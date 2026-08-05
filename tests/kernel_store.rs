@@ -12,17 +12,15 @@ use devmanager::domain::command::{
 use devmanager::domain::event::{
     AgentSessionRegisteredPayload, OperationAcceptedFact, OperationCancelledFact,
     OperationFailedFact, OperationSettledFact, OperationUncertainFact, PrimaryAgentSetPayload,
-    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
-    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
-    EVENT_SCHEMA_VERSION,
+    ResourceRegisteredPayload, ResourceReleasedPayload, TaskCloseBegunPayload, TaskCreatedPayload,
+    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use devmanager::domain::id::{
-    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
     ProjectId, ResourceId, TaskId,
 };
 use devmanager::domain::operation::{
-    CancellationReason, OperationErrorCode, OperationOutcome, OperationOutcomeKind, OperationState,
-    OperationUncertaintyCode, OutcomeSource, ResourceFence,
+    CancellationReason, OperationErrorCode, OperationState, OutcomeSource, ResourceFence,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -32,10 +30,12 @@ use devmanager::domain::task::{
     TaskLifecycle, WorkspaceRef,
 };
 use devmanager::kernel::{
-    DestinationClass, Effect, KernelStore, ProjectionRebuild, ReplayPolicy, StoreError,
+    AmbiguityDisposition, DestinationClass, DispatchCompletion, DispatchPermit, Effect,
+    KernelStore, ProjectionRebuild, ReconciliationFinding, ReconciliationOrigin, ReplayPolicy,
+    StoreError,
 };
-use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -494,198 +494,6 @@ fn schema_corrupt_and_truncated_databases_fail_typed() {
 }
 
 #[test]
-fn schema_rebuild_projections_is_deterministic_and_repairs_drift() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0x40);
-    let agent = agent_id(0x41);
-    let resource = resource_id(0x42);
-    let cmd = command_id(0x43);
-    let op = operation_id(0x44);
-
-    {
-        let conn = open_raw(&path);
-        seed_task_created(&conn, task, event_id(0x50), 1_000);
-
-        let agent_facts = AgentSessionFacts {
-            id: agent,
-            task_id: task,
-            role: AgentRole::Primary,
-            provider_kind: "claude".into(),
-            provider_session_id: Some("sess-1".into()),
-            lifecycle: devmanager::domain::agent::AgentSessionLifecycle::Open,
-            runtime_generation: 0,
-            revision: 0,
-        };
-        insert_event(
-            &conn,
-            event_id(0x51),
-            Some(task),
-            Some(2),
-            "agent_session.registered",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&AgentSessionRegisteredPayload { agent: agent_facts }).unwrap(),
-        );
-        insert_event(
-            &conn,
-            event_id(0x52),
-            Some(task),
-            Some(3),
-            "primary_agent.set",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&PrimaryAgentSetPayload {
-                agent_session_id: agent,
-            })
-            .unwrap(),
-        );
-
-        let resource_facts = ResourceFacts {
-            id: resource,
-            task_id: Some(task),
-            owner_kind: OwnerKind::Task,
-            resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal {
-                cols: 120,
-                rows: 40,
-            },
-            lifecycle: ResourceLifecycle::Active,
-            runtime_generation: 0,
-            updated_at_ms: 1_300,
-        };
-        insert_event(
-            &conn,
-            event_id(0x53),
-            Some(task),
-            Some(4),
-            "resource.registered",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&ResourceRegisteredPayload {
-                resource: resource_facts,
-            })
-            .unwrap(),
-        );
-
-        conn.execute(
-            "INSERT INTO command_receipts(
-                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-             ) VALUES (?1, ?2, ?3, X'00', 5, 1400)",
-            rusqlite::params![
-                cmd.as_bytes().as_slice(),
-                client_id(0x45).as_bytes().as_slice(),
-                task.as_bytes().as_slice(),
-            ],
-        )
-        .expect("receipt");
-
-        let accepted = OperationAcceptedFact::new(cmd, op, 1_400, None, None, None).unwrap();
-        insert_event(
-            &conn,
-            event_id(0x54),
-            Some(task),
-            None,
-            "operation.accepted",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_400,
-            &rmp_serde::to_vec(&accepted).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let first = store.rebuild_projections().expect("rebuild");
-    assert_eq!(
-        first,
-        ProjectionRebuild {
-            events_replayed: 5,
-            drift_detected: true,
-        }
-    );
-    let second = store.rebuild_projections().expect("rebuild again");
-    assert_eq!(
-        second,
-        ProjectionRebuild {
-            events_replayed: 5,
-            drift_detected: false,
-        }
-    );
-    drop(store);
-
-    let conn = open_raw(&path);
-    let primary: Vec<u8> = conn
-        .query_row(
-            "SELECT primary_agent_session_id FROM tasks WHERE task_id = ?1",
-            [task.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("primary");
-    assert_eq!(primary, agent.as_bytes().as_slice());
-
-    let op_task: Vec<u8> = conn
-        .query_row(
-            "SELECT task_id FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("operation task_id");
-    assert_eq!(
-        op_task,
-        task.as_bytes().as_slice(),
-        "operations.task_id must come from DomainEvent.task_id"
-    );
-
-    let lifecycle: String = conn
-        .query_row(
-            "SELECT lifecycle FROM resources WHERE resource_id = ?1",
-            [resource.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("resource");
-    assert_eq!(lifecycle, "active");
-
-    // Corrupt a projection row, then rebuild must repair without touching events.
-    conn.execute(
-        "UPDATE tasks SET title = 'drifted' WHERE task_id = ?1",
-        [task.as_bytes().as_slice()],
-    )
-    .expect("drift");
-    let event_count_before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-        .unwrap();
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let repaired = store.rebuild_projections().expect("repair");
-    assert!(repaired.drift_detected);
-    drop(store);
-
-    let conn = open_raw(&path);
-    let title: String = conn
-        .query_row(
-            "SELECT title FROM tasks WHERE task_id = ?1",
-            [task.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(title, "Ship kernel");
-    let event_count_after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(event_count_before, event_count_after);
-    let shadow: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_schema WHERE name LIKE 'shadow_%' LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap();
-    assert!(shadow.is_none(), "shadow tables must not remain");
-}
-
-#[test]
 fn schema_primary_agent_selection_requires_same_task_primary_role() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
@@ -737,159 +545,6 @@ fn schema_primary_agent_selection_requires_same_task_primary_role() {
     assert!(
         matches!(err, StoreError::Projection(_)),
         "expected projection failure for non-primary role, got {err:?}"
-    );
-}
-
-#[test]
-fn schema_resource_release_fences_generation_and_uses_occurred_at() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0x80);
-    let resource = resource_id(0x81);
-    let cmd = command_id(0x82);
-    let op = operation_id(0x83);
-    let released_id = event_id(0x93);
-
-    {
-        let conn = open_raw(&path);
-        seed_task_created(&conn, task, event_id(0x90), 1_000);
-        let resource_facts = ResourceFacts {
-            id: resource,
-            task_id: Some(task),
-            owner_kind: OwnerKind::Task,
-            resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
-            lifecycle: ResourceLifecycle::Active,
-            runtime_generation: 3,
-            updated_at_ms: 1_100,
-        };
-        insert_event(
-            &conn,
-            event_id(0x91),
-            Some(task),
-            Some(2),
-            "resource.registered",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&ResourceRegisteredPayload {
-                resource: resource_facts,
-            })
-            .unwrap(),
-        );
-        insert_event(
-            &conn,
-            event_id(0x92),
-            Some(task),
-            Some(3),
-            "resource.release_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&ResourceReleaseBegunPayload {
-                resource_id: resource,
-                runtime_generation: 3,
-            })
-            .unwrap(),
-        );
-        conn.execute(
-            "INSERT INTO command_receipts(
-                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-             ) VALUES (?1, ?2, ?3, X'00', 4, 1200)",
-            rusqlite::params![
-                cmd.as_bytes().as_slice(),
-                client_id(0x01).as_bytes().as_slice(),
-                task.as_bytes().as_slice(),
-            ],
-        )
-        .unwrap();
-        let accepted =
-            OperationAcceptedFact::new(cmd, op, 1_200, Some(0), Some(resource), Some(3)).unwrap();
-        insert_event(
-            &conn,
-            event_id(0x94),
-            Some(task),
-            None,
-            "operation.accepted",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&accepted).unwrap(),
-        );
-        insert_event(
-            &conn,
-            released_id,
-            Some(task),
-            Some(4),
-            "resource.released",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_500,
-            &rmp_serde::to_vec(&ResourceReleasedPayload {
-                resource_id: resource,
-                runtime_generation: 3,
-            })
-            .unwrap(),
-        );
-        let settled = OperationSettledFact::new(
-            cmd,
-            op,
-            1_500,
-            vec![released_id],
-            Some(0),
-            Some(resource),
-            Some(3),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x95),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_500,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("rebuild");
-    drop(store);
-
-    let conn = open_raw(&path);
-    let (lifecycle, updated_at_ms, generation): (String, i64, i64) = conn
-        .query_row(
-            "SELECT lifecycle, updated_at_ms, runtime_generation
-             FROM resources WHERE resource_id = ?1",
-            [resource.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(lifecycle, "released");
-    assert_eq!(
-        updated_at_ms, 1_500,
-        "release must use event occurred_at_ms"
-    );
-    assert_eq!(generation, 3);
-
-    // Stale generation must fail.
-    conn.execute("DELETE FROM resources", []).unwrap();
-    conn.execute("DELETE FROM tasks", []).unwrap();
-    conn.execute("DELETE FROM operations", []).unwrap();
-    conn.execute(
-        "UPDATE events SET payload = ?1 WHERE event_type = 'resource.released'",
-        [rmp_serde::to_vec(&ResourceReleasedPayload {
-            resource_id: resource,
-            runtime_generation: 99,
-        })
-        .unwrap()],
-    )
-    .unwrap();
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store.rebuild_projections().expect_err("stale generation");
-    assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected generation fence failure, got {err:?}"
     );
 }
 
@@ -1075,207 +730,6 @@ fn schema_nullable_id_columns_reject_malformed_lengths() {
     assert!(sql.contains("task_id"));
     assert!(sql.contains("resource_kind"));
     assert!(sql.to_lowercase().contains("lifecycle = 'active'"));
-}
-
-#[test]
-fn schema_operation_outcome_requires_matching_task_fence() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task_a = task_id(0xC0);
-    let task_b = task_id(0xC1);
-    let resource = resource_id(0xC2);
-    let cmd = command_id(0xC3);
-    let op = operation_id(0xC4);
-
-    {
-        let conn = open_raw(&path);
-        seed_task_created(&conn, task_a, event_id(0xD0), 1_000);
-        seed_task_created(&conn, task_b, event_id(0xD1), 1_050);
-
-        let resource_facts = ResourceFacts {
-            id: resource,
-            task_id: Some(task_a),
-            owner_kind: OwnerKind::Task,
-            resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
-            lifecycle: ResourceLifecycle::Active,
-            runtime_generation: 7,
-            updated_at_ms: 1_100,
-        };
-        insert_event(
-            &conn,
-            event_id(0xD2),
-            Some(task_a),
-            Some(2),
-            "resource.registered",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&ResourceRegisteredPayload {
-                resource: resource_facts,
-            })
-            .unwrap(),
-        );
-        insert_event(
-            &conn,
-            event_id(0xD6),
-            Some(task_a),
-            Some(3),
-            "resource.release_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&ResourceReleaseBegunPayload {
-                resource_id: resource,
-                runtime_generation: 7,
-            })
-            .unwrap(),
-        );
-
-        conn.execute(
-            "INSERT INTO command_receipts(
-                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-             ) VALUES (?1, ?2, ?3, X'00', 5, 1200)",
-            rusqlite::params![
-                cmd.as_bytes().as_slice(),
-                client_id(0xC6).as_bytes().as_slice(),
-                task_a.as_bytes().as_slice(),
-            ],
-        )
-        .unwrap();
-
-        let accepted =
-            OperationAcceptedFact::new(cmd, op, 1_200, Some(0), Some(resource), Some(7)).unwrap();
-        insert_event(
-            &conn,
-            event_id(0xD3),
-            Some(task_a),
-            None,
-            "operation.accepted",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&accepted).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept rebuild");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        let (state, rid, gen): (String, Vec<u8>, i64) = conn
-            .query_row(
-                "SELECT state, resource_id, runtime_generation FROM operations WHERE operation_id = ?1",
-                [op.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "accepted");
-        assert_eq!(rid, resource.as_bytes().as_slice());
-        assert_eq!(gen, 7);
-
-        // Wrong task scope on an otherwise matching outcome (still missing released; task fence fails first).
-        let settled = OperationSettledFact::new(
-            cmd,
-            op,
-            1_300,
-            vec![event_id(0xC5)],
-            Some(0),
-            Some(resource),
-            Some(7),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xD4),
-            Some(task_b),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store.rebuild_projections().expect_err("task fence");
-    assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected task fence projection error, got {err:?}"
-    );
-    drop(store);
-
-    let conn = open_raw(&path);
-    let state: String = conn
-        .query_row(
-            "SELECT state FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        state, "accepted",
-        "failed rebuild must not alter stable ops"
-    );
-
-    // Valid release chain: released then settled on the owning task.
-    conn.execute(
-        "DELETE FROM events WHERE event_type = 'operation.settled'",
-        [],
-    )
-    .unwrap();
-    let released_id = event_id(0xC5);
-    insert_event(
-        &conn,
-        released_id,
-        Some(task_a),
-        Some(4),
-        "resource.released",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_400,
-        &rmp_serde::to_vec(&ResourceReleasedPayload {
-            resource_id: resource,
-            runtime_generation: 7,
-        })
-        .unwrap(),
-    );
-    let settled = OperationSettledFact::new(
-        cmd,
-        op,
-        1_400,
-        vec![released_id],
-        Some(0),
-        Some(resource),
-        Some(7),
-    )
-    .unwrap();
-    insert_event(
-        &conn,
-        event_id(0xD5),
-        Some(task_a),
-        None,
-        "operation.settled",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_400,
-        &rmp_serde::to_vec(&settled).unwrap(),
-    );
-    drop(conn);
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("scoped settle");
-    drop(store);
-
-    let conn = open_raw(&path);
-    let (state, outcome_at): (String, i64) = conn
-        .query_row(
-            "SELECT state, outcome_at_ms FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "settled");
-    assert_eq!(outcome_at, 1_400);
 }
 
 #[test]
@@ -1597,439 +1051,6 @@ fn schema_replay_rejects_domain_invalid_transitions() {
             "releasing registration must fail, got {err:?}"
         );
     }
-}
-
-#[test]
-fn schema_operation_outcome_requires_matching_command_id() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0xA8);
-    let resource = resource_id(0xA9);
-    let cmd = command_id(0xAA);
-    let other_cmd = command_id(0xAB);
-    let op = operation_id(0xAC);
-    let result_event = event_id(0xAD);
-
-    {
-        let conn = open_raw(&path);
-        seed_task_created(&conn, task, event_id(0xB0), 1_000);
-        let resource_facts = ResourceFacts {
-            id: resource,
-            task_id: Some(task),
-            owner_kind: OwnerKind::Task,
-            resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
-            lifecycle: ResourceLifecycle::Active,
-            runtime_generation: 2,
-            updated_at_ms: 1_100,
-        };
-        insert_event(
-            &conn,
-            event_id(0xB1),
-            Some(task),
-            Some(2),
-            "resource.registered",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&ResourceRegisteredPayload {
-                resource: resource_facts,
-            })
-            .unwrap(),
-        );
-        conn.execute(
-            "INSERT INTO command_receipts(
-                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-             ) VALUES (?1, ?2, ?3, X'00', 3, 1200)",
-            rusqlite::params![
-                cmd.as_bytes().as_slice(),
-                client_id(0xAE).as_bytes().as_slice(),
-                task.as_bytes().as_slice(),
-            ],
-        )
-        .unwrap();
-        let accepted =
-            OperationAcceptedFact::new(cmd, op, 1_200, Some(0), Some(resource), Some(2)).unwrap();
-        insert_event(
-            &conn,
-            event_id(0xB2),
-            Some(task),
-            None,
-            "operation.accepted",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&accepted).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        // Every fence matches except command_id.
-        let settled = OperationSettledFact::new(
-            other_cmd,
-            op,
-            1_300,
-            vec![result_event],
-            Some(0),
-            Some(resource),
-            Some(2),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xB3),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store.rebuild_projections().expect_err("command fence");
-    assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected command_id fence failure, got {err:?}"
-    );
-    drop(store);
-
-    let conn = open_raw(&path);
-    let state: String = conn
-        .query_row(
-            "SELECT state FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "accepted");
-}
-
-fn seed_accepted_operation(
-    path: &Path,
-    task: TaskId,
-    cmd: CommandId,
-    op: OperationId,
-    resource: Option<(ResourceId, u64)>,
-    action_epoch: Option<u64>,
-) {
-    let conn = open_raw(path);
-    conn.execute(
-        "INSERT INTO command_receipts(
-            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, 1, 1)",
-        rusqlite::params![
-            cmd.as_bytes().as_slice(),
-            client_id(0x01).as_bytes().as_slice(),
-            task.as_bytes().as_slice(),
-            vec![1u8, 2, 3],
-        ],
-    )
-    .expect("receipt");
-    insert_event(
-        &conn,
-        event_id(0xE0),
-        Some(task),
-        Some(1),
-        "task.created",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_000,
-        &task_created_payload(task),
-    );
-    let (resource_id, runtime_generation) = match resource {
-        Some((id, gen)) => (Some(id), Some(gen)),
-        None => (None, None),
-    };
-    let accepted = OperationAcceptedFact::new(
-        cmd,
-        op,
-        1_100,
-        action_epoch,
-        resource_id,
-        runtime_generation,
-    )
-    .expect("accepted");
-    insert_event(
-        &conn,
-        event_id(0xE1),
-        Some(task),
-        None,
-        "operation.accepted",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_100,
-        &rmp_serde::to_vec(&accepted).unwrap(),
-    );
-}
-
-#[test]
-fn command_contract_projector_accepts_dispatch_from_accepted_only() {
-    use devmanager::domain::operation::OutcomeSource;
-
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0x40);
-    let cmd = command_id(0x41);
-    let op = operation_id(0x42);
-    seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept rebuild");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        insert_event(
-            &conn,
-            event_id(0xE7),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_150,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        let archive_id = event_id(0x90);
-        insert_event(
-            &conn,
-            archive_id,
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        let settled =
-            OperationSettledFact::new(cmd, op, 1_200, vec![archive_id], Some(1), None, None)
-                .expect("dispatch settled");
-        assert_eq!(settled.source, OutcomeSource::Dispatch);
-        insert_event(
-            &conn,
-            event_id(0xE2),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("dispatch settle");
-    drop(store);
-
-    let conn = open_raw(&path);
-    let state: String = conn
-        .query_row(
-            "SELECT state FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "settled");
-}
-
-#[test]
-fn command_contract_projector_rejects_reconciliation_from_accepted() {
-    use devmanager::domain::operation::OutcomeSource;
-
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0x50);
-    let cmd = command_id(0x51);
-    let op = operation_id(0x52);
-    seed_accepted_operation(&path, task, cmd, op, None, None);
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept rebuild");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        let settled = OperationSettledFact::with_source(
-            cmd,
-            op,
-            1_200,
-            vec![event_id(0x91)],
-            None,
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(0, "ext-too-early").expect("identity"),
-        )
-        .expect("reconciled settled");
-        insert_event(
-            &conn,
-            event_id(0xE3),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .rebuild_projections()
-        .expect_err("accepted cannot take verified reconciliation");
-    assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected projection fence, got {err:?}"
-    );
-}
-
-#[test]
-fn command_contract_projector_uncertain_resolves_only_via_reconciliation() {
-    use devmanager::domain::event::OperationUncertainFact;
-    use devmanager::domain::operation::{OperationUncertaintyCode, OutcomeSource};
-
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-
-    let task = task_id(0x60);
-    let cmd = command_id(0x61);
-    let op = operation_id(0x62);
-    seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept rebuild");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        let uncertain = OperationUncertainFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationUncertaintyCode::AmbiguousDispatch,
-            Some(1),
-            None,
-            None,
-        )
-        .expect("uncertain");
-        insert_event(
-            &conn,
-            event_id(0xE4),
-            Some(task),
-            None,
-            "operation.uncertain",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&uncertain).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("uncertain rebuild");
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        let dispatch_settle =
-            OperationSettledFact::new(cmd, op, 1_300, vec![event_id(0x92)], Some(1), None, None)
-                .expect("dispatch");
-        insert_event(
-            &conn,
-            event_id(0xE5),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&dispatch_settle).unwrap(),
-        );
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .rebuild_projections()
-        .expect_err("uncertain rejects dispatch settlement");
-    assert!(
-        matches!(err, StoreError::Projection(_)),
-        "expected projection error, got {err:?}"
-    );
-    drop(store);
-
-    {
-        let conn = open_raw(&path);
-        conn.execute(
-            "DELETE FROM events WHERE event_type = 'operation.settled'",
-            [],
-        )
-        .unwrap();
-        let archive_id = event_id(0x93);
-        insert_event(
-            &conn,
-            event_id(0xE8),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_350,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        insert_event(
-            &conn,
-            archive_id,
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_400,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        let reconciled = OperationSettledFact::with_source(
-            cmd,
-            op,
-            1_400,
-            vec![archive_id],
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(0, "provider:proof").expect("identity"),
-        )
-        .expect("reconciled");
-        insert_event(
-            &conn,
-            event_id(0xE6),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_400,
-            &rmp_serde::to_vec(&reconciled).unwrap(),
-        );
-        insert_terminal_outbox_row(&conn, op, 0, "settled", None);
-    }
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .rebuild_projections()
-        .expect("uncertain resolves via verified reconciliation");
-    drop(store);
-
-    let conn = open_raw(&path);
-    let state: String = conn
-        .query_row(
-            "SELECT state FROM operations WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "settled");
 }
 
 fn create_task_intent(task: TaskId) -> CreateTaskIntent {
@@ -5055,44 +4076,95 @@ fn accept_release_resource(
     (operation_id, receipt)
 }
 
-fn settle_close_outcome(
-    operation_id: OperationId,
-    occurred_at_ms: i64,
-    action_epoch: u64,
-    result_id: EventId,
-) -> OperationOutcome {
-    OperationOutcome::new(
-        operation_id,
-        occurred_at_ms,
-        Some(action_epoch),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
-        },
-    )
-    .expect("close settle outcome")
+fn begin_expected_dispatch(store: &mut KernelStore, expected: Effect) -> DispatchPermit {
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim expected dispatch")
+        .expect("expected dispatch is ready");
+    let permit = store
+        .begin_dispatch(&claim)
+        .expect("begin expected dispatch");
+    assert_eq!(
+        permit.effect(),
+        &expected,
+        "claimed the wrong durable effect"
+    );
+    permit
 }
 
-fn settle_release_outcome(
-    operation_id: OperationId,
-    occurred_at_ms: i64,
-    action_epoch: u64,
+fn complete_expected_dispatch(
+    store: &mut KernelStore,
+    expected: Effect,
+    completion: DispatchCompletion,
+) -> (DispatchPermit, OperationState) {
+    let permit = begin_expected_dispatch(store, expected);
+    let state = store
+        .record_dispatch_completion(&permit, completion)
+        .expect("complete expected dispatch");
+    (permit, state)
+}
+
+fn reconcile_expected_dispatch_as_settled(
+    store: &mut KernelStore,
+    path: &Path,
+    expected: Effect,
+    external_identity: &str,
+) -> OperationState {
+    let permit = begin_expected_dispatch(store, expected);
+    assert_eq!(
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route expected dispatch to reconciliation"),
+        AmbiguityDisposition::ReconciliationRequired,
+    );
+    let conn = open_raw(path);
+    let due: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .expect("reconciliation due time");
+    drop(conn);
+    wait_until_wall_reaches(due);
+    let claim = store
+        .claim_next_reconciliation(Duration::from_secs(30))
+        .expect("claim expected reconciliation")
+        .expect("expected reconciliation is ready");
+    assert_eq!(claim.lookup_identity(), permit.external_idempotency_key());
+    store
+        .record_reconciliation(
+            &claim,
+            ReconciliationFinding::PresentSettled {
+                lookup_identity: claim.lookup_identity().to_owned(),
+                external_identity: external_identity.to_owned(),
+            },
+        )
+        .expect("settle expected dispatch by reconciliation")
+}
+
+fn seed_reconciled_release(
+    path: &Path,
+    task: TaskId,
     resource: ResourceId,
-    generation: u64,
-    result_id: EventId,
-) -> OperationOutcome {
-    OperationOutcome::new(
-        operation_id,
-        occurred_at_ms,
-        Some(action_epoch),
-        Some(ResourceFence::new(resource, generation)),
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
+    create_command: CommandId,
+    release_command: CommandId,
+    runtime_generation: u64,
+    external_identity: &str,
+) -> OperationId {
+    let mut store = KernelStore::open(path).expect("open reconciliation fixture");
+    create_open_task(&mut store, task, create_command);
+    drop(store);
+    seed_active_resource(path, task, resource, runtime_generation);
+    let mut store = KernelStore::open(path).expect("reopen reconciliation fixture");
+    let (operation_id, _) = accept_release_resource(&mut store, task, release_command, resource, 2);
+    reconcile_expected_dispatch_as_settled(
+        &mut store,
+        path,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, runtime_generation),
         },
-    )
-    .expect("release settle outcome")
+        external_identity,
+    );
+    operation_id
 }
 
 #[test]
@@ -5119,23 +4191,26 @@ fn command_outcome_close_success_derives_task_archived_and_settles() {
     let receipt_before = receipt_blob(&conn, close_cmd);
     drop(conn);
 
-    let result_id = event_id(0xE1);
     let mut store = KernelStore::open(&path).expect("reopen");
-    let state = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 10,
-            1,
-            result_id,
-        ))
-        .expect("settle close");
-    assert_eq!(
-        state,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 10,
-            result_event_ids: vec![result_id],
-        }
+    let (_, state) = complete_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+        DispatchCompletion::Settled,
     );
+    let (settled_at_ms, result_id) = match state {
+        OperationState::Settled {
+            settled_at_ms,
+            result_event_ids,
+        } => {
+            assert_eq!(result_event_ids.len(), 1);
+            (settled_at_ms, result_event_ids[0])
+        }
+        other => panic!("expected settled close, got {other:?}"),
+    };
+    assert!(settled_at_ms >= accepted_ms);
     drop(store);
 
     let conn = open_raw(&path);
@@ -5217,7 +4292,7 @@ fn command_outcome_close_success_derives_task_archived_and_settles() {
         (state, outcome_at, last_error, outbox_state)
     };
     assert_eq!(op_state, "settled");
-    assert_eq!(outcome_at, Some(accepted_ms + 10));
+    assert_eq!(outcome_at, Some(settled_at_ms));
     assert_eq!(outbox_state, "settled");
     assert!(last_error.is_none());
 
@@ -5255,25 +4330,26 @@ fn command_outcome_release_success_derives_generation_fenced_resource_released()
     let events_before = count_table(&conn, "events");
     drop(conn);
 
-    let result_id = event_id(0xE2);
     let mut store = KernelStore::open(&path).expect("reopen");
-    let state = store
-        .record_outcome(settle_release_outcome(
-            operation_id,
-            accepted_ms + 5,
-            0,
-            resource,
-            9,
-            result_id,
-        ))
-        .expect("settle release");
-    assert_eq!(
-        state,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 5,
-            result_event_ids: vec![result_id],
-        }
+    let (_, state) = complete_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 9),
+        },
+        DispatchCompletion::Settled,
     );
+    match state {
+        OperationState::Settled {
+            settled_at_ms,
+            result_event_ids,
+        } => {
+            assert!(settled_at_ms >= accepted_ms);
+            assert_eq!(result_event_ids.len(), 1);
+        }
+        other => panic!("expected settled release, got {other:?}"),
+    }
     drop(store);
 
     let conn = open_raw(&path);
@@ -5315,11 +4391,11 @@ fn command_outcome_release_success_derives_generation_fenced_resource_released()
 }
 
 #[test]
-fn command_outcome_failed_cancelled_uncertain_append_only_outcome_facts() {
-    for (label, kind, expected_state, expected_outbox, expected_error, event_type) in [
+fn command_outcome_failed_and_cancelled_append_only_outcome_facts() {
+    for (label, completion, expected_state, expected_outbox, expected_error, event_type) in [
         (
             "failed",
-            OperationOutcomeKind::Failed {
+            DispatchCompletion::Failed {
                 code: OperationErrorCode::SideEffectFailed,
             },
             "failed",
@@ -5329,23 +4405,13 @@ fn command_outcome_failed_cancelled_uncertain_append_only_outcome_facts() {
         ),
         (
             "cancelled",
-            OperationOutcomeKind::Cancelled {
+            DispatchCompletion::Cancelled {
                 reason: CancellationReason::Superseded,
             },
             "cancelled",
             "cancelled",
             Some("superseded"),
             "operation.cancelled",
-        ),
-        (
-            "uncertain",
-            OperationOutcomeKind::Uncertain {
-                code: OperationUncertaintyCode::AmbiguousDispatch,
-            },
-            "uncertain",
-            "uncertain",
-            Some("ambiguous_dispatch"),
-            "operation.uncertain",
         ),
     ] {
         let dir = TempDir::new().expect("tempdir");
@@ -5358,21 +4424,18 @@ fn command_outcome_failed_cancelled_uncertain_append_only_outcome_facts() {
         drop(store);
 
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         drop(conn);
 
-        let outcome = OperationOutcome::new(
-            operation_id,
-            accepted_ms + 1,
-            Some(1),
-            None,
-            OutcomeSource::Dispatch,
-            kind,
-        )
-        .expect(label);
         let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome).expect(label);
+        complete_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+            completion,
+        );
         drop(store);
 
         let conn = open_raw(&path);
@@ -5409,7 +4472,7 @@ fn command_outcome_failed_cancelled_uncertain_append_only_outcome_facts() {
 }
 
 #[test]
-fn command_outcome_stale_fences_and_backward_timestamp_leave_store_unchanged() {
+fn command_completion_corrupt_ownership_leaves_store_unchanged() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
@@ -5420,108 +4483,42 @@ fn command_outcome_stale_fences_and_backward_timestamp_leave_store_unchanged() {
     seed_active_resource(&path, task, resource, 3);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let release_cmd = command_id(0xDE);
-    let (operation_id, _) = accept_release_resource(&mut store, task, release_cmd, resource, 2);
+    let (operation_id, _) =
+        accept_release_resource(&mut store, task, command_id(0xDE), resource, 2);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 3),
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    let snapshot = (
-        count_table(&conn, "events"),
-        count_table(&conn, "outbox"),
-        operation_projection(&conn, operation_id),
-        {
-            let (lifecycle, gen): (String, i64) = conn
-                .query_row(
-                    "SELECT lifecycle, runtime_generation FROM resources WHERE resource_id = ?1",
-                    [resource.as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            (lifecycle, gen)
-        },
-    );
+    conn.execute(
+        "UPDATE resources SET lifecycle = 'active' WHERE resource_id = ?1",
+        [resource.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    let operation_before = operation_projection(&conn, operation_id);
     drop(conn);
 
-    let result_id = event_id(0xE3);
-    let cases: Vec<(&str, OperationOutcome)> = vec![
-        (
-            "stale action epoch",
-            settle_release_outcome(operation_id, accepted_ms + 1, 99, resource, 3, result_id),
-        ),
-        (
-            "stale resource id",
-            settle_release_outcome(
-                operation_id,
-                accepted_ms + 1,
-                0,
-                resource_id(0xEF),
-                3,
-                result_id,
-            ),
-        ),
-        (
-            "stale generation",
-            settle_release_outcome(operation_id, accepted_ms + 1, 0, resource, 99, result_id),
-        ),
-        (
-            "backward timestamp",
-            settle_release_outcome(operation_id, accepted_ms - 1, 0, resource, 3, result_id),
-        ),
-    ];
+    let mut store = KernelStore::open(&path).expect("reopen corrupt ownership");
+    assert_eq!(
+        store.record_dispatch_completion(&permit, DispatchCompletion::Settled,),
+        Err(StoreError::Corruption)
+    );
+    drop(store);
 
-    for (label, outcome) in cases {
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .record_outcome(outcome)
-            .expect_err(&format!("{label} must fail"));
-        assert_eq!(err, StoreError::StaleFence, "{label}");
-        drop(store);
-
-        let conn = open_raw(&path);
-        assert_eq!(count_table(&conn, "events"), snapshot.0, "{label}");
-        assert_eq!(count_table(&conn, "outbox"), snapshot.1, "{label}");
-        assert_eq!(
-            operation_projection(&conn, operation_id),
-            snapshot.2,
-            "{label}"
-        );
-        let (lifecycle, gen): (String, i64) = conn
-            .query_row(
-                "SELECT lifecycle, runtime_generation FROM resources WHERE resource_id = ?1",
-                [resource.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((lifecycle, gen), snapshot.3, "{label}");
-    }
-
-    // Ownership/lifecycle break: force resource out of releasing — durable
-    // replay/projection mismatch is Corruption (not a caller StaleFence).
-    {
-        let conn = open_raw(&path);
-        conn.execute(
-            "UPDATE resources SET lifecycle = 'active' WHERE resource_id = ?1",
-            [resource.as_bytes().as_slice()],
-        )
-        .unwrap();
-    }
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .record_outcome(settle_release_outcome(
-            operation_id,
-            accepted_ms + 1,
-            0,
-            resource,
-            3,
-            result_id,
-        ))
-        .expect_err("lifecycle mismatch");
-    assert_eq!(err, StoreError::Corruption);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(operation_projection(&conn, operation_id), operation_before);
 }
 
 #[test]
-fn command_outcome_missing_and_pure_operations_fail_typed() {
+fn pure_operations_never_expose_a_dispatch_permit() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
@@ -5539,45 +4536,13 @@ fn command_outcome_missing_and_pure_operations_fail_typed() {
             }),
         ))
         .expect("rename");
-    let CommandReceipt::Accepted {
-        operation_id: pure_op,
-        ..
-    } = rename_receipt
-    else {
+    let CommandReceipt::Accepted { .. } = rename_receipt else {
         panic!("expected accepted rename");
     };
-
-    let missing = OperationOutcome::new(
-        operation_id(0xEE),
-        1,
-        None,
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Failed {
-            code: OperationErrorCode::SideEffectFailed,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        store.record_outcome(missing).unwrap_err(),
-        StoreError::MissingOperation
-    );
-
-    let pure = OperationOutcome::new(
-        pure_op,
-        2,
-        None,
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Failed {
-            code: OperationErrorCode::SideEffectFailed,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        store.record_outcome(pure).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
+    assert!(store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("pure command scan")
+        .is_none());
 }
 
 #[test]
@@ -5588,17 +4553,21 @@ fn command_outcome_exact_duplicate_is_idempotent_before_and_after_reopen() {
     let task = task_id(0xF1);
     create_open_task(&mut store, task, command_id(0xF2));
     let close_cmd = command_id(0xF3);
-    let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
+    let (_operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
     drop(store);
 
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let result_id = event_id(0xF4);
-    let outcome = settle_close_outcome(operation_id, accepted_ms + 7, 1, result_id);
+    let completion = DispatchCompletion::Settled;
     let mut store = KernelStore::open(&path).expect("reopen");
-    let first = store.record_outcome(outcome.clone()).expect("first settle");
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
+    let first = store
+        .record_dispatch_completion(&permit, completion.clone())
+        .expect("first settle");
     let events_after_first = {
         drop(store);
         let conn = open_raw(&path);
@@ -5607,7 +4576,7 @@ fn command_outcome_exact_duplicate_is_idempotent_before_and_after_reopen() {
 
     let mut store = KernelStore::open(&path).expect("reopen");
     let dup = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, completion.clone())
         .expect("exact duplicate");
     assert_eq!(dup, first);
     drop(store);
@@ -5626,327 +4595,41 @@ fn command_outcome_exact_duplicate_is_idempotent_before_and_after_reopen() {
         ))
         .expect("reopen archived");
     let after_reopen = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, completion.clone())
         .expect("exact duplicate after reopen");
-    assert_eq!(
-        after_reopen,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 7,
-            result_event_ids: vec![result_id],
-        }
-    );
+    assert_eq!(after_reopen, first);
     drop(store);
     let conn = open_raw(&path);
     assert_eq!(count_table(&conn, "events"), events_after_first + 3); // reopen: decision+accepted+settled
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let differing_kind = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 7,
-        Some(1),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Failed {
-            code: OperationErrorCode::SideEffectFailed,
-        },
-    )
-    .unwrap();
     assert_eq!(
-        store.record_outcome(differing_kind).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-    let differing_time = settle_close_outcome(operation_id, accepted_ms + 8, 1, result_id);
-    assert_eq!(
-        store.record_outcome(differing_time).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-    let differing_result = settle_close_outcome(operation_id, accepted_ms + 7, 1, event_id(0xF6));
-    assert_eq!(
-        store.record_outcome(differing_result).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-    let differing_source = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 7,
-        Some(1),
-        None,
-        OutcomeSource::verified_reconciliation(0, "provider:x").unwrap(),
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        store.record_outcome(differing_source).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-}
-
-#[test]
-fn command_outcome_reconciliation_rules_and_uncertain_resolution() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    let mut store = KernelStore::open(&path).expect("open");
-    let task = task_id(0xA1);
-    create_open_task(&mut store, task, command_id(0xA2));
-    let close_cmd = command_id(0xA3);
-    let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-    drop(store);
-
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let result_id = event_id(0xA4);
-    let direct_reconcile = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 1,
-        Some(1),
-        None,
-        OutcomeSource::verified_reconciliation(0, "provider:early").unwrap(),
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
-        },
-    )
-    .unwrap();
-    let mut store = KernelStore::open(&path).expect("reopen");
-    assert_eq!(
-        store.record_outcome(direct_reconcile).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-
-    let uncertain = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 2,
-        Some(1),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Uncertain {
-            code: OperationUncertaintyCode::AmbiguousDispatch,
-        },
-    )
-    .unwrap();
-    store.record_outcome(uncertain.clone()).expect("uncertain");
-
-    let dispatch_from_uncertain = settle_close_outcome(operation_id, accepted_ms + 3, 1, result_id);
-    assert_eq!(
-        store.record_outcome(dispatch_from_uncertain).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-
-    let bad_index = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 4,
-        Some(1),
-        None,
-        OutcomeSource::verified_reconciliation(1, "provider:proof").unwrap(),
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        store.record_outcome(bad_index).unwrap_err(),
-        StoreError::ConflictingOutcome
-    );
-
-    // Exact earlier uncertain retry after resolution path setup: first resolve to settled.
-    let reconcile_settle = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 5,
-        Some(1),
-        None,
-        OutcomeSource::verified_reconciliation(0, "provider:proof").unwrap(),
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![result_id],
-        },
-    )
-    .unwrap();
-    let settled = store
-        .record_outcome(reconcile_settle.clone())
-        .expect("uncertain -> settled");
-    assert_eq!(
-        settled,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 5,
-            result_event_ids: vec![result_id],
-        }
-    );
-
-    let events_after = {
-        drop(store);
-        let conn = open_raw(&path);
-        let settled_payload: Vec<u8> = conn
-            .query_row(
-                "SELECT payload FROM events WHERE event_type = 'operation.settled'
-                 ORDER BY sequence DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let fact: OperationSettledFact = rmp_serde::from_slice(&settled_payload).unwrap();
-        assert!(matches!(
-            fact.source,
-            OutcomeSource::VerifiedReconciliation {
-                effect_index: 0,
-                ..
-            }
-        ));
-        assert_eq!(
-            match &fact.source {
-                OutcomeSource::VerifiedReconciliation {
-                    external_identity, ..
-                } => external_identity.as_str(),
-                _ => panic!("expected verified source"),
+        store.record_dispatch_completion(
+            &permit,
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
             },
-            "provider:proof"
-        );
-        let (_, _, _, _, _, _, outbox_state, _, _, _, _, last_error) =
-            load_outbox_row(&conn, operation_id);
-        assert_eq!(outbox_state, "settled");
-        assert!(last_error.is_none());
-        count_table(&conn, "events")
-    };
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let uncertain_retry = store
-        .record_outcome(uncertain)
-        .expect("exact earlier uncertain after resolution");
-    assert_eq!(uncertain_retry, settled);
-    drop(store);
-    let conn = open_raw(&path);
-    assert_eq!(count_table(&conn, "events"), events_after);
-    drop(conn);
-
-    // Separate close op for Uncertain -> Failed.
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .execute(command_envelope(
-            command_id(0xA5),
-            Some(task),
-            Some(3),
-            Command::ReopenTask,
-        ))
-        .expect("reopen");
-    let (op2, _) = accept_begin_close(&mut store, task, command_id(0xA6), 4);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted2 = accepted_at_ms(&conn, op2);
-    drop(conn);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .record_outcome(
-            OperationOutcome::new(
-                op2,
-                accepted2 + 1,
-                Some(2),
-                None,
-                OutcomeSource::Dispatch,
-                OperationOutcomeKind::Uncertain {
-                    code: OperationUncertaintyCode::AmbiguousDispatch,
-                },
-            )
-            .unwrap(),
-        )
-        .expect("uncertain2");
-    let failed = store
-        .record_outcome(
-            OperationOutcome::new(
-                op2,
-                accepted2 + 2,
-                Some(2),
-                None,
-                OutcomeSource::verified_reconciliation(0, "provider:fail").unwrap(),
-                OperationOutcomeKind::Failed {
-                    code: OperationErrorCode::SideEffectFailed,
-                },
-            )
-            .unwrap(),
-        )
-        .expect("uncertain -> failed");
-    assert_eq!(
-        failed,
-        OperationState::Failed {
-            settled_at_ms: accepted2 + 2,
-            code: OperationErrorCode::SideEffectFailed,
-        }
+        ),
+        Err(StoreError::ConflictingOutcome)
     );
-    drop(store);
-    let conn = open_raw(&path);
-    let (_, _, _, _, _, _, outbox_state, _, _, _, _, last_error) = load_outbox_row(&conn, op2);
-    assert_eq!(outbox_state, "failed");
-    assert_eq!(last_error.as_deref(), Some("side_effect_failed"));
-    let failed_payload: Vec<u8> = conn
-        .query_row(
-            "SELECT payload FROM events WHERE event_type = 'operation.failed'
-             ORDER BY sequence DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let failed_fact: OperationFailedFact = rmp_serde::from_slice(&failed_payload).unwrap();
-    assert!(matches!(
-        failed_fact.source,
-        OutcomeSource::VerifiedReconciliation { .. }
-    ));
 }
 
 #[test]
 fn command_outcome_duplicate_command_after_every_outcome_returns_original_receipt() {
-    for (label, make_outcome) in [
-        (
-            "settled",
-            Box::new(|op, ms| settle_close_outcome(op, ms + 1i64, 1, event_id(0xB1)))
-                as Box<dyn Fn(OperationId, i64) -> OperationOutcome>,
-        ),
+    for (label, completion) in [
+        ("settled", DispatchCompletion::Settled),
         (
             "failed",
-            Box::new(|op, ms| {
-                OperationOutcome::new(
-                    op,
-                    ms + 1i64,
-                    Some(1),
-                    None,
-                    OutcomeSource::Dispatch,
-                    OperationOutcomeKind::Failed {
-                        code: OperationErrorCode::SideEffectFailed,
-                    },
-                )
-                .unwrap()
-            }),
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+            },
         ),
         (
             "cancelled",
-            Box::new(|op, ms| {
-                OperationOutcome::new(
-                    op,
-                    ms + 1i64,
-                    Some(1),
-                    None,
-                    OutcomeSource::Dispatch,
-                    OperationOutcomeKind::Cancelled {
-                        reason: CancellationReason::Superseded,
-                    },
-                )
-                .unwrap()
-            }),
-        ),
-        (
-            "uncertain",
-            Box::new(|op, ms| {
-                OperationOutcome::new(
-                    op,
-                    ms + 1i64,
-                    Some(1),
-                    None,
-                    OutcomeSource::Dispatch,
-                    OperationOutcomeKind::Uncertain {
-                        code: OperationUncertaintyCode::AmbiguousDispatch,
-                    },
-                )
-                .unwrap()
-            }),
+            DispatchCompletion::Cancelled {
+                reason: CancellationReason::Superseded,
+            },
         ),
     ] {
         let dir = TempDir::new().expect("tempdir");
@@ -5957,19 +4640,23 @@ fn command_outcome_duplicate_command_after_every_outcome_returns_original_receip
         let close_cmd = command_id(0xB4);
         let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
         let first = store.execute(envelope.clone()).expect("accept");
-        let CommandReceipt::Accepted { operation_id, .. } = first.clone() else {
+        let CommandReceipt::Accepted { .. } = first.clone() else {
             panic!("accepted");
         };
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let original_blob = receipt_blob(&conn, close_cmd);
         drop(conn);
 
         let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .record_outcome(make_outcome(operation_id, accepted_ms))
-            .expect(label);
+        complete_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+            completion,
+        );
         let retry = store.execute(envelope).expect("dup command");
         assert_eq!(retry, first, "{label}");
         drop(store);
@@ -6031,18 +4718,15 @@ fn command_outcome_duplicate_command_after_every_outcome_returns_original_receip
             panic!("accepted");
         };
         drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0xB8),
-            ))
-            .expect("settle");
+        complete_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+            DispatchCompletion::Settled,
+        );
         drop(store);
         {
             let conn = open_raw(&path);
@@ -6066,7 +4750,7 @@ fn command_outcome_duplicate_command_after_every_outcome_returns_original_receip
 }
 
 #[test]
-fn command_outcome_result_id_errors_and_trigger_roll_back_atomically() {
+fn command_completion_trigger_abort_rolls_back_atomically() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
@@ -6074,10 +4758,16 @@ fn command_outcome_result_id_errors_and_trigger_roll_back_atomically() {
     create_open_task(&mut store, task, command_id(0xC1));
     let close_cmd = command_id(0xC2);
     let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
     let snap = (
         count_table(&conn, "events"),
         operation_projection(&conn, operation_id),
@@ -6096,87 +4786,7 @@ fn command_outcome_result_id_errors_and_trigger_roll_back_atomically() {
             (lifecycle, revision)
         },
     );
-    // Reuse an already-persisted event id as "used".
-    let used_id = event_id(0xC3);
-    // Grab an existing event id from the log.
-    let existing_id: Vec<u8> = conn
-        .query_row(
-            "SELECT event_id FROM events ORDER BY sequence ASC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let used = EventId::from_bytes(existing_id.try_into().unwrap()).unwrap();
     drop(conn);
-
-    let wrong_count = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 1,
-        Some(1),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![event_id(0xC4), event_id(0xC5)],
-        },
-    )
-    .unwrap();
-    let empty = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 1,
-        Some(1),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![],
-        },
-    )
-    .unwrap();
-    let dup_ids = OperationOutcome::new(
-        operation_id,
-        accepted_ms + 1,
-        Some(1),
-        None,
-        OutcomeSource::Dispatch,
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![event_id(0xC6), event_id(0xC6)],
-        },
-    )
-    .unwrap();
-    let used_ids = settle_close_outcome(operation_id, accepted_ms + 1, 1, used);
-
-    for (label, outcome) in [
-        ("wrong count", wrong_count),
-        ("empty", empty),
-        ("duplicate ids", dup_ids),
-        ("used id", used_ids),
-    ] {
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .record_outcome(outcome)
-            .expect_err(&format!("{label} must fail"));
-        assert!(
-            matches!(
-                err,
-                StoreError::ConflictingOutcome | StoreError::ConstraintViolation
-            ),
-            "{label}: {err:?}"
-        );
-        drop(store);
-        let conn = open_raw(&path);
-        assert_eq!(count_table(&conn, "events"), snap.0, "{label}");
-        assert_eq!(operation_projection(&conn, operation_id), snap.1, "{label}");
-        let (_, _, _, _, _, _, state, _, _, _, _, err_class) = load_outbox_row(&conn, operation_id);
-        assert_eq!((state, err_class), snap.2, "{label}");
-        let (lifecycle, revision): (String, i64) = conn
-            .query_row(
-                "SELECT lifecycle, revision FROM tasks WHERE task_id = ?1",
-                [task.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((lifecycle, revision), snap.3, "{label}");
-        let _ = used_id;
-    }
 
     // Trigger abort during outcome append rolls everything back.
     {
@@ -6193,12 +4803,7 @@ fn command_outcome_result_id_errors_and_trigger_roll_back_atomically() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 1,
-            1,
-            event_id(0xC7),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("trigger abort");
     assert!(
         matches!(
@@ -6297,10 +4902,16 @@ fn command_outcome_corrupt_lineage_before_new_transition_writes_nothing() {
         create_open_task(&mut store, task, command_id(0x32));
         let close_cmd = command_id(0x33);
         let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
 
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         let op_before = operation_projection(&conn, operation_id);
         let outbox_before = {
@@ -6312,17 +4923,13 @@ fn command_outcome_corrupt_lineage_before_new_transition_writes_nothing() {
 
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x34),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err(&format!("{label} must fail closed"));
         assert!(
             matches!(
                 err,
-                StoreError::Corruption
+                StoreError::StaleClaim
+                    | StoreError::Corruption
                     | StoreError::CodecMismatch { .. }
                     | StoreError::EventDecode(_)
                     | StoreError::Projection(_)
@@ -6350,24 +4957,7 @@ fn command_outcome_corrupt_lineage_before_new_transition_writes_nothing() {
 
 #[test]
 fn command_outcome_exact_retry_rejects_tampered_durable_state() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    let mut store = KernelStore::open(&path).expect("open");
-    let task = task_id(0x35);
-    create_open_task(&mut store, task, command_id(0x36));
-    let close_cmd = command_id(0x37);
-    let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-    drop(store);
-
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let result_id = event_id(0x38);
-    let outcome = settle_close_outcome(operation_id, accepted_ms + 3, 1, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let first = store.record_outcome(outcome.clone()).expect("settle");
-    drop(store);
+    let completion = DispatchCompletion::Settled;
 
     let tampers: &[(&str, fn(&Connection, OperationId))] = &[
         ("tampered operation projection state", |conn, op| {
@@ -6421,13 +5011,16 @@ fn command_outcome_exact_retry_rejects_tampered_durable_state() {
         create_open_task(&mut store, task, command_id(0x36));
         let close_cmd = command_id(0x37);
         let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 3, 1, result_id);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
+        store
+            .record_dispatch_completion(&permit, completion.clone())
+            .expect("settle");
         drop(store);
         {
             let conn = open_raw(&path);
@@ -6435,7 +5028,7 @@ fn command_outcome_exact_retry_rejects_tampered_durable_state() {
         }
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, completion.clone())
             .expect_err(&format!("{label} exact retry must fail"));
         assert!(
             matches!(
@@ -6447,7 +5040,6 @@ fn command_outcome_exact_retry_rejects_tampered_durable_state() {
             ),
             "{label}: {err:?}"
         );
-        let _ = first;
     }
 }
 
@@ -6489,6 +5081,14 @@ fn command_outcome_interleaved_task_events_do_not_break_settle_or_retries() {
             }),
         ))
         .expect("rename while pending");
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 5),
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
@@ -6497,22 +5097,25 @@ fn command_outcome_interleaved_task_events_do_not_break_settle_or_retries() {
     assert!(events_mid > 5, "rename must append while release pending");
     drop(conn);
 
-    let result_id = event_id(0x46);
-    let outcome = settle_release_outcome(operation_id, accepted_ms + 2, 0, resource, 5, result_id);
+    let completion = DispatchCompletion::Settled;
     let mut store = KernelStore::open(&path).expect("reopen");
     let settled = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, completion.clone())
         .expect("settle release");
-    assert_eq!(
-        settled,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 2,
-            result_event_ids: vec![result_id],
-        }
-    );
+    let OperationState::Settled {
+        settled_at_ms,
+        result_event_ids,
+    } = &settled
+    else {
+        panic!("settled release");
+    };
+    assert!(*settled_at_ms >= accepted_ms);
+    assert_eq!(result_event_ids.len(), 1);
 
     // Exact duplicate outcome after interleaving remains valid.
-    let dup = store.record_outcome(outcome.clone()).expect("dup outcome");
+    let dup = store
+        .record_dispatch_completion(&permit, completion.clone())
+        .expect("dup outcome");
     assert_eq!(dup, settled);
 
     // Duplicate command remains valid.
@@ -6554,7 +5157,7 @@ fn command_outcome_interleaved_task_events_do_not_break_settle_or_retries() {
         ))
         .expect("rename after settle");
     let after = store
-        .record_outcome(outcome)
+        .record_dispatch_completion(&permit, completion)
         .expect("dup after later events");
     assert_eq!(after, settled);
     let retry2 = store
@@ -6574,50 +5177,18 @@ fn command_outcome_interleaved_task_events_do_not_break_settle_or_retries() {
 fn command_outcome_reconciliation_wire_tampers_fail_closed() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
-    let mut store = KernelStore::open(&path).expect("open");
     let task = task_id(0x51);
-    create_open_task(&mut store, task, command_id(0x52));
-    let close_cmd = command_id(0x53);
-    let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-    drop(store);
-
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .record_outcome(
-            OperationOutcome::new(
-                operation_id,
-                accepted_ms + 1,
-                Some(1),
-                None,
-                OutcomeSource::Dispatch,
-                OperationOutcomeKind::Uncertain {
-                    code: OperationUncertaintyCode::AmbiguousDispatch,
-                },
-            )
-            .unwrap(),
-        )
-        .expect("uncertain");
-    let result_id = event_id(0x54);
-    store
-        .record_outcome(
-            OperationOutcome::new(
-                operation_id,
-                accepted_ms + 2,
-                Some(1),
-                None,
-                OutcomeSource::verified_reconciliation(0, "provider:wire").unwrap(),
-                OperationOutcomeKind::Settled {
-                    result_event_ids: vec![result_id],
-                },
-            )
-            .unwrap(),
-        )
-        .expect("reconcile settle");
-    drop(store);
+    let resource = resource_id(0x54);
+    let release_cmd = command_id(0x53);
+    seed_reconciled_release(
+        &path,
+        task,
+        resource,
+        command_id(0x52),
+        release_cmd,
+        4,
+        "provider:wire",
+    );
 
     // Wrong terminal command_id (valid wire).
     {
@@ -6642,10 +5213,12 @@ fn command_outcome_reconciliation_wire_tampers_fail_closed() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
         .execute(command_envelope(
-            close_cmd,
+            release_cmd,
             Some(task),
-            Some(1),
-            Command::BeginCloseTask,
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource,
+            },
         ))
         .expect_err("wrong terminal command_id");
     assert!(
@@ -6724,47 +5297,18 @@ fn command_outcome_reconciliation_wire_tampers_fail_closed() {
     ] {
         let dir = TempDir::new().expect("tempdir");
         let path = temp_db_path(&dir);
-        let mut store = KernelStore::open(&path).expect("open");
         let task = task_id(0x51);
-        create_open_task(&mut store, task, command_id(0x52));
-        let close_cmd = command_id(0x53);
-        let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .record_outcome(
-                OperationOutcome::new(
-                    operation_id,
-                    accepted_ms + 1,
-                    Some(1),
-                    None,
-                    OutcomeSource::Dispatch,
-                    OperationOutcomeKind::Uncertain {
-                        code: OperationUncertaintyCode::AmbiguousDispatch,
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        store
-            .record_outcome(
-                OperationOutcome::new(
-                    operation_id,
-                    accepted_ms + 2,
-                    Some(1),
-                    None,
-                    OutcomeSource::verified_reconciliation(0, "provider:wire").unwrap(),
-                    OperationOutcomeKind::Settled {
-                        result_event_ids: vec![event_id(0x54)],
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        drop(store);
+        let resource = resource_id(0x54);
+        let release_cmd = command_id(0x53);
+        seed_reconciled_release(
+            &path,
+            task,
+            resource,
+            command_id(0x52),
+            release_cmd,
+            4,
+            "provider:wire",
+        );
         {
             let conn = open_raw(&path);
             tamper(&conn);
@@ -6772,10 +5316,12 @@ fn command_outcome_reconciliation_wire_tampers_fail_closed() {
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
             .execute(command_envelope(
-                close_cmd,
+                release_cmd,
                 Some(task),
-                Some(1),
-                Command::BeginCloseTask,
+                Some(2),
+                Command::ReleaseResource {
+                    resource_id: resource,
+                },
             ))
             .expect_err(label);
         assert!(
@@ -6811,14 +5357,14 @@ fn command_outcome_terminal_outbox_dispatch_metadata_rules() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 10,
-            1,
-            event_id(0x64),
-        ))
-        .expect("settle");
+    complete_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+        DispatchCompletion::Settled,
+    );
     drop(store);
 
     // Positive: simulated completed dispatch metadata is tolerated.
@@ -6830,11 +5376,7 @@ fn command_outcome_terminal_outbox_dispatch_metadata_rules() {
                  available_at_ms = ?1,
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
-            rusqlite::params![
-                accepted_ms + 1,
-                accepted_ms + 2,
-                operation_id.as_bytes().as_slice()
-            ],
+            rusqlite::params![accepted_ms, accepted_ms, operation_id.as_bytes().as_slice()],
         )
         .unwrap();
     }
@@ -6881,14 +5423,14 @@ fn command_outcome_terminal_outbox_dispatch_metadata_rules() {
         let accepted_ms = accepted_at_ms(&conn, operation_id);
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 10,
-                1,
-                event_id(0x64),
-            ))
-            .unwrap();
+        complete_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+            DispatchCompletion::Settled,
+        );
         drop(store);
         {
             let conn = open_raw(&path);
@@ -6983,10 +5525,16 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let close_cmd = command_id(0x74);
     let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 2);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
     let events_before = count_table(&conn, "events");
     // Resource remains Active while task is Closing.
     let lifecycle: String = conn
@@ -7001,12 +5549,7 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
 
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 1,
-            1,
-            event_id(0x75),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("live resource must block archive");
     assert_eq!(err, StoreError::StaleFence);
     drop(store);
@@ -7023,15 +5566,17 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
     let task = task_id(0x76);
     create_open_task(&mut store, task, command_id(0x77));
     let close_cmd = command_id(0x78);
-    let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-    let result_id = event_id(0x79);
-    let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.record_outcome(outcome.clone()).expect("settle");
+    let (_operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
+    store
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+        .expect("settle");
     drop(store);
 
     {
@@ -7044,7 +5589,7 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("task projection must remain archived");
     assert!(
         matches!(err, StoreError::Corruption | StoreError::Projection(_)),
@@ -7062,23 +5607,18 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
     let resource = resource_id(0x7C);
     seed_active_resource(&path, task, resource, 4);
     let mut store = KernelStore::open(&path).expect("reopen");
-    let (operation_id, _) =
+    let (_operation_id, _) =
         accept_release_resource(&mut store, task, command_id(0x7D), resource, 2);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-    let outcome = settle_release_outcome(
-        operation_id,
-        accepted_ms + 1,
-        0,
-        resource,
-        4,
-        event_id(0x7E),
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 4),
+        },
     );
-    let mut store = KernelStore::open(&path).expect("reopen");
     store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect("settle release");
     drop(store);
     {
@@ -7091,7 +5631,7 @@ fn command_outcome_close_refuses_live_resources_and_projection_tampers_fail() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome)
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("resource projection must remain released");
     assert!(
         matches!(err, StoreError::Corruption | StoreError::Projection(_)),
@@ -7134,11 +5674,6 @@ fn backdate_terminal_history(
             fact.settled_at_ms = backdated_ms;
             rmp_serde::to_vec(&fact).unwrap()
         }
-        "operation.uncertain" => {
-            let mut fact: OperationUncertainFact = rmp_serde::from_slice(&payload).unwrap();
-            fact.observed_at_ms = backdated_ms;
-            rmp_serde::to_vec(&fact).unwrap()
-        }
         other => panic!("unexpected event type {other}"),
     };
     conn.execute(
@@ -7155,34 +5690,21 @@ fn backdate_terminal_history(
 
 #[test]
 fn command_outcome_terminal_chronology_rejects_backdated_terminals() {
-    for (label, kind, event_type) in [
-        (
-            "settled",
-            OperationOutcomeKind::Settled {
-                result_event_ids: vec![event_id(0x81)],
-            },
-            "operation.settled",
-        ),
+    for (label, completion, event_type) in [
+        ("settled", DispatchCompletion::Settled, "operation.settled"),
         (
             "failed",
-            OperationOutcomeKind::Failed {
+            DispatchCompletion::Failed {
                 code: OperationErrorCode::SideEffectFailed,
             },
             "operation.failed",
         ),
         (
             "cancelled",
-            OperationOutcomeKind::Cancelled {
+            DispatchCompletion::Cancelled {
                 reason: CancellationReason::Superseded,
             },
             "operation.cancelled",
-        ),
-        (
-            "uncertain",
-            OperationOutcomeKind::Uncertain {
-                code: OperationUncertaintyCode::AmbiguousDispatch,
-            },
-            "operation.uncertain",
         ),
     ] {
         let dir = TempDir::new().expect("tempdir");
@@ -7196,28 +5718,23 @@ fn command_outcome_terminal_chronology_rejects_backdated_terminals() {
         let CommandReceipt::Accepted { operation_id, .. } = first.clone() else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
 
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, operation_id);
         drop(conn);
 
-        let outcome = match &kind {
-            OperationOutcomeKind::Settled { result_event_ids } => {
-                settle_close_outcome(operation_id, accepted_ms + 5, 1, result_event_ids[0])
-            }
-            other => OperationOutcome::new(
-                operation_id,
-                accepted_ms + 5,
-                Some(1),
-                None,
-                OutcomeSource::Dispatch,
-                other.clone(),
-            )
-            .unwrap(),
-        };
         let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect(label);
+        store
+            .record_dispatch_completion(&permit, completion.clone())
+            .expect(label);
         drop(store);
 
         {
@@ -7234,7 +5751,7 @@ fn command_outcome_terminal_chronology_rejects_backdated_terminals() {
             "{label} command: {err_cmd:?}"
         );
         let err_out = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, completion)
             .expect_err(&format!("{label} dup outcome"));
         assert!(
             matches!(err_out, StoreError::Corruption),
@@ -7263,14 +5780,14 @@ fn command_outcome_dispatch_available_must_not_follow_started() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 20,
-            1,
-            event_id(0x87),
-        ))
-        .expect("settle");
+    complete_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+        DispatchCompletion::Settled,
+    );
     drop(store);
 
     // Positive: accepted <= available <= started <= outcome
@@ -7282,11 +5799,7 @@ fn command_outcome_dispatch_available_must_not_follow_started() {
                  available_at_ms = ?1,
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
-            rusqlite::params![
-                accepted_ms + 2,
-                accepted_ms + 5,
-                operation_id.as_bytes().as_slice()
-            ],
+            rusqlite::params![accepted_ms, accepted_ms, operation_id.as_bytes().as_slice()],
         )
         .unwrap();
     }
@@ -7307,8 +5820,8 @@ fn command_outcome_dispatch_available_must_not_follow_started() {
                  dispatch_started_at_ms = ?2
              WHERE operation_id = ?3",
             rusqlite::params![
-                accepted_ms + 9,
-                accepted_ms + 5,
+                accepted_ms + 1,
+                accepted_ms,
                 operation_id.as_bytes().as_slice()
             ],
         )
@@ -7331,19 +5844,19 @@ fn command_outcome_settled_projection_lineage_matches_durable_lifecycle_chain() 
     let close_cmd = command_id(0x8A);
     let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
     let first = store.execute(envelope.clone()).expect("accept close");
-    let CommandReceipt::Accepted { operation_id, .. } = first.clone() else {
+    let CommandReceipt::Accepted { .. } = first.clone() else {
         panic!("accepted");
     };
-    drop(store);
-
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let result_id = event_id(0x8B);
-    let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.record_outcome(outcome.clone()).expect("archive");
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
+    let settled = store
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+        .expect("archive");
 
     // Legitimate archive -> reopen advances revision and lifecycle via durable facts.
     store
@@ -7355,15 +5868,9 @@ fn command_outcome_settled_projection_lineage_matches_durable_lifecycle_chain() 
         ))
         .expect("reopen");
     let after_reopen = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect("exact retry after reopen");
-    assert_eq!(
-        after_reopen,
-        OperationState::Settled {
-            settled_at_ms: accepted_ms + 1,
-            result_event_ids: vec![result_id],
-        }
-    );
+    assert_eq!(after_reopen, settled);
     let retry = store
         .execute(envelope.clone())
         .expect("dup command after reopen");
@@ -7381,7 +5888,7 @@ fn command_outcome_settled_projection_lineage_matches_durable_lifecycle_chain() 
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("lifecycle tamper");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
@@ -7397,7 +5904,7 @@ fn command_outcome_settled_projection_lineage_matches_durable_lifecycle_chain() 
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("action_epoch tamper");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
@@ -7413,7 +5920,7 @@ fn command_outcome_settled_projection_lineage_matches_durable_lifecycle_chain() 
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome)
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("revision ahead of durable max");
     assert_eq!(err, StoreError::Corruption);
     let err_cmd = store
@@ -7431,41 +5938,27 @@ fn command_outcome_preserves_pre_transition_dispatch_metadata() {
     create_open_task(&mut store, task, command_id(0x92));
     let close_cmd = command_id(0x93);
     let (operation_id, _) = accept_begin_close(&mut store, task, close_cmd, 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    let available = accepted_ms + 3;
-    let started = accepted_ms + 5;
-    let lease = accepted_ms + 50;
-    conn.execute(
-        "UPDATE outbox
-         SET available_at_ms = ?1,
-             dispatch_started_at_ms = ?2,
-             attempts = 2,
-             leased_until_ms = ?3
-         WHERE operation_id = ?4",
-        rusqlite::params![
-            available,
-            started,
-            lease,
-            operation_id.as_bytes().as_slice()
-        ],
-    )
-    .unwrap();
     let before = load_outbox_row(&conn, operation_id);
+    assert_eq!(before.6, "dispatching");
+    assert!(before.8.is_some());
+    assert!(before.9.is_some());
+    assert_eq!(before.10, 1);
     drop(conn);
 
-    let result_id = event_id(0x94);
     let mut store = KernelStore::open(&path).expect("reopen");
     store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            started + 2,
-            1,
-            result_id,
-        ))
-        .expect("settle claimed pending row");
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+        .expect("settle started dispatch");
     drop(store);
 
     let conn = open_raw(&path);
@@ -7476,9 +5969,9 @@ fn command_outcome_preserves_pre_transition_dispatch_metadata() {
     assert_eq!(after.3, before.3, "destination_class");
     assert_eq!(after.4, before.4, "replay_policy");
     assert_eq!(after.5, before.5, "payload");
-    assert_eq!(after.7, available, "available_at preserved");
-    assert_eq!(after.9, Some(started), "dispatch_started preserved");
-    assert_eq!(after.10, 2, "attempts preserved");
+    assert_eq!(after.7, before.7, "available_at preserved");
+    assert_eq!(after.9, before.9, "dispatch_started preserved");
+    assert_eq!(after.10, before.10, "attempts preserved");
     assert_eq!(after.8, None, "lease cleared");
     assert_eq!(after.6, "settled");
     assert_eq!(after.11, None);
@@ -7494,9 +5987,15 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
         let task = task_id(0x95);
         create_open_task(&mut store, task, command_id(0x96));
         let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x97), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         let durable_max: i64 = conn
             .query_row(
@@ -7513,12 +6012,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x98),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("projection revision ahead");
         assert_eq!(err, StoreError::Corruption);
         drop(store);
@@ -7535,10 +6029,16 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
         let mut store = KernelStore::open(&path).expect("open");
         let task = task_id(0x99);
         create_open_task(&mut store, task, command_id(0x9A));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x9B), 1);
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0x9B), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         conn.execute(
             "UPDATE tasks SET revision = 1 WHERE task_id = ?1",
@@ -7548,12 +6048,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x9C),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("projection revision behind");
         assert_eq!(err, StoreError::Corruption);
         drop(store);
@@ -7570,17 +6065,19 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
     let close_cmd = command_id(0x9F);
     let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
     let first = store.execute(envelope.clone()).expect("accept");
-    let CommandReceipt::Accepted { operation_id, .. } = first.clone() else {
+    let CommandReceipt::Accepted { .. } = first.clone() else {
         panic!("accepted");
     };
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-    let result_id = event_id(0xA0);
-    let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.record_outcome(outcome.clone()).expect("settle");
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
+    store
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+        .expect("settle");
     store
         .execute(command_envelope(
             command_id(0xA5),
@@ -7590,7 +6087,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
         ))
         .expect("reopen");
     store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect("exact retry after valid reopen");
     drop(store);
 
@@ -7611,7 +6108,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("revision gap");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
@@ -7640,7 +6137,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("revision duplicate");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
@@ -7678,7 +6175,7 @@ fn command_outcome_task_history_validator_projection_and_lineage() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("illegal reopen->archived swap");
     assert_eq!(err, StoreError::Corruption);
     let err_cmd = store
@@ -7702,6 +6199,13 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         let CommandReceipt::Accepted { operation_id, .. } = first else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -7717,12 +6221,7 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0xB3),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("accepted envelope timestamp");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -7738,30 +6237,33 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         let mut store = KernelStore::open(&path).expect("open");
         let task = task_id(0xB4);
         create_open_task(&mut store, task, command_id(0xB5));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xB6), 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, event_id(0xB7));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0xB6), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
+        store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle");
         drop(store);
         {
             let conn = open_raw(&path);
             conn.execute(
-                "UPDATE events SET occurred_at_ms = ?1
+                "UPDATE events SET occurred_at_ms = occurred_at_ms + 1
                  WHERE event_type = 'operation.settled'
                    AND sequence = (
                      SELECT MAX(sequence) FROM events WHERE event_type = 'operation.settled'
                    )",
-                [accepted_ms + 50],
+                [],
             )
             .unwrap();
         }
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("terminal envelope timestamp");
         assert_eq!(err, StoreError::Corruption);
     }
@@ -7773,14 +6275,17 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         let mut store = KernelStore::open(&path).expect("open");
         let task = task_id(0xB8);
         create_open_task(&mut store, task, command_id(0xB9));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xBA), 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, event_id(0xBB));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0xBA), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
+        store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle");
         drop(store);
         {
             let conn = open_raw(&path);
@@ -7796,7 +6301,7 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         }
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("terminal task_revision must be null");
         assert_eq!(err, StoreError::Corruption);
     }
@@ -7810,14 +6315,17 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         let other = task_id(0xBD);
         create_open_task(&mut store, task, command_id(0xBE));
         create_open_task(&mut store, other, command_id(0xBF));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xC8), 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, event_id(0xC9));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0xC8), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
+        store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle");
         drop(store);
         {
             let conn = open_raw(&path);
@@ -7848,7 +6356,7 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         }
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("extra terminal under other task");
         assert_eq!(err, StoreError::Corruption);
     }
@@ -7860,10 +6368,16 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         let mut store = KernelStore::open(&path).expect("open");
         let task = task_id(0xCB);
         create_open_task(&mut store, task, command_id(0xCC));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xCD), 1);
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0xCD), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let accepted_seq: i64 = conn
             .query_row(
                 "SELECT sequence FROM events WHERE event_type = 'operation.accepted'
@@ -7873,9 +6387,10 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
             )
             .unwrap();
         drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, event_id(0xCE));
         let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle");
         drop(store);
         {
             let conn = open_raw(&path);
@@ -7946,7 +6461,7 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
         }
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("pre-acceptance terminal fact");
         assert_eq!(err, StoreError::Corruption);
     }
@@ -7954,10 +6469,10 @@ fn command_outcome_envelope_and_complete_terminal_history_correlation() {
 
 #[test]
 fn command_outcome_live_resources_only_block_settled_archive() {
-    for (label, kind, task_tail, live_tail, cmd_tail) in [
+    for (label, completion, task_tail, live_tail, cmd_tail) in [
         (
             "failed",
-            OperationOutcomeKind::Failed {
+            DispatchCompletion::Failed {
                 code: OperationErrorCode::SideEffectFailed,
             },
             0xD0u8,
@@ -7966,21 +6481,12 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         ),
         (
             "cancelled",
-            OperationOutcomeKind::Cancelled {
+            DispatchCompletion::Cancelled {
                 reason: CancellationReason::Superseded,
             },
             0xD1,
             0x13,
             0x14,
-        ),
-        (
-            "uncertain",
-            OperationOutcomeKind::Uncertain {
-                code: OperationUncertaintyCode::AmbiguousDispatch,
-            },
-            0xD2,
-            0x15,
-            0x16,
         ),
     ] {
         let dir = TempDir::new().expect("tempdir");
@@ -7992,72 +6498,17 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         let live = resource_id(live_tail);
         seed_active_resource(&path, task, live, 1);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(cmd_tail), 2);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = OperationOutcome::new(
-            operation_id,
-            accepted_ms + 1,
-            Some(1),
-            None,
-            OutcomeSource::Dispatch,
-            kind,
-        )
-        .unwrap();
-        let mut store = KernelStore::open(&path).expect("reopen");
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(cmd_tail), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, completion)
             .unwrap_or_else(|e| panic!("{label} with live resource must succeed: {e:?}"));
-    }
-
-    // Verified reconciliation Failed with live resources.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        let mut store = KernelStore::open(&path).expect("open");
-        let task = task_id(0xD4);
-        create_open_task(&mut store, task, command_id(0xD5));
-        drop(store);
-        seed_active_resource(&path, task, resource_id(0xD6), 2);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xD7), 2);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .record_outcome(
-                OperationOutcome::new(
-                    operation_id,
-                    accepted_ms + 1,
-                    Some(1),
-                    None,
-                    OutcomeSource::Dispatch,
-                    OperationOutcomeKind::Uncertain {
-                        code: OperationUncertaintyCode::AmbiguousDispatch,
-                    },
-                )
-                .unwrap(),
-            )
-            .expect("uncertain");
-        store
-            .record_outcome(
-                OperationOutcome::new(
-                    operation_id,
-                    accepted_ms + 2,
-                    Some(1),
-                    None,
-                    OutcomeSource::verified_reconciliation(0, "provider:fail").unwrap(),
-                    OperationOutcomeKind::Failed {
-                        code: OperationErrorCode::SideEffectFailed,
-                    },
-                )
-                .unwrap(),
-            )
-            .expect("reconcile failed with live resource");
     }
 
     // Settled close still blocked by live Active resource.
@@ -8070,20 +6521,21 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         drop(store);
         seed_active_resource(&path, task, resource_id(0xDA), 1);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xDB), 2);
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0xDB), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0xDC),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("settled archive blocked");
         assert_eq!(err, StoreError::StaleFence);
         drop(store);
@@ -8103,9 +6555,15 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         seed_active_resource(&path, task, bad, 1);
         let mut store = KernelStore::open(&path).expect("reopen");
         let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xE0), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         conn.execute(
             "UPDATE resources SET lifecycle = 'bogus' WHERE resource_id = ?1",
             [bad.as_bytes().as_slice()],
@@ -8116,12 +6574,7 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0xE1),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("invalid lifecycle");
         assert_eq!(err, StoreError::Corruption);
         drop(store);
@@ -8129,100 +6582,6 @@ fn command_outcome_live_resources_only_block_settled_archive() {
         assert_eq!(count_table(&conn, "events"), events_before);
         assert_eq!(operation_projection(&conn, operation_id), op_before);
     }
-}
-
-#[test]
-fn command_outcome_reconciled_dispatch_started_before_uncertain() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    let mut store = KernelStore::open(&path).expect("open");
-    let task = task_id(0xE2);
-    create_open_task(&mut store, task, command_id(0xE3));
-    let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xE8), 1);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let uncertain_at = accepted_ms + 4;
-    store
-        .record_outcome(
-            OperationOutcome::new(
-                operation_id,
-                uncertain_at,
-                Some(1),
-                None,
-                OutcomeSource::Dispatch,
-                OperationOutcomeKind::Uncertain {
-                    code: OperationUncertaintyCode::AmbiguousDispatch,
-                },
-            )
-            .unwrap(),
-        )
-        .expect("uncertain");
-    let final_at = uncertain_at + 10;
-    let settle = OperationOutcome::new(
-        operation_id,
-        final_at,
-        Some(1),
-        None,
-        OutcomeSource::verified_reconciliation(0, "provider:ok").unwrap(),
-        OperationOutcomeKind::Settled {
-            result_event_ids: vec![event_id(0xE9)],
-        },
-    )
-    .unwrap();
-    store
-        .record_outcome(settle.clone())
-        .expect("reconcile settle");
-    drop(store);
-
-    // Valid nonzero-attempt reconciled case: accepted <= available <= started <= uncertain.
-    {
-        let conn = open_raw(&path);
-        conn.execute(
-            "UPDATE outbox
-             SET attempts = 2,
-                 available_at_ms = ?1,
-                 dispatch_started_at_ms = ?2
-             WHERE operation_id = ?3",
-            rusqlite::params![
-                accepted_ms + 1,
-                accepted_ms + 2,
-                operation_id.as_bytes().as_slice()
-            ],
-        )
-        .unwrap();
-    }
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .record_outcome(settle.clone())
-        .expect("valid reconciled dispatch timing");
-    drop(store);
-
-    // Tamper: accepted <= available <= uncertain < started <= final.
-    {
-        let conn = open_raw(&path);
-        conn.execute(
-            "UPDATE outbox
-             SET attempts = 2,
-                 available_at_ms = ?1,
-                 dispatch_started_at_ms = ?2
-             WHERE operation_id = ?3",
-            rusqlite::params![
-                accepted_ms + 1,
-                uncertain_at + 1,
-                operation_id.as_bytes().as_slice()
-            ],
-        )
-        .unwrap();
-    }
-    let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .record_outcome(settle)
-        .expect_err("started after uncertain must fail");
-    assert_eq!(err, StoreError::Corruption);
 }
 
 #[test]
@@ -8238,16 +6597,16 @@ fn command_outcome_release_projection_updated_at_matches_result() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let (operation_id, _) =
         accept_release_resource(&mut store, task, command_id(0xED), resource, 2);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    drop(conn);
-    let result_id = event_id(0xEE);
-    let occurred = accepted_ms + 3;
-    let outcome = settle_release_outcome(operation_id, occurred, 0, resource, 6, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 6),
+        },
+    );
     store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect("settle release");
     drop(store);
     let conn = open_raw(&path);
@@ -8255,6 +6614,13 @@ fn command_outcome_release_projection_updated_at_matches_result() {
         .query_row(
             "SELECT updated_at_ms FROM resources WHERE resource_id = ?1",
             [resource.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let occurred: i64 = conn
+        .query_row(
+            "SELECT outcome_at_ms FROM operations WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
             |row| row.get(0),
         )
         .unwrap();
@@ -8271,7 +6637,7 @@ fn command_outcome_release_projection_updated_at_matches_result() {
     }
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(outcome)
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("updated_at tamper");
     assert_eq!(err, StoreError::Corruption);
 }
@@ -8284,26 +6650,17 @@ fn command_outcome_outbox_update_abort_rolls_back_completely() {
     let task = task_id(0xEF);
     create_open_task(&mut store, task, command_id(0xF0));
     let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xF7), 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
-    // Simulate pre-transition dispatch metadata that must remain unchanged on rollback.
-    conn.execute(
-        "UPDATE outbox
-         SET available_at_ms = ?1,
-             dispatch_started_at_ms = ?2,
-             attempts = 3,
-             leased_until_ms = ?3
-         WHERE operation_id = ?4",
-        rusqlite::params![
-            accepted_ms + 1,
-            accepted_ms + 2,
-            accepted_ms + 99,
-            operation_id.as_bytes().as_slice()
-        ],
-    )
-    .unwrap();
+    // The real in-flight dispatch metadata must remain unchanged on rollback.
     let event_ids_before: Vec<Vec<u8>> = {
         let mut stmt = conn
             .prepare("SELECT event_id FROM events ORDER BY sequence ASC")
@@ -8364,12 +6721,7 @@ fn command_outcome_outbox_update_abort_rolls_back_completely() {
 
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 5,
-            1,
-            event_id(0xF8),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("outbox update abort");
     assert_eq!(err, StoreError::ConstraintViolation);
     drop(store);
@@ -8437,9 +6789,15 @@ fn command_outcome_task_history_rejects_payload_identity_and_impossible_release(
         let task = task_id(0x01);
         create_open_task(&mut store, task, command_id(0x02));
         let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x03), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         let payload: Vec<u8> = conn
             .query_row(
@@ -8462,12 +6820,7 @@ fn command_outcome_task_history_rejects_payload_identity_and_impossible_release(
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x04),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("mismatched TaskCreated id");
         assert_eq!(err, StoreError::Corruption);
         drop(store);
@@ -8485,6 +6838,13 @@ fn command_outcome_task_history_rejects_payload_identity_and_impossible_release(
         let task = task_id(0x05);
         create_open_task(&mut store, task, command_id(0x06));
         let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x07), 1);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -8512,12 +6872,7 @@ fn command_outcome_task_history_rejects_payload_identity_and_impossible_release(
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x0A),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("orphan ResourceReleased");
         assert_eq!(err, StoreError::Corruption);
         drop(store);
@@ -8529,8 +6884,8 @@ fn command_outcome_task_history_rejects_payload_identity_and_impossible_release(
 }
 
 #[test]
-fn command_outcome_pending_outbox_lease_metadata_rules() {
-    // attempts == 0 forbids a live lease (zero writes on settle).
+fn dispatch_claim_rejects_zero_attempt_live_lease_metadata() {
+    // attempts == 0 forbids a live lease and claiming writes nothing.
     {
         let dir = TempDir::new().expect("tempdir");
         let path = temp_db_path(&dir);
@@ -8544,63 +6899,15 @@ fn command_outcome_pending_outbox_lease_metadata_rules() {
         let events_before = count_table(&conn, "events");
         conn.execute(
             "UPDATE outbox SET leased_until_ms = ?1 WHERE operation_id = ?2",
-            rusqlite::params![accepted_ms + 10, operation_id.as_bytes().as_slice()],
+            rusqlite::params![accepted_ms + 60_000, operation_id.as_bytes().as_slice()],
         )
         .unwrap();
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x0E),
-            ))
-            .expect_err("attempts=0 with lease");
-        assert_eq!(err, StoreError::Corruption);
-        drop(store);
-        let conn = open_raw(&path);
-        assert_eq!(count_table(&conn, "events"), events_before);
-    }
-
-    // attempts > 0 with lease predating dispatch_started fails closed.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        let mut store = KernelStore::open(&path).expect("open");
-        let task = task_id(0x0F);
-        create_open_task(&mut store, task, command_id(0x10));
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x11), 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        let events_before = count_table(&conn, "events");
-        conn.execute(
-            "UPDATE outbox
-             SET attempts = 2,
-                 available_at_ms = ?1,
-                 dispatch_started_at_ms = ?2,
-                 leased_until_ms = ?3
-             WHERE operation_id = ?4",
-            rusqlite::params![
-                accepted_ms + 1,
-                accepted_ms + 3,
-                accepted_ms + 2,
-                operation_id.as_bytes().as_slice()
-            ],
-        )
-        .unwrap();
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 5,
-                1,
-                event_id(0x12),
-            ))
-            .expect_err("lease before started");
-        assert_eq!(err, StoreError::Corruption);
+        assert_eq!(
+            store.claim_next_dispatch(Duration::from_secs(30)),
+            Err(StoreError::Corruption),
+        );
         drop(store);
         let conn = open_raw(&path);
         assert_eq!(count_table(&conn, "events"), events_before);
@@ -8729,10 +7036,16 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         let live = resource_id(0x23);
         seed_active_resource(&path, task, live, 1);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x24), 2);
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0x24), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         conn.execute(
             "DELETE FROM resources WHERE resource_id = ?1",
@@ -8742,12 +7055,7 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x25),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("deleted live resource must not hide archive integrity");
         assert!(
             matches!(err, StoreError::Corruption | StoreError::Projection(_)),
@@ -8769,10 +7077,16 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         let live = resource_id(0x28);
         seed_active_resource(&path, task, live, 2);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x29), 2);
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0x29), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let events_before = count_table(&conn, "events");
         conn.execute(
             "UPDATE resources SET task_id = NULL WHERE resource_id = ?1",
@@ -8782,12 +7096,7 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x2A),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("rescoped live resource");
         assert!(
             matches!(err, StoreError::Corruption | StoreError::Projection(_)),
@@ -8808,19 +7117,16 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         drop(store);
         seed_active_resource(&path, task, resource_id(0x2D), 1);
         let mut store = KernelStore::open(&path).expect("reopen");
-        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x2E), 2);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
+        let (_operation_id, _) = accept_begin_close(&mut store, task, command_id(0x2E), 2);
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x2F),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("live resource StaleFence");
         assert_eq!(err, StoreError::StaleFence);
     }
@@ -8835,16 +7141,19 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         let close_cmd = command_id(0x32);
         let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
         let first = store.execute(envelope.clone()).expect("accept");
-        let CommandReceipt::Accepted { operation_id, .. } = first else {
+        let CommandReceipt::Accepted { .. } = first else {
             panic!("accepted");
         };
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
-        drop(conn);
-        let outcome = settle_close_outcome(operation_id, accepted_ms + 1, 1, event_id(0x33));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(outcome.clone()).expect("settle");
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
+        store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle");
         drop(store);
         let events_before = {
             let conn = open_raw(&path);
@@ -8857,7 +7166,7 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         };
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(outcome)
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("title tamper exact retry");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -8885,6 +7194,13 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         let CommandReceipt::Accepted { operation_id, .. } = first else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -8909,12 +7225,7 @@ fn command_outcome_full_snapshot_and_archive_integrity() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 2,
-                1,
-                event_id(0x39),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("archive with live durable resource");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -8942,6 +7253,13 @@ fn command_outcome_decision_envelope_time_and_unique_accepted() {
         let CommandReceipt::Accepted { operation_id, .. } = first else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -8958,12 +7276,7 @@ fn command_outcome_decision_envelope_time_and_unique_accepted() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x3D),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("close_begun envelope time");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -8985,12 +7298,18 @@ fn command_outcome_decision_envelope_time_and_unique_accepted() {
         let close_cmd = command_id(0x40);
         let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
         let first = store.execute(envelope.clone()).expect("accept");
-        let CommandReceipt::Accepted { operation_id, .. } = first else {
+        let CommandReceipt::Accepted { .. } = first else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, operation_id);
         let (payload, schema, occurred, task_bytes): (Vec<u8>, i64, i64, Vec<u8>) = conn
             .query_row(
                 "SELECT payload, schema_version, occurred_at_ms, task_id
@@ -9018,12 +7337,7 @@ fn command_outcome_decision_envelope_time_and_unique_accepted() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(
-                operation_id,
-                accepted_ms + 1,
-                1,
-                event_id(0x42),
-            ))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("duplicate accepted fact");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -9047,15 +7361,18 @@ fn command_outcome_half_match_command_operation_lineage() {
         let close_cmd = command_id(0x72);
         let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
         let first = store.execute(envelope.clone()).expect("accept");
-        let CommandReceipt::Accepted {
-            operation_id: op, ..
-        } = first
-        else {
+        let CommandReceipt::Accepted { .. } = first else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, op);
         let (payload, schema, occurred, task_bytes): (Vec<u8>, i64, i64, Vec<u8>) = conn
             .query_row(
                 "SELECT payload, schema_version, occurred_at_ms, task_id
@@ -9085,7 +7402,7 @@ fn command_outcome_half_match_command_operation_lineage() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(op, accepted_ms + 1, 1, event_id(0x75)))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("half-match accepted");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -9113,6 +7430,13 @@ fn command_outcome_half_match_command_operation_lineage() {
         else {
             panic!("accepted");
         };
+        let permit = begin_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+        );
         drop(store);
         let conn = open_raw(&path);
         let accepted_ms = accepted_at_ms(&conn, op);
@@ -9140,7 +7464,7 @@ fn command_outcome_half_match_command_operation_lineage() {
         drop(conn);
         let mut store = KernelStore::open(&path).expect("reopen");
         let err = store
-            .record_outcome(settle_close_outcome(op, accepted_ms + 1, 1, event_id(0x7B)))
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
             .expect_err("half-match terminal");
         assert_eq!(err, StoreError::Corruption);
         let err_cmd = store
@@ -9166,6 +7490,13 @@ fn command_outcome_accepted_receipt_created_at_matches_accepted_time() {
     let CommandReceipt::Accepted { operation_id, .. } = first else {
         panic!("accepted");
     };
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
     let conn = open_raw(&path);
     let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -9178,12 +7509,7 @@ fn command_outcome_accepted_receipt_created_at_matches_accepted_time() {
     drop(conn);
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 1,
-            1,
-            event_id(0x7F),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("receipt created_at tamper");
     assert_eq!(err, StoreError::Corruption);
     let err_cmd = store
@@ -9208,6 +7534,13 @@ fn command_outcome_task_updated_at_matches_latest_mutation() {
     let CommandReceipt::Accepted { operation_id, .. } = first else {
         panic!("accepted");
     };
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
     let conn = open_raw(&path);
     let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -9220,12 +7553,7 @@ fn command_outcome_task_updated_at_matches_latest_mutation() {
     drop(conn);
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 1,
-            1,
-            event_id(0x83),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("updated_at tamper");
     assert_eq!(err, StoreError::Corruption);
     let err_cmd = store
@@ -9250,6 +7578,13 @@ fn command_outcome_orphan_derived_archive_is_corruption_not_stale_fence() {
     let CommandReceipt::Accepted { operation_id, .. } = first else {
         panic!("accepted");
     };
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
     let conn = open_raw(&path);
     let accepted_ms = accepted_at_ms(&conn, operation_id);
@@ -9273,12 +7608,7 @@ fn command_outcome_orphan_derived_archive_is_corruption_not_stale_fence() {
     drop(conn);
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 2,
-            1,
-            event_id(0x88),
-        ))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("orphan archive");
     assert_eq!(err, StoreError::Corruption);
     let err_cmd = store
@@ -9351,272 +7681,6 @@ fn schema_rebuild_rejects_archive_with_live_resource() {
 }
 
 #[test]
-fn schema_rebuild_rejects_envelope_and_outcome_chronology_mismatches() {
-    // Accepted envelope occurred_at != fact.accepted_at_ms
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x90);
-        let cmd = command_id(0x91);
-        let op = operation_id(0x92);
-        seed_accepted_operation(&path, task, cmd, op, None, None);
-        let conn = open_raw(&path);
-        conn.execute(
-            "UPDATE events SET occurred_at_ms = 9999 WHERE event_type = 'operation.accepted'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store.rebuild_projections().expect_err("accepted envelope");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Outcome before acceptance
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x93);
-        let cmd = command_id(0x94);
-        let op = operation_id(0x95);
-        seed_accepted_operation(&path, task, cmd, op, None, None);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept rebuild");
-        drop(store);
-        let conn = open_raw(&path);
-        let failed = OperationFailedFact::new(
-            cmd,
-            op,
-            1_050,
-            OperationErrorCode::SideEffectFailed,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x96),
-            Some(task),
-            None,
-            "operation.failed",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_050,
-            &rmp_serde::to_vec(&failed).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store.rebuild_projections().expect_err("before acceptance");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Reconciliation before uncertainty
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        let mut store = KernelStore::open(&path).expect("open");
-        let task = task_id(0x97);
-        create_open_task(&mut store, task, command_id(0x98));
-        let close_cmd = command_id(0x99);
-        let (op, _) = accept_begin_close(&mut store, task, close_cmd, 1);
-        drop(store);
-        let conn = open_raw(&path);
-        let accepted_ms = accepted_at_ms(&conn, op);
-        drop(conn);
-        let uncertain_at = accepted_ms + 100;
-        let uncertain = OperationOutcome::new(
-            op,
-            uncertain_at,
-            Some(1),
-            None,
-            OutcomeSource::Dispatch,
-            OperationOutcomeKind::Uncertain {
-                code: OperationUncertaintyCode::AmbiguousDispatch,
-            },
-        )
-        .unwrap();
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.record_outcome(uncertain).expect("mark uncertain");
-        drop(store);
-
-        let conn = open_raw(&path);
-        // Shadow rebuild of VerifiedReconciliation Failed expects retained final outbox.
-        conn.execute(
-            "UPDATE outbox
-             SET state = 'failed', leased_until_ms = NULL, last_error_class = 'side_effect_failed'
-             WHERE operation_id = ?1",
-            [op.as_bytes().as_slice()],
-        )
-        .unwrap();
-        let failed = OperationFailedFact::with_source(
-            close_cmd,
-            op,
-            uncertain_at - 1,
-            OperationErrorCode::SideEffectFailed,
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(0, "ext").unwrap(),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x9C),
-            Some(task),
-            None,
-            "operation.failed",
-            i64::from(EVENT_SCHEMA_VERSION),
-            uncertain_at - 1,
-            &rmp_serde::to_vec(&failed).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("reconcile before uncertain");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-}
-
-#[test]
-fn schema_rebuild_side_effect_settled_result_lineage() {
-    // Orphan task.archived rejected.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xA0);
-        let conn = open_raw(&path);
-        seed_task_created(&conn, task, event_id(0xA1), 1_000);
-        insert_event(
-            &conn,
-            event_id(0xA2),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        insert_event(
-            &conn,
-            event_id(0xA3),
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store.rebuild_projections().expect_err("orphan archive");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Side-effect settled missing/wrong/nonadjacent derived result.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xA4);
-        let cmd = command_id(0xA5);
-        let op = operation_id(0xA6);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        // Inject close_begun + accepted already; force closing via extra close is wrong.
-        // Rebuild seed only has created+accepted. Add close_begun then settled without archive.
-        let conn = open_raw(&path);
-        insert_event(
-            &conn,
-            event_id(0xA7),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_150,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        // Update accepted fence epoch in projection is rebuilt from events — accepted has epoch 1.
-        let settled =
-            OperationSettledFact::new(cmd, op, 1_200, vec![event_id(0xA8)], Some(1), None, None)
-                .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xA9),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("settled without adjacent archive");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Valid archive + settle pair rebuilds.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xAA);
-        let cmd = command_id(0xAB);
-        let op = operation_id(0xAC);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        insert_event(
-            &conn,
-            event_id(0xAD),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_150,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        let archive_id = event_id(0xAE);
-        insert_event(
-            &conn,
-            archive_id,
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        let settled =
-            OperationSettledFact::new(cmd, op, 1_200, vec![archive_id], Some(1), None, None)
-                .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xAF),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("valid pair");
-    }
-}
-
-#[test]
 fn schema_rebuild_rejects_orphan_derived_across_sequence_gap() {
     // Orphan task.archived then unrelated event at a higher nonconsecutive sequence.
     // Numeric sequence-1 adjacency would miss the orphan; existing-row adjacency must reject.
@@ -9678,72 +7742,6 @@ fn schema_rebuild_rejects_orphan_derived_across_sequence_gap() {
         .rebuild_projections()
         .expect_err("orphan derived across sequence gap");
     assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-}
-
-#[test]
-fn schema_rebuild_accepts_adjacent_derived_settle_with_gap_before_pair() {
-    // Gap before the pair is fine; archive and settle remain immediately adjacent existing rows.
-    let dir = TempDir::new().expect("tempdir");
-    let path = temp_db_path(&dir);
-    drop(KernelStore::open(&path).expect("open"));
-    let task = task_id(0xB6);
-    let cmd = command_id(0xB7);
-    let op = operation_id(0xB8);
-    seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store.rebuild_projections().expect("accept rebuild");
-    drop(store);
-    let conn = open_raw(&path);
-    insert_event(
-        &conn,
-        event_id(0xB9),
-        Some(task),
-        Some(2),
-        "task.close_begun",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_150,
-        &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-    );
-    let archive_id = event_id(0xBA);
-    insert_event_at_sequence(
-        &conn,
-        20,
-        archive_id,
-        Some(task),
-        Some(3),
-        "task.archived",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_200,
-        &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-    );
-    let settled =
-        OperationSettledFact::new(cmd, op, 1_200, vec![archive_id], Some(1), None, None).unwrap();
-    insert_event_at_sequence(
-        &conn,
-        21,
-        event_id(0xBB),
-        Some(task),
-        None,
-        "operation.settled",
-        i64::from(EVENT_SCHEMA_VERSION),
-        1_200,
-        &rmp_serde::to_vec(&settled).unwrap(),
-    );
-    let sequences: Vec<i64> = {
-        let mut stmt = conn
-            .prepare("SELECT sequence FROM events ORDER BY sequence ASC")
-            .unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
-    assert_eq!(sequences, vec![1, 2, 3, 20, 21]);
-    drop(conn);
-    let mut store = KernelStore::open(&path).expect("reopen");
-    store
-        .rebuild_projections()
-        .expect("adjacent derived+settle remains valid with earlier gap");
 }
 
 #[test]
@@ -9942,16 +7940,15 @@ fn command_outcome_rejects_global_interleave_between_derived_and_settle() {
             Command::ReopenTask,
         ))
         .expect("reopen A");
-    let (op2, _) = accept_begin_close(&mut store, task_a, command_id(0xD8), 4);
+    accept_begin_close(&mut store, task_a, command_id(0xD8), 4);
     drop(store);
     let conn = open_raw(&path);
-    let accepted2 = accepted_at_ms(&conn, op2);
     let events_before = count_table(&conn, "events");
     drop(conn);
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(op2, accepted2 + 1, 2, event_id(0xD9)))
-        .expect_err("global interleave must fail later settle");
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect_err("global interleave must prevent permit issuance");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
     let conn = open_raw(&path);
@@ -9967,18 +7964,21 @@ fn command_outcome_allows_unrelated_events_outside_derived_settle_pair() {
     let task_b = task_id(0xDB);
     create_open_task(&mut store, task_a, command_id(0xDC));
     create_open_task(&mut store, task_b, command_id(0xDD));
-    let (op, _) = accept_begin_close(&mut store, task_a, command_id(0xDE), 1);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, op);
-    drop(conn);
-    let outcome = settle_close_outcome(op, accepted_ms + 1, 1, event_id(0xDF));
-    let mut store = KernelStore::open(&path).expect("reopen");
+    accept_begin_close(&mut store, task_a, command_id(0xDE), 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task_a,
+            action_epoch: 1,
+        },
+    );
     let first = store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect("settle with B present");
     assert!(matches!(first, OperationState::Settled { .. }));
-    let again = store.record_outcome(outcome).expect("exact retry");
+    let again = store
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+        .expect("exact retry");
     assert!(matches!(again, OperationState::Settled { .. }));
 }
 
@@ -9992,10 +7992,16 @@ fn command_outcome_missing_projection_with_durable_lineage_is_corruption() {
     let task = task_id(0xE0);
     create_open_task(&mut store, task, command_id(0xE1));
     let (op, _) = accept_begin_close(&mut store, task, command_id(0xE2), 1);
+    let permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     drop(store);
 
     let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, op);
     let events_before = count_table(&conn, "events");
     let outbox_before = count_table(&conn, "outbox");
     let receipts_before = count_table(&conn, "command_receipts");
@@ -10010,7 +8016,7 @@ fn command_outcome_missing_projection_with_durable_lineage_is_corruption() {
 
     let mut store = KernelStore::open(&path).expect("reopen");
     let err = store
-        .record_outcome(settle_close_outcome(op, accepted_ms + 1, 1, event_id(0xE3)))
+        .record_dispatch_completion(&permit, DispatchCompletion::Settled)
         .expect_err("durable lineage without projection is corruption");
     assert_eq!(err, StoreError::Corruption);
     drop(store);
@@ -10030,579 +8036,25 @@ fn command_outcome_missing_projection_with_durable_lineage_is_corruption() {
 }
 
 #[test]
-fn schema_rebuild_rejects_unsupported_operation_fence_shapes() {
-    // Supported: pure all-none, teardown action-only, release action+resource+generation.
-    // Resource pair with action_epoch None must fail at accepted (and non-settled outcomes).
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xE4);
-        let cmd = command_id(0xE5);
-        let op = operation_id(0xE6);
-        let resource = resource_id(0xE7);
-        seed_accepted_operation(&path, task, cmd, op, Some((resource, 3)), None);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("accepted resource fence without action_epoch");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
+fn schema_rebuild_accepts_valid_pure_create_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x39);
+    store
+        .execute(command_envelope(
+            command_id(0x3A),
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+    drop(store);
 
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xE8);
-        let cmd = command_id(0xE9);
-        let op = operation_id(0xEA);
-        seed_accepted_operation(&path, task, cmd, op, None, None);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("pure accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let cancelled = OperationCancelledFact::new(
-            cmd,
-            op,
-            1_200,
-            CancellationReason::Superseded,
-            None,
-            Some(resource_id(0xEB)),
-            Some(1),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xEC),
-            Some(task),
-            None,
-            "operation.cancelled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&cancelled).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("cancelled resource fence without action_epoch");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Valid shapes still rebuild.
-    for (label, resource, action_epoch) in [
-        ("pure", None, None),
-        ("teardown", None, Some(1u64)),
-        ("release", Some((resource_id(0xED), 2u64)), Some(0u64)),
-    ] {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xEE);
-        let cmd = command_id(0xEF);
-        let op = operation_id(0xF0);
-        seed_accepted_operation(&path, task, cmd, op, resource, action_epoch);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .rebuild_projections()
-            .unwrap_or_else(|err| panic!("{label} accept must rebuild: {err:?}"));
-    }
-}
-
-#[test]
-fn schema_rebuild_rejects_task_revision_on_non_mutating_operation_envelopes() {
-    // Accepted with Some revision.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xF1);
-        let cmd = command_id(0xF2);
-        let op = operation_id(0xF3);
-        let conn = open_raw(&path);
-        conn.execute(
-            "INSERT INTO command_receipts(
-                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-             ) VALUES (?1, ?2, ?3, X'00', 1, 1)",
-            rusqlite::params![
-                cmd.as_bytes().as_slice(),
-                client_id(0x01).as_bytes().as_slice(),
-                task.as_bytes().as_slice(),
-            ],
-        )
-        .unwrap();
-        seed_task_created(&conn, task, event_id(0xF4), 1_000);
-        let accepted = OperationAcceptedFact::new(cmd, op, 1_100, None, None, None).unwrap();
-        insert_event(
-            &conn,
-            event_id(0xF5),
-            Some(task),
-            Some(2), // non-mutation must be NULL
-            "operation.accepted",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_100,
-            &rmp_serde::to_vec(&accepted).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("accepted requires NULL task_revision");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Adjacent archive + settle, but settle envelope carries Some revision.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0xF6);
-        let cmd = command_id(0xF7);
-        let op = operation_id(0xF8);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        insert_event(
-            &conn,
-            event_id(0xF9),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_150,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        let archive_id = event_id(0xFA);
-        insert_event(
-            &conn,
-            archive_id,
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        let settled =
-            OperationSettledFact::new(cmd, op, 1_200, vec![archive_id], Some(1), None, None)
-                .unwrap();
-        insert_event(
-            &conn,
-            event_id(0xFB),
-            Some(task),
-            Some(4), // must be None for operation.settled
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("settled requires NULL task_revision");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-}
-
-fn insert_terminal_outbox_row(
-    conn: &Connection,
-    op: OperationId,
-    effect_index: i64,
-    state: &str,
-    last_error_class: Option<&str>,
-) {
-    let outbox_id = fixed_uuid_v7(0xCD);
-    conn.execute(
-        "INSERT INTO outbox(
-            outbox_id, operation_id, effect_index, event_sequence, destination_class,
-            replay_policy, payload, state, available_at_ms, leased_until_ms,
-            dispatch_started_at_ms, attempts, last_error_class
-         ) VALUES (?1, ?2, ?3, 2, 'task_teardown', 'reconcile_before_retry', X'00',
-                   ?4, 1100, NULL, NULL, 0, ?5)",
-        rusqlite::params![
-            outbox_id.as_slice(),
-            op.as_bytes().as_slice(),
-            effect_index,
-            state,
-            last_error_class,
-        ],
-    )
-    .expect("seed outbox");
-}
-
-#[test]
-fn schema_rebuild_verified_reconciliation_requires_matching_outbox_identity_and_state() {
-    // effect_index=1 against durable index-0 outbox must fail closed.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x10);
-        let cmd = command_id(0x11);
-        let op = operation_id(0x12);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let uncertain = OperationUncertainFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationUncertaintyCode::AmbiguousDispatch,
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x13),
-            Some(task),
-            None,
-            "operation.uncertain",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&uncertain).unwrap(),
-        );
-        let reconciled = OperationSettledFact::with_source(
-            cmd,
-            op,
-            1_300,
-            vec![event_id(0x14)],
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(1, "provider:wrong-index").unwrap(),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x15),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&reconciled).unwrap(),
-        );
-        insert_terminal_outbox_row(&conn, op, 0, "settled", None);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("effect_index must match durable outbox");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Consistently impossible: fact and sole outbox row both at index 1.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x21);
-        let cmd = command_id(0x22);
-        let op = operation_id(0x23);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let uncertain = OperationUncertainFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationUncertaintyCode::AmbiguousDispatch,
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x24),
-            Some(task),
-            None,
-            "operation.uncertain",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&uncertain).unwrap(),
-        );
-        let reconciled = OperationSettledFact::with_source(
-            cmd,
-            op,
-            1_300,
-            vec![event_id(0x25)],
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(1, "provider:both-one").unwrap(),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x26),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&reconciled).unwrap(),
-        );
-        insert_terminal_outbox_row(&conn, op, 1, "settled", None);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("V1 effect_index must be 0");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Failed reconciliation while retained outbox remains uncertain must fail (shadow expects final).
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x16);
-        let cmd = command_id(0x17);
-        let op = operation_id(0x18);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let uncertain = OperationUncertainFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationUncertaintyCode::AmbiguousDispatch,
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x19),
-            Some(task),
-            None,
-            "operation.uncertain",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&uncertain).unwrap(),
-        );
-        let failed = OperationFailedFact::with_source(
-            cmd,
-            op,
-            1_300,
-            OperationErrorCode::SideEffectFailed,
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(0, "provider:failed").unwrap(),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x1A),
-            Some(task),
-            None,
-            "operation.failed",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_300,
-            &rmp_serde::to_vec(&failed).unwrap(),
-        );
-        insert_terminal_outbox_row(&conn, op, 0, "uncertain", Some("ambiguous_dispatch"));
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("shadow rebuild requires final outbox state");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Matching identity + final settled outbox: uncertain replay then verified settle is green.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x1B);
-        let cmd = command_id(0x1C);
-        let op = operation_id(0x1D);
-        seed_accepted_operation(&path, task, cmd, op, None, Some(1));
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let uncertain = OperationUncertainFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationUncertaintyCode::AmbiguousDispatch,
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x1E),
-            Some(task),
-            None,
-            "operation.uncertain",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&uncertain).unwrap(),
-        );
-        insert_event(
-            &conn,
-            event_id(0x27),
-            Some(task),
-            Some(2),
-            "task.close_begun",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_350,
-            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
-        );
-        let archive_id = event_id(0x1F);
-        insert_event(
-            &conn,
-            archive_id,
-            Some(task),
-            Some(3),
-            "task.archived",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_400,
-            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
-        );
-        let reconciled = OperationSettledFact::with_source(
-            cmd,
-            op,
-            1_400,
-            vec![archive_id],
-            Some(1),
-            None,
-            None,
-            OutcomeSource::verified_reconciliation(0, "provider:proof").unwrap(),
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x20),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_400,
-            &rmp_serde::to_vec(&reconciled).unwrap(),
-        );
-        insert_terminal_outbox_row(&conn, op, 0, "settled", None);
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .rebuild_projections()
-            .expect("matching outbox allows uncertain then verified settle");
-    }
-}
-
-#[test]
-fn schema_rebuild_rejects_pure_non_settled_and_invalid_pure_settle() {
-    // Pure all-none may not become Failed/Cancelled/Uncertain.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x30);
-        let cmd = command_id(0x31);
-        let op = operation_id(0x32);
-        seed_accepted_operation(&path, task, cmd, op, None, None);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("pure accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let failed = OperationFailedFact::new(
-            cmd,
-            op,
-            1_200,
-            OperationErrorCode::SideEffectFailed,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x33),
-            Some(task),
-            None,
-            "operation.failed",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_200,
-            &rmp_serde::to_vec(&failed).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store.rebuild_projections().expect_err("pure cannot fail");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Pure settled must use Dispatch, accepted_at == settled_at, and exact prior decision IDs.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        drop(KernelStore::open(&path).expect("open"));
-        let task = task_id(0x34);
-        let cmd = command_id(0x35);
-        let op = operation_id(0x36);
-        seed_accepted_operation(&path, task, cmd, op, None, None);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store.rebuild_projections().expect("pure accept");
-        drop(store);
-        let conn = open_raw(&path);
-        let settled =
-            OperationSettledFact::new(cmd, op, 1_999, vec![event_id(0x37)], None, None, None)
-                .unwrap();
-        insert_event(
-            &conn,
-            event_id(0x38),
-            Some(task),
-            None,
-            "operation.settled",
-            i64::from(EVENT_SCHEMA_VERSION),
-            1_999,
-            &rmp_serde::to_vec(&settled).unwrap(),
-        );
-        drop(conn);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        let err = store
-            .rebuild_projections()
-            .expect_err("pure settle requires sync decision lineage");
-        assert!(matches!(err, StoreError::Projection(_)), "{err:?}");
-    }
-
-    // Valid pure create rebuild: created decision id is the settle result.
-    {
-        let dir = TempDir::new().expect("tempdir");
-        let path = temp_db_path(&dir);
-        let mut store = KernelStore::open(&path).expect("open");
-        let task = task_id(0x39);
-        store
-            .execute(command_envelope(
-                command_id(0x3A),
-                None,
-                None,
-                Command::CreateTask(create_task_intent(task)),
-            ))
-            .expect("create");
-        drop(store);
-        let mut store = KernelStore::open(&path).expect("reopen");
-        store
-            .rebuild_projections()
-            .expect("valid pure create rebuild");
-    }
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store
+        .rebuild_projections()
+        .expect("valid pure create rebuild");
 }
 
 #[test]
@@ -10618,30 +8070,28 @@ fn command_outcome_release_epoch_tamper_detected_from_task_history() {
     let mut store = KernelStore::open(&path).expect("reopen");
     let release_cmd = command_id(0x53);
     let (op, _) = accept_release_resource(&mut store, task, release_cmd, resource, 2);
-    drop(store);
-    let conn = open_raw(&path);
-    let accepted_ms = accepted_at_ms(&conn, op);
-    drop(conn);
-    let result_id = event_id(0x54);
-    let outcome = settle_release_outcome(op, accepted_ms + 1, 0, resource, 3, result_id);
-    let mut store = KernelStore::open(&path).expect("reopen");
+    let release_permit = begin_expected_dispatch(
+        &mut store,
+        Effect::ReleaseResource {
+            task_id: task,
+            action_epoch: 0,
+            resource_fence: ResourceFence::new(resource, 3),
+        },
+    );
     store
-        .record_outcome(outcome.clone())
+        .record_dispatch_completion(&release_permit, DispatchCompletion::Settled)
         .expect("settle release");
     // Later close/reopen so current task epoch is no longer the release epoch.
-    let (close_op, _) = accept_begin_close(&mut store, task, command_id(0x55), 4);
-    drop(store);
-    let conn = open_raw(&path);
-    let close_accepted = accepted_at_ms(&conn, close_op);
-    drop(conn);
-    let mut store = KernelStore::open(&path).expect("reopen");
+    accept_begin_close(&mut store, task, command_id(0x55), 4);
+    let close_permit = begin_expected_dispatch(
+        &mut store,
+        Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        },
+    );
     store
-        .record_outcome(settle_close_outcome(
-            close_op,
-            close_accepted + 1,
-            1,
-            event_id(0x56),
-        ))
+        .record_dispatch_completion(&close_permit, DispatchCompletion::Settled)
         .expect("archive");
     store
         .execute(command_envelope(
@@ -10750,10 +8200,21 @@ fn command_outcome_release_epoch_tamper_detected_from_task_history() {
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let err = store
-        .record_outcome(outcome)
+    let stale_permit = store
+        .record_dispatch_completion(&release_permit, DispatchCompletion::Settled)
+        .expect_err("rewritten effect must invalidate the original permit");
+    assert_eq!(stale_permit, StoreError::StaleClaim);
+    let history_err = store
+        .execute(command_envelope(
+            release_cmd,
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource,
+            },
+        ))
         .expect_err("history epoch must beat circular operation epoch");
-    assert_eq!(err, StoreError::Corruption);
+    assert_eq!(history_err, StoreError::Corruption);
     drop(store);
     let conn = open_raw(&path);
     assert_eq!(count_table(&conn, "events"), events_before);
@@ -10812,23 +8273,9 @@ fn dispatch_claim_pending_to_claimed_begin_without_exposing_payload() {
     assert!(reconciliation_receipt.is_none());
     assert_eq!(destination, "task_teardown");
     assert_eq!(policy, "retry_safe");
-    let accepted_ms = accepted_at_ms(&conn, operation_id);
     drop(conn);
 
     let mut store = KernelStore::open(&path).expect("reopen");
-    let bare_err = store
-        .record_outcome(settle_close_outcome(
-            operation_id,
-            accepted_ms + 1,
-            1,
-            event_id(0xA4),
-        ))
-        .expect_err("bare outcome must reject claimed");
-    assert!(
-        matches!(bare_err, StoreError::InvalidDispatchTransition),
-        "claimed bare outcome must be InvalidDispatchTransition, got {bare_err:?}"
-    );
-
     let permit = store.begin_dispatch(&claim).expect("begin");
     assert_eq!(
         permit.effect(),
@@ -11127,6 +8574,40 @@ fn dispatch_claim_renew_and_release_require_live_state() {
 }
 
 #[test]
+fn dispatch_claim_renewal_does_not_accumulate_future_lease_time() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xC7);
+    create_open_task(&mut store, task, command_id(0xC8));
+    accept_begin_close(&mut store, task, command_id(0xC9), 1);
+
+    let mut claim = store
+        .claim_next_dispatch(Duration::from_secs(10))
+        .expect("claim")
+        .expect("claimable");
+    for _ in 0..3 {
+        claim = store
+            .renew_dispatch_claim(&claim, Duration::from_secs(10))
+            .expect("renew without stacking");
+    }
+
+    let conn = open_raw(&path);
+    let deadline: i64 = conn
+        .query_row(
+            "SELECT leased_until_ms FROM outbox WHERE state = 'claimed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("dispatch lease deadline");
+    let now = wall_now_ms();
+    assert!(
+        deadline <= now + 15_000,
+        "rapid renewals must keep the deadline near now, not stack each requested lease: now={now}, deadline={deadline}"
+    );
+}
+
+#[test]
 fn dispatch_claim_orders_candidates_and_excludes_terminal_rows() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
@@ -11158,7 +8639,6 @@ fn dispatch_claim_orders_candidates_and_excludes_terminal_rows() {
             |row| row.get(0),
         )
         .unwrap();
-    let second_accepted_at = accepted_at_ms(&conn, second_operation);
     assert_eq!(first_state, "claimed");
     assert_eq!(second_state, "pending");
     drop(conn);
@@ -11169,17 +8649,10 @@ fn dispatch_claim_orders_candidates_and_excludes_terminal_rows() {
         .claim_next_dispatch(Duration::from_secs(30))
         .expect("skip dispatching")
         .expect("second candidate");
+    let second_permit = store.begin_dispatch(&second_claim).expect("begin second");
     store
-        .release_dispatch_claim(&second_claim, Duration::from_secs(30))
-        .expect("release second");
-    store
-        .record_outcome(settle_close_outcome(
-            second_operation,
-            second_accepted_at + 1,
-            1,
-            event_id(0xDE),
-        ))
-        .expect("terminalize released pending row");
+        .record_dispatch_completion(&second_permit, DispatchCompletion::Settled)
+        .expect("terminalize second row");
     assert!(
         store
             .claim_next_dispatch(Duration::from_secs(30))
@@ -11324,6 +8797,11 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
             action_epoch: 1,
         }
     );
+    assert_eq!(
+        store.claim_next_dispatch(Duration::from_secs(30)),
+        Err(StoreError::StaleFence),
+        "a stale row must stay visible after later valid work is claimed",
+    );
     drop(store);
 
     let conn = open_raw(&path);
@@ -11430,9 +8908,1288 @@ fn dispatch_claim_clock_rollback_preserves_durable_time_order() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert!(renewed_lease > begin_lease);
+    assert!(
+        renewed_lease >= begin_lease,
+        "a shorter renewal must preserve the already-live durable deadline"
+    );
     assert!(started >= begin_floor);
     assert!(started < renewed_lease);
+}
+
+#[test]
+fn dispatch_permit_completion_is_fenced_and_idempotent() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x05);
+    create_open_task(&mut store, task, command_id(0x06));
+    accept_begin_close(&mut store, task, command_id(0x07), 1);
+
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("dispatch ready");
+    let permit = store.begin_dispatch(&claim).expect("begin dispatch");
+    let completion = DispatchCompletion::Settled;
+    let first = store
+        .record_dispatch_completion(&permit, completion.clone())
+        .expect("permit-authorized settlement");
+    let (settled_at_ms, result_event_ids) = match first.clone() {
+        OperationState::Settled {
+            settled_at_ms,
+            result_event_ids,
+        } => (settled_at_ms, result_event_ids),
+        other => panic!("expected settled state, got {other:?}"),
+    };
+    assert!(settled_at_ms > 0);
+    assert_eq!(result_event_ids.len(), 1);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let events_after_first = count_table(&conn, "events");
+    let (state, lease): (String, Option<i64>) = conn
+        .query_row("SELECT state, leased_until_ms FROM outbox", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "settled");
+    assert!(lease.is_none());
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    assert_eq!(
+        store
+            .record_dispatch_completion(&permit, completion)
+            .expect("exact replay"),
+        first
+    );
+    assert_eq!(
+        store.record_dispatch_completion(
+            &permit,
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+            },
+        ),
+        Err(StoreError::ConflictingOutcome)
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_after_first);
+}
+
+#[test]
+fn dispatch_permit_completion_supports_failure_cancellation_and_stale_fencing() {
+    for (tail, completion, expected_state) in [
+        (
+            0x0Au8,
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+            },
+            "failed",
+        ),
+        (
+            0x10u8,
+            DispatchCompletion::Cancelled {
+                reason: CancellationReason::Superseded,
+            },
+            "cancelled",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(tail);
+        create_open_task(&mut store, task, command_id(tail + 1));
+        accept_begin_close(&mut store, task, command_id(tail + 2), 1);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&claim).expect("begin dispatch");
+        let state = store
+            .record_dispatch_completion(&permit, completion)
+            .expect(expected_state);
+        match (expected_state, state) {
+            (
+                "failed",
+                OperationState::Failed {
+                    settled_at_ms,
+                    code: OperationErrorCode::SideEffectFailed,
+                },
+            ) => assert!(settled_at_ms > 0),
+            (
+                "cancelled",
+                OperationState::Cancelled {
+                    settled_at_ms,
+                    reason: CancellationReason::Superseded,
+                },
+            ) => assert!(settled_at_ms > 0),
+            (_, other) => panic!("unexpected {expected_state} state: {other:?}"),
+        }
+        drop(store);
+        let conn = open_raw(&path);
+        let durable_state: String = conn
+            .query_row("SELECT state FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(durable_state, expected_state);
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open stale case");
+    let task = task_id(0x16);
+    create_open_task(&mut store, task, command_id(0x17));
+    accept_begin_close(&mut store, task, command_id(0x18), 1);
+    let first_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("first claim")
+        .expect("first dispatch ready");
+    let abandoned = store
+        .begin_dispatch(&first_claim)
+        .expect("begin first dispatch");
+    store
+        .record_dispatch_ambiguity(&abandoned, Duration::from_millis(1))
+        .expect("schedule retry");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let due: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    wait_until_wall_reaches(due);
+
+    let mut store = KernelStore::open(&path).expect("reopen stale case");
+    let replacement_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("replacement claim")
+        .expect("retry ready");
+    let _replacement = store
+        .begin_dispatch(&replacement_claim)
+        .expect("begin replacement");
+    drop(store);
+    let conn = open_raw(&path);
+    let events_before = count_table(&conn, "events");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen old callback");
+    assert_eq!(
+        store.record_dispatch_completion(
+            &abandoned,
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+            },
+        ),
+        Err(StoreError::StaleClaim)
+    );
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn dispatch_policy_ambiguity_routes_retry_and_reconciliation() {
+    // RetrySafe schedules another attempt with the same external key.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x21);
+        create_open_task(&mut store, task, command_id(0x22));
+        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0x23), 1);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("ready");
+        let first = store.begin_dispatch(&claim).expect("begin attempt 1");
+        let key = first.external_idempotency_key().to_owned();
+        assert_eq!(
+            store
+                .record_dispatch_ambiguity(&first, Duration::from_millis(1))
+                .expect("record retry-safe ambiguity"),
+            AmbiguityDisposition::RetryScheduled,
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        let (state, attempts, lease): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT state, attempts, leased_until_ms FROM outbox WHERE operation_id = ?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+        assert_eq!(attempts, 1);
+        assert!(lease.is_none());
+        let available = conn
+            .query_row(
+                "SELECT available_at_ms FROM outbox WHERE operation_id = ?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(available);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let retry_claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("retry claim")
+            .expect("retry ready");
+        let second = store.begin_dispatch(&retry_claim).expect("begin attempt 2");
+        assert_eq!(second.attempt(), 2);
+        assert_eq!(second.external_idempotency_key(), key);
+    }
+
+    // ReconcileBeforeRetry cannot return to ordinary dispatch before evidence.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x24);
+        let resource = resource_id(0x25);
+        create_open_task(&mut store, task, command_id(0x26));
+        drop(store);
+        seed_active_resource(&path, task, resource, 3);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x27), resource, 2);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("ready");
+        let permit = store.begin_dispatch(&claim).expect("begin attempt 1");
+        assert_eq!(permit.replay_policy(), ReplayPolicy::ReconcileBeforeRetry);
+        assert_eq!(
+            store
+                .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+                .expect("route to reconciliation"),
+            AmbiguityDisposition::ReconciliationRequired,
+        );
+        assert!(store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("ordinary claim scan")
+            .is_none(),);
+        drop(store);
+
+        let conn = open_raw(&path);
+        let available: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(available);
+
+        let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+        let reconciliation = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("reconciliation claim")
+            .expect("reconciliation ready");
+        assert_eq!(reconciliation.origin(), ReconciliationOrigin::Accepted);
+        assert_eq!(reconciliation.completed_attempt(), 1);
+        assert_eq!(
+            reconciliation.replay_policy(),
+            ReplayPolicy::ReconcileBeforeRetry
+        );
+        assert_eq!(
+            reconciliation.lookup_identity(),
+            permit.external_idempotency_key()
+        );
+    }
+}
+
+#[test]
+fn reconciliation_claim_lifecycle_and_expired_dispatch_recovery_are_fenced() {
+    // A reconciliation lease can be renewed and voluntarily released, but a
+    // replaced generation can never submit evidence.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x28);
+        let resource = resource_id(0x29);
+        create_open_task(&mut store, task, command_id(0x2a));
+        drop(store);
+        seed_active_resource(&path, task, resource, 4);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x2b), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route to reconciliation");
+        drop(store);
+
+        let conn = open_raw(&path);
+        let due: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(due);
+
+        let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+        let first = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("first reconciliation claim")
+            .expect("reconciliation ready");
+        let renewed = store
+            .renew_reconciliation_claim(&first, Duration::from_secs(30))
+            .expect("renew reconciliation claim");
+        assert_eq!(renewed, first, "renewal preserves the opaque generation");
+        store
+            .release_reconciliation_claim(&renewed, Duration::from_millis(1))
+            .expect("release reconciliation claim");
+        assert_eq!(
+            store.record_reconciliation(
+                &renewed,
+                ReconciliationFinding::Inconclusive {
+                    lookup_identity: renewed.lookup_identity().to_owned(),
+                    retry_after: Duration::from_millis(1),
+                },
+            ),
+            Err(StoreError::StaleClaim),
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        let (state, lease, due): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT state, leased_until_ms, available_at_ms FROM outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "reconcile_required");
+        assert!(lease.is_none());
+        drop(conn);
+        wait_until_wall_reaches(due);
+
+        let mut store = KernelStore::open(&path).expect("reopen after release");
+        let replacement = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("replacement reconciliation claim")
+            .expect("replacement ready");
+        assert_ne!(replacement, first, "reclaim must advance the generation");
+        assert_eq!(
+            store.record_reconciliation(
+                &first,
+                ReconciliationFinding::Inconclusive {
+                    lookup_identity: first.lookup_identity().to_owned(),
+                    retry_after: Duration::from_millis(1),
+                },
+            ),
+            Err(StoreError::StaleClaim),
+        );
+        assert_eq!(
+            store
+                .record_reconciliation(
+                    &replacement,
+                    ReconciliationFinding::Inconclusive {
+                        lookup_identity: replacement.lookup_identity().to_owned(),
+                        retry_after: Duration::from_millis(1),
+                    },
+                )
+                .expect("record inconclusive evidence"),
+            OperationState::Accepted,
+        );
+        assert_eq!(
+            store
+                .record_reconciliation(
+                    &replacement,
+                    ReconciliationFinding::Inconclusive {
+                        lookup_identity: replacement.lookup_identity().to_owned(),
+                        retry_after: Duration::from_millis(1),
+                    },
+                )
+                .expect("exact repeat is idempotent"),
+            OperationState::Accepted,
+        );
+    }
+
+    // Expiry recovery owns the transition and advances the generation so the
+    // abandoned dispatch permit cannot race a later callback.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x2c);
+        let resource = resource_id(0x2d);
+        create_open_task(&mut store, task, command_id(0x2e));
+        drop(store);
+        seed_active_resource(&path, task, resource, 5);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x2f), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let abandoned = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        drop(store);
+
+        let conn = open_raw(&path);
+        expire_state_lease(&conn, "dispatching");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen for recovery");
+        assert_eq!(
+            store
+                .recover_next_expired_dispatch(Duration::from_millis(1))
+                .expect("recover expired dispatch"),
+            Some(AmbiguityDisposition::ReconciliationRequired),
+        );
+        assert_eq!(
+            store.record_dispatch_ambiguity(&abandoned, Duration::from_millis(1)),
+            Err(StoreError::StaleClaim),
+        );
+        assert!(store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("ordinary dispatch scan")
+            .is_none());
+    }
+}
+
+#[test]
+fn reconciliation_claim_renewal_does_not_accumulate_future_lease_time() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x35);
+    let resource = resource_id(0x36);
+    create_open_task(&mut store, task, command_id(0x37));
+    drop(store);
+    seed_active_resource(&path, task, resource, 4);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    accept_release_resource(&mut store, task, command_id(0x38), resource, 2);
+    let dispatch = store
+        .claim_next_dispatch(Duration::from_secs(10))
+        .expect("dispatch claim")
+        .expect("dispatch ready");
+    let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+    store
+        .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+        .expect("route to reconciliation");
+
+    let conn = open_raw(&path);
+    let due: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .expect("reconciliation due time");
+    drop(conn);
+    wait_until_wall_reaches(due);
+
+    let mut claim = store
+        .claim_next_reconciliation(Duration::from_secs(10))
+        .expect("reconciliation claim")
+        .expect("reconciliation ready");
+    for _ in 0..3 {
+        claim = store
+            .renew_reconciliation_claim(&claim, Duration::from_secs(10))
+            .expect("renew without stacking");
+    }
+
+    let conn = open_raw(&path);
+    let deadline: i64 = conn
+        .query_row(
+            "SELECT leased_until_ms FROM outbox WHERE state = 'reconciling'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reconciliation lease deadline");
+    let now = wall_now_ms();
+    assert!(
+        deadline <= now + 15_000,
+        "rapid renewals must keep the deadline near now, not stack each requested lease: now={now}, deadline={deadline}"
+    );
+}
+
+#[test]
+fn accepted_reconciliation_present_evidence_resolves_atomically() {
+    // Verified failure records the ambiguity immediately before the terminal
+    // fact and makes an exact callback replay idempotent.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x41);
+        let resource = resource_id(0x42);
+        create_open_task(&mut store, task, command_id(0x43));
+        drop(store);
+        seed_active_resource(&path, task, resource, 6);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let (operation_id, _) =
+            accept_release_resource(&mut store, task, command_id(0x44), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route to reconciliation");
+        drop(store);
+
+        let conn = open_raw(&path);
+        let due: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        let events_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(due);
+
+        let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+        let claim = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("reconciliation claim")
+            .expect("reconciliation ready");
+        let finding = ReconciliationFinding::PresentFailed {
+            lookup_identity: claim.lookup_identity().to_owned(),
+            external_identity: "provider:release-failed".into(),
+            code: OperationErrorCode::SideEffectFailed,
+        };
+        let state = store
+            .record_reconciliation(&claim, finding.clone())
+            .expect("verified present failure");
+        assert!(matches!(
+            state,
+            OperationState::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .record_reconciliation(&claim, finding.clone())
+                .expect("exact present failure replay"),
+            state,
+        );
+        let conflicting = ReconciliationFinding::PresentFailed {
+            lookup_identity: claim.lookup_identity().to_owned(),
+            external_identity: "provider:different-result".into(),
+            code: OperationErrorCode::SideEffectFailed,
+        };
+        assert_eq!(
+            store.record_reconciliation(&claim, conflicting),
+            Err(StoreError::ConflictingOutcome),
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        let (operation_state, outbox_state, lease, receipt): (
+            String,
+            String,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ) = conn
+            .query_row(
+                "SELECT op.state, o.state, o.leased_until_ms, o.reconciliation_receipt
+                 FROM operations op JOIN outbox o ON o.operation_id = op.operation_id
+                 WHERE op.operation_id = ?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(operation_state, "failed");
+        assert_eq!(outbox_state, "failed");
+        assert!(lease.is_none());
+        assert!(receipt.is_none());
+        let events_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_after, events_before + 2);
+        let terminal_types: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT event_type FROM events ORDER BY sequence DESC LIMIT 2")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            terminal_types,
+            vec!["operation.failed", "operation.uncertain"]
+        );
+    }
+
+    // Verified settlement keeps the derived resource result adjacent between
+    // uncertainty and settlement in the same transaction.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x45);
+        let resource = resource_id(0x46);
+        create_open_task(&mut store, task, command_id(0x47));
+        drop(store);
+        seed_active_resource(&path, task, resource, 8);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x48), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route to reconciliation");
+        drop(store);
+
+        let conn = open_raw(&path);
+        let due: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(due);
+
+        let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+        let claim = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("reconciliation claim")
+            .expect("reconciliation ready");
+        let state = store
+            .record_reconciliation(
+                &claim,
+                ReconciliationFinding::PresentSettled {
+                    lookup_identity: claim.lookup_identity().to_owned(),
+                    external_identity: "provider:release-settled".into(),
+                },
+            )
+            .expect("verified present settlement");
+        assert!(matches!(
+            state,
+            OperationState::Settled {
+                ref result_event_ids,
+                ..
+            } if result_event_ids.len() == 1
+        ));
+        drop(store);
+
+        let conn = open_raw(&path);
+        let terminal_types: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT event_type FROM events ORDER BY sequence DESC LIMIT 3")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            terminal_types,
+            vec![
+                "operation.settled",
+                "resource.released",
+                "operation.uncertain",
+            ]
+        );
+        let lifecycle: String = conn
+            .query_row(
+                "SELECT lifecycle FROM resources WHERE resource_id = ?1",
+                [resource.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "released");
+    }
+}
+
+#[test]
+fn recovery_expiry_and_corruption_paths_fail_closed() {
+    // RetrySafe expiry recovery fences the abandoned permit and preserves the
+    // stable identity for attempt 2.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x51);
+        create_open_task(&mut store, task, command_id(0x52));
+        accept_begin_close(&mut store, task, command_id(0x53), 1);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let abandoned = store.begin_dispatch(&claim).expect("begin attempt 1");
+        let key = abandoned.external_idempotency_key().to_owned();
+        drop(store);
+
+        let conn = open_raw(&path);
+        expire_state_lease(&conn, "dispatching");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen for recovery");
+        assert_eq!(
+            store
+                .recover_next_expired_dispatch(Duration::from_millis(1))
+                .expect("recover expired dispatch"),
+            Some(AmbiguityDisposition::RetryScheduled),
+        );
+        assert_eq!(
+            store.record_dispatch_ambiguity(&abandoned, Duration::from_millis(1)),
+            Err(StoreError::StaleClaim),
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        let due: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(due);
+        let mut store = KernelStore::open(&path).expect("reopen for attempt 2");
+        let retry = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("retry claim")
+            .expect("retry ready");
+        let permit = store.begin_dispatch(&retry).expect("begin attempt 2");
+        assert_eq!(permit.attempt(), 2);
+        assert_eq!(permit.external_idempotency_key(), key);
+    }
+
+    // An expired reconciliation lease can be taken over, but every callback
+    // from the abandoned generation is rejected without writes.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x54);
+        let resource = resource_id(0x55);
+        create_open_task(&mut store, task, command_id(0x56));
+        drop(store);
+        seed_active_resource(&path, task, resource, 9);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x57), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route to reconciliation");
+        drop(store);
+
+        let conn = open_raw(&path);
+        let due: i64 = conn
+            .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        wait_until_wall_reaches(due);
+        let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+        let expired = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("reconciliation claim")
+            .expect("reconciliation ready");
+        drop(store);
+
+        let conn = open_raw(&path);
+        expire_state_lease(&conn, "reconciling");
+        let events_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen after expiry");
+        assert_eq!(
+            store.renew_reconciliation_claim(&expired, Duration::from_secs(30)),
+            Err(StoreError::ExpiredClaim),
+        );
+        assert_eq!(
+            store.release_reconciliation_claim(&expired, Duration::from_millis(1)),
+            Err(StoreError::ExpiredClaim),
+        );
+        assert_eq!(
+            store.record_reconciliation(
+                &expired,
+                ReconciliationFinding::Inconclusive {
+                    lookup_identity: expired.lookup_identity().to_owned(),
+                    retry_after: Duration::from_millis(1),
+                },
+            ),
+            Err(StoreError::ExpiredClaim),
+        );
+        let replacement = store
+            .claim_next_reconciliation(Duration::from_secs(30))
+            .expect("take over expired reconciliation")
+            .expect("replacement ready");
+        assert_ne!(replacement, expired);
+        assert_eq!(
+            store.record_reconciliation(
+                &expired,
+                ReconciliationFinding::Inconclusive {
+                    lookup_identity: expired.lookup_identity().to_owned(),
+                    retry_after: Duration::from_millis(1),
+                },
+            ),
+            Err(StoreError::StaleClaim),
+        );
+        drop(store);
+        let conn = open_raw(&path);
+        let events_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_after, events_before);
+    }
+
+    // A dispatching row without a lease is corruption, not invisible work.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x58);
+        create_open_task(&mut store, task, command_id(0x59));
+        accept_begin_close(&mut store, task, command_id(0x5a), 1);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        store.begin_dispatch(&claim).expect("begin dispatch");
+        drop(store);
+
+        let conn = open_raw(&path);
+        conn.execute(
+            "UPDATE outbox SET leased_until_ms = NULL WHERE state = 'dispatching'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen corrupt row");
+        assert_eq!(
+            store.recover_next_expired_dispatch(Duration::from_millis(1)),
+            Err(StoreError::Corruption),
+        );
+    }
+}
+
+#[test]
+fn reconciliation_absence_receipt_survives_reopen_and_authorizes_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x31);
+    let resource = resource_id(0x32);
+    create_open_task(&mut store, task, command_id(0x33));
+    drop(store);
+    seed_active_resource(&path, task, resource, 7);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let (operation_id, _) =
+        accept_release_resource(&mut store, task, command_id(0x34), resource, 2);
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("ready");
+    let permit = store.begin_dispatch(&claim).expect("begin attempt 1");
+    let key = permit.external_idempotency_key().to_owned();
+    store
+        .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+        .expect("require reconciliation");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let reconcile_at: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    wait_until_wall_reaches(reconcile_at);
+
+    let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+    let reconciliation = store
+        .claim_next_reconciliation(Duration::from_secs(30))
+        .expect("reconciliation claim")
+        .expect("ready");
+    assert_eq!(
+        store.record_reconciliation(
+            &reconciliation,
+            ReconciliationFinding::Absent {
+                lookup_identity: "v1:wrong-operation:0".into(),
+                retry_after: Duration::from_millis(1),
+            },
+        ),
+        Err(StoreError::ConflictingOutcome),
+    );
+    store
+        .record_reconciliation(
+            &reconciliation,
+            ReconciliationFinding::Absent {
+                lookup_identity: key.clone(),
+                retry_after: Duration::from_millis(1),
+            },
+        )
+        .expect("verified absence");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let (outbox_id_bytes, state, attempts, receipt, available, started_at): (
+        Vec<u8>,
+        String,
+        i64,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT outbox_id, state, attempts, reconciliation_receipt,
+                    available_at_ms, dispatch_started_at_ms FROM outbox",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(attempts, 1);
+    let receipt = receipt.expect("absence proof must survive durably");
+    let receipt: AbsenceReceiptProbe = rmp_serde::from_slice(&receipt).expect("strict receipt");
+    assert_eq!(receipt.schema_version, 1);
+    assert_eq!(receipt.outbox_id.as_bytes().as_slice(), outbox_id_bytes);
+    assert_eq!(receipt.operation_id, operation_id);
+    assert_eq!(receipt.effect_index, 0);
+    assert_eq!(receipt.completed_attempt, 1);
+    assert_eq!(receipt.lookup_identity, key);
+    assert!(receipt.proved_at_ms >= started_at);
+    assert!(receipt.proved_at_ms <= available);
+    assert_eq!(receipt.finding, "absent");
+    drop(conn);
+    wait_until_wall_reaches(available);
+
+    let mut store = KernelStore::open(&path).expect("reopen for authorized retry");
+    let retry_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim authorized retry")
+        .expect("absence authorizes attempt 2");
+    store
+        .release_dispatch_claim(&retry_claim, Duration::from_millis(1))
+        .expect("pre-start release preserves proof");
+    drop(store);
+    let conn = open_raw(&path);
+    let available: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    let receipt_after_release: Option<Vec<u8>> = conn
+        .query_row("SELECT reconciliation_receipt FROM outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(receipt_after_release.is_some());
+    drop(conn);
+    wait_until_wall_reaches(available);
+
+    let mut store = KernelStore::open(&path).expect("reopen after release");
+    let reclaimed = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("reclaim")
+        .expect("authorized retry remains ready");
+    let second = store.begin_dispatch(&reclaimed).expect("consume proof");
+    assert_eq!(second.attempt(), 2);
+    assert_eq!(second.external_idempotency_key(), key);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let (state, attempts, receipt): (String, i64, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT state, attempts, reconciliation_receipt FROM outbox
+             WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "dispatching");
+    assert_eq!(attempts, 2);
+    assert!(receipt.is_none(), "begin must consume the one-use proof");
+}
+
+#[test]
+fn reconciliation_receipt_corruption_blocks_duplicate_rebuild_and_dispatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x61);
+    let resource = resource_id(0x62);
+    let release_command = command_id(0x63);
+    create_open_task(&mut store, task, command_id(0x64));
+    drop(store);
+    seed_active_resource(&path, task, resource, 10);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let (_, receipt) = accept_release_resource(&mut store, task, release_command, resource, 2);
+    let dispatch = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("dispatch claim")
+        .expect("dispatch ready");
+    let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+    store
+        .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+        .expect("route to reconciliation");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let due: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    wait_until_wall_reaches(due);
+
+    let mut store = KernelStore::open(&path).expect("reopen for reconciliation");
+    let claim = store
+        .claim_next_reconciliation(Duration::from_secs(30))
+        .expect("reconciliation claim")
+        .expect("reconciliation ready");
+    store
+        .record_reconciliation(
+            &claim,
+            ReconciliationFinding::Absent {
+                lookup_identity: claim.lookup_identity().to_owned(),
+                retry_after: Duration::from_millis(1),
+            },
+        )
+        .expect("record absence");
+    assert_eq!(
+        store
+            .execute(command_envelope(
+                release_command,
+                Some(task),
+                Some(2),
+                Command::ReleaseResource {
+                    resource_id: resource,
+                },
+            ))
+            .expect("valid duplicate receipt"),
+        receipt,
+    );
+    store.rebuild_projections().expect("valid rebuild");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let due: i64 = conn
+        .query_row("SELECT available_at_ms FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    conn.execute("UPDATE outbox SET reconciliation_receipt = NULL", [])
+        .unwrap();
+    let events_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    wait_until_wall_reaches(due);
+
+    let mut store = KernelStore::open(&path).expect("reopen corrupt receipt");
+    assert_eq!(
+        store.execute(command_envelope(
+            release_command,
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource,
+            },
+        )),
+        Err(StoreError::Corruption),
+    );
+    assert_eq!(
+        store.claim_next_dispatch(Duration::from_secs(30)),
+        Err(StoreError::Corruption),
+    );
+    assert_eq!(store.rebuild_projections(), Err(StoreError::Corruption));
+    drop(store);
+
+    let conn = open_raw(&path);
+    let events_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(events_after, events_before);
+}
+
+#[test]
+fn reconciliation_claim_rejects_backdated_and_superseded_metadata() {
+    for (label, tamper) in [
+        (
+            "chronology before acceptance",
+            "UPDATE outbox
+             SET dispatch_started_at_ms = (
+                     SELECT accepted_at_ms - 1 FROM operations
+                     WHERE operations.operation_id = outbox.operation_id
+                 ),
+                 available_at_ms = (
+                     SELECT accepted_at_ms - 1 FROM operations
+                     WHERE operations.operation_id = outbox.operation_id
+                 )",
+        ),
+        (
+            "generation behind completed attempt",
+            "UPDATE outbox SET lease_generation = attempts - 1",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x71);
+        let resource = resource_id(0x72);
+        create_open_task(&mut store, task, command_id(0x73));
+        drop(store);
+        seed_active_resource(&path, task, resource, 10);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x74), resource, 2);
+        let dispatch = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("dispatch claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&dispatch).expect("begin dispatch");
+        store
+            .record_dispatch_ambiguity(&permit, Duration::from_millis(1))
+            .expect("route to reconciliation");
+        drop(store);
+
+        let conn = open_raw(&path);
+        conn.execute(tamper, []).expect(label);
+        let events_before = count_table(&conn, "events");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen corrupt metadata");
+        assert_eq!(
+            store.rebuild_projections(),
+            Err(StoreError::Corruption),
+            "{label} rebuild"
+        );
+        assert_eq!(
+            store.claim_next_reconciliation(Duration::from_secs(30)),
+            Err(StoreError::Corruption),
+            "{label} claim"
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        assert_eq!(count_table(&conn, "events"), events_before, "{label}");
+        let state: String = conn
+            .query_row("SELECT state FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "reconcile_required", "{label}");
+    }
+}
+
+#[test]
+fn rebuild_rejects_missing_or_terminalized_active_outbox_lineage() {
+    for (label, tamper) in [
+        ("missing outbox row", "DELETE FROM outbox"),
+        (
+            "accepted operation with terminal outbox",
+            "UPDATE outbox SET state = 'settled'",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x81);
+        let resource = resource_id(0x82);
+        create_open_task(&mut store, task, command_id(0x83));
+        drop(store);
+        seed_active_resource(&path, task, resource, 10);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        accept_release_resource(&mut store, task, command_id(0x84), resource, 2);
+        drop(store);
+
+        let conn = open_raw(&path);
+        conn.execute(tamper, []).expect(label);
+        let events_before = count_table(&conn, "events");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen corrupt lineage");
+        let error = store.rebuild_projections().expect_err(label);
+        assert!(
+            matches!(
+                error,
+                StoreError::Corruption | StoreError::CodecMismatch { .. }
+            ),
+            "{label}: {error:?}"
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        assert_eq!(count_table(&conn, "events"), events_before, "{label}");
+    }
+}
+
+#[test]
+fn rebuild_rejects_corrupt_terminal_outbox_metadata() {
+    for (label, tamper) in [
+        ("negative attempts", "UPDATE outbox SET attempts = -1"),
+        (
+            "malformed effect payload",
+            "UPDATE outbox SET payload = X'00'",
+        ),
+        (
+            "terminal availability before acceptance",
+            "UPDATE outbox
+             SET available_at_ms = (
+                 SELECT accepted_at_ms - 1 FROM operations
+                 WHERE operations.operation_id = outbox.operation_id
+             )",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0x91);
+        create_open_task(&mut store, task, command_id(0x92));
+        accept_begin_close(&mut store, task, command_id(0x93), 1);
+        complete_expected_dispatch(
+            &mut store,
+            Effect::BeginTaskTeardown {
+                task_id: task,
+                action_epoch: 1,
+            },
+            DispatchCompletion::Settled,
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        conn.execute(tamper, []).expect(label);
+        let events_before = count_table(&conn, "events");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen corrupt terminal metadata");
+        let error = store.rebuild_projections().expect_err(label);
+        assert!(
+            matches!(
+                error,
+                StoreError::Corruption | StoreError::CodecMismatch { .. }
+            ),
+            "{label}: {error:?}"
+        );
+        drop(store);
+
+        let conn = open_raw(&path);
+        assert_eq!(count_table(&conn, "events"), events_before, "{label}");
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbsenceReceiptProbe {
+    schema_version: u32,
+    outbox_id: OutboxId,
+    operation_id: OperationId,
+    effect_index: u32,
+    completed_attempt: u64,
+    lookup_identity: String,
+    proved_at_ms: i64,
+    finding: String,
 }
 
 fn external_idempotency_key_v1(operation_id: OperationId, effect_index: u32) -> String {
@@ -11463,4 +10220,52 @@ fn expire_claim_lease(conn: &Connection) {
         [expired_at_ms],
     )
     .expect("expire claim with valid chronology");
+}
+
+fn expire_state_lease(conn: &Connection, state: &str) {
+    let (available_at_ms, started_at_ms): (i64, i64) = conn
+        .query_row(
+            "SELECT available_at_ms, dispatch_started_at_ms FROM outbox WHERE state = ?1",
+            [state],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("leased row chronology");
+    let expired_at_ms = loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis();
+        let now = i64::try_from(now).expect("test clock fits i64");
+        if now > available_at_ms.max(started_at_ms) {
+            break now;
+        }
+        std::thread::yield_now();
+    };
+    conn.execute(
+        "UPDATE outbox SET leased_until_ms = ?1 WHERE state = ?2",
+        rusqlite::params![expired_at_ms, state],
+    )
+    .expect("expire state lease with valid chronology");
+}
+
+fn wait_until_wall_reaches(timestamp_ms: i64) {
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis();
+        let now = i64::try_from(now).expect("test clock fits i64");
+        if now >= timestamp_ms {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn wall_now_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis();
+    i64::try_from(now).expect("test clock fits i64")
 }

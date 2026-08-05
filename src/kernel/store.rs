@@ -15,12 +15,18 @@ use crate::domain::event::{
     EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OutboxId, TaskId};
-use crate::domain::operation::{OperationOutcome, OperationState, ResourceFence};
+use crate::domain::operation::{
+    OperationOutcome, OperationOutcomeKind, OperationState, OutcomeSource, ResourceFence,
+};
 use crate::kernel::command_bus::{
     self, load_outbox_row_by_id, validate_dispatch_candidate_lineage, OutboxRow,
 };
-use crate::kernel::dispatch::{DispatchClaim, DispatchPermit};
-use crate::kernel::outbox::external_idempotency_key;
+use crate::kernel::dispatch::{
+    ambiguity_disposition, decode_absence_receipt, encode_absence_receipt, AbsenceReceiptDocument,
+    AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
+    ReconciliationFinding, ReconciliationOrigin,
+};
+use crate::kernel::outbox::{decode_effect_document, external_idempotency_key, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 
@@ -149,17 +155,6 @@ impl KernelStore {
         command_bus::execute(self, envelope)
     }
 
-    /// Temporary pre-e2 outcome API for pending rows only.
-    ///
-    /// Rejects `claimed` / `dispatching` rows. Not the safe dispatcher callback path;
-    /// e2 replaces this with permit-bound terminal callbacks.
-    pub fn record_outcome(
-        &mut self,
-        outcome: OperationOutcome,
-    ) -> Result<OperationState, StoreError> {
-        command_bus::record_outcome(self, outcome)
-    }
-
     /// Claim the next dispatch-ready outbox row under a bounded lease fence.
     pub fn claim_next_dispatch(
         &mut self,
@@ -196,6 +191,84 @@ impl KernelStore {
     /// Begin dispatch for a live claim, returning an authorizing permit.
     pub fn begin_dispatch(&mut self, claim: &DispatchClaim) -> Result<DispatchPermit, StoreError> {
         self.with_immediate_transaction(|tx| begin_dispatch_in_tx(tx, now_ms()?, claim))
+    }
+
+    /// Record a terminal result for the exact in-flight dispatch attempt.
+    pub fn record_dispatch_completion(
+        &mut self,
+        permit: &DispatchPermit,
+        completion: DispatchCompletion,
+    ) -> Result<OperationState, StoreError> {
+        command_bus::record_dispatch_completion(self, permit, completion)
+    }
+
+    /// Conservatively recover one started attempt whose external result is ambiguous.
+    pub fn record_dispatch_ambiguity(
+        &mut self,
+        permit: &DispatchPermit,
+        retry_after: Duration,
+    ) -> Result<AmbiguityDisposition, StoreError> {
+        let delay_ms = validate_dispatch_lease_ms(retry_after)?;
+        self.with_immediate_transaction(|tx| {
+            record_dispatch_ambiguity_in_tx(tx, permit, now_ms()?, delay_ms)
+        })
+    }
+
+    /// Recover one expired started attempt without recreating its permit.
+    pub fn recover_next_expired_dispatch(
+        &mut self,
+        retry_after: Duration,
+    ) -> Result<Option<AmbiguityDisposition>, StoreError> {
+        let delay_ms = validate_dispatch_lease_ms(retry_after)?;
+        self.with_immediate_transaction(|tx| {
+            recover_next_expired_dispatch_in_tx(tx, now_ms()?, delay_ms)
+        })
+    }
+
+    /// Claim the next due reconciliation lookup under a bounded lease fence.
+    pub fn claim_next_reconciliation(
+        &mut self,
+        lease: Duration,
+    ) -> Result<Option<ReconciliationClaim>, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            claim_next_reconciliation_in_tx(tx, now_ms()?, lease_ms)
+        })
+    }
+
+    /// Renew a live reconciliation lease without changing its opaque generation.
+    pub fn renew_reconciliation_claim(
+        &mut self,
+        claim: &ReconciliationClaim,
+        lease: Duration,
+    ) -> Result<ReconciliationClaim, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            renew_reconciliation_claim_in_tx(tx, claim, now_ms()?, lease_ms)
+        })
+    }
+
+    /// Release reconciliation work for a later claim without losing ambiguity.
+    pub fn release_reconciliation_claim(
+        &mut self,
+        claim: &ReconciliationClaim,
+        retry_after: Duration,
+    ) -> Result<(), StoreError> {
+        let delay_ms = validate_dispatch_lease_ms(retry_after)?;
+        self.with_immediate_transaction(|tx| {
+            release_reconciliation_claim_in_tx(tx, claim, now_ms()?, delay_ms)
+        })
+    }
+
+    /// Record evidence for one live reconciliation claim.
+    pub fn record_reconciliation(
+        &mut self,
+        claim: &ReconciliationClaim,
+        finding: ReconciliationFinding,
+    ) -> Result<OperationState, StoreError> {
+        self.with_immediate_transaction(|tx| {
+            record_reconciliation_in_tx(tx, claim, finding, now_ms()?)
+        })
     }
 
     /// Canonical database path retained for private snapshot connections.
@@ -549,6 +622,12 @@ fn detect_interrupted_partial_schema(
 }
 
 fn rebuild_projections_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, StoreError> {
+    let result = rebuild_projection_tables_tx(tx)?;
+    command_bus::validate_all_rebuilt_outbox_metadata(tx)?;
+    Ok(result)
+}
+
+fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, StoreError> {
     for table in PROJECTION_TABLES {
         let shadow = shadow_name(table);
         tx.execute_batch(&format!(
@@ -629,12 +708,14 @@ fn rebuild_projections_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, Sto
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DROP TABLE {}", shadow_name(table)), [])?;
     }
-
     Ok(ProjectionRebuild {
         events_replayed,
         drift_detected,
     })
 }
+
+#[cfg(test)]
+mod projector_rebuild_tests;
 
 fn shadow_name(table: &str) -> String {
     format!("shadow_{table}")
@@ -968,6 +1049,14 @@ fn lease_deadline(now_ms: i64, lease_ms: i64) -> Result<i64, StoreError> {
         })
 }
 
+fn renewed_lease_deadline(
+    now_ms: i64,
+    prior_deadline_ms: i64,
+    lease_ms: i64,
+) -> Result<i64, StoreError> {
+    Ok(prior_deadline_ms.max(lease_deadline(now_ms, lease_ms)?))
+}
+
 fn verify_claim_generation(
     row: &OutboxRow,
     claim: &DispatchClaim,
@@ -1159,6 +1248,141 @@ fn build_dispatch_permit(
     ))
 }
 
+fn validate_dispatch_permit(
+    row: &OutboxRow,
+    permit: &DispatchPermit,
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+    fence: crate::kernel::outbox::OperationFence,
+) -> Result<(), StoreError> {
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    let resource_fence = ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+        .map_err(|_| StoreError::Corruption)?;
+    if row.outbox_id != permit.outbox_id()
+        || row.lease_generation != permit.lease_generation()
+        || row.operation_id != permit.operation_id()
+        || effect_index != permit.effect_index()
+        || attempt != permit.attempt()
+        || effect_doc != permit.document()
+        || external_idempotency_key(row.operation_id, effect_index)
+            != permit.external_idempotency_key()
+        || fence.action_epoch != permit.action_epoch()
+        || resource_fence != permit.resource_fence()
+    {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(())
+}
+
+fn validate_absence_authorization(row: &OutboxRow) -> Result<(), StoreError> {
+    let payload = row
+        .reconciliation_receipt
+        .as_deref()
+        .ok_or(StoreError::Corruption)?;
+    let receipt = decode_absence_receipt(payload)?;
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let completed_attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    if !receipt.authorizes(
+        row.outbox_id,
+        row.operation_id,
+        effect_index,
+        completed_attempt,
+        &external_idempotency_key(row.operation_id, effect_index),
+        row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?,
+        row.available_at_ms,
+    ) {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
+}
+
+fn pending_dispatch_is_authorized(
+    row: &OutboxRow,
+    replay_policy: ReplayPolicy,
+) -> Result<bool, StoreError> {
+    if row.attempts == 0 {
+        return Ok(true);
+    }
+    if row.lease_generation == 0 {
+        return Ok(false);
+    }
+    match replay_policy {
+        ReplayPolicy::RetrySafe => {
+            if row.reconciliation_receipt.is_some() {
+                return Err(StoreError::Corruption);
+            }
+            Ok(true)
+        }
+        ReplayPolicy::ReconcileBeforeRetry => {
+            validate_absence_authorization(row)?;
+            Ok(true)
+        }
+        ReplayPolicy::NoAutomaticRetry => Ok(false),
+    }
+}
+
+fn build_reconciliation_claim(
+    row: &OutboxRow,
+    origin: ReconciliationOrigin,
+    effect_doc: crate::kernel::outbox::PlannedEffectDocument,
+    fence: crate::kernel::outbox::OperationFence,
+) -> Result<ReconciliationClaim, StoreError> {
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let completed_attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    if completed_attempt == 0 {
+        return Err(StoreError::Corruption);
+    }
+    let resource_fence = ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+        .map_err(|_| StoreError::Corruption)?;
+    Ok(ReconciliationClaim::new(
+        row.outbox_id,
+        row.lease_generation,
+        row.operation_id,
+        effect_index,
+        completed_attempt,
+        origin,
+        effect_doc,
+        external_idempotency_key(row.operation_id, effect_index),
+        fence.action_epoch,
+        resource_fence,
+    ))
+}
+
+fn validate_reconciliation_claim(
+    row: &OutboxRow,
+    claim: &ReconciliationClaim,
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+    fence: crate::kernel::outbox::OperationFence,
+) -> Result<(), StoreError> {
+    validate_reconciliation_claim_identity(row, claim, effect_doc)?;
+    let resource_fence = ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+        .map_err(|_| StoreError::Corruption)?;
+    if fence.action_epoch != claim.action_epoch() || resource_fence != claim.resource_fence() {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_claim_identity(
+    row: &OutboxRow,
+    claim: &ReconciliationClaim,
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+) -> Result<(), StoreError> {
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    if row.outbox_id != claim.outbox_id()
+        || row.lease_generation != claim.lease_generation()
+        || row.operation_id != claim.operation_id()
+        || effect_index != claim.effect_index()
+        || attempt != claim.completed_attempt()
+        || effect_doc != claim.document()
+        || external_idempotency_key(row.operation_id, effect_index) != claim.lookup_identity()
+    {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(())
+}
+
 fn claim_outbox_row(
     tx: &Transaction<'_>,
     row: &OutboxRow,
@@ -1195,22 +1419,26 @@ fn claim_next_dispatch_in_tx(
     lease_ms: i64,
 ) -> Result<Option<DispatchClaim>, StoreError> {
     let mut prior_candidate = None;
+    let mut saw_stale_fence = false;
     loop {
         let Some(row) = load_next_dispatch_candidate(tx, now_ms, prior_candidate.as_ref())? else {
-            return Ok(None);
+            return if saw_stale_fence {
+                Err(StoreError::StaleFence)
+            } else {
+                Ok(None)
+            };
         };
-        match revalidate_outbox_effect(tx, &row) {
-            Ok(_) => {}
+        let effect_doc = match revalidate_outbox_effect(tx, &row) {
+            Ok((effect_doc, _)) => effect_doc,
             Err(StoreError::StaleFence) => {
+                saw_stale_fence = true;
                 prior_candidate = Some(row);
                 continue;
             }
             Err(error) => return Err(error),
-        }
+        };
         match row.state.as_str() {
-            // Before e2, a pending row that already crossed the dispatch-start
-            // boundary can only be completed through the temporary outcome API.
-            "pending" if row.attempts > 0 => {
+            "pending" if !pending_dispatch_is_authorized(&row, effect_doc.replay_policy)? => {
                 prior_candidate = Some(row);
             }
             "pending" | "claimed" => {
@@ -1269,7 +1497,7 @@ fn renew_dispatch_claim_in_tx(
     revalidate_outbox_effect(tx, &row)?;
     verify_claim_generation(&row, claim, now_ms)?;
     let prior = row.leased_until_ms.ok_or(StoreError::StaleClaim)?;
-    let leased_until = lease_deadline(now_ms.max(prior), lease_ms)?;
+    let leased_until = renewed_lease_deadline(now_ms, prior, lease_ms)?;
     let changed = tx.execute(
         "UPDATE outbox
          SET leased_until_ms = ?1
@@ -1308,7 +1536,8 @@ fn begin_dispatch_in_tx(
     let next_attempts = row.attempts.checked_add(1).ok_or(StoreError::Corruption)?;
     let changed = tx.execute(
         "UPDATE outbox
-         SET state = 'dispatching', attempts = ?1, dispatch_started_at_ms = ?2
+         SET state = 'dispatching', attempts = ?1, dispatch_started_at_ms = ?2,
+             reconciliation_receipt = NULL
          WHERE outbox_id = ?3 AND state = 'claimed' AND lease_generation = ?4",
         rusqlite::params![
             next_attempts,
@@ -1324,7 +1553,606 @@ fn begin_dispatch_in_tx(
     permit_row.state = "dispatching".into();
     permit_row.attempts = next_attempts;
     permit_row.dispatch_started_at_ms = Some(dispatch_started_at);
+    permit_row.reconciliation_receipt = None;
     build_dispatch_permit(&permit_row, effect_doc, fence)
+}
+
+fn record_dispatch_ambiguity_in_tx(
+    tx: &Transaction<'_>,
+    permit: &DispatchPermit,
+    now_ms: i64,
+    delay_ms: i64,
+) -> Result<AmbiguityDisposition, StoreError> {
+    let row = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    let (effect_doc, fence) = revalidate_outbox_effect(tx, &row)?;
+    validate_dispatch_permit(&row, permit, &effect_doc, fence)?;
+    let disposition = ambiguity_disposition(effect_doc.replay_policy);
+
+    let idempotent_state = match disposition {
+        AmbiguityDisposition::RetryScheduled => "pending",
+        AmbiguityDisposition::ReconciliationRequired => "reconcile_required",
+        AmbiguityDisposition::Uncertain => "uncertain",
+    };
+    if row.state == idempotent_state {
+        return Ok(disposition);
+    }
+    if row.state != "dispatching" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    if row.reconciliation_receipt.is_some() {
+        return Err(StoreError::Corruption);
+    }
+
+    let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+    let available_at = lease_deadline(now_ms.max(started_at).max(row.available_at_ms), delay_ms)?;
+    let (next_state, last_error_class) = match disposition {
+        AmbiguityDisposition::RetryScheduled => ("pending", None),
+        AmbiguityDisposition::ReconciliationRequired => {
+            ("reconcile_required", Some("ambiguous_dispatch"))
+        }
+        // There is no production NoAutomaticRetry effect in this phase. The
+        // pure policy mapping is locked now; the first durable uncertain path
+        // is exercised with its real effect in Phase 4.
+        AmbiguityDisposition::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+    };
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = ?1, available_at_ms = ?2, leased_until_ms = NULL,
+             last_error_class = ?3, reconciliation_receipt = NULL
+         WHERE outbox_id = ?4 AND state = 'dispatching'
+           AND lease_generation = ?5 AND attempts = ?6",
+        rusqlite::params![
+            next_state,
+            available_at,
+            last_error_class,
+            row.outbox_id.as_bytes().as_slice(),
+            row.lease_generation,
+            row.attempts,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(disposition)
+}
+
+fn load_next_expired_dispatch_candidate(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    after: Option<&OutboxRow>,
+) -> Result<Option<OutboxRow>, StoreError> {
+    let after_available_at = after.map(|row| row.available_at_ms);
+    let after_event_sequence = after
+        .map(|row| u64_to_sqlite_i64("outbox.event_sequence", row.event_sequence))
+        .transpose()?;
+    let after_effect_index = after.map(|row| row.effect_index);
+    let after_outbox_id = after.map(|row| row.outbox_id.as_bytes().as_slice());
+    let selected: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT o.outbox_id
+             FROM outbox o
+             JOIN operations op ON op.operation_id = o.operation_id
+             WHERE op.state = 'accepted'
+               AND o.state = 'dispatching'
+               AND (o.leased_until_ms IS NULL OR o.leased_until_ms <= ?1)
+               AND (
+                 ?2 IS NULL
+                 OR o.available_at_ms > ?2
+                 OR (o.available_at_ms = ?2 AND o.event_sequence > ?3)
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index > ?4
+                 )
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index = ?4 AND o.outbox_id > ?5
+                 )
+               )
+             ORDER BY o.available_at_ms ASC, o.event_sequence ASC,
+                      o.effect_index ASC, o.outbox_id ASC
+             LIMIT 1",
+            rusqlite::params![
+                now_ms,
+                after_available_at,
+                after_event_sequence,
+                after_effect_index,
+                after_outbox_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(outbox_id_bytes) = selected else {
+        return Ok(None);
+    };
+    let outbox_id = parse_outbox_id(&outbox_id_bytes)?;
+    Ok(Some(
+        load_outbox_row_by_id(tx, outbox_id)?.ok_or(StoreError::Corruption)?,
+    ))
+}
+
+fn recover_next_expired_dispatch_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    delay_ms: i64,
+) -> Result<Option<AmbiguityDisposition>, StoreError> {
+    let mut prior_candidate = None;
+    let mut saw_stale_fence = false;
+    loop {
+        let Some(row) = load_next_expired_dispatch_candidate(tx, now_ms, prior_candidate.as_ref())?
+        else {
+            return if saw_stale_fence {
+                Err(StoreError::StaleFence)
+            } else {
+                Ok(None)
+            };
+        };
+        let effect_doc = match revalidate_outbox_effect(tx, &row) {
+            Ok((effect_doc, _)) => effect_doc,
+            Err(StoreError::StaleFence) => {
+                saw_stale_fence = true;
+                prior_candidate = Some(row);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if row.state != "dispatching" || row.attempts <= 0 || row.reconciliation_receipt.is_some() {
+            return Err(StoreError::Corruption);
+        }
+        let leased_until = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+        if leased_until > now_ms {
+            return Err(StoreError::InvalidDispatchTransition);
+        }
+        let disposition = ambiguity_disposition(effect_doc.replay_policy);
+        let (next_state, last_error_class) = match disposition {
+            AmbiguityDisposition::RetryScheduled => ("pending", None),
+            AmbiguityDisposition::ReconciliationRequired => {
+                ("reconcile_required", Some("ambiguous_dispatch"))
+            }
+            AmbiguityDisposition::Uncertain => {
+                return Err(StoreError::InvalidDispatchTransition);
+            }
+        };
+        let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+        let available_at =
+            lease_deadline(now_ms.max(started_at).max(row.available_at_ms), delay_ms)?;
+        let next_generation = row
+            .lease_generation
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+        let changed = tx.execute(
+            "UPDATE outbox
+             SET state = ?1, available_at_ms = ?2, leased_until_ms = NULL,
+                 last_error_class = ?3, reconciliation_receipt = NULL,
+                 lease_generation = ?4
+             WHERE outbox_id = ?5 AND state = 'dispatching'
+               AND lease_generation = ?6 AND attempts = ?7
+               AND leased_until_ms IS NOT NULL AND leased_until_ms <= ?8",
+            rusqlite::params![
+                next_state,
+                available_at,
+                last_error_class,
+                next_generation,
+                row.outbox_id.as_bytes().as_slice(),
+                row.lease_generation,
+                row.attempts,
+                now_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleClaim);
+        }
+        return Ok(Some(disposition));
+    }
+}
+
+fn load_next_reconciliation_candidate(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    after: Option<&OutboxRow>,
+) -> Result<Option<(OutboxRow, ReconciliationOrigin)>, StoreError> {
+    let after_available_at = after.map(|row| row.available_at_ms);
+    let after_event_sequence = after
+        .map(|row| u64_to_sqlite_i64("outbox.event_sequence", row.event_sequence))
+        .transpose()?;
+    let after_effect_index = after.map(|row| row.effect_index);
+    let after_outbox_id = after.map(|row| row.outbox_id.as_bytes().as_slice());
+    let selected: Option<(Vec<u8>, String)> = tx
+        .query_row(
+            "SELECT o.outbox_id, op.state
+             FROM outbox o
+             JOIN operations op ON op.operation_id = o.operation_id
+             WHERE op.state = 'accepted'
+               AND (
+                 (o.state = 'reconcile_required' AND o.available_at_ms <= ?1)
+                 OR (
+                   o.state = 'reconciling' AND o.available_at_ms <= ?1
+                   AND (o.leased_until_ms IS NULL OR o.leased_until_ms <= ?1)
+                 )
+               )
+               AND (
+                 ?2 IS NULL
+                 OR o.available_at_ms > ?2
+                 OR (o.available_at_ms = ?2 AND o.event_sequence > ?3)
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index > ?4
+                 )
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index = ?4 AND o.outbox_id > ?5
+                 )
+               )
+             ORDER BY o.available_at_ms ASC, o.event_sequence ASC,
+                      o.effect_index ASC, o.outbox_id ASC
+             LIMIT 1",
+            rusqlite::params![
+                now_ms,
+                after_available_at,
+                after_event_sequence,
+                after_effect_index,
+                after_outbox_id,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((outbox_id_bytes, operation_state)) = selected else {
+        return Ok(None);
+    };
+    let outbox_id = parse_outbox_id(&outbox_id_bytes)?;
+    let row = load_outbox_row_by_id(tx, outbox_id)?.ok_or(StoreError::Corruption)?;
+    let origin = match operation_state.as_str() {
+        "accepted" => ReconciliationOrigin::Accepted,
+        "uncertain" => ReconciliationOrigin::Uncertain,
+        _ => return Err(StoreError::Corruption),
+    };
+    Ok(Some((row, origin)))
+}
+
+fn claim_next_reconciliation_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<Option<ReconciliationClaim>, StoreError> {
+    let mut prior_candidate = None;
+    let mut saw_stale_fence = false;
+    loop {
+        let Some((row, origin)) =
+            load_next_reconciliation_candidate(tx, now_ms, prior_candidate.as_ref())?
+        else {
+            return if saw_stale_fence {
+                Err(StoreError::StaleFence)
+            } else {
+                Ok(None)
+            };
+        };
+        let (effect_doc, fence) = match origin {
+            ReconciliationOrigin::Accepted => match revalidate_outbox_effect(tx, &row) {
+                Ok(validated) => validated,
+                Err(StoreError::StaleFence) => {
+                    saw_stale_fence = true;
+                    prior_candidate = Some(row);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
+            ReconciliationOrigin::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+        };
+        if effect_doc.replay_policy != ReplayPolicy::ReconcileBeforeRetry
+            || (row.state != "reconcile_required" && row.state != "reconciling")
+        {
+            return Err(StoreError::Corruption);
+        }
+        let leased_until = lease_deadline(now_ms, lease_ms)?;
+        let next_generation = row
+            .lease_generation
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+        let changed = tx.execute(
+            "UPDATE outbox
+             SET state = 'reconciling', lease_generation = ?1, leased_until_ms = ?2
+             WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
+            rusqlite::params![
+                next_generation,
+                leased_until,
+                row.outbox_id.as_bytes().as_slice(),
+                row.state.as_str(),
+                row.lease_generation,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidDispatchTransition);
+        }
+        let mut claimed_row = row;
+        claimed_row.state = "reconciling".into();
+        claimed_row.lease_generation = next_generation;
+        claimed_row.leased_until_ms = Some(leased_until);
+        return Ok(Some(build_reconciliation_claim(
+            &claimed_row,
+            origin,
+            effect_doc,
+            fence,
+        )?));
+    }
+}
+
+fn verify_reconciliation_claim_generation(
+    row: &OutboxRow,
+    claim: &ReconciliationClaim,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    if row.lease_generation != claim.lease_generation() {
+        return Err(StoreError::StaleClaim);
+    }
+    let leased_until = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+    if leased_until <= now_ms {
+        return Err(StoreError::ExpiredClaim);
+    }
+    Ok(())
+}
+
+fn renew_reconciliation_claim_in_tx(
+    tx: &Transaction<'_>,
+    claim: &ReconciliationClaim,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<ReconciliationClaim, StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if row.state != "reconciling" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let (effect_doc, fence) = match claim.origin() {
+        ReconciliationOrigin::Accepted => revalidate_outbox_effect(tx, &row)?,
+        ReconciliationOrigin::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+    };
+    validate_reconciliation_claim(&row, claim, &effect_doc, fence)?;
+    verify_reconciliation_claim_generation(&row, claim, now_ms)?;
+    let prior = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+    let leased_until = renewed_lease_deadline(now_ms, prior, lease_ms)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET leased_until_ms = ?1
+         WHERE outbox_id = ?2 AND state = 'reconciling'
+           AND lease_generation = ?3 AND attempts = ?4",
+        rusqlite::params![
+            leased_until,
+            row.outbox_id.as_bytes().as_slice(),
+            row.lease_generation,
+            row.attempts,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(claim.clone())
+}
+
+fn release_reconciliation_claim_in_tx(
+    tx: &Transaction<'_>,
+    claim: &ReconciliationClaim,
+    now_ms: i64,
+    delay_ms: i64,
+) -> Result<(), StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if row.state != "reconciling" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let (effect_doc, fence) = match claim.origin() {
+        ReconciliationOrigin::Accepted => revalidate_outbox_effect(tx, &row)?,
+        ReconciliationOrigin::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+    };
+    validate_reconciliation_claim(&row, claim, &effect_doc, fence)?;
+    verify_reconciliation_claim_generation(&row, claim, now_ms)?;
+    let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+    let available_at = lease_deadline(now_ms.max(started_at).max(row.available_at_ms), delay_ms)?;
+    let next_generation = row
+        .lease_generation
+        .checked_add(1)
+        .ok_or(StoreError::Corruption)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = 'reconcile_required', available_at_ms = ?1,
+             leased_until_ms = NULL, last_error_class = 'ambiguous_dispatch',
+             reconciliation_receipt = NULL, lease_generation = ?2
+         WHERE outbox_id = ?3 AND state = 'reconciling'
+           AND lease_generation = ?4 AND attempts = ?5",
+        rusqlite::params![
+            available_at,
+            next_generation,
+            row.outbox_id.as_bytes().as_slice(),
+            row.lease_generation,
+            row.attempts,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(())
+}
+
+fn record_reconciliation_in_tx(
+    tx: &Transaction<'_>,
+    claim: &ReconciliationClaim,
+    finding: ReconciliationFinding,
+    now_ms: i64,
+) -> Result<OperationState, StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if finding.lookup_identity() != claim.lookup_identity() {
+        return Err(StoreError::ConflictingOutcome);
+    }
+    if matches!(row.state.as_str(), "settled" | "failed") {
+        if claim.origin() != ReconciliationOrigin::Accepted {
+            return Err(StoreError::InvalidDispatchTransition);
+        }
+        let effect_doc =
+            decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+        validate_reconciliation_claim_identity(&row, claim, &effect_doc)?;
+        let durable_outcome_at: Option<i64> = tx.query_row(
+            "SELECT outcome_at_ms FROM operations WHERE operation_id = ?1",
+            [claim.operation_id().as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        let outcome = build_present_reconciliation_outcome(
+            tx,
+            claim,
+            &finding,
+            durable_outcome_at.ok_or(StoreError::Corruption)?,
+        )?
+        .ok_or(StoreError::InvalidDispatchTransition)?;
+        return command_bus::record_present_reconciliation_in_tx(
+            tx,
+            outcome,
+            row.outbox_id,
+            row.lease_generation,
+        );
+    }
+    let (effect_doc, fence) = match claim.origin() {
+        ReconciliationOrigin::Accepted => revalidate_outbox_effect(tx, &row)?,
+        ReconciliationOrigin::Uncertain => return Err(StoreError::InvalidDispatchTransition),
+    };
+    validate_reconciliation_claim(&row, claim, &effect_doc, fence)?;
+
+    match (&row.state[..], &finding) {
+        ("pending", ReconciliationFinding::Absent { .. }) => {
+            validate_absence_authorization(&row)?;
+            return Ok(OperationState::Accepted);
+        }
+        ("reconcile_required", ReconciliationFinding::Inconclusive { .. }) => {
+            return Ok(OperationState::Accepted);
+        }
+        _ => {}
+    }
+    if row.state != "reconciling" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let leased_until = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+    if leased_until <= now_ms {
+        return Err(StoreError::ExpiredClaim);
+    }
+    if effect_doc.replay_policy != ReplayPolicy::ReconcileBeforeRetry {
+        return Err(StoreError::Corruption);
+    }
+    let started_at = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+    let proof_or_observation_at = now_ms.max(started_at).max(row.available_at_ms);
+    let present_outcome =
+        build_present_reconciliation_outcome(tx, claim, &finding, proof_or_observation_at)?;
+
+    match finding {
+        ReconciliationFinding::Absent {
+            lookup_identity,
+            retry_after,
+        } => {
+            let delay_ms = validate_dispatch_lease_ms(retry_after)?;
+            let effect_index =
+                u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+            let completed_attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+            let receipt = AbsenceReceiptDocument::new(
+                row.outbox_id,
+                row.operation_id,
+                effect_index,
+                completed_attempt,
+                lookup_identity,
+                proof_or_observation_at,
+            )?;
+            let receipt = encode_absence_receipt(&receipt)?;
+            let available_at = lease_deadline(proof_or_observation_at, delay_ms)?;
+            let changed = tx.execute(
+                "UPDATE outbox
+                 SET state = 'pending', available_at_ms = ?1, leased_until_ms = NULL,
+                     last_error_class = NULL, reconciliation_receipt = ?2
+                 WHERE outbox_id = ?3 AND state = 'reconciling'
+                   AND lease_generation = ?4 AND attempts = ?5",
+                rusqlite::params![
+                    available_at,
+                    receipt,
+                    row.outbox_id.as_bytes().as_slice(),
+                    row.lease_generation,
+                    row.attempts,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::StaleClaim);
+            }
+            Ok(OperationState::Accepted)
+        }
+        ReconciliationFinding::Inconclusive {
+            lookup_identity: _,
+            retry_after,
+        } => {
+            let delay_ms = validate_dispatch_lease_ms(retry_after)?;
+            let available_at = lease_deadline(proof_or_observation_at, delay_ms)?;
+            let changed = tx.execute(
+                "UPDATE outbox
+                 SET state = 'reconcile_required', available_at_ms = ?1,
+                     leased_until_ms = NULL, last_error_class = 'ambiguous_dispatch',
+                     reconciliation_receipt = NULL
+                 WHERE outbox_id = ?2 AND state = 'reconciling'
+                   AND lease_generation = ?3 AND attempts = ?4",
+                rusqlite::params![
+                    available_at,
+                    row.outbox_id.as_bytes().as_slice(),
+                    row.lease_generation,
+                    row.attempts,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::StaleClaim);
+            }
+            Ok(OperationState::Accepted)
+        }
+        ReconciliationFinding::PresentSettled { .. }
+        | ReconciliationFinding::PresentFailed { .. } => {
+            command_bus::record_present_reconciliation_in_tx(
+                tx,
+                present_outcome.ok_or(StoreError::InvalidDispatchTransition)?,
+                row.outbox_id,
+                row.lease_generation,
+            )
+        }
+    }
+}
+
+fn build_present_reconciliation_outcome(
+    tx: &Transaction<'_>,
+    claim: &ReconciliationClaim,
+    finding: &ReconciliationFinding,
+    occurred_at_ms: i64,
+) -> Result<Option<OperationOutcome>, StoreError> {
+    let (external_identity, kind) = match finding {
+        ReconciliationFinding::PresentSettled {
+            external_identity, ..
+        } => (
+            external_identity,
+            OperationOutcomeKind::Settled {
+                result_event_ids: command_bus::settled_result_ids_for_callback(
+                    tx,
+                    claim.operation_id(),
+                )?,
+            },
+        ),
+        ReconciliationFinding::PresentFailed {
+            external_identity,
+            code,
+            ..
+        } => (
+            external_identity,
+            OperationOutcomeKind::Failed { code: *code },
+        ),
+        ReconciliationFinding::Absent { .. } | ReconciliationFinding::Inconclusive { .. } => {
+            return Ok(None);
+        }
+    };
+    let source = OutcomeSource::verified_reconciliation(claim.effect_index(), external_identity)
+        .map_err(|_| StoreError::ConstraintViolation)?;
+    let outcome = OperationOutcome::new(
+        claim.operation_id(),
+        occurred_at_ms,
+        claim.action_epoch(),
+        claim.resource_fence(),
+        source,
+        kind,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    Ok(Some(outcome))
 }
 
 #[cfg(test)]
@@ -1379,7 +2207,7 @@ mod tests {
             StoreError::Corruption
         );
 
-        // Typed variants exercised by execute/record_outcome paths.
+        // Typed variants exercised by command execution and completion paths.
         assert_ne!(StoreError::StaleFence, StoreError::ConflictingOutcome);
         assert_ne!(
             StoreError::MissingOperation,

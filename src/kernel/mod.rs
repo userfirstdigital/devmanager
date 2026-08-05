@@ -11,6 +11,9 @@ mod projector;
 mod schema;
 mod store;
 
-pub use dispatch::{DispatchClaim, DispatchPermit};
+pub use dispatch::{
+    AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
+    ReconciliationFinding, ReconciliationOrigin,
+};
 pub use outbox::{DestinationClass, Effect, ReplayPolicy};
 pub use store::{KernelStore, ProjectionRebuild, StoreError};

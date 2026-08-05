@@ -27,9 +27,11 @@ use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
 };
+use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, DispatchPermit};
 use crate::kernel::outbox::{
     decode_effect_document, decode_receipt_document, encode_effect_document,
-    encode_receipt_document, plan_effects, Effect, OperationFence, PlannedEffect,
+    encode_receipt_document, external_idempotency_key, plan_effects, Effect, OperationFence,
+    PlannedEffect, ReplayPolicy,
 };
 use crate::kernel::projector;
 use crate::kernel::store::{
@@ -42,13 +44,6 @@ pub(crate) fn execute(
     envelope: CommandEnvelope,
 ) -> Result<CommandReceipt, StoreError> {
     store.with_immediate_transaction(|tx| execute_in_tx(tx, envelope))
-}
-
-pub(crate) fn record_outcome(
-    store: &mut KernelStore,
-    outcome: OperationOutcome,
-) -> Result<OperationState, StoreError> {
-    store.with_immediate_transaction(|tx| record_outcome_in_tx(tx, outcome))
 }
 
 fn record_outcome_in_tx(
@@ -155,12 +150,12 @@ fn record_outcome_in_tx(
             if !outcome.source.is_dispatch() {
                 return Err(StoreError::ConflictingOutcome);
             }
-            match outbox.state.as_str() {
-                "claimed" | "dispatching" => {
-                    return Err(StoreError::InvalidDispatchTransition);
-                }
-                "pending" => {}
-                _ => return Err(StoreError::Corruption),
+            if outbox.state != "dispatching" {
+                return if matches!(outbox.state.as_str(), "pending" | "claimed" | "dispatching") {
+                    Err(StoreError::InvalidDispatchTransition)
+                } else {
+                    Err(StoreError::Corruption)
+                };
             }
             if outcome.occurred_at_ms < operation.accepted_at_ms {
                 return Err(StoreError::StaleFence);
@@ -173,7 +168,7 @@ fn record_outcome_in_tx(
                 &outcome,
                 &effect_doc.effect,
                 outbox,
-                "pending",
+                "dispatching",
             )
         }
         "uncertain" => {
@@ -219,6 +214,197 @@ fn record_outcome_in_tx(
         "settled" | "failed" | "cancelled" => Err(StoreError::ConflictingOutcome),
         _ => Err(StoreError::Corruption),
     }
+}
+
+pub(crate) fn record_dispatch_completion(
+    store: &mut KernelStore,
+    permit: &DispatchPermit,
+    completion: DispatchCompletion,
+) -> Result<OperationState, StoreError> {
+    store.with_immediate_transaction(|tx| {
+        record_dispatch_completion_in_tx(tx, permit, completion, now_ms()?)
+    })
+}
+
+fn record_dispatch_completion_in_tx(
+    tx: &Transaction<'_>,
+    permit: &DispatchPermit,
+    completion: DispatchCompletion,
+    observed_at_ms: i64,
+) -> Result<OperationState, StoreError> {
+    let outbox = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    let operation =
+        load_operation_projection_by_id(tx, outbox.operation_id)?.ok_or(StoreError::Corruption)?;
+    let effect_doc = decode_effect_document(
+        &outbox.payload,
+        &outbox.destination_class,
+        &outbox.replay_policy,
+    )?;
+    let fence = operation_fence_from_projection(&operation)?;
+    validate_dispatch_permit_identity(&outbox, permit, &effect_doc, fence)?;
+
+    let occurred_at_ms = match operation.state.as_str() {
+        "accepted" => {
+            if outbox.state != "dispatching" {
+                return Err(StoreError::InvalidDispatchTransition);
+            }
+            let (validated_doc, validated_fence) =
+                validate_dispatch_candidate_lineage(tx, outbox.operation_id, outbox.outbox_id)?;
+            validate_dispatch_permit_identity(&outbox, permit, &validated_doc, validated_fence)?;
+            observed_at_ms
+                .max(operation.accepted_at_ms)
+                .max(outbox.available_at_ms)
+                .max(
+                    outbox
+                        .dispatch_started_at_ms
+                        .ok_or(StoreError::Corruption)?,
+                )
+        }
+        "settled" | "failed" | "cancelled" => {
+            operation.outcome_at_ms.ok_or(StoreError::Corruption)?
+        }
+        "uncertain" => return Err(StoreError::InvalidDispatchTransition),
+        _ => return Err(StoreError::Corruption),
+    };
+
+    let kind = match completion {
+        DispatchCompletion::Settled => OperationOutcomeKind::Settled {
+            result_event_ids: settled_result_ids_for_callback(tx, permit.operation_id())?,
+        },
+        DispatchCompletion::Failed { code } => OperationOutcomeKind::Failed { code },
+        DispatchCompletion::Cancelled { reason } => OperationOutcomeKind::Cancelled { reason },
+    };
+    let outcome = OperationOutcome::new(
+        permit.operation_id(),
+        occurred_at_ms,
+        permit.action_epoch(),
+        permit.resource_fence(),
+        OutcomeSource::Dispatch,
+        kind,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    record_outcome_in_tx(tx, outcome)
+}
+
+pub(crate) fn validate_dispatch_permit_identity(
+    row: &OutboxRow,
+    permit: &DispatchPermit,
+    effect_doc: &crate::kernel::outbox::PlannedEffectDocument,
+    fence: OperationFence,
+) -> Result<(), StoreError> {
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    let resource_fence = ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+        .map_err(|_| StoreError::Corruption)?;
+    if row.outbox_id != permit.outbox_id()
+        || row.lease_generation != permit.lease_generation()
+        || row.operation_id != permit.operation_id()
+        || effect_index != permit.effect_index()
+        || attempt != permit.attempt()
+        || effect_doc != permit.document()
+        || external_idempotency_key(row.operation_id, effect_index)
+            != permit.external_idempotency_key()
+        || fence.action_epoch != permit.action_epoch()
+        || resource_fence != permit.resource_fence()
+    {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(())
+}
+
+/// Resolve provider-present reconciliation evidence. The caller has already
+/// correlated an opaque reconciliation claim with the live row; this helper
+/// owns the required durable sequence: uncertainty first, then the verified
+/// terminal outcome in the same transaction. Exact terminal replays skip the
+/// uncertainty write and use the ordinary durable-history matcher.
+pub(crate) fn record_present_reconciliation_in_tx(
+    tx: &Transaction<'_>,
+    outcome: OperationOutcome,
+    expected_outbox_id: OutboxId,
+    expected_lease_generation: i64,
+) -> Result<OperationState, StoreError> {
+    outcome
+        .validate()
+        .map_err(|_| StoreError::ConstraintViolation)?;
+    let OutcomeSource::VerifiedReconciliation { effect_index, .. } = &outcome.source else {
+        return Err(StoreError::ConflictingOutcome);
+    };
+    if !matches!(
+        &outcome.kind,
+        OperationOutcomeKind::Settled { .. } | OperationOutcomeKind::Failed { .. }
+    ) {
+        return Err(StoreError::ConflictingOutcome);
+    }
+
+    let rows = load_outbox_rows(tx, outcome.operation_id)?;
+    if rows.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    let outbox = &rows[0];
+    if outbox.outbox_id != expected_outbox_id
+        || outbox.lease_generation != expected_lease_generation
+        || outbox.effect_index != i64::from(*effect_index)
+    {
+        return Err(StoreError::StaleClaim);
+    }
+
+    if matches!(outbox.state.as_str(), "settled" | "failed") {
+        return record_outcome_in_tx(tx, outcome);
+    }
+    if outbox.state != "reconciling" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+
+    let operation = load_operation_projection_by_id(tx, outcome.operation_id)?
+        .ok_or(StoreError::MissingOperation)?;
+    if operation.state != "accepted" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let Some(task_id) = operation.task_id else {
+        return Err(StoreError::Corruption);
+    };
+    let fence = operation_fence_from_projection(&operation)?;
+    if !outcome_fences_match_accepted(&outcome, fence) {
+        return Err(StoreError::StaleFence);
+    }
+    let started_at = outbox
+        .dispatch_started_at_ms
+        .ok_or(StoreError::Corruption)?;
+    if outcome.occurred_at_ms < operation.accepted_at_ms
+        || outcome.occurred_at_ms < started_at
+        || outcome.occurred_at_ms < outbox.available_at_ms
+    {
+        return Err(StoreError::StaleFence);
+    }
+
+    let command_id = load_operation_command_id(tx, outcome.operation_id)?;
+    let (resource_id, runtime_generation) = ResourceFence::into_parts(outcome.resource_fence);
+    let uncertain = OperationUncertainFact::new(
+        command_id,
+        outcome.operation_id,
+        outcome.occurred_at_ms,
+        OperationUncertaintyCode::AmbiguousDispatch,
+        outcome.action_epoch,
+        resource_id,
+        runtime_generation,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    append_and_project(
+        tx,
+        EventId::new(),
+        Some(task_id),
+        None,
+        outcome.occurred_at_ms,
+        Event::OperationUncertain(uncertain),
+    )?;
+    transition_outbox(
+        tx,
+        outbox,
+        "reconciling",
+        "uncertain",
+        Some("ambiguous_dispatch"),
+    )?;
+    record_outcome_in_tx(tx, outcome)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +703,41 @@ fn load_operation_projection_by_id(
         accepted_at_ms,
         outcome_at_ms,
     }))
+}
+
+/// Allocate a result-event identity inside the outcome transaction, or recover
+/// the already-committed identity for an exact callback replay.
+pub(crate) fn settled_result_ids_for_callback(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+) -> Result<Vec<EventId>, StoreError> {
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    match operation.state.as_str() {
+        "accepted" | "uncertain" => {
+            if operation.result.is_some() {
+                return Err(StoreError::Corruption);
+            }
+            Ok(vec![EventId::new()])
+        }
+        "settled" => {
+            let result_event_ids = unpack_projection_blob::<Vec<EventId>>(
+                "operations.result",
+                operation.result.as_deref().ok_or(StoreError::Corruption)?,
+            )?;
+            if result_event_ids.len() != 1 {
+                return Err(StoreError::Corruption);
+            }
+            Ok(result_event_ids)
+        }
+        "failed" | "cancelled" => {
+            if operation.result.is_some() {
+                return Err(StoreError::Corruption);
+            }
+            Ok(vec![EventId::new()])
+        }
+        _ => Err(StoreError::Corruption),
+    }
 }
 
 fn operation_fence_from_projection(
@@ -1006,10 +1227,7 @@ fn apply_new_outcome(
     let outcome_event_id = EventId::new();
 
     // Dispatch outcomes against a row that already started must not predate start.
-    if matches!(outcome.source, OutcomeSource::Dispatch)
-        && expected_outbox_state == "pending"
-        && outbox.attempts > 0
-    {
+    if matches!(outcome.source, OutcomeSource::Dispatch) && outbox.attempts > 0 {
         let Some(started) = outbox.dispatch_started_at_ms else {
             return Err(StoreError::Corruption);
         };
@@ -1204,7 +1422,8 @@ fn transition_outbox(
 ) -> Result<(), StoreError> {
     let changed = tx.execute(
         "UPDATE outbox
-         SET state = ?1, leased_until_ms = NULL, last_error_class = ?2
+         SET state = ?1, leased_until_ms = NULL, last_error_class = ?2,
+             reconciliation_receipt = NULL
          WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
         rusqlite::params![
             next_state,
@@ -1342,6 +1561,67 @@ fn lookup_receipt(
         }
     }
     Ok(Some(receipt))
+}
+
+/// Validate durable e2 dispatch metadata after an explicit projection rebuild.
+/// Strict receipt-backed operations are re-correlated end to end so a missing,
+/// extra, or terminally corrupted outbox row cannot survive repair. The final
+/// outbox scan independently rejects orphan rows that have no receipt root.
+pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let receipt_backed_commands = {
+        let mut stmt = tx.prepare("SELECT command_id FROM operations ORDER BY operation_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut command_ids = Vec::new();
+        for row in rows {
+            command_ids.push(id16::<CommandId>("operations.command_id", &row?)?);
+        }
+        command_ids
+    };
+    for command_id in receipt_backed_commands {
+        lookup_receipt(tx, command_id)?.ok_or(StoreError::Corruption)?;
+    }
+
+    let operation_ids = {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT operation_id FROM outbox ORDER BY operation_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for bytes in operation_ids {
+        let operation_id = id16::<OperationId>("outbox.operation_id", &bytes)?;
+        let operation =
+            load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+        let rows = load_outbox_rows(tx, operation_id)?;
+        for row in rows {
+            match row.state.as_str() {
+                "pending" | "claimed" | "dispatching" | "reconcile_required" | "reconciling" => {
+                    if operation.state != "accepted" {
+                        return Err(StoreError::Corruption);
+                    }
+                    let decoded = decode_effect_document(
+                        &row.payload,
+                        &row.destination_class,
+                        &row.replay_policy,
+                    )?;
+                    validate_nonterminal_outbox_dispatch_metadata(
+                        &row,
+                        operation.accepted_at_ms,
+                        decoded.replay_policy,
+                    )?;
+                    if row.state == "pending" && row.last_error_class.is_some() {
+                        return Err(StoreError::Corruption);
+                    }
+                }
+                "settled" | "failed" | "cancelled" | "uncertain" => {
+                    if row.leased_until_ms.is_some() || row.reconciliation_receipt.is_some() {
+                        return Err(StoreError::Corruption);
+                    }
+                }
+                _ => return Err(StoreError::Corruption),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_accepted_receipt_correlation(
@@ -1665,20 +1945,22 @@ fn validate_side_effect_active_outbox(
         if row.lease_generation < 0 {
             return Err(StoreError::Corruption);
         }
-        match row.state.as_str() {
-            "pending" | "claimed" | "dispatching" => {
-                validate_nonterminal_outbox_dispatch_metadata(row, accepted_at_ms)?;
-            }
-            // e2 reserved names (reconcile_required/reconciling/uncertain) are never
-            // legitimate on an accepted-operation receipt in this slice.
-            _ => return Err(StoreError::Corruption),
-        }
-        if row.state == "pending" && row.last_error_class.is_some() {
-            return Err(StoreError::Corruption);
-        }
         let decoded =
             decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
         if decoded != planned.document {
+            return Err(StoreError::Corruption);
+        }
+        match row.state.as_str() {
+            "pending" | "claimed" | "dispatching" | "reconcile_required" | "reconciling" => {
+                validate_nonterminal_outbox_dispatch_metadata(
+                    row,
+                    accepted_at_ms,
+                    decoded.replay_policy,
+                )?;
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+        if row.state == "pending" && row.last_error_class.is_some() {
             return Err(StoreError::Corruption);
         }
         validate_effect_matches_fence(&decoded.effect, scope, fence)?;
@@ -1723,6 +2005,9 @@ fn validate_side_effect_terminal_receipt(
             _ => None,
         })
         .unwrap_or(outcome_at);
+    let was_reconciled = history
+        .iter()
+        .any(|fact| matches!(fact, HistoricalOutcome::Uncertain { .. }));
     for (expected_index, (row, planned)) in
         outbox_rows.iter().zip(expected_effects.iter()).enumerate()
     {
@@ -1742,6 +2027,7 @@ fn validate_side_effect_terminal_receipt(
             row,
             operation.accepted_at_ms,
             dispatch_upper_bound,
+            was_reconciled,
         )?;
         let decoded =
             decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
@@ -1768,6 +2054,7 @@ fn validate_side_effect_terminal_receipt(
 fn validate_nonterminal_outbox_dispatch_metadata(
     row: &OutboxRow,
     accepted_at_ms: i64,
+    replay_policy: ReplayPolicy,
 ) -> Result<(), StoreError> {
     if row.lease_generation < 0 {
         return Err(StoreError::Corruption);
@@ -1780,6 +2067,7 @@ fn validate_nonterminal_outbox_dispatch_metadata(
             if row.attempts == 0 {
                 if row.dispatch_started_at_ms.is_some()
                     || row.leased_until_ms.is_some()
+                    || row.reconciliation_receipt.is_some()
                     || (row.lease_generation == 0 && row.available_at_ms != accepted_at_ms)
                     || (row.lease_generation > 0 && row.available_at_ms < accepted_at_ms)
                 {
@@ -1789,7 +2077,11 @@ fn validate_nonterminal_outbox_dispatch_metadata(
                 let Some(started) = row.dispatch_started_at_ms else {
                     return Err(StoreError::Corruption);
                 };
-                if row.available_at_ms < accepted_at_ms || row.available_at_ms > started {
+                if row.available_at_ms < accepted_at_ms
+                    || (row.lease_generation == 0 && row.available_at_ms > started)
+                    || (row.lease_generation > 0 && row.available_at_ms < started)
+                    || (row.lease_generation == 0 && row.reconciliation_receipt.is_some())
+                {
                     return Err(StoreError::Corruption);
                 }
                 if let Some(lease) = row.leased_until_ms {
@@ -1797,13 +2089,17 @@ fn validate_nonterminal_outbox_dispatch_metadata(
                         return Err(StoreError::Corruption);
                     }
                 }
+                if row.lease_generation > 0 {
+                    if row.leased_until_ms.is_some() {
+                        return Err(StoreError::Corruption);
+                    }
+                    validate_retry_authorization(row, replay_policy)?;
+                }
             }
         }
         "claimed" => {
             if row.lease_generation <= 0
-                || row.attempts != 0
                 || row.leased_until_ms.is_none()
-                || row.dispatch_started_at_ms.is_some()
                 || row.available_at_ms < accepted_at_ms
                 || row.last_error_class.is_some()
             {
@@ -1811,6 +2107,19 @@ fn validate_nonterminal_outbox_dispatch_metadata(
             }
             if row.leased_until_ms.ok_or(StoreError::Corruption)? <= row.available_at_ms {
                 return Err(StoreError::Corruption);
+            }
+            if row.attempts == 0 {
+                if row.dispatch_started_at_ms.is_some() || row.reconciliation_receipt.is_some() {
+                    return Err(StoreError::Corruption);
+                }
+            } else {
+                let Some(started) = row.dispatch_started_at_ms else {
+                    return Err(StoreError::Corruption);
+                };
+                if row.available_at_ms < started || row.lease_generation <= row.attempts {
+                    return Err(StoreError::Corruption);
+                }
+                validate_retry_authorization(row, replay_policy)?;
             }
         }
         "dispatching" => {
@@ -1833,19 +2142,93 @@ fn validate_nonterminal_outbox_dispatch_metadata(
             if lease <= started {
                 return Err(StoreError::Corruption);
             }
+            if row.reconciliation_receipt.is_some() {
+                return Err(StoreError::Corruption);
+            }
+        }
+        "reconcile_required" => {
+            if replay_policy != ReplayPolicy::ReconcileBeforeRetry
+                || row.lease_generation <= 0
+                || row.attempts <= 0
+                || row.lease_generation < row.attempts
+                || row.leased_until_ms.is_some()
+                || row.reconciliation_receipt.is_some()
+                || row.last_error_class.as_deref() != Some("ambiguous_dispatch")
+            {
+                return Err(StoreError::Corruption);
+            }
+            let started = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+            if started < accepted_at_ms || row.available_at_ms < started {
+                return Err(StoreError::Corruption);
+            }
+        }
+        "reconciling" => {
+            if replay_policy != ReplayPolicy::ReconcileBeforeRetry
+                || row.lease_generation <= 0
+                || row.attempts <= 0
+                || row.lease_generation <= row.attempts
+                || row.leased_until_ms.is_none()
+                || row.reconciliation_receipt.is_some()
+                || row.last_error_class.as_deref() != Some("ambiguous_dispatch")
+            {
+                return Err(StoreError::Corruption);
+            }
+            let started = row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?;
+            let lease = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+            if started < accepted_at_ms
+                || row.available_at_ms < started
+                || lease <= row.available_at_ms
+            {
+                return Err(StoreError::Corruption);
+            }
         }
         _ => return Err(StoreError::Corruption),
     }
-    if row.reconciliation_receipt.is_some() {
-        return Err(StoreError::Corruption);
-    }
     Ok(())
+}
+
+fn validate_retry_authorization(
+    row: &OutboxRow,
+    replay_policy: ReplayPolicy,
+) -> Result<(), StoreError> {
+    match replay_policy {
+        ReplayPolicy::RetrySafe => {
+            if row.reconciliation_receipt.is_some() {
+                return Err(StoreError::Corruption);
+            }
+            Ok(())
+        }
+        ReplayPolicy::ReconcileBeforeRetry => {
+            let payload = row
+                .reconciliation_receipt
+                .as_deref()
+                .ok_or(StoreError::Corruption)?;
+            let receipt = decode_absence_receipt(payload)?;
+            let effect_index =
+                u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+            let completed_attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+            if !receipt.authorizes(
+                row.outbox_id,
+                row.operation_id,
+                effect_index,
+                completed_attempt,
+                &external_idempotency_key(row.operation_id, effect_index),
+                row.dispatch_started_at_ms.ok_or(StoreError::Corruption)?,
+                row.available_at_ms,
+            ) {
+                return Err(StoreError::Corruption);
+            }
+            Ok(())
+        }
+        ReplayPolicy::NoAutomaticRetry => Err(StoreError::Corruption),
+    }
 }
 
 fn validate_terminal_outbox_dispatch_metadata(
     row: &OutboxRow,
     accepted_at_ms: i64,
     dispatch_upper_bound_ms: i64,
+    was_reconciled: bool,
 ) -> Result<(), StoreError> {
     if row.attempts < 0 {
         return Err(StoreError::Corruption);
@@ -1861,9 +2244,12 @@ fn validate_terminal_outbox_dispatch_metadata(
         let Some(started) = row.dispatch_started_at_ms else {
             return Err(StoreError::Corruption);
         };
-        // accepted_at <= available_at <= dispatch_started <= uncertain_or_final
+        // Recovery scheduling may move availability after the dispatch start;
+        // both durable clocks must still precede uncertainty/finality.
         if row.available_at_ms < accepted_at_ms
-            || row.available_at_ms > started
+            || started < accepted_at_ms
+            || (!was_reconciled && row.available_at_ms > started)
+            || row.available_at_ms > dispatch_upper_bound_ms
             || started > dispatch_upper_bound_ms
         {
             return Err(StoreError::Corruption);
