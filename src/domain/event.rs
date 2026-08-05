@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::de::{self, Deserializer};
-use serde::ser::Serializer;
+use serde::ser::{self, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
@@ -59,6 +59,10 @@ impl OperationAcceptedFact {
             runtime_generation,
         })
     }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        validate_outcome_fence(self.resource_id, self.runtime_generation)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +78,7 @@ struct OperationAcceptedFactWire {
 
 impl Serialize for OperationAcceptedFact {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationAcceptedFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,
@@ -245,6 +250,11 @@ impl OperationSettledFact {
             source,
         })
     }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        validate_outcome_fence(self.resource_id, self.runtime_generation)?;
+        validate_terminal_fact_source(&self.source)
+    }
 }
 
 impl OperationFailedFact {
@@ -293,6 +303,11 @@ impl OperationFailedFact {
             source,
         })
     }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        validate_outcome_fence(self.resource_id, self.runtime_generation)?;
+        validate_terminal_fact_source(&self.source)
+    }
 }
 
 impl OperationCancelledFact {
@@ -315,6 +330,10 @@ impl OperationCancelledFact {
             resource_id,
             runtime_generation,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        validate_outcome_fence(self.resource_id, self.runtime_generation)
     }
 }
 
@@ -339,10 +358,15 @@ impl OperationUncertainFact {
             runtime_generation,
         })
     }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        validate_outcome_fence(self.resource_id, self.runtime_generation)
+    }
 }
 
 impl Serialize for OperationSettledFact {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationSettledFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,
@@ -376,6 +400,7 @@ impl<'de> Deserialize<'de> for OperationSettledFact {
 
 impl Serialize for OperationFailedFact {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationFailedFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,
@@ -409,6 +434,7 @@ impl<'de> Deserialize<'de> for OperationFailedFact {
 
 impl Serialize for OperationCancelledFact {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationCancelledFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,
@@ -440,6 +466,7 @@ impl<'de> Deserialize<'de> for OperationCancelledFact {
 
 impl Serialize for OperationUncertainFact {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationUncertainFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,

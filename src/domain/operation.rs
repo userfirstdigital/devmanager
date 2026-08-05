@@ -1,5 +1,5 @@
 use serde::de::{self, Deserializer};
-use serde::ser::Serializer;
+use serde::ser::{self, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::canonical;
@@ -187,6 +187,7 @@ enum OutcomeSourceWire {
 
 impl Serialize for OutcomeSource {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         let wire = match self {
             Self::Dispatch => OutcomeSourceWire::Dispatch,
             Self::VerifiedReconciliation {
@@ -265,6 +266,11 @@ impl OperationOutcome {
             kind,
         })
     }
+
+    pub fn validate(&self) -> Result<(), OutcomeFenceError> {
+        self.source.validate()?;
+        validate_source_for_kind(&self.source, &self.kind)
+    }
 }
 
 pub fn validate_source_for_kind(
@@ -298,6 +304,7 @@ struct OperationOutcomeWire {
 
 impl Serialize for OperationOutcome {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(ser::Error::custom)?;
         OperationOutcomeWire {
             operation_id: self.operation_id,
             occurred_at_ms: self.occurred_at_ms,

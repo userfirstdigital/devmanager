@@ -6,7 +6,8 @@ use crate::domain::agent::AgentRole;
 use crate::domain::event::{DomainEvent, Event};
 use crate::domain::id::{AgentSessionId, CommandId, ResourceId, TaskId};
 use crate::domain::operation::{
-    CancellationReason, OperationErrorCode, OperationUncertaintyCode, OutcomeSource,
+    CancellationReason, OperationErrorCode, OperationUncertaintyCode, OutcomeFenceError,
+    OutcomeSource,
 };
 use crate::domain::resource::ResourceLifecycle;
 use crate::domain::task::{
@@ -315,6 +316,7 @@ pub(crate) fn apply_event(
             bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::OperationAccepted(fact) => {
+            require_valid_operation_fact(fact.validate())?;
             // operations.task_id comes only from DomainEvent.task_id.
             let table = table_name("operations", shadow);
             tx.execute(
@@ -337,6 +339,7 @@ pub(crate) fn apply_event(
             )?;
         }
         Event::OperationSettled(fact) => {
+            require_valid_operation_fact(fact.validate())?;
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -354,6 +357,7 @@ pub(crate) fn apply_event(
             )?;
         }
         Event::OperationFailed(fact) => {
+            require_valid_operation_fact(fact.validate())?;
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -371,6 +375,7 @@ pub(crate) fn apply_event(
             )?;
         }
         Event::OperationCancelled(fact) => {
+            require_valid_operation_fact(fact.validate())?;
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -388,6 +393,7 @@ pub(crate) fn apply_event(
             )?;
         }
         Event::OperationUncertain(fact) => {
+            require_valid_operation_fact(fact.validate())?;
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -912,5 +918,112 @@ fn cancel_text(value: CancellationReason) -> &'static str {
 fn uncertain_text(value: OperationUncertaintyCode) -> &'static str {
     match value {
         OperationUncertaintyCode::AmbiguousDispatch => "ambiguous_dispatch",
+    }
+}
+
+fn require_valid_operation_fact(result: Result<(), OutcomeFenceError>) -> Result<(), StoreError> {
+    result.map_err(|err| StoreError::Projection(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::event::{
+        OperationAcceptedFact, OperationCancelledFact, OperationUncertainFact,
+    };
+    use crate::domain::id::{CommandId, EventId, OperationId, ResourceId, TaskId};
+    use crate::domain::operation::CancellationReason;
+    use crate::kernel::store::KernelStore;
+    use tempfile::TempDir;
+
+    fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+        [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ]
+    }
+
+    fn domain(payload: Event) -> DomainEvent {
+        DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0x90)).unwrap(),
+            task_id: Some(TaskId::from_bytes(fixed_uuid_v7(0x40)).unwrap()),
+            sequence: 1,
+            task_revision: None,
+            occurred_at_ms: 1,
+            payload,
+        }
+    }
+
+    #[test]
+    fn command_contract_projector_rejects_forged_partial_fence_facts() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+
+        let cmd = CommandId::from_bytes(fixed_uuid_v7(0x41)).unwrap();
+        let op = OperationId::from_bytes(fixed_uuid_v7(0x42)).unwrap();
+        let resource = ResourceId::from_bytes(fixed_uuid_v7(0x43)).unwrap();
+
+        let forged_accepted = OperationAcceptedFact {
+            command_id: cmd,
+            operation_id: op,
+            accepted_at_ms: 1,
+            action_epoch: None,
+            resource_id: Some(resource),
+            runtime_generation: None,
+        };
+        let err = store
+            .with_transaction(|tx| {
+                apply_event(
+                    tx,
+                    &domain(Event::OperationAccepted(forged_accepted)),
+                    false,
+                )
+            })
+            .expect_err("accepted partial fence");
+        assert!(
+            matches!(err, StoreError::Projection(_)),
+            "expected projection error, got {err:?}"
+        );
+
+        let forged_cancelled = OperationCancelledFact {
+            command_id: cmd,
+            operation_id: op,
+            settled_at_ms: 1,
+            reason: CancellationReason::Superseded,
+            action_epoch: None,
+            resource_id: None,
+            runtime_generation: Some(2),
+        };
+        let err = store
+            .with_transaction(|tx| {
+                apply_event(
+                    tx,
+                    &domain(Event::OperationCancelled(forged_cancelled)),
+                    false,
+                )
+            })
+            .expect_err("cancelled partial fence");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+
+        let forged_uncertain = OperationUncertainFact {
+            command_id: cmd,
+            operation_id: op,
+            observed_at_ms: 1,
+            code: OperationUncertaintyCode::AmbiguousDispatch,
+            action_epoch: Some(1),
+            resource_id: Some(resource),
+            runtime_generation: None,
+        };
+        let err = store
+            .with_transaction(|tx| {
+                apply_event(
+                    tx,
+                    &domain(Event::OperationUncertain(forged_uncertain)),
+                    false,
+                )
+            })
+            .expect_err("uncertain partial fence");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
     }
 }

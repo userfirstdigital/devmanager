@@ -2574,3 +2574,126 @@ fn command_contract_settled_failed_facts_persist_source() {
     );
     assert_golden_event("operation_failed.json", &Event::OperationFailed(failed));
 }
+
+#[test]
+fn command_contract_forged_public_values_fail_closed_on_serialize() {
+    fn assert_json_and_msgpack_reject<T: serde::Serialize>(value: &T, label: &str) {
+        assert!(
+            serde_json::to_value(value).is_err(),
+            "{label}: JSON serialize must reject forged value"
+        );
+        assert!(
+            rmp_serde::to_vec(value).is_err(),
+            "{label}: MessagePack serialize must reject forged value"
+        );
+    }
+
+    let blank_identity = OutcomeSource::VerifiedReconciliation {
+        effect_index: 0,
+        external_identity: "   ".into(),
+    };
+    assert_json_and_msgpack_reject(&blank_identity, "blank reconciliation identity");
+
+    let oversize_identity = OutcomeSource::VerifiedReconciliation {
+        effect_index: 0,
+        external_identity: "x".repeat(MAX_EXTERNAL_IDENTITY_BYTES + 1),
+    };
+    assert_json_and_msgpack_reject(&oversize_identity, "oversize reconciliation identity");
+
+    let invalid_pairing = OperationOutcome {
+        operation_id: operation_id(0x71),
+        occurred_at_ms: 1,
+        action_epoch: None,
+        resource_fence: None,
+        source: OutcomeSource::VerifiedReconciliation {
+            effect_index: 0,
+            external_identity: "ext-1".into(),
+        },
+        kind: OperationOutcomeKind::Cancelled {
+            reason: CancellationReason::Superseded,
+        },
+    };
+    assert_json_and_msgpack_reject(&invalid_pairing, "invalid source/kind pairing");
+
+    let partial_fence_settled = OperationSettledFact {
+        command_id: command_id(0x3b),
+        operation_id: operation_id(0x61),
+        settled_at_ms: 1,
+        result_event_ids: Vec::new(),
+        action_epoch: None,
+        resource_id: Some(resource_id(0x57)),
+        runtime_generation: None,
+        source: OutcomeSource::Dispatch,
+    };
+    assert_json_and_msgpack_reject(&partial_fence_settled, "partial resource fence on settled");
+    assert_json_and_msgpack_reject(
+        &Event::OperationSettled(partial_fence_settled),
+        "partial fence via settled event",
+    );
+
+    let invalid_source_failed = OperationFailedFact {
+        command_id: command_id(0x3b),
+        operation_id: operation_id(0x61),
+        settled_at_ms: 1,
+        code: OperationErrorCode::SideEffectFailed,
+        action_epoch: None,
+        resource_id: None,
+        runtime_generation: None,
+        source: OutcomeSource::VerifiedReconciliation {
+            effect_index: 0,
+            external_identity: String::new(),
+        },
+    };
+    assert_json_and_msgpack_reject(
+        &invalid_source_failed,
+        "invalid terminal fact source on failed",
+    );
+    assert_json_and_msgpack_reject(
+        &Event::OperationFailed(invalid_source_failed),
+        "invalid terminal fact source via failed event",
+    );
+
+    let forged_accepted = OperationAcceptedFact {
+        command_id: command_id(0x3b),
+        operation_id: operation_id(0x61),
+        accepted_at_ms: 1,
+        action_epoch: None,
+        resource_id: Some(resource_id(0x57)),
+        runtime_generation: None,
+    };
+    assert_json_and_msgpack_reject(&forged_accepted, "partial fence on accepted");
+    assert_json_and_msgpack_reject(
+        &Event::OperationAccepted(forged_accepted),
+        "partial fence via accepted event",
+    );
+
+    let forged_cancelled = OperationCancelledFact {
+        command_id: command_id(0x3b),
+        operation_id: operation_id(0x61),
+        settled_at_ms: 1,
+        reason: CancellationReason::Superseded,
+        action_epoch: None,
+        resource_id: None,
+        runtime_generation: Some(2),
+    };
+    assert_json_and_msgpack_reject(&forged_cancelled, "partial fence on cancelled");
+    assert_json_and_msgpack_reject(
+        &Event::OperationCancelled(forged_cancelled),
+        "partial fence via cancelled event",
+    );
+
+    let forged_uncertain = OperationUncertainFact {
+        command_id: command_id(0x3b),
+        operation_id: operation_id(0x61),
+        observed_at_ms: 1,
+        code: OperationUncertaintyCode::AmbiguousDispatch,
+        action_epoch: Some(1),
+        resource_id: Some(resource_id(0x57)),
+        runtime_generation: None,
+    };
+    assert_json_and_msgpack_reject(&forged_uncertain, "partial fence on uncertain");
+    assert_json_and_msgpack_reject(
+        &Event::OperationUncertain(forged_uncertain),
+        "partial fence via uncertain event",
+    );
+}

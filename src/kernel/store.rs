@@ -141,6 +141,17 @@ impl KernelStore {
         open_readonly_query_connection(&self.path)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_transaction<T>(
+        &mut self,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let tx = self.conn.transaction()?;
+        let out = body(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let manifest = schema::migration_manifest();
         loop {
@@ -266,15 +277,23 @@ fn classify_path_before_open(path: &Path) -> Result<(), StoreError> {
 }
 
 fn map_open_error(err: rusqlite::Error) -> StoreError {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-    if lower.contains("truncated") || lower.contains("file is not a database") {
-        if lower.contains("truncated") {
-            StoreError::Truncated
-        } else {
-            StoreError::Corruption
+    if let rusqlite::Error::SqliteFailure(code, _) = &err {
+        match code.code {
+            rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::DatabaseCorrupt
+            | rusqlite::ErrorCode::NotADatabase
+            | rusqlite::ErrorCode::ConstraintViolation => {
+                return map_sqlite_error(&err);
+            }
+            _ => {}
         }
-    } else if lower.contains("corrupt") {
+    }
+    // Text fallback only when SQLite did not surface a typed code above.
+    let lower = err.to_string().to_lowercase();
+    if lower.contains("truncated") {
+        StoreError::Truncated
+    } else if lower.contains("file is not a database") || lower.contains("corrupt") {
         StoreError::Corruption
     } else {
         map_sqlite_error(&err)
@@ -338,7 +357,8 @@ fn map_sqlite_error(err: &rusqlite::Error) -> StoreError {
             StoreError::Busy
         }
         rusqlite::Error::SqliteFailure(code, _)
-            if code.code == rusqlite::ErrorCode::DatabaseCorrupt =>
+            if code.code == rusqlite::ErrorCode::DatabaseCorrupt
+                || code.code == rusqlite::ErrorCode::NotADatabase =>
         {
             StoreError::Corruption
         }
@@ -880,6 +900,23 @@ mod tests {
             Some("database disk image is malformed".into()),
         );
         assert_eq!(map_sqlite_error(&corrupt), StoreError::Corruption);
+
+        let not_a_db = rusqlite::Error::SqliteFailure(
+            FfiError::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("file is not a database".into()),
+        );
+        assert_eq!(
+            map_sqlite_error(&not_a_db),
+            StoreError::Corruption,
+            "NotADatabase must map by typed code"
+        );
+        assert_eq!(
+            map_open_error(rusqlite::Error::SqliteFailure(
+                FfiError::new(rusqlite::ffi::SQLITE_NOTADB),
+                Some("file is not a database".into()),
+            )),
+            StoreError::Corruption
+        );
 
         // Typed variants reserved for later execute/record_outcome paths.
         assert_ne!(StoreError::StaleFence, StoreError::ConflictingOutcome);
