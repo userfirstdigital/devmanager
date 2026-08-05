@@ -4,7 +4,7 @@ use rusqlite::Transaction;
 
 use crate::domain::agent::AgentRole;
 use crate::domain::event::{DomainEvent, Event};
-use crate::domain::id::{AgentSessionId, ResourceId, TaskId};
+use crate::domain::id::{AgentSessionId, CommandId, ResourceId, TaskId};
 use crate::domain::operation::{CancellationReason, OperationErrorCode, OperationUncertaintyCode};
 use crate::domain::resource::ResourceLifecycle;
 use crate::domain::task::{
@@ -112,6 +112,7 @@ pub(crate) fn apply_event(
         Event::TaskCloseBegun { action_epoch } => {
             let task_id = require_task_id(event)?;
             let next_revision = require_next_revision(tx, shadow, task_id, event)?;
+            require_close_begun(tx, shadow, task_id, *action_epoch)?;
             let table = table_name("tasks", shadow);
             tx.execute(
                 &format!(
@@ -132,6 +133,7 @@ pub(crate) fn apply_event(
         Event::TaskReopened => {
             let task_id = require_task_id(event)?;
             let next_revision = require_next_revision(tx, shadow, task_id, event)?;
+            require_reopen(tx, shadow, task_id)?;
             let table = table_name("tasks", shadow);
             tx.execute(
                 &format!(
@@ -151,6 +153,7 @@ pub(crate) fn apply_event(
         Event::TaskArchived => {
             let task_id = require_task_id(event)?;
             let next_revision = require_next_revision(tx, shadow, task_id, event)?;
+            require_archive(tx, shadow, task_id)?;
             let table = table_name("tasks", shadow);
             tx.execute(
                 &format!(
@@ -336,6 +339,7 @@ pub(crate) fn apply_event(
                 tx,
                 shadow,
                 event.task_id,
+                fact.command_id,
                 fact.operation_id.as_bytes(),
                 fact.action_epoch,
                 fact.resource_id,
@@ -351,6 +355,7 @@ pub(crate) fn apply_event(
                 tx,
                 shadow,
                 event.task_id,
+                fact.command_id,
                 fact.operation_id.as_bytes(),
                 fact.action_epoch,
                 fact.resource_id,
@@ -366,6 +371,7 @@ pub(crate) fn apply_event(
                 tx,
                 shadow,
                 event.task_id,
+                fact.command_id,
                 fact.operation_id.as_bytes(),
                 fact.action_epoch,
                 fact.resource_id,
@@ -381,6 +387,7 @@ pub(crate) fn apply_event(
                 tx,
                 shadow,
                 event.task_id,
+                fact.command_id,
                 fact.operation_id.as_bytes(),
                 fact.action_epoch,
                 fact.resource_id,
@@ -468,6 +475,75 @@ fn require_one_change(tx: &Transaction<'_>, context: &str) -> Result<(), StoreEr
     if tx.changes() != 1 {
         return Err(StoreError::Projection(format!(
             "{context}: expected exactly one affected row"
+        )));
+    }
+    Ok(())
+}
+
+fn read_task_lifecycle_epoch(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+) -> Result<(String, i64), StoreError> {
+    let table = table_name("tasks", shadow);
+    match tx.query_row(
+        &format!("SELECT lifecycle, action_epoch FROM {table} WHERE task_id = ?1"),
+        [task_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::Projection(
+            "missing task for lifecycle transition".into(),
+        )),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn require_close_begun(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    action_epoch: u64,
+) -> Result<(), StoreError> {
+    let (lifecycle, stored_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    if lifecycle != lifecycle_text(TaskLifecycle::Open) {
+        return Err(StoreError::Projection(format!(
+            "task.close_begun requires open lifecycle, found {lifecycle}"
+        )));
+    }
+    let stored_u64 = u64::try_from(stored_epoch).map_err(|_| StoreError::IntegerOutOfRange {
+        field: "tasks.action_epoch",
+        value: stored_epoch.unsigned_abs(),
+    })?;
+    let expected = stored_u64
+        .checked_add(1)
+        .ok_or(StoreError::IntegerOutOfRange {
+            field: "tasks.action_epoch",
+            value: u64::MAX,
+        })?;
+    if action_epoch != expected {
+        return Err(StoreError::Projection(format!(
+            "task.close_begun action_epoch must be stored+1: stored {stored_u64}, event {action_epoch}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_reopen(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
+    let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    match lifecycle.as_str() {
+        "closing" | "archived" => Ok(()),
+        other => Err(StoreError::Projection(format!(
+            "task.reopened requires closing or archived lifecycle, found {other}"
+        ))),
+    }
+}
+
+fn require_archive(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
+    let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    if lifecycle != lifecycle_text(TaskLifecycle::Closing) {
+        return Err(StoreError::Projection(format!(
+            "task.archived requires closing lifecycle, found {lifecycle}"
         )));
     }
     Ok(())
@@ -575,6 +651,7 @@ fn apply_operation_outcome(
     tx: &Transaction<'_>,
     shadow: bool,
     event_task_id: Option<TaskId>,
+    command_id: CommandId,
     operation_id: &[u8; 16],
     action_epoch: Option<u64>,
     resource_id: Option<crate::domain::id::ResourceId>,
@@ -587,6 +664,7 @@ fn apply_operation_outcome(
     let table = table_name("operations", shadow);
     let row: Result<
         (
+            Vec<u8>,
             Option<Vec<u8>>,
             Option<i64>,
             Option<Vec<u8>>,
@@ -596,7 +674,7 @@ fn apply_operation_outcome(
         rusqlite::Error,
     > = tx.query_row(
         &format!(
-            "SELECT task_id, action_epoch, resource_id, runtime_generation, state
+            "SELECT command_id, task_id, action_epoch, resource_id, runtime_generation, state
              FROM {table} WHERE operation_id = ?1"
         ),
         [operation_id.as_slice()],
@@ -607,10 +685,18 @@ fn apply_operation_outcome(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         },
     );
-    let (stored_task, stored_epoch, stored_resource, stored_generation, stored_state) = match row {
+    let (
+        stored_command,
+        stored_task,
+        stored_epoch,
+        stored_resource,
+        stored_generation,
+        stored_state,
+    ) = match row {
         Ok(v) => v,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             return Err(StoreError::Projection("operation not found".into()))
@@ -621,6 +707,11 @@ fn apply_operation_outcome(
         return Err(StoreError::Projection(format!(
             "operation state {stored_state} is not accepted"
         )));
+    }
+    if stored_command.as_slice() != command_id.as_bytes().as_slice() {
+        return Err(StoreError::Projection(
+            "operation command_id fence mismatch".into(),
+        ));
     }
     let expected_task = event_task_id.map(|id| id.as_bytes().as_slice().to_vec());
     if stored_task != expected_task {

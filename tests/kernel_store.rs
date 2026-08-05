@@ -4,8 +4,9 @@ use std::path::Path;
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts};
 use devmanager::domain::event::{
     AgentSessionRegisteredPayload, OperationAcceptedFact, OperationSettledFact,
-    PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleasedPayload, TaskCreatedPayload,
-    TaskRenamedPayload, EVENT_SCHEMA_VERSION,
+    PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleasedPayload,
+    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
+    EVENT_SCHEMA_VERSION,
 };
 use devmanager::domain::id::{
     AgentSessionId, ClientId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
@@ -396,6 +397,16 @@ fn schema_interrupted_migration_is_safe() {
 #[test]
 fn schema_corrupt_and_truncated_databases_fail_typed() {
     let dir = TempDir::new().expect("tempdir");
+
+    let zero = dir.path().join("zero.sqlite3");
+    fs::write(&zero, b"").expect("write zero-byte file");
+    assert!(zero.exists());
+    assert_eq!(fs::metadata(&zero).unwrap().len(), 0);
+    let err = KernelStore::open(&zero).expect_err("existing zero-byte db");
+    assert!(
+        matches!(err, StoreError::Truncated),
+        "existing zero-byte file must be Truncated, got {err:?}"
+    );
 
     let truncated = dir.path().join("truncated.sqlite3");
     fs::write(&truncated, b"SQLite format 3\0").expect("write truncated");
@@ -1278,4 +1289,294 @@ fn schema_corrupt_revision_order_fails_projection() {
     let mut store = KernelStore::open(&path2).expect("reopen");
     let err = store.rebuild_projections().expect_err("missing task");
     assert!(matches!(err, StoreError::Projection(_)));
+}
+
+#[test]
+fn schema_replay_rejects_domain_invalid_transitions() {
+    let dir = TempDir::new().expect("tempdir");
+
+    // Blank rename title must fail decode/replay (domain canonicalize).
+    {
+        let path = dir.path().join("blank_rename.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xF0);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xF1), 1_000);
+        insert_event(
+            &conn,
+            event_id(0xF2),
+            Some(task),
+            Some(2),
+            "task.renamed",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&TaskRenamedPayload {
+                title: "   ".into(),
+            })
+            .unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store.rebuild_projections().expect_err("blank rename");
+        assert!(
+            matches!(err, StoreError::EventDecode(_) | StoreError::Projection(_)),
+            "blank rename must fail, got {err:?}"
+        );
+    }
+
+    // CloseBegun requires Open and action_epoch == stored + 1.
+    {
+        let path = dir.path().join("bad_close.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xF3);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xF4), 1_000);
+        insert_event(
+            &conn,
+            event_id(0xF5),
+            Some(task),
+            Some(2),
+            "task.close_begun",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 99 }).unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store.rebuild_projections().expect_err("bad close epoch");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+    }
+
+    // A second close with the next revision/epoch still fails because the task is Closing.
+    {
+        let path = dir.path().join("double_close.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xE2);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xE3), 1_000);
+        insert_event(
+            &conn,
+            event_id(0xE4),
+            Some(task),
+            Some(2),
+            "task.close_begun",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 1 }).unwrap(),
+        );
+        insert_event(
+            &conn,
+            event_id(0xE5),
+            Some(task),
+            Some(3),
+            "task.close_begun",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_200,
+            &rmp_serde::to_vec(&TaskCloseBegunPayload { action_epoch: 2 }).unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store.rebuild_projections().expect_err("close from closing");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+    }
+
+    // Reopen from Open is invalid.
+    {
+        let path = dir.path().join("bad_reopen.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xF6);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xF7), 1_000);
+        insert_event(
+            &conn,
+            event_id(0xF8),
+            Some(task),
+            Some(2),
+            "task.reopened",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store.rebuild_projections().expect_err("reopen from open");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+    }
+
+    // Archive from Open is invalid (must be Closing).
+    {
+        let path = dir.path().join("bad_archive.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xF9);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xFA), 1_000);
+        insert_event(
+            &conn,
+            event_id(0xFB),
+            Some(task),
+            Some(2),
+            "task.archived",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&TaskUnitPayload {}).unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store.rebuild_projections().expect_err("archive from open");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+    }
+
+    // ResourceRegistered must reject non-Active registration lifecycle.
+    {
+        let path = dir.path().join("bad_resource.sqlite3");
+        drop(KernelStore::open(&path).expect("open"));
+        let task = task_id(0xFC);
+        let resource = resource_id(0xFD);
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xFE), 1_000);
+        let resource_facts = ResourceFacts {
+            id: resource,
+            task_id: Some(task),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            lifecycle: ResourceLifecycle::Releasing,
+            runtime_generation: 0,
+            updated_at_ms: 1_100,
+        };
+        insert_event(
+            &conn,
+            event_id(0xFF),
+            Some(task),
+            Some(2),
+            "resource.registered",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&ResourceRegisteredPayload {
+                resource: resource_facts,
+            })
+            .unwrap(),
+        );
+        drop(conn);
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store
+            .rebuild_projections()
+            .expect_err("releasing registration");
+        assert!(
+            matches!(err, StoreError::EventDecode(_) | StoreError::Projection(_)),
+            "releasing registration must fail, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn schema_operation_outcome_requires_matching_command_id() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    drop(KernelStore::open(&path).expect("open"));
+
+    let task = task_id(0xA8);
+    let resource = resource_id(0xA9);
+    let cmd = command_id(0xAA);
+    let other_cmd = command_id(0xAB);
+    let op = operation_id(0xAC);
+    let result_event = event_id(0xAD);
+
+    {
+        let conn = open_raw(&path);
+        seed_task_created(&conn, task, event_id(0xB0), 1_000);
+        let resource_facts = ResourceFacts {
+            id: resource,
+            task_id: Some(task),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 2,
+            updated_at_ms: 1_100,
+        };
+        insert_event(
+            &conn,
+            event_id(0xB1),
+            Some(task),
+            Some(2),
+            "resource.registered",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_100,
+            &rmp_serde::to_vec(&ResourceRegisteredPayload {
+                resource: resource_facts,
+            })
+            .unwrap(),
+        );
+        conn.execute(
+            "INSERT INTO command_receipts(
+                command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
+             ) VALUES (?1, ?2, ?3, X'00', 3, 1200)",
+            rusqlite::params![
+                cmd.as_bytes().as_slice(),
+                client_id(0xAE).as_bytes().as_slice(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+        let accepted =
+            OperationAcceptedFact::new(cmd, op, 1_200, Some(0), Some(resource), Some(2)).unwrap();
+        insert_event(
+            &conn,
+            event_id(0xB2),
+            Some(task),
+            None,
+            "operation.accepted",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_200,
+            &rmp_serde::to_vec(&accepted).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("accept");
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        // Every fence matches except command_id.
+        let settled = OperationSettledFact::new(
+            other_cmd,
+            op,
+            1_300,
+            vec![result_event],
+            Some(0),
+            Some(resource),
+            Some(2),
+        )
+        .unwrap();
+        insert_event(
+            &conn,
+            event_id(0xB3),
+            Some(task),
+            None,
+            "operation.settled",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_300,
+            &rmp_serde::to_vec(&settled).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store.rebuild_projections().expect_err("command fence");
+    assert!(
+        matches!(err, StoreError::Projection(_)),
+        "expected command_id fence failure, got {err:?}"
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM operations WHERE operation_id = ?1",
+            [op.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "accepted");
 }

@@ -231,7 +231,9 @@ fn classify_path_before_open(path: &Path) -> Result<(), StoreError> {
         return Ok(());
     }
     let meta = std::fs::metadata(path).map_err(|e| StoreError::Io(e.to_string()))?;
-    if meta.len() > 0 && meta.len() < 100 {
+    // Existing files shorter than a minimum valid SQLite header/page are truncated,
+    // including a pre-existing zero-byte path (SQLite would otherwise initialize it).
+    if meta.len() < 100 {
         return Err(StoreError::Truncated);
     }
     Ok(())
@@ -651,7 +653,9 @@ fn decode_stored_event(
         }
         "task.renamed" => {
             let p: TaskRenamedPayload = unpack(payload)?;
-            Event::TaskRenamed { title: p.title }
+            let title = crate::domain::task::TaskFacts::canonicalize_title(p.title)
+                .map_err(|e| StoreError::EventDecode(e.to_string()))?;
+            Event::TaskRenamed { title }
         }
         "task.attention_set" => {
             let p: TaskAttentionSetPayload = unpack(payload)?;
@@ -698,7 +702,7 @@ fn decode_stored_event(
         "resource.registered" => {
             let p: ResourceRegisteredPayload = unpack(payload)?;
             p.resource
-                .validate()
+                .validate_for_registration()
                 .map_err(|e| StoreError::EventDecode(e.to_string()))?;
             Event::ResourceRegistered {
                 resource: p.resource,
