@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::domain::id::{AgentSessionId, ArtifactId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
 use crate::domain::snapshot::{
     PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
     TaskSnapshotItem,
@@ -28,7 +28,6 @@ pub(crate) enum SnapshotError {
     EntropyUnavailable,
     InvalidCursor,
     CursorContextMismatch,
-    UnsupportedSection,
     PageEnvelopeTooLarge {
         encoded_bytes: u32,
         max_encoded_bytes: u32,
@@ -48,7 +47,6 @@ impl fmt::Display for SnapshotError {
             Self::EntropyUnavailable => write!(f, "snapshot cursor entropy unavailable"),
             Self::InvalidCursor => write!(f, "invalid snapshot cursor"),
             Self::CursorContextMismatch => write!(f, "snapshot cursor context mismatch"),
-            Self::UnsupportedSection => write!(f, "snapshot section is not implemented"),
             Self::PageEnvelopeTooLarge {
                 encoded_bytes,
                 max_encoded_bytes,
@@ -168,7 +166,7 @@ impl SnapshotSession {
             SnapshotSection::AgentSessions => self.agent_sessions_page(after_item),
             SnapshotSection::Artifacts => self.artifacts_page(after_item),
             SnapshotSection::Resources => self.resources_page(after_item),
-            SnapshotSection::Operations => Err(SnapshotError::UnsupportedSection),
+            SnapshotSection::Operations => self.operations_page(after_item),
         }
     }
 
@@ -281,6 +279,32 @@ impl SnapshotSession {
                         StoreError::Projection("resource disappeared from pinned snapshot".into())
                     })?;
                 Ok(SnapshotItem::Resource(resource))
+            },
+        )
+    }
+
+    fn operations_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_operation = match after_item {
+            Some(SnapshotItemKey::Operation(operation_id)) => Some(operation_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let fetch_limit = i64::from(self.limits.max_items) + 1;
+        let operation_ids = load_operation_ids(&self.conn, after_operation, fetch_limit)?;
+        self.assemble_page(
+            SnapshotSection::Operations,
+            after_item,
+            operation_ids,
+            SnapshotItemKey::Operation,
+            |operation_id| {
+                let operation = command_bus::load_operation_facts(&self.conn, operation_id)?
+                    .ok_or_else(|| {
+                        StoreError::Projection("operation disappeared from pinned snapshot".into())
+                    })?;
+                Ok(SnapshotItem::Operation(operation))
             },
         )
     }
@@ -560,6 +584,39 @@ fn load_resource_ids(
     Ok(resource_ids)
 }
 
+fn load_operation_ids(
+    conn: &Connection,
+    after_operation: Option<OperationId>,
+    fetch_limit: i64,
+) -> Result<Vec<OperationId>, SnapshotError> {
+    let mut operation_ids = Vec::new();
+    match after_operation {
+        Some(after_operation) => {
+            let mut stmt = conn.prepare(
+                "SELECT operation_id FROM operations
+                 WHERE operation_id > ?1 ORDER BY operation_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![after_operation.as_bytes().as_slice(), fetch_limit],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                operation_ids.push(decode_operation_id(&row?)?);
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT operation_id FROM operations ORDER BY operation_id ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                operation_ids.push(decode_operation_id(&row?)?);
+            }
+        }
+    }
+    Ok(operation_ids)
+}
+
 fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
     let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
         detail: "tasks.task_id must be 16 bytes".into(),
@@ -600,6 +657,17 @@ fn decode_resource_id(bytes: &[u8]) -> Result<ResourceId, SnapshotError> {
     ResourceId::from_bytes(bytes)
         .map_err(|error| StoreError::CodecMismatch {
             detail: format!("resources.resource_id: {error}"),
+        })
+        .map_err(Into::into)
+}
+
+fn decode_operation_id(bytes: &[u8]) -> Result<OperationId, SnapshotError> {
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: "operations.operation_id must be 16 bytes".into(),
+    })?;
+    OperationId::from_bytes(bytes)
+        .map_err(|error| StoreError::CodecMismatch {
+            detail: format!("operations.operation_id: {error}"),
         })
         .map_err(Into::into)
 }
@@ -662,6 +730,8 @@ impl Drop for SnapshotSession {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -671,9 +741,10 @@ mod tests {
         Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RenameTaskIntent,
     };
     use crate::domain::id::{
-        AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, ProjectId, ResourceId,
-        TaskId,
+        AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, OperationId, ProjectId,
+        ResourceId, TaskId,
     };
+    use crate::domain::operation::OperationState;
     use crate::domain::resource::{
         OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
     };
@@ -681,6 +752,7 @@ mod tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
+    use crate::kernel::dispatch::DispatchCompletion;
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -722,8 +794,8 @@ mod tests {
         }
     }
 
-    fn create_task(store: &mut KernelStore, task_id: TaskId, command_id: CommandId) {
-        create_task_with_title(store, task_id, command_id, "Ship kernel");
+    fn create_task(store: &mut KernelStore, task_id: TaskId, command_id: CommandId) -> OperationId {
+        create_task_with_title(store, task_id, command_id, "Ship kernel")
     }
 
     fn create_task_with_title(
@@ -731,7 +803,7 @@ mod tests {
         task_id: TaskId,
         command_id: CommandId,
         title: &str,
-    ) {
+    ) -> OperationId {
         let intent = CreateTaskIntent {
             id: task_id,
             environment_id: environment_id(0x10),
@@ -746,14 +818,18 @@ mod tests {
             activity: TaskActivity::Idle,
             review_readiness: ReviewReadiness::NotReady,
         };
-        store
+        match store
             .execute(envelope(
                 command_id,
                 None,
                 None,
                 Command::CreateTask(intent),
             ))
-            .expect("create task");
+            .expect("create task")
+        {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected accepted create, got {other:?}"),
+        }
     }
 
     fn agent_facts(task_id: TaskId, agent_session_id: AgentSessionId) -> AgentSessionFacts {
@@ -1511,6 +1587,163 @@ mod tests {
                 item: SnapshotItemKey::Resource(id),
                 ..
             }) if id == resource
+        ));
+    }
+
+    #[test]
+    fn snapshot_operations_pages_are_frozen_and_resume_without_duplicates() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let first_task = task_id(0xD0);
+        let second_task = task_id(0xD1);
+        let create_first_command = command_id(0xD2);
+        let create_second_command = command_id(0xD3);
+        let close_command = command_id(0xD4);
+        let create_first = create_task(&mut store, first_task, create_first_command);
+        let create_second = create_task(&mut store, second_task, create_second_command);
+        let close = match store
+            .execute(envelope(
+                close_command,
+                Some(first_task),
+                Some(1),
+                Command::BeginCloseTask,
+            ))
+            .expect("begin close")
+        {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected accepted close, got {other:?}"),
+        };
+        let mut expected_ids = vec![create_first, create_second, close];
+        expected_ids.sort();
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(2, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim dispatch")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&claim).expect("begin dispatch");
+        assert!(matches!(
+            store
+                .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+                .expect("settle close"),
+            OperationState::Settled { .. }
+        ));
+        let post_snapshot = create_task(&mut store, task_id(0xD5), command_id(0xD6));
+
+        let first = snapshot
+            .page(SnapshotSection::Operations, None)
+            .expect("first operation page");
+        let cursor = first.next_cursor.clone().expect("operation resume cursor");
+        let second = snapshot
+            .page(SnapshotSection::Operations, Some(&cursor))
+            .expect("second operation page");
+
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(first.through_sequence, second.through_sequence);
+        assert_eq!(
+            second.after_item,
+            Some(SnapshotItemKey::Operation(expected_ids[1]))
+        );
+        assert_eq!(second.next_cursor, None);
+        for page in [&first, &second] {
+            assert_eq!(
+                usize::try_from(page.encoded_bytes).expect("page length fits"),
+                rmp_serde::to_vec_named(page)
+                    .expect("encode operation page")
+                    .len(),
+            );
+        }
+
+        let operations = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| match item {
+                SnapshotItem::Operation(operation) => operation,
+                other => panic!("expected operation item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(!operations
+            .iter()
+            .any(|operation| operation.id == post_snapshot));
+
+        let close_facts = operations
+            .iter()
+            .find(|operation| operation.id == close)
+            .expect("close operation");
+        assert_eq!(close_facts.command_id, close_command);
+        assert_eq!(close_facts.task_id, Some(first_task));
+        assert_eq!(close_facts.state, OperationState::Accepted);
+        for (id, command_id, task_id) in [
+            (create_first, create_first_command, first_task),
+            (create_second, create_second_command, second_task),
+        ] {
+            let facts = operations
+                .iter()
+                .find(|operation| operation.id == id)
+                .expect("create operation");
+            assert_eq!(facts.command_id, command_id);
+            assert_eq!(facts.task_id, Some(task_id));
+            assert!(matches!(facts.state, OperationState::Settled { .. }));
+        }
+    }
+
+    #[test]
+    fn snapshot_operations_reject_invalid_durable_lineage() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let command = command_id(0xD8);
+        create_task(&mut store, task_id(0xD7), command);
+
+        let conn = Connection::open(&path).expect("open tamper connection");
+        conn.execute(
+            "UPDATE command_receipts SET receipt = X'00' WHERE command_id = ?1",
+            [command.as_bytes().as_slice()],
+        )
+        .expect("tamper receipt lineage");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        assert!(matches!(
+            snapshot
+                .page(SnapshotSection::Operations, None)
+                .expect_err("invalid operation lineage must fail closed"),
+            SnapshotError::Store(StoreError::CodecMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_operations_report_oversized_item_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let operation = create_task(&mut store, task_id(0xDA), command_id(0xDB));
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 1).expect("limits"))
+            .expect("begin snapshot");
+        assert!(matches!(
+            snapshot.page(SnapshotSection::Operations, None),
+            Err(SnapshotError::PageItemTooLarge {
+                item: SnapshotItemKey::Operation(id),
+                ..
+            }) if id == operation
         ));
     }
 

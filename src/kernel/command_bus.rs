@@ -19,8 +19,8 @@ use crate::domain::id::{
     ProjectId, ResourceId, TaskId,
 };
 use crate::domain::operation::{
-    CancellationReason, OperationErrorCode, OperationOutcome, OperationOutcomeKind, OperationState,
-    OperationUncertaintyCode, OutcomeSource, ResourceFence,
+    CancellationReason, OperationErrorCode, OperationFacts, OperationOutcome, OperationOutcomeKind,
+    OperationState, OperationUncertaintyCode, OutcomeSource, ResourceFence,
 };
 use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
@@ -50,16 +50,23 @@ pub(crate) fn operation_status_in_tx(
     tx: &Transaction<'_>,
     operation_id: OperationId,
 ) -> Result<Option<OperationState>, StoreError> {
-    let Some(operation) = load_operation_projection_by_id(tx, operation_id)? else {
-        return if durable_operation_lineage_exists(tx, operation_id)? {
+    Ok(load_operation_facts(tx, operation_id)?.map(|facts| facts.state))
+}
+
+pub(crate) fn load_operation_facts(
+    conn: &Connection,
+    operation_id: OperationId,
+) -> Result<Option<OperationFacts>, StoreError> {
+    let Some(operation) = load_operation_projection_by_id(conn, operation_id)? else {
+        return if durable_operation_lineage_exists(conn, operation_id)? {
             Err(StoreError::Corruption)
         } else {
             Ok(None)
         };
     };
 
-    let command_id = load_operation_command_id(tx, operation_id)?;
-    match lookup_receipt(tx, command_id)? {
+    let command_id = load_operation_command_id(conn, operation_id)?;
+    match lookup_receipt(conn, command_id)? {
         Some(CommandReceipt::Accepted {
             operation_id: receipt_operation_id,
             ..
@@ -67,7 +74,14 @@ pub(crate) fn operation_status_in_tx(
         _ => return Err(StoreError::Corruption),
     }
 
-    Ok(Some(operation_state_from_validated_projection(&operation)?))
+    let state = operation_state_from_validated_projection(&operation)?;
+    Ok(Some(OperationFacts {
+        id: operation_id,
+        command_id,
+        task_id: operation.task_id,
+        state,
+        accepted_at_ms: operation.accepted_at_ms,
+    }))
 }
 
 fn operation_state_from_validated_projection(
@@ -735,7 +749,7 @@ fn require_accepted_dispatch_operation(
 /// When the operations projection row is absent, distinguish a genuinely unknown
 /// OperationId from durable lineage that still references it (Corruption).
 fn durable_operation_lineage_exists(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     operation_id: OperationId,
 ) -> Result<bool, StoreError> {
     let outbox_hits: i64 = tx.query_row(
@@ -796,7 +810,7 @@ fn event_references_operation(event: &Event, operation_id: OperationId) -> bool 
 }
 
 fn load_operation_command_id(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     operation_id: OperationId,
 ) -> Result<CommandId, StoreError> {
     let bytes: Vec<u8> = tx
@@ -813,7 +827,7 @@ fn load_operation_command_id(
 }
 
 fn load_operation_projection_by_id(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     operation_id: OperationId,
 ) -> Result<Option<OperationProjectionRow>, StoreError> {
     let row: Option<(
@@ -1063,7 +1077,7 @@ fn outcome_matches_history(outcome: &OperationOutcome, fact: &HistoricalOutcome)
 }
 
 fn load_operation_outcome_history(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     task_id: TaskId,
     after_sequence: u64,
     command_id: CommandId,
@@ -1678,7 +1692,7 @@ fn execute_in_tx(
 }
 
 fn lookup_receipt(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
 ) -> Result<Option<CommandReceipt>, StoreError> {
     let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, i64)> = tx
@@ -1795,7 +1809,7 @@ pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Resu
 }
 
 fn validate_accepted_receipt_correlation(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     event_ids: &[EventId],
@@ -1863,7 +1877,7 @@ fn validate_accepted_receipt_correlation(
 }
 
 fn validate_pure_accepted_receipt(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     event_ids: &[EventId],
@@ -1968,7 +1982,7 @@ fn validate_pure_accepted_receipt(
 }
 
 fn validate_side_effect_accepted_receipt(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     event_ids: &[EventId],
@@ -2139,7 +2153,7 @@ fn validate_side_effect_active_outbox(
 }
 
 fn validate_side_effect_terminal_receipt(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     scope: TaskId,
@@ -2429,7 +2443,7 @@ fn validate_terminal_outbox_dispatch_metadata(
 }
 
 fn validate_terminal_outcome_history(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     scope: TaskId,
@@ -2683,7 +2697,7 @@ fn validate_verified_reconciliation_source(
 }
 
 fn validate_settled_result_fact(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     effect: &Effect,
     result_id: EventId,
@@ -2773,7 +2787,7 @@ fn validate_settled_result_fact(
 }
 
 fn validate_settled_projections(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     effect: &Effect,
     result_revision: u64,
@@ -2826,7 +2840,7 @@ fn validate_settled_projections(
 /// command-decision lifecycle gates that `apply` does not enforce are checked separately.
 /// Final replayed snapshot must equal the complete current projection.
 fn validate_task_history_and_projection(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
 ) -> Result<(String, u64, u64), StoreError> {
     let mut stmt = tx.prepare(
@@ -2969,21 +2983,21 @@ fn validate_task_history_and_projection(
 }
 
 fn load_global_event_before(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     sequence: u64,
 ) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
     load_global_event_adjacent(tx, sequence, /*after=*/ false)
 }
 
 fn load_global_event_after(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     sequence: u64,
 ) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
     load_global_event_adjacent(tx, sequence, /*after=*/ true)
 }
 
 fn load_global_event_adjacent(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     sequence: u64,
     after: bool,
 ) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
@@ -3106,7 +3120,7 @@ fn uncertain_code_text(value: OperationUncertaintyCode) -> &'static str {
 }
 
 fn effects_from_durable_decision_facts(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     first_decision_sequence: u64,
     decision_facts: &[(Event, u64)],
@@ -3167,7 +3181,7 @@ fn effects_from_durable_decision_facts(
 
 /// Replay task mutations through `through_sequence` and return the resulting action_epoch.
 fn historical_action_epoch_through(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     through_sequence: u64,
 ) -> Result<u64, StoreError> {
@@ -3272,7 +3286,7 @@ fn validate_accepted_fact_row(
 /// `operation.accepted` row and require exactly one matching fact for this
 /// operation; extras in any task scope/sequence are Corruption.
 fn ensure_unique_operation_accepted_fact(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
     scope: TaskId,
@@ -3369,7 +3383,7 @@ fn ensure_unique_operation_accepted_fact(
 }
 
 fn validate_decision_event_batch(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     event_ids: &[EventId],
     scope: TaskId,
     receipt_final_revision: u64,
@@ -3469,7 +3483,7 @@ fn validate_decision_event_batch(
 }
 
 fn validate_decision_fact_ownership(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     event: &Event,
     scope: TaskId,
 ) -> Result<(), StoreError> {
@@ -3503,7 +3517,7 @@ fn validate_decision_fact_ownership(
 }
 
 fn validate_primary_agent_set_ownership(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     agent_session_id: AgentSessionId,
     scope: TaskId,
 ) -> Result<(), StoreError> {
@@ -3529,7 +3543,7 @@ fn validate_primary_agent_set_ownership(
 }
 
 fn ensure_unique_task_revision(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     task_revision: u64,
     event_id: EventId,
@@ -3568,7 +3582,7 @@ fn ensure_unique_task_revision(
 }
 
 fn load_latest_prior_task_mutation(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     scope: TaskId,
     before_sequence: u64,
 ) -> Result<u64, StoreError> {
@@ -3620,7 +3634,7 @@ struct OperationProjectionRow {
 }
 
 fn load_operation_projection(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
 ) -> Result<OperationProjectionRow, StoreError> {
     let row: Option<(
@@ -3716,7 +3730,7 @@ pub(crate) struct OutboxRow {
 }
 
 fn load_outbox_rows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     operation_id: OperationId,
 ) -> Result<Vec<OutboxRow>, StoreError> {
     let mut stmt = tx.prepare(
@@ -3888,7 +3902,7 @@ pub(crate) fn load_outbox_row_by_id(
     }))
 }
 
-fn load_event_row_at_sequence(tx: &Transaction<'_>, sequence: u64) -> Result<EventRow, StoreError> {
+fn load_event_row_at_sequence(tx: &Connection, sequence: u64) -> Result<EventRow, StoreError> {
     let row: Option<(
         Vec<u8>,
         Option<Vec<u8>>,
@@ -3964,7 +3978,7 @@ fn is_side_effect_decision_fact(event: &Event) -> bool {
 }
 
 fn validate_rejected_receipt_correlation(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     command_id: CommandId,
     committed_sequence: Option<i64>,
 ) -> Result<(), StoreError> {
