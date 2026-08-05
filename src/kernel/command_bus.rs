@@ -46,6 +46,176 @@ pub(crate) fn execute(
     store.with_immediate_transaction(|tx| execute_in_tx(tx, envelope))
 }
 
+pub(crate) fn operation_status_in_tx(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+) -> Result<Option<OperationState>, StoreError> {
+    let Some(operation) = load_operation_projection_by_id(tx, operation_id)? else {
+        return if durable_operation_lineage_exists(tx, operation_id)? {
+            Err(StoreError::Corruption)
+        } else {
+            Ok(None)
+        };
+    };
+
+    let command_id = load_operation_command_id(tx, operation_id)?;
+    match lookup_receipt(tx, command_id)? {
+        Some(CommandReceipt::Accepted {
+            operation_id: receipt_operation_id,
+            ..
+        }) if receipt_operation_id == operation_id => {}
+        _ => return Err(StoreError::Corruption),
+    }
+
+    Ok(Some(operation_state_from_validated_projection(&operation)?))
+}
+
+fn operation_state_from_validated_projection(
+    operation: &OperationProjectionRow,
+) -> Result<OperationState, StoreError> {
+    match operation.state.as_str() {
+        "accepted" => {
+            if operation.result.is_some()
+                || operation.outcome_code.is_some()
+                || operation.outcome_at_ms.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            Ok(OperationState::Accepted)
+        }
+        "settled" => {
+            let settled_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+            if settled_at_ms < operation.accepted_at_ms || operation.outcome_code.is_some() {
+                return Err(StoreError::Corruption);
+            }
+            let result_event_ids = unpack_projection_blob::<Vec<EventId>>(
+                "operations.result",
+                operation.result.as_deref().ok_or(StoreError::Corruption)?,
+            )?;
+            if result_event_ids.is_empty() {
+                return Err(StoreError::Corruption);
+            }
+            Ok(OperationState::Settled {
+                settled_at_ms,
+                result_event_ids,
+            })
+        }
+        "failed" => {
+            let settled_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+            if settled_at_ms < operation.accepted_at_ms
+                || operation.result.is_some()
+                || operation.outcome_code.as_deref() != Some("side_effect_failed")
+            {
+                return Err(StoreError::Corruption);
+            }
+            Ok(OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::SideEffectFailed,
+            })
+        }
+        "cancelled" => {
+            let settled_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+            if settled_at_ms < operation.accepted_at_ms
+                || operation.result.is_some()
+                || operation.outcome_code.as_deref() != Some("superseded")
+            {
+                return Err(StoreError::Corruption);
+            }
+            Ok(OperationState::Cancelled {
+                settled_at_ms,
+                reason: CancellationReason::Superseded,
+            })
+        }
+        "uncertain" => {
+            let observed_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+            if observed_at_ms < operation.accepted_at_ms
+                || operation.result.is_some()
+                || operation.outcome_code.as_deref() != Some("ambiguous_dispatch")
+            {
+                return Err(StoreError::Corruption);
+            }
+            Ok(OperationState::Uncertain {
+                observed_at_ms,
+                code: OperationUncertaintyCode::AmbiguousDispatch,
+            })
+        }
+        _ => Err(StoreError::Corruption),
+    }
+}
+
+#[cfg(test)]
+mod operation_status_tests {
+    use super::*;
+
+    #[test]
+    fn operation_status_reconstructs_every_durable_state_exactly() {
+        let result_event_id = EventId::new();
+        let cases = vec![
+            ("accepted", None, None, None, OperationState::Accepted),
+            (
+                "settled",
+                Some(projector::pack(&vec![result_event_id]).expect("pack result")),
+                None,
+                Some(110),
+                OperationState::Settled {
+                    settled_at_ms: 110,
+                    result_event_ids: vec![result_event_id],
+                },
+            ),
+            (
+                "failed",
+                None,
+                Some("side_effect_failed"),
+                Some(120),
+                OperationState::Failed {
+                    settled_at_ms: 120,
+                    code: OperationErrorCode::SideEffectFailed,
+                },
+            ),
+            (
+                "cancelled",
+                None,
+                Some("superseded"),
+                Some(130),
+                OperationState::Cancelled {
+                    settled_at_ms: 130,
+                    reason: CancellationReason::Superseded,
+                },
+            ),
+            (
+                "uncertain",
+                None,
+                Some("ambiguous_dispatch"),
+                Some(140),
+                OperationState::Uncertain {
+                    observed_at_ms: 140,
+                    code: OperationUncertaintyCode::AmbiguousDispatch,
+                },
+            ),
+        ];
+
+        for (state, result, outcome_code, outcome_at_ms, expected) in cases {
+            let operation = OperationProjectionRow {
+                operation_id: OperationId::new(),
+                task_id: None,
+                state: state.into(),
+                action_epoch: None,
+                resource_id: None,
+                runtime_generation: None,
+                result,
+                outcome_code: outcome_code.map(str::to_owned),
+                accepted_at_ms: 100,
+                outcome_at_ms,
+            };
+            assert_eq!(
+                operation_state_from_validated_projection(&operation).expect("valid state"),
+                expected,
+                "wrong mapping for {state}",
+            );
+        }
+    }
+}
+
 fn record_outcome_in_tx(
     tx: &Transaction<'_>,
     outcome: OperationOutcome,

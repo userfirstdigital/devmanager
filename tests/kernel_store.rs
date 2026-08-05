@@ -1575,6 +1575,162 @@ fn create_open_task(store: &mut KernelStore, task: TaskId, cmd: CommandId) {
         .expect("create task");
 }
 
+#[test]
+fn operation_status_survives_reopen() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0xB7);
+    let create_command = command_id(0xB8);
+    let mut store = KernelStore::open(&path).expect("open");
+    let operation = match store
+        .execute(command_envelope(
+            create_command,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create task")
+    {
+        CommandReceipt::Accepted { operation_id, .. } => operation_id,
+        other => panic!("expected accepted create, got {other:?}"),
+    };
+
+    let accepted_operation = match store
+        .execute(command_envelope(
+            command_id(0xBC),
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect("begin close")
+    {
+        CommandReceipt::Accepted { operation_id, .. } => operation_id,
+        other => panic!("expected accepted close, got {other:?}"),
+    };
+
+    let before = store
+        .operation_status(operation)
+        .expect("status before reopen")
+        .expect("known operation");
+    assert!(matches!(before, OperationState::Settled { .. }));
+    assert_eq!(
+        store
+            .operation_status(accepted_operation)
+            .expect("accepted status before reopen"),
+        Some(OperationState::Accepted),
+    );
+    drop(store);
+
+    let reopened = KernelStore::open(&path).expect("reopen");
+    assert_eq!(
+        reopened
+            .operation_status(operation)
+            .expect("status after reopen"),
+        Some(before)
+    );
+    assert_eq!(
+        reopened
+            .operation_status(accepted_operation)
+            .expect("accepted status after reopen"),
+        Some(OperationState::Accepted),
+    );
+    assert_eq!(
+        reopened
+            .operation_status(operation_id(0xB9))
+            .expect("unknown status"),
+        None
+    );
+}
+
+#[test]
+fn operation_status_returns_exact_dispatch_terminal_states() {
+    for (tail, completion) in [
+        (0xC0, DispatchCompletion::Settled),
+        (
+            0xC3,
+            DispatchCompletion::Failed {
+                code: OperationErrorCode::SideEffectFailed,
+            },
+        ),
+        (
+            0xC6,
+            DispatchCompletion::Cancelled {
+                reason: CancellationReason::Superseded,
+            },
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let task = task_id(tail);
+        let mut store = KernelStore::open(&path).expect("open");
+        create_open_task(&mut store, task, command_id(tail + 1));
+        let (operation, _) = accept_begin_close(&mut store, task, command_id(tail + 2), 1);
+        assert_eq!(
+            store.operation_status(operation).expect("accepted status"),
+            Some(OperationState::Accepted),
+        );
+
+        let permit = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("dispatch ready");
+        let permit = store.begin_dispatch(&permit).expect("begin dispatch");
+        let expected = store
+            .record_dispatch_completion(&permit, completion)
+            .expect("record terminal state");
+        assert_eq!(
+            store.operation_status(operation).expect("terminal status"),
+            Some(expected.clone()),
+        );
+        drop(store);
+
+        let reopened = KernelStore::open(&path).expect("reopen");
+        assert_eq!(
+            reopened
+                .operation_status(operation)
+                .expect("terminal status after reopen"),
+            Some(expected),
+        );
+    }
+}
+
+#[test]
+fn operation_status_rejects_missing_projection_with_durable_lineage() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0xBA);
+    let mut store = KernelStore::open(&path).expect("open");
+    let operation = match store
+        .execute(command_envelope(
+            command_id(0xBB),
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create task")
+    {
+        CommandReceipt::Accepted { operation_id, .. } => operation_id,
+        other => panic!("expected accepted create, got {other:?}"),
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "DELETE FROM operations WHERE operation_id = ?1",
+        [operation.as_bytes().as_slice()],
+    )
+    .expect("remove derived projection only");
+    drop(conn);
+
+    let reopened = KernelStore::open(&path).expect("reopen");
+    assert_eq!(
+        reopened
+            .operation_status(operation)
+            .expect_err("durable lineage without projection must fail closed"),
+        StoreError::Corruption
+    );
+}
+
 fn seed_projection_rows(path: &Path, task: TaskId) {
     let conn = open_raw(path);
     let agent = agent_id(0xA1);

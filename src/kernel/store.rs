@@ -14,7 +14,7 @@ use crate::domain::event::{
     TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
     EVENT_SCHEMA_VERSION,
 };
-use crate::domain::id::{EventId, OutboxId, TaskId};
+use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
     OperationOutcome, OperationOutcomeKind, OperationState, OutcomeSource, ResourceFence,
 };
@@ -153,6 +153,18 @@ impl KernelStore {
     /// Execute a command in one IMMEDIATE writer transaction.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         command_bus::execute(self, envelope)
+    }
+
+    /// Load one durable operation state after validating its complete lineage.
+    pub fn operation_status(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<OperationState>, StoreError> {
+        let conn = self.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let status = command_bus::operation_status_in_tx(&tx, operation_id)?;
+        tx.commit()?;
+        Ok(status)
     }
 
     /// Claim the next dispatch-ready outbox row under a bounded lease fence.
