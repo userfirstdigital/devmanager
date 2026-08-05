@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::domain::id::{SnapshotId, TaskId};
+use crate::domain::id::{AgentSessionId, SnapshotId, TaskId};
 use crate::domain::snapshot::{
     PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
     TaskSnapshotItem,
@@ -165,8 +165,8 @@ impl SnapshotSession {
         };
         match section {
             SnapshotSection::Tasks => self.tasks_page(after_item),
-            SnapshotSection::AgentSessions
-            | SnapshotSection::Artifacts
+            SnapshotSection::AgentSessions => self.agent_sessions_page(after_item),
+            SnapshotSection::Artifacts
             | SnapshotSection::Resources
             | SnapshotSection::Operations => Err(SnapshotError::UnsupportedSection),
         }
@@ -260,6 +260,97 @@ impl SnapshotSession {
             snapshot_id: self.snapshot_id,
             through_sequence: self.through_sequence,
             section: SnapshotSection::Tasks,
+            after_item,
+            items,
+            encoded_bytes,
+            next_cursor: accepted_next_cursor,
+        })
+    }
+
+    fn agent_sessions_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_agent = match after_item {
+            Some(SnapshotItemKey::AgentSession(agent_session_id)) => Some(agent_session_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let fetch_limit = i64::from(self.limits.max_items) + 1;
+        let agent_session_ids = load_agent_session_ids(&self.conn, after_agent, fetch_limit)?;
+
+        let mut items =
+            Vec::with_capacity(agent_session_ids.len().min(self.limits.max_items as usize));
+        let mut accepted_encoded_bytes = None;
+        let mut accepted_next_cursor = None;
+        for (index, agent_session_id) in agent_session_ids
+            .iter()
+            .take(self.limits.max_items as usize)
+            .copied()
+            .enumerate()
+        {
+            let agent = command_bus::load_agent_session(&self.conn, agent_session_id)?.ok_or_else(
+                || StoreError::Projection("agent session disappeared from pinned snapshot".into()),
+            )?;
+            items.push(SnapshotItem::AgentSession(agent));
+
+            let has_more = index + 1 < agent_session_ids.len();
+            let next_cursor = if has_more {
+                Some(self.encode_cursor(
+                    SnapshotSection::AgentSessions,
+                    SnapshotItemKey::AgentSession(agent_session_id),
+                )?)
+            } else {
+                None
+            };
+            let encoded_bytes = canonical_page_encoded_bytes(
+                self.snapshot_id,
+                self.through_sequence,
+                SnapshotSection::AgentSessions,
+                after_item,
+                &items,
+                &next_cursor,
+            )?;
+            if encoded_bytes > self.limits.max_encoded_bytes {
+                items.pop();
+                if items.is_empty() {
+                    return Err(SnapshotError::PageItemTooLarge {
+                        item: SnapshotItemKey::AgentSession(agent_session_id),
+                        encoded_bytes,
+                        max_encoded_bytes: self.limits.max_encoded_bytes,
+                    });
+                }
+                break;
+            }
+            accepted_encoded_bytes = Some(encoded_bytes);
+            accepted_next_cursor = next_cursor;
+        }
+
+        let encoded_bytes = match accepted_encoded_bytes {
+            Some(encoded_bytes) => encoded_bytes,
+            None => {
+                let encoded_bytes = canonical_page_encoded_bytes(
+                    self.snapshot_id,
+                    self.through_sequence,
+                    SnapshotSection::AgentSessions,
+                    after_item,
+                    &items,
+                    &None,
+                )?;
+                if encoded_bytes > self.limits.max_encoded_bytes {
+                    return Err(SnapshotError::PageEnvelopeTooLarge {
+                        encoded_bytes,
+                        max_encoded_bytes: self.limits.max_encoded_bytes,
+                    });
+                }
+                encoded_bytes
+            }
+        };
+
+        Ok(SnapshotPage {
+            snapshot_id: self.snapshot_id,
+            through_sequence: self.through_sequence,
+            section: SnapshotSection::AgentSessions,
             after_item,
             items,
             encoded_bytes,
@@ -361,6 +452,40 @@ fn load_task_ids(
     Ok(task_ids)
 }
 
+fn load_agent_session_ids(
+    conn: &Connection,
+    after_agent: Option<AgentSessionId>,
+    fetch_limit: i64,
+) -> Result<Vec<AgentSessionId>, SnapshotError> {
+    let mut agent_session_ids = Vec::new();
+    match after_agent {
+        Some(after_agent) => {
+            let mut stmt = conn.prepare(
+                "SELECT agent_session_id FROM agent_sessions
+                 WHERE agent_session_id > ?1 ORDER BY agent_session_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![after_agent.as_bytes().as_slice(), fetch_limit],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                agent_session_ids.push(decode_agent_session_id(&row?)?);
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT agent_session_id FROM agent_sessions
+                 ORDER BY agent_session_id ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                agent_session_ids.push(decode_agent_session_id(&row?)?);
+            }
+        }
+    }
+    Ok(agent_session_ids)
+}
+
 fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
     let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
         detail: "tasks.task_id must be 16 bytes".into(),
@@ -368,6 +493,17 @@ fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
     TaskId::from_bytes(bytes)
         .map_err(|error| StoreError::CodecMismatch {
             detail: format!("tasks.task_id: {error}"),
+        })
+        .map_err(Into::into)
+}
+
+fn decode_agent_session_id(bytes: &[u8]) -> Result<AgentSessionId, SnapshotError> {
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: "agent_sessions.agent_session_id must be 16 bytes".into(),
+    })?;
+    AgentSessionId::from_bytes(bytes)
+        .map_err(|error| StoreError::CodecMismatch {
+            detail: format!("agent_sessions.agent_session_id: {error}"),
         })
         .map_err(Into::into)
 }
@@ -433,6 +569,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
     use crate::domain::command::{
         Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RenameTaskIntent,
     };
@@ -514,6 +651,38 @@ mod tests {
                 Command::CreateTask(intent),
             ))
             .expect("create task");
+    }
+
+    fn agent_facts(task_id: TaskId, agent_session_id: AgentSessionId) -> AgentSessionFacts {
+        AgentSessionFacts {
+            id: agent_session_id,
+            task_id,
+            role: AgentRole::Primary,
+            provider_kind: "codex".into(),
+            provider_session_id: Some(format!("session-{agent_session_id}")),
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 0,
+            revision: 0,
+        }
+    }
+
+    fn register_agent(
+        store: &mut KernelStore,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        command_id: CommandId,
+        expected_revision: u64,
+    ) {
+        store
+            .execute(envelope(
+                command_id,
+                Some(task_id),
+                Some(expected_revision),
+                Command::RegisterAgentSession {
+                    agent: agent_facts(task_id, agent_session_id),
+                },
+            ))
+            .expect("register agent");
     }
 
     #[test]
@@ -720,6 +889,93 @@ mod tests {
                 ..
             }) if id == task_id(0xC8)
         ));
+    }
+
+    #[test]
+    fn snapshot_agent_sessions_pages_are_frozen_and_resume_without_duplicates() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xE0);
+        create_task(&mut store, task, command_id(0xE1));
+        for (agent_tail, command_tail, expected_revision) in
+            [(0xE2, 0xE5, 1), (0xE3, 0xE6, 2), (0xE4, 0xE7, 3)]
+        {
+            register_agent(
+                &mut store,
+                task,
+                agent_id(agent_tail),
+                command_id(command_tail),
+                expected_revision,
+            );
+        }
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(2, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        register_agent(&mut store, task, agent_id(0xE8), command_id(0xE9), 4);
+
+        let first = snapshot
+            .page(SnapshotSection::AgentSessions, None)
+            .expect("first agent page");
+        let cursor = first.next_cursor.clone().expect("agent resume cursor");
+        let second = snapshot
+            .page(SnapshotSection::AgentSessions, Some(&cursor))
+            .expect("second agent page");
+
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(first.through_sequence, second.through_sequence);
+        assert_eq!(
+            second.after_item,
+            Some(SnapshotItemKey::AgentSession(agent_id(0xE3)))
+        );
+        assert_eq!(second.next_cursor, None);
+
+        let ids = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| match item {
+                SnapshotItem::AgentSession(agent) => agent.id,
+                other => panic!("expected agent item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![agent_id(0xE2), agent_id(0xE3), agent_id(0xE4)]);
+        assert!(!ids.contains(&agent_id(0xE8)));
+    }
+
+    #[test]
+    fn snapshot_agent_sessions_rejects_invalid_projection() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xEA);
+        let agent = agent_id(0xEB);
+        create_task(&mut store, task, command_id(0xEC));
+        register_agent(&mut store, task, agent, command_id(0xED), 1);
+
+        let conn = Connection::open(&path).expect("open tamper connection");
+        conn.execute(
+            "UPDATE agent_sessions SET runtime_generation = -1 WHERE agent_session_id = ?1",
+            [agent.as_bytes().as_slice()],
+        )
+        .expect("tamper agent generation");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(1_000, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        assert_eq!(
+            snapshot
+                .page(SnapshotSection::AgentSessions, None)
+                .expect_err("invalid agent projection must fail closed"),
+            SnapshotError::Store(StoreError::IntegerOutOfRange {
+                field: "agent_sessions.runtime_generation",
+                value: 1,
+            })
+        );
     }
 
     #[test]

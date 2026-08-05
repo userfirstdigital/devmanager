@@ -4532,25 +4532,98 @@ fn load_agents(
             revision,
         ) = row?;
         let id = id16::<AgentSessionId>("agent_sessions.agent_session_id", &id_bytes)?;
-        let agent = AgentSessionFacts {
+        let agent = decode_agent_projection(
             id,
             task_id,
-            role: unpack_projection_blob("agent_sessions.role", &role)?,
+            role,
             provider_kind,
             provider_session_id,
-            lifecycle: parse_agent_lifecycle(&lifecycle)?,
-            runtime_generation: u64_from_nonnegative_i64(
-                "agent_sessions.runtime_generation",
-                runtime_generation,
-            )?,
-            revision: u64_from_nonnegative_i64("agent_sessions.revision", revision)?,
-        };
-        agent
-            .validate()
-            .map_err(|err| StoreError::Projection(err.to_string()))?;
+            lifecycle,
+            runtime_generation,
+            revision,
+        )?;
         agents.insert(id, agent);
     }
     Ok(agents)
+}
+
+pub(crate) fn load_agent_session(
+    conn: &Connection,
+    agent_session_id: AgentSessionId,
+) -> Result<Option<AgentSessionFacts>, StoreError> {
+    let row: Option<(Vec<u8>, Vec<u8>, String, Option<String>, String, i64, i64)> = conn
+        .query_row(
+            "SELECT task_id, role, provider_kind, provider_session_id, lifecycle,
+                    runtime_generation, revision
+             FROM agent_sessions WHERE agent_session_id = ?1",
+            [agent_session_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        task_id,
+        role,
+        provider_kind,
+        provider_session_id,
+        lifecycle,
+        runtime_generation,
+        revision,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let task_id = id16::<TaskId>("agent_sessions.task_id", &task_id)?;
+    load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+    Ok(Some(decode_agent_projection(
+        agent_session_id,
+        task_id,
+        role,
+        provider_kind,
+        provider_session_id,
+        lifecycle,
+        runtime_generation,
+        revision,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_agent_projection(
+    id: AgentSessionId,
+    task_id: TaskId,
+    role: Vec<u8>,
+    provider_kind: String,
+    provider_session_id: Option<String>,
+    lifecycle: String,
+    runtime_generation: i64,
+    revision: i64,
+) -> Result<AgentSessionFacts, StoreError> {
+    let agent = AgentSessionFacts {
+        id,
+        task_id,
+        role: unpack_projection_blob("agent_sessions.role", &role)?,
+        provider_kind,
+        provider_session_id,
+        lifecycle: parse_agent_lifecycle(&lifecycle)?,
+        runtime_generation: u64_from_nonnegative_i64(
+            "agent_sessions.runtime_generation",
+            runtime_generation,
+        )?,
+        revision: u64_from_nonnegative_i64("agent_sessions.revision", revision)?,
+    };
+    agent
+        .validate()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    Ok(agent)
 }
 
 fn load_artifacts(
