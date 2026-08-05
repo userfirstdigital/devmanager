@@ -6,6 +6,7 @@
 mod command_bus;
 mod dispatch;
 mod lineage;
+mod maintenance;
 mod outbox;
 mod projector;
 mod replay;
@@ -18,6 +19,7 @@ pub use dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
     ReconciliationFinding, ReconciliationOrigin,
 };
+pub(crate) use maintenance::{StoreMaintenanceReport, WalCheckpointOutcome};
 pub use outbox::{DestinationClass, Effect, ReplayPolicy};
 pub use runtime::{CompletionDisposition, RuntimePresence, RuntimeRegistry, RuntimeRegistryError};
 pub use store::{KernelStore, ProjectionRebuild, StoreError};

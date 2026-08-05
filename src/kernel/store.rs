@@ -26,9 +26,11 @@ use crate::kernel::dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
     ReconciliationFinding, ReconciliationOrigin,
 };
+use crate::kernel::maintenance;
 use crate::kernel::outbox::{decode_effect_document, external_idempotency_key, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
+use crate::kernel::StoreMaintenanceReport;
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
@@ -165,6 +167,12 @@ impl KernelStore {
         let status = command_bus::operation_status_in_tx(&tx, operation_id)?;
         tx.commit()?;
         Ok(status)
+    }
+
+    /// Run one explicit non-destructive maintenance pass outside command/query hot paths.
+    #[allow(dead_code)] // consumed by the bounded host scheduler in a later phase
+    pub(crate) fn run_maintenance(&mut self) -> Result<StoreMaintenanceReport, StoreError> {
+        maintenance::run(&self.conn)
     }
 
     /// Claim the next dispatch-ready outbox row under a bounded lease fence.
@@ -2234,6 +2242,7 @@ fn build_present_reconciliation_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::WalCheckpointOutcome;
     use rusqlite::ffi::Error as FfiError;
     use tempfile::TempDir;
 
@@ -2352,5 +2361,124 @@ mod tests {
             !text.contains("event codec mismatch"),
             "display must not hard-code event-only wording, got {text}"
         );
+    }
+
+    fn synchronous_mode(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous mode")
+    }
+
+    #[test]
+    fn passive_maintenance_preserves_pinned_reader_and_retries_to_completion() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let original_applied_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT applied_at_ms FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .expect("original migration timestamp");
+
+        let reader = store.open_query_connection().expect("open pinned reader");
+        reader
+            .execute_batch("BEGIN DEFERRED")
+            .expect("begin reader");
+        let _: i64 = reader
+            .query_row(
+                "SELECT pruned_through_sequence FROM event_retention WHERE singleton_key = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pin read view");
+
+        store
+            .conn
+            .execute(
+                "UPDATE schema_migrations SET applied_at_ms = applied_at_ms + 1 WHERE version = 3",
+                [],
+            )
+            .expect("append WAL frame after reader pin");
+        let first = store
+            .run_maintenance()
+            .expect("passive maintenance with reader");
+        let WalCheckpointOutcome::Partial {
+            log_frames,
+            checkpointed_frames,
+        } = first.wal
+        else {
+            panic!("pinned reader must yield a partial checkpoint: {first:?}");
+        };
+        assert!(checkpointed_frames < log_frames);
+        assert_eq!(synchronous_mode(&store.conn), 1, "must restore NORMAL");
+        let pinned_applied_at: i64 = reader
+            .query_row(
+                "SELECT applied_at_ms FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original pinned value after maintenance");
+        assert_eq!(pinned_applied_at, original_applied_at);
+
+        reader.execute_batch("ROLLBACK").expect("release reader");
+        drop(reader);
+        let second = store
+            .run_maintenance()
+            .expect("retry maintenance after reader release");
+        assert!(matches!(
+            second.wal,
+            WalCheckpointOutcome::Complete {
+                log_frames,
+                checkpointed_frames,
+            } if log_frames == checkpointed_frames
+        ));
+        assert_eq!(synchronous_mode(&store.conn), 1, "must remain NORMAL");
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("migration count"),
+            3,
+            "maintenance must not delete durable rows"
+        );
+    }
+
+    #[test]
+    fn full_synchronous_scope_restores_normal_after_action_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let store = KernelStore::open(&path).expect("open");
+
+        let error = maintenance::with_full_synchronous(&store.conn, |conn| {
+            assert_eq!(synchronous_mode(conn), 2, "action must run at FULL");
+            Err::<(), _>(StoreError::Busy)
+        })
+        .expect_err("injected action failure");
+        assert_eq!(error, StoreError::Busy);
+        assert_eq!(synchronous_mode(&store.conn), 1, "must restore NORMAL");
+    }
+
+    #[test]
+    fn passive_maintenance_surfaces_integrity_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+
+        let conn = Connection::open(&path).expect("open corruption fixture");
+        conn.execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE event_retention SET pruned_through_sequence = -1 WHERE singleton_key = 1;",
+        )
+        .expect("violate retained boundary check");
+        drop(conn);
+
+        assert!(matches!(
+            store.run_maintenance(),
+            Err(StoreError::IntegrityCheckFailed(_))
+        ));
+        assert_eq!(synchronous_mode(&store.conn), 1, "must remain NORMAL");
     }
 }
