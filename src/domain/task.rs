@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::canonical;
 use crate::domain::id::{EnvironmentId, ProjectId, TaskId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum TaskValidationError {
     EmptyBranch,
     EmptyPrincipalAuthority,
     EmptyPrincipalSubject,
+    InvalidCreateState,
 }
 
 impl std::fmt::Display for TaskValidationError {
@@ -24,6 +26,12 @@ impl std::fmt::Display for TaskValidationError {
             Self::EmptyBranch => write!(f, "worktree branch must be non-empty"),
             Self::EmptyPrincipalAuthority => write!(f, "principal authority must be non-empty"),
             Self::EmptyPrincipalSubject => write!(f, "principal subject must be non-empty"),
+            Self::InvalidCreateState => {
+                write!(
+                    f,
+                    "created task must be open with action_epoch 0 and revision 1"
+                )
+            }
         }
     }
 }
@@ -44,13 +52,27 @@ impl WorkspaceRef {
         branch: impl Into<String>,
     ) -> Result<Self, TaskValidationError> {
         let path = validate_path(path.into())?;
-        let branch = validate_non_empty(branch.into(), TaskValidationError::EmptyBranch)?;
+        let branch = canonicalize_branch(branch.into())?;
         Ok(Self::Worktree { path, branch })
     }
 
     pub fn external(path: impl Into<PathBuf>) -> Result<Self, TaskValidationError> {
         let path = validate_path(path.into())?;
         Ok(Self::External { path })
+    }
+
+    pub fn validate(&self) -> Result<(), TaskValidationError> {
+        match self {
+            Self::Main => Ok(()),
+            Self::Worktree { path, branch } => {
+                check_path(path)?;
+                if !canonical::is_canonical(branch) {
+                    return Err(TaskValidationError::EmptyBranch);
+                }
+                Ok(())
+            }
+            Self::External { path } => check_path(path),
+        }
     }
 }
 
@@ -172,13 +194,28 @@ impl TaskAssignment {
         authority: impl Into<String>,
         subject: impl Into<String>,
     ) -> Result<Self, TaskValidationError> {
-        let authority = validate_non_empty(
+        let authority = canonicalize_principal(
             authority.into(),
             TaskValidationError::EmptyPrincipalAuthority,
         )?;
         let subject =
-            validate_non_empty(subject.into(), TaskValidationError::EmptyPrincipalSubject)?;
+            canonicalize_principal(subject.into(), TaskValidationError::EmptyPrincipalSubject)?;
         Ok(Self::ExternalPrincipal { authority, subject })
+    }
+
+    pub fn validate(&self) -> Result<(), TaskValidationError> {
+        match self {
+            Self::LocalOwner => Ok(()),
+            Self::ExternalPrincipal { authority, subject } => {
+                if !canonical::is_canonical(authority) {
+                    return Err(TaskValidationError::EmptyPrincipalAuthority);
+                }
+                if !canonical::is_canonical(subject) {
+                    return Err(TaskValidationError::EmptyPrincipalSubject);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -228,14 +265,10 @@ impl TaskFacts {
         assignment: TaskAssignment,
         created_at_ms: i64,
     ) -> Result<Self, TaskValidationError> {
-        let title = validate_non_empty(title.into(), TaskValidationError::EmptyTitle)?;
-        let description = match description {
-            Some(value) => Some(validate_non_empty(
-                value,
-                TaskValidationError::EmptyDescription,
-            )?),
-            None => None,
-        };
+        let title = Self::canonicalize_title(title)?;
+        let description = Self::canonicalize_description(description)?;
+        workspace.validate()?;
+        assignment.validate()?;
 
         Ok(Self {
             id: TaskId::new(),
@@ -250,6 +283,44 @@ impl TaskFacts {
             revision: 0,
             created_at_ms,
         })
+    }
+
+    pub fn canonicalize_title(title: impl Into<String>) -> Result<String, TaskValidationError> {
+        canonical::canonicalize(title.into()).ok_or(TaskValidationError::EmptyTitle)
+    }
+
+    pub fn canonicalize_description(
+        description: Option<String>,
+    ) -> Result<Option<String>, TaskValidationError> {
+        match description {
+            Some(value) => Ok(Some(
+                canonical::canonicalize(value).ok_or(TaskValidationError::EmptyDescription)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub fn validate_content(&self) -> Result<(), TaskValidationError> {
+        if !canonical::is_canonical(&self.title) {
+            return Err(TaskValidationError::EmptyTitle);
+        }
+        match &self.description {
+            Some(value) if !canonical::is_canonical(value) => {
+                return Err(TaskValidationError::EmptyDescription);
+            }
+            Some(_) | None => {}
+        }
+        self.workspace.validate()?;
+        self.assignment.validate()?;
+        Ok(())
+    }
+
+    pub fn validate_for_create(&self) -> Result<(), TaskValidationError> {
+        self.validate_content()?;
+        if self.lifecycle != TaskLifecycle::Open || self.action_epoch != 0 || self.revision != 1 {
+            return Err(TaskValidationError::InvalidCreateState);
+        }
+        Ok(())
     }
 }
 
@@ -274,15 +345,12 @@ impl<'de> Deserialize<'de> for TaskFacts {
         }
 
         let wire = TaskFactsWire::deserialize(deserializer)?;
-        let title = validate_non_empty(wire.title, TaskValidationError::EmptyTitle)
-            .map_err(de::Error::custom)?;
-        let description = match wire.description {
-            Some(value) => Some(
-                validate_non_empty(value, TaskValidationError::EmptyDescription)
-                    .map_err(de::Error::custom)?,
-            ),
-            None => None,
-        };
+        let title = Self::canonicalize_title(wire.title).map_err(de::Error::custom)?;
+        let description =
+            Self::canonicalize_description(wire.description).map_err(de::Error::custom)?;
+        // WorkspaceRef/TaskAssignment deserialize already produce canonical values.
+        wire.workspace.validate().map_err(de::Error::custom)?;
+        wire.assignment.validate().map_err(de::Error::custom)?;
 
         // Preserve every persisted identity/lifecycle/revision/timestamp field from the wire.
         Ok(Self {
@@ -301,22 +369,27 @@ impl<'de> Deserialize<'de> for TaskFacts {
     }
 }
 
-fn validate_non_empty(
+fn canonicalize_branch(value: String) -> Result<String, TaskValidationError> {
+    canonical::canonicalize(value).ok_or(TaskValidationError::EmptyBranch)
+}
+
+fn canonicalize_principal(
     value: String,
     empty_error: TaskValidationError,
 ) -> Result<String, TaskValidationError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(empty_error);
-    }
-    Ok(trimmed.to_string())
+    canonical::canonicalize(value).ok_or(empty_error)
 }
 
 fn validate_path(path: PathBuf) -> Result<PathBuf, TaskValidationError> {
-    if path.as_os_str().is_empty() || path_has_nul(&path) {
+    check_path(&path)?;
+    Ok(path)
+}
+
+fn check_path(path: &Path) -> Result<(), TaskValidationError> {
+    if path.as_os_str().is_empty() || path_has_nul(path) {
         return Err(TaskValidationError::EmptyPath);
     }
-    Ok(path)
+    Ok(())
 }
 
 fn path_has_nul(path: &Path) -> bool {

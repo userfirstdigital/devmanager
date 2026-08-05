@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "event_type": "operation.accepted",
+  "payload": {
+    "command_id": "018f60b0-9c1a-7001-8000-00000000003b",
+    "operation_id": "018f60b0-9c1a-7001-8000-000000000061",
+    "task_id": "018f60b0-9c1a-7001-8000-00000000000b",
+    "accepted_at_ms": 1725000000390,
+    "action_epoch": 1,
+    "runtime_generation": 2
+  }
+}

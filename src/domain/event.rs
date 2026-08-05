@@ -31,6 +31,76 @@ pub struct DomainEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationAcceptedFact {
+    pub command_id: CommandId,
+    pub operation_id: OperationId,
+    pub task_id: Option<TaskId>,
+    pub accepted_at_ms: i64,
+    pub action_epoch: Option<u64>,
+    pub runtime_generation: Option<u64>,
+}
+
+impl OperationAcceptedFact {
+    pub fn new(
+        command_id: CommandId,
+        operation_id: OperationId,
+        task_id: Option<TaskId>,
+        accepted_at_ms: i64,
+        action_epoch: Option<u64>,
+        runtime_generation: Option<u64>,
+    ) -> Result<Self, OutcomeFenceError> {
+        Ok(Self {
+            command_id,
+            operation_id,
+            task_id,
+            accepted_at_ms,
+            action_epoch,
+            runtime_generation,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationAcceptedFactWire {
+    command_id: CommandId,
+    operation_id: OperationId,
+    task_id: Option<TaskId>,
+    accepted_at_ms: i64,
+    action_epoch: Option<u64>,
+    runtime_generation: Option<u64>,
+}
+
+impl Serialize for OperationAcceptedFact {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        OperationAcceptedFactWire {
+            command_id: self.command_id,
+            operation_id: self.operation_id,
+            task_id: self.task_id,
+            accepted_at_ms: self.accepted_at_ms,
+            action_epoch: self.action_epoch,
+            runtime_generation: self.runtime_generation,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationAcceptedFact {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = OperationAcceptedFactWire::deserialize(deserializer)?;
+        Self::new(
+            wire.command_id,
+            wire.operation_id,
+            wire.task_id,
+            wire.accepted_at_ms,
+            wire.action_epoch,
+            wire.runtime_generation,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationSettledFact {
     pub command_id: CommandId,
     pub operation_id: OperationId,
@@ -356,6 +426,14 @@ pub struct TaskRenamedPayload {
     pub title: String,
 }
 
+impl TaskRenamedPayload {
+    fn validated(title: String) -> Result<Self, crate::domain::task::TaskValidationError> {
+        Ok(Self {
+            title: TaskFacts::canonicalize_title(title)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskAttentionSetPayload {
@@ -450,6 +528,7 @@ pub enum Event {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
+    OperationAccepted(OperationAcceptedFact),
     OperationSettled(OperationSettledFact),
     OperationFailed(OperationFailedFact),
     OperationCancelled(OperationCancelledFact),
@@ -471,6 +550,7 @@ impl Event {
             Self::ResourceRegistered { .. } => "resource.registered",
             Self::ResourceReleaseBegun { .. } => "resource.release_begun",
             Self::ResourceReleased { .. } => "resource.released",
+            Self::OperationAccepted(_) => "operation.accepted",
             Self::OperationSettled(_) => "operation.settled",
             Self::OperationFailed(_) => "operation.failed",
             Self::OperationCancelled(_) => "operation.cancelled",
@@ -481,7 +561,8 @@ impl Event {
     pub fn is_task_mutation(&self) -> bool {
         !matches!(
             self,
-            Self::OperationSettled(_)
+            Self::OperationAccepted(_)
+                | Self::OperationSettled(_)
                 | Self::OperationFailed(_)
                 | Self::OperationCancelled(_)
                 | Self::OperationUncertain(_)
@@ -516,6 +597,8 @@ enum EventBody {
     ResourceReleaseBegun(ResourceReleaseBegunPayload),
     #[serde(rename = "resource.released")]
     ResourceReleased(ResourceReleasedPayload),
+    #[serde(rename = "operation.accepted")]
+    OperationAccepted(OperationAcceptedFact),
     #[serde(rename = "operation.settled")]
     OperationSettled(OperationSettledFact),
     #[serde(rename = "operation.failed")]
@@ -598,6 +681,7 @@ impl From<&Event> for EventDocument {
                 resource_id: *resource_id,
                 runtime_generation: *runtime_generation,
             }),
+            Event::OperationAccepted(fact) => EventBody::OperationAccepted(fact.clone()),
             Event::OperationSettled(fact) => EventBody::OperationSettled(fact.clone()),
             Event::OperationFailed(fact) => EventBody::OperationFailed(fact.clone()),
             Event::OperationCancelled(fact) => EventBody::OperationCancelled(fact.clone()),
@@ -620,14 +704,25 @@ impl TryFrom<EventDocument> for Event {
             )));
         }
         Ok(match value.body {
-            EventBody::TaskCreated(p) => Event::TaskCreated {
-                task: p.task,
-                connectivity: p.connectivity,
-                attention: p.attention,
-                activity: p.activity,
-                review_readiness: p.review_readiness,
-            },
-            EventBody::TaskRenamed(p) => Event::TaskRenamed { title: p.title },
+            EventBody::TaskCreated(p) => {
+                p.task
+                    .validate_for_create()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::TaskCreated {
+                    task: p.task,
+                    connectivity: p.connectivity,
+                    attention: p.attention,
+                    activity: p.activity,
+                    review_readiness: p.review_readiness,
+                }
+            }
+            EventBody::TaskRenamed(p) => {
+                let payload = TaskRenamedPayload::validated(p.title)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::TaskRenamed {
+                    title: payload.title,
+                }
+            }
             EventBody::TaskAttentionSet(p) => Event::TaskAttentionSet {
                 attention: p.attention,
             },
@@ -637,17 +732,37 @@ impl TryFrom<EventDocument> for Event {
             EventBody::TaskReopened(_) => Event::TaskReopened,
             EventBody::TaskArchived(_) => Event::TaskArchived,
             EventBody::AgentSessionRegistered(p) => {
+                p.agent
+                    .validate_for_registration()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
                 Event::AgentSessionRegistered { agent: p.agent }
             }
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
             },
-            EventBody::ArtifactRegistered(p) => Event::ArtifactRegistered {
-                artifact: p.artifact,
-            },
-            EventBody::ResourceRegistered(p) => Event::ResourceRegistered {
-                resource: p.resource,
-            },
+            EventBody::ArtifactRegistered(p) => {
+                p.artifact
+                    .validate()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                Event::ArtifactRegistered {
+                    artifact: p.artifact,
+                }
+            }
+            EventBody::ResourceRegistered(p) => {
+                p.resource
+                    .validate()
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                if p.resource.owner_kind != crate::domain::resource::OwnerKind::Task
+                    || p.resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active
+                {
+                    return Err(EventSerdeError::Payload(
+                        "resource registration requires Active Task-owned facts".into(),
+                    ));
+                }
+                Event::ResourceRegistered {
+                    resource: p.resource,
+                }
+            }
             EventBody::ResourceReleaseBegun(p) => Event::ResourceReleaseBegun {
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
@@ -656,6 +771,7 @@ impl TryFrom<EventDocument> for Event {
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
             },
+            EventBody::OperationAccepted(fact) => Event::OperationAccepted(fact),
             EventBody::OperationSettled(fact) => Event::OperationSettled(fact),
             EventBody::OperationFailed(fact) => Event::OperationFailed(fact),
             EventBody::OperationCancelled(fact) => Event::OperationCancelled(fact),
@@ -751,6 +867,8 @@ pub fn apply(
             if event.task_revision != Some(1) || task.revision != 1 {
                 return Err(ApplyError::RevisionConflict);
             }
+            task.validate_for_create()
+                .map_err(|_| ApplyError::InvalidTransition)?;
             Ok(TaskSnapshot {
                 task: task.clone(),
                 connectivity: *connectivity,
@@ -762,6 +880,14 @@ pub fn apply(
                 artifacts: BTreeMap::new(),
                 resources: BTreeMap::new(),
             })
+        }
+        Event::OperationAccepted(fact) => {
+            let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
+            require_matching_task_id(&snap, event)?;
+            if fact.task_id != event.task_id {
+                return Err(ApplyError::TaskMismatch);
+            }
+            Ok(snap)
         }
         Event::OperationSettled(_)
         | Event::OperationFailed(_)
@@ -808,7 +934,9 @@ fn require_next_revision(snap: &TaskSnapshot, event: &DomainEvent) -> Result<u64
 fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError> {
     match payload {
         Event::TaskRenamed { title } => {
-            snap.task.title = title.clone();
+            let title = TaskFacts::canonicalize_title(title.clone())
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            snap.task.title = title;
         }
         Event::TaskAttentionSet { attention } => {
             snap.attention = *attention;
@@ -845,14 +973,20 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
             if agent.task_id != snap.task.id {
                 return Err(ApplyError::OwnershipConflict);
             }
+            agent
+                .validate_for_registration()
+                .map_err(|_| ApplyError::InvalidTransition)?;
             if snap.agents.contains_key(&agent.id) {
                 return Err(ApplyError::AlreadyExists);
             }
             snap.agents.insert(agent.id, agent.clone());
         }
         Event::PrimaryAgentSet { agent_session_id } => {
-            if !snap.agents.contains_key(agent_session_id) {
+            let Some(agent) = snap.agents.get(agent_session_id) else {
                 return Err(ApplyError::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
+                return Err(ApplyError::InvalidTransition);
             }
             snap.primary_agent_id = Some(*agent_session_id);
         }
@@ -860,6 +994,9 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
             if artifact.task_id != snap.task.id {
                 return Err(ApplyError::OwnershipConflict);
             }
+            artifact
+                .validate()
+                .map_err(|_| ApplyError::InvalidTransition)?;
             if snap.artifacts.contains_key(&artifact.id) {
                 return Err(ApplyError::AlreadyExists);
             }
@@ -872,6 +1009,12 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
             match resource.task_id {
                 Some(id) if id == snap.task.id => {}
                 _ => return Err(ApplyError::OwnershipConflict),
+            }
+            resource
+                .validate()
+                .map_err(|_| ApplyError::InvalidTransition)?;
+            if resource.lifecycle != ResourceLifecycle::Active {
+                return Err(ApplyError::InvalidTransition);
             }
             if snap.resources.contains_key(&resource.id) {
                 return Err(ApplyError::AlreadyExists);
@@ -919,6 +1062,7 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
             resource.lifecycle = ResourceLifecycle::Released;
         }
         Event::TaskCreated { .. }
+        | Event::OperationAccepted(_)
         | Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)

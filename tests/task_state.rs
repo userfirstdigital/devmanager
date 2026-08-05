@@ -8,8 +8,8 @@ use devmanager::domain::command::{
     SetTaskAttentionIntent,
 };
 use devmanager::domain::event::{
-    apply, ApplyError, DomainEvent, Event, OperationCancelledFact, OperationFailedFact,
-    OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
+    apply, ApplyError, DomainEvent, Event, OperationAcceptedFact, OperationCancelledFact,
+    OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
 };
 use devmanager::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
@@ -1467,4 +1467,710 @@ fn golden_event_serialization_fixtures() {
         }
     });
     assert!(serde_json::from_value::<Event>(partial_fence).is_err());
+
+    assert_golden_event(
+        "operation_accepted.json",
+        &Event::OperationAccepted(
+            OperationAcceptedFact::new(
+                command_id(0x3b),
+                operation_id(0x61),
+                Some(task),
+                1_725_000_000_390,
+                Some(1),
+                Some(2),
+            )
+            .expect("accepted"),
+        ),
+    );
+}
+
+#[test]
+fn forged_task_created_and_renamed_are_rejected() {
+    let task = task_id(0xf1);
+    let mut forged = TaskFacts {
+        id: task,
+        environment_id: env_id(0x10),
+        title: "ok".into(),
+        description: None,
+        project_id: project_id(0x11),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        lifecycle: TaskLifecycle::Closing,
+        action_epoch: 0,
+        revision: 1,
+        created_at_ms: 1,
+    };
+    assert!(
+        matches!(
+            apply(
+                None,
+                &domain_event(
+                    event_id(0xf2),
+                    Some(task),
+                    1,
+                    Some(1),
+                    1,
+                    Event::TaskCreated {
+                        task: forged.clone(),
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    },
+                ),
+            ),
+            Err(ApplyError::InvalidTransition)
+        ),
+        "TaskCreated must reject non-Open lifecycle"
+    );
+    forged.lifecycle = TaskLifecycle::Open;
+    forged.action_epoch = 3;
+    assert!(matches!(
+        apply(
+            None,
+            &domain_event(
+                event_id(0xf3),
+                Some(task),
+                1,
+                Some(1),
+                1,
+                Event::TaskCreated {
+                    task: forged.clone(),
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    forged.action_epoch = 0;
+    forged.title = "ok".into();
+    // Bypass WorkspaceRef constructors to forge an empty-path worktree.
+    forged.workspace = WorkspaceRef::Worktree {
+        path: std::path::PathBuf::from(""),
+        branch: "main".into(),
+    };
+    assert!(
+        matches!(
+            apply(
+                None,
+                &domain_event(
+                    event_id(0xf4),
+                    Some(task),
+                    1,
+                    Some(1),
+                    1,
+                    Event::TaskCreated {
+                        task: forged.clone(),
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    },
+                ),
+            ),
+            Err(ApplyError::InvalidTransition)
+        ),
+        "TaskCreated must reject empty workspace path"
+    );
+    forged.workspace = WorkspaceRef::External {
+        path: std::path::PathBuf::from("C:\\code\\proj\0bad"),
+    };
+    assert!(
+        matches!(
+            apply(
+                None,
+                &domain_event(
+                    event_id(0xa0),
+                    Some(task),
+                    1,
+                    Some(1),
+                    1,
+                    Event::TaskCreated {
+                        task: forged.clone(),
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    },
+                ),
+            ),
+            Err(ApplyError::InvalidTransition)
+        ),
+        "TaskCreated must reject NUL workspace path"
+    );
+    forged.workspace = WorkspaceRef::Worktree {
+        path: std::path::PathBuf::from(r"C:\code\proj"),
+        branch: "   ".into(),
+    };
+    assert!(matches!(
+        apply(
+            None,
+            &domain_event(
+                event_id(0xa1),
+                Some(task),
+                1,
+                Some(1),
+                1,
+                Event::TaskCreated {
+                    task: forged.clone(),
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    forged.workspace = WorkspaceRef::Main;
+    forged.assignment = TaskAssignment::ExternalPrincipal {
+        authority: "   ".into(),
+        subject: "user".into(),
+    };
+    assert!(matches!(
+        apply(
+            None,
+            &domain_event(
+                event_id(0xa2),
+                Some(task),
+                1,
+                Some(1),
+                1,
+                Event::TaskCreated {
+                    task: forged.clone(),
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    forged.assignment = TaskAssignment::LocalOwner;
+    forged.title = "   ".into();
+    assert!(matches!(
+        apply(
+            None,
+            &domain_event(
+                event_id(0xa3),
+                Some(task),
+                1,
+                Some(1),
+                1,
+                Event::TaskCreated {
+                    task: forged,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+
+    let snap = create_task(None, task, 1, 0xf5);
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xf6),
+                Some(task),
+                2,
+                Some(2),
+                2,
+                Event::TaskRenamed {
+                    title: "   ".into(),
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+
+    let blank_created = serde_json::json!({
+        "event_type": "task.created",
+        "schema_version": 1,
+        "payload": {
+            "task": {
+                "id": task.to_string(),
+                "environment_id": env_id(0x10).to_string(),
+                "title": "   ",
+                "description": null,
+                "project_id": project_id(0x11).to_string(),
+                "workspace": "main",
+                "assignment": "local_owner",
+                "lifecycle": "open",
+                "action_epoch": 0,
+                "revision": 1,
+                "created_at_ms": 1
+            },
+            "connectivity": "connected",
+            "attention": "none",
+            "activity": "idle",
+            "review_readiness": "not_ready"
+        }
+    });
+    assert!(serde_json::from_value::<Event>(blank_created).is_err());
+    let blank_rename = serde_json::json!({
+        "event_type": "task.renamed",
+        "schema_version": 1,
+        "payload": { "title": "  " }
+    });
+    assert!(serde_json::from_value::<Event>(blank_rename).is_err());
+
+    #[derive(serde::Serialize)]
+    struct EventWire<P> {
+        schema_version: u32,
+        event_type: &'static str,
+        payload: P,
+    }
+    #[derive(serde::Serialize)]
+    struct BlankTitle {
+        title: &'static str,
+    }
+    let mp_rename = rmp_serde::to_vec(&EventWire {
+        schema_version: 1,
+        event_type: "task.renamed",
+        payload: BlankTitle { title: "   " },
+    })
+    .expect("msgpack blank rename");
+    assert!(rmp_serde::from_slice::<Event>(&mp_rename).is_err());
+
+    #[derive(serde::Serialize)]
+    struct CreatedPayload {
+        task: MalformedTask,
+        connectivity: &'static str,
+        attention: &'static str,
+        activity: &'static str,
+        review_readiness: &'static str,
+    }
+    #[derive(serde::Serialize)]
+    struct MalformedTask {
+        id: String,
+        environment_id: String,
+        title: &'static str,
+        description: Option<&'static str>,
+        project_id: String,
+        workspace: MalformedWorkspace,
+        assignment: &'static str,
+        lifecycle: &'static str,
+        action_epoch: u64,
+        revision: u64,
+        created_at_ms: i64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum MalformedWorkspace {
+        Worktree {
+            path: &'static str,
+            branch: &'static str,
+        },
+    }
+    let mp_created = rmp_serde::to_vec(&EventWire {
+        schema_version: 1,
+        event_type: "task.created",
+        payload: CreatedPayload {
+            task: MalformedTask {
+                id: task.to_string(),
+                environment_id: env_id(0x10).to_string(),
+                title: "ok",
+                description: None,
+                project_id: project_id(0x11).to_string(),
+                workspace: MalformedWorkspace::Worktree {
+                    path: "",
+                    branch: "main",
+                },
+                assignment: "local_owner",
+                lifecycle: "open",
+                action_epoch: 0,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: "connected",
+            attention: "none",
+            activity: "idle",
+            review_readiness: "not_ready",
+        },
+    })
+    .expect("msgpack malformed created");
+    assert!(
+        rmp_serde::from_slice::<Event>(&mp_created).is_err(),
+        "MessagePack TaskCreated with empty path must fail closed"
+    );
+}
+
+#[test]
+fn forged_resource_and_agent_registration_are_rejected() {
+    let task = task_id(0xf7);
+    let snap = create_task(None, task, 1, 0xf8);
+
+    let released = ResourceFacts {
+        id: resource_id(0xf9),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Released,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    assert!(matches!(
+        decide(
+            Some(&snap),
+            &envelope(
+                command_id(0xfa),
+                Some(task),
+                Some(1),
+                Command::RegisterResource {
+                    resource: released.clone(),
+                },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xfb),
+                Some(task),
+                2,
+                Some(2),
+                2,
+                Event::ResourceRegistered {
+                    resource: released.clone(),
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+
+    let mismatched = ResourceFacts {
+        id: resource_id(0xfc),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Service {
+            command: "echo".into(),
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    assert!(
+        ResourceFacts::new(
+            Some(task),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Service {
+                command: "echo".into(),
+            },
+            1,
+        )
+        .is_err(),
+        "kind/recipe mismatch must fail construction"
+    );
+    let mismatched_json = serde_json::to_value(&mismatched).expect("serialize mismatched");
+    assert!(
+        serde_json::from_value::<ResourceFacts>(mismatched_json).is_err(),
+        "kind/recipe mismatch must fail JSON deserialize"
+    );
+    #[derive(serde::Serialize)]
+    struct ResourceWire {
+        id: String,
+        task_id: String,
+        owner_kind: &'static str,
+        resource_kind: &'static str,
+        recipe: KindMismatchRecipe,
+        lifecycle: &'static str,
+        runtime_generation: u64,
+        updated_at_ms: i64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum KindMismatchRecipe {
+        Service { command: &'static str },
+    }
+    let mp_resource = rmp_serde::to_vec(&ResourceWire {
+        id: resource_id(0xfc).to_string(),
+        task_id: task.to_string(),
+        owner_kind: "task",
+        resource_kind: "terminal",
+        recipe: KindMismatchRecipe::Service { command: "echo" },
+        lifecycle: "active",
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    })
+    .expect("msgpack mismatched resource");
+    assert!(
+        rmp_serde::from_slice::<ResourceFacts>(&mp_resource).is_err(),
+        "MessagePack ResourceFacts kind/recipe mismatch must fail closed"
+    );
+    #[derive(serde::Serialize)]
+    struct EventWire<P> {
+        schema_version: u32,
+        event_type: &'static str,
+        payload: P,
+    }
+    #[derive(serde::Serialize)]
+    struct RegisteredPayload {
+        resource: ResourceWire,
+    }
+    let mp_registered = rmp_serde::to_vec(&EventWire {
+        schema_version: 1,
+        event_type: "resource.registered",
+        payload: RegisteredPayload {
+            resource: ResourceWire {
+                id: resource_id(0xfc).to_string(),
+                task_id: task.to_string(),
+                owner_kind: "task",
+                resource_kind: "terminal",
+                recipe: KindMismatchRecipe::Service { command: "echo" },
+                lifecycle: "active",
+                runtime_generation: 0,
+                updated_at_ms: 1,
+            },
+        },
+    })
+    .expect("msgpack registered");
+    assert!(
+        rmp_serde::from_slice::<Event>(&mp_registered).is_err(),
+        "MessagePack ResourceRegistered with kind/recipe mismatch must fail closed"
+    );
+
+    assert!(ResourceFacts::new(
+        None,
+        OwnerKind::Task,
+        ResourceKind::Terminal,
+        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        1,
+    )
+    .is_err());
+    assert!(ResourceFacts::new(
+        Some(task),
+        OwnerKind::Host,
+        ResourceKind::Terminal,
+        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        1,
+    )
+    .is_err());
+
+    // Valid persisted Releasing facts must still deserialize.
+    let releasing = ResourceFacts {
+        id: resource_id(0xfd),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Service,
+        recipe: ResourceRecipe::Service {
+            command: "echo".into(),
+        },
+        lifecycle: ResourceLifecycle::Releasing,
+        runtime_generation: 2,
+        updated_at_ms: 3,
+    };
+    let json = serde_json::to_value(&releasing).expect("serialize releasing");
+    let restored: ResourceFacts = serde_json::from_value(json).expect("deserialize releasing");
+    assert_eq!(restored.lifecycle, ResourceLifecycle::Releasing);
+    let packed = rmp_serde::to_vec(&releasing).expect("msgpack releasing");
+    let mp: ResourceFacts = rmp_serde::from_slice(&packed).expect("msgpack restoring");
+    assert_eq!(mp, releasing);
+
+    let released_persisted = ResourceFacts {
+        id: resource_id(0xfd),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Service,
+        recipe: ResourceRecipe::Service {
+            command: "echo".into(),
+        },
+        lifecycle: ResourceLifecycle::Released,
+        runtime_generation: 2,
+        updated_at_ms: 4,
+    };
+    let released_json = serde_json::to_value(&released_persisted).expect("serialize released");
+    let released_restored: ResourceFacts =
+        serde_json::from_value(released_json).expect("deserialize released");
+    assert_eq!(released_restored.lifecycle, ResourceLifecycle::Released);
+    let released_packed = rmp_serde::to_vec(&released_persisted).expect("msgpack released");
+    let released_mp: ResourceFacts =
+        rmp_serde::from_slice(&released_packed).expect("msgpack restore released");
+    assert_eq!(released_mp, released_persisted);
+
+    let bad_owner = serde_json::json!({
+        "id": resource_id(0xfe).to_string(),
+        "task_id": null,
+        "owner_kind": "task",
+        "resource_kind": "terminal",
+        "recipe": { "terminal": { "cols": 1, "rows": 1 } },
+        "lifecycle": "active",
+        "runtime_generation": 0,
+        "updated_at_ms": 1
+    });
+    assert!(serde_json::from_value::<ResourceFacts>(bad_owner).is_err());
+
+    let specialist = AgentSessionFacts {
+        id: agent_id(0x01),
+        task_id: task,
+        role: AgentRole::specialist("reviewer").expect("role"),
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    let with_agent = apply_decided(
+        Some(snap),
+        &envelope(
+            command_id(0x02),
+            Some(task),
+            Some(1),
+            Command::RegisterAgentSession {
+                agent: specialist.clone(),
+            },
+        ),
+        2,
+        0x03,
+        3,
+    )
+    .expect("register specialist");
+    assert!(matches!(
+        decide(
+            Some(&with_agent),
+            &envelope(
+                command_id(0x04),
+                Some(task),
+                Some(2),
+                Command::SetPrimaryAgent {
+                    agent_session_id: specialist.id,
+                },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+
+    let closed_agent = AgentSessionFacts {
+        id: agent_id(0x05),
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Closed,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    assert!(matches!(
+        decide(
+            Some(&with_agent),
+            &envelope(
+                command_id(0x06),
+                Some(task),
+                Some(2),
+                Command::RegisterAgentSession {
+                    agent: closed_agent.clone(),
+                },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+    assert!(matches!(
+        apply(
+            Some(with_agent),
+            &domain_event(
+                event_id(0x07),
+                Some(task),
+                3,
+                Some(3),
+                4,
+                Event::AgentSessionRegistered {
+                    agent: closed_agent,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+}
+
+#[test]
+fn operation_accepted_is_rebuildable_and_not_settlement() {
+    let task = task_id(0x08);
+    let snap = create_task(None, task, 1, 0x09);
+    let fact = OperationAcceptedFact::new(
+        command_id(0x0a),
+        operation_id(0x0b),
+        Some(task),
+        10,
+        Some(0),
+        None,
+    )
+    .expect("accepted fact");
+    let event = domain_event(
+        event_id(0x0c),
+        Some(task),
+        2,
+        Some(1),
+        11,
+        Event::OperationAccepted(fact.clone()),
+    );
+    assert!(!Event::OperationAccepted(fact.clone()).is_task_mutation());
+    let after = apply(Some(snap.clone()), &event).expect("apply accepted");
+    assert_eq!(after.task.revision, snap.task.revision);
+    assert!(!matches!(
+        Event::OperationAccepted(fact.clone()),
+        Event::OperationSettled(_)
+    ));
+
+    let mismatched = OperationAcceptedFact::new(
+        command_id(0x0a),
+        operation_id(0x0b),
+        Some(task_id(0x0d)),
+        10,
+        Some(0),
+        None,
+    )
+    .expect("fact");
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0x0e),
+                Some(task),
+                2,
+                Some(1),
+                11,
+                Event::OperationAccepted(mismatched),
+            ),
+        ),
+        Err(ApplyError::TaskMismatch)
+    ));
+
+    let missing_fact_task = OperationAcceptedFact::new(
+        command_id(0x0a),
+        operation_id(0x0b),
+        None,
+        10,
+        Some(0),
+        None,
+    )
+    .expect("fact with None task_id");
+    assert!(
+        matches!(
+            apply(
+                Some(snap),
+                &domain_event(
+                    event_id(0x0f),
+                    Some(task),
+                    2,
+                    Some(1),
+                    11,
+                    Event::OperationAccepted(missing_fact_task),
+                ),
+            ),
+            Err(ApplyError::TaskMismatch)
+        ),
+        "fact.task_id None must not apply inside a task-scoped DomainEvent"
+    );
 }

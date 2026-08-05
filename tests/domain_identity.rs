@@ -474,4 +474,131 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         0,
     )
     .is_err());
+    assert!(ResourceFacts::new(
+        Some(task_id),
+        OwnerKind::Host,
+        ResourceKind::Terminal,
+        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        0,
+    )
+    .is_err());
+    assert!(ResourceFacts::new(
+        None,
+        OwnerKind::Task,
+        ResourceKind::Terminal,
+        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        0,
+    )
+    .is_err());
+    assert!(ResourceFacts::new(
+        Some(task_id),
+        OwnerKind::Task,
+        ResourceKind::Service,
+        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        0,
+    )
+    .is_err());
+
+    let releasing = ResourceFacts {
+        id: ResourceId::new(),
+        task_id: Some(task_id),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        lifecycle: ResourceLifecycle::Releasing,
+        runtime_generation: 1,
+        updated_at_ms: 0,
+    };
+    let json = serde_json::to_value(&releasing).expect("json");
+    let restored: ResourceFacts = serde_json::from_value(json).expect("json restore releasing");
+    assert_eq!(restored.lifecycle, ResourceLifecycle::Releasing);
+    let packed = rmp_serde::to_vec(&releasing).expect("msgpack");
+    let mp: ResourceFacts = rmp_serde::from_slice(&packed).expect("msgpack restore");
+    assert_eq!(mp.lifecycle, ResourceLifecycle::Releasing);
+
+    let bad_binding = serde_json::json!({
+        "id": ResourceId::new().to_string(),
+        "task_id": null,
+        "owner_kind": "task",
+        "resource_kind": "terminal",
+        "recipe": { "terminal": { "cols": 1, "rows": 1 } },
+        "lifecycle": "active",
+        "runtime_generation": 0,
+        "updated_at_ms": 0
+    });
+    assert!(serde_json::from_value::<ResourceFacts>(bad_binding).is_err());
+
+    // Constructors trim; validate rejects forged untrimmed noncanonical durable strings.
+    let specialist = AgentRole::specialist("  reviewer  ").expect("specialist trims");
+    assert_eq!(
+        specialist,
+        AgentRole::Specialist {
+            name: "reviewer".into()
+        }
+    );
+    assert!(serde_json::from_value::<AgentRole>(serde_json::json!({
+        "specialist": { "name": "  " }
+    }))
+    .is_err());
+    let padded_specialist = AgentRole::Specialist {
+        name: "  reviewer  ".into(),
+    };
+    assert!(padded_specialist.validate().is_err());
+
+    let agent = AgentSessionFacts::new(
+        task_id,
+        AgentRole::Primary,
+        "  claude  ",
+        Some("  sess  ".into()),
+    )
+    .expect("provider strings trim");
+    assert_eq!(agent.provider_kind, "claude");
+    assert_eq!(agent.provider_session_id.as_deref(), Some("sess"));
+    let forged_agent = AgentSessionFacts {
+        provider_kind: "  claude  ".into(),
+        ..agent.clone()
+    };
+    assert!(forged_agent.validate().is_err());
+
+    let artifact = ArtifactFacts::new(
+        task_id,
+        ArtifactKind::Finding,
+        "  note  ",
+        ArtifactContentRef::content_addressed("  abc123  ").expect("digest"),
+        [0u8; 32],
+        PrivacyClass::LocalOnly,
+        0,
+    )
+    .expect("artifact");
+    assert_eq!(artifact.label, "note");
+    assert_eq!(
+        artifact.content_ref,
+        ArtifactContentRef::ContentAddressed {
+            digest_hex: "abc123".into()
+        }
+    );
+    let padded_inline = ArtifactContentRef::InlineUtf8("  keep spaces  ".into());
+    assert!(padded_inline.validate().is_ok());
+    assert_eq!(
+        padded_inline,
+        ArtifactContentRef::InlineUtf8("  keep spaces  ".into())
+    );
+
+    let browser = ResourceRecipe::browser("  https://example  ").expect("url");
+    assert_eq!(
+        browser,
+        ResourceRecipe::Browser {
+            start_url: "https://example".into()
+        }
+    );
+    assert!(ResourceRecipe::Browser {
+        start_url: "  https://example  ".into()
+    }
+    .validate()
+    .is_err());
+    assert!(ResourceRecipe::Service {
+        command: "  echo  ".into()
+    }
+    .validate()
+    .is_err());
 }

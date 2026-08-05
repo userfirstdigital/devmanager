@@ -104,9 +104,9 @@ pub fn decide(
             if intent.title.trim().is_empty() {
                 return Err(RejectionCode::InvalidTransition);
             }
-            Ok(vec![Event::TaskRenamed {
-                title: intent.title.trim().to_string(),
-            }])
+            let title = TaskFacts::canonicalize_title(intent.title.clone())
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            Ok(vec![Event::TaskRenamed { title }])
         }
         Command::SetTaskAttention(intent) => {
             let snap = require_open_or_closing_task(snapshot, envelope)?;
@@ -130,6 +130,9 @@ pub fn decide(
             if agent.task_id != snap.task.id {
                 return Err(RejectionCode::OwnershipConflict);
             }
+            if agent.validate_for_registration().is_err() {
+                return Err(RejectionCode::InvalidTransition);
+            }
             if snap.agents.contains_key(&agent.id) {
                 return Err(RejectionCode::AlreadyExists);
             }
@@ -140,8 +143,11 @@ pub fn decide(
         Command::SetPrimaryAgent { agent_session_id } => {
             let snap = require_runtime_capable_task(snapshot, envelope)?;
             require_expected_revision(snap, envelope)?;
-            if !snap.agents.contains_key(agent_session_id) {
+            let Some(agent) = snap.agents.get(agent_session_id) else {
                 return Err(RejectionCode::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
+                return Err(RejectionCode::InvalidTransition);
             }
             Ok(vec![Event::PrimaryAgentSet {
                 agent_session_id: *agent_session_id,
@@ -152,6 +158,9 @@ pub fn decide(
             require_expected_revision(snap, envelope)?;
             if artifact.task_id != snap.task.id {
                 return Err(RejectionCode::OwnershipConflict);
+            }
+            if artifact.validate().is_err() {
+                return Err(RejectionCode::InvalidTransition);
             }
             if snap.artifacts.contains_key(&artifact.id) {
                 return Err(RejectionCode::AlreadyExists);
@@ -169,6 +178,12 @@ pub fn decide(
             match resource.task_id {
                 Some(id) if id == snap.task.id => {}
                 _ => return Err(RejectionCode::OwnershipConflict),
+            }
+            if resource.validate().is_err() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active {
+                return Err(RejectionCode::InvalidTransition);
             }
             if snap.resources.contains_key(&resource.id) {
                 return Err(RejectionCode::AlreadyExists);
@@ -241,6 +256,8 @@ fn decide_create_task(
         revision: 1,
         created_at_ms: intent.created_at_ms,
     };
+    task.validate_for_create()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
     Ok(vec![Event::TaskCreated {
         task,
         connectivity: intent.connectivity,

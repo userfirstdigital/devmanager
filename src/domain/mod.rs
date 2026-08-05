@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod artifact;
+pub(crate) mod canonical;
 pub mod command;
 pub mod event;
 pub mod id;
@@ -18,8 +19,9 @@ pub use command::{
     RenameTaskIntent, SetTaskAttentionIntent,
 };
 pub use event::{
-    apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationCancelledFact,
-    OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
+    apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
+    OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
+    EVENT_SCHEMA_VERSION,
 };
 pub use id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
