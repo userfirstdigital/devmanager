@@ -3,8 +3,10 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::protocol::{
-    Capability, CapabilitySet, FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec,
-    PhysicalFrameError, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    Capability, CapabilitySet, FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec,
+    MessagePackError, MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError,
+    ProtocolVersion, VersionNegotiationError, MAX_MESSAGEPACK_COLLECTION_ITEMS,
+    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -352,4 +354,157 @@ fn protocol_physical_frame_partial_io_fails_closed() {
     })
     .expect("hard-capped codec");
     assert_eq!(hard_capped.max_payload_bytes(), 1024 * 1024);
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MessagePackFixture {
+    name: String,
+    values: Vec<u16>,
+}
+
+#[test]
+fn protocol_messagepack_codec_round_trips_one_named_bounded_document() {
+    let codec = MessagePackCodec::from_limits(FrameLimits {
+        max_physical_frame_bytes: 1_024,
+        ..FrameLimits::v1_default()
+    })
+    .expect("codec");
+    let expected = MessagePackFixture {
+        name: "bounded".to_string(),
+        values: vec![1, 2, 3],
+    };
+
+    let encoded = codec.encode(&expected).expect("encode");
+    assert_eq!(encoded[0], 0x82, "named structs use a stable map envelope");
+    assert_eq!(
+        codec
+            .decode::<MessagePackFixture>(&encoded)
+            .expect("decode"),
+        expected
+    );
+    assert_eq!(codec.decode::<u64>(&encoded), Err(MessagePackError::Decode));
+}
+
+#[test]
+fn protocol_messagepack_codec_rejects_document_boundary_violations() {
+    let codec = MessagePackCodec::from_limits(FrameLimits {
+        max_physical_frame_bytes: 8,
+        ..FrameLimits::v1_default()
+    })
+    .expect("codec");
+
+    assert_eq!(codec.decode::<()>(&[]), Err(MessagePackError::Empty));
+    assert_eq!(
+        codec.decode::<()>(&[0xc0; 9]),
+        Err(MessagePackError::Oversized {
+            declared: 9,
+            maximum: 8,
+        })
+    );
+    assert_eq!(
+        codec.decode::<()>(&[0xc1]),
+        Err(MessagePackError::ReservedMarker { offset: 0 })
+    );
+    assert_eq!(
+        codec.decode::<String>(&[0xd9, 0x01]),
+        Err(MessagePackError::Truncated { offset: 2 })
+    );
+    assert_eq!(
+        codec.decode::<()>(&[0xc0, 0xc0]),
+        Err(MessagePackError::TrailingBytes { offset: 1 })
+    );
+}
+
+#[test]
+fn protocol_messagepack_codec_rejects_huge_declarations_before_serde() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let cases = [
+        (
+            vec![0xdd, 0xff, 0xff, 0xff, 0xff],
+            MessagePackLengthKind::Array,
+            MAX_MESSAGEPACK_COLLECTION_ITEMS,
+        ),
+        (
+            vec![0xdf, 0xff, 0xff, 0xff, 0xff],
+            MessagePackLengthKind::Map,
+            MAX_MESSAGEPACK_COLLECTION_ITEMS,
+        ),
+        (
+            vec![0xdb, 0xff, 0xff, 0xff, 0xff],
+            MessagePackLengthKind::String,
+            1024 * 1024,
+        ),
+        (
+            vec![0xc6, 0xff, 0xff, 0xff, 0xff],
+            MessagePackLengthKind::Binary,
+            1024 * 1024,
+        ),
+    ];
+
+    for (payload, kind, maximum) in cases {
+        assert_eq!(
+            codec.decode::<()>(&payload),
+            Err(MessagePackError::DeclaredLengthExceeded {
+                kind,
+                declared: u32::MAX,
+                maximum,
+            })
+        );
+    }
+
+    for payload in [vec![0xd4], vec![0xc9, 0xff, 0xff, 0xff, 0xff]] {
+        assert_eq!(
+            codec.decode::<()>(&payload),
+            Err(MessagePackError::UnsupportedExtension { offset: 0 })
+        );
+    }
+}
+
+#[test]
+fn protocol_messagepack_codec_bounds_depth_and_total_values() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    let mut maximum_depth = vec![0x91; usize::from(MAX_MESSAGEPACK_DEPTH)];
+    maximum_depth.push(0xc0);
+    codec
+        .decode::<serde::de::IgnoredAny>(&maximum_depth)
+        .expect("the advertised maximum depth remains decodable");
+
+    let mut too_deep = vec![0x91; usize::from(MAX_MESSAGEPACK_DEPTH) + 1];
+    too_deep.push(0xc0);
+    assert_eq!(
+        codec.decode::<()>(&too_deep),
+        Err(MessagePackError::DepthExceeded {
+            maximum: MAX_MESSAGEPACK_DEPTH,
+        })
+    );
+
+    let mut too_deep_even_when_empty = vec![0x91; usize::from(MAX_MESSAGEPACK_DEPTH)];
+    too_deep_even_when_empty.push(0x90);
+    assert_eq!(
+        codec.decode::<serde::de::IgnoredAny>(&too_deep_even_when_empty),
+        Err(MessagePackError::DepthExceeded {
+            maximum: MAX_MESSAGEPACK_DEPTH,
+        })
+    );
+
+    let mut too_many = vec![0xdc];
+    too_many.extend_from_slice(
+        &u16::try_from(MAX_MESSAGEPACK_COLLECTION_ITEMS)
+            .expect("collection bound fits u16")
+            .to_be_bytes(),
+    );
+    for _ in 0..MAX_MESSAGEPACK_COLLECTION_ITEMS {
+        too_many.push(0xdc);
+        too_many.extend_from_slice(&66_u16.to_be_bytes());
+        too_many.extend_from_slice(&[0xc0; 66]);
+    }
+    assert!(too_many.len() < 1024 * 1024);
+    assert_eq!(
+        codec.decode::<()>(&too_many),
+        Err(MessagePackError::ValueCountExceeded {
+            maximum: MAX_MESSAGEPACK_VALUES,
+        })
+    );
 }
