@@ -128,7 +128,7 @@ struct PlannedEffectWire {
     effect: Effect,
 }
 
-#[allow(dead_code)] // reserved for Task 1.4b+ outbox insert
+#[allow(dead_code)] // reserved for Task 1.4c+ outbox insert
 pub(crate) fn encode_effect_document(doc: &PlannedEffectDocument) -> Result<Vec<u8>, StoreError> {
     if doc.schema_version != EFFECT_SCHEMA_VERSION {
         return Err(StoreError::CodecMismatch {
@@ -226,7 +226,6 @@ struct ReceiptDocumentWire {
     receipt: ReceiptBodyWire,
 }
 
-#[allow(dead_code)] // reserved for Task 1.4b+ receipt persistence
 pub(crate) fn encode_receipt_document(receipt: &CommandReceipt) -> Result<Vec<u8>, StoreError> {
     let body = match receipt {
         CommandReceipt::Accepted {
@@ -259,7 +258,6 @@ pub(crate) fn encode_receipt_document(receipt: &CommandReceipt) -> Result<Vec<u8
     })
 }
 
-#[allow(dead_code)] // reserved for Task 1.4b+ receipt lookup
 pub(crate) fn decode_receipt_document(payload: &[u8]) -> Result<CommandReceipt, StoreError> {
     let wire: ReceiptDocumentWire =
         rmp_serde::from_slice(payload).map_err(|err| StoreError::CodecMismatch {

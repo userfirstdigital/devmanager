@@ -2,9 +2,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
     OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
@@ -14,6 +15,7 @@ use crate::domain::event::{
     EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, TaskId};
+use crate::kernel::command_bus;
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 
@@ -128,6 +130,11 @@ impl KernelStore {
         Ok(result)
     }
 
+    /// Execute a command in one IMMEDIATE writer transaction.
+    pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
+        command_bus::execute(self, envelope)
+    }
+
     /// Canonical database path retained for private snapshot connections.
     #[allow(dead_code)] // reserved for Task 1.4+ snapshot loading
     pub(crate) fn path(&self) -> &Path {
@@ -139,6 +146,18 @@ impl KernelStore {
     #[allow(dead_code)] // reserved for Task 1.4+ snapshot loading
     pub(crate) fn open_query_connection(&self) -> Result<Connection, StoreError> {
         open_readonly_query_connection(&self.path)
+    }
+
+    pub(crate) fn with_immediate_transaction<T>(
+        &mut self,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let out = body(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -629,14 +648,14 @@ pub(crate) fn u64_to_sqlite_i64(field: &'static str, value: u64) -> Result<i64, 
     i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange { field, value })
 }
 
-fn u64_from_nonnegative_i64(field: &'static str, value: i64) -> Result<u64, StoreError> {
+pub(crate) fn u64_from_nonnegative_i64(field: &'static str, value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange {
         field,
         value: value.unsigned_abs(),
     })
 }
 
-fn now_ms() -> Result<i64, StoreError> {
+pub(crate) fn now_ms() -> Result<i64, StoreError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| StoreError::Io(e.to_string()))?;
@@ -660,7 +679,6 @@ fn task_id_from_bytes(bytes: &[u8]) -> Result<TaskId, StoreError> {
     TaskId::from_bytes(array).map_err(|e| StoreError::EventDecode(e.to_string()))
 }
 
-#[allow(dead_code)] // reserved for Task 1.4 event append path
 pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError> {
     let bytes = match event {
         Event::TaskCreated {
@@ -725,7 +743,7 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
     Ok(bytes)
 }
 
-fn decode_stored_event(
+pub(crate) fn decode_stored_event(
     event_type: &str,
     schema_version: i64,
     payload: &[u8],

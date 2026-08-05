@@ -811,7 +811,8 @@ fn opt_u64(field: &'static str, value: Option<u64>) -> Result<Option<i64>, Store
     }
 }
 
-fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
+/// Pack a projection MessagePack blob. Same encoding the store uses when writing.
+pub(crate) fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
     rmp_serde::to_vec(value).map_err(|e| StoreError::Projection(e.to_string()))
 }
 

@@ -1,7 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use devmanager::domain::agent::{AgentRole, AgentSessionFacts};
+use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::artifact::ArtifactContentRef;
+use devmanager::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode, RenameTaskIntent,
+};
 use devmanager::domain::event::{
     AgentSessionRegisteredPayload, OperationAcceptedFact, OperationSettledFact,
     PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleasedPayload,
@@ -9,8 +13,8 @@ use devmanager::domain::event::{
     EVENT_SCHEMA_VERSION,
 };
 use devmanager::domain::id::{
-    AgentSessionId, ClientId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
-    ResourceId, TaskId,
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
+    ProjectId, ResourceId, TaskId,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -21,6 +25,7 @@ use devmanager::domain::task::{
 };
 use devmanager::kernel::{KernelStore, ProjectionRebuild, StoreError};
 use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
 use tempfile::TempDir;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -44,6 +49,9 @@ fn event_id(tail: u8) -> EventId {
 }
 fn agent_id(tail: u8) -> AgentSessionId {
     AgentSessionId::from_bytes(fixed_uuid_v7(tail)).expect("agent id")
+}
+fn artifact_id(tail: u8) -> ArtifactId {
+    ArtifactId::from_bytes(fixed_uuid_v7(tail)).expect("artifact id")
 }
 fn resource_id(tail: u8) -> ResourceId {
     ResourceId::from_bytes(fixed_uuid_v7(tail)).expect("resource id")
@@ -1857,4 +1865,2039 @@ fn command_contract_projector_uncertain_resolves_only_via_reconciliation() {
         )
         .unwrap();
     assert_eq!(state, "settled");
+}
+
+fn create_task_intent(task: TaskId) -> CreateTaskIntent {
+    CreateTaskIntent {
+        id: task,
+        environment_id: env_id(0x10),
+        title: "Ship kernel".into(),
+        description: Some("Phase 1 domain".into()),
+        project_id: project_id(0x11),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        created_at_ms: 1_725_000_000_000,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+    }
+}
+
+fn command_envelope(
+    command_id: CommandId,
+    task_id: Option<TaskId>,
+    expected_task_revision: Option<u64>,
+    command: Command,
+) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id,
+        client_id: client_id(0x20),
+        task_id,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision,
+        command,
+    }
+}
+
+fn receipt_blob(conn: &Connection, command_id: CommandId) -> Vec<u8> {
+    conn.query_row(
+        "SELECT receipt FROM command_receipts WHERE command_id = ?1",
+        [command_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )
+    .expect("receipt blob")
+}
+
+fn count_table(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .expect("count")
+}
+
+fn event_types(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT event_type FROM events ORDER BY sequence ASC")
+        .expect("prepare events");
+    stmt.query_map([], |row| row.get(0))
+        .expect("query events")
+        .map(|r| r.expect("row"))
+        .collect()
+}
+
+#[test]
+fn command_pure_create_persists_decision_operation_receipt_and_sequence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xC1);
+    let cmd = command_id(0xC2);
+    let envelope = command_envelope(
+        cmd,
+        None,
+        None,
+        Command::CreateTask(create_task_intent(task)),
+    );
+
+    let receipt = store.execute(envelope).expect("create execute");
+    let CommandReceipt::Accepted {
+        command_id,
+        operation_id,
+        task_revision,
+        event_ids,
+    } = receipt
+    else {
+        panic!("expected accepted receipt, got {receipt:?}");
+    };
+    assert_eq!(command_id, cmd);
+    assert_eq!(task_revision, Some(1));
+    assert_eq!(event_ids.len(), 1);
+
+    drop(store);
+    let conn = open_raw(&path);
+
+    assert_eq!(
+        event_types(&conn),
+        vec![
+            "task.created".to_string(),
+            "operation.accepted".to_string(),
+            "operation.settled".to_string(),
+        ]
+    );
+
+    let committed: i64 = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("committed_sequence");
+    assert_eq!(committed, 3);
+
+    let (title, revision, lifecycle): (String, i64, String) = conn
+        .query_row(
+            "SELECT title, revision, lifecycle FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("task projection");
+    assert_eq!(title, "Ship kernel");
+    assert_eq!(revision, 1);
+    assert_eq!(lifecycle, "open");
+
+    let (op_state, stored_op): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT state, operation_id FROM operations WHERE command_id = ?1",
+            [cmd.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("operation projection");
+    assert_eq!(op_state, "settled");
+    assert_eq!(stored_op.as_slice(), operation_id.as_bytes().as_slice());
+    assert_eq!(count_table(&conn, "outbox"), 0);
+
+    let decision_event_id: Vec<u8> = conn
+        .query_row(
+            "SELECT event_id FROM events WHERE event_type = 'task.created'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("decision event id");
+    assert_eq!(
+        event_ids[0].as_bytes().as_slice(),
+        decision_event_id.as_slice()
+    );
+}
+
+#[test]
+fn command_pure_rename_settles_with_decision_event_ids_only() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xC3);
+    store
+        .execute(command_envelope(
+            command_id(0xC4),
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+
+    let rename_cmd = command_id(0xC5);
+    let receipt = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Renamed kernel".into(),
+            }),
+        ))
+        .expect("rename");
+
+    let CommandReceipt::Accepted {
+        event_ids,
+        task_revision,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted rename, got {receipt:?}");
+    };
+    assert_eq!(task_revision, Some(2));
+    assert_eq!(event_ids.len(), 1);
+
+    drop(store);
+    let conn = open_raw(&path);
+    let types = event_types(&conn);
+    assert_eq!(
+        &types[3..],
+        &[
+            "task.renamed".to_string(),
+            "operation.accepted".to_string(),
+            "operation.settled".to_string(),
+        ]
+    );
+
+    let all_event_ids: Vec<Vec<u8>> = {
+        let mut stmt = conn
+            .prepare("SELECT event_id FROM events ORDER BY sequence ASC")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(all_event_ids.len(), 6);
+    assert_eq!(
+        event_ids[0].as_bytes().as_slice(),
+        all_event_ids[3].as_slice(),
+        "receipt event_ids must be the decision event only"
+    );
+    assert_ne!(
+        event_ids[0].as_bytes().as_slice(),
+        all_event_ids[4].as_slice()
+    );
+    assert_ne!(
+        event_ids[0].as_bytes().as_slice(),
+        all_event_ids[5].as_slice()
+    );
+
+    let settled_payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM events WHERE event_type = 'operation.settled'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let settled: OperationSettledFact = rmp_serde::from_slice(&settled_payload).unwrap();
+    assert_eq!(settled.result_event_ids, event_ids);
+    assert_eq!(
+        settled.source,
+        devmanager::domain::operation::OutcomeSource::Dispatch
+    );
+
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "Renamed kernel");
+    assert_eq!(count_table(&conn, "outbox"), 0);
+}
+
+#[test]
+fn command_pure_retry_returns_byte_equivalent_receipt() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xC6);
+    let cmd = command_id(0xC7);
+    let envelope = command_envelope(
+        cmd,
+        None,
+        None,
+        Command::CreateTask(create_task_intent(task)),
+    );
+    let first = store.execute(envelope.clone()).expect("first execute");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let original_blob = receipt_blob(&conn, cmd);
+    let event_count = count_table(&conn, "events");
+    let task_revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let second = store
+        .execute(envelope.clone())
+        .expect("retry same connection");
+    assert_eq!(second, first);
+
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(receipt_blob(&conn, cmd), original_blob);
+    assert_eq!(count_table(&conn, "events"), event_count);
+    let revision_after: i64 = conn
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, task_revision);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen again");
+    let third = store.execute(envelope).expect("retry after reopen");
+    assert_eq!(third, first);
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(receipt_blob(&conn, cmd), original_blob);
+    assert_eq!(count_table(&conn, "events"), event_count);
+}
+
+#[test]
+fn command_pure_revision_conflict_persists_rejected_receipt() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xC8);
+    store
+        .execute(command_envelope(
+            command_id(0xC9),
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+
+    let conflict_cmd = command_id(0xCA);
+    let conflict_envelope = command_envelope(
+        conflict_cmd,
+        Some(task),
+        Some(99),
+        Command::RenameTask(RenameTaskIntent {
+            title: "Stale rename".into(),
+        }),
+    );
+    let rejected = store.execute(conflict_envelope.clone()).expect("conflict");
+    assert_eq!(
+        rejected,
+        CommandReceipt::Rejected {
+            command_id: conflict_cmd,
+            code: RejectionCode::RevisionConflict,
+            current_revision: Some(1),
+        }
+    );
+
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(
+        event_types(&conn),
+        vec![
+            "task.created".to_string(),
+            "operation.accepted".to_string(),
+            "operation.settled".to_string(),
+        ]
+    );
+    assert_eq!(count_table(&conn, "operations"), 1);
+    assert_eq!(count_table(&conn, "outbox"), 0);
+    let rejected_blob = receipt_blob(&conn, conflict_cmd);
+    let committed: Option<i64> = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [conflict_cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, None);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store
+        .execute(command_envelope(
+            command_id(0xCB),
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Advance revision".into(),
+            }),
+        ))
+        .expect("advance revision");
+
+    let retry = store
+        .execute(conflict_envelope)
+        .expect("retry rejected command");
+    assert_eq!(retry, rejected);
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(receipt_blob(&conn, conflict_cmd), rejected_blob);
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "Advance revision");
+    assert_eq!(count_table(&conn, "operations"), 2);
+}
+
+#[test]
+fn command_pure_create_derives_scope_from_intent_id() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xCC);
+    let cmd = command_id(0xCD);
+    let envelope = command_envelope(
+        cmd,
+        None,
+        None,
+        Command::CreateTask(create_task_intent(task)),
+    );
+    assert_eq!(envelope.task_id, None, "CreateTask envelope stays unscoped");
+
+    let receipt = store.execute(envelope).expect("create");
+    let CommandReceipt::Accepted { .. } = receipt else {
+        panic!("expected accepted, got {receipt:?}");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    let receipt_task: Vec<u8> = conn
+        .query_row(
+            "SELECT task_id FROM command_receipts WHERE command_id = ?1",
+            [cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("receipt task_id");
+    assert_eq!(receipt_task.as_slice(), task.as_bytes().as_slice());
+
+    let event_task_ids: Vec<Option<Vec<u8>>> = {
+        let mut stmt = conn
+            .prepare("SELECT task_id FROM events ORDER BY sequence ASC")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(event_task_ids.len(), 3);
+    for tid in event_task_ids {
+        assert_eq!(
+            tid.as_deref(),
+            Some(task.as_bytes().as_slice()),
+            "effective durable scope is CreateTaskIntent.id"
+        );
+    }
+
+    let op_task: Vec<u8> = conn
+        .query_row(
+            "SELECT task_id FROM operations WHERE command_id = ?1",
+            [cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(op_task.as_slice(), task.as_bytes().as_slice());
+}
+
+#[test]
+fn command_pure_effectful_command_unsupported() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0xCE);
+    store
+        .execute(command_envelope(
+            command_id(0xCF),
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+
+    let close_cmd = command_id(0xD0);
+    let receipt = store
+        .execute(command_envelope(
+            close_cmd,
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect("begin close");
+    assert_eq!(
+        receipt,
+        CommandReceipt::Rejected {
+            command_id: close_cmd,
+            code: RejectionCode::UnsupportedCapability,
+            current_revision: Some(1),
+        }
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(
+        event_types(&conn),
+        vec![
+            "task.created".to_string(),
+            "operation.accepted".to_string(),
+            "operation.settled".to_string(),
+        ]
+    );
+    assert_eq!(count_table(&conn, "operations"), 1);
+    assert_eq!(count_table(&conn, "outbox"), 0);
+    let lifecycle: String = conn
+        .query_row(
+            "SELECT lifecycle FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle, "open");
+
+    let committed: Option<i64> = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [close_cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, None);
+}
+
+fn create_open_task(store: &mut KernelStore, task: TaskId, cmd: CommandId) {
+    store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create task");
+}
+
+fn seed_projection_rows(path: &Path, task: TaskId) {
+    let conn = open_raw(path);
+    let agent = agent_id(0xA1);
+    let artifact = artifact_id(0xA2);
+    let resource = resource_id(0xA3);
+    conn.execute(
+        "INSERT INTO agent_sessions(
+            agent_session_id, task_id, role, provider_kind, provider_session_id,
+            lifecycle, runtime_generation, revision
+         ) VALUES (?1, ?2, ?3, 'claude', 'sess-1', 'open', 0, 0)",
+        rusqlite::params![
+            agent.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&AgentRole::Primary).unwrap(),
+        ],
+    )
+    .expect("seed agent");
+    conn.execute(
+        "INSERT INTO artifacts(
+            artifact_id, task_id, kind, label, content_ref, sha256, privacy_class, created_at_ms
+         ) VALUES (?1, ?2, 'finding', 'note', ?3, ?4, 'local_only', 1)",
+        rusqlite::params![
+            artifact.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&ArtifactContentRef::InlineUtf8("body".into())).unwrap(),
+            vec![0u8; 32],
+        ],
+    )
+    .expect("seed artifact");
+    conn.execute(
+        "INSERT INTO resources(
+            resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+            runtime_generation, updated_at_ms
+         ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'active', 1, 1)",
+        rusqlite::params![
+            resource.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+        ],
+    )
+    .expect("seed resource");
+}
+
+fn assert_store_error_integrity(err: StoreError) {
+    assert!(
+        matches!(
+            err,
+            StoreError::Corruption
+                | StoreError::CodecMismatch { .. }
+                | StoreError::EventDecode(_)
+                | StoreError::Projection(_)
+        ),
+        "expected fail-closed integrity error, got {err:?}"
+    );
+}
+
+#[test]
+fn command_pure_corrupt_accepted_missing_operation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xE1);
+    let cmd = command_id(0xE2);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "DELETE FROM operations WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("missing operation must fail closed");
+    assert_store_error_integrity(err);
+}
+
+#[test]
+fn command_pure_corrupt_accepted_operation_id_mismatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xE3);
+    let cmd = command_id(0xE4);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let wrong_op = operation_id(0xEE);
+    // Replace the operation row with a mismatched operation_id.
+    conn.execute(
+        "DELETE FROM operations WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO operations(
+            operation_id, command_id, task_id, resource_id, action_epoch, runtime_generation,
+            state, result, outcome_code, accepted_at_ms, outcome_at_ms
+         ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, 'accepted', NULL, NULL, 1, NULL)",
+        rusqlite::params![
+            wrong_op.as_bytes().as_slice(),
+            cmd.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("operation_id mismatch must fail closed");
+    assert_store_error_integrity(err);
+}
+
+#[test]
+fn command_pure_corrupt_accepted_missing_committed_sequence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xE5);
+    let cmd = command_id(0xE6);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE command_receipts SET committed_sequence = NULL WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("accepted receipt without committed_sequence must fail");
+    assert_store_error_integrity(err);
+}
+
+#[test]
+fn command_pure_corrupt_accepted_missing_committed_event() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xE7);
+    let cmd = command_id(0xE8);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let committed: i64 = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute("DELETE FROM events WHERE sequence = ?1", [committed])
+        .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("missing committed event must fail");
+    assert_store_error_integrity(err);
+}
+
+#[test]
+fn command_pure_corrupt_accepted_task_scope_mismatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xE9);
+    let cmd = command_id(0xEA);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let other = task_id(0xEB);
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE operations SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![other.as_bytes().as_slice(), cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("task scope mismatch must fail");
+    assert_store_error_integrity(err);
+}
+
+fn invalid_uuid_bytes() -> [u8; 16] {
+    // 16 bytes with version nibble 4 — not UUIDv7.
+    [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x40, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x99,
+    ]
+}
+
+fn assert_retry_create_fails_closed(path: &Path, task: TaskId, cmd: CommandId) {
+    let events_before = {
+        let conn = open_raw(path);
+        count_table(&conn, "events")
+    };
+    let mut store = KernelStore::open(path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect_err("corrupt receipt correlation must fail closed");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+fn encode_accepted_receipt_blob(
+    command_id: CommandId,
+    operation_id: OperationId,
+    task_revision: Option<u64>,
+    event_ids: Vec<EventId>,
+) -> Vec<u8> {
+    #[derive(Serialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum ReceiptBodyWire {
+        Accepted {
+            command_id: CommandId,
+            operation_id: OperationId,
+            task_revision: Option<u64>,
+            event_ids: Vec<EventId>,
+        },
+    }
+    #[derive(Serialize)]
+    struct ReceiptDocumentWire {
+        schema_version: u32,
+        receipt: ReceiptBodyWire,
+    }
+    rmp_serde::to_vec_named(&ReceiptDocumentWire {
+        schema_version: 1,
+        receipt: ReceiptBodyWire::Accepted {
+            command_id,
+            operation_id,
+            task_revision,
+            event_ids,
+        },
+    })
+    .expect("encode forged receipt")
+}
+
+#[test]
+fn command_pure_corrupt_shared_invalid_task_scope() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x11);
+    let cmd = command_id(0x12);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let invalid = invalid_uuid_bytes();
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE command_receipts SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![invalid.as_slice(), cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE operations SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![invalid.as_slice(), cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE events SET task_id = ?1 WHERE task_id = ?2",
+        rusqlite::params![invalid.as_slice(), task.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_rejected_invalid_task_scope() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x13);
+    create_open_task(&mut store, task, command_id(0x14));
+    let conflict_cmd = command_id(0x15);
+    store
+        .execute(command_envelope(
+            conflict_cmd,
+            Some(task),
+            Some(99),
+            Command::RenameTask(RenameTaskIntent {
+                title: "stale".into(),
+            }),
+        ))
+        .expect("rejected");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let receipts_before = count_table(&conn, "command_receipts");
+    conn.execute(
+        "UPDATE command_receipts SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![
+            invalid_uuid_bytes().as_slice(),
+            conflict_cmd.as_bytes().as_slice()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            conflict_cmd,
+            Some(task),
+            Some(99),
+            Command::RenameTask(RenameTaskIntent {
+                title: "stale".into(),
+            }),
+        ))
+        .expect_err("rejected invalid task scope must fail");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "command_receipts"), receipts_before);
+}
+
+#[test]
+fn command_pure_corrupt_committed_sequence_points_to_unrelated_event() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x16);
+    let cmd = command_id(0x17);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    // Redirect to same-task task.created instead of operation.settled.
+    conn.execute(
+        "UPDATE command_receipts SET committed_sequence = 1 WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_settled_fact_ids_mismatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x18);
+    let cmd = command_id(0x19);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let forged = OperationSettledFact::new(
+        command_id(0x1A),
+        operation_id(0x1B),
+        1_200,
+        vec![event_id(0x1C)],
+        None,
+        None,
+        None,
+    )
+    .expect("forged settled");
+    conn.execute(
+        "UPDATE events SET payload = ?1 WHERE event_type = 'operation.settled'",
+        [rmp_serde::to_vec(&forged).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_decision_event_after_committed_sequence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x1D);
+    let cmd = command_id(0x1E);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE events SET sequence = 50 WHERE event_type = 'task.created'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_decision_event_at_committed_sequence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x21);
+    let cmd = command_id(0x22);
+    let receipt = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+    let CommandReceipt::Accepted {
+        operation_id,
+        task_revision,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    let settled_event_id = EventId::from_bytes(
+        conn.query_row(
+            "SELECT event_id FROM events WHERE event_type = 'operation.settled'",
+            [],
+            |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                let array: [u8; 16] = bytes.try_into().expect("16");
+                Ok(array)
+            },
+        )
+        .expect("settled id"),
+    )
+    .expect("event id");
+    // Receipt claims the settled/committed event itself as a "decision" id.
+    let forged =
+        encode_accepted_receipt_blob(cmd, operation_id, task_revision, vec![settled_event_id]);
+    conn.execute(
+        "UPDATE command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![forged, cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+fn event_id_for_type(conn: &Connection, event_type: &str) -> EventId {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT event_id FROM events WHERE event_type = ?1 ORDER BY sequence ASC LIMIT 1",
+            [event_type],
+            |row| row.get(0),
+        )
+        .expect("event id");
+    EventId::from_bytes(bytes.try_into().expect("16")).expect("event id")
+}
+
+#[test]
+fn command_pure_corrupt_forged_task_revision() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x31);
+    let cmd = command_id(0x32);
+    let receipt = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+    let CommandReceipt::Accepted {
+        operation_id,
+        event_ids,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    let forged = encode_accepted_receipt_blob(cmd, operation_id, Some(99), event_ids);
+    conn.execute(
+        "UPDATE command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![forged, cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_noncontiguous_foreign_earlier_mutation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x33);
+    create_open_task(&mut store, task, command_id(0x34));
+    let rename_cmd = command_id(0x35);
+    let receipt = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Renamed".into(),
+            }),
+        ))
+        .expect("rename");
+    let CommandReceipt::Accepted {
+        operation_id,
+        task_revision,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted rename");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    let earlier_created = event_id_for_type(&conn, "task.created");
+    let forged = encode_accepted_receipt_blob(
+        rename_cmd,
+        operation_id,
+        task_revision,
+        vec![earlier_created],
+    );
+    conn.execute(
+        "UPDATE command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![forged, rename_cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    // Keep settled.result_event_ids aligned so layout/contiguity is the failing axis.
+    let settled = OperationSettledFact::new(
+        rename_cmd,
+        operation_id,
+        1_200,
+        vec![earlier_created],
+        None,
+        None,
+        None,
+    )
+    .expect("settled");
+    conn.execute(
+        "UPDATE events SET payload = ?1
+         WHERE sequence = (
+            SELECT committed_sequence FROM command_receipts WHERE command_id = ?2
+         )",
+        rusqlite::params![
+            rmp_serde::to_vec(&settled).unwrap(),
+            rename_cmd.as_bytes().as_slice()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE operations SET result = ?1 WHERE command_id = ?2",
+        rusqlite::params![
+            rmp_serde::to_vec(&vec![earlier_created]).unwrap(),
+            rename_cmd.as_bytes().as_slice()
+        ],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Renamed".into(),
+            }),
+        ))
+        .expect_err("foreign earlier mutation must fail");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn command_pure_corrupt_operation_state_not_settled() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x36);
+    let cmd = command_id(0x37);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE operations SET state = 'accepted', outcome_at_ms = NULL WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_operation_non_null_pure_fence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x38);
+    let cmd = command_id(0x39);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE operations SET action_epoch = 1 WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_operation_result_mismatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x3A);
+    let cmd = command_id(0x3B);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE operations SET result = ?1 WHERE command_id = ?2",
+        rusqlite::params![
+            rmp_serde::to_vec(&vec![event_id(0x3C)]).unwrap(),
+            cmd.as_bytes().as_slice()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_accepted_scopes_all_null() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x41);
+    let cmd = command_id(0x42);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE command_receipts SET task_id = NULL WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE operations SET task_id = NULL WHERE command_id = ?1",
+        [cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE events SET task_id = NULL WHERE task_id = ?1",
+        [task.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_alternate_scope_keeps_created_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x43);
+    let cmd = command_id(0x44);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let other = task_id(0x45);
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE command_receipts SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![other.as_bytes().as_slice(), cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE operations SET task_id = ?1 WHERE command_id = ?2",
+        rusqlite::params![other.as_bytes().as_slice(), cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE events SET task_id = ?1 WHERE task_id = ?2",
+        rusqlite::params![other.as_bytes().as_slice(), task.as_bytes().as_slice()],
+    )
+    .unwrap();
+    // TaskCreated payload still embeds the original task id.
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_create_revisions_forged_away_from_projection() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x46);
+    let cmd = command_id(0x47);
+    let receipt = store
+        .execute(command_envelope(
+            cmd,
+            None,
+            None,
+            Command::CreateTask(create_task_intent(task)),
+        ))
+        .expect("create");
+    let CommandReceipt::Accepted {
+        operation_id,
+        event_ids,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    let mut created = sample_task(task);
+    created.revision = 99;
+    let payload = TaskCreatedPayload {
+        task: created,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+    };
+    conn.execute(
+        "UPDATE events SET task_revision = 99, payload = ?1 WHERE event_type = 'task.created'",
+        [rmp_serde::to_vec(&payload).unwrap()],
+    )
+    .unwrap();
+    let forged = encode_accepted_receipt_blob(cmd, operation_id, Some(99), event_ids);
+    conn.execute(
+        "UPDATE command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![forged, cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let projection_revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(projection_revision, 1);
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+#[test]
+fn command_pure_corrupt_rename_revision_unanchored_from_prior() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x48);
+    create_open_task(&mut store, task, command_id(0x49));
+    let rename_cmd = command_id(0x4A);
+    let receipt = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Renamed".into(),
+            }),
+        ))
+        .expect("rename");
+    let CommandReceipt::Accepted {
+        operation_id,
+        event_ids,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted rename");
+    };
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE events SET task_revision = 50
+         WHERE event_id = ?1",
+        [event_ids[0].as_bytes().as_slice()],
+    )
+    .unwrap();
+    let forged =
+        encode_accepted_receipt_blob(rename_cmd, operation_id, Some(50), event_ids.clone());
+    conn.execute(
+        "UPDATE command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![forged, rename_cmd.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Renamed".into(),
+            }),
+        ))
+        .expect_err("unanchored rename revision must fail");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn command_pure_corrupt_operational_events_have_task_revision() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x4B);
+    let cmd = command_id(0x4C);
+    create_open_task(&mut store, task, cmd);
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE events SET task_revision = 1
+         WHERE event_type IN ('operation.accepted', 'operation.settled')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_retry_create_fails_closed(&path, task, cmd);
+}
+
+fn primary_agent_facts(task: TaskId, agent: AgentSessionId) -> AgentSessionFacts {
+    AgentSessionFacts {
+        id: agent,
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: Some("sess-primary".into()),
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    }
+}
+
+fn register_and_set_primary(
+    store: &mut KernelStore,
+    task: TaskId,
+    agent: AgentSessionId,
+    register_cmd: CommandId,
+    set_cmd: CommandId,
+    expected_revision: u64,
+) {
+    store
+        .execute(command_envelope(
+            register_cmd,
+            Some(task),
+            Some(expected_revision),
+            Command::RegisterAgentSession {
+                agent: primary_agent_facts(task, agent),
+            },
+        ))
+        .expect("register primary");
+    store
+        .execute(command_envelope(
+            set_cmd,
+            Some(task),
+            Some(expected_revision + 1),
+            Command::SetPrimaryAgent {
+                agent_session_id: agent,
+            },
+        ))
+        .expect("set primary");
+}
+
+#[test]
+fn command_pure_corrupt_primary_agent_set_cross_task() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task_a = task_id(0x51);
+    let task_b = task_id(0x52);
+    let agent_a = agent_id(0x53);
+    let agent_b = agent_id(0x54);
+    create_open_task(&mut store, task_a, command_id(0x55));
+    create_open_task(&mut store, task_b, command_id(0x56));
+    register_and_set_primary(
+        &mut store,
+        task_a,
+        agent_a,
+        command_id(0x57),
+        command_id(0x58),
+        1,
+    );
+    register_and_set_primary(
+        &mut store,
+        task_b,
+        agent_b,
+        command_id(0x59),
+        command_id(0x5A),
+        1,
+    );
+    drop(store);
+
+    let set_cmd = command_id(0x58);
+    let conn = open_raw(&path);
+    let events_before = count_table(&conn, "events");
+    conn.execute(
+        "UPDATE events SET payload = ?1
+         WHERE event_type = 'primary_agent.set' AND task_id = ?2",
+        rusqlite::params![
+            rmp_serde::to_vec(&PrimaryAgentSetPayload {
+                agent_session_id: agent_b,
+            })
+            .unwrap(),
+            task_a.as_bytes().as_slice(),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            set_cmd,
+            Some(task_a),
+            Some(2),
+            Command::SetPrimaryAgent {
+                agent_session_id: agent_a,
+            },
+        ))
+        .expect_err("cross-task primary agent must fail closed");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn command_pure_corrupt_primary_agent_set_specialist_same_task() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let task = task_id(0x5B);
+    let primary = agent_id(0x5C);
+    let specialist = agent_id(0x5D);
+    create_open_task(&mut store, task, command_id(0x5E));
+    register_and_set_primary(
+        &mut store,
+        task,
+        primary,
+        command_id(0x5F),
+        command_id(0x60),
+        1,
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "INSERT INTO agent_sessions(
+            agent_session_id, task_id, role, provider_kind, provider_session_id,
+            lifecycle, runtime_generation, revision
+         ) VALUES (?1, ?2, ?3, 'claude', 'sess-spec', 'open', 0, 0)",
+        rusqlite::params![
+            specialist.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&AgentRole::specialist("reviewer").unwrap()).unwrap(),
+        ],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    conn.execute(
+        "UPDATE events SET payload = ?1
+         WHERE event_type = 'primary_agent.set' AND task_id = ?2",
+        rusqlite::params![
+            rmp_serde::to_vec(&PrimaryAgentSetPayload {
+                agent_session_id: specialist,
+            })
+            .unwrap(),
+            task.as_bytes().as_slice(),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            command_id(0x60),
+            Some(task),
+            Some(2),
+            Command::SetPrimaryAgent {
+                agent_session_id: primary,
+            },
+        ))
+        .expect_err("specialist primary agent must fail closed");
+    assert_store_error_integrity(err);
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn command_pure_corrupt_rejected_with_operation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xEC);
+    create_open_task(&mut store, task, command_id(0xED));
+
+    let conflict_cmd = command_id(0xEE);
+    let rejected = store
+        .execute(command_envelope(
+            conflict_cmd,
+            Some(task),
+            Some(99),
+            Command::RenameTask(RenameTaskIntent {
+                title: "stale".into(),
+            }),
+        ))
+        .expect("rejected");
+    assert!(matches!(rejected, CommandReceipt::Rejected { .. }));
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "INSERT INTO operations(
+            operation_id, command_id, task_id, resource_id, action_epoch, runtime_generation,
+            state, result, outcome_code, accepted_at_ms, outcome_at_ms
+         ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, 'accepted', NULL, NULL, 1, NULL)",
+        rusqlite::params![
+            operation_id(0xEF).as_bytes().as_slice(),
+            conflict_cmd.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command_envelope(
+            conflict_cmd,
+            Some(task),
+            Some(99),
+            Command::RenameTask(RenameTaskIntent {
+                title: "stale".into(),
+            }),
+        ))
+        .expect_err("rejected receipt with operation must fail");
+    assert_store_error_integrity(err);
+}
+
+#[test]
+fn command_pure_already_closing_begin_close_unsupported() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xF1);
+    create_open_task(&mut store, task, command_id(0xF2));
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'closing', action_epoch = 1 WHERE task_id = ?1",
+        [task.as_bytes().as_slice()],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    let ops_before = count_table(&conn, "operations");
+    let receipts_before = count_table(&conn, "command_receipts");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let close_cmd = command_id(0xF3);
+    let receipt = store
+        .execute(command_envelope(
+            close_cmd,
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect("already closing");
+    assert_eq!(
+        receipt,
+        CommandReceipt::Rejected {
+            command_id: close_cmd,
+            code: RejectionCode::UnsupportedCapability,
+            current_revision: Some(1),
+        }
+    );
+    let retry = store
+        .execute(command_envelope(
+            close_cmd,
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect("retry");
+    assert_eq!(retry, receipt);
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(count_table(&conn, "operations"), ops_before);
+    assert_eq!(count_table(&conn, "command_receipts"), receipts_before + 1);
+    assert_eq!(count_table(&conn, "outbox"), 0);
+}
+
+#[test]
+fn command_pure_already_releasing_release_resource_unsupported() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xF4);
+    create_open_task(&mut store, task, command_id(0xF5));
+    drop(store);
+
+    let resource = resource_id(0xF6);
+    let conn = open_raw(&path);
+    conn.execute(
+        "INSERT INTO resources(
+            resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+            runtime_generation, updated_at_ms
+         ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'releasing', 3, 1)",
+        rusqlite::params![
+            resource.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+        ],
+    )
+    .unwrap();
+    let events_before = count_table(&conn, "events");
+    let ops_before = count_table(&conn, "operations");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let release_cmd = command_id(0xF7);
+    let receipt = store
+        .execute(command_envelope(
+            release_cmd,
+            Some(task),
+            Some(1),
+            Command::ReleaseResource {
+                resource_id: resource,
+            },
+        ))
+        .expect("already releasing");
+    assert_eq!(
+        receipt,
+        CommandReceipt::Rejected {
+            command_id: release_cmd,
+            code: RejectionCode::UnsupportedCapability,
+            current_revision: Some(1),
+        }
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(count_table(&conn, "operations"), ops_before);
+    assert_eq!(count_table(&conn, "outbox"), 0);
+}
+
+#[test]
+fn command_pure_effectful_domain_rejection_still_wins() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xF8);
+    create_open_task(&mut store, task, command_id(0xF9));
+
+    let receipt = store
+        .execute(command_envelope(
+            command_id(0xFA),
+            Some(task),
+            Some(99),
+            Command::BeginCloseTask,
+        ))
+        .expect("revision conflict");
+    assert_eq!(
+        receipt,
+        CommandReceipt::Rejected {
+            command_id: command_id(0xFA),
+            code: RejectionCode::RevisionConflict,
+            current_revision: Some(1),
+        }
+    );
+}
+
+#[test]
+fn command_pure_populated_snapshot_loads_valid_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB1);
+    create_open_task(&mut store, task, command_id(0xB2));
+    drop(store);
+
+    seed_projection_rows(&path, task);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let receipt = store
+        .execute(command_envelope(
+            command_id(0xB3),
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "With snapshot peers".into(),
+            }),
+        ))
+        .expect("rename with populated snapshot");
+    assert!(matches!(
+        receipt,
+        CommandReceipt::Accepted {
+            task_revision: Some(2),
+            ..
+        }
+    ));
+}
+
+fn corrupt_blob_and_rename_must_roll_back(
+    path: &Path,
+    task: TaskId,
+    mutate: impl FnOnce(&Connection),
+) {
+    let conn = open_raw(path);
+    let events_before = count_table(&conn, "events");
+    let receipts_before = count_table(&conn, "command_receipts");
+    let title_before: String = conn
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    mutate(&conn);
+    drop(conn);
+
+    let mut store = KernelStore::open(path).expect("reopen");
+    let rename_cmd = command_id(0xD1);
+    let err = store
+        .execute(command_envelope(
+            rename_cmd,
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Should not commit".into(),
+            }),
+        ))
+        .expect_err("noncanonical projection blob must fail closed");
+    assert_store_error_integrity(err);
+    drop(store);
+
+    let conn = open_raw(path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(count_table(&conn, "command_receipts"), receipts_before);
+    let title_after: String = conn
+        .query_row(
+            "SELECT title FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title_after, title_before);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM command_receipts WHERE command_id = ?1",
+            [rename_cmd.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn command_pure_corrupt_noncanonical_workspace_branch_rolls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB4);
+    create_open_task(&mut store, task, command_id(0xB5));
+    drop(store);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawWorkspace {
+        Worktree { path: PathBuf, branch: String },
+    }
+
+    corrupt_blob_and_rename_must_roll_back(&path, task, |conn| {
+        conn.execute(
+            "UPDATE tasks SET workspace = ?1 WHERE task_id = ?2",
+            rusqlite::params![
+                rmp_serde::to_vec(&RawWorkspace::Worktree {
+                    path: PathBuf::from("wt"),
+                    branch: " main ".into(),
+                })
+                .unwrap(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn command_pure_corrupt_noncanonical_assignment_principal_rolls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB6);
+    create_open_task(&mut store, task, command_id(0xB7));
+    drop(store);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawAssignment {
+        ExternalPrincipal { authority: String, subject: String },
+    }
+
+    corrupt_blob_and_rename_must_roll_back(&path, task, |conn| {
+        conn.execute(
+            "UPDATE tasks SET assignment = ?1 WHERE task_id = ?2",
+            rusqlite::params![
+                rmp_serde::to_vec(&RawAssignment::ExternalPrincipal {
+                    authority: " org ".into(),
+                    subject: "user".into(),
+                })
+                .unwrap(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn command_pure_corrupt_noncanonical_agent_specialist_rolls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB8);
+    create_open_task(&mut store, task, command_id(0xB9));
+    drop(store);
+    seed_projection_rows(&path, task);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawRole {
+        Specialist { name: String },
+    }
+
+    corrupt_blob_and_rename_must_roll_back(&path, task, |conn| {
+        conn.execute(
+            "UPDATE agent_sessions SET role = ?1 WHERE task_id = ?2",
+            rusqlite::params![
+                rmp_serde::to_vec(&RawRole::Specialist {
+                    name: " reviewer ".into(),
+                })
+                .unwrap(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn command_pure_corrupt_noncanonical_artifact_digest_rolls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xBA);
+    create_open_task(&mut store, task, command_id(0xBB));
+    drop(store);
+    seed_projection_rows(&path, task);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawContentRef {
+        ContentAddressed { digest_hex: String },
+    }
+
+    corrupt_blob_and_rename_must_roll_back(&path, task, |conn| {
+        conn.execute(
+            "UPDATE artifacts SET content_ref = ?1 WHERE task_id = ?2",
+            rusqlite::params![
+                rmp_serde::to_vec(&RawContentRef::ContentAddressed {
+                    digest_hex: " abc ".into(),
+                })
+                .unwrap(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn command_pure_corrupt_noncanonical_resource_recipe_rolls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xBC);
+    create_open_task(&mut store, task, command_id(0xBD));
+    drop(store);
+    seed_projection_rows(&path, task);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawRecipe {
+        Browser { start_url: String },
+    }
+
+    corrupt_blob_and_rename_must_roll_back(&path, task, |conn| {
+        conn.execute(
+            "UPDATE resources SET resource_kind = 'browser_context', recipe = ?1 WHERE task_id = ?2",
+            rusqlite::params![
+                rmp_serde::to_vec(&RawRecipe::Browser {
+                    start_url: " https://example.com ".into(),
+                })
+                .unwrap(),
+                task.as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    });
 }
