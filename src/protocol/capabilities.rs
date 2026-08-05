@@ -1,0 +1,118 @@
+use serde::{Deserialize, Serialize};
+
+pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl ProtocolVersion {
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+
+    pub const fn current() -> Self {
+        Self::new(PROTOCOL_MAJOR, PROTOCOL_MINOR)
+    }
+
+    pub fn negotiate(self, peer: Self) -> Result<Self, VersionNegotiationError> {
+        if self.major != peer.major {
+            return Err(VersionNegotiationError::IncompatibleMajor {
+                local: self.major,
+                peer: peer.major,
+            });
+        }
+        Ok(Self::new(self.major, self.minor.min(peer.minor)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionNegotiationError {
+    IncompatibleMajor { local: u16, peer: u16 },
+}
+
+impl std::fmt::Display for VersionNegotiationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompatibleMajor { local, peer } => {
+                write!(
+                    f,
+                    "protocol major {peer} is incompatible with local major {local}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VersionNegotiationError {}
+
+/// Stable capability bit assignments for protocol v1.
+///
+/// `CapabilitySet` carries the bits on the wire so a newer minor peer's
+/// unknown bits can be preserved and safely excluded by intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Capability {
+    PagedSnapshots = 0,
+    EventReplay = 1,
+    OperationSettlement = 2,
+    ChunkResume = 3,
+    GenericExtensions = 4,
+    SemanticConversation = 5,
+    TerminalDeltas = 6,
+    BrowserProjection = 7,
+    PromptProjection = 8,
+    ConnectEncryption = 9,
+    Guests = 10,
+    ManagementMetadata = 11,
+}
+
+impl Capability {
+    pub const fn bit(self) -> u64 {
+        1_u64 << (self as u8)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapabilitySet {
+    bits: u64,
+}
+
+impl CapabilitySet {
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self { bits }
+    }
+
+    pub fn from_capabilities(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        let mut bits = 0;
+        for capability in capabilities {
+            bits |= capability.bit();
+        }
+        Self { bits }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.bits
+    }
+
+    pub const fn contains(self, capability: Capability) -> bool {
+        self.contains_bit(capability.bit())
+    }
+
+    pub const fn contains_bit(self, bit: u64) -> bool {
+        bit != 0 && self.bits & bit == bit
+    }
+
+    pub const fn intersection(self, peer: Self) -> Self {
+        Self::from_bits(self.bits & peer.bits)
+    }
+}

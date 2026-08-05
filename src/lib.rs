@@ -11,6 +11,7 @@ pub mod kernel;
 pub mod models;
 pub mod notifications;
 pub mod persistence;
+pub mod protocol;
 pub mod remote;
 pub mod services;
 pub mod sidebar;
