@@ -4,9 +4,9 @@
 
 **Goal:** Establish a fail-closed replacement-development environment and reproducible evidence proving that builds, tests, preview binaries, browsers, ports, and cleanup cannot touch the installed DevManager.
 
-**Architecture:** All replacement work runs from `.worktrees/native-gpui-kernel` on `codex/native-gpui-kernel`, with the explicit profile `native-next-dev`, instance label `Next`, dedicated target/live directories, and ignored evidence files. Shared PowerShell guards capture and compare production hashes and process identity around every risky gate; Rust path resolution remains fail-closed in tests. A provider/protocol conformance runner begins here with immutable manifests and append-only traces so every later seam is measured through one reproducible evidence contract.
+**Architecture:** All replacement work runs from `.worktrees/native-gpui-kernel` on `codex/native-gpui-kernel`, with the explicit profile `native-next-dev`, instance label `Next`, dedicated target/live directories, and ignored evidence files. Shared PowerShell guards capture and compare production hashes and process identity around every risky gate; Rust path resolution remains fail-closed in tests. Real lifecycle, conformance artifacts, and measurements begin only once Phase 2 has a real host/client surface.
 
-**Tech Stack:** PowerShell 7, Rust 1.94.0, serde/rmp-serde/serde_json, existing `dirs`/persistence code, Windows CIM/process APIs, SHA-256, Git worktrees.
+**Tech Stack:** PowerShell 7, Rust 1.94.0, existing `dirs`/persistence code, Windows CIM/process APIs, SHA-256, Git worktrees.
 
 ## Global Constraints
 
@@ -14,10 +14,10 @@
 - Production storage is the unprofiled `%APPDATA%\com.userfirst.devmanager` tree; tests must never resolve beneath it.
 - `config.json` and `remote.json` hashes plus installed PID/start time are the protected invariants. `session.json` is observed only as a path and never read or hashed because the installed app may legitimately update it.
 - Use `DEVMANAGER_PROFILE=native-next-dev` and `DEVMANAGER_INSTANCE_LABEL=Next` for every replacement binary.
+- Exception for the complete `cargo test --lib` recipe: explicitly remove any inherited `DEVMANAGER_PROFILE`; profile-sensitive unit tests own and restore that process-global variable under the required serial runner.
 - Use `target-native-next` and `target-live-native-next`; never copy a development executable into the installed location.
-- Full Rust library verification remains `cargo test --lib -- --test-threads=1` and must be announced before execution.
 - Every script fails closed on unresolved paths, ambiguous executable identity, malformed evidence, or missing expected profile variables.
-- This phase changes development tooling, path policy, and provider-independent conformance evidence only; it does not introduce the new kernel or launch provider/browser work.
+- This phase changes development tooling and path policy only; it does not introduce the new kernel, launch lifecycle, or provider/browser work.
 
 ---
 
@@ -33,7 +33,6 @@
 - Create: `src/config/mod.rs` — replacement configuration namespace.
 - Create: `src/config/paths.rs` — profile parsing and resolved storage/build identity.
 - Modify: `src/lib.rs` — export `config`.
-- Modify: `Cargo.toml`, `Cargo.lock` — pin UUIDv7 support for conformance run identity.
 - Modify: `src/persistence/mod.rs` — delegate path calculation to `config::paths` without changing production behavior.
 - Create: `tests/development_isolation.rs` — path/profile fail-closed contract.
 - Create: `scripts/native-next/Isolation.ps1` — shared path, process, hash, and evidence functions.
@@ -44,18 +43,8 @@
 - Create: `scripts/native-next/NativeNext.ps1` — shared path/env validation library for the scaffold.
 - Create: `scripts/native-next/Invoke-PhaseGate.ps1` — exact recipe execution plus before/after evidence; observe/fail-closed residue (no kill).
 - Create: `scripts/native-next/PhaseGate.ps1` — recipe table, observation, and phase-gate helpers.
-- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1` — read-only machine/installed idle reference; isolated cold-start keys deferred until Phase 2 Start/Stop exist.
-- Create: `scripts/native-next/Invoke-Conformance.ps1` — shared case/arm runner under the Phase 0 production guard.
-- Create: `src/conformance/mod.rs` — conformance API exports.
-- Create: `src/conformance/manifest.rs` — immutable run/case/arm/environment manifest.
-- Create: `src/conformance/trace.rs` — bounded append-only `.dmtrace` records.
-- Create: `src/conformance/runner.rs` — resumable deterministic case executor.
-- Create: `tests/conformance_manifest.rs` — manifest/trace/resume/redaction contract.
-- Create: `tests/fixtures/conformance/v1/isolation-case.json` — first deterministic case definition.
 - Create: `docs/replacement-deletion-ledger.md` — old-path ownership and deletion criteria.
-- Create: `docs/performance-budgets.md` — stable measurement definitions and initial acceptance budgets.
 - Modify: `.gitignore` — ignore development output/evidence.
-- Modify: `AGENTS.md` — make the replacement isolation command authoritative.
 
 ### Task 0.1: Introduce one typed profile/path contract
 
@@ -290,7 +279,8 @@ git commit -m "chore: add isolated native-next validation scaffold"
 - Produces: unique per-run phase evidence with recipe, exit code, duration, before/after process inventories, and cleanup result.
 - Accepts: `-Phase`, `-Recipe`, `-LongRustRun`.
 - Never accepts `-Command`/`-Arguments`, a production profile, or broad kill target.
-- Phase 0 recipes are an exact closed Cargo set: `cargo-version`, `cargo-fmt-check`, `development-isolation-tests`, `library-tests-serial`.
+- Phase 0 recipes are an exact closed Cargo set: `cargo-version`, `cargo-fmt-check`, `development-isolation-tests`, and `library-tests-serial`.
+- Integration-test recipes force `native-next-dev`; `library-tests-serial` explicitly removes inherited `DEVMANAGER_PROFILE` while retaining the isolated target/instance/runtime environment.
 
 - [ ] **Step 1: Write the failing gate contract test**
 
@@ -339,28 +329,16 @@ git add scripts/native-next tests/development_isolation.rs
 git commit -m "chore: add guarded phase verification"
 ```
 
-### Task 0.5: Capture the replacement inventory and deletion ledger
+### Task 0.5: Seed the replacement deletion ledger
 
 **Files:**
 - Create: `docs/replacement-deletion-ledger.md`
-- Modify: `AGENTS.md`
 
 **Interfaces:**
-- Produces: one list of current source owners, replacement phase, temporary seam, and deletion proof.
-- Consumed by: Phase 11; every temporary re-export added later must be appended in its creating commit.
+- Produces: one committed owner map plus an append-only record of temporary seams and their deletion proof.
+- Consumed by: every replacement phase and Phase 11; every temporary re-export is appended in its creating commit.
 
-- [ ] **Step 1: Generate a read-only current inventory**
-
-Run:
-
-```powershell
-rg --files src tests web zz-archive | Sort-Object | Set-Content .devmanager-next/evidence/phase-00/source-files.txt
-Get-ChildItem src -Recurse -Filter *.rs | Sort-Object Length -Descending | Select-Object FullName,Length | ConvertTo-Json | Set-Content .devmanager-next/evidence/phase-00/rust-file-sizes.json
-```
-
-Expected: ignored evidence identifies the largest coupled files without modifying them.
-
-- [ ] **Step 2: Write the ledger with these mandatory owners**
+- [ ] **Step 1: Write the lean ledger with these mandatory owners**
 
 ```markdown
 | Current path | Current responsibility | Replacement phase | Delete only after |
@@ -368,7 +346,9 @@ Expected: ignored evidence identifies the largest coupled files without modifyin
 | `src/app/mod.rs` | Window, orchestration, UI, background polling | 2–10 | New GPUI client passes full feature gate |
 | `src/services/process_manager.rs` | PTY/provider/server/process monolith | 3–8 | Host services pass zero-orphan gate |
 | `src/state/` | Tab/runtime read models | 1–6 | Task projections serve all clients |
-| `src/models/SessionState` | Old open-tab persistence | 1, 11 | New host proves empty-start behavior |
+| `src/models/config.rs` (`SessionState`/`SessionTab`) | Old open-tab persistence data model | 1, 11 | Cutover passes with both symbols absent |
+| `src/persistence/mod.rs` session path/read-write | Legacy `session.json` resolution and persistence | 1, 11 | Cutover passes with no session path or reader |
+| `src/services/session_manager.rs` | Runtime session save behavior | 1, 11 | Cutover passes after the file is removed |
 | `src/remote/mod.rs` old snapshot bridge | Window-owned remote authority | 2, 9 | Connect protocol/realtime gate passes |
 | `src/remote/web/bridge.rs` old bridge | Old web mutation/snapshot transport | 9 | New web client passes reconnect gate |
 | `src/sidebar/` | Old GPUI navigation | 5 | Task navigation/configuration passes UI gate |
@@ -378,13 +358,9 @@ Expected: ignored evidence identifies the largest coupled files without modifyin
 | `zz-archive/tauri-react-v0.1.11` | Archived old desktop | 11 | Release docs no longer reference it |
 ```
 
-Also list every old browser/UI/provider compatibility seam discovered by `rg -n "legacy|compat|migrate|SessionState|RemoteWorkspaceSnapshot" src tests`.
+Add one rule beneath the table: a phase that introduces a temporary re-export, bridge, or compatibility seam appends its owner, replacement phase, and deletion proof in the same commit. Do not pre-inventory speculative future seams.
 
-- [ ] **Step 3: Strengthen `AGENTS.md` with the exact replacement gate command**
-
-Add one consolidated project rule: all native-kernel implementation and verification uses `scripts/native-next/Invoke-PhaseGate.ps1`; direct long/full Rust runs are prohibited for this program because the wrapper owns production evidence and cleanup.
-
-- [ ] **Step 4: Review the ledger against the approved specification**
+- [ ] **Step 2: Review the ledger against the approved specification**
 
 Run:
 
@@ -395,180 +371,22 @@ git diff --check
 
 Expected: every mandatory owner appears and the diff is clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```powershell
-git add docs/replacement-deletion-ledger.md AGENTS.md
+git add docs/replacement-deletion-ledger.md
 git commit -m "docs: define replacement isolation and deletion gates"
 ```
 
-### Task 0.6: Capture the performance reference and measurement contract
-
-**Files:**
-- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1`
-- Create: `docs/performance-budgets.md`
-- Modify: `tests/development_isolation.rs`
-
-**Interfaces:**
-- Produces ignored `performance.json` with reference hardware and installed idle samples; isolated cold-start keys may be defined as unavailable/`pending-phase-2` until real Start/Stop exist.
-- Produces committed metric definitions/budgets used unchanged by Phases 3, 5, 7, 8, 9, 10, and 11.
-- Never sends input, changes priority/affinity, opens configuration files, restarts the installed process, or launches against the production profile. Phase 0 must not invoke real Start/Stop lifecycle for measurement.
-
-- [ ] **Step 1: Write the failing safety/shape tests**
-
-Add `performance_baseline_is_read_only_and_profile_guarded` and `performance_budget_defines_every_program_metric`. Assert the script exposes only `-InstalledReadOnly`, `-IsolatedColdStart`, `-DurationSeconds`, and `-EvidenceDirectory`; `-IsolatedColdStart` in Phase 0 records the metric contract/availability only (no process launch); the installed mode contains no stop/kill/input/window-message/file-content operations.
-
-- [ ] **Step 2: Run and observe the expected failure**
-
-```powershell
-cargo test --test development_isolation performance_ -- --nocapture
-```
-
-Expected: missing script/budget contract.
-
-- [ ] **Step 3: Implement read-only measurement**
-
-Record Windows/build, CPU model/logical processor count, physical memory, active display sizes/scales, sample interval, and monotonic timestamps. For an already-running installed DevManager, sample only cumulative CPU time, working/private bytes, handles, and threads for 120 seconds by PID plus creation time. For isolated cold-start measurement, Phase 0 may only define the metric contract and capture the installed reference; it must not claim an isolated start measurement until Phase 2 provides real `Start-NativeNext` lifecycle against `devmanager-host`/`devmanager-next`.
-
-- [ ] **Step 4: Lock metric definitions and initial budgets**
-
-`docs/performance-budgets.md` defines input-to-paint, PTY-byte-to-grid, local/remote command acknowledgement, event propagation, cold/warm startup, task-open, idle CPU/memory, background wakeups, long-session growth, scrollback bounds, provider/browser process counts, 4K frame time, and slow-client isolation. Record baseline values only in ignored evidence; commit measurement methods, reference percentile/sample sizes, and the initial Phase 5/8 targets.
-
-- [ ] **Step 5: Run the baseline without disturbing production**
-
-```powershell
-pwsh -NoProfile -File scripts/native-next/Capture-PerformanceBaseline.ps1 -InstalledReadOnly -DurationSeconds 120 -EvidenceDirectory .devmanager-next/evidence/phase-00-performance
-pwsh -NoProfile -File scripts/native-next/Capture-PerformanceBaseline.ps1 -IsolatedColdStart -EvidenceDirectory .devmanager-next/evidence/phase-00-performance
-cargo test --test development_isolation performance_ -- --nocapture
-```
-
-Expected: the installed PID/start time remain unchanged, production files are unopened/unchanged, no isolated process is started, and `performance.json` contains installed samples plus cold-start keys marked unavailable until Phase 2 (no invented zeroes).
-
-- [ ] **Step 6: Commit**
-
-```powershell
-git add scripts/native-next/Capture-PerformanceBaseline.ps1 docs/performance-budgets.md tests/development_isolation.rs
-git commit -m "test: define replacement performance baseline"
-```
-
-### Task 0.7: Establish the shared conformance manifest and trace runner
-
-**Files:**
-- Create: `src/conformance/{mod,manifest,trace,runner}.rs`
-- Modify: `src/lib.rs`
-- Modify: `Cargo.toml`, `Cargo.lock`
-- Create: `tests/conformance_manifest.rs`
-- Create: `tests/fixtures/conformance/v1/isolation-case.json`
-- Create: `scripts/native-next/Invoke-Conformance.ps1`
-- Modify: `.gitignore`
-
-**Interfaces:**
-- Produces: `ConformanceCase`, `ConformanceArm`, `ConformanceRunManifest`, `TraceRecord`, and `ConformanceRunner::resume`.
-- Produces: immutable `manifest.json`, append-only `trace.dmtrace`, resumable `cursor.json`, and terminal `result.json` under ignored `.devmanager-next/evidence/<phase>/conformance/<run-id>/`.
-- Consumed by: protocol, process, provider, browser, Connect, and release gates. SQLite/search dashboards may index these artifacts later but never become canonical.
-
-- [ ] **Step 1: Write the failing manifest/trace tests**
-
-```rust
-#[test]
-fn completed_run_is_immutable_and_resumable() {
-    let temp = tempfile::tempdir().unwrap();
-    let case = fixture_case("isolation-path-contract");
-    let run = ConformanceRunner::start(temp.path(), case, ConformanceArm::Baseline).unwrap();
-    run.record(TraceRecord::case_started(1)).unwrap();
-    drop(run); // simulate interruption
-
-    let resumed = ConformanceRunner::resume(temp.path()).unwrap();
-    resumed.record(TraceRecord::assertion_passed(2, "profile_isolated")).unwrap();
-    let result = resumed.finish(ConformanceOutcome::Passed).unwrap();
-
-    assert_eq!(result.trace_sequence, 2);
-    assert!(ConformanceRunner::resume(temp.path()).is_err());
-    assert_manifest_and_trace_hashes_match(temp.path());
-}
-```
-
-Also add `manifest_rejects_unknown_schema_major`, `trace_rejects_non_monotonic_sequence`, `trace_record_is_bounded_before_write`, `secrets_and_absolute_user_paths_are_rejected`, and `baseline_and_variant_keep_distinct_arm_ids`. Phase 1 adds the separate rebuildable query-index contract after the canonical artifact format exists.
-
-- [ ] **Step 2: Run the focused test and observe the intended failure**
-
-Run: `cargo test --test conformance_manifest -- --nocapture`
-
-Expected: compilation fails because `devmanager::conformance` does not exist.
-
-- [ ] **Step 3: Define the versioned manifest and case types**
-
-```rust
-pub enum ConformanceArm {
-    Baseline,
-    Variant { label: String },
-}
-
-pub struct ConformanceRunManifest {
-    pub schema_version: u16,
-    pub run_id: ConformanceRunId,
-    pub case_id: String,
-    pub arm: ConformanceArm,
-    pub devmanager_revision: String,
-    pub adapter_revision: Option<String>,
-    pub provider: Option<ProviderEvidence>,
-    pub platform: PlatformEvidence,
-    pub capabilities: std::collections::BTreeSet<String>,
-    pub fixture_sha256: [u8; 32],
-    pub trace_schema_version: u16,
-    pub started_at_ms: i64,
-}
-
-pub struct ProviderEvidence {
-    pub kind: String,
-    pub executable_sha256: [u8; 32],
-    pub version: String,
-}
-
-pub struct PlatformEvidence {
-    pub os: String,
-    pub architecture: String,
-    pub logical_processors: u16,
-}
-```
-
-Add `uuid = { version = "1.24.0", features = ["v7", "serde"] }` and define `ConformanceRunId` as a private-field UUIDv7 newtype. Validate bounded labels/fields, reject credentials/raw prompts/responses and user-profile absolute paths, sort capability/evidence maps deterministically, and write the manifest once through same-directory temporary-file plus atomic rename. A run arm never mutates after the first trace record.
-
-- [ ] **Step 4: Implement bounded append-only traces and resume**
-
-Use a `u32` big-endian length followed by MessagePack `TraceRecord`; hard-limit one record to 256 KiB and fsync at case checkpoints. Each record has sequence, monotonic nanoseconds from run start, stable event kind, redacted typed fields, and prior-record hash. `cursor.json` records the last settled case step and trace hash. Resume verifies the manifest, full hash chain, and cursor before appending; a completed `result.json` makes the directory immutable.
-
-- [ ] **Step 5: Add the first deterministic case and guarded script**
-
-`isolation-case.json` runs only the pure path/profile assertions from Task 0.1 and records pass/fail plus durations. `Invoke-Conformance.ps1 -Case isolation-path-contract -Arm Baseline -EvidenceDirectory ...` validates that it is inside `native-next-dev`, calls `Invoke-PhaseGate.ps1`, supports `-ResumeRunId`, and refuses production paths/provider authentication.
-
-- [ ] **Step 6: Run baseline and variant arms**
-
-```powershell
-cargo test --test conformance_manifest -- --nocapture
-pwsh -NoProfile -File scripts/native-next/Invoke-Conformance.ps1 -Case isolation-path-contract -Arm Baseline -EvidenceDirectory .devmanager-next/evidence/phase-00/conformance
-pwsh -NoProfile -File scripts/native-next/Invoke-Conformance.ps1 -Case isolation-path-contract -Arm Variant -ArmLabel repeat -EvidenceDirectory .devmanager-next/evidence/phase-00/conformance
-```
-
-Expected: both manifests reference the same case/fixture hash, different arm/run IDs, valid immutable trace/result hashes, and unchanged production evidence.
-
-- [ ] **Step 7: Review and commit**
-
-```powershell
-git diff --check
-git add Cargo.toml Cargo.lock src/conformance src/lib.rs tests/conformance_manifest.rs tests/fixtures/conformance scripts/native-next/Invoke-Conformance.ps1 .gitignore
-git commit -m "test: establish compatibility conformance runner"
-```
-
-### Task 0.8: Run the Phase 0 gate
+### Task 0.6: Run the Phase 0 gate
 
 **Files:** none beyond ignored evidence.
 
-- [ ] **Step 1: Announce the long Rust verification and capture a fresh baseline**
+- [ ] **Step 1: Announce the serial Rust verification**
 
-Use the wrapper so the user sees that Rust test executables will run and be cleaned up.
+Use the guarded wrapper so the user sees that Rust test executables will run serially and phase evidence will be captured.
 
-- [ ] **Step 2: Run formatting and focused isolation tests**
+- [ ] **Step 2: Run formatting and the focused isolation recipe**
 
 ```powershell
 pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-fmt -Recipe cargo-fmt-check
@@ -586,8 +404,11 @@ pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-l
 Run:
 
 ```powershell
-Get-Content .devmanager-next/evidence/phase-00-lib/verification.json
-Get-Content .devmanager-next/evidence/phase-00-lib/processes-after.json
+$latestRun = Get-ChildItem .devmanager-next/evidence/phase-00-lib/runs -Directory |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+Get-Content (Join-Path $latestRun.FullName verification.json)
+Get-Content (Join-Path $latestRun.FullName processes-after.json)
 git status --short --branch
 ```
 
@@ -598,9 +419,7 @@ Expected: commands pass, production comparison is unchanged, no disposable proce
 - Named path tests prove `native-next-dev` cannot alias production.
 - Baseline/comparison scripts pass on the real machine without reading `session.json`.
 - `-ValidateOnly` start/stop scaffolds start no processes and refuse real lifecycle without the switch.
-- Guarded command evidence records exit codes and cleanup.
-- Deletion ledger covers every old architecture owner.
-- Performance measurement definitions and a read-only installed reference are captured; isolated cold-start measurement is deferred until Phase 2 Start/Stop exist.
-- The deterministic conformance case runs baseline/variant arms with immutable manifests, resumable bounded traces, no raw content, and unchanged production evidence.
-- Full serial library baseline is green or any pre-existing failure is recorded before Phase 1.
+- Guarded command evidence records exit codes and observed residue without kill authority.
+- The lean deletion ledger records the mandatory current owners and every temporary seam introduced later.
+- `cargo-fmt-check`, `development-isolation-tests`, and the complete serial `library-tests-serial` recipe are green before Phase 1, or a pre-existing failure is recorded.
 - Installed DevManager PID/start time and production `config.json`/`remote.json` remain unchanged.

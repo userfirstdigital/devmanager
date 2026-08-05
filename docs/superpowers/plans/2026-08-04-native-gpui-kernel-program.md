@@ -39,7 +39,7 @@
 - Before and after persistence/runtime/process/browser/full-suite gates, verify production `config.json` and `remote.json` hashes plus installed PID/start time.
 - Announce long Rust verification before it starts; run the complete library suite as `cargo test --lib -- --test-threads=1`; confirm no test harness, Cargo, rustc, development host, provider, or browser helper remains afterward.
 - Use TDD for each behavior: failing focused test, observed failure, minimum implementation, focused pass, then the phase gate.
-- Extend the shared provider/protocol conformance case matrix in every phase that changes an owned seam. Immutable run manifests and native trace artifacts are canonical; query indexes are rebuildable mirrors.
+- Phase 2 establishes the canonical conformance manifest/trace contract, rebuildable index, and first phase-owned performance evidence. Phases 0-1 are exempt and use only their documented isolation/domain gates; from Phase 2 onward, every phase that changes an owned seam extends the shared conformance matrix and records only its owned performance metrics. Immutable run manifests and native trace artifacts are canonical; query indexes are rebuildable mirrors.
 - Ordinary CI uses fixtures/fake runtimes only. Real subscription-CLI checks are explicit, isolated, low-volume E2E runs and never use production DevManager/provider/browser profiles or consume quota implicitly.
 - Commit each independently reviewable task. Do not push, publish, install, or run the production cutover without explicit user authority.
 
@@ -95,10 +95,10 @@ Phases are dependency ordered, but tasks inside a phase may run in parallel only
 
 | Approved requirement | Owning tasks | Release proof |
 |---|---|---|
-| Development/tests cannot touch daily DevManager | 0.1–0.8 | Production hashes/PID/start time before/after every risky gate |
-| Provider/protocol compatibility lab and immutable traces | 0.7, 1.6, 1.8, 2.5, 3.10, 4.10–4.11, 5.7, 6.10, 7.8, 8.11, 9.10, 10.11, 11.8–11.10 | Shared deterministic cases, baseline/variant manifests, resumable runs, rebuildable query index |
+| Development/tests cannot touch daily DevManager | 0.1–0.6 | Production hashes/PID/start time before/after every risky gate |
+| Provider/protocol compatibility lab and immutable traces | 1.6, 1.8, 2.5, 2.11–2.14, 3.10, 4.10–4.11, 5.7, 6.10, 7.8, 8.11, 9.10, 10.11, 11.8–11.10 | Shared deterministic cases, baseline/variant manifests, resumable runs, rebuildable query index |
 | Durable local Task facts, accepted/settled operations, clean start, no one-time migration | 1.1–1.9, 11.4, 11.6, 11.9 | Empty SQLite v1 at old-to-new cutover; later DB preservation; operation recovery; `config.json`/`remote.json` direct; `session.json` never opened |
-| One Rust host, many detachable/reconnecting clients | 2.1–2.11 | Two-client/CLI soak, crash/replay/resync, explicit full quit |
+| One Rust host, many detachable/reconnecting clients | 2.1–2.14 | Two-client/CLI soak, crash/replay/resync, explicit full quit |
 | Complete owned process trees, Task Manager CPU, blue external ports | 3.1–3.10 | Suspended-assignment proof, accounting comparison, zero Job members |
 | Stock subscription Claude/Codex/Cursor and exact resume | 4.1–4.11 | Version fixtures, one-process/two-view, visible exact-resume failure |
 | Native GPUI Task Cockpit, semantic renderer registry, and major UI/UX replacement | 5.1–5.10 | Preview matrix, generic unknown-event fallback, keyboard/accessibility, large-data/performance gates |
@@ -452,6 +452,8 @@ Each detailed plan follows this sequence:
 
 ## Mandatory evidence bundle per phase
 
+Phases 0-1 are exempt from `performance.json` and `conformance/`; they retain the baseline, verification, and process evidence required by their detailed isolation/domain gates. Phase 2 establishes the canonical conformance/index and performance contract. From Phase 2 onward, include `conformance/` for changed seams and `performance.json` only when the phase owns declared metrics.
+
 Store local evidence under the ignored phase directory `.devmanager-next/evidence/phase-XX/`:
 
 ```text
@@ -459,8 +461,8 @@ baseline.json                 Production hashes/PID/start time before work
 verification.json             Commands, exit codes, durations, pass/fail counts
 processes-before.json         Development-owned process inventory
 processes-after.json          Must contain zero live disposable members
-performance.json             Metrics required by that phase
-conformance/                 Immutable manifests and append-only native traces for changed seams
+performance.json             Phase-owned metrics (unavailable before Phase 2)
+conformance/                 Required for changed seams from Phase 2 onward
 screenshots/                 UI/browser evidence when applicable
 notes.md                     Only deviations and resolved failures
 ```

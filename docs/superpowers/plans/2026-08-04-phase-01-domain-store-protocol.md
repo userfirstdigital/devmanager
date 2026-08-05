@@ -21,7 +21,7 @@
 - `config.json` and `remote.json` remain direct supported contracts. The new kernel must never read or infer state from `session.json`.
 - Wire decoding is bounded before allocation. V1 hard ceilings are 1 MiB per physical frame, 16 MiB per reassembled message, 1,000 items/512 KiB per page, and 256 KiB per chunk; peers advertise lower limits when required.
 - Unknown optional capabilities/frames are ignored or surfaced through the closed generic extension envelope; incompatible protocol majors fail visibly. Unknown data never becomes a domain transition.
-- Use the Phase 0 isolated worktree, profile, target directory, evidence wrapper, and production guard for every command.
+- Use the Phase 0 isolated worktree throughout. Pure domain/protocol tests and tests with explicit temporary roots may use direct focused Cargo red/green loops; profile-backed configuration tests and the grouped phase exit use exact named recipes with production/process evidence. Never restore generic command or argument admission.
 
 ---
 
@@ -50,7 +50,6 @@
 - Create: `src/protocol/envelope.rs`
 - Create: `src/protocol/frame.rs`
 - Create: `src/protocol/chunk.rs`
-- Create: `src/conformance/index.rs`
 - Create: `src/config/model.rs`
 - Create: `src/config/project_store.rs`
 - Create: `src/config/remote_store.rs`
@@ -62,8 +61,9 @@
 - Create: `tests/kernel_store.rs`
 - Create: `tests/protocol_contract.rs`
 - Create: `tests/operation_lifecycle.rs`
-- Create: `tests/conformance_index.rs`
 - Create: `tests/configuration_contract.rs`
+- Modify: `scripts/native-next/PhaseGate.ps1` (add the exact Phase 1 cargo recipes)
+- Modify: `tests/development_isolation.rs` (lock the Phase 1 recipe vectors and reject generic arguments)
 
 ### Task 1.1: Add typed identifiers and immutable task facts
 
@@ -96,7 +96,7 @@ pub struct TaskFacts {
 ```
 
 - [ ] **Step 1: Write the failing identity tests** in `tests/domain_identity.rs` for UUIDv7 generation, serde round-trip, display/parse round-trip, invalid-version rejection, and compile-time non-interchangeability using `static_assertions::assert_not_impl_any!`.
-- [ ] **Step 2: Run** `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-01-domain-red -Command cargo -Arguments @('test','--test','domain_identity','--','--nocapture')` **and record** the unresolved `devmanager::domain` failure in the phase evidence directory.
+- [ ] **Step 2: Run** `cargo test --test domain_identity -- --nocapture` directly in the isolated worktree and retain the unresolved `devmanager::domain` failure. This test is pure and has no persistence/runtime/process surface.
 - [ ] **Step 3: Add** `rusqlite = { version = "0.40.1", features = ["bundled"] }`; retain the Phase 0 `uuid = { version = "1.24.0", features = ["v7", "serde"] }`; implement a private `define_id!` macro whose public types validate UUID version 7 when parsed from external text.
 - [ ] **Step 4: Define** `EnvironmentId`, `ProjectId`, `TaskId`, `AgentSessionId`, `ArtifactId`, `ResourceId`, `TerminalId`, `BrowserContextId`, `ServiceId`, `ClientId`, `CommandId`, `RequestId`, `OperationId`, `TransferId`, `SubscriptionId`, and `EventId`; expose UUID bytes for persistence without exposing cross-type conversion.
 - [ ] **Step 5: Define** `WorkspaceRef::{Main, Worktree { path, branch }, External { path }}`, `TaskLifecycle::{Open, Closing, Archived}`, `TaskAssignment::{LocalOwner, ExternalPrincipal { authority, subject }}`, and fact records for task, agent, artifact, and resource ownership. Validate titles, descriptions, principal references, and paths at construction boundaries.
@@ -408,50 +408,36 @@ pub struct ChunkFrame {
 
 ### Task 1.7: Preserve only supported configuration contracts
 
-**Files:** `src/config/{mod,model,project_store,remote_store}.rs`, `tests/configuration_contract.rs`
+**Files:** `src/config/{mod,model,project_store,remote_store}.rs`, `scripts/native-next/PhaseGate.ps1`, `tests/{configuration_contract,development_isolation}.rs`
 
+- [ ] **Step 0: Register one exact guarded recipe** `phase-01-configuration` as `cargo test --test configuration_contract -- --nocapture`; lock its vector and the unchanged no-arguments public surface in `tests/development_isolation.rs` before implementation.
 - [ ] **Step 1: Write failing tests** that load current `config.json` and `remote.json` fixtures, round-trip unknown supported fields, create recoverable backups, atomically replace files, recover from an interrupted/corrupt replacement, retain the existing field currently named invite code as the long-lived device pairing code, and prove no code path opens `session.json`.
-- [ ] **Step 2: Run** `cargo test --test configuration_contract -- --nocapture` and retain the red result.
+- [ ] **Step 2: Run** `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-01-configuration-red -Recipe phase-01-configuration -LongRustRun` and retain the red result with production/process evidence.
 - [ ] **Step 3: Move or re-export the stable project/folder/command/SSH types** from `src/models/config.rs` into `src/config/model.rs` without changing their serialized field names. Keep a single source of truth; temporary re-exports go in the Phase 0 deletion ledger.
 - [ ] **Step 4: Implement atomic stores** with validated content, recoverable same-directory backups, same-directory temporary files, flush, replace, and permission preservation. A parse/write/interruption failure leaves or restores the last valid original and surfaces the exact path/error.
 - [ ] **Step 5: Preserve `remote.json` device records, revocations, pairing token, and manually rotatable long-lived device pairing code** across host/UI upgrades. Reading configuration must not rotate secrets. This credential is not reused as a later Task invitation.
 - [ ] **Step 6: Add a test-only file-open observer** and assert the new config facade never requests `session.json`; do not write an importer or migration shim.
-- [ ] **Step 7: Run** `cargo test --test configuration_contract -- --nocapture`; commit as `refactor(config): preserve supported durable contracts`.
+- [ ] **Step 7: Run** the same `phase-01-configuration` recipe green; commit as `refactor(config): preserve supported durable contracts`.
 
-### Task 1.8: Add the rebuildable conformance query index
+### Task 1.8: Integrate the headless kernel boundary
 
-**Files:** `src/conformance/index.rs`, `src/conformance/mod.rs`, `tests/conformance_index.rs`, `tests/conformance_manifest.rs`
-
-**Interfaces:**
-- Consumes: immutable Phase 0 `manifest.json`, `trace.dmtrace`, and `result.json` artifacts.
-- Produces: `ConformanceIndex::rebuild(evidence_root, sqlite_path)` and `ConformanceQuery` over a disposable local SQLite mirror.
-- Invariant: dashboards/queries never write canonical run artifacts and a deleted/corrupt index is fully reconstructible.
-
-- [ ] **Step 1: Write failing tests** `index_rebuilds_from_two_arms`, `deleted_index_loses_no_run`, `corrupt_index_is_replaced_not_trusted`, `metric_definition_comes_from_case_schema`, `unknown_trace_record_is_indexed_as_unknown_not_dropped`, and `raw_payload_is_not_copied_into_index`.
-- [ ] **Step 2: Run** `cargo test --test conformance_index -- --nocapture` and retain the missing index failure.
-- [ ] **Step 3: Define index tables** `runs`, `cases`, `steps`, `metrics`, and `artifacts` keyed by run/case/arm IDs and source SHA-256. Store typed scalar metric values, units, status, durations, schema versions, and artifact paths relative to the evidence root; do not store raw trace payloads, prompts, responses, credentials, or absolute user paths.
-- [ ] **Step 4: Implement deterministic rebuild** by scanning only completed manifests/results, verifying source hashes and full trace chains, writing a same-directory replacement database, and atomically swapping it. A partially written or schema-mismatched index is discarded.
-- [ ] **Step 5: Define `ConformanceMetricDefinition` in each case fixture** with stable metric ID, unit, value kind, and aggregation. The index rejects a result that reports an undeclared metric; UI code never hard-codes provider metric meaning.
-- [ ] **Step 6: Run** `cargo test --test conformance_manifest --test conformance_index -- --nocapture`; delete/rebuild the test index; commit as `feat(conformance): add rebuildable run index`.
-
-### Task 1.9: Integrate the headless kernel boundary
-
-**Files:** `src/kernel/{mod,command_bus,outbox,runtime}.rs`, `src/lib.rs`, `tests/{kernel_store,operation_lifecycle}.rs`, `docs/replacement-deletion-ledger.md`
+**Files:** `src/kernel/{mod,command_bus,outbox,runtime}.rs`, `src/lib.rs`, `scripts/native-next/PhaseGate.ps1`, `tests/{kernel_store,operation_lifecycle,development_isolation}.rs`, `docs/replacement-deletion-ledger.md`
 
 - [ ] **Step 1: Add an integration test** that creates a temporary profile, creates two tasks through `CommandBus`, retries one command, observes the same OperationId, settles one side effect, streams ordered events, pages snapshots, begins closing one task, reopens the store, queries both operation states without creating operations, and obtains the identical projection.
 - [ ] **Step 2: Run** `cargo test --test kernel_store headless_kernel_round_trip -- --nocapture` and confirm the integration is red before wiring the public boundary.
 - [ ] **Step 3: Expose only** `CommandBus`, `KernelStore`, `RuntimeRegistry`, domain envelopes, and read APIs from `kernel::mod`; prevent UI code from reaching SQLite internals.
 - [ ] **Step 4: Define the outbox claim/ack/recovery contract** with leases, dispatch-start timestamps, stable effect/idempotency identity, and the three replay policies. The phase does not send network traffic; tests prove retry-safe redelivery, reconcile-before-retry, and explicit uncertainty for ambiguous non-idempotent work. Never describe the generic outbox as exactly-once.
 - [ ] **Step 5: Mark every temporary old-module re-export** with its exact deletion criterion in `docs/replacement-deletion-ledger.md`.
-- [ ] **Step 6: Run** the integration test, `cargo test --test domain_identity --test task_state --test kernel_store --test operation_lifecycle --test protocol_contract --test configuration_contract --test conformance_index -- --nocapture`, then `cargo fmt --all -- --check` and `cargo clippy --lib --tests -- -D warnings` through the isolation wrapper.
-- [ ] **Step 7: Commit** as `feat(kernel): expose durable headless kernel boundary`.
+- [ ] **Step 6: Extend the closed recipe table.** Add exact no-argument recipes to `scripts/native-next/PhaseGate.ps1` and lock them in `tests/development_isolation.rs`: `phase-01-tests` runs `cargo test --test domain_identity --test task_state --test kernel_store --test operation_lifecycle --test protocol_contract --test configuration_contract -- --nocapture`; `phase-01-clippy` runs `cargo clippy --lib --tests -- -D warnings`. Do not add command or argument parameters. Reuse the existing `cargo-fmt-check` recipe for formatting.
+- [ ] **Step 7: Run** the integration test and the named recipes through the isolation gate: `phase-01-tests`, `cargo-fmt-check`, and `phase-01-clippy`.
+- [ ] **Step 8: Commit** as `feat(kernel): expose durable headless kernel boundary`.
 
 ## Phase 1 verification gate
 
 - [ ] Capture the production baseline with Phase 0 tooling.
-- [ ] Run `cargo test --test domain_identity --test task_state --test kernel_store --test operation_lifecycle --test protocol_contract --test configuration_contract --test conformance_index -- --nocapture`.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo clippy --lib --tests -- -D warnings`.
+- [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-01-tests -Recipe phase-01-tests -LongRustRun`.
+- [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-01-fmt -Recipe cargo-fmt-check`.
+- [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-01-clippy -Recipe phase-01-clippy -LongRustRun`.
 - [ ] Inspect `kernel_store` with `PRAGMA integrity_check`, replay all facts into shadow projections, and compare row-for-row.
 - [ ] Search for forbidden dependencies with `rg -n "gpui|wry|WebView|portable_pty|std::process::Command" src/domain src/kernel src/protocol` and require no runtime/UI matches.
 - [ ] Search for accidental session migration with `rg -n "session\.json|codex_rollout" src/config src/domain src/kernel src/protocol tests`; only the negative contract test may mention `session.json`, and `codex_rollout` must not appear.
@@ -465,6 +451,5 @@ pub struct ChunkFrame {
 - Every accepted mutation is atomic, idempotent, revision checked, event-backed, and correlated to a separately queryable outcome; ambiguous external delivery is visible `Uncertain` and never automatically duplicated.
 - Paged snapshots plus ordered events deterministically reconstruct every durable read model.
 - Protocol major/minor, negotiated physical/reassembled/page/chunk bounds, unknown-extension behavior, and capability behavior are fixed by golden frames.
-- Conformance manifests/traces are canonical and the local query index rebuilds from them exactly.
 - Existing project configuration and stable remote pairing survive direct load/save; legacy session state is never opened.
 - Production storage and the installed DevManager remain byte/process-identical across the gate.
