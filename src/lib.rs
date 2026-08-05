@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod git;
 pub mod icons;
+pub mod kernel;
 pub mod models;
 pub mod notifications;
 pub mod persistence;
