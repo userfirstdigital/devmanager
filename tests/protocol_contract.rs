@@ -5,7 +5,8 @@ use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use devmanager::domain::{
     CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId,
     OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode, Query,
-    QueryEnvelope, RejectionCode, RequestId, TaskId,
+    QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId,
+    TaskId,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
@@ -1492,6 +1493,306 @@ fn protocol_operation_state_rejects_alternate_or_open_shapes() {
     trailing.push(0xc0);
     assert_eq!(
         codec.decode::<OperationState>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
+    );
+}
+
+#[test]
+fn protocol_query_reply_preserves_request_and_operation_correlation() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let expected_request_id = protocol_request_id(0x91);
+    let expected_operation_id = protocol_operation_id(0x92);
+    let success = QueryReply {
+        request_id: expected_request_id,
+        outcome: QueryOutcome::Ok(QueryResult::OperationStatus {
+            operation_id: expected_operation_id,
+            state: OperationState::Settled {
+                settled_at_ms: -1,
+                result_event_ids: vec![protocol_event_id(0x93)],
+            },
+        }),
+    };
+
+    let encoded = codec.encode(&success).expect("encode successful reply");
+    assert_eq!(encoded[0], 0x82, "QueryReply is a two-field map");
+    assert_eq!(
+        rmp_serde::to_vec(&success).expect("direct query-reply serialization"),
+        encoded,
+        "compact serializers must preserve the named reply shape"
+    );
+    assert_eq!(
+        serde_json::from_value::<QueryReply>(serde_json::to_value(&success).unwrap()).unwrap(),
+        success
+    );
+    let decoded = codec
+        .decode::<QueryReply>(&encoded)
+        .expect("decode successful reply");
+    assert_eq!(decoded.request_id, expected_request_id);
+    match decoded.outcome {
+        QueryOutcome::Ok(QueryResult::OperationStatus {
+            operation_id,
+            state,
+        }) => {
+            assert_eq!(operation_id, expected_operation_id);
+            assert!(matches!(state, OperationState::Settled { .. }));
+        }
+        QueryOutcome::Err(error) => panic!("expected successful reply, got {error:?}"),
+    }
+
+    let rejected = QueryReply {
+        request_id: protocol_request_id(0x94),
+        outcome: QueryOutcome::Err(QueryError::NotFound),
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&codec.encode(&rejected).expect("encode error reply"))
+            .expect("decode error reply"),
+        rejected
+    );
+    assert_eq!(
+        serde_json::from_value::<QueryReply>(serde_json::to_value(&rejected).unwrap()).unwrap(),
+        rejected
+    );
+}
+
+#[derive(serde::Serialize)]
+struct RawQueryReply<O> {
+    request_id: RequestId,
+    outcome: O,
+}
+
+fn raw_query_reply<O>(outcome: O) -> RawQueryReply<O> {
+    RawQueryReply {
+        request_id: protocol_request_id(0x95),
+        outcome,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawOkOutcome<R> {
+    Ok(R),
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawErrOutcome<E> {
+    Err(E),
+}
+
+struct RawUnknownOutcome;
+
+impl serde::Serialize for RawUnknownOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("future_outcome", &())?;
+        map.end()
+    }
+}
+
+struct RawMultipleOutcome;
+
+impl serde::Serialize for RawMultipleOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(
+            "ok",
+            &QueryResult::OperationStatus {
+                operation_id: protocol_operation_id(0x96),
+                state: OperationState::Accepted,
+            },
+        )?;
+        map.serialize_entry("err", &QueryError::NotFound)?;
+        map.end()
+    }
+}
+
+struct RawUnknownQueryResult;
+
+impl serde::Serialize for RawUnknownQueryResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("future_result", &())?;
+        map.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RawOperationStatusResultPayload {
+    operation_id: OperationId,
+    state: OperationState,
+}
+
+struct RawMultipleQueryResult;
+
+impl serde::Serialize for RawMultipleQueryResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let payload = RawOperationStatusResultPayload {
+            operation_id: protocol_operation_id(0x96),
+            state: OperationState::Accepted,
+        };
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("operation_status", &payload)?;
+        map.serialize_entry("future_result", &())?;
+        map.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawPositionalQueryResult {
+    OperationStatus((OperationId, OperationState)),
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawOpenQueryResult {
+    OperationStatus {
+        operation_id: OperationId,
+        state: OperationState,
+        future_field: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawMissingQueryResult {
+    OperationStatus { operation_id: OperationId },
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawFutureQueryError {
+    FutureError,
+}
+
+struct RawNumericQueryErrorOutcome;
+
+impl serde::Serialize for RawNumericQueryErrorOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("err", &0_u8)?;
+        map.end()
+    }
+}
+
+#[test]
+fn protocol_query_reply_rejects_alternate_or_open_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let valid = raw_query_reply(QueryOutcome::Ok(QueryResult::OperationStatus {
+        operation_id: protocol_operation_id(0x96),
+        state: OperationState::Accepted,
+    }));
+    let valid_bytes = rmp_serde::to_vec_named(&valid).expect("valid raw reply");
+
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&rmp_serde::to_vec(&(valid.request_id, &valid.outcome)).unwrap()),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut duplicate = valid_bytes.clone();
+    duplicate[0] = 0x83;
+    push_messagepack(&mut duplicate, "request_id");
+    push_messagepack(&mut duplicate, &valid.request_id);
+    assert_eq!(
+        codec.decode::<QueryReply>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = valid_bytes.clone();
+    unknown[0] = 0x83;
+    push_messagepack(&mut unknown, "future_field");
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<QueryReply>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut missing = valid_bytes.clone();
+    let outcome_suffix = [
+        rmp_serde::to_vec(&"outcome").unwrap(),
+        rmp_serde::to_vec_named(&valid.outcome).unwrap(),
+    ]
+    .concat();
+    assert!(missing.ends_with(&outcome_suffix));
+    missing[0] = 0x81;
+    missing.truncate(missing.len() - outcome_suffix.len());
+    assert_eq!(
+        codec.decode::<QueryReply>(&missing),
+        Err(MessagePackError::Decode)
+    );
+
+    for malformed in [
+        rmp_serde::to_vec_named(&raw_query_reply(RawUnknownOutcome)).unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawMultipleOutcome)).unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawOkOutcome::Ok(RawUnknownQueryResult))).unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawOkOutcome::Ok(RawMultipleQueryResult)))
+            .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawOkOutcome::Ok(
+            RawPositionalQueryResult::OperationStatus((
+                protocol_operation_id(0x96),
+                OperationState::Accepted,
+            )),
+        )))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawOkOutcome::Ok(
+            RawOpenQueryResult::OperationStatus {
+                operation_id: protocol_operation_id(0x96),
+                state: OperationState::Accepted,
+                future_field: true,
+            },
+        )))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawOkOutcome::Ok(
+            RawMissingQueryResult::OperationStatus {
+                operation_id: protocol_operation_id(0x96),
+            },
+        )))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawErrOutcome::Err(
+            RawFutureQueryError::FutureError,
+        )))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_reply(RawNumericQueryErrorOutcome)).unwrap(),
+    ] {
+        assert_eq!(
+            codec.decode::<QueryReply>(&malformed),
+            Err(MessagePackError::Decode)
+        );
+    }
+
+    let mut trailing = valid_bytes;
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<QueryReply>(&trailing),
         Err(MessagePackError::TrailingBytes {
             offset: u32::try_from(trailing.len() - 1).unwrap(),
         })
