@@ -770,6 +770,54 @@ mod tests {
     }
 
     #[test]
+    fn expired_cursor_requires_snapshot() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, 0x4B);
+        create_task(&mut store, 0x4C);
+        create_task(&mut store, 0x4D);
+        let newest_sequence = max_sequence(&path);
+        let pruned_through_sequence = newest_sequence - 1;
+
+        let conn = Connection::open(&path).expect("open retention fixture");
+        conn.execute(
+            "UPDATE event_retention SET pruned_through_sequence = ?1 WHERE singleton_key = 1",
+            [i64::try_from(pruned_through_sequence).expect("prune boundary fits")],
+        )
+        .expect("advance explicit retention boundary");
+        drop(conn);
+
+        let limits = PageLimits::new(100, 512 * 1024).expect("limits");
+        let reported_newest = match store
+            .begin_event_replay(pruned_through_sequence - 1, limits)
+            .expect_err("expired replay must require a fresh snapshot")
+        {
+            ReplayError::ReplayUnavailable {
+                oldest_sequence,
+                newest_sequence: reported_newest,
+            } => {
+                assert_eq!(oldest_sequence, pruned_through_sequence + 1);
+                reported_newest
+            }
+            other => panic!("expected replay unavailable, got {other:?}"),
+        };
+        assert_eq!(reported_newest, newest_sequence);
+
+        let snapshot = store
+            .begin_snapshot(limits)
+            .expect("begin required replacement snapshot");
+        let first_page = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("load replacement snapshot");
+        assert_eq!(
+            first_page.through_sequence, reported_newest,
+            "replacement snapshot must start from the replay error's durable high-water"
+        );
+        assert_eq!(first_page.items.len(), 3);
+    }
+
+    #[test]
     fn retained_sequence_gaps_do_not_expire_replay() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("kernel.sqlite3");

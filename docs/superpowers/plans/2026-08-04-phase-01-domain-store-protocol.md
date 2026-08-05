@@ -335,14 +335,14 @@ Safe dispatch/reconciliation callback APIs do not accept durable event timestamp
 
 **Files:** `src/domain/snapshot.rs`, `src/kernel/{store,runtime}.rs`, `tests/kernel_store.rs`
 
-- [ ] **Step 1: Write failing tests** for `snapshot_has_global_cursor`, `snapshot_pages_resume_without_duplicates`, `snapshot_page_honors_item_and_encoded_byte_limits`, `events_after_cursor_are_strictly_ordered`, `expired_cursor_requires_snapshot`, `operation_status_survives_reopen`, `runtime_generation_rejects_stale_completion`, and `archived_task_has_no_live_resources`.
-- [ ] **Step 2: Run** `cargo test --test kernel_store replay_ -- --nocapture` and record the red result.
-- [ ] **Step 3: Define** `SnapshotPage { snapshot_id, through_sequence, section, after_item, items, encoded_bytes, next_cursor }` and `EventPage { after_sequence, through_sequence, events, next_cursor }`. Pages stop before either 1,000 items or 512 KiB encoded, return an opaque HMAC-bound cursor, and keep ephemeral terminal grids/screenshots/large artifacts outside the durable snapshot.
-- [ ] **Step 4: Add retention metadata** and a typed `ReplayUnavailable { oldest_sequence, newest_sequence }`; a client must request a fresh paged snapshot instead of guessing across a gap. Cursors bind snapshot ID, through-sequence, section, last item, and negotiated page limits so they cannot be replayed against another snapshot/limit set.
-- [ ] **Step 5: Implement `RuntimeRegistry`** keyed by typed resource ID with monotonically increasing generation. Every asynchronous completion carries `(resource_id, generation)` and stale completions are discarded.
-- [ ] **Step 6: Add bounded store maintenance** for WAL checkpoints, settled outbox payload cleanup while retaining compact effect/receipt idempotency records, integrity checks, and optional event-retention snapshots. Canonical facts and known command IDs are never pruned without an explicit retention/compaction policy and a replay boundary.
-- [ ] **Step 7: On recovery**, load durable resource recipes as `Recovering` facts, reconcile actual processes in later phases, and never convert stored metadata into a claim that a process is still alive.
-- [ ] **Step 8: Run** the focused replay/runtime/maintenance tests and commit as `feat(kernel): add paged snapshots replay and generation fences`.
+- [x] **Step 1: Write failing tests** for `snapshot_has_global_cursor`, `snapshot_pages_resume_without_duplicates`, `snapshot_page_honors_item_and_encoded_byte_limits`, `events_after_cursor_are_strictly_ordered`, `expired_cursor_requires_snapshot`, `operation_status_survives_reopen`, `runtime_generation_rejects_stale_completion`, and `archived_task_has_no_live_resources`.
+- [x] **Step 2: Run** `cargo test --test kernel_store replay_ -- --nocapture` and record the red result.
+- [x] **Step 3: Define** `SnapshotPage { snapshot_id, through_sequence, section, after_item, items, encoded_bytes, next_cursor }` and `EventPage { after_sequence, through_sequence, events, next_cursor }`. Pages stop before either 1,000 items or 512 KiB encoded, return an opaque HMAC-bound cursor, and keep ephemeral terminal grids/screenshots/large artifacts outside the durable snapshot.
+- [x] **Step 4: Add retention metadata** and a typed `ReplayUnavailable { oldest_sequence, newest_sequence }`; a client must request a fresh paged snapshot instead of guessing across a gap. Cursors bind snapshot ID, through-sequence, section, last item, and negotiated page limits so they cannot be replayed against another snapshot/limit set.
+- [x] **Step 5: Implement `RuntimeRegistry`** keyed by typed resource ID with monotonically increasing generation. Every asynchronous completion carries `(resource_id, generation)` and stale completions are discarded.
+- [x] **Step 6: Add bounded store maintenance** for WAL checkpoints, settled outbox payload cleanup while retaining compact effect/receipt idempotency records, integrity checks, and optional event-retention snapshots. Canonical facts and known command IDs are never pruned without an explicit retention/compaction policy and a replay boundary.
+- [x] **Step 7: On recovery**, load durable resource recipes as `Recovering` facts, reconcile actual processes in later phases, and never convert stored metadata into a claim that a process is still alive.
+- [x] **Step 8: Run** the focused replay/runtime/maintenance tests and commit as `feat(kernel): add paged snapshots replay and generation fences`.
 
 ### Task 1.6: Define capability negotiation and bounded MessagePack framing
 
