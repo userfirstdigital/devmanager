@@ -2,7 +2,10 @@
 
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
-use devmanager::domain::{ClientId, Command, CommandEnvelope, CommandId, TaskId};
+use devmanager::domain::{
+    ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId, OperationId,
+    RejectionCode, TaskId,
+};
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
     FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
@@ -530,6 +533,14 @@ fn protocol_task_id(tail: u8) -> TaskId {
     TaskId::from_bytes(protocol_uuid_v7(tail)).expect("task id")
 }
 
+fn protocol_operation_id(tail: u8) -> OperationId {
+    OperationId::from_bytes(protocol_uuid_v7(tail)).expect("operation id")
+}
+
+fn protocol_event_id(tail: u8) -> EventId {
+    EventId::from_bytes(protocol_uuid_v7(tail)).expect("event id")
+}
+
 #[test]
 fn protocol_client_hello_round_trips_and_negotiates_without_freezing_server_hello() {
     let unknown_bit = 1_u64 << 63;
@@ -906,6 +917,175 @@ fn protocol_command_envelope_rejects_alternate_or_open_shapes() {
     trailing.push(0xc0);
     assert_eq!(
         codec.decode::<CommandEnvelope>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
+    );
+}
+
+#[test]
+fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation() {
+    let accepted = CommandReceipt::Accepted {
+        command_id: protocol_command_id(0x61),
+        operation_id: protocol_operation_id(0x62),
+        task_revision: None,
+        event_ids: vec![protocol_event_id(0x63), protocol_event_id(0x64)],
+    };
+    assert_eq!(accepted.command_id(), protocol_command_id(0x61));
+    assert_eq!(
+        accepted.accepted_operation_id(),
+        Some(protocol_operation_id(0x62))
+    );
+
+    let rejected = CommandReceipt::Rejected {
+        command_id: protocol_command_id(0x65),
+        code: RejectionCode::RevisionConflict,
+        current_revision: None,
+    };
+    assert_eq!(rejected.command_id(), protocol_command_id(0x65));
+    assert_eq!(rejected.accepted_operation_id(), None);
+
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    for receipt in [accepted, rejected] {
+        let encoded = codec.encode(&receipt).expect("encode receipt");
+        assert_eq!(encoded[0], 0x81, "receipt has one outer variant entry");
+        assert_eq!(
+            rmp_serde::to_vec(&receipt).expect("direct receipt serialization")[0],
+            0x81
+        );
+        assert_eq!(
+            codec
+                .decode::<CommandReceipt>(&encoded)
+                .expect("decode receipt"),
+            receipt
+        );
+    }
+}
+
+fn push_messagepack<T: serde::Serialize + ?Sized>(bytes: &mut Vec<u8>, value: &T) {
+    bytes.extend(rmp_serde::to_vec(value).expect("encode fixture value"));
+}
+
+fn accepted_receipt_bytes(inner_fields: u8) -> Vec<u8> {
+    let mut bytes = vec![0x81];
+    push_messagepack(&mut bytes, "accepted");
+    bytes.push(0x80 | inner_fields);
+    for (key, value) in [
+        (
+            "command_id",
+            rmp_serde::to_vec(&protocol_command_id(0x66)).unwrap(),
+        ),
+        (
+            "operation_id",
+            rmp_serde::to_vec(&protocol_operation_id(0x67)).unwrap(),
+        ),
+        (
+            "task_revision",
+            rmp_serde::to_vec(&Option::<u64>::None).unwrap(),
+        ),
+        (
+            "event_ids",
+            rmp_serde::to_vec(&vec![protocol_event_id(0x68)]).unwrap(),
+        ),
+    ]
+    .into_iter()
+    .take(usize::from(inner_fields.min(4)))
+    {
+        push_messagepack(&mut bytes, key);
+        bytes.extend(value);
+    }
+    bytes
+}
+
+#[test]
+fn protocol_command_receipt_rejects_alternate_or_open_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    let positional_payload = (
+        protocol_command_id(0x66),
+        protocol_operation_id(0x67),
+        Option::<u64>::None,
+        vec![protocol_event_id(0x68)],
+    );
+    let mut positional = vec![0x81];
+    push_messagepack(&mut positional, "accepted");
+    push_messagepack(&mut positional, &positional_payload);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&positional),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut duplicate = accepted_receipt_bytes(4);
+    let inner_offset = 1 + rmp_serde::to_vec(&"accepted").unwrap().len();
+    assert_eq!(duplicate[inner_offset], 0x84);
+    duplicate[inner_offset] = 0x85;
+    push_messagepack(&mut duplicate, "command_id");
+    push_messagepack(&mut duplicate, &protocol_command_id(0x66));
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = accepted_receipt_bytes(4);
+    unknown[inner_offset] = 0x85;
+    push_messagepack(&mut unknown, "future_field");
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&accepted_receipt_bytes(3)),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown_variant = vec![0x81];
+    push_messagepack(&mut unknown_variant, "future_receipt");
+    unknown_variant.push(0x80);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&unknown_variant),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut multiple_variants = accepted_receipt_bytes(4);
+    multiple_variants[0] = 0x82;
+    push_messagepack(&mut multiple_variants, "rejected");
+    multiple_variants.push(0x83);
+    push_messagepack(&mut multiple_variants, "command_id");
+    push_messagepack(&mut multiple_variants, &protocol_command_id(0x69));
+    push_messagepack(&mut multiple_variants, "code");
+    push_messagepack(&mut multiple_variants, &RejectionCode::NotFound);
+    push_messagepack(&mut multiple_variants, "current_revision");
+    push_messagepack(&mut multiple_variants, &Option::<u64>::None);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&multiple_variants),
+        Err(MessagePackError::Decode)
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawRejectionCode {
+        FutureCode,
+    }
+    let mut unknown_code = vec![0x81];
+    push_messagepack(&mut unknown_code, "rejected");
+    unknown_code.push(0x83);
+    push_messagepack(&mut unknown_code, "command_id");
+    push_messagepack(&mut unknown_code, &protocol_command_id(0x6A));
+    push_messagepack(&mut unknown_code, "code");
+    push_messagepack(&mut unknown_code, &RawRejectionCode::FutureCode);
+    push_messagepack(&mut unknown_code, "current_revision");
+    push_messagepack(&mut unknown_code, &Option::<u64>::None);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&unknown_code),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut trailing = accepted_receipt_bytes(4);
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<CommandReceipt>(&trailing),
         Err(MessagePackError::TrailingBytes {
             offset: u32::try_from(trailing.len() - 1).unwrap(),
         })

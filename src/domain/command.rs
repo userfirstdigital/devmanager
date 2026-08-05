@@ -1,4 +1,4 @@
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -188,8 +188,7 @@ impl<'de> Deserialize<'de> for CommandEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandReceipt {
     Accepted {
         command_id: CommandId,
@@ -202,6 +201,385 @@ pub enum CommandReceipt {
         code: RejectionCode,
         current_revision: Option<u64>,
     },
+}
+
+impl CommandReceipt {
+    pub const fn command_id(&self) -> CommandId {
+        match self {
+            Self::Accepted { command_id, .. } | Self::Rejected { command_id, .. } => *command_id,
+        }
+    }
+
+    pub const fn accepted_operation_id(&self) -> Option<OperationId> {
+        match self {
+            Self::Accepted { operation_id, .. } => Some(*operation_id),
+            Self::Rejected { .. } => None,
+        }
+    }
+}
+
+struct AcceptedReceiptRef<'a> {
+    command_id: &'a CommandId,
+    operation_id: &'a OperationId,
+    task_revision: &'a Option<u64>,
+    event_ids: &'a [EventId],
+}
+
+impl Serialize for AcceptedReceiptRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("command_id", self.command_id)?;
+        map.serialize_entry("operation_id", self.operation_id)?;
+        map.serialize_entry("task_revision", self.task_revision)?;
+        map.serialize_entry("event_ids", self.event_ids)?;
+        map.end()
+    }
+}
+
+struct RejectedReceiptRef<'a> {
+    command_id: &'a CommandId,
+    code: &'a RejectionCode,
+    current_revision: &'a Option<u64>,
+}
+
+impl Serialize for RejectedReceiptRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("command_id", self.command_id)?;
+        map.serialize_entry("code", self.code)?;
+        map.serialize_entry("current_revision", self.current_revision)?;
+        map.end()
+    }
+}
+
+impl Serialize for CommandReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Accepted {
+                command_id,
+                operation_id,
+                task_revision,
+                event_ids,
+            } => map.serialize_entry(
+                "accepted",
+                &AcceptedReceiptRef {
+                    command_id,
+                    operation_id,
+                    task_revision,
+                    event_ids,
+                },
+            )?,
+            Self::Rejected {
+                command_id,
+                code,
+                current_revision,
+            } => map.serialize_entry(
+                "rejected",
+                &RejectedReceiptRef {
+                    command_id,
+                    code,
+                    current_revision,
+                },
+            )?,
+        }
+        map.end()
+    }
+}
+
+enum CommandReceiptVariant {
+    Accepted,
+    Rejected,
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VariantVisitor;
+
+        impl Visitor<'_> for VariantVisitor {
+            type Value = CommandReceiptVariant;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("accepted or rejected")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "accepted" => Ok(CommandReceiptVariant::Accepted),
+                    "rejected" => Ok(CommandReceiptVariant::Rejected),
+                    _ => Err(de::Error::unknown_variant(value, &["accepted", "rejected"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct AcceptedReceiptSeed;
+
+impl<'de> DeserializeSeed<'de> for AcceptedReceiptSeed {
+    type Value = CommandReceipt;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(AcceptedReceiptVisitor)
+    }
+}
+
+const ACCEPTED_RECEIPT_FIELDS: &[&str] =
+    &["command_id", "operation_id", "task_revision", "event_ids"];
+
+enum AcceptedReceiptField {
+    CommandId,
+    OperationId,
+    TaskRevision,
+    EventIds,
+}
+
+impl<'de> Deserialize<'de> for AcceptedReceiptField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = AcceptedReceiptField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an accepted CommandReceipt field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(AcceptedReceiptField::CommandId),
+                    "operation_id" => Ok(AcceptedReceiptField::OperationId),
+                    "task_revision" => Ok(AcceptedReceiptField::TaskRevision),
+                    "event_ids" => Ok(AcceptedReceiptField::EventIds),
+                    _ => Err(de::Error::unknown_field(value, ACCEPTED_RECEIPT_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct AcceptedReceiptVisitor;
+
+impl<'de> Visitor<'de> for AcceptedReceiptVisitor {
+    type Value = CommandReceipt;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a named accepted CommandReceipt payload map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut command_id = None;
+        let mut operation_id = None;
+        let mut task_revision: Option<Option<u64>> = None;
+        let mut event_ids = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                AcceptedReceiptField::CommandId => {
+                    if command_id.is_some() {
+                        return Err(de::Error::duplicate_field("command_id"));
+                    }
+                    command_id = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::OperationId => {
+                    if operation_id.is_some() {
+                        return Err(de::Error::duplicate_field("operation_id"));
+                    }
+                    operation_id = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::TaskRevision => {
+                    if task_revision.is_some() {
+                        return Err(de::Error::duplicate_field("task_revision"));
+                    }
+                    task_revision = Some(map.next_value()?);
+                }
+                AcceptedReceiptField::EventIds => {
+                    if event_ids.is_some() {
+                        return Err(de::Error::duplicate_field("event_ids"));
+                    }
+                    event_ids = Some(map.next_value()?);
+                }
+            }
+        }
+
+        Ok(CommandReceipt::Accepted {
+            command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+            operation_id: operation_id.ok_or_else(|| de::Error::missing_field("operation_id"))?,
+            task_revision: task_revision
+                .ok_or_else(|| de::Error::missing_field("task_revision"))?,
+            event_ids: event_ids.ok_or_else(|| de::Error::missing_field("event_ids"))?,
+        })
+    }
+}
+
+struct RejectedReceiptSeed;
+
+impl<'de> DeserializeSeed<'de> for RejectedReceiptSeed {
+    type Value = CommandReceipt;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(RejectedReceiptVisitor)
+    }
+}
+
+const REJECTED_RECEIPT_FIELDS: &[&str] = &["command_id", "code", "current_revision"];
+
+enum RejectedReceiptField {
+    CommandId,
+    Code,
+    CurrentRevision,
+}
+
+impl<'de> Deserialize<'de> for RejectedReceiptField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = RejectedReceiptField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a rejected CommandReceipt field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(RejectedReceiptField::CommandId),
+                    "code" => Ok(RejectedReceiptField::Code),
+                    "current_revision" => Ok(RejectedReceiptField::CurrentRevision),
+                    _ => Err(de::Error::unknown_field(value, REJECTED_RECEIPT_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct RejectedReceiptVisitor;
+
+impl<'de> Visitor<'de> for RejectedReceiptVisitor {
+    type Value = CommandReceipt;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a named rejected CommandReceipt payload map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut command_id = None;
+        let mut code = None;
+        let mut current_revision: Option<Option<u64>> = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                RejectedReceiptField::CommandId => {
+                    if command_id.is_some() {
+                        return Err(de::Error::duplicate_field("command_id"));
+                    }
+                    command_id = Some(map.next_value()?);
+                }
+                RejectedReceiptField::Code => {
+                    if code.is_some() {
+                        return Err(de::Error::duplicate_field("code"));
+                    }
+                    code = Some(map.next_value()?);
+                }
+                RejectedReceiptField::CurrentRevision => {
+                    if current_revision.is_some() {
+                        return Err(de::Error::duplicate_field("current_revision"));
+                    }
+                    current_revision = Some(map.next_value()?);
+                }
+            }
+        }
+
+        Ok(CommandReceipt::Rejected {
+            command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+            code: code.ok_or_else(|| de::Error::missing_field("code"))?,
+            current_revision: current_revision
+                .ok_or_else(|| de::Error::missing_field("current_revision"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandReceiptVisitor;
+
+        impl<'de> Visitor<'de> for CommandReceiptVisitor {
+            type Value = CommandReceipt;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a one-entry named CommandReceipt map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let variant = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("CommandReceipt variant is missing"))?;
+                let receipt = match variant {
+                    CommandReceiptVariant::Accepted => map.next_value_seed(AcceptedReceiptSeed)?,
+                    CommandReceiptVariant::Rejected => map.next_value_seed(RejectedReceiptSeed)?,
+                };
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "CommandReceipt must contain exactly one variant",
+                    ));
+                }
+                Ok(receipt)
+            }
+        }
+
+        deserializer.deserialize_map(CommandReceiptVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
