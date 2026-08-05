@@ -4743,45 +4743,96 @@ fn load_resources(
     let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
+            ResourceProjectionFields {
+                owner_kind: row.get(1)?,
+                resource_kind: row.get(2)?,
+                recipe: row.get(3)?,
+                lifecycle: row.get(4)?,
+                runtime_generation: row.get(5)?,
+                updated_at_ms: row.get(6)?,
+            },
         ))
     })?;
     let mut resources = BTreeMap::new();
     for row in rows {
-        let (
-            id_bytes,
-            owner_kind,
-            resource_kind,
-            recipe,
-            lifecycle,
-            runtime_generation,
-            updated_at_ms,
-        ) = row?;
+        let (id_bytes, fields) = row?;
         let id = id16::<ResourceId>("resources.resource_id", &id_bytes)?;
-        let resource = ResourceFacts {
-            id,
-            task_id: Some(task_id),
-            owner_kind: parse_owner_kind(&owner_kind)?,
-            resource_kind: parse_resource_kind(&resource_kind)?,
-            recipe: unpack_projection_blob("resources.recipe", &recipe)?,
-            lifecycle: parse_resource_lifecycle(&lifecycle)?,
-            runtime_generation: u64_from_nonnegative_i64(
-                "resources.runtime_generation",
-                runtime_generation,
-            )?,
-            updated_at_ms,
-        };
-        resource
-            .validate()
-            .map_err(|err| StoreError::Projection(err.to_string()))?;
+        let resource = decode_resource_projection(id, Some(task_id), fields)?;
         resources.insert(id, resource);
     }
     Ok(resources)
+}
+
+struct ResourceProjectionFields {
+    owner_kind: String,
+    resource_kind: String,
+    recipe: Vec<u8>,
+    lifecycle: String,
+    runtime_generation: i64,
+    updated_at_ms: i64,
+}
+
+pub(crate) fn load_resource(
+    conn: &Connection,
+    resource_id: ResourceId,
+) -> Result<Option<ResourceFacts>, StoreError> {
+    let row: Option<(Option<Vec<u8>>, ResourceProjectionFields)> = conn
+        .query_row(
+            "SELECT task_id, owner_kind, resource_kind, recipe, lifecycle,
+                    runtime_generation, updated_at_ms
+             FROM resources WHERE resource_id = ?1",
+            [resource_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    ResourceProjectionFields {
+                        owner_kind: row.get(1)?,
+                        resource_kind: row.get(2)?,
+                        recipe: row.get(3)?,
+                        lifecycle: row.get(4)?,
+                        runtime_generation: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((task_id, fields)) = row else {
+        return Ok(None);
+    };
+    let task_id = parse_optional_task_scope("resources.task_id", task_id)?;
+    if let Some(task_id) = task_id {
+        load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+    }
+    Ok(Some(decode_resource_projection(
+        resource_id,
+        task_id,
+        fields,
+    )?))
+}
+
+fn decode_resource_projection(
+    id: ResourceId,
+    task_id: Option<TaskId>,
+    fields: ResourceProjectionFields,
+) -> Result<ResourceFacts, StoreError> {
+    let resource = ResourceFacts {
+        id,
+        task_id,
+        owner_kind: parse_owner_kind(&fields.owner_kind)?,
+        resource_kind: parse_resource_kind(&fields.resource_kind)?,
+        recipe: unpack_projection_blob("resources.recipe", &fields.recipe)?,
+        lifecycle: parse_resource_lifecycle(&fields.lifecycle)?,
+        runtime_generation: u64_from_nonnegative_i64(
+            "resources.runtime_generation",
+            fields.runtime_generation,
+        )?,
+        updated_at_ms: fields.updated_at_ms,
+    };
+    resource
+        .validate()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    Ok(resource)
 }
 
 fn unpack_projection_blob<T>(field: &str, bytes: &[u8]) -> Result<T, StoreError>

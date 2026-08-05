@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::domain::id::{AgentSessionId, ArtifactId, SnapshotId, TaskId};
+use crate::domain::id::{AgentSessionId, ArtifactId, ResourceId, SnapshotId, TaskId};
 use crate::domain::snapshot::{
     PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
     TaskSnapshotItem,
@@ -167,9 +167,8 @@ impl SnapshotSession {
             SnapshotSection::Tasks => self.tasks_page(after_item),
             SnapshotSection::AgentSessions => self.agent_sessions_page(after_item),
             SnapshotSection::Artifacts => self.artifacts_page(after_item),
-            SnapshotSection::Resources | SnapshotSection::Operations => {
-                Err(SnapshotError::UnsupportedSection)
-            }
+            SnapshotSection::Resources => self.resources_page(after_item),
+            SnapshotSection::Operations => Err(SnapshotError::UnsupportedSection),
         }
     }
 
@@ -256,6 +255,32 @@ impl SnapshotSession {
                         StoreError::Projection("artifact disappeared from pinned snapshot".into())
                     })?;
                 Ok(SnapshotItem::Artifact(artifact))
+            },
+        )
+    }
+
+    fn resources_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_resource = match after_item {
+            Some(SnapshotItemKey::Resource(resource_id)) => Some(resource_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let fetch_limit = i64::from(self.limits.max_items) + 1;
+        let resource_ids = load_resource_ids(&self.conn, after_resource, fetch_limit)?;
+        self.assemble_page(
+            SnapshotSection::Resources,
+            after_item,
+            resource_ids,
+            SnapshotItemKey::Resource,
+            |resource_id| {
+                let resource =
+                    command_bus::load_resource(&self.conn, resource_id)?.ok_or_else(|| {
+                        StoreError::Projection("resource disappeared from pinned snapshot".into())
+                    })?;
+                Ok(SnapshotItem::Resource(resource))
             },
         )
     }
@@ -503,6 +528,38 @@ fn load_artifact_ids(
     Ok(artifact_ids)
 }
 
+fn load_resource_ids(
+    conn: &Connection,
+    after_resource: Option<ResourceId>,
+    fetch_limit: i64,
+) -> Result<Vec<ResourceId>, SnapshotError> {
+    let mut resource_ids = Vec::new();
+    match after_resource {
+        Some(after_resource) => {
+            let mut stmt = conn.prepare(
+                "SELECT resource_id FROM resources
+                 WHERE resource_id > ?1 ORDER BY resource_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![after_resource.as_bytes().as_slice(), fetch_limit],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                resource_ids.push(decode_resource_id(&row?)?);
+            }
+        }
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT resource_id FROM resources ORDER BY resource_id ASC LIMIT ?1")?;
+            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                resource_ids.push(decode_resource_id(&row?)?);
+            }
+        }
+    }
+    Ok(resource_ids)
+}
+
 fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
     let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
         detail: "tasks.task_id must be 16 bytes".into(),
@@ -532,6 +589,17 @@ fn decode_artifact_id(bytes: &[u8]) -> Result<ArtifactId, SnapshotError> {
     ArtifactId::from_bytes(bytes)
         .map_err(|error| StoreError::CodecMismatch {
             detail: format!("artifacts.artifact_id: {error}"),
+        })
+        .map_err(Into::into)
+}
+
+fn decode_resource_id(bytes: &[u8]) -> Result<ResourceId, SnapshotError> {
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: "resources.resource_id must be 16 bytes".into(),
+    })?;
+    ResourceId::from_bytes(bytes)
+        .map_err(|error| StoreError::CodecMismatch {
+            detail: format!("resources.resource_id: {error}"),
         })
         .map_err(Into::into)
 }
@@ -603,7 +671,11 @@ mod tests {
         Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RenameTaskIntent,
     };
     use crate::domain::id::{
-        AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, ProjectId, TaskId,
+        AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, ProjectId, ResourceId,
+        TaskId,
+    };
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
     };
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
@@ -632,6 +704,7 @@ mod tests {
     test_id!(client_id, ClientId);
     test_id!(agent_id, AgentSessionId);
     test_id!(artifact_id, ArtifactId);
+    test_id!(resource_id, ResourceId);
 
     fn envelope(
         command_id: CommandId,
@@ -748,6 +821,41 @@ mod tests {
                 Command::RegisterArtifact { artifact },
             ))
             .expect("register artifact");
+    }
+
+    fn resource_facts(task_id: TaskId, resource_id: ResourceId) -> ResourceFacts {
+        ResourceFacts {
+            id: resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 0,
+            updated_at_ms: 1_725_000_000_300,
+        }
+    }
+
+    fn register_resource(
+        store: &mut KernelStore,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        command_id: CommandId,
+        expected_revision: u64,
+    ) {
+        store
+            .execute(envelope(
+                command_id,
+                Some(task_id),
+                Some(expected_revision),
+                Command::RegisterResource {
+                    resource: resource_facts(task_id, resource_id),
+                },
+            ))
+            .expect("register resource");
     }
 
     #[test]
@@ -1197,6 +1305,212 @@ mod tests {
                 .page(SnapshotSection::Artifacts, None)
                 .expect_err("invalid artifact projection must fail closed"),
             SnapshotError::Store(StoreError::Projection(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_resources_pages_are_frozen_and_resume_without_duplicates() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xB0);
+        create_task(&mut store, task, command_id(0xB1));
+        for (resource_tail, command_tail, expected_revision) in
+            [(0xB2, 0xB5, 1), (0xB3, 0xB6, 2), (0xB4, 0xB7, 3)]
+        {
+            register_resource(
+                &mut store,
+                task,
+                resource_id(resource_tail),
+                command_id(command_tail),
+                expected_revision,
+            );
+        }
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(2, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        register_resource(&mut store, task, resource_id(0xB8), command_id(0xB9), 4);
+
+        let first = snapshot
+            .page(SnapshotSection::Resources, None)
+            .expect("first resource page");
+        let cursor = first.next_cursor.clone().expect("resource resume cursor");
+        let second = snapshot
+            .page(SnapshotSection::Resources, Some(&cursor))
+            .expect("second resource page");
+
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(first.through_sequence, second.through_sequence);
+        assert_eq!(
+            second.after_item,
+            Some(SnapshotItemKey::Resource(resource_id(0xB3)))
+        );
+        assert_eq!(second.next_cursor, None);
+
+        let ids = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| match item {
+                SnapshotItem::Resource(resource) => resource.id,
+                other => panic!("expected resource item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![resource_id(0xB2), resource_id(0xB3), resource_id(0xB4)]
+        );
+        assert!(!ids.contains(&resource_id(0xB8)));
+    }
+
+    #[test]
+    fn snapshot_resources_preserve_host_ownership() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let store = KernelStore::open(&path).expect("open");
+        let resource = resource_id(0xBA);
+
+        let conn = Connection::open(&path).expect("open seed connection");
+        conn.execute(
+            "INSERT INTO resources(
+                resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+                runtime_generation, updated_at_ms
+             ) VALUES (?1, NULL, 'host', 'service', ?2, 'released', 7, 100)",
+            rusqlite::params![
+                resource.as_bytes().as_slice(),
+                rmp_serde::to_vec(&ResourceRecipe::Service {
+                    command: "host-service".into(),
+                })
+                .expect("encode host recipe"),
+            ],
+        )
+        .expect("seed host resource projection");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        let page = snapshot
+            .page(SnapshotSection::Resources, None)
+            .expect("host resource page");
+        assert_eq!(page.items.len(), 1);
+        match &page.items[0] {
+            SnapshotItem::Resource(item) => {
+                assert_eq!(item.id, resource);
+                assert_eq!(item.owner_kind, OwnerKind::Host);
+                assert_eq!(item.task_id, None);
+                assert_eq!(item.lifecycle, ResourceLifecycle::Released);
+                assert_eq!(item.runtime_generation, 7);
+            }
+            other => panic!("expected resource item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_resources_reject_invalid_owner_binding() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xBB);
+        let resource = resource_id(0xBC);
+        create_task(&mut store, task, command_id(0xBD));
+        register_resource(&mut store, task, resource, command_id(0xBE), 1);
+
+        let conn = Connection::open(&path).expect("open tamper connection");
+        conn.execute(
+            "UPDATE resources SET owner_kind = 'host' WHERE resource_id = ?1",
+            [resource.as_bytes().as_slice()],
+        )
+        .expect("tamper resource owner binding");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(1_000, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        assert!(matches!(
+            snapshot
+                .page(SnapshotSection::Resources, None)
+                .expect_err("invalid owner binding must fail closed"),
+            SnapshotError::Store(StoreError::Projection(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_resources_reject_dangling_task_owner() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let store = KernelStore::open(&path).expect("open");
+        let resource = resource_id(0xC0);
+        let missing_task = task_id(0xC1);
+
+        let conn = Connection::open(&path).expect("open seed connection");
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("allow corruption fixture");
+        conn.execute(
+            "INSERT INTO resources(
+                resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+                runtime_generation, updated_at_ms
+             ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'active', 0, 100)",
+            rusqlite::params![
+                resource.as_bytes().as_slice(),
+                missing_task.as_bytes().as_slice(),
+                rmp_serde::to_vec(&ResourceRecipe::Terminal {
+                    cols: 120,
+                    rows: 40
+                })
+                .expect("encode terminal recipe"),
+            ],
+        )
+        .expect("seed dangling resource projection");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        assert!(matches!(
+            snapshot
+                .page(SnapshotSection::Resources, None)
+                .expect_err("dangling task owner must fail closed"),
+            SnapshotError::Store(StoreError::Corruption)
+        ));
+    }
+
+    #[test]
+    fn snapshot_resources_report_oversized_item_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let store = KernelStore::open(&path).expect("open");
+        let resource = resource_id(0xC2);
+
+        let conn = Connection::open(&path).expect("open seed connection");
+        conn.execute(
+            "INSERT INTO resources(
+                resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+                runtime_generation, updated_at_ms
+             ) VALUES (?1, NULL, 'host', 'service', ?2, 'active', 0, 100)",
+            rusqlite::params![
+                resource.as_bytes().as_slice(),
+                rmp_serde::to_vec(&ResourceRecipe::Service {
+                    command: "x".repeat(8_192),
+                })
+                .expect("encode oversized service recipe"),
+            ],
+        )
+        .expect("seed oversized resource projection");
+        drop(conn);
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 2_048).expect("limits"))
+            .expect("begin snapshot");
+        assert!(matches!(
+            snapshot.page(SnapshotSection::Resources, None),
+            Err(SnapshotError::PageItemTooLarge {
+                item: SnapshotItemKey::Resource(id),
+                ..
+            }) if id == resource
         ));
     }
 
