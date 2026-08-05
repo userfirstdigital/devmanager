@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
@@ -25,7 +27,7 @@ pub enum RejectionCode {
     UnsupportedCapability,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandEnvelope {
     pub command_id: CommandId,
     pub client_id: ClientId,
@@ -33,6 +35,157 @@ pub struct CommandEnvelope {
     pub issued_at_ms: i64,
     pub expected_task_revision: Option<u64>,
     pub command: Command,
+}
+
+impl Serialize for CommandEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("command_id", &self.command_id)?;
+        map.serialize_entry("client_id", &self.client_id)?;
+        map.serialize_entry("task_id", &self.task_id)?;
+        map.serialize_entry("issued_at_ms", &self.issued_at_ms)?;
+        map.serialize_entry("expected_task_revision", &self.expected_task_revision)?;
+        map.serialize_entry("command", &self.command)?;
+        map.end()
+    }
+}
+
+const COMMAND_ENVELOPE_FIELDS: &[&str] = &[
+    "command_id",
+    "client_id",
+    "task_id",
+    "issued_at_ms",
+    "expected_task_revision",
+    "command",
+];
+
+enum CommandEnvelopeField {
+    CommandId,
+    ClientId,
+    TaskId,
+    IssuedAtMs,
+    ExpectedTaskRevision,
+    Command,
+}
+
+impl<'de> Deserialize<'de> for CommandEnvelopeField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = CommandEnvelopeField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a CommandEnvelope field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command_id" => Ok(CommandEnvelopeField::CommandId),
+                    "client_id" => Ok(CommandEnvelopeField::ClientId),
+                    "task_id" => Ok(CommandEnvelopeField::TaskId),
+                    "issued_at_ms" => Ok(CommandEnvelopeField::IssuedAtMs),
+                    "expected_task_revision" => Ok(CommandEnvelopeField::ExpectedTaskRevision),
+                    "command" => Ok(CommandEnvelopeField::Command),
+                    _ => Err(de::Error::unknown_field(value, COMMAND_ENVELOPE_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CommandEnvelopeVisitor;
+
+        impl<'de> Visitor<'de> for CommandEnvelopeVisitor {
+            type Value = CommandEnvelope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named CommandEnvelope map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut command_id = None;
+                let mut client_id = None;
+                let mut task_id: Option<Option<TaskId>> = None;
+                let mut issued_at_ms = None;
+                let mut expected_task_revision: Option<Option<u64>> = None;
+                let mut command = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        CommandEnvelopeField::CommandId => {
+                            if command_id.is_some() {
+                                return Err(de::Error::duplicate_field("command_id"));
+                            }
+                            command_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::ClientId => {
+                            if client_id.is_some() {
+                                return Err(de::Error::duplicate_field("client_id"));
+                            }
+                            client_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::TaskId => {
+                            if task_id.is_some() {
+                                return Err(de::Error::duplicate_field("task_id"));
+                            }
+                            task_id = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::IssuedAtMs => {
+                            if issued_at_ms.is_some() {
+                                return Err(de::Error::duplicate_field("issued_at_ms"));
+                            }
+                            issued_at_ms = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::ExpectedTaskRevision => {
+                            if expected_task_revision.is_some() {
+                                return Err(de::Error::duplicate_field("expected_task_revision"));
+                            }
+                            expected_task_revision = Some(map.next_value()?);
+                        }
+                        CommandEnvelopeField::Command => {
+                            if command.is_some() {
+                                return Err(de::Error::duplicate_field("command"));
+                            }
+                            command = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                Ok(CommandEnvelope {
+                    command_id: command_id.ok_or_else(|| de::Error::missing_field("command_id"))?,
+                    client_id: client_id.ok_or_else(|| de::Error::missing_field("client_id"))?,
+                    task_id: task_id.ok_or_else(|| de::Error::missing_field("task_id"))?,
+                    issued_at_ms: issued_at_ms
+                        .ok_or_else(|| de::Error::missing_field("issued_at_ms"))?,
+                    expected_task_revision: expected_task_revision
+                        .ok_or_else(|| de::Error::missing_field("expected_task_revision"))?,
+                    command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(CommandEnvelopeVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

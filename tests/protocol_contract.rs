@@ -2,7 +2,7 @@
 
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
-use devmanager::domain::ClientId;
+use devmanager::domain::{ClientId, Command, CommandEnvelope, CommandId, TaskId};
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
     FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
@@ -511,12 +511,23 @@ fn protocol_messagepack_codec_bounds_depth_and_total_values() {
     );
 }
 
-fn protocol_client_id(tail: u8) -> ClientId {
-    ClientId::from_bytes([
+fn protocol_uuid_v7(tail: u8) -> [u8; 16] {
+    [
         0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         tail,
-    ])
-    .expect("client id")
+    ]
+}
+
+fn protocol_client_id(tail: u8) -> ClientId {
+    ClientId::from_bytes(protocol_uuid_v7(tail)).expect("client id")
+}
+
+fn protocol_command_id(tail: u8) -> CommandId {
+    CommandId::from_bytes(protocol_uuid_v7(tail)).expect("command id")
+}
+
+fn protocol_task_id(tail: u8) -> TaskId {
+    TaskId::from_bytes(protocol_uuid_v7(tail)).expect("task id")
 }
 
 #[test]
@@ -759,5 +770,144 @@ fn protocol_client_hello_decodes_incompatible_major_then_rejects_negotiation() {
                 peer: PROTOCOL_MAJOR + 1,
             }
         ))
+    );
+}
+
+#[test]
+fn protocol_command_envelope_is_one_strict_named_correlation_map() {
+    let expected = CommandEnvelope {
+        command_id: protocol_command_id(0x51),
+        client_id: protocol_client_id(0x52),
+        task_id: Some(protocol_task_id(0x53)),
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: Some(7),
+        command: Command::BeginCloseTask,
+    };
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    let encoded = codec.encode(&expected).expect("encode command envelope");
+    assert_eq!(encoded[0], 0x86, "CommandEnvelope is a six-field map");
+    assert_eq!(
+        rmp_serde::to_vec(&expected).expect("direct command envelope serialization")[0],
+        0x86,
+        "compact serializers cannot create a positional request shape"
+    );
+    assert_eq!(
+        codec
+            .decode::<CommandEnvelope>(&encoded)
+            .expect("decode command envelope"),
+        expected
+    );
+
+    let unscoped = CommandEnvelope {
+        command_id: protocol_command_id(0x57),
+        client_id: protocol_client_id(0x58),
+        task_id: None,
+        issued_at_ms: -1,
+        expected_task_revision: None,
+        command: Command::BeginCloseTask,
+    };
+    assert_eq!(
+        codec
+            .decode::<CommandEnvelope>(&codec.encode(&unscoped).expect("encode null optionals"))
+            .expect("decode null optionals without applying business rules"),
+        unscoped
+    );
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawUnknownCommand {
+    FutureCommand,
+}
+
+#[derive(serde::Serialize)]
+struct RawCommandEnvelope<C> {
+    command_id: CommandId,
+    client_id: ClientId,
+    task_id: Option<TaskId>,
+    issued_at_ms: i64,
+    expected_task_revision: Option<u64>,
+    command: C,
+}
+
+fn raw_command_envelope<C>(command: C) -> RawCommandEnvelope<C> {
+    RawCommandEnvelope {
+        command_id: protocol_command_id(0x54),
+        client_id: protocol_client_id(0x55),
+        task_id: Some(protocol_task_id(0x56)),
+        issued_at_ms: 1_725_000_000_200,
+        expected_task_revision: Some(9),
+        command,
+    }
+}
+
+#[test]
+fn protocol_command_envelope_rejects_alternate_or_open_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let valid = raw_command_envelope(Command::BeginCloseTask);
+    let valid_bytes = rmp_serde::to_vec_named(&valid).expect("valid raw command");
+
+    let positional = (
+        valid.command_id,
+        valid.client_id,
+        valid.task_id,
+        valid.issued_at_ms,
+        valid.expected_task_revision,
+        Command::BeginCloseTask,
+    );
+    let positional_bytes = rmp_serde::to_vec(&positional).expect("positional fixture");
+    assert_eq!(positional_bytes[0], 0x96);
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&positional_bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut duplicate = valid_bytes.clone();
+    duplicate[0] = 0x87;
+    duplicate.extend(rmp_serde::to_vec(&"command_id").unwrap());
+    duplicate.extend(rmp_serde::to_vec(&valid.command_id).unwrap());
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = valid_bytes.clone();
+    unknown[0] = 0x87;
+    unknown.extend(rmp_serde::to_vec(&"future_field").unwrap());
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut missing = valid_bytes.clone();
+    assert_eq!(missing[0], 0x86);
+    missing[0] = 0x85;
+    let command_key = rmp_serde::to_vec(&"command").unwrap();
+    let command_value = rmp_serde::to_vec(&Command::BeginCloseTask).unwrap();
+    let suffix = [command_key, command_value].concat();
+    assert!(missing.ends_with(&suffix));
+    missing.truncate(missing.len() - suffix.len());
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&missing),
+        Err(MessagePackError::Decode)
+    );
+
+    let unknown_command =
+        rmp_serde::to_vec_named(&raw_command_envelope(RawUnknownCommand::FutureCommand))
+            .expect("unknown command fixture");
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&unknown_command),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut trailing = valid_bytes;
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
     );
 }
