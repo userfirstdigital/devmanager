@@ -111,16 +111,20 @@ function Resolve-DevManagerPhaseGateRecipe {
 
     $arguments = [string[]]@($table[$name])
     $environment = [ordered]@{
-        DEVMANAGER_INSTANCE_LABEL = 'Next'
-        DEVMANAGER_RUNTIME_KIND   = 'native-next'
-        CARGO_TARGET_DIR          = $cargoTargetDir
+        CARGO_TARGET_DIR = $cargoTargetDir
     }
     $environmentRemovals = [string[]]@()
     if ($name -eq 'library-tests-serial') {
-        # AGENTS.md: complete lib suite must not receive an external DEVMANAGER_PROFILE.
-        $environmentRemovals = [string[]]@('DEVMANAGER_PROFILE')
+        # The complete lib suite owns its test identity and profile environment.
+        $environmentRemovals = [string[]]@(
+            'DEVMANAGER_PROFILE',
+            'DEVMANAGER_INSTANCE_LABEL',
+            'DEVMANAGER_RUNTIME_KIND'
+        )
     }
     else {
+        $environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+        $environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
         $environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
     }
 
@@ -154,30 +158,38 @@ function Assert-DevManagerPhaseGateExecutionPlan {
         throw 'Phase-gate execution plan is missing environmentRemovals.'
     }
 
-    foreach ($requiredEnv in @('DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND', 'CARGO_TARGET_DIR')) {
-        if (-not $Plan.environment.Contains($requiredEnv)) {
-            throw "Execution plan missing required environment key '$requiredEnv'."
-        }
-    }
-    if ([string]$Plan.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {
-        throw "Execution plan must force DEVMANAGER_INSTANCE_LABEL=Next."
-    }
-    if ([string]$Plan.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {
-        throw "Execution plan must force DEVMANAGER_RUNTIME_KIND=native-next."
+    if (-not $Plan.environment.Contains('CARGO_TARGET_DIR')) {
+        throw "Execution plan missing required environment key 'CARGO_TARGET_DIR'."
     }
 
     $removals = [string[]]@($Plan.environmentRemovals)
     if ([string]$Plan.recipe -eq 'library-tests-serial') {
-        if ($Plan.environment.Contains('DEVMANAGER_PROFILE')) {
-            throw "library-tests-serial must not include a DEVMANAGER_PROFILE override."
+        foreach ($removed in @('DEVMANAGER_PROFILE', 'DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND')) {
+            if ($Plan.environment.Contains($removed)) {
+                throw "library-tests-serial must not include a $removed override."
+            }
         }
-        if (($removals -join ',') -cne 'DEVMANAGER_PROFILE') {
-            throw "library-tests-serial environmentRemovals must be exactly DEVMANAGER_PROFILE (got: $($removals -join ', '))."
+        if (@($Plan.environment.Keys).Count -ne 1) {
+            throw "library-tests-serial must override only CARGO_TARGET_DIR."
+        }
+        if (($removals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND') {
+            throw "library-tests-serial environmentRemovals must clear all DevManager runtime identity (got: $($removals -join ', '))."
         }
     }
     else {
-        if (-not $Plan.environment.Contains('DEVMANAGER_PROFILE')) {
-            throw "Execution plan missing required environment key 'DEVMANAGER_PROFILE'."
+        foreach ($requiredEnv in @('DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND', 'DEVMANAGER_PROFILE')) {
+            if (-not $Plan.environment.Contains($requiredEnv)) {
+                throw "Execution plan missing required environment key '$requiredEnv'."
+            }
+        }
+        if (@($Plan.environment.Keys).Count -ne 4) {
+            throw "Non-library Phase 0 recipes must declare exactly four environment overrides."
+        }
+        if ([string]$Plan.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {
+            throw "Execution plan must force DEVMANAGER_INSTANCE_LABEL=Next."
+        }
+        if ([string]$Plan.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {
+            throw "Execution plan must force DEVMANAGER_RUNTIME_KIND=native-next."
         }
         if ([string]$Plan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {
             throw "Execution plan must force DEVMANAGER_PROFILE=native-next-dev."

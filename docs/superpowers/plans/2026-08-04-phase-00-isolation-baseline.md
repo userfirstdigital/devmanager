@@ -14,7 +14,7 @@
 - Production storage is the unprofiled `%APPDATA%\com.userfirst.devmanager` tree; tests must never resolve beneath it.
 - `config.json` and `remote.json` hashes plus installed PID/start time are the protected invariants. `session.json` is observed only as a path and never read or hashed because the installed app may legitimately update it.
 - Use `DEVMANAGER_PROFILE=native-next-dev` and `DEVMANAGER_INSTANCE_LABEL=Next` for every replacement binary.
-- Exception for the complete `cargo test --lib` recipe: explicitly remove any inherited `DEVMANAGER_PROFILE`; profile-sensitive unit tests own and restore that process-global variable under the required serial runner.
+- Exception for the complete `cargo test --lib` recipe: explicitly remove inherited `DEVMANAGER_PROFILE`, `DEVMANAGER_INSTANCE_LABEL`, and `DEVMANAGER_RUNTIME_KIND`; unit tests own and restore their process-global identity/profile variables under the required serial runner. Retain only the isolated Cargo target override.
 - Use `target-native-next` and `target-live-native-next`; never copy a development executable into the installed location.
 - Every script fails closed on unresolved paths, ambiguous executable identity, malformed evidence, or missing expected profile variables.
 - This phase changes development tooling and path policy only; it does not introduce the new kernel, launch lifecycle, or provider/browser work.
@@ -280,7 +280,7 @@ git commit -m "chore: add isolated native-next validation scaffold"
 - Accepts: `-Phase`, `-Recipe`, `-LongRustRun`.
 - Never accepts `-Command`/`-Arguments`, a production profile, or broad kill target.
 - Phase 0 recipes are an exact closed Cargo set: `cargo-version`, `cargo-fmt-check`, `development-isolation-tests`, and `library-tests-serial`.
-- Integration-test recipes force `native-next-dev`; `library-tests-serial` explicitly removes inherited `DEVMANAGER_PROFILE` while retaining the isolated target/instance/runtime environment.
+- Integration-test recipes force the `native-next-dev` profile plus `Next`/`native-next` identity; `library-tests-serial` removes all three inherited DevManager runtime identity variables and retains only the isolated Cargo target override.
 
 - [ ] **Step 1: Write the failing gate contract test**
 

@@ -1049,34 +1049,49 @@ Assert-DevManagerPhaseGateExecutionPlan -Plan $libPlan
 Assert-DevManagerPhaseGateExecutionPlan -Plan $isoPlan
 if ($libPlan.environment.Contains('DEVMANAGER_PROFILE')) {{ throw 'library plan must omit DEVMANAGER_PROFILE override' }}
 $libRemovals = @($libPlan.environmentRemovals)
-if (($libRemovals -join ',') -cne 'DEVMANAGER_PROFILE') {{ throw ("library removals must be exact DEVMANAGER_PROFILE; got: {{0}}" -f ($libRemovals -join ',')) }}
+if (($libRemovals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND') {{
+  throw ("library removals must clear all DevManager runtime identity; got: {{0}}" -f ($libRemovals -join ','))
+}}
+foreach ($removed in $libRemovals) {{
+  if ($libPlan.environment.Contains($removed)) {{ throw "library plan must not override removed $removed" }}
+}}
 if (-not $isoPlan.environment.Contains('DEVMANAGER_PROFILE') -or [string]$isoPlan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{
   throw 'integration plan must force DEVMANAGER_PROFILE=native-next-dev'
 }}
 if (@($isoPlan.environmentRemovals).Count -ne 0) {{ throw 'integration plan must not remove DEVMANAGER_PROFILE' }}
-foreach ($shared in @('DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','CARGO_TARGET_DIR')) {{
-  if (-not $libPlan.environment.Contains($shared)) {{ throw "library missing $shared" }}
-  if (-not $isoPlan.environment.Contains($shared)) {{ throw "integration missing $shared" }}
+if (-not $libPlan.environment.Contains('CARGO_TARGET_DIR')) {{ throw 'library missing isolated CARGO_TARGET_DIR' }}
+foreach ($integrationEnv in @('DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','CARGO_TARGET_DIR')) {{
+  if (-not $isoPlan.environment.Contains($integrationEnv)) {{ throw "integration missing $integrationEnv" }}
 }}
 $priorProfile = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE', 'Process')
+$priorLabel = [Environment]::GetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Process')
+$priorKind = [Environment]::GetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'Process')
 try {{
   [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', 'poison-parent-profile', 'Process')
+  [Environment]::SetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Poisoned Label', 'Process')
+  [Environment]::SetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'poisoned-runtime', 'Process')
   $psiLib = [System.Diagnostics.ProcessStartInfo]::new()
   $psiLib.UseShellExecute = $false
-  if (-not $psiLib.Environment.ContainsKey('DEVMANAGER_PROFILE')) {{ throw 'expected poisoned parent profile to be inherited into StartInfo' }}
+  foreach ($poisoned in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND')) {{
+    if (-not $psiLib.Environment.ContainsKey($poisoned)) {{ throw "expected poisoned parent $poisoned to be inherited into StartInfo" }}
+  }}
   Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiLib -Plan $libPlan
-  if ($psiLib.Environment.ContainsKey('DEVMANAGER_PROFILE')) {{ throw 'library plan must remove poisoned DEVMANAGER_PROFILE' }}
-  if ([string]$psiLib.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw 'library label override' }}
-  if ([string]$psiLib.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw 'library kind override' }}
+  foreach ($removed in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND')) {{
+    if ($psiLib.Environment.ContainsKey($removed)) {{ throw "library plan must remove poisoned $removed" }}
+  }}
   $psiIso = [System.Diagnostics.ProcessStartInfo]::new()
   $psiIso.UseShellExecute = $false
   Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiIso -Plan $isoPlan
   if ([string]$psiIso.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw 'integration must force named profile over poison' }}
+  if ([string]$psiIso.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw 'integration must force label over poison' }}
+  if ([string]$psiIso.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw 'integration must force runtime kind over poison' }}
 }} finally {{
-  if ($null -eq $priorProfile) {{
-    [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', $null, 'Process')
-  }} else {{
-    [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', $priorProfile, 'Process')
+  foreach ($restore in @(
+    @('DEVMANAGER_PROFILE', $priorProfile),
+    @('DEVMANAGER_INSTANCE_LABEL', $priorLabel),
+    @('DEVMANAGER_RUNTIME_KIND', $priorKind)
+  )) {{
+    [Environment]::SetEnvironmentVariable([string]$restore[0], $restore[1], 'Process')
   }}
 }}
 $observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
