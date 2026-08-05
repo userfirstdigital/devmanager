@@ -1,7 +1,7 @@
-//! Pure database command execution: one IMMEDIATE transaction for lookup,
-//! snapshot load, decide, receipt, append, projection, and settlement.
+//! Pure and side-effect command acceptance: one IMMEDIATE transaction for lookup,
+//! snapshot load, decide, plan, receipt, append, projection, and optional outbox.
 //!
-//! This slice does not insert outbox effects or dispatch external work.
+//! Side-effect acceptance does not claim settlement or dispatch external work.
 
 use std::collections::BTreeMap;
 
@@ -14,15 +14,19 @@ use crate::domain::event::{
     DomainEvent, Event, OperationAcceptedFact, OperationSettledFact, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{
-    AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
-    ResourceId, TaskId,
+    AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
+    ProjectId, ResourceId, TaskId,
 };
+use crate::domain::operation::ResourceFence;
 use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
 };
-use crate::kernel::outbox::{decode_receipt_document, encode_receipt_document};
+use crate::kernel::outbox::{
+    decode_effect_document, decode_receipt_document, encode_effect_document,
+    encode_receipt_document, plan_effects, Effect, OperationFence, PlannedEffect,
+};
 use crate::kernel::projector;
 use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
@@ -62,9 +66,9 @@ fn execute_in_tx(
             accepted_at_ms,
         ),
         Ok(decision) => {
-            // Incremental slice boundary: side-effect commands stay unsupported even when
-            // decide emits an empty idempotent vector (already Closing / Releasing).
-            if command_is_effectful_in_this_slice(&envelope.command) {
+            // Empty authoritative decisions for already Closing/Releasing stay unsupported
+            // rather than inventing a duplicate in-flight operation/effect.
+            if decision.is_empty() && command_is_effectful(&envelope.command) {
                 return persist_rejection(
                     tx,
                     &envelope,
@@ -74,14 +78,32 @@ fn execute_in_tx(
                     accepted_at_ms,
                 );
             }
-            persist_pure_acceptance(
-                tx,
-                &envelope,
-                effective_task_id,
-                snapshot.as_ref(),
-                decision,
-                accepted_at_ms,
-            )
+            let Some(task_id) = effective_task_id else {
+                return Err(StoreError::Projection(
+                    "accepted commands require an effective task scope".into(),
+                ));
+            };
+            let planned = plan_effects(snapshot.as_ref(), task_id, &decision)?;
+            if planned.is_empty() {
+                persist_pure_acceptance(
+                    tx,
+                    &envelope,
+                    effective_task_id,
+                    snapshot.as_ref(),
+                    decision,
+                    accepted_at_ms,
+                )
+            } else {
+                persist_side_effect_acceptance(
+                    tx,
+                    &envelope,
+                    task_id,
+                    snapshot.as_ref(),
+                    decision,
+                    planned,
+                    accepted_at_ms,
+                )
+            }
         }
     }
 }
@@ -150,10 +172,6 @@ fn validate_accepted_receipt_correlation(
     receipt_task_id: Option<TaskId>,
     committed_sequence: Option<i64>,
 ) -> Result<(), StoreError> {
-    // Pure-command slice: accepted receipts settle in the acceptance transaction, so
-    // committed_sequence must be operation.settled for this command/operation with the
-    // contiguous decision + accepted + settled batch below. Task 1.4c will add a separately
-    // correlated outbox-backed accepted path rather than weakening this pure validator.
     let committed_sequence = committed_sequence.ok_or(StoreError::Corruption)?;
     if committed_sequence < 0 {
         return Err(StoreError::Corruption);
@@ -164,6 +182,62 @@ fn validate_accepted_receipt_correlation(
     if event_ids.is_empty() {
         return Err(StoreError::Corruption);
     }
+    let Some(scope) = receipt_task_id else {
+        return Err(StoreError::Corruption);
+    };
+    let Some(receipt_final_revision) = receipt_task_revision else {
+        return Err(StoreError::Corruption);
+    };
+
+    let operation = load_operation_projection(tx, command_id)?;
+    if operation.operation_id != expected_operation_id {
+        return Err(StoreError::Corruption);
+    }
+    if operation.task_id != Some(scope) {
+        return Err(StoreError::Corruption);
+    }
+
+    let outbox_rows = load_outbox_rows(tx, expected_operation_id)?;
+    if !outbox_rows.is_empty() {
+        return validate_side_effect_accepted_receipt(
+            tx,
+            command_id,
+            expected_operation_id,
+            event_ids,
+            receipt_final_revision,
+            scope,
+            committed_sequence,
+            &operation,
+            &outbox_rows,
+        );
+    }
+    // Missing outbox must not fall through into the pure validator for accepted ops.
+    if operation.state == "accepted" {
+        return Err(StoreError::Corruption);
+    }
+    validate_pure_accepted_receipt(
+        tx,
+        command_id,
+        expected_operation_id,
+        event_ids,
+        receipt_final_revision,
+        scope,
+        committed_sequence,
+        &operation,
+    )
+}
+
+fn validate_pure_accepted_receipt(
+    tx: &Transaction<'_>,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    // Pure-command path: committed_sequence is operation.settled.
     let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
     let accepted_sequence = committed_sequence
         .checked_sub(1)
@@ -172,16 +246,6 @@ fn validate_accepted_receipt_correlation(
         .checked_sub(decision_count)
         .ok_or(StoreError::Corruption)?;
 
-    let operation = load_pure_operation_projection(tx, command_id)?;
-    if operation.operation_id != expected_operation_id {
-        return Err(StoreError::Corruption);
-    }
-    let Some(scope) = receipt_task_id else {
-        return Err(StoreError::Corruption);
-    };
-    if operation.task_id != Some(scope) {
-        return Err(StoreError::Corruption);
-    }
     if operation.state != "settled"
         || operation.action_epoch.is_some()
         || operation.resource_id.is_some()
@@ -198,10 +262,290 @@ fn validate_accepted_receipt_correlation(
         return Err(StoreError::Corruption);
     }
 
-    let Some(receipt_final_revision) = receipt_task_revision else {
+    let decision_facts = validate_decision_event_batch(
+        tx,
+        event_ids,
+        scope,
+        receipt_final_revision,
+        first_decision_sequence,
+        is_pure_slice_decision_fact,
+    )?;
+
+    let accepted_row = load_event_row_at_sequence(tx, accepted_sequence)?;
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        scope,
+        operation.accepted_at_ms,
+        OperationFence {
+            action_epoch: None,
+            resource_id: None,
+            runtime_generation: None,
+        },
+    )?;
+
+    let settled_row = load_event_row_at_sequence(tx, committed_sequence)?;
+    if settled_row.task_id != Some(scope) || settled_row.task_revision.is_some() {
+        return Err(StoreError::Corruption);
+    }
+    let settled_event = crate::kernel::store::decode_stored_event(
+        &settled_row.event_type,
+        settled_row.schema_version,
+        &settled_row.payload,
+    )?;
+    let Event::OperationSettled(settled_fact) = settled_event else {
         return Err(StoreError::Corruption);
     };
+    let Some(outcome_at_ms) = operation.outcome_at_ms else {
+        return Err(StoreError::Corruption);
+    };
+    if settled_fact.command_id != command_id
+        || settled_fact.operation_id != expected_operation_id
+        || settled_fact.result_event_ids.as_slice() != event_ids
+        || settled_fact.action_epoch.is_some()
+        || settled_fact.resource_id.is_some()
+        || settled_fact.runtime_generation.is_some()
+        || settled_fact.source != crate::domain::operation::OutcomeSource::Dispatch
+        || settled_fact.settled_at_ms != outcome_at_ms
+    {
+        return Err(StoreError::Corruption);
+    }
+    let _ = decision_facts;
+    Ok(())
+}
 
+fn validate_side_effect_accepted_receipt(
+    tx: &Transaction<'_>,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+    outbox_rows: &[OutboxRow],
+) -> Result<(), StoreError> {
+    // Side-effect path: committed_sequence is operation.accepted. Do not re-plan from
+    // the current snapshot — correlate durable decision facts, accepted fence, and rows.
+    let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
+    let first_decision_sequence = committed_sequence
+        .checked_sub(decision_count)
+        .ok_or(StoreError::Corruption)?;
+
+    if operation.state != "accepted"
+        || operation.result.is_some()
+        || operation.outcome_code.is_some()
+        || operation.outcome_at_ms.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+
+    let decision_facts = validate_decision_event_batch(
+        tx,
+        event_ids,
+        scope,
+        receipt_final_revision,
+        first_decision_sequence,
+        is_side_effect_decision_fact,
+    )?;
+
+    let expected_effects = effects_from_durable_decision_facts(scope, &decision_facts, operation)?;
+    if expected_effects.len() != outbox_rows.len() {
+        return Err(StoreError::Corruption);
+    }
+
+    let fence = OperationFence {
+        action_epoch: match operation.action_epoch {
+            Some(v) => Some(u64_from_nonnegative_i64("operations.action_epoch", v)?),
+            None => None,
+        },
+        resource_id: match &operation.resource_id {
+            Some(bytes) => Some(id16::<ResourceId>("operations.resource_id", bytes)?),
+            None => None,
+        },
+        runtime_generation: match operation.runtime_generation {
+            Some(v) => Some(u64_from_nonnegative_i64(
+                "operations.runtime_generation",
+                v,
+            )?),
+            None => None,
+        },
+    };
+    for planned in &expected_effects {
+        if planned.fence != fence {
+            return Err(StoreError::Corruption);
+        }
+    }
+
+    let accepted_row = load_event_row_at_sequence(tx, committed_sequence)?;
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        scope,
+        operation.accepted_at_ms,
+        fence,
+    )?;
+
+    // Contiguous zero-based indexes; no gaps/extras.
+    for (expected_index, (row, planned)) in
+        outbox_rows.iter().zip(expected_effects.iter()).enumerate()
+    {
+        let expected_index = i64::try_from(expected_index).map_err(|_| StoreError::Corruption)?;
+        if row.effect_index != expected_index {
+            return Err(StoreError::Corruption);
+        }
+        if row.operation_id != expected_operation_id {
+            return Err(StoreError::Corruption);
+        }
+        if row.event_sequence != committed_sequence {
+            return Err(StoreError::Corruption);
+        }
+        if row.state != "pending"
+            || row.attempts != 0
+            || row.leased_until_ms.is_some()
+            || row.dispatch_started_at_ms.is_some()
+            || row.last_error_class.is_some()
+            || row.available_at_ms != operation.accepted_at_ms
+        {
+            return Err(StoreError::Corruption);
+        }
+        let decoded =
+            decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+        if decoded != planned.document {
+            return Err(StoreError::Corruption);
+        }
+        match &decoded.effect {
+            Effect::BeginTaskTeardown {
+                task_id,
+                action_epoch,
+            } => {
+                if *task_id != scope || Some(*action_epoch) != fence.action_epoch {
+                    return Err(StoreError::Corruption);
+                }
+            }
+            Effect::ReleaseResource {
+                task_id,
+                action_epoch,
+                resource_fence,
+            } => {
+                if *task_id != scope
+                    || Some(*action_epoch) != fence.action_epoch
+                    || Some(resource_fence.resource_id) != fence.resource_id
+                    || Some(resource_fence.runtime_generation) != fence.runtime_generation
+                {
+                    return Err(StoreError::Corruption);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn effects_from_durable_decision_facts(
+    scope: TaskId,
+    decision_facts: &[(Event, u64)],
+    operation: &OperationProjectionRow,
+) -> Result<Vec<PlannedEffect>, StoreError> {
+    let action_epoch = match operation.action_epoch {
+        Some(v) => Some(u64_from_nonnegative_i64("operations.action_epoch", v)?),
+        None => None,
+    };
+    let mut planned = Vec::new();
+    for (fact, _) in decision_facts {
+        match fact {
+            Event::TaskCloseBegun {
+                action_epoch: epoch,
+            } => {
+                if Some(*epoch) != action_epoch || action_epoch.is_none() {
+                    return Err(StoreError::Corruption);
+                }
+                planned.push(PlannedEffect {
+                    document: crate::kernel::outbox::PlannedEffectDocument::new(
+                        Effect::BeginTaskTeardown {
+                            task_id: scope,
+                            action_epoch: *epoch,
+                        },
+                        crate::kernel::outbox::ReplayPolicy::RetrySafe,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*epoch),
+                        resource_id: None,
+                        runtime_generation: None,
+                    },
+                });
+            }
+            Event::ResourceReleaseBegun {
+                resource_id,
+                runtime_generation,
+            } => {
+                let Some(epoch) = action_epoch else {
+                    return Err(StoreError::Corruption);
+                };
+                planned.push(PlannedEffect {
+                    document: crate::kernel::outbox::PlannedEffectDocument::new(
+                        Effect::ReleaseResource {
+                            task_id: scope,
+                            action_epoch: epoch,
+                            resource_fence: ResourceFence::new(*resource_id, *runtime_generation),
+                        },
+                        crate::kernel::outbox::ReplayPolicy::ReconcileBeforeRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(epoch),
+                        resource_id: Some(*resource_id),
+                        runtime_generation: Some(*runtime_generation),
+                    },
+                });
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+    Ok(planned)
+}
+
+fn validate_accepted_fact_row(
+    accepted_row: &EventRow,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    scope: TaskId,
+    accepted_at_ms: i64,
+    fence: OperationFence,
+) -> Result<(), StoreError> {
+    if accepted_row.task_id != Some(scope) || accepted_row.task_revision.is_some() {
+        return Err(StoreError::Corruption);
+    }
+    let accepted_event = crate::kernel::store::decode_stored_event(
+        &accepted_row.event_type,
+        accepted_row.schema_version,
+        &accepted_row.payload,
+    )?;
+    let Event::OperationAccepted(accepted_fact) = accepted_event else {
+        return Err(StoreError::Corruption);
+    };
+    let expected_resource = fence.resource_id;
+    let expected_generation = fence.runtime_generation;
+    if accepted_fact.command_id != command_id
+        || accepted_fact.operation_id != expected_operation_id
+        || accepted_fact.action_epoch != fence.action_epoch
+        || accepted_fact.resource_id != expected_resource
+        || accepted_fact.runtime_generation != expected_generation
+        || accepted_fact.accepted_at_ms != accepted_at_ms
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
+}
+
+fn validate_decision_event_batch(
+    tx: &Transaction<'_>,
+    event_ids: &[EventId],
+    scope: TaskId,
+    receipt_final_revision: u64,
+    first_decision_sequence: u64,
+    is_allowed: fn(&Event) -> bool,
+) -> Result<Vec<(Event, u64)>, StoreError> {
     let mut decision_facts = Vec::with_capacity(event_ids.len());
     let mut previous_revision: Option<u64> = None;
     for (offset, expected_event_id) in event_ids.iter().enumerate() {
@@ -221,7 +565,7 @@ fn validate_accepted_receipt_correlation(
             row.schema_version,
             &row.payload,
         )?;
-        if !is_pure_slice_decision_fact(&decoded) {
+        if !is_allowed(&decoded) {
             return Err(StoreError::Corruption);
         }
         validate_decision_fact_ownership(tx, &decoded, scope)?;
@@ -291,56 +635,7 @@ fn validate_accepted_receipt_correlation(
     if projection_revision < receipt_final_revision {
         return Err(StoreError::Corruption);
     }
-
-    let accepted_row = load_event_row_at_sequence(tx, accepted_sequence)?;
-    if accepted_row.task_id != Some(scope) || accepted_row.task_revision.is_some() {
-        return Err(StoreError::Corruption);
-    }
-    let accepted_event = crate::kernel::store::decode_stored_event(
-        &accepted_row.event_type,
-        accepted_row.schema_version,
-        &accepted_row.payload,
-    )?;
-    let Event::OperationAccepted(accepted_fact) = accepted_event else {
-        return Err(StoreError::Corruption);
-    };
-    if accepted_fact.command_id != command_id
-        || accepted_fact.operation_id != expected_operation_id
-        || accepted_fact.action_epoch.is_some()
-        || accepted_fact.resource_id.is_some()
-        || accepted_fact.runtime_generation.is_some()
-        || accepted_fact.accepted_at_ms != operation.accepted_at_ms
-    {
-        return Err(StoreError::Corruption);
-    }
-
-    let settled_row = load_event_row_at_sequence(tx, committed_sequence)?;
-    if settled_row.task_id != Some(scope) || settled_row.task_revision.is_some() {
-        return Err(StoreError::Corruption);
-    }
-    let settled_event = crate::kernel::store::decode_stored_event(
-        &settled_row.event_type,
-        settled_row.schema_version,
-        &settled_row.payload,
-    )?;
-    let Event::OperationSettled(settled_fact) = settled_event else {
-        return Err(StoreError::Corruption);
-    };
-    let Some(outcome_at_ms) = operation.outcome_at_ms else {
-        return Err(StoreError::Corruption);
-    };
-    if settled_fact.command_id != command_id
-        || settled_fact.operation_id != expected_operation_id
-        || settled_fact.result_event_ids.as_slice() != event_ids
-        || settled_fact.action_epoch.is_some()
-        || settled_fact.resource_id.is_some()
-        || settled_fact.runtime_generation.is_some()
-        || settled_fact.source != crate::domain::operation::OutcomeSource::Dispatch
-        || settled_fact.settled_at_ms != outcome_at_ms
-    {
-        return Err(StoreError::Corruption);
-    }
-    Ok(())
+    Ok(decision_facts)
 }
 
 fn validate_decision_fact_ownership(
@@ -508,7 +803,7 @@ struct OperationProjectionRow {
     outcome_at_ms: Option<i64>,
 }
 
-fn load_pure_operation_projection(
+fn load_operation_projection(
     tx: &Transaction<'_>,
     command_id: CommandId,
 ) -> Result<OperationProjectionRow, StoreError> {
@@ -583,6 +878,98 @@ struct EventRow {
     payload: Vec<u8>,
 }
 
+struct OutboxRow {
+    #[allow(dead_code)] // validated on read; retained for later dispatch slices
+    outbox_id: OutboxId,
+    operation_id: OperationId,
+    effect_index: i64,
+    event_sequence: u64,
+    destination_class: String,
+    replay_policy: String,
+    payload: Vec<u8>,
+    state: String,
+    available_at_ms: i64,
+    leased_until_ms: Option<i64>,
+    dispatch_started_at_ms: Option<i64>,
+    attempts: i64,
+    last_error_class: Option<String>,
+}
+
+fn load_outbox_rows(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+) -> Result<Vec<OutboxRow>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                replay_policy, payload, state, available_at_ms, leased_until_ms,
+                dispatch_started_at_ms, attempts, last_error_class
+         FROM outbox
+         WHERE operation_id = ?1
+         ORDER BY effect_index ASC",
+    )?;
+    let rows = stmt.query_map([operation_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, Option<String>>(12)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    let mut expected_index = 0i64;
+    for row in rows {
+        let (
+            outbox_id_bytes,
+            operation_id_bytes,
+            effect_index,
+            event_sequence,
+            destination_class,
+            replay_policy,
+            payload,
+            state,
+            available_at_ms,
+            leased_until_ms,
+            dispatch_started_at_ms,
+            attempts,
+            last_error_class,
+        ) = row?;
+        if effect_index != expected_index {
+            return Err(StoreError::Corruption);
+        }
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+        if event_sequence < 0 {
+            return Err(StoreError::Corruption);
+        }
+        out.push(OutboxRow {
+            outbox_id: id16::<OutboxId>("outbox.outbox_id", &outbox_id_bytes)?,
+            operation_id: id16::<OperationId>("outbox.operation_id", &operation_id_bytes)?,
+            effect_index,
+            event_sequence: u64_from_nonnegative_i64("outbox.event_sequence", event_sequence)?,
+            destination_class,
+            replay_policy,
+            payload,
+            state,
+            available_at_ms,
+            leased_until_ms,
+            dispatch_started_at_ms,
+            attempts,
+            last_error_class,
+        });
+    }
+    Ok(out)
+}
+
 fn load_event_row_at_sequence(tx: &Transaction<'_>, sequence: u64) -> Result<EventRow, StoreError> {
     let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, String, i64, Vec<u8>)> = tx
         .query_row(
@@ -633,6 +1020,13 @@ fn is_pure_slice_decision_fact(event: &Event) -> bool {
     )
 }
 
+fn is_side_effect_decision_fact(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::TaskCloseBegun { .. } | Event::ResourceReleaseBegun { .. }
+    )
+}
+
 fn validate_rejected_receipt_correlation(
     tx: &Transaction<'_>,
     command_id: CommandId,
@@ -669,7 +1063,7 @@ fn effective_task_scope(envelope: &CommandEnvelope) -> Option<TaskId> {
     }
 }
 
-fn command_is_effectful_in_this_slice(command: &Command) -> bool {
+fn command_is_effectful(command: &Command) -> bool {
     matches!(
         command,
         Command::BeginCloseTask | Command::ReleaseResource { .. }
@@ -800,6 +1194,125 @@ fn persist_pure_acceptance(
         accepted_at_ms,
         Event::OperationSettled(settled),
     )?;
+
+    set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
+    Ok(receipt)
+}
+
+fn persist_side_effect_acceptance(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    task_id: TaskId,
+    snapshot: Option<&TaskSnapshot>,
+    decision: Vec<Event>,
+    planned: Vec<PlannedEffect>,
+    accepted_at_ms: i64,
+) -> Result<CommandReceipt, StoreError> {
+    if planned.is_empty() {
+        return Err(StoreError::Projection(
+            "side-effect acceptance requires a non-empty plan".into(),
+        ));
+    }
+    let fence = planned[0].fence;
+    for effect in &planned[1..] {
+        if effect.fence != fence {
+            return Err(StoreError::Projection(
+                "planned effects disagree on accepted operation fence".into(),
+            ));
+        }
+    }
+
+    let operation_id = OperationId::new();
+    let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
+    let accepted_event_id = EventId::new();
+    let outbox_ids: Vec<OutboxId> = (0..planned.len()).map(|_| OutboxId::new()).collect();
+
+    let mut next_revision = snapshot.map(|snap| snap.task.revision);
+    let mut decision_revisions = Vec::with_capacity(decision.len());
+    for payload in &decision {
+        if payload.is_task_mutation() {
+            let revision = match next_revision {
+                None => 1u64,
+                Some(current) => current
+                    .checked_add(1)
+                    .ok_or(StoreError::IntegerOutOfRange {
+                        field: "tasks.revision",
+                        value: u64::MAX,
+                    })?,
+            };
+            next_revision = Some(revision);
+            decision_revisions.push(Some(revision));
+        } else {
+            decision_revisions.push(next_revision);
+        }
+    }
+    let final_task_revision = next_revision;
+
+    let receipt = CommandReceipt::Accepted {
+        command_id: envelope.command_id,
+        operation_id,
+        task_revision: final_task_revision,
+        event_ids: decision_event_ids.clone(),
+    };
+    insert_receipt_row(tx, envelope, Some(task_id), &receipt, None, accepted_at_ms)?;
+
+    for ((payload, event_id), task_revision) in decision
+        .into_iter()
+        .zip(decision_event_ids.iter().copied())
+        .zip(decision_revisions)
+    {
+        append_and_project(
+            tx,
+            event_id,
+            Some(task_id),
+            task_revision,
+            accepted_at_ms,
+            payload,
+        )?;
+    }
+
+    let accepted = OperationAcceptedFact::new(
+        envelope.command_id,
+        operation_id,
+        accepted_at_ms,
+        fence.action_epoch,
+        fence.resource_id,
+        fence.runtime_generation,
+    )
+    .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let committed_sequence = append_and_project(
+        tx,
+        accepted_event_id,
+        Some(task_id),
+        None,
+        accepted_at_ms,
+        Event::OperationAccepted(accepted),
+    )?;
+
+    for (index, (planned_effect, outbox_id)) in planned.into_iter().zip(outbox_ids).enumerate() {
+        let effect_index = i64::try_from(index).map_err(|_| StoreError::IntegerOutOfRange {
+            field: "outbox.effect_index",
+            value: u64::MAX,
+        })?;
+        let payload = encode_effect_document(&planned_effect.document)?;
+        tx.execute(
+            "INSERT INTO outbox(
+                outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                replay_policy, payload, state, available_at_ms, leased_until_ms,
+                dispatch_started_at_ms, attempts, last_error_class
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, NULL, 0, NULL)",
+            rusqlite::params![
+                outbox_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                effect_index,
+                u64_to_sqlite_i64("outbox.event_sequence", committed_sequence)?,
+                planned_effect.document.destination_class.as_str(),
+                planned_effect.document.replay_policy.as_str(),
+                payload,
+                accepted_at_ms,
+            ],
+        )?;
+    }
 
     set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
     Ok(receipt)
@@ -1261,6 +1774,7 @@ impl_try_from_bytes16!(
     ResourceId,
     OperationId,
     EventId,
+    OutboxId,
 );
 
 fn parse_lifecycle(value: &str) -> Result<TaskLifecycle, StoreError> {

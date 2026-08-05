@@ -6,8 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::command::{CommandReceipt, RejectionCode};
-use crate::domain::id::{CommandId, EventId, OperationId, TaskId};
+use crate::domain::event::Event;
+use crate::domain::id::{CommandId, EventId, OperationId, ResourceId, TaskId};
 use crate::domain::operation::ResourceFence;
+use crate::domain::resource::{OwnerKind, ResourceLifecycle};
+use crate::domain::snapshot::TaskSnapshot;
 use crate::kernel::store::StoreError;
 
 pub(crate) const RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -16,14 +19,12 @@ pub(crate) const EFFECT_SCHEMA_VERSION: u32 = 1;
 /// Stable destination class stored in `outbox.destination_class`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // reserved for Task 1.4b+ outbox insert/claim
 pub(crate) enum DestinationClass {
     TaskTeardown,
     ResourceRelease,
 }
 
 impl DestinationClass {
-    #[allow(dead_code)] // reserved for Task 1.4b+ outbox insert/claim
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::TaskTeardown => "task_teardown",
@@ -44,7 +45,6 @@ impl DestinationClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // reserved for Task 1.4b+ outbox insert/claim
 pub(crate) enum ReplayPolicy {
     RetrySafe,
     ReconcileBeforeRetry,
@@ -52,7 +52,6 @@ pub(crate) enum ReplayPolicy {
 }
 
 impl ReplayPolicy {
-    #[allow(dead_code)] // reserved for Task 1.4b+ outbox insert/claim
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::RetrySafe => "retry_safe",
@@ -75,7 +74,6 @@ impl ReplayPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-#[allow(dead_code)] // reserved for Task 1.4b+ effect planning
 pub(crate) enum Effect {
     BeginTaskTeardown {
         task_id: TaskId,
@@ -88,6 +86,192 @@ pub(crate) enum Effect {
     },
 }
 
+/// Accepted-operation fence shared by every planned effect for one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperationFence {
+    pub action_epoch: Option<u64>,
+    pub resource_id: Option<ResourceId>,
+    pub runtime_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedEffect {
+    pub document: PlannedEffectDocument,
+    pub fence: OperationFence,
+}
+
+/// Deterministic external retry identity. Stable across retries; not the row PK.
+#[cfg_attr(not(test), allow(dead_code))] // exercised by dispatch/outcome slices next
+pub(crate) fn external_idempotency_key(operation_id: OperationId, effect_index: u32) -> String {
+    format!("{operation_id}:{effect_index}")
+}
+
+/// Pure planner: maps accepted decision facts + pre-command snapshot to effects.
+/// No clock, RNG, SQLite, filesystem, process, or provider calls.
+pub(crate) fn plan_effects(
+    snapshot: Option<&TaskSnapshot>,
+    task_id: TaskId,
+    decision: &[Event],
+) -> Result<Vec<PlannedEffect>, StoreError> {
+    let mut planned = Vec::new();
+    let mut effect_fact_count = 0usize;
+    let mut pure_fact_count = 0usize;
+
+    for event in decision {
+        match event {
+            Event::TaskCloseBegun { action_epoch } => {
+                effect_fact_count = effect_fact_count
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?;
+                let Some(snap) = snapshot else {
+                    return Err(StoreError::Projection(
+                        "task teardown planning requires a pre-command snapshot".into(),
+                    ));
+                };
+                if snap.task.id != task_id {
+                    return Err(StoreError::Projection(
+                        "task teardown planning task scope mismatch".into(),
+                    ));
+                }
+                if snap.task.lifecycle != crate::domain::task::TaskLifecycle::Open {
+                    return Err(StoreError::Projection(
+                        "task teardown planning requires Open lifecycle".into(),
+                    ));
+                }
+                let expected_epoch =
+                    snap.task
+                        .action_epoch
+                        .checked_add(1)
+                        .ok_or(StoreError::Projection(
+                            "task teardown planning action_epoch overflow".into(),
+                        ))?;
+                if *action_epoch != expected_epoch {
+                    return Err(StoreError::Projection(
+                        "task teardown planning action_epoch must be snapshot.action_epoch + 1"
+                            .into(),
+                    ));
+                }
+                planned.push(PlannedEffect {
+                    document: PlannedEffectDocument::new(
+                        Effect::BeginTaskTeardown {
+                            task_id,
+                            action_epoch: *action_epoch,
+                        },
+                        ReplayPolicy::RetrySafe,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(*action_epoch),
+                        resource_id: None,
+                        runtime_generation: None,
+                    },
+                });
+            }
+            Event::ResourceReleaseBegun {
+                resource_id,
+                runtime_generation,
+            } => {
+                effect_fact_count = effect_fact_count
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?;
+                let Some(snap) = snapshot else {
+                    return Err(StoreError::Projection(
+                        "resource release planning requires a pre-command snapshot".into(),
+                    ));
+                };
+                if snap.task.id != task_id {
+                    return Err(StoreError::Projection(
+                        "resource release planning task scope mismatch".into(),
+                    ));
+                }
+                let Some(resource) = snap.resources.get(resource_id) else {
+                    return Err(StoreError::Projection(
+                        "resource release planning missing pre-command resource".into(),
+                    ));
+                };
+                if resource.owner_kind != OwnerKind::Task
+                    || resource.task_id != Some(task_id)
+                    || resource.lifecycle != ResourceLifecycle::Active
+                    || resource.runtime_generation != *runtime_generation
+                {
+                    return Err(StoreError::Projection(
+                        "resource release planning requires task-owned Active resource with exact generation"
+                            .into(),
+                    ));
+                }
+                planned.push(PlannedEffect {
+                    document: PlannedEffectDocument::new(
+                        Effect::ReleaseResource {
+                            task_id,
+                            action_epoch: snap.task.action_epoch,
+                            resource_fence: ResourceFence::new(*resource_id, *runtime_generation),
+                        },
+                        ReplayPolicy::ReconcileBeforeRetry,
+                    ),
+                    fence: OperationFence {
+                        action_epoch: Some(snap.task.action_epoch),
+                        resource_id: Some(*resource_id),
+                        runtime_generation: Some(*runtime_generation),
+                    },
+                });
+            }
+            Event::TaskCreated { .. }
+            | Event::TaskRenamed { .. }
+            | Event::TaskAttentionSet { .. }
+            | Event::TaskReopened
+            | Event::TaskArchived
+            | Event::AgentSessionRegistered { .. }
+            | Event::PrimaryAgentSet { .. }
+            | Event::ArtifactRegistered { .. }
+            | Event::ResourceRegistered { .. }
+            | Event::ResourceReleased { .. } => {
+                pure_fact_count = pure_fact_count
+                    .checked_add(1)
+                    .ok_or(StoreError::Corruption)?;
+            }
+            Event::OperationAccepted(_)
+            | Event::OperationSettled(_)
+            | Event::OperationFailed(_)
+            | Event::OperationCancelled(_)
+            | Event::OperationUncertain(_) => {
+                return Err(StoreError::Projection(
+                    "operation outcome facts are not decision inputs for effect planning".into(),
+                ));
+            }
+        }
+    }
+
+    if effect_fact_count > 0 && pure_fact_count > 0 {
+        return Err(StoreError::Projection(
+            "mixed pure and side-effect decision facts cannot be planned together".into(),
+        ));
+    }
+    if effect_fact_count > 1 {
+        return Err(StoreError::Projection(
+            "current side-effect commands plan exactly one decision fact".into(),
+        ));
+    }
+    if effect_fact_count != planned.len() {
+        return Err(StoreError::Projection(
+            "planner dropped a required side-effect decision fact".into(),
+        ));
+    }
+    if planned.len() > 1 {
+        return Err(StoreError::Projection(
+            "current side-effect commands emit exactly one planned effect".into(),
+        ));
+    }
+    if let Some(first) = planned.first() {
+        for effect in &planned[1..] {
+            if effect.fence != first.fence {
+                return Err(StoreError::Projection(
+                    "planned effects disagree on accepted operation fence".into(),
+                ));
+            }
+        }
+    }
+    Ok(planned)
+}
+
 impl Effect {
     pub(crate) fn destination_class(&self) -> DestinationClass {
         match self {
@@ -98,7 +282,6 @@ impl Effect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // reserved for Task 1.4b+ outbox insert
 pub(crate) struct PlannedEffectDocument {
     pub schema_version: u32,
     pub destination_class: DestinationClass,
@@ -107,7 +290,6 @@ pub(crate) struct PlannedEffectDocument {
 }
 
 impl PlannedEffectDocument {
-    #[allow(dead_code)] // reserved for Task 1.4b+ outbox insert
     pub(crate) fn new(effect: Effect, replay_policy: ReplayPolicy) -> Self {
         let destination_class = effect.destination_class();
         Self {
@@ -128,7 +310,6 @@ struct PlannedEffectWire {
     effect: Effect,
 }
 
-#[allow(dead_code)] // reserved for Task 1.4c+ outbox insert
 pub(crate) fn encode_effect_document(doc: &PlannedEffectDocument) -> Result<Vec<u8>, StoreError> {
     if doc.schema_version != EFFECT_SCHEMA_VERSION {
         return Err(StoreError::CodecMismatch {
@@ -154,7 +335,6 @@ pub(crate) fn encode_effect_document(doc: &PlannedEffectDocument) -> Result<Vec<
     })
 }
 
-#[allow(dead_code)] // reserved for Task 1.4b+ outbox claim/decode
 pub(crate) fn decode_effect_document(
     payload: &[u8],
     destination_class_column: &str,
@@ -467,6 +647,190 @@ mod tests {
             )
             .is_err(),
             "unknown fields inside effect payload must fail"
+        );
+    }
+
+    #[test]
+    fn command_side_effect_planner_close_and_release_shapes() {
+        use std::collections::BTreeMap;
+
+        use crate::domain::id::{EnvironmentId, ProjectId};
+        use crate::domain::resource::{
+            OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+        };
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskLifecycle, WorkspaceRef,
+        };
+
+        let task_id = TaskId::from_bytes(fixed_uuid_v7(0x21)).unwrap();
+        let resource_id = ResourceId::from_bytes(fixed_uuid_v7(0x22)).unwrap();
+
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            resource_id,
+            ResourceFacts {
+                id: resource_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 9,
+                updated_at_ms: 1,
+            },
+        );
+        let snap = TaskSnapshot {
+            task: TaskFacts {
+                id: task_id,
+                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x23)).unwrap(),
+                title: "t".into(),
+                description: None,
+                project_id: ProjectId::from_bytes(fixed_uuid_v7(0x24)).unwrap(),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle: TaskLifecycle::Open,
+                action_epoch: 3,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            agents: BTreeMap::new(),
+            primary_agent_id: None,
+            artifacts: BTreeMap::new(),
+            resources,
+        };
+
+        let close = plan_effects(
+            Some(&snap),
+            task_id,
+            &[Event::TaskCloseBegun { action_epoch: 4 }],
+        )
+        .expect("close plan");
+        assert_eq!(close.len(), 1);
+        assert_eq!(
+            close[0].document.effect,
+            Effect::BeginTaskTeardown {
+                task_id,
+                action_epoch: 4
+            }
+        );
+        assert_eq!(close[0].document.replay_policy, ReplayPolicy::RetrySafe);
+        assert_eq!(
+            close[0].fence,
+            OperationFence {
+                action_epoch: Some(4),
+                resource_id: None,
+                runtime_generation: None,
+            }
+        );
+
+        // Missing snapshot / wrong lifecycle / wrong epoch / duplicate teardown must fail.
+        assert!(
+            plan_effects(None, task_id, &[Event::TaskCloseBegun { action_epoch: 4 }]).is_err(),
+            "TaskCloseBegun requires pre-command snapshot"
+        );
+        let mut closing = snap.clone();
+        closing.task.lifecycle = TaskLifecycle::Closing;
+        assert!(
+            plan_effects(
+                Some(&closing),
+                task_id,
+                &[Event::TaskCloseBegun { action_epoch: 4 }],
+            )
+            .is_err(),
+            "TaskCloseBegun requires Open lifecycle"
+        );
+        assert!(
+            plan_effects(
+                Some(&snap),
+                task_id,
+                &[Event::TaskCloseBegun { action_epoch: 5 }],
+            )
+            .is_err(),
+            "action_epoch must be snapshot.action_epoch + 1"
+        );
+        assert!(
+            plan_effects(
+                Some(&snap),
+                task_id,
+                &[
+                    Event::TaskCloseBegun { action_epoch: 4 },
+                    Event::TaskCloseBegun { action_epoch: 4 },
+                ],
+            )
+            .is_err(),
+            "duplicate teardown facts must fail"
+        );
+
+        let release = plan_effects(
+            Some(&snap),
+            task_id,
+            &[Event::ResourceReleaseBegun {
+                resource_id,
+                runtime_generation: 9,
+            }],
+        )
+        .expect("release plan");
+        assert_eq!(release.len(), 1);
+        assert_eq!(
+            release[0].document.effect,
+            Effect::ReleaseResource {
+                task_id,
+                action_epoch: 3,
+                resource_fence: ResourceFence::new(resource_id, 9),
+            }
+        );
+        assert_eq!(
+            release[0].document.replay_policy,
+            ReplayPolicy::ReconcileBeforeRetry
+        );
+
+        let pure = plan_effects(
+            Some(&snap),
+            task_id,
+            &[Event::TaskRenamed { title: "x".into() }],
+        )
+        .expect("pure plans nothing");
+        assert!(pure.is_empty());
+
+        assert!(plan_effects(
+            Some(&snap),
+            task_id,
+            &[
+                Event::TaskCloseBegun { action_epoch: 4 },
+                Event::TaskRenamed {
+                    title: "mixed".into()
+                },
+            ],
+        )
+        .is_err());
+
+        assert!(
+            plan_effects(
+                Some(&snap),
+                task_id,
+                &[
+                    Event::TaskCloseBegun { action_epoch: 4 },
+                    Event::ResourceReleaseBegun {
+                        resource_id,
+                        runtime_generation: 9,
+                    },
+                ],
+            )
+            .is_err(),
+            "multiple side-effect decision facts must fail for current commands"
+        );
+
+        assert_eq!(
+            external_idempotency_key(OperationId::from_bytes(fixed_uuid_v7(0x30)).unwrap(), 0),
+            format!(
+                "{}:0",
+                OperationId::from_bytes(fixed_uuid_v7(0x30)).unwrap()
+            )
         );
     }
 }

@@ -175,3 +175,4 @@ define_id!(OperationId);
 define_id!(TransferId);
 define_id!(SubscriptionId);
 define_id!(EventId);
+define_id!(OutboxId);

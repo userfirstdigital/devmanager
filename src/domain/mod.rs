@@ -25,8 +25,8 @@ pub use event::{
 };
 pub use id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
-    IdError, OperationId, ProjectId, RequestId, ResourceId, ServiceId, SubscriptionId, TaskId,
-    TerminalId, TransferId,
+    IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SubscriptionId,
+    TaskId, TerminalId, TransferId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,

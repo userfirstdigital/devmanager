@@ -2321,7 +2321,7 @@ fn command_pure_create_derives_scope_from_intent_id() {
 }
 
 #[test]
-fn command_pure_effectful_command_unsupported() {
+fn command_pure_effectful_empty_decision_stays_unsupported() {
     let dir = TempDir::new().expect("tempdir");
     let path = temp_db_path(&dir);
     let mut store = KernelStore::open(&path).expect("open");
@@ -2335,7 +2335,17 @@ fn command_pure_effectful_command_unsupported() {
             Command::CreateTask(create_task_intent(task)),
         ))
         .expect("create");
+    drop(store);
 
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'closing', action_epoch = 1 WHERE task_id = ?1",
+        [task.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
     let close_cmd = command_id(0xD0);
     let receipt = store
         .execute(command_envelope(
@@ -2344,7 +2354,7 @@ fn command_pure_effectful_command_unsupported() {
             Some(1),
             Command::BeginCloseTask,
         ))
-        .expect("begin close");
+        .expect("already closing empty decision");
     assert_eq!(
         receipt,
         CommandReceipt::Rejected {
@@ -2356,25 +2366,7 @@ fn command_pure_effectful_command_unsupported() {
     drop(store);
 
     let conn = open_raw(&path);
-    assert_eq!(
-        event_types(&conn),
-        vec![
-            "task.created".to_string(),
-            "operation.accepted".to_string(),
-            "operation.settled".to_string(),
-        ]
-    );
-    assert_eq!(count_table(&conn, "operations"), 1);
     assert_eq!(count_table(&conn, "outbox"), 0);
-    let lifecycle: String = conn
-        .query_row(
-            "SELECT lifecycle FROM tasks WHERE task_id = ?1",
-            [task.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(lifecycle, "open");
-
     let committed: Option<i64> = conn
         .query_row(
             "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
@@ -3900,4 +3892,868 @@ fn command_pure_corrupt_noncanonical_resource_recipe_rolls_back() {
         )
         .unwrap();
     });
+}
+
+fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generation: u64) {
+    let conn = open_raw(path);
+    conn.execute(
+        "INSERT INTO resources(
+            resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+            runtime_generation, updated_at_ms
+         ) VALUES (?1, ?2, 'task', 'terminal', ?3, 'active', ?4, 1)",
+        rusqlite::params![
+            resource.as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            generation as i64,
+        ],
+    )
+    .expect("seed active resource");
+}
+
+fn external_idempotency_key(operation_id: OperationId, effect_index: u32) -> String {
+    format!("{operation_id}:{effect_index}")
+}
+
+fn load_outbox_row(
+    conn: &Connection,
+    operation_id: OperationId,
+) -> (
+    Vec<u8>,
+    i64,
+    i64,
+    String,
+    String,
+    Vec<u8>,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+) {
+    conn.query_row(
+        "SELECT outbox_id, effect_index, event_sequence, destination_class, replay_policy,
+                payload, state, available_at_ms, leased_until_ms, dispatch_started_at_ms,
+                attempts, last_error_class
+         FROM outbox WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+            ))
+        },
+    )
+    .expect("outbox row")
+}
+
+#[test]
+fn command_side_effect_begin_close_accepts_pending_outbox_without_settlement() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x01);
+    create_open_task(&mut store, task, command_id(0x02));
+
+    let close_cmd = command_id(0x03);
+    let receipt = store
+        .execute(command_envelope(
+            close_cmd,
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect("begin close");
+    let CommandReceipt::Accepted {
+        command_id,
+        operation_id,
+        task_revision,
+        event_ids,
+    } = receipt.clone()
+    else {
+        panic!("expected accepted begin close, got {receipt:?}");
+    };
+    assert_eq!(command_id, close_cmd);
+    assert_eq!(task_revision, Some(2));
+    assert_eq!(event_ids.len(), 1);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let types = event_types(&conn);
+    assert_eq!(
+        &types[3..],
+        &[
+            "task.close_begun".to_string(),
+            "operation.accepted".to_string(),
+        ]
+    );
+    assert!(
+        !types[3..].iter().any(|t| t == "operation.settled"),
+        "side-effect acceptance must not append operation.settled"
+    );
+
+    let (lifecycle, action_epoch, revision): (String, i64, i64) = conn
+        .query_row(
+            "SELECT lifecycle, action_epoch, revision FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(lifecycle, "closing");
+    assert_eq!(action_epoch, 1);
+    assert_eq!(revision, 2);
+
+    let (op_state, op_epoch, op_resource, op_gen, outcome_at): (
+        String,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<i64>,
+    ) = conn
+        .query_row(
+            "SELECT state, action_epoch, resource_id, runtime_generation, outcome_at_ms
+             FROM operations WHERE command_id = ?1",
+            [close_cmd.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(op_state, "accepted");
+    assert_eq!(op_epoch, Some(1));
+    assert!(op_resource.is_none());
+    assert!(op_gen.is_none());
+    assert!(outcome_at.is_none());
+
+    let accepted_payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM events WHERE event_type = 'operation.accepted'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let accepted: OperationAcceptedFact = rmp_serde::from_slice(&accepted_payload).unwrap();
+    assert_eq!(accepted.operation_id, operation_id);
+    assert_eq!(accepted.action_epoch, Some(1));
+    assert_eq!(accepted.resource_id, None);
+    assert_eq!(accepted.runtime_generation, None);
+
+    let committed: i64 = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [close_cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let accepted_sequence: i64 = conn
+        .query_row(
+            "SELECT sequence FROM events WHERE event_type = 'operation.accepted'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, accepted_sequence);
+
+    let decision_event_id: Vec<u8> = conn
+        .query_row(
+            "SELECT event_id FROM events WHERE event_type = 'task.close_begun'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        event_ids[0].as_bytes().as_slice(),
+        decision_event_id.as_slice()
+    );
+
+    assert_eq!(count_table(&conn, "outbox"), 1);
+    let (
+        outbox_id,
+        effect_index,
+        event_sequence,
+        destination,
+        policy,
+        payload,
+        state,
+        available_at,
+        leased,
+        dispatch_started,
+        attempts,
+        last_error,
+    ) = load_outbox_row(&conn, operation_id);
+    assert_eq!(outbox_id.len(), 16);
+    assert_eq!(effect_index, 0);
+    assert_eq!(event_sequence, accepted_sequence);
+    assert_eq!(destination, "task_teardown");
+    assert_eq!(policy, "retry_safe");
+    assert_eq!(state, "pending");
+    assert!(available_at > 0);
+    assert!(leased.is_none());
+    assert!(dispatch_started.is_none());
+    assert_eq!(attempts, 0);
+    assert!(last_error.is_none());
+    assert!(!payload.is_empty());
+    assert_eq!(
+        external_idempotency_key(operation_id, 0),
+        format!("{operation_id}:0")
+    );
+}
+
+#[test]
+fn command_side_effect_release_resource_fences_task_epoch_and_generation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x04);
+    create_open_task(&mut store, task, command_id(0x05));
+    drop(store);
+
+    let resource = resource_id(0x06);
+    seed_active_resource(&path, task, resource, 7);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let release_cmd = command_id(0x07);
+    let receipt = store
+        .execute(command_envelope(
+            release_cmd,
+            Some(task),
+            Some(1),
+            Command::ReleaseResource {
+                resource_id: resource,
+            },
+        ))
+        .expect("release resource");
+    let CommandReceipt::Accepted {
+        operation_id,
+        task_revision,
+        event_ids,
+        ..
+    } = receipt
+    else {
+        panic!("expected accepted release, got {receipt:?}");
+    };
+    assert_eq!(task_revision, Some(2));
+    assert_eq!(event_ids.len(), 1);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let types = event_types(&conn);
+    assert_eq!(
+        &types[3..],
+        &[
+            "resource.release_begun".to_string(),
+            "operation.accepted".to_string(),
+        ]
+    );
+    assert!(
+        !types[3..].iter().any(|t| t == "operation.settled"),
+        "side-effect acceptance must not append operation.settled"
+    );
+
+    let (lifecycle, generation): (String, i64) = conn
+        .query_row(
+            "SELECT lifecycle, runtime_generation FROM resources WHERE resource_id = ?1",
+            [resource.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(lifecycle, "releasing");
+    assert_eq!(generation, 7);
+
+    let (op_state, op_epoch, op_resource, op_gen): (
+        String,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i64>,
+    ) = conn
+        .query_row(
+            "SELECT state, action_epoch, resource_id, runtime_generation
+             FROM operations WHERE command_id = ?1",
+            [release_cmd.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(op_state, "accepted");
+    assert_eq!(
+        op_epoch,
+        Some(0),
+        "fence uses pre-command task action_epoch"
+    );
+    assert_eq!(op_resource.as_deref(), Some(resource.as_bytes().as_slice()));
+    assert_eq!(op_gen, Some(7));
+
+    let accepted_payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM events WHERE event_type = 'operation.accepted'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let accepted: OperationAcceptedFact = rmp_serde::from_slice(&accepted_payload).unwrap();
+    assert_eq!(accepted.action_epoch, Some(0));
+    assert_eq!(accepted.resource_id, Some(resource));
+    assert_eq!(accepted.runtime_generation, Some(7));
+
+    let (
+        _outbox_id,
+        effect_index,
+        event_sequence,
+        destination,
+        policy,
+        _payload,
+        state,
+        _available_at,
+        leased,
+        dispatch_started,
+        attempts,
+        last_error,
+    ) = load_outbox_row(&conn, operation_id);
+    assert_eq!(effect_index, 0);
+    assert_eq!(destination, "resource_release");
+    assert_eq!(policy, "reconcile_before_retry");
+    assert_eq!(state, "pending");
+    assert!(leased.is_none());
+    assert!(dispatch_started.is_none());
+    assert_eq!(attempts, 0);
+    assert!(last_error.is_none());
+
+    let committed: i64 = conn
+        .query_row(
+            "SELECT committed_sequence FROM command_receipts WHERE command_id = ?1",
+            [release_cmd.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, event_sequence);
+}
+
+#[test]
+fn command_side_effect_retry_before_and_after_reopen_is_stable() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x08);
+    create_open_task(&mut store, task, command_id(0x09));
+
+    let close_cmd = command_id(0x0A);
+    let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
+    let first = store.execute(envelope.clone()).expect("first close");
+    let CommandReceipt::Accepted {
+        operation_id,
+        event_ids,
+        ..
+    } = first.clone()
+    else {
+        panic!("expected accepted, got {first:?}");
+    };
+    let retry_same = store
+        .execute(envelope.clone())
+        .expect("retry same connection");
+    assert_eq!(retry_same, first);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let original_receipt = receipt_blob(&conn, close_cmd);
+    let events_before = count_table(&conn, "events");
+    let outbox_before = count_table(&conn, "outbox");
+    let (
+        outbox_id,
+        effect_index,
+        event_sequence,
+        destination,
+        policy,
+        payload,
+        state,
+        available_at,
+        leased,
+        dispatch_started,
+        attempts,
+        last_error,
+    ) = load_outbox_row(&conn, operation_id);
+    let key = external_idempotency_key(operation_id, effect_index as u32);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let retry_reopen = store.execute(envelope).expect("retry after reopen");
+    assert_eq!(retry_reopen, first);
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(receipt_blob(&conn, close_cmd), original_receipt);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(count_table(&conn, "outbox"), outbox_before);
+    let (
+        outbox_id2,
+        effect_index2,
+        event_sequence2,
+        destination2,
+        policy2,
+        payload2,
+        state2,
+        available_at2,
+        leased2,
+        dispatch_started2,
+        attempts2,
+        last_error2,
+    ) = load_outbox_row(&conn, operation_id);
+    assert_eq!(outbox_id2, outbox_id);
+    assert_eq!(effect_index2, effect_index);
+    assert_eq!(event_sequence2, event_sequence);
+    assert_eq!(destination2, destination);
+    assert_eq!(policy2, policy);
+    assert_eq!(payload2, payload);
+    assert_eq!(state2, state);
+    assert_eq!(available_at2, available_at);
+    assert_eq!(leased2, leased);
+    assert_eq!(dispatch_started2, dispatch_started);
+    assert_eq!(attempts2, attempts);
+    assert_eq!(last_error2, last_error);
+    assert_eq!(
+        external_idempotency_key(operation_id, effect_index2 as u32),
+        key
+    );
+    assert_eq!(event_ids.len(), 1);
+}
+
+#[test]
+fn command_side_effect_pure_command_never_gets_outbox_row() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x0B);
+    create_open_task(&mut store, task, command_id(0x0C));
+    store
+        .execute(command_envelope(
+            command_id(0x0D),
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Pure rename".into(),
+            }),
+        ))
+        .expect("rename");
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "outbox"), 0);
+    assert!(event_types(&conn).iter().any(|t| t == "operation.settled"));
+}
+
+#[test]
+fn command_side_effect_corrupt_outbox_axes_fail_closed() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x0E);
+    create_open_task(&mut store, task, command_id(0x0F));
+    let close_cmd = command_id(0x10);
+    let envelope = command_envelope(close_cmd, Some(task), Some(1), Command::BeginCloseTask);
+    let first = store.execute(envelope.clone()).expect("close");
+    let CommandReceipt::Accepted { .. } = first else {
+        panic!("expected accepted");
+    };
+    drop(store);
+
+    let forged_operation = operation_id(0xEE);
+    let create_operation: Vec<u8> = {
+        let conn = open_raw(&path);
+        conn.query_row(
+            "SELECT operation_id FROM operations WHERE command_id = ?1",
+            [command_id(0x0F).as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("create operation")
+    };
+    let cases: Vec<(&str, Box<dyn Fn(&Connection)>)> = vec![
+        (
+            "tampered effect_index",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET effect_index = 1", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered operation_id",
+            Box::new(move |conn| {
+                // Point at another real operation so FK stays satisfied while lookup fails closed.
+                let _ = forged_operation;
+                conn.execute(
+                    "UPDATE outbox SET operation_id = ?1",
+                    [create_operation.as_slice()],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered event_sequence",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET event_sequence = 1", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered destination",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE outbox SET destination_class = 'resource_release'",
+                    [],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered policy",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE outbox SET replay_policy = 'reconcile_before_retry'",
+                    [],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered payload",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET payload = X'00'", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered action_epoch fence",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE operations SET action_epoch = 99 WHERE command_id = ?1",
+                    [close_cmd.as_bytes().as_slice()],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered resource fence on teardown op",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE operations SET resource_id = ?1, runtime_generation = 1
+                     WHERE command_id = ?2",
+                    rusqlite::params![
+                        resource_id(0xE0).as_bytes().as_slice(),
+                        close_cmd.as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered task scope on accepted event",
+            Box::new(move |conn| {
+                let other = task_id(0xE1);
+                // Create a decoy task row so FK/checks stay quiet if any exist.
+                let _ = other;
+                conn.execute(
+                    "UPDATE events SET task_id = ?1 WHERE event_type = 'operation.accepted'
+                     AND sequence = (
+                        SELECT committed_sequence FROM command_receipts WHERE command_id = ?2
+                     )",
+                    rusqlite::params![
+                        other.as_bytes().as_slice(),
+                        close_cmd.as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "missing outbox row",
+            Box::new(|conn| {
+                conn.execute("DELETE FROM outbox", []).unwrap();
+            }),
+        ),
+        (
+            "extra outbox row",
+            Box::new(|conn| {
+                let (op_bytes, event_sequence, destination, policy, payload, available_at): (
+                    Vec<u8>,
+                    i64,
+                    String,
+                    String,
+                    Vec<u8>,
+                    i64,
+                ) = conn
+                    .query_row(
+                        "SELECT operation_id, event_sequence, destination_class, replay_policy,
+                                payload, available_at_ms FROM outbox LIMIT 1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                let extra_outbox = operation_id(0xE2);
+                conn.execute(
+                    "INSERT INTO outbox(
+                        outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                        replay_policy, payload, state, available_at_ms, leased_until_ms,
+                        dispatch_started_at_ms, attempts, last_error_class
+                     ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, NULL, 0, NULL)",
+                    rusqlite::params![
+                        extra_outbox.as_bytes().as_slice(),
+                        op_bytes.as_slice(),
+                        event_sequence,
+                        destination,
+                        policy,
+                        payload,
+                        available_at,
+                    ],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "invalid non-v7 outbox_id",
+            Box::new(|conn| {
+                // Version nibble cleared -> not UUIDv7.
+                let mut bad = [0u8; 16];
+                bad[6] = 0x40; // version 4
+                bad[8] = 0x80; // RFC variant
+                conn.execute("UPDATE outbox SET outbox_id = ?1", [bad.as_slice()])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered state",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET state = 'leased'", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered attempts",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET attempts = 1", []).unwrap();
+            }),
+        ),
+        (
+            "tampered leased_until",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET leased_until_ms = 9", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered dispatch_started",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET dispatch_started_at_ms = 9", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered last_error",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET last_error_class = 'x'", [])
+                    .unwrap();
+            }),
+        ),
+        (
+            "tampered available_at",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE outbox SET available_at_ms = available_at_ms + 1",
+                    [],
+                )
+                .unwrap();
+            }),
+        ),
+    ];
+
+    for (label, mutate) in cases {
+        let case_dir = TempDir::new().expect("case tempdir");
+        let case_path = temp_db_path(&case_dir);
+        fs::copy(&path, &case_path).expect("copy db");
+        let conn = open_raw(&case_path);
+        mutate(&conn);
+        drop(conn);
+
+        let mut store = KernelStore::open(&case_path).expect("reopen");
+        let err = store
+            .execute(envelope.clone())
+            .expect_err(&format!("{label} must fail closed"));
+        assert_store_error_integrity(err);
+    }
+}
+
+#[test]
+fn command_side_effect_corrupt_release_generation_fence_fails_closed() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x14);
+    create_open_task(&mut store, task, command_id(0x15));
+    drop(store);
+
+    let resource = resource_id(0x16);
+    seed_active_resource(&path, task, resource, 7);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let release_cmd = command_id(0x17);
+    let envelope = command_envelope(
+        release_cmd,
+        Some(task),
+        Some(1),
+        Command::ReleaseResource {
+            resource_id: resource,
+        },
+    );
+    let first = store.execute(envelope.clone()).expect("release");
+    let CommandReceipt::Accepted { .. } = first else {
+        panic!("expected accepted release");
+    };
+    drop(store);
+
+    let cases: Vec<(&str, Box<dyn Fn(&Connection)>)> = vec![
+        (
+            "tampered runtime_generation fence",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE operations SET runtime_generation = 99 WHERE command_id = ?1",
+                    [release_cmd.as_bytes().as_slice()],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered resource_id fence",
+            Box::new(|conn| {
+                conn.execute(
+                    "UPDATE operations SET resource_id = ?1 WHERE command_id = ?2",
+                    rusqlite::params![
+                        resource_id(0x18).as_bytes().as_slice(),
+                        release_cmd.as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "tampered available_at on release outbox",
+            Box::new(|conn| {
+                conn.execute("UPDATE outbox SET available_at_ms = 1", [])
+                    .unwrap();
+            }),
+        ),
+    ];
+
+    for (label, mutate) in cases {
+        let case_dir = TempDir::new().expect("case tempdir");
+        let case_path = temp_db_path(&case_dir);
+        fs::copy(&path, &case_path).expect("copy db");
+        let conn = open_raw(&case_path);
+        mutate(&conn);
+        drop(conn);
+
+        let mut store = KernelStore::open(&case_path).expect("reopen");
+        let err = store
+            .execute(envelope.clone())
+            .expect_err(&format!("{label} must fail closed"));
+        assert_store_error_integrity(err);
+    }
+}
+
+#[test]
+fn command_side_effect_outbox_insert_trigger_rolls_back_acceptance() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x11);
+    create_open_task(&mut store, task, command_id(0x12));
+    drop(store);
+
+    let conn = open_raw(&path);
+    let events_before = count_table(&conn, "events");
+    let receipts_before = count_table(&conn, "command_receipts");
+    let ops_before = count_table(&conn, "operations");
+    let outbox_before = count_table(&conn, "outbox");
+    let lifecycle_before: String = conn
+        .query_row(
+            "SELECT lifecycle FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER test_abort_outbox_insert
+         BEFORE INSERT ON outbox
+         BEGIN
+           SELECT RAISE(ABORT, 'test outbox insert abort');
+         END;",
+    )
+    .expect("install outbox abort trigger");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let close_cmd = command_id(0x13);
+    let err = store
+        .execute(command_envelope(
+            close_cmd,
+            Some(task),
+            Some(1),
+            Command::BeginCloseTask,
+        ))
+        .expect_err("outbox insert abort must fail transaction");
+    assert!(
+        matches!(
+            err,
+            StoreError::ConstraintViolation | StoreError::Sqlite(_) | StoreError::Projection(_)
+        ),
+        "unexpected error: {err:?}"
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(count_table(&conn, "events"), events_before);
+    assert_eq!(count_table(&conn, "command_receipts"), receipts_before);
+    assert_eq!(count_table(&conn, "operations"), ops_before);
+    assert_eq!(count_table(&conn, "outbox"), outbox_before);
+    let lifecycle_after: String = conn
+        .query_row(
+            "SELECT lifecycle FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_after, lifecycle_before);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM command_receipts WHERE command_id = ?1",
+            [close_cmd.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
 }
