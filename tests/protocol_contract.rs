@@ -1,8 +1,10 @@
 //! Stable protocol compatibility and safety contracts.
 
+use std::io::{Cursor, Error, ErrorKind, Read, Write};
+
 use devmanager::protocol::{
-    Capability, CapabilitySet, FrameLimitField, FrameLimits, FrameLimitsError, ProtocolVersion,
-    VersionNegotiationError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    Capability, CapabilitySet, FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec,
+    PhysicalFrameError, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -166,4 +168,188 @@ fn protocol_frame_limits_reject_every_zero_offer() {
         rmp_serde::from_slice::<FrameLimits>(&malformed_wire).is_err(),
         "wire decode must enforce the same nonzero contract"
     );
+}
+
+#[test]
+fn protocol_physical_frame_writer_uses_big_endian_length_prefix() {
+    let codec = PhysicalFrameCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let mut wire = Vec::new();
+    codec
+        .write(&mut wire, &[0xAA, 0xBB, 0xCC])
+        .expect("write frame");
+    assert_eq!(wire, vec![0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
+
+    let mut empty_writer = Vec::new();
+    assert_eq!(
+        codec.write(&mut empty_writer, &[]),
+        Err(PhysicalFrameError::Empty)
+    );
+    assert!(empty_writer.is_empty());
+}
+
+struct FragmentedReader {
+    inner: Cursor<Vec<u8>>,
+    max_read: usize,
+    bytes_read: usize,
+}
+
+impl FragmentedReader {
+    fn new(bytes: Vec<u8>, max_read: usize) -> Self {
+        Self {
+            inner: Cursor::new(bytes),
+            max_read,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl Read for FragmentedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let allowed = buffer.len().min(self.max_read);
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.bytes_read += read;
+        Ok(read)
+    }
+}
+
+#[test]
+fn protocol_physical_frame_reader_handles_fragmented_and_coalesced_frames() {
+    let limits = FrameLimits::v1_default();
+    let codec = PhysicalFrameCodec::from_limits(limits).expect("codec");
+    let mut wire = Vec::new();
+    codec.write(&mut wire, b"first").expect("first frame");
+    codec.write(&mut wire, b"second").expect("second frame");
+
+    let mut reader = FragmentedReader::new(wire, 1);
+    assert_eq!(codec.read(&mut reader).unwrap(), b"first");
+    assert_eq!(codec.read(&mut reader).unwrap(), b"second");
+    assert_eq!(
+        codec.read(&mut reader),
+        Err(PhysicalFrameError::ReadHeader {
+            kind: ErrorKind::UnexpectedEof,
+        })
+    );
+}
+
+#[test]
+fn protocol_physical_frame_rejects_header_before_payload_read() {
+    let small_limit = FrameLimits {
+        max_physical_frame_bytes: 8,
+        ..FrameLimits::v1_default()
+    };
+    let cases = [
+        (0_u32, FrameLimits::v1_default(), PhysicalFrameError::Empty),
+        (
+            9_u32,
+            small_limit,
+            PhysicalFrameError::Oversized {
+                declared: 9,
+                maximum: 8,
+            },
+        ),
+        (
+            1024 * 1024 + 1,
+            FrameLimits::v1_default(),
+            PhysicalFrameError::Oversized {
+                declared: 1024 * 1024 + 1,
+                maximum: 1024 * 1024,
+            },
+        ),
+    ];
+
+    for (announced, limits, expected) in cases {
+        let mut bytes = announced.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"payload-must-not-be-read");
+        let mut reader = FragmentedReader::new(bytes, usize::MAX);
+        let codec = PhysicalFrameCodec::from_limits(limits).expect("codec");
+        assert_eq!(codec.read(&mut reader), Err(expected));
+        assert_eq!(
+            reader.bytes_read, 4,
+            "invalid header must be rejected before payload I/O"
+        );
+    }
+}
+
+struct FailingWriter {
+    bytes_before_failure: usize,
+}
+
+impl Write for FailingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.bytes_before_failure == 0 {
+            return Err(Error::new(ErrorKind::BrokenPipe, "closed fixture"));
+        }
+        let written = buffer.len().min(self.bytes_before_failure);
+        self.bytes_before_failure -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn protocol_physical_frame_partial_io_fails_closed() {
+    let limits = FrameLimits::v1_default();
+    let codec = PhysicalFrameCodec::from_limits(limits).expect("codec");
+    for bytes in [
+        vec![0x00, 0x00, 0x00],
+        vec![0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB],
+    ] {
+        let expected = if bytes.len() < 4 {
+            PhysicalFrameError::ReadHeader {
+                kind: ErrorKind::UnexpectedEof,
+            }
+        } else {
+            PhysicalFrameError::ReadPayload {
+                declared: 3,
+                kind: ErrorKind::UnexpectedEof,
+            }
+        };
+        assert_eq!(codec.read(&mut Cursor::new(bytes)), Err(expected));
+    }
+
+    let mut header_writer = FailingWriter {
+        bytes_before_failure: 0,
+    };
+    assert_eq!(
+        codec.write(&mut header_writer, b"payload"),
+        Err(PhysicalFrameError::WriteHeader {
+            kind: ErrorKind::BrokenPipe,
+        })
+    );
+
+    let mut writer = FailingWriter {
+        bytes_before_failure: 5,
+    };
+    assert_eq!(
+        codec.write(&mut writer, b"payload"),
+        Err(PhysicalFrameError::WritePayload {
+            declared: 7,
+            kind: ErrorKind::BrokenPipe,
+        })
+    );
+
+    let mut untouched = Vec::new();
+    let small_codec = PhysicalFrameCodec::from_limits(FrameLimits {
+        max_physical_frame_bytes: 8,
+        ..limits
+    })
+    .expect("small codec");
+    assert_eq!(
+        small_codec.write(&mut untouched, &[0xAA; 9]),
+        Err(PhysicalFrameError::Oversized {
+            declared: 9,
+            maximum: 8,
+        })
+    );
+    assert!(untouched.is_empty());
+
+    let hard_capped = PhysicalFrameCodec::from_limits(FrameLimits {
+        max_physical_frame_bytes: u32::MAX,
+        ..limits
+    })
+    .expect("hard-capped codec");
+    assert_eq!(hard_capped.max_payload_bytes(), 1024 * 1024);
 }

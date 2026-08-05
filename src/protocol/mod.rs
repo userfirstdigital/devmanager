@@ -7,4 +7,6 @@ pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
-pub use frame::{FrameLimitField, FrameLimits, FrameLimitsError};
+pub use frame::{
+    FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError,
+};
