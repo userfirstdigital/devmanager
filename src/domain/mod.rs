@@ -39,7 +39,10 @@ pub use resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
     ResourceValidationError,
 };
-pub use snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem};
+pub use snapshot::{
+    PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
+    TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
+};
 pub use task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, TaskValidationError, VisibleTaskStatus, WorkspaceRef,

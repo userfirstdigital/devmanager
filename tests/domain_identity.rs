@@ -5,8 +5,8 @@ use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecy
 use devmanager::domain::artifact::{ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass};
 use devmanager::domain::id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
-    IdError, OperationId, ProjectId, RequestId, ResourceId, ServiceId, SubscriptionId, TaskId,
-    TerminalId, TransferId,
+    IdError, OperationId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId, SubscriptionId,
+    TaskId, TerminalId, TransferId,
 };
 use devmanager::domain::operation::{OperationFacts, OperationState};
 use devmanager::domain::resource::{
@@ -26,6 +26,7 @@ assert_not_impl_any!(OperationId: From<TransferId>, From<CommandId>, From<EventI
 assert_not_impl_any!(EnvironmentId: From<ProjectId>, From<TaskId>);
 assert_not_impl_any!(TerminalId: From<BrowserContextId>, From<ServiceId>);
 assert_not_impl_any!(RequestId: From<SubscriptionId>, From<EventId>);
+assert_not_impl_any!(SnapshotId: From<SubscriptionId>, From<TaskId>, From<EventId>);
 
 fn uuid_version(bytes: &[u8; 16]) -> u8 {
     (bytes[6] >> 4) & 0x0f
@@ -56,6 +57,7 @@ fn typed_ids_generate_uuid_version_7() {
         *OperationId::new().as_bytes(),
         *TransferId::new().as_bytes(),
         *SubscriptionId::new().as_bytes(),
+        *SnapshotId::new().as_bytes(),
         *EventId::new().as_bytes(),
     ];
     for bytes in ids {

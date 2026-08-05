@@ -1,11 +1,103 @@
 use std::fmt;
 
+use hmac::{Hmac, Mac};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::domain::id::{SnapshotId, TaskId};
-use crate::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use crate::domain::snapshot::{
+    PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
+    TaskSnapshotItem,
+};
 use crate::kernel::command_bus;
 use crate::kernel::store::{u64_from_nonnegative_i64, KernelStore, StoreError};
+
+const SNAPSHOT_CURSOR_VERSION: u16 = 1;
+const SNAPSHOT_CURSOR_DOMAIN: &[u8] = b"devmanager:snapshot-cursor:v1\0";
+const CURSOR_TAG_BYTES: usize = 32;
+const MAX_CURSOR_BYTES: usize = 4_096;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnapshotError {
+    Store(StoreError),
+    InvalidLimits(PageLimitsError),
+    EntropyUnavailable,
+    InvalidCursor,
+    CursorContextMismatch,
+    UnsupportedSection,
+    PageEnvelopeTooLarge {
+        encoded_bytes: u32,
+        max_encoded_bytes: u32,
+    },
+    PageItemTooLarge {
+        item: SnapshotItemKey,
+        encoded_bytes: u32,
+        max_encoded_bytes: u32,
+    },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => error.fmt(f),
+            Self::InvalidLimits(error) => error.fmt(f),
+            Self::EntropyUnavailable => write!(f, "snapshot cursor entropy unavailable"),
+            Self::InvalidCursor => write!(f, "invalid snapshot cursor"),
+            Self::CursorContextMismatch => write!(f, "snapshot cursor context mismatch"),
+            Self::UnsupportedSection => write!(f, "snapshot section is not implemented"),
+            Self::PageEnvelopeTooLarge {
+                encoded_bytes,
+                max_encoded_bytes,
+            } => write!(
+                f,
+                "snapshot page envelope is {encoded_bytes} bytes, exceeding {max_encoded_bytes}"
+            ),
+            Self::PageItemTooLarge {
+                item,
+                encoded_bytes,
+                max_encoded_bytes,
+            } => write!(
+                f,
+                "snapshot item {item:?} requires a {encoded_bytes}-byte page, exceeding {max_encoded_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<StoreError> for SnapshotError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<rusqlite::Error> for SnapshotError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Store(StoreError::from(error))
+    }
+}
+
+impl From<PageLimitsError> for SnapshotError {
+    fn from(error: PageLimitsError) -> Self {
+        Self::InvalidLimits(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotCursorDocument {
+    version: u16,
+    snapshot_id: SnapshotId,
+    through_sequence: u64,
+    section: SnapshotSection,
+    last_item: SnapshotItemKey,
+    limits: PageLimits,
+}
 
 /// One immutable, read-only SQLite view of the durable kernel projections.
 ///
@@ -15,6 +107,8 @@ use crate::kernel::store::{u64_from_nonnegative_i64, KernelStore, StoreError};
 pub(crate) struct SnapshotSession {
     snapshot_id: SnapshotId,
     through_sequence: u64,
+    limits: PageLimits,
+    cursor_hmac_key: Zeroizing<[u8; 32]>,
     conn: Connection,
 }
 
@@ -23,6 +117,7 @@ impl fmt::Debug for SnapshotSession {
         f.debug_struct("SnapshotSession")
             .field("snapshot_id", &self.snapshot_id)
             .field("through_sequence", &self.through_sequence)
+            .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
 }
@@ -30,7 +125,13 @@ impl fmt::Debug for SnapshotSession {
 impl KernelStore {
     /// Pin a read-only snapshot at the current global durable event sequence.
     #[allow(dead_code)] // consumed by the bounded host registry in a later phase
-    pub(crate) fn begin_snapshot(&self) -> Result<SnapshotSession, StoreError> {
+    pub(crate) fn begin_snapshot(
+        &self,
+        limits: PageLimits,
+    ) -> Result<SnapshotSession, SnapshotError> {
+        limits.validate()?;
+        let mut cursor_hmac_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(cursor_hmac_key.as_mut()).map_err(|_| SnapshotError::EntropyUnavailable)?;
         let conn = self.open_query_connection()?;
         conn.execute_batch("BEGIN DEFERRED;")?;
         // The first read establishes the WAL snapshot before the writer can
@@ -43,41 +144,55 @@ impl KernelStore {
         Ok(SnapshotSession {
             snapshot_id: SnapshotId::new(),
             through_sequence,
+            limits,
+            cursor_hmac_key,
             conn,
         })
     }
 }
 
 impl SnapshotSession {
-    /// Read the task-row section from the view pinned by `begin_snapshot`.
+    /// Read one bounded section page from the view pinned by `begin_snapshot`.
     #[allow(dead_code)] // consumed by the bounded host registry in a later phase
-    pub(crate) fn tasks_page(&self) -> Result<SnapshotPage, StoreError> {
-        let task_ids = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT task_id FROM tasks ORDER BY task_id ASC")?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            let mut task_ids = Vec::new();
-            for row in rows {
-                let bytes = row?;
-                let bytes: [u8; 16] =
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| StoreError::CodecMismatch {
-                            detail: "tasks.task_id must be 16 bytes".into(),
-                        })?;
-                let task_id =
-                    TaskId::from_bytes(bytes).map_err(|err| StoreError::CodecMismatch {
-                        detail: format!("tasks.task_id: {err}"),
-                    })?;
-                task_ids.push(task_id);
-            }
-            task_ids
+    pub(crate) fn page(
+        &self,
+        section: SnapshotSection,
+        resume_cursor: Option<&[u8]>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_item = match resume_cursor {
+            Some(cursor) => Some(self.decode_cursor(cursor, section)?.last_item),
+            None => None,
         };
+        match section {
+            SnapshotSection::Tasks => self.tasks_page(after_item),
+            SnapshotSection::AgentSessions
+            | SnapshotSection::Artifacts
+            | SnapshotSection::Resources
+            | SnapshotSection::Operations => Err(SnapshotError::UnsupportedSection),
+        }
+    }
 
-        let mut items = Vec::with_capacity(task_ids.len());
-        for task_id in task_ids {
+    fn tasks_page(
+        &self,
+        after_item: Option<SnapshotItemKey>,
+    ) -> Result<SnapshotPage, SnapshotError> {
+        let after_task = match after_item {
+            Some(SnapshotItemKey::Task(task_id)) => Some(task_id),
+            Some(_) => return Err(SnapshotError::CursorContextMismatch),
+            None => None,
+        };
+        let fetch_limit = i64::from(self.limits.max_items) + 1;
+        let task_ids = load_task_ids(&self.conn, after_task, fetch_limit)?;
+
+        let mut items = Vec::with_capacity(task_ids.len().min(self.limits.max_items as usize));
+        let mut accepted_encoded_bytes = None;
+        let mut accepted_next_cursor = None;
+        for (index, task_id) in task_ids
+            .iter()
+            .take(self.limits.max_items as usize)
+            .copied()
+            .enumerate()
+        {
             let snapshot =
                 command_bus::load_task_snapshot(&self.conn, task_id)?.ok_or_else(|| {
                     StoreError::Projection("task disappeared from pinned snapshot".into())
@@ -90,15 +205,219 @@ impl SnapshotSession {
                 review_readiness: snapshot.review_readiness,
                 primary_agent_id: snapshot.primary_agent_id,
             }));
+
+            let has_more = index + 1 < task_ids.len();
+            let next_cursor = if has_more {
+                Some(self.encode_cursor(SnapshotSection::Tasks, SnapshotItemKey::Task(task_id))?)
+            } else {
+                None
+            };
+            let encoded_bytes = canonical_page_encoded_bytes(
+                self.snapshot_id,
+                self.through_sequence,
+                SnapshotSection::Tasks,
+                after_item,
+                &items,
+                &next_cursor,
+            )?;
+            if encoded_bytes > self.limits.max_encoded_bytes {
+                items.pop();
+                if items.is_empty() {
+                    return Err(SnapshotError::PageItemTooLarge {
+                        item: SnapshotItemKey::Task(task_id),
+                        encoded_bytes,
+                        max_encoded_bytes: self.limits.max_encoded_bytes,
+                    });
+                }
+                break;
+            }
+            accepted_encoded_bytes = Some(encoded_bytes);
+            accepted_next_cursor = next_cursor;
         }
+
+        let encoded_bytes = match accepted_encoded_bytes {
+            Some(encoded_bytes) => encoded_bytes,
+            None => {
+                let encoded_bytes = canonical_page_encoded_bytes(
+                    self.snapshot_id,
+                    self.through_sequence,
+                    SnapshotSection::Tasks,
+                    after_item,
+                    &items,
+                    &None,
+                )?;
+                if encoded_bytes > self.limits.max_encoded_bytes {
+                    return Err(SnapshotError::PageEnvelopeTooLarge {
+                        encoded_bytes,
+                        max_encoded_bytes: self.limits.max_encoded_bytes,
+                    });
+                }
+                encoded_bytes
+            }
+        };
 
         Ok(SnapshotPage {
             snapshot_id: self.snapshot_id,
             through_sequence: self.through_sequence,
             section: SnapshotSection::Tasks,
+            after_item,
             items,
+            encoded_bytes,
+            next_cursor: accepted_next_cursor,
         })
     }
+
+    fn encode_cursor(
+        &self,
+        section: SnapshotSection,
+        last_item: SnapshotItemKey,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        let document = SnapshotCursorDocument {
+            version: SNAPSHOT_CURSOR_VERSION,
+            snapshot_id: self.snapshot_id,
+            through_sequence: self.through_sequence,
+            section,
+            last_item,
+            limits: self.limits,
+        };
+        let payload =
+            rmp_serde::to_vec_named(&document).map_err(|error| StoreError::CodecMismatch {
+                detail: format!("encode snapshot cursor: {error}"),
+            })?;
+        let mut mac = HmacSha256::new_from_slice(self.cursor_hmac_key.as_ref())
+            .map_err(|_| SnapshotError::InvalidCursor)?;
+        mac.update(SNAPSHOT_CURSOR_DOMAIN);
+        mac.update(&payload);
+        let tag = mac.finalize().into_bytes();
+        let mut cursor = Vec::with_capacity(payload.len() + tag.len());
+        cursor.extend_from_slice(&payload);
+        cursor.extend_from_slice(&tag);
+        Ok(cursor)
+    }
+
+    fn decode_cursor(
+        &self,
+        cursor: &[u8],
+        requested_section: SnapshotSection,
+    ) -> Result<SnapshotCursorDocument, SnapshotError> {
+        if cursor.len() <= CURSOR_TAG_BYTES || cursor.len() > MAX_CURSOR_BYTES {
+            return Err(SnapshotError::InvalidCursor);
+        }
+        let (payload, tag) = cursor.split_at(cursor.len() - CURSOR_TAG_BYTES);
+        let mut mac = HmacSha256::new_from_slice(self.cursor_hmac_key.as_ref())
+            .map_err(|_| SnapshotError::InvalidCursor)?;
+        mac.update(SNAPSHOT_CURSOR_DOMAIN);
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| SnapshotError::InvalidCursor)?;
+
+        let document: SnapshotCursorDocument =
+            rmp_serde::from_slice(payload).map_err(|_| SnapshotError::InvalidCursor)?;
+        let canonical =
+            rmp_serde::to_vec_named(&document).map_err(|_| SnapshotError::InvalidCursor)?;
+        if canonical.as_slice() != payload || document.version != SNAPSHOT_CURSOR_VERSION {
+            return Err(SnapshotError::InvalidCursor);
+        }
+        document.limits.validate()?;
+        if document.snapshot_id != self.snapshot_id
+            || document.through_sequence != self.through_sequence
+            || document.section != requested_section
+            || document.limits != self.limits
+        {
+            return Err(SnapshotError::CursorContextMismatch);
+        }
+        Ok(document)
+    }
+}
+
+fn load_task_ids(
+    conn: &Connection,
+    after_task: Option<TaskId>,
+    fetch_limit: i64,
+) -> Result<Vec<TaskId>, SnapshotError> {
+    let mut task_ids = Vec::new();
+    match after_task {
+        Some(after_task) => {
+            let mut stmt = conn.prepare(
+                "SELECT task_id FROM tasks WHERE task_id > ?1 ORDER BY task_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![after_task.as_bytes().as_slice(), fetch_limit],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                task_ids.push(decode_task_id(&row?)?);
+            }
+        }
+        None => {
+            let mut stmt =
+                conn.prepare("SELECT task_id FROM tasks ORDER BY task_id ASC LIMIT ?1")?;
+            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                task_ids.push(decode_task_id(&row?)?);
+            }
+        }
+    }
+    Ok(task_ids)
+}
+
+fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+        detail: "tasks.task_id must be 16 bytes".into(),
+    })?;
+    TaskId::from_bytes(bytes)
+        .map_err(|error| StoreError::CodecMismatch {
+            detail: format!("tasks.task_id: {error}"),
+        })
+        .map_err(Into::into)
+}
+
+#[derive(Serialize)]
+struct SnapshotPageWire<'a> {
+    snapshot_id: SnapshotId,
+    through_sequence: u64,
+    section: SnapshotSection,
+    after_item: Option<SnapshotItemKey>,
+    items: &'a [SnapshotItem],
+    encoded_bytes: u32,
+    next_cursor: &'a Option<Vec<u8>>,
+}
+
+fn canonical_page_encoded_bytes(
+    snapshot_id: SnapshotId,
+    through_sequence: u64,
+    section: SnapshotSection,
+    after_item: Option<SnapshotItemKey>,
+    items: &[SnapshotItem],
+    next_cursor: &Option<Vec<u8>>,
+) -> Result<u32, SnapshotError> {
+    let mut encoded_bytes = 0u32;
+    for _ in 0..8 {
+        let wire = SnapshotPageWire {
+            snapshot_id,
+            through_sequence,
+            section,
+            after_item,
+            items,
+            encoded_bytes,
+            next_cursor,
+        };
+        let bytes = rmp_serde::to_vec_named(&wire).map_err(|error| StoreError::CodecMismatch {
+            detail: format!("encode snapshot page: {error}"),
+        })?;
+        let actual = u32::try_from(bytes.len()).map_err(|_| StoreError::IntegerOutOfRange {
+            field: "snapshot_page.encoded_bytes",
+            value: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        })?;
+        if actual == encoded_bytes {
+            return Ok(actual);
+        }
+        encoded_bytes = actual;
+    }
+    Err(StoreError::CodecMismatch {
+        detail: "snapshot page encoded length did not converge".into(),
+    }
+    .into())
 }
 
 impl Drop for SnapshotSession {
@@ -164,10 +483,19 @@ mod tests {
     }
 
     fn create_task(store: &mut KernelStore, task_id: TaskId, command_id: CommandId) {
+        create_task_with_title(store, task_id, command_id, "Ship kernel");
+    }
+
+    fn create_task_with_title(
+        store: &mut KernelStore,
+        task_id: TaskId,
+        command_id: CommandId,
+        title: &str,
+    ) {
         let intent = CreateTaskIntent {
             id: task_id,
             environment_id: environment_id(0x10),
-            title: "Ship kernel".into(),
+            title: title.into(),
             description: Some("Phase 1 domain".into()),
             project_id: project_id(0x11),
             workspace: WorkspaceRef::Main,
@@ -205,7 +533,9 @@ mod tests {
                 .expect("maximum sequence");
             u64::try_from(sequence).expect("nonnegative event sequence")
         };
-        let snapshot = store.begin_snapshot().expect("begin frozen snapshot");
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(1_000, 512 * 1024).expect("limits"))
+            .expect("begin frozen snapshot");
 
         let rename = envelope(
             command_id(0xB3),
@@ -223,8 +553,12 @@ mod tests {
             }
         ));
 
-        let first = snapshot.tasks_page().expect("first frozen task page");
-        let second = snapshot.tasks_page().expect("repeat frozen task page");
+        let first = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("first frozen task page");
+        let second = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("repeat frozen task page");
         assert_eq!(first, second);
         assert_eq!(first.through_sequence, before_sequence);
         assert_eq!(first.section, SnapshotSection::Tasks);
@@ -258,12 +592,157 @@ mod tests {
         .expect("tamper primary agent projection");
         drop(conn);
 
-        let snapshot = store.begin_snapshot().expect("begin snapshot");
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(1_000, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
         assert!(matches!(
             snapshot
-                .tasks_page()
+                .page(SnapshotSection::Tasks, None)
                 .expect_err("dangling primary agent must fail closed"),
-            StoreError::Projection(_)
+            SnapshotError::Store(StoreError::Projection(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_pages_resume_without_duplicates() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        for (task_tail, command_tail) in [(0xC1, 0xD1), (0xC2, 0xD2), (0xC3, 0xD3)] {
+            create_task(&mut store, task_id(task_tail), command_id(command_tail));
+        }
+
+        let limits = PageLimits::new(2, 512 * 1024).expect("limits");
+        let snapshot = store.begin_snapshot(limits).expect("begin snapshot");
+        let first = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("first page");
+        let cursor = first.next_cursor.clone().expect("resume cursor");
+        let second = snapshot
+            .page(SnapshotSection::Tasks, Some(&cursor))
+            .expect("second page");
+
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.next_cursor, None);
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(first.through_sequence, second.through_sequence);
+
+        let mut ids = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|item| match item {
+                SnapshotItem::Task(item) => item.task.id,
+                other => panic!("expected task item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let unique = ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), 3);
+        ids.sort();
+        assert_eq!(ids, vec![task_id(0xC1), task_id(0xC2), task_id(0xC3)]);
+        assert_eq!(
+            second.after_item,
+            Some(SnapshotItemKey::Task(task_id(0xC2)))
+        );
+    }
+
+    #[test]
+    fn snapshot_cursor_rejects_tampering_and_wrong_section() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, task_id(0xC4), command_id(0xD4));
+        create_task(&mut store, task_id(0xC5), command_id(0xD5));
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(1, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        let first = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("first page");
+        let cursor = first.next_cursor.expect("resume cursor");
+
+        let mut tampered = cursor.clone();
+        tampered[0] ^= 0x01;
+        assert_eq!(
+            snapshot.page(SnapshotSection::Tasks, Some(&tampered)),
+            Err(SnapshotError::InvalidCursor)
+        );
+        assert_eq!(
+            snapshot.page(SnapshotSection::AgentSessions, Some(&cursor)),
+            Err(SnapshotError::CursorContextMismatch)
+        );
+    }
+
+    #[test]
+    fn snapshot_page_honors_item_and_encoded_byte_limits() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, task_id(0xC6), command_id(0xD6));
+        create_task(&mut store, task_id(0xC7), command_id(0xD7));
+
+        let limits = PageLimits::new(1, 2_048).expect("limits");
+        let snapshot = store.begin_snapshot(limits).expect("begin snapshot");
+        let page = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("bounded page");
+        assert_eq!(page.items.len(), 1);
+        assert!(page.encoded_bytes <= limits.max_encoded_bytes);
+        assert_eq!(
+            usize::try_from(page.encoded_bytes).expect("page length fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final page")
+                .len(),
+            "encoded_bytes must describe the complete canonical page body"
+        );
+
+        let huge_dir = TempDir::new().expect("huge tempdir");
+        let huge_path = huge_dir.path().join("kernel.sqlite3");
+        let mut huge_store = KernelStore::open(&huge_path).expect("open huge store");
+        create_task_with_title(
+            &mut huge_store,
+            task_id(0xC8),
+            command_id(0xD8),
+            &"x".repeat(4_096),
+        );
+        let huge_snapshot = huge_store
+            .begin_snapshot(PageLimits::new(1, 1_024).expect("small byte limit"))
+            .expect("begin huge snapshot");
+        assert!(matches!(
+            huge_snapshot.page(SnapshotSection::Tasks, None),
+            Err(SnapshotError::PageItemTooLarge {
+                item: SnapshotItemKey::Task(id),
+                ..
+            }) if id == task_id(0xC8)
+        ));
+    }
+
+    #[test]
+    fn page_limits_reject_forged_wire_values() {
+        let forged = PageLimits {
+            max_items: 0,
+            max_encoded_bytes: 1,
+        };
+        assert!(
+            rmp_serde::to_vec_named(&forged).is_err(),
+            "invalid public value must not serialize"
+        );
+
+        #[derive(Serialize)]
+        struct ForgedPageLimits {
+            max_items: u32,
+            max_encoded_bytes: u32,
+        }
+        let bytes = rmp_serde::to_vec_named(&ForgedPageLimits {
+            max_items: 0,
+            max_encoded_bytes: 1,
+        })
+        .expect("encode tampered limits");
+        assert!(rmp_serde::from_slice::<PageLimits>(&bytes).is_err());
     }
 }
