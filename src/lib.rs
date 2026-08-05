@@ -6,6 +6,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod domain;
 pub mod git;
+pub mod host;
 pub mod icons;
 pub mod kernel;
 pub mod models;
