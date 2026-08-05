@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 use crate::domain::event::DomainEvent;
 use crate::domain::snapshot::{EventPage, PageLimits, PageLimitsError};
 use crate::kernel::store::{
-    decode_stored_domain_event, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
-    StoreError,
+    decode_stored_domain_event, load_event_log_bounds, u64_from_nonnegative_i64, u64_to_sqlite_i64,
+    KernelStore, StoreError,
 };
 
 const EVENT_CURSOR_VERSION: u16 = 1;
@@ -28,6 +28,10 @@ pub(crate) enum ReplayError {
     InvalidRange {
         after_sequence: u64,
         through_sequence: u64,
+    },
+    ReplayUnavailable {
+        oldest_sequence: u64,
+        newest_sequence: u64,
     },
     InvalidCursor,
     CursorContextMismatch,
@@ -54,6 +58,13 @@ impl fmt::Display for ReplayError {
             } => write!(
                 f,
                 "event replay starts after {after_sequence}, beyond newest sequence {through_sequence}"
+            ),
+            Self::ReplayUnavailable {
+                oldest_sequence,
+                newest_sequence,
+            } => write!(
+                f,
+                "event replay is unavailable before sequence {oldest_sequence}; newest sequence is {newest_sequence}"
             ),
             Self::InvalidCursor => write!(f, "invalid event replay cursor"),
             Self::CursorContextMismatch => write!(f, "event replay cursor context mismatch"),
@@ -138,11 +149,14 @@ impl KernelStore {
         getrandom::fill(cursor_hmac_key.as_mut()).map_err(|_| ReplayError::EntropyUnavailable)?;
         let conn = self.open_query_connection()?;
         conn.execute_batch("BEGIN DEFERRED;")?;
-        let sequence: i64 =
-            conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
-                row.get(0)
-            })?;
-        let through_sequence = u64_from_nonnegative_i64("events.sequence", sequence)?;
+        let bounds = load_event_log_bounds(&conn)?;
+        if after_sequence < bounds.pruned_through_sequence {
+            return Err(ReplayError::ReplayUnavailable {
+                oldest_sequence: bounds.pruned_through_sequence + 1,
+                newest_sequence: bounds.newest_sequence,
+            });
+        }
+        let through_sequence = bounds.newest_sequence;
         if after_sequence > through_sequence {
             return Err(ReplayError::InvalidRange {
                 after_sequence,
@@ -703,6 +717,178 @@ mod tests {
             store.begin_event_replay(first.through_sequence + 1, limits),
             Err(ReplayError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn expired_replay_returns_retention_bounds_and_exact_edge_resumes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, 0x45);
+        create_task(&mut store, 0x46);
+        create_task(&mut store, 0x47);
+        let newest_sequence = max_sequence(&path);
+        let pruned_through_sequence = newest_sequence - 2;
+
+        let conn = Connection::open(&path).expect("open retention fixture");
+        conn.execute(
+            "UPDATE event_retention SET pruned_through_sequence = ?1 WHERE singleton_key = 1",
+            [i64::try_from(pruned_through_sequence).expect("prune boundary fits")],
+        )
+        .expect("advance explicit retention boundary");
+        conn.execute(
+            "DELETE FROM events WHERE sequence = ?1",
+            [i64::try_from(pruned_through_sequence + 1).expect("gap sequence fits")],
+        )
+        .expect("create a retained sequence gap");
+        drop(conn);
+
+        let limits = PageLimits::new(100, 512 * 1024).expect("limits");
+        assert!(matches!(
+            store.begin_event_replay(pruned_through_sequence - 1, limits),
+            Err(ReplayError::ReplayUnavailable {
+                oldest_sequence,
+                newest_sequence: reported_newest,
+            }) if oldest_sequence == pruned_through_sequence + 1
+                && reported_newest == newest_sequence
+        ));
+
+        let replay = store
+            .begin_event_replay(pruned_through_sequence, limits)
+            .expect("exact retention edge remains replayable");
+        let page = replay.page(None).expect("replay retained suffix");
+        assert_eq!(page.after_sequence, pruned_through_sequence);
+        assert_eq!(page.through_sequence, newest_sequence);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![newest_sequence],
+            "ordinary gaps after the boundary must not be mistaken for pruning"
+        );
+    }
+
+    #[test]
+    fn retained_sequence_gaps_do_not_expire_replay() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, 0x49);
+        create_task(&mut store, 0x4A);
+        let newest_sequence = max_sequence(&path);
+
+        let conn = Connection::open(&path).expect("open gap fixture");
+        conn.execute("DELETE FROM events WHERE sequence = 1", [])
+            .expect("create leading retained gap");
+        drop(conn);
+
+        let replay = store
+            .begin_event_replay(0, PageLimits::new(100, 512 * 1024).expect("limits"))
+            .expect("metadata, not the first stored row, defines expiration");
+        let page = replay.page(None).expect("replay across retained gap");
+        assert_eq!(page.after_sequence, 0);
+        assert_eq!(page.through_sequence, newest_sequence);
+        assert!(!page.events.is_empty());
+        assert!(page.events.iter().all(|event| event.sequence > 1));
+    }
+
+    #[test]
+    fn fully_pruned_history_preserves_high_water_for_snapshot_and_replay() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        create_task(&mut store, 0x48);
+        let newest_sequence = max_sequence(&path);
+
+        let conn = Connection::open(&path).expect("open retention fixture");
+        conn.execute(
+            "UPDATE event_retention SET pruned_through_sequence = ?1 WHERE singleton_key = 1",
+            [i64::try_from(newest_sequence).expect("high-water fits")],
+        )
+        .expect("advance explicit retention boundary");
+        conn.execute("DELETE FROM events", [])
+            .expect("simulate later bounded pruning");
+        drop(conn);
+
+        let limits = PageLimits::new(100, 512 * 1024).expect("limits");
+        let snapshot = store.begin_snapshot(limits).expect("begin snapshot");
+        let snapshot_page = snapshot
+            .page(SnapshotSection::Tasks, None)
+            .expect("load frozen task snapshot");
+        assert_eq!(snapshot_page.through_sequence, newest_sequence);
+        assert_eq!(snapshot_page.items.len(), 1);
+
+        let replay = store
+            .begin_event_replay(newest_sequence, limits)
+            .expect("resume at fully pruned high-water");
+        let replay_page = replay.page(None).expect("empty retained suffix");
+        assert_eq!(replay_page.through_sequence, newest_sequence);
+        assert!(replay_page.events.is_empty());
+        assert!(replay_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn missing_retention_singleton_fails_closed() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let store = KernelStore::open(&path).expect("open");
+
+        let conn = Connection::open(&path).expect("open retention fixture");
+        conn.execute("DELETE FROM event_retention WHERE singleton_key = 1", [])
+            .expect("remove retention singleton");
+        drop(conn);
+
+        assert!(matches!(
+            store.begin_event_replay(0, PageLimits::new(10, 512 * 1024).expect("limits")),
+            Err(ReplayError::Store(StoreError::Corruption))
+        ));
+        assert!(matches!(
+            store.begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits")),
+            Err(crate::kernel::snapshot::SnapshotError::Store(
+                StoreError::Corruption
+            ))
+        ));
+    }
+
+    #[test]
+    fn invalid_retention_metadata_is_corruption_for_replay_and_snapshot() {
+        for tamper_sql in [
+            "UPDATE event_retention SET pruned_through_sequence = -1 WHERE singleton_key = 1",
+            "UPDATE event_retention SET pruned_through_sequence = 'not-an-integer' WHERE singleton_key = 1",
+            "INSERT INTO event_retention(singleton_key, pruned_through_sequence) VALUES (2, 0)",
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().join("kernel.sqlite3");
+            let store = KernelStore::open(&path).expect("open");
+
+            let conn = Connection::open(&path).expect("open retention fixture");
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("allow malformed metadata fixture");
+            conn.execute_batch(tamper_sql)
+                .expect("tamper retention metadata");
+            drop(conn);
+
+            assert!(
+                matches!(
+                    store.begin_event_replay(
+                        0,
+                        PageLimits::new(10, 512 * 1024).expect("limits")
+                    ),
+                    Err(ReplayError::Store(StoreError::Corruption))
+                ),
+                "replay must classify invalid metadata as corruption: {tamper_sql}"
+            );
+            assert!(
+                matches!(
+                    store.begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits")),
+                    Err(crate::kernel::snapshot::SnapshotError::Store(
+                        StoreError::Corruption
+                    ))
+                ),
+                "snapshot must classify invalid metadata as corruption: {tamper_sql}"
+            );
+        }
     }
 
     #[test]

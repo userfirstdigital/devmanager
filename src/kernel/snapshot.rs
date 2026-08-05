@@ -12,7 +12,7 @@ use crate::domain::snapshot::{
     TaskSnapshotItem,
 };
 use crate::kernel::command_bus;
-use crate::kernel::store::{u64_from_nonnegative_i64, KernelStore, StoreError};
+use crate::kernel::store::{load_event_log_bounds, KernelStore, StoreError};
 
 const SNAPSHOT_CURSOR_VERSION: u16 = 1;
 const SNAPSHOT_CURSOR_DOMAIN: &[u8] = b"devmanager:snapshot-cursor:v1\0";
@@ -134,11 +134,7 @@ impl KernelStore {
         conn.execute_batch("BEGIN DEFERRED;")?;
         // The first read establishes the WAL snapshot before the writer can
         // commit changes that would otherwise leak into later pages.
-        let sequence: i64 =
-            conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
-                row.get(0)
-            })?;
-        let through_sequence = u64_from_nonnegative_i64("events.sequence", sequence)?;
+        let through_sequence = load_event_log_bounds(&conn)?.newest_sequence;
         Ok(SnapshotSession {
             snapshot_id: SnapshotId::new(),
             through_sequence,

@@ -623,7 +623,7 @@ fn detect_interrupted_partial_schema(
         "SELECT COUNT(*) FROM sqlite_schema
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
-                        'agent_sessions', 'artifacts', 'resources')",
+                        'agent_sessions', 'artifacts', 'resources', 'event_retention')",
         [],
         |row| row.get(0),
     )?;
@@ -804,6 +804,48 @@ pub(crate) fn u64_from_nonnegative_i64(field: &'static str, value: i64) -> Resul
     u64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange {
         field,
         value: value.unsigned_abs(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EventLogBounds {
+    pub pruned_through_sequence: u64,
+    pub newest_sequence: u64,
+}
+
+/// Read the explicit replay boundary and durable high-water from one SQLite view.
+///
+/// Missing event sequences are ordinary gaps. Only the singleton retention row
+/// declares history unavailable, so this intentionally never consults `MIN(sequence)`.
+pub(crate) fn load_event_log_bounds(conn: &Connection) -> Result<EventLogBounds, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT singleton_key, pruned_through_sequence
+         FROM event_retention ORDER BY singleton_key",
+    )?;
+    let mut rows = stmt.query([])?;
+    let Some(row) = rows.next()? else {
+        return Err(StoreError::Corruption);
+    };
+    let singleton_key: rusqlite::types::Value = row.get(0)?;
+    let pruned_through: rusqlite::types::Value = row.get(1)?;
+    if rows.next()?.is_some() {
+        return Err(StoreError::Corruption);
+    }
+    let (rusqlite::types::Value::Integer(1), rusqlite::types::Value::Integer(pruned_through)) =
+        (singleton_key, pruned_through)
+    else {
+        return Err(StoreError::Corruption);
+    };
+    let pruned_through_sequence =
+        u64::try_from(pruned_through).map_err(|_| StoreError::Corruption)?;
+    let max_stored: i64 =
+        conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+    let max_stored_sequence = u64_from_nonnegative_i64("events.sequence", max_stored)?;
+    Ok(EventLogBounds {
+        pruned_through_sequence,
+        newest_sequence: pruned_through_sequence.max(max_stored_sequence),
     })
 }
 

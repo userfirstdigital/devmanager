@@ -228,6 +228,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "agent_sessions".to_string(),
             "artifacts".to_string(),
             "command_receipts".to_string(),
+            "event_retention".to_string(),
             "events".to_string(),
             "operations".to_string(),
             "outbox".to_string(),
@@ -265,13 +266,16 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             .map(|r| r.unwrap())
             .collect()
     };
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "v1_initial");
     assert_eq!(rows[0].2.len(), 32);
     assert_eq!(rows[1].0, 2);
     assert_eq!(rows[1].1, "v2_outbox_dispatch_fence");
     assert_eq!(rows[1].2.len(), 32);
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[2].1, "v3_event_retention_boundary");
+    assert_eq!(rows[2].2.len(), 32);
 
     let resource_notnull: i64 = conn
         .query_row(
@@ -344,7 +348,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (3, 'v3_future', 1, ?1)",
+             VALUES (4, 'v4_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");

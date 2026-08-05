@@ -125,6 +125,15 @@ ALTER TABLE outbox ADD COLUMN reconciliation_receipt BLOB;\n\
 CREATE INDEX idx_outbox_claim_ready ON outbox(state, available_at_ms, leased_until_ms);\n\
 ";
 
+const V3_SQL: &str = "\
+CREATE TABLE event_retention (\n\
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),\n\
+  pruned_through_sequence INTEGER NOT NULL CHECK(pruned_through_sequence >= 0)\n\
+);\n\
+INSERT INTO event_retention(singleton_key, pruned_through_sequence)\n\
+VALUES (1, 0);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -135,6 +144,12 @@ pub(crate) const V1_SHA256: [u8; 32] = [
 pub(crate) const V2_SHA256: [u8; 32] = [
     0xa7, 0x80, 0x18, 0xb1, 0x02, 0x8f, 0xca, 0x90, 0x82, 0x46, 0x57, 0x61, 0x7f, 0xce, 0x53, 0x66,
     0x94, 0x31, 0x2f, 0x51, 0x27, 0x4a, 0x84, 0x98, 0x24, 0xa2, 0x0a, 0x01, 0xa1, 0x46, 0x78, 0xcb,
+];
+
+/// Compiled SHA-256 of [`V3_SQL`]. Do not change V3_SQL without updating this literal.
+pub(crate) const V3_SHA256: [u8; 32] = [
+    0x0e, 0xb7, 0x70, 0x7c, 0x6e, 0x72, 0x17, 0xfa, 0xdd, 0xd0, 0x9a, 0x06, 0x05, 0x7f, 0xa8, 0x0e,
+    0x7b, 0x9e, 0x80, 0x2b, 0x73, 0xc5, 0xf1, 0x95, 0x8f, 0xca, 0xf1, 0x5f, 0x10, 0xeb, 0xa8, 0xe5,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -169,6 +184,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V2_SQL),
                 "V2_SHA256 literal must match V2_SQL bytes"
             );
+            assert_eq!(
+                V3_SHA256,
+                sha256_bytes(V3_SQL),
+                "V3_SHA256 literal must match V3_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -181,6 +201,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v2_outbox_dispatch_fence",
                     sql: V2_SQL,
                     sha256: V2_SHA256,
+                },
+                Migration {
+                    version: 3,
+                    name: "v3_event_retention_boundary",
+                    sql: V3_SQL,
+                    sha256: V3_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -346,6 +372,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn schema_v2_upgrades_to_v3_with_explicit_zero_prune_boundary() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v2.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(V1_SQL).expect("apply v1");
+            conn.execute_batch(V2_SQL).expect("apply v2");
+            conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                 VALUES (1, 'v1_initial', 1, ?1),
+                        (2, 'v2_outbox_dispatch_fence', 2, ?2)",
+                rusqlite::params![V1_SHA256.as_slice(), V2_SHA256.as_slice()],
+            )
+            .expect("record v1 and v2");
+        }
+
+        let store = crate::kernel::KernelStore::open(&path).expect("upgrade open");
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen raw");
+        let retention: (i64, i64) = conn
+            .query_row(
+                "SELECT singleton_key, pruned_through_sequence
+                 FROM event_retention WHERE singleton_key = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("V3 retention singleton");
+        assert_eq!(retention, (1, 0));
+
+        let history: Vec<(i64, String, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare("SELECT version, name, sha256 FROM schema_migrations ORDER BY version")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
+        assert_eq!(
+            history[1],
+            (2, "v2_outbox_dispatch_fence".into(), V2_SHA256.to_vec())
+        );
+        assert_eq!(history[2].0, 3);
+        assert_eq!(history[2].1, "v3_event_retention_boundary");
+        assert_eq!(history[2].2, V3_SHA256.to_vec());
     }
 
     #[test]
