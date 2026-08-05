@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
@@ -3994,6 +3995,245 @@ fn command_side_effect_outbox_insert_trigger_rolls_back_acceptance() {
         )
         .unwrap(),
         0
+    );
+}
+
+#[test]
+fn projector_failure_rolls_back_every_record() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x14);
+    create_open_task(&mut store, task, command_id(0x15));
+    drop(store);
+
+    let conn = open_raw(&path);
+    let before_counts = (
+        count_table(&conn, "events"),
+        count_table(&conn, "command_receipts"),
+        count_table(&conn, "operations"),
+        count_table(&conn, "outbox"),
+    );
+    let task_before: (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT title, lifecycle, revision, updated_at_ms FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("task projection before abort");
+    conn.execute_batch(
+        "CREATE TRIGGER test_abort_task_projection
+         BEFORE UPDATE OF lifecycle ON tasks
+         WHEN NEW.lifecycle = 'closing'
+         BEGIN
+           SELECT RAISE(ABORT, 'test projection abort');
+         END;",
+    )
+    .expect("install projection abort trigger");
+    drop(conn);
+
+    let command = command_envelope(
+        command_id(0x16),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .execute(command.clone())
+        .expect_err("projection trigger must abort the whole command");
+    assert_eq!(err, StoreError::ConstraintViolation);
+    drop(store);
+
+    let conn = open_raw(&path);
+    assert_eq!(
+        (
+            count_table(&conn, "events"),
+            count_table(&conn, "command_receipts"),
+            count_table(&conn, "operations"),
+            count_table(&conn, "outbox"),
+        ),
+        before_counts,
+    );
+    let task_after: (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT title, lifecycle, revision, updated_at_ms FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("task projection after abort");
+    assert_eq!(task_after, task_before);
+    let failed_receipt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM command_receipts WHERE command_id = ?1",
+            [command.command_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("failed command receipt count");
+    assert_eq!(failed_receipt, 0);
+    conn.execute_batch("DROP TRIGGER test_abort_task_projection;")
+        .expect("remove projection abort trigger");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen after trigger removal");
+    assert!(matches!(
+        store
+            .execute(command)
+            .expect("the exact command id remains retryable after rollback"),
+        CommandReceipt::Accepted {
+            task_revision: Some(2),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn concurrent_writers_accept_only_one_revision() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0x17);
+    create_open_task(&mut store, task, command_id(0x18));
+    drop(store);
+
+    let conn = open_raw(&path);
+    let events_before = count_table(&conn, "events");
+    let receipts_before = count_table(&conn, "command_receipts");
+    let operations_before = count_table(&conn, "operations");
+    drop(conn);
+
+    let first_command = command_envelope(
+        command_id(0x19),
+        Some(task),
+        Some(1),
+        Command::RenameTask(RenameTaskIntent {
+            title: "Concurrent alpha".into(),
+        }),
+    );
+    let second_command = command_envelope(
+        command_id(0x1A),
+        Some(task),
+        Some(1),
+        Command::RenameTask(RenameTaskIntent {
+            title: "Concurrent beta".into(),
+        }),
+    );
+    let first_store = KernelStore::open(&path).expect("open first writer");
+    let second_store = KernelStore::open(&path).expect("open second writer");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = Arc::clone(&barrier);
+    let first_for_thread = first_command.clone();
+    let first = std::thread::spawn(move || {
+        let mut store = first_store;
+        first_barrier.wait();
+        store.execute(first_for_thread)
+    });
+
+    let second_barrier = Arc::clone(&barrier);
+    let second_for_thread = second_command.clone();
+    let second = std::thread::spawn(move || {
+        let mut store = second_store;
+        second_barrier.wait();
+        store.execute(second_for_thread)
+    });
+
+    let receipts = [
+        first
+            .join()
+            .expect("first writer panicked")
+            .expect("first writer"),
+        second
+            .join()
+            .expect("second writer panicked")
+            .expect("second writer"),
+    ];
+
+    let accepted: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| matches!(receipt, CommandReceipt::Accepted { .. }))
+        .collect();
+    let rejected: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| matches!(receipt, CommandReceipt::Rejected { .. }))
+        .collect();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(rejected.len(), 1);
+    let CommandReceipt::Accepted {
+        command_id: accepted_command_id,
+        task_revision,
+        ..
+    } = accepted[0]
+    else {
+        unreachable!();
+    };
+    assert_eq!(*task_revision, Some(2));
+    assert!(matches!(
+        rejected[0],
+        CommandReceipt::Rejected {
+            code: RejectionCode::RevisionConflict,
+            current_revision: Some(2),
+            ..
+        }
+    ));
+
+    let expected_title = if *accepted_command_id == first_command.command_id {
+        "Concurrent alpha"
+    } else {
+        assert_eq!(*accepted_command_id, second_command.command_id);
+        "Concurrent beta"
+    };
+    let conn = open_raw(&path);
+    let (title, revision): (String, i64) = conn
+        .query_row(
+            "SELECT title, revision FROM tasks WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("final task projection");
+    assert_eq!(title, expected_title);
+    assert_eq!(revision, 2);
+    let rename_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'task.renamed' AND task_id = ?1",
+            [task.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("rename event count");
+    assert_eq!(rename_events, 1);
+    assert!(count_table(&conn, "events") > events_before);
+    assert_eq!(count_table(&conn, "command_receipts"), receipts_before + 2);
+    assert_eq!(count_table(&conn, "operations"), operations_before + 1);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen for exact receipt replay");
+    let counts_before_replay = {
+        let conn = open_raw(&path);
+        (
+            count_table(&conn, "events"),
+            count_table(&conn, "command_receipts"),
+            count_table(&conn, "operations"),
+        )
+    };
+    assert_eq!(
+        store.execute(first_command).expect("replay first command"),
+        receipts[0]
+    );
+    assert_eq!(
+        store
+            .execute(second_command)
+            .expect("replay second command"),
+        receipts[1]
+    );
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(
+        (
+            count_table(&conn, "events"),
+            count_table(&conn, "command_receipts"),
+            count_table(&conn, "operations"),
+        ),
+        counts_before_replay,
     );
 }
 
