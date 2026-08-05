@@ -30,6 +30,7 @@ use crate::kernel::dispatch::{
 use crate::kernel::maintenance;
 use crate::kernel::outbox::{external_idempotency_key, ReplayPolicy};
 use crate::kernel::projector;
+use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 use crate::kernel::StoreMaintenanceReport;
 
@@ -168,6 +169,22 @@ impl KernelStore {
         let status = command_bus::operation_status_in_tx(&tx, operation_id)?;
         tx.commit()?;
         Ok(status)
+    }
+
+    /// Load durable recipes that require process-aware reconciliation.
+    ///
+    /// The returned values are metadata-only `Recovering` facts. This method
+    /// neither probes nor claims that an operating-system process is alive.
+    pub fn load_recovering_resources(&self) -> Result<Vec<RecoveringResource>, StoreError> {
+        let conn = self.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let resources = command_bus::load_all_resources(&tx)?;
+        let recovering = resources
+            .into_iter()
+            .filter_map(RecoveringResource::from_durable)
+            .collect();
+        tx.commit()?;
+        Ok(recovering)
     }
 
     /// Run one explicit non-destructive maintenance pass outside command/query hot paths.

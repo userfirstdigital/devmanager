@@ -4949,6 +4949,25 @@ fn load_resources(
     Ok(resources)
 }
 
+pub(crate) fn load_all_resources(conn: &Connection) -> Result<Vec<ResourceFacts>, StoreError> {
+    let resource_ids = {
+        let mut stmt =
+            conn.prepare("SELECT resource_id FROM resources ORDER BY resource_id ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut resource_ids = Vec::new();
+        for row in rows {
+            resource_ids.push(id16::<ResourceId>("resources.resource_id", &row?)?);
+        }
+        resource_ids
+    };
+
+    let mut resources = Vec::with_capacity(resource_ids.len());
+    for resource_id in resource_ids {
+        resources.push(load_resource(conn, resource_id)?.ok_or(StoreError::Corruption)?);
+    }
+    Ok(resources)
+}
+
 struct ResourceProjectionFields {
     owner_kind: String,
     resource_kind: String,
@@ -4987,14 +5006,21 @@ pub(crate) fn load_resource(
         return Ok(None);
     };
     let task_id = parse_optional_task_scope("resources.task_id", task_id)?;
+    let resource = decode_resource_projection(resource_id, task_id, fields)?;
     if let Some(task_id) = task_id {
-        load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+        let task = load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+        if task.task.lifecycle == TaskLifecycle::Archived
+            && matches!(
+                resource.lifecycle,
+                ResourceLifecycle::Active | ResourceLifecycle::Releasing
+            )
+        {
+            return Err(StoreError::Projection(
+                "archived task cannot own an active or releasing resource".into(),
+            ));
+        }
     }
-    Ok(Some(decode_resource_projection(
-        resource_id,
-        task_id,
-        fields,
-    )?))
+    Ok(Some(resource))
 }
 
 fn decode_resource_projection(

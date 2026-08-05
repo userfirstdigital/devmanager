@@ -3,6 +3,36 @@ use std::fmt;
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
+use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
+
+/// A durable resource recipe that still requires operating-system
+/// reconciliation after kernel startup.
+///
+/// This value deliberately carries no liveness claim. `Active` and
+/// `Releasing` are durable lifecycle facts; both enter the runtime registry as
+/// [`RuntimePresence::Recovering`] until a later process-aware phase proves
+/// what is actually running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveringResource {
+    facts: ResourceFacts,
+}
+
+impl RecoveringResource {
+    pub(crate) fn from_durable(facts: ResourceFacts) -> Option<Self> {
+        match facts.lifecycle {
+            ResourceLifecycle::Active | ResourceLifecycle::Releasing => Some(Self { facts }),
+            ResourceLifecycle::Released => None,
+        }
+    }
+
+    pub fn facts(&self) -> &ResourceFacts {
+        &self.facts
+    }
+
+    pub fn fence(&self) -> ResourceFence {
+        ResourceFence::new(self.facts.id, self.facts.runtime_generation)
+    }
+}
 
 /// What the kernel actually knows about an in-memory resource generation.
 ///
@@ -101,6 +131,13 @@ impl RuntimeRegistry {
 
     pub fn install_recovering(&mut self, fence: ResourceFence) -> Result<(), RuntimeRegistryError> {
         self.install(fence, RuntimePresence::Recovering)
+    }
+
+    pub fn install_recovering_resource(
+        &mut self,
+        resource: &RecoveringResource,
+    ) -> Result<(), RuntimeRegistryError> {
+        self.install_recovering(resource.fence())
     }
 
     pub fn install_current(&mut self, fence: ResourceFence) -> Result<(), RuntimeRegistryError> {

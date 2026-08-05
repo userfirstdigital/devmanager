@@ -1,5 +1,6 @@
 //! Integration tests for [`devmanager::kernel::KernelStore`].
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
@@ -31,9 +32,9 @@ use devmanager::domain::task::{
     TaskLifecycle, WorkspaceRef,
 };
 use devmanager::kernel::{
-    AmbiguityDisposition, DestinationClass, DispatchCompletion, DispatchPermit, Effect,
-    KernelStore, ProjectionRebuild, ReconciliationFinding, ReconciliationOrigin, ReplayPolicy,
-    StoreError,
+    AmbiguityDisposition, CompletionDisposition, DestinationClass, DispatchCompletion,
+    DispatchPermit, Effect, KernelStore, ProjectionRebuild, ReconciliationFinding,
+    ReconciliationOrigin, ReplayPolicy, RuntimePresence, RuntimeRegistry, StoreError,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -3307,6 +3308,201 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
         ],
     )
     .expect("seed active resource");
+}
+
+#[test]
+fn recovery_loads_durable_recipes_without_claiming_process_liveness() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0x20);
+    let host = resource_id(0x1F);
+    let active = resource_id(0x21);
+    let releasing = resource_id(0x22);
+    let released = resource_id(0x23);
+
+    let mut store = KernelStore::open(&path).expect("open");
+    create_open_task(&mut store, task, command_id(0x24));
+    drop(store);
+    seed_active_resource(&path, task, active, 4);
+    seed_active_resource(&path, task, releasing, 5);
+    seed_active_resource(&path, task, released, 6);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE resources SET lifecycle = 'releasing' WHERE resource_id = ?1",
+        [releasing.as_bytes().as_slice()],
+    )
+    .expect("mark releasing fixture");
+    conn.execute(
+        "UPDATE resources SET lifecycle = 'released' WHERE resource_id = ?1",
+        [released.as_bytes().as_slice()],
+    )
+    .expect("mark released fixture");
+    conn.execute(
+        "INSERT INTO resources(
+            resource_id, task_id, owner_kind, resource_kind, recipe, lifecycle,
+            runtime_generation, updated_at_ms
+         ) VALUES (?1, NULL, 'host', 'service', ?2, 'active', 3, 1)",
+        rusqlite::params![
+            host.as_bytes().as_slice(),
+            rmp_serde::to_vec(&ResourceRecipe::Service {
+                command: "host-service".into(),
+            })
+            .unwrap(),
+        ],
+    )
+    .expect("seed host recovery fixture");
+    let events_before = count_table(&conn, "events");
+    drop(conn);
+
+    let store = KernelStore::open(&path).expect("reopen");
+    let recovering = store
+        .load_recovering_resources()
+        .expect("load durable recovery facts");
+
+    assert_eq!(recovering.len(), 3);
+    assert_eq!(recovering[0].facts().id, host);
+    assert_eq!(recovering[0].facts().owner_kind, OwnerKind::Host);
+    assert_eq!(recovering[0].facts().task_id, None);
+    assert_eq!(
+        recovering[0].facts().recipe,
+        ResourceRecipe::Service {
+            command: "host-service".into(),
+        }
+    );
+    assert_eq!(recovering[0].fence(), ResourceFence::new(host, 3));
+    assert_eq!(recovering[1].facts().id, active);
+    assert_eq!(recovering[1].facts().lifecycle, ResourceLifecycle::Active);
+    assert_eq!(
+        recovering[1].facts().recipe,
+        ResourceRecipe::Terminal { cols: 80, rows: 24 }
+    );
+    assert_eq!(recovering[1].fence(), ResourceFence::new(active, 4));
+    assert_eq!(recovering[2].facts().id, releasing);
+    assert_eq!(
+        recovering[2].facts().lifecycle,
+        ResourceLifecycle::Releasing
+    );
+    assert_eq!(recovering[2].fence(), ResourceFence::new(releasing, 5));
+    assert!(
+        recovering
+            .iter()
+            .all(|candidate| candidate.facts().id != released),
+        "released resources are not recovery candidates"
+    );
+
+    let mut registry = RuntimeRegistry::new();
+    for candidate in &recovering {
+        registry
+            .install_recovering_resource(candidate)
+            .expect("install recovery fence");
+    }
+    assert_eq!(registry.presence(host), Some(RuntimePresence::Recovering));
+    assert_eq!(registry.presence(active), Some(RuntimePresence::Recovering));
+    assert_eq!(
+        registry.presence(releasing),
+        Some(RuntimePresence::Recovering)
+    );
+    assert_eq!(registry.presence(released), None);
+
+    let applied = Cell::new(false);
+    assert_eq!(
+        registry.apply_completion(recovering[1].fence(), || applied.set(true)),
+        CompletionDisposition::Recovering
+    );
+    assert!(
+        !applied.get(),
+        "recovery metadata must not accept callbacks"
+    );
+
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(
+        count_table(&conn, "events"),
+        events_before,
+        "loading recovery facts must not write durable state"
+    );
+}
+
+#[test]
+fn recovery_rejects_archived_task_with_live_resource() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0x25);
+    let resource = resource_id(0x26);
+
+    let mut store = KernelStore::open(&path).expect("open");
+    create_open_task(&mut store, task, command_id(0x27));
+    drop(store);
+    seed_active_resource(&path, task, resource, 7);
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'archived' WHERE task_id = ?1",
+        [task.as_bytes().as_slice()],
+    )
+    .expect("forge archived/live projection");
+    drop(conn);
+
+    let store = KernelStore::open(&path).expect("reopen");
+    assert!(
+        matches!(
+            store.load_recovering_resources(),
+            Err(StoreError::Projection(_))
+        ),
+        "archived tasks must not recover live resources"
+    );
+}
+
+#[test]
+fn recovery_validates_released_rows_and_fails_closed_on_invalid_generation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0x28);
+    let resource = resource_id(0x29);
+
+    let mut store = KernelStore::open(&path).expect("open");
+    create_open_task(&mut store, task, command_id(0x2A));
+    drop(store);
+    seed_active_resource(&path, task, resource, 8);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE resources SET lifecycle = 'released', recipe = X'00' WHERE resource_id = ?1",
+        [resource.as_bytes().as_slice()],
+    )
+    .expect("forge released recipe");
+    drop(conn);
+    let store = KernelStore::open(&path).expect("reopen corrupt recipe");
+    assert!(
+        matches!(
+            store.load_recovering_resources(),
+            Err(StoreError::CodecMismatch { .. })
+        ),
+        "excluded released rows must still be decoded"
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE resources SET recipe = ?1, runtime_generation = -1 WHERE resource_id = ?2",
+        rusqlite::params![
+            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            resource.as_bytes().as_slice(),
+        ],
+    )
+    .expect("forge negative generation");
+    drop(conn);
+    let store = KernelStore::open(&path).expect("reopen negative generation");
+    assert!(
+        matches!(
+            store.load_recovering_resources(),
+            Err(StoreError::IntegerOutOfRange {
+                field: "resources.runtime_generation",
+                value: 1,
+            })
+        ),
+        "invalid generations must fail before lifecycle filtering"
+    );
 }
 
 fn external_idempotency_key(operation_id: OperationId, effect_index: u32) -> String {
