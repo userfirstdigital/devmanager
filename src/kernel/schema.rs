@@ -134,6 +134,12 @@ INSERT INTO event_retention(singleton_key, pruned_through_sequence)\n\
 VALUES (1, 0);\n\
 ";
 
+const V4_SQL: &str = "\
+ALTER TABLE outbox ADD COLUMN compacted_payload_sha256 BLOB CHECK(compacted_payload_sha256 IS NULL OR length(compacted_payload_sha256) = 32);\n\
+CREATE INDEX idx_outbox_cleanup_ready ON outbox(event_sequence, effect_index, outbox_id)\n\
+WHERE state IN ('settled', 'failed', 'cancelled') AND compacted_payload_sha256 IS NULL AND length(payload) > 0;\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -150,6 +156,12 @@ pub(crate) const V2_SHA256: [u8; 32] = [
 pub(crate) const V3_SHA256: [u8; 32] = [
     0x0e, 0xb7, 0x70, 0x7c, 0x6e, 0x72, 0x17, 0xfa, 0xdd, 0xd0, 0x9a, 0x06, 0x05, 0x7f, 0xa8, 0x0e,
     0x7b, 0x9e, 0x80, 0x2b, 0x73, 0xc5, 0xf1, 0x95, 0x8f, 0xca, 0xf1, 0x5f, 0x10, 0xeb, 0xa8, 0xe5,
+];
+
+/// Compiled SHA-256 of [`V4_SQL`]. Do not change V4_SQL without updating this literal.
+pub(crate) const V4_SHA256: [u8; 32] = [
+    0xb4, 0x38, 0x36, 0x29, 0x1f, 0xac, 0x5e, 0xd0, 0x21, 0x19, 0x92, 0x39, 0xa4, 0x73, 0x76, 0x87,
+    0xf4, 0x9b, 0x55, 0xeb, 0x20, 0x05, 0x08, 0x85, 0xb4, 0x44, 0xa2, 0xa6, 0xc0, 0x89, 0x18, 0xf3,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -189,6 +201,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V3_SQL),
                 "V3_SHA256 literal must match V3_SQL bytes"
             );
+            assert_eq!(
+                V4_SHA256,
+                sha256_bytes(V4_SQL),
+                "V4_SHA256 literal must match V4_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -207,6 +224,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v3_event_retention_boundary",
                     sql: V3_SQL,
                     sha256: V3_SHA256,
+                },
+                Migration {
+                    version: 4,
+                    name: "v4_terminal_outbox_payload_compaction",
+                    sql: V4_SQL,
+                    sha256: V4_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -414,7 +437,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -423,6 +446,88 @@ mod tests {
         assert_eq!(history[2].0, 3);
         assert_eq!(history[2].1, "v3_event_retention_boundary");
         assert_eq!(history[2].2, V3_SHA256.to_vec());
+        assert_eq!(history[3].0, 4);
+        assert_eq!(history[3].1, "v4_terminal_outbox_payload_compaction");
+        assert_eq!(history[3].2, V4_SHA256.to_vec());
+
+        let compacted_column: (String, i64) = conn
+            .query_row(
+                "SELECT type, \"notnull\" FROM pragma_table_info('outbox')
+                 WHERE name = 'compacted_payload_sha256'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("V4 compacted payload digest column");
+        assert_eq!(compacted_column, ("BLOB".into(), 0));
+        let cleanup_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_outbox_cleanup_ready'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("V4 cleanup index");
+        assert_eq!(cleanup_index, 1);
+    }
+
+    #[test]
+    fn schema_v3_upgrades_to_v4_without_rewriting_existing_payloads() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v3.sqlite3");
+        let original_payload = vec![0x91, 0x01, 0x02, 0x03];
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(V1_SQL).expect("apply v1");
+            conn.execute_batch(V2_SQL).expect("apply v2");
+            conn.execute_batch(V3_SQL).expect("apply v3");
+            conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                 VALUES (1, 'v1_initial', 1, ?1),
+                        (2, 'v2_outbox_dispatch_fence', 2, ?2),
+                        (3, 'v3_event_retention_boundary', 3, ?3)",
+                rusqlite::params![
+                    V1_SHA256.as_slice(),
+                    V2_SHA256.as_slice(),
+                    V3_SHA256.as_slice(),
+                ],
+            )
+            .expect("record v1 through v3");
+            conn.pragma_update(None, "foreign_keys", false)
+                .expect("disable foreign keys for isolated legacy-row fixture");
+            conn.execute(
+                "INSERT INTO outbox(
+                    outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                    replay_policy, payload, state, available_at_ms, leased_until_ms,
+                    dispatch_started_at_ms, attempts, last_error_class, lease_generation,
+                    reconciliation_receipt
+                 ) VALUES (?1, ?2, 0, 7, 'task_teardown', 'retry_safe', ?3,
+                           'settled', 11, NULL, 11, 1, NULL, 1, NULL)",
+                rusqlite::params![&[0x31u8; 16], &[0x32u8; 16], &original_payload],
+            )
+            .expect("seed existing V3 outbox payload");
+        }
+
+        drop(crate::kernel::KernelStore::open(&path).expect("upgrade open"));
+
+        let conn = Connection::open(&path).expect("reopen raw");
+        let (payload, compacted_digest): (Vec<u8>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT payload, compacted_payload_sha256 FROM outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserved V3 row");
+        assert_eq!(payload, original_payload);
+        assert!(compacted_digest.is_none());
+        let v4: (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT name, sha256 FROM schema_migrations WHERE version = 4",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("V4 migration record");
+        assert_eq!(v4.0, "v4_terminal_outbox_payload_compaction");
+        assert_eq!(v4.1, V4_SHA256.to_vec());
     }
 
     #[test]

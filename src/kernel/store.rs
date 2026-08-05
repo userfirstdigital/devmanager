@@ -19,7 +19,8 @@ use crate::domain::operation::{
     OperationOutcome, OperationOutcomeKind, OperationState, OutcomeSource, ResourceFence,
 };
 use crate::kernel::command_bus::{
-    self, load_outbox_row_by_id, validate_dispatch_candidate_lineage, OutboxRow,
+    self, effect_document_for_terminal_replay, load_outbox_row_by_id,
+    validate_dispatch_candidate_lineage, OutboxRow,
 };
 use crate::kernel::dispatch::{
     ambiguity_disposition, decode_absence_receipt, encode_absence_receipt, AbsenceReceiptDocument,
@@ -27,7 +28,7 @@ use crate::kernel::dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 use crate::kernel::maintenance;
-use crate::kernel::outbox::{decode_effect_document, external_idempotency_key, ReplayPolicy};
+use crate::kernel::outbox::{external_idempotency_key, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 use crate::kernel::StoreMaintenanceReport;
@@ -172,7 +173,10 @@ impl KernelStore {
     /// Run one explicit non-destructive maintenance pass outside command/query hot paths.
     #[allow(dead_code)] // consumed by the bounded host scheduler in a later phase
     pub(crate) fn run_maintenance(&mut self) -> Result<StoreMaintenanceReport, StoreError> {
-        maintenance::run(&self.conn)
+        maintenance::run(
+            &mut self.conn,
+            maintenance::DEFAULT_OUTBOX_CLEANUP_BATCH_ROWS,
+        )
     }
 
     /// Claim the next dispatch-ready outbox row under a bounded lease fence.
@@ -1206,13 +1210,14 @@ fn load_next_dispatch_candidate(
         Option<String>,
         i64,
         Option<Vec<u8>>,
+        Option<Vec<u8>>,
     )> = tx
         .query_row(
             "SELECT o.outbox_id, o.operation_id, o.effect_index, o.event_sequence,
                     o.destination_class, o.replay_policy, o.payload, o.state,
                     o.available_at_ms, o.leased_until_ms, o.dispatch_started_at_ms,
                     o.attempts, o.last_error_class, o.lease_generation,
-                    o.reconciliation_receipt
+                    o.reconciliation_receipt, o.compacted_payload_sha256
              FROM outbox o
              JOIN operations op ON op.operation_id = o.operation_id
              WHERE op.state = 'accepted'
@@ -1264,6 +1269,7 @@ fn load_next_dispatch_candidate(
                     row.get(12)?,
                     row.get(13)?,
                     row.get(14)?,
+                    row.get(15)?,
                 ))
             },
         )
@@ -1284,6 +1290,7 @@ fn load_next_dispatch_candidate(
         last_error_class,
         lease_generation,
         reconciliation_receipt,
+        compacted_payload_sha256,
     )) = row
     else {
         return Ok(None);
@@ -1307,6 +1314,7 @@ fn load_next_dispatch_candidate(
         last_error_class,
         lease_generation,
         reconciliation_receipt,
+        compacted_payload_sha256,
     }))
 }
 
@@ -2067,8 +2075,7 @@ fn record_reconciliation_in_tx(
         if claim.origin() != ReconciliationOrigin::Accepted {
             return Err(StoreError::InvalidDispatchTransition);
         }
-        let effect_doc =
-            decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+        let effect_doc = effect_document_for_terminal_replay(&row, claim.document())?;
         validate_reconciliation_claim_identity(&row, claim, &effect_doc)?;
         let durable_outcome_at: Option<i64> = tx.query_row(
             "SELECT outcome_at_ms FROM operations WHERE operation_id = ?1",
@@ -2242,9 +2249,118 @@ fn build_present_reconciliation_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::command::{Command, CreateTaskIntent};
+    use crate::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
+    use crate::domain::operation::{CancellationReason, OperationErrorCode};
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        WorkspaceRef,
+    };
+    use crate::kernel::maintenance::OutboxPayloadCleanup;
     use crate::kernel::WalCheckpointOutcome;
     use rusqlite::ffi::Error as FfiError;
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct TerminalCloseFixture {
+        command: CommandEnvelope,
+        receipt: CommandReceipt,
+        operation_id: OperationId,
+        permit: DispatchPermit,
+        completion: DispatchCompletion,
+        state: OperationState,
+    }
+
+    fn maintenance_envelope(
+        command_id: CommandId,
+        task_id: Option<TaskId>,
+        expected_task_revision: Option<u64>,
+        command: Command,
+    ) -> CommandEnvelope {
+        CommandEnvelope {
+            command_id,
+            client_id: ClientId::new(),
+            task_id,
+            issued_at_ms: 1_725_000_000_100,
+            expected_task_revision,
+            command,
+        }
+    }
+
+    fn seed_open_task(store: &mut KernelStore) -> TaskId {
+        let task_id = TaskId::new();
+        store
+            .execute(maintenance_envelope(
+                CommandId::new(),
+                None,
+                None,
+                Command::CreateTask(CreateTaskIntent {
+                    id: task_id,
+                    environment_id: EnvironmentId::new(),
+                    title: "Maintenance fixture".into(),
+                    description: None,
+                    project_id: ProjectId::new(),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    created_at_ms: 1_725_000_000_000,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                }),
+            ))
+            .expect("create maintenance fixture task");
+        task_id
+    }
+
+    fn seed_terminal_close(
+        store: &mut KernelStore,
+        completion: DispatchCompletion,
+    ) -> TerminalCloseFixture {
+        let task_id = seed_open_task(store);
+        let command = maintenance_envelope(
+            CommandId::new(),
+            Some(task_id),
+            Some(1),
+            Command::BeginCloseTask,
+        );
+        let receipt = store.execute(command.clone()).expect("accept close");
+        let CommandReceipt::Accepted { operation_id, .. } = receipt.clone() else {
+            panic!("close must be accepted: {receipt:?}");
+        };
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim close")
+            .expect("close dispatch ready");
+        let permit = store.begin_dispatch(&claim).expect("begin close dispatch");
+        let state = store
+            .record_dispatch_completion(&permit, completion.clone())
+            .expect("finish close dispatch");
+        TerminalCloseFixture {
+            command,
+            receipt,
+            operation_id,
+            permit,
+            completion,
+            state,
+        }
+    }
+
+    fn seed_pending_close(store: &mut KernelStore) -> OperationId {
+        let task_id = seed_open_task(store);
+        let receipt = store
+            .execute(maintenance_envelope(
+                CommandId::new(),
+                Some(task_id),
+                Some(1),
+                Command::BeginCloseTask,
+            ))
+            .expect("accept pending close");
+        let CommandReceipt::Accepted { operation_id, .. } = receipt else {
+            panic!("pending close must be accepted: {receipt:?}");
+        };
+        operation_id
+    }
 
     #[test]
     fn command_contract_maps_sqlite_constraint_busy_and_corruption() {
@@ -2441,7 +2557,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .expect("migration count"),
-            3,
+            4,
             "maintenance must not delete durable rows"
         );
     }
@@ -2450,9 +2566,9 @@ mod tests {
     fn full_synchronous_scope_restores_normal_after_action_failure() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("kernel.sqlite3");
-        let store = KernelStore::open(&path).expect("open");
+        let mut store = KernelStore::open(&path).expect("open");
 
-        let error = maintenance::with_full_synchronous(&store.conn, |conn| {
+        let error = maintenance::with_full_synchronous(&mut store.conn, |conn| {
             assert_eq!(synchronous_mode(conn), 2, "action must run at FULL");
             Err::<(), _>(StoreError::Busy)
         })
@@ -2480,5 +2596,257 @@ mod tests {
             Err(StoreError::IntegrityCheckFailed(_))
         ));
         assert_eq!(synchronous_mode(&store.conn), 1, "must remain NORMAL");
+    }
+
+    #[test]
+    fn terminal_outbox_payload_cleanup_is_bounded_and_preserves_idempotency() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let fixtures = [
+            seed_terminal_close(&mut store, DispatchCompletion::Settled),
+            seed_terminal_close(
+                &mut store,
+                DispatchCompletion::Failed {
+                    code: OperationErrorCode::SideEffectFailed,
+                },
+            ),
+            seed_terminal_close(
+                &mut store,
+                DispatchCompletion::Cancelled {
+                    reason: CancellationReason::Superseded,
+                },
+            ),
+        ];
+        let pending_operation = seed_pending_close(&mut store);
+
+        let first_payload_bytes: i64 = store
+            .conn
+            .query_row(
+                "SELECT length(payload) FROM outbox WHERE operation_id = ?1",
+                [fixtures[0].operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("terminal payload bytes");
+        assert!(first_payload_bytes > 0);
+
+        let first = maintenance::run(&mut store.conn, 1).expect("first bounded maintenance");
+        assert_eq!(
+            first.outbox_payloads,
+            OutboxPayloadCleanup {
+                rows_compacted: 1,
+                payload_bytes_reclaimed: u64::try_from(first_payload_bytes)
+                    .expect("payload bytes fit"),
+                has_more: true,
+            }
+        );
+
+        let compacted_operation_bytes: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT operation_id FROM outbox
+                 WHERE compacted_payload_sha256 IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("one compacted row");
+        let compacted_operation = OperationId::from_bytes(
+            compacted_operation_bytes
+                .try_into()
+                .expect("operation id bytes"),
+        )
+        .expect("operation id");
+        let compacted = fixtures
+            .iter()
+            .find(|fixture| fixture.operation_id == compacted_operation)
+            .expect("compacted fixture");
+        let (payload_len, digest_len): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT length(payload), length(compacted_payload_sha256)
+                 FROM outbox WHERE operation_id = ?1",
+                [compacted.operation_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("compacted payload marker");
+        assert_eq!((payload_len, digest_len), (0, 32));
+
+        assert_eq!(
+            store
+                .execute(compacted.command.clone())
+                .expect("duplicate command"),
+            compacted.receipt
+        );
+        assert_eq!(
+            store
+                .record_dispatch_completion(&compacted.permit, compacted.completion.clone())
+                .expect("duplicate completion"),
+            compacted.state
+        );
+        assert_eq!(
+            store
+                .operation_status(compacted.operation_id)
+                .expect("operation status"),
+            Some(compacted.state.clone())
+        );
+        store
+            .rebuild_projections()
+            .expect("rebuild after compaction");
+
+        let pending: (i64, Option<Vec<u8>>) = store
+            .conn
+            .query_row(
+                "SELECT length(payload), compacted_payload_sha256
+                 FROM outbox WHERE operation_id = ?1",
+                [pending_operation.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("pending payload");
+        assert!(pending.0 > 0);
+        assert!(pending.1.is_none());
+
+        let second = maintenance::run(&mut store.conn, 2).expect("second bounded maintenance");
+        assert_eq!(second.outbox_payloads.rows_compacted, 2);
+        assert!(!second.outbox_payloads.has_more);
+        drop(store);
+
+        let mut store = KernelStore::open(&path).expect("reopen compacted store");
+        for fixture in fixtures {
+            assert_eq!(
+                store
+                    .execute(fixture.command)
+                    .expect("duplicate after reopen"),
+                fixture.receipt
+            );
+            assert_eq!(
+                store
+                    .operation_status(fixture.operation_id)
+                    .expect("status after reopen"),
+                Some(fixture.state)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_outbox_payload_cleanup_rolls_back_a_corrupt_batch() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let first = seed_terminal_close(&mut store, DispatchCompletion::Settled);
+        let second = seed_terminal_close(
+            &mut store,
+            DispatchCompletion::Cancelled {
+                reason: CancellationReason::Superseded,
+            },
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET payload = X'00' WHERE operation_id = ?1",
+                [second.operation_id.as_bytes().as_slice()],
+            )
+            .expect("corrupt one terminal payload");
+
+        assert!(maintenance::run(&mut store.conn, 2).is_err());
+        let rows: Vec<(i64, Option<Vec<u8>>)> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT length(payload), compacted_payload_sha256 FROM outbox
+                     WHERE operation_id IN (?1, ?2) ORDER BY operation_id",
+                )
+                .expect("prepare rollback check");
+            stmt.query_map(
+                rusqlite::params![
+                    first.operation_id.as_bytes().as_slice(),
+                    second.operation_id.as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query rollback check")
+            .map(|row| row.expect("rollback row"))
+            .collect()
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, digest)| digest.is_none()));
+        assert!(rows.iter().all(|(payload_len, _)| *payload_len > 0));
+    }
+
+    #[test]
+    fn compacted_payload_marker_fails_closed_when_forged() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let terminal = seed_terminal_close(&mut store, DispatchCompletion::Settled);
+        let pending = seed_pending_close(&mut store);
+
+        let original_terminal_payload: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT payload FROM outbox WHERE operation_id = ?1",
+                [terminal.operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("terminal payload");
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET compacted_payload_sha256 = zeroblob(32)
+                 WHERE operation_id = ?1",
+                [terminal.operation_id.as_bytes().as_slice()],
+            )
+            .expect("forge marker beside full payload");
+        assert_eq!(
+            store.operation_status(terminal.operation_id),
+            Err(StoreError::Corruption)
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET payload = X'', compacted_payload_sha256 = NULL
+                 WHERE operation_id = ?1",
+                [terminal.operation_id.as_bytes().as_slice()],
+            )
+            .expect("forge empty payload without marker");
+        assert_eq!(
+            store.operation_status(terminal.operation_id),
+            Err(StoreError::Corruption)
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET payload = ?1, compacted_payload_sha256 = NULL
+                 WHERE operation_id = ?2",
+                rusqlite::params![
+                    original_terminal_payload,
+                    terminal.operation_id.as_bytes().as_slice(),
+                ],
+            )
+            .expect("restore valid terminal payload");
+
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET payload = X'', compacted_payload_sha256 = zeroblob(32)
+                 WHERE operation_id = ?1",
+                [pending.as_bytes().as_slice()],
+            )
+            .expect("forge active compaction marker");
+        assert_eq!(store.operation_status(pending), Err(StoreError::Corruption));
+
+        let report = maintenance::run(&mut store.conn, 1).expect("compact terminal row");
+        assert_eq!(report.outbox_payloads.rows_compacted, 1);
+        store
+            .conn
+            .execute(
+                "UPDATE outbox SET compacted_payload_sha256 = zeroblob(32)
+                 WHERE operation_id = ?1",
+                [terminal.operation_id.as_bytes().as_slice()],
+            )
+            .expect("forge terminal digest");
+        assert_eq!(
+            store.operation_status(terminal.operation_id),
+            Err(StoreError::Corruption)
+        );
     }
 }

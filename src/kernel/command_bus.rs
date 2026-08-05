@@ -29,9 +29,9 @@ use crate::domain::task::{
 };
 use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, DispatchPermit};
 use crate::kernel::outbox::{
-    decode_effect_document, decode_receipt_document, encode_effect_document,
-    encode_receipt_document, external_idempotency_key, plan_effects, Effect, OperationFence,
-    PlannedEffect, ReplayPolicy,
+    decode_effect_document, decode_receipt_document, effect_document_sha256,
+    encode_effect_document, encode_receipt_document, external_idempotency_key, plan_effects,
+    Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
 use crate::kernel::store::{
@@ -301,12 +301,6 @@ fn record_outcome_in_tx(
         .committed_sequence
         .ok_or(StoreError::Corruption)?;
     let fence = operation_fence_from_projection(&operation)?;
-    let effect_doc = decode_effect_document(
-        &outbox.payload,
-        &outbox.destination_class,
-        &outbox.replay_policy,
-    )?;
-    validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
 
     // Accepted-fence comparison precedes idempotent matching.
     if !outcome_fences_match_accepted(&outcome, fence) {
@@ -331,6 +325,8 @@ fn record_outcome_in_tx(
 
     match operation.state.as_str() {
         "accepted" => {
+            let effect_doc = decode_full_outbox_payload(outbox)?;
+            validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
             if !outcome.source.is_dispatch() {
                 return Err(StoreError::ConflictingOutcome);
             }
@@ -356,6 +352,8 @@ fn record_outcome_in_tx(
             )
         }
         "uncertain" => {
+            let effect_doc = decode_full_outbox_payload(outbox)?;
+            validate_effect_matches_fence(&effect_doc.effect, task_id, fence)?;
             let OutcomeSource::VerifiedReconciliation {
                 effect_index,
                 external_identity: _,
@@ -419,12 +417,15 @@ fn record_dispatch_completion_in_tx(
     let outbox = load_outbox_row_by_id(tx, permit.outbox_id())?.ok_or(StoreError::StaleClaim)?;
     let operation =
         load_operation_projection_by_id(tx, outbox.operation_id)?.ok_or(StoreError::Corruption)?;
-    let effect_doc = decode_effect_document(
-        &outbox.payload,
-        &outbox.destination_class,
-        &outbox.replay_policy,
-    )?;
     let fence = operation_fence_from_projection(&operation)?;
+    let effect_doc = match operation.state.as_str() {
+        "accepted" => decode_full_outbox_payload(&outbox)?,
+        "settled" | "failed" | "cancelled" => {
+            effect_document_for_terminal_replay(&outbox, permit.document())?
+        }
+        "uncertain" => return Err(StoreError::InvalidDispatchTransition),
+        _ => return Err(StoreError::Corruption),
+    };
     validate_dispatch_permit_identity(&outbox, permit, &effect_doc, fence)?;
 
     let occurred_at_ms = match operation.state.as_str() {
@@ -729,8 +730,7 @@ pub(crate) fn validate_dispatch_candidate_lineage(
     let row = &rows[0];
     let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
     let fence = operation_fence_from_projection(&operation)?;
-    let document =
-        decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+    let document = decode_full_outbox_payload(row)?;
     validate_effect_matches_fence(&document.effect, task_id, fence)?;
     require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
     Ok((document, fence))
@@ -1782,11 +1782,7 @@ pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Resu
                     if operation.state != "accepted" {
                         return Err(StoreError::Corruption);
                     }
-                    let decoded = decode_effect_document(
-                        &row.payload,
-                        &row.destination_class,
-                        &row.replay_policy,
-                    )?;
+                    let decoded = decode_full_outbox_payload(&row)?;
                     validate_nonterminal_outbox_dispatch_metadata(
                         &row,
                         operation.accepted_at_ms,
@@ -2129,8 +2125,7 @@ fn validate_side_effect_active_outbox(
         if row.lease_generation < 0 {
             return Err(StoreError::Corruption);
         }
-        let decoded =
-            decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+        let decoded = decode_full_outbox_payload(row)?;
         if decoded != planned.document {
             return Err(StoreError::Corruption);
         }
@@ -2150,6 +2145,178 @@ fn validate_side_effect_active_outbox(
         validate_effect_matches_fence(&decoded.effect, scope, fence)?;
     }
     Ok(())
+}
+
+fn decode_full_outbox_payload(row: &OutboxRow) -> Result<PlannedEffectDocument, StoreError> {
+    if row.payload.is_empty() || row.compacted_payload_sha256.is_some() {
+        return Err(StoreError::Corruption);
+    }
+    decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)
+}
+
+fn validate_compacted_payload_marker(
+    row: &OutboxRow,
+    expected: &PlannedEffectDocument,
+) -> Result<bool, StoreError> {
+    if !row.payload.is_empty()
+        || !matches!(row.state.as_str(), "settled" | "failed" | "cancelled")
+        || row.destination_class != expected.destination_class.as_str()
+        || row.replay_policy != expected.replay_policy.as_str()
+    {
+        return Err(StoreError::Corruption);
+    }
+    let stored = row
+        .compacted_payload_sha256
+        .as_deref()
+        .ok_or(StoreError::Corruption)?;
+    let stored: [u8; 32] = stored.try_into().map_err(|_| StoreError::Corruption)?;
+    Ok(stored == effect_document_sha256(expected)?)
+}
+
+fn validate_terminal_outbox_payload(
+    row: &OutboxRow,
+    expected: &PlannedEffectDocument,
+) -> Result<(), StoreError> {
+    if row.payload.is_empty() {
+        if validate_compacted_payload_marker(row, expected)? {
+            return Ok(());
+        }
+        return Err(StoreError::Corruption);
+    }
+    let decoded = decode_full_outbox_payload(row)?;
+    if decoded != *expected {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
+}
+
+/// Recover the canonical effect document from an opaque callback token after
+/// terminal payload cleanup. The complete durable receipt lineage is validated
+/// again by the outcome path before any idempotent return.
+pub(crate) fn effect_document_for_terminal_replay(
+    row: &OutboxRow,
+    callback_document: &PlannedEffectDocument,
+) -> Result<PlannedEffectDocument, StoreError> {
+    if row.payload.is_empty() {
+        if !validate_compacted_payload_marker(row, callback_document)? {
+            return Err(StoreError::StaleClaim);
+        }
+        return Ok(callback_document.clone());
+    }
+    decode_full_outbox_payload(row)
+}
+
+pub(crate) fn compact_terminal_outbox_payloads_in_tx(
+    tx: &Transaction<'_>,
+    batch_limit: u32,
+) -> Result<(u64, u64, bool), StoreError> {
+    if batch_limit == 0 {
+        return Err(StoreError::ConstraintViolation);
+    }
+    let candidate_ids = {
+        let mut stmt = tx.prepare(
+            "SELECT outbox_id FROM outbox
+             WHERE state IN ('settled', 'failed', 'cancelled')
+               AND compacted_payload_sha256 IS NULL
+               AND length(payload) > 0
+             ORDER BY event_sequence, effect_index, outbox_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([i64::from(batch_limit)], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut rows_compacted = 0u64;
+    let mut payload_bytes_reclaimed = 0u64;
+    for candidate in candidate_ids {
+        let outbox_id = id16::<OutboxId>("outbox.outbox_id", &candidate)?;
+        let row = load_outbox_row_by_id(tx, outbox_id)?.ok_or(StoreError::Corruption)?;
+        if !matches!(row.state.as_str(), "settled" | "failed" | "cancelled")
+            || row.payload.is_empty()
+            || row.compacted_payload_sha256.is_some()
+        {
+            return Err(StoreError::Corruption);
+        }
+
+        let operation =
+            load_operation_projection_by_id(tx, row.operation_id)?.ok_or(StoreError::Corruption)?;
+        let command_id = load_operation_command_id(tx, row.operation_id)?;
+        let receipt_row = load_receipt_correlation(tx, command_id)?;
+        let CommandReceipt::Accepted {
+            command_id: receipt_command_id,
+            operation_id: receipt_operation_id,
+            event_ids,
+            task_revision,
+        } = &receipt_row.receipt
+        else {
+            return Err(StoreError::Corruption);
+        };
+        if *receipt_command_id != command_id || *receipt_operation_id != row.operation_id {
+            return Err(StoreError::Corruption);
+        }
+        let committed_sequence = receipt_row
+            .committed_sequence
+            .map(|sequence| u64_to_sqlite_i64("command_receipts.committed_sequence", sequence))
+            .transpose()?;
+        validate_accepted_receipt_correlation(
+            tx,
+            command_id,
+            row.operation_id,
+            event_ids,
+            *task_revision,
+            receipt_row.task_id,
+            committed_sequence,
+            receipt_row.created_at_ms,
+        )?;
+        if operation.state != row.state {
+            return Err(StoreError::Corruption);
+        }
+
+        let document = decode_full_outbox_payload(&row)?;
+        let canonical_payload = encode_effect_document(&document)?;
+        if canonical_payload != row.payload {
+            return Err(StoreError::Corruption);
+        }
+        let digest = effect_document_sha256(&document)?;
+        let payload_bytes = u64::try_from(row.payload.len()).map_err(|_| StoreError::Corruption)?;
+        payload_bytes_reclaimed = payload_bytes_reclaimed
+            .checked_add(payload_bytes)
+            .ok_or(StoreError::Corruption)?;
+        let changed = tx.execute(
+            "UPDATE outbox
+             SET payload = X'', compacted_payload_sha256 = ?1
+             WHERE outbox_id = ?2 AND state = ?3
+               AND compacted_payload_sha256 IS NULL AND payload = ?4",
+            rusqlite::params![
+                digest.as_slice(),
+                row.outbox_id.as_bytes().as_slice(),
+                row.state,
+                row.payload,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Corruption);
+        }
+        rows_compacted = rows_compacted
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+    }
+
+    let has_more: i64 = tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM outbox
+           WHERE state IN ('settled', 'failed', 'cancelled')
+             AND compacted_payload_sha256 IS NULL
+             AND length(payload) > 0
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    match has_more {
+        0 => Ok((rows_compacted, payload_bytes_reclaimed, false)),
+        1 => Ok((rows_compacted, payload_bytes_reclaimed, true)),
+        _ => Err(StoreError::Corruption),
+    }
 }
 
 fn validate_side_effect_terminal_receipt(
@@ -2213,12 +2380,8 @@ fn validate_side_effect_terminal_receipt(
             dispatch_upper_bound,
             was_reconciled,
         )?;
-        let decoded =
-            decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
-        if decoded != planned.document {
-            return Err(StoreError::Corruption);
-        }
-        validate_effect_matches_fence(&decoded.effect, scope, fence)?;
+        validate_terminal_outbox_payload(row, &planned.document)?;
+        validate_effect_matches_fence(&planned.document.effect, scope, fence)?;
     }
 
     validate_terminal_outcome_history(
@@ -3727,6 +3890,8 @@ pub(crate) struct OutboxRow {
     /// V2 column reserved for e2; must remain NULL and unused in e1.
     #[allow(dead_code)]
     pub(crate) reconciliation_receipt: Option<Vec<u8>>,
+    /// Present only after intentional cleanup of an eligible terminal payload.
+    pub(crate) compacted_payload_sha256: Option<Vec<u8>>,
 }
 
 fn load_outbox_rows(
@@ -3737,7 +3902,7 @@ fn load_outbox_rows(
         "SELECT outbox_id, operation_id, effect_index, event_sequence, destination_class,
                 replay_policy, payload, state, available_at_ms, leased_until_ms,
                 dispatch_started_at_ms, attempts, last_error_class, lease_generation,
-                reconciliation_receipt
+                reconciliation_receipt, compacted_payload_sha256
          FROM outbox
          WHERE operation_id = ?1
          ORDER BY effect_index ASC",
@@ -3759,6 +3924,7 @@ fn load_outbox_rows(
             row.get::<_, Option<String>>(12)?,
             row.get::<_, i64>(13)?,
             row.get::<_, Option<Vec<u8>>>(14)?,
+            row.get::<_, Option<Vec<u8>>>(15)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -3780,6 +3946,7 @@ fn load_outbox_rows(
             last_error_class,
             lease_generation,
             reconciliation_receipt,
+            compacted_payload_sha256,
         ) = row?;
         if effect_index != expected_index {
             return Err(StoreError::Corruption);
@@ -3809,6 +3976,7 @@ fn load_outbox_rows(
             last_error_class,
             lease_generation,
             reconciliation_receipt,
+            compacted_payload_sha256,
         });
     }
     Ok(out)
@@ -3833,12 +4001,13 @@ pub(crate) fn load_outbox_row_by_id(
         Option<String>,
         i64,
         Option<Vec<u8>>,
+        Option<Vec<u8>>,
     )> = tx
         .query_row(
             "SELECT operation_id, effect_index, event_sequence, destination_class,
                     replay_policy, payload, state, available_at_ms, leased_until_ms,
                     dispatch_started_at_ms, attempts, last_error_class, lease_generation,
-                    reconciliation_receipt
+                    reconciliation_receipt, compacted_payload_sha256
              FROM outbox WHERE outbox_id = ?1",
             [outbox_id.as_bytes().as_slice()],
             |row| {
@@ -3857,6 +4026,7 @@ pub(crate) fn load_outbox_row_by_id(
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
@@ -3876,6 +4046,7 @@ pub(crate) fn load_outbox_row_by_id(
         last_error_class,
         lease_generation,
         reconciliation_receipt,
+        compacted_payload_sha256,
     )) = row
     else {
         return Ok(None);
@@ -3899,6 +4070,7 @@ pub(crate) fn load_outbox_row_by_id(
         last_error_class,
         lease_generation,
         reconciliation_receipt,
+        compacted_payload_sha256,
     }))
 }
 

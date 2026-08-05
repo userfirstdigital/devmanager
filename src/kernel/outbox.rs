@@ -4,6 +4,7 @@
 //! the replay policy/destination columns they must agree with.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::command::{CommandReceipt, RejectionCode};
 use crate::domain::event::Event;
@@ -335,6 +336,14 @@ pub(crate) fn encode_effect_document(doc: &PlannedEffectDocument) -> Result<Vec<
     })
 }
 
+pub(crate) fn effect_document_sha256(doc: &PlannedEffectDocument) -> Result<[u8; 32], StoreError> {
+    let encoded = encode_effect_document(doc)?;
+    let digest = Sha256::digest(encoded);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
 pub(crate) fn decode_effect_document(
     payload: &[u8],
     destination_class_column: &str,
@@ -647,6 +656,46 @@ mod tests {
             )
             .is_err(),
             "unknown fields inside effect payload must fail"
+        );
+    }
+
+    fn digest_hex(bytes: [u8; 32]) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in bytes {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    #[test]
+    fn effect_document_digest_golden_values_guard_compacted_rows() {
+        let teardown = PlannedEffectDocument::new(
+            Effect::BeginTaskTeardown {
+                task_id: TaskId::from_bytes(fixed_uuid_v7(0x11)).unwrap(),
+                action_epoch: 2,
+            },
+            ReplayPolicy::RetrySafe,
+        );
+        assert_eq!(
+            digest_hex(effect_document_sha256(&teardown).expect("teardown digest")),
+            "6f88ecb0354de3f3b1938915e61e3eedf5238c3f0001c61301309cf1d9ae42f6"
+        );
+
+        let release = PlannedEffectDocument::new(
+            Effect::ReleaseResource {
+                task_id: TaskId::from_bytes(fixed_uuid_v7(0x12)).unwrap(),
+                action_epoch: 3,
+                resource_fence: ResourceFence::new(
+                    ResourceId::from_bytes(fixed_uuid_v7(0x10)).unwrap(),
+                    4,
+                ),
+            },
+            ReplayPolicy::ReconcileBeforeRetry,
+        );
+        assert_eq!(
+            digest_hex(effect_document_sha256(&release).expect("release digest")),
+            "71cd5a27f493f539b1fe442bf98463762140b8db790dfe21c2eb3320fb4390d1"
         );
     }
 

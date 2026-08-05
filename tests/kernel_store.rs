@@ -37,6 +37,7 @@ use devmanager::kernel::{
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -244,6 +245,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "idx_events_task_sequence".to_string(),
             "idx_operations_state".to_string(),
             "idx_outbox_claim_ready".to_string(),
+            "idx_outbox_cleanup_ready".to_string(),
             "idx_outbox_delivery_state".to_string(),
             "idx_resources_active".to_string(),
         ]
@@ -266,7 +268,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             .map(|r| r.unwrap())
             .collect()
     };
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "v1_initial");
     assert_eq!(rows[0].2.len(), 32);
@@ -276,6 +278,19 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
     assert_eq!(rows[2].0, 3);
     assert_eq!(rows[2].1, "v3_event_retention_boundary");
     assert_eq!(rows[2].2.len(), 32);
+    assert_eq!(rows[3].0, 4);
+    assert_eq!(rows[3].1, "v4_terminal_outbox_payload_compaction");
+    assert_eq!(rows[3].2.len(), 32);
+
+    let compacted_digest_column: (String, i64) = conn
+        .query_row(
+            "SELECT type, \"notnull\" FROM pragma_table_info('outbox')
+             WHERE name = 'compacted_payload_sha256'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("V4 compacted payload digest column");
+    assert_eq!(compacted_digest_column, ("BLOB".into(), 0));
 
     let resource_notnull: i64 = conn
         .query_row(
@@ -348,7 +363,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (4, 'v4_future', 1, ?1)",
+             VALUES (5, 'v5_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");
@@ -9879,6 +9894,23 @@ fn accepted_reconciliation_present_evidence_resolves_atomically() {
             store.record_reconciliation(&claim, conflicting),
             Err(StoreError::ConflictingOutcome),
         );
+        let conn = open_raw(&path);
+        let payload: Vec<u8> = conn
+            .query_row("SELECT payload FROM outbox", [], |row| row.get(0))
+            .expect("terminal reconciliation payload");
+        let digest = Sha256::digest(&payload);
+        conn.execute(
+            "UPDATE outbox SET payload = X'', compacted_payload_sha256 = ?1",
+            [digest.as_slice()],
+        )
+        .expect("compact reconciled failure payload");
+        drop(conn);
+        assert_eq!(
+            store
+                .record_reconciliation(&claim, finding)
+                .expect("exact compacted failure replay"),
+            state,
+        );
         drop(store);
 
         let conn = open_raw(&path);
@@ -9955,14 +9987,12 @@ fn accepted_reconciliation_present_evidence_resolves_atomically() {
             .claim_next_reconciliation(Duration::from_secs(30))
             .expect("reconciliation claim")
             .expect("reconciliation ready");
+        let finding = ReconciliationFinding::PresentSettled {
+            lookup_identity: claim.lookup_identity().to_owned(),
+            external_identity: "provider:release-settled".into(),
+        };
         let state = store
-            .record_reconciliation(
-                &claim,
-                ReconciliationFinding::PresentSettled {
-                    lookup_identity: claim.lookup_identity().to_owned(),
-                    external_identity: "provider:release-settled".into(),
-                },
-            )
+            .record_reconciliation(&claim, finding.clone())
             .expect("verified present settlement");
         assert!(matches!(
             state,
@@ -9971,6 +10001,23 @@ fn accepted_reconciliation_present_evidence_resolves_atomically() {
                 ..
             } if result_event_ids.len() == 1
         ));
+        let conn = open_raw(&path);
+        let payload: Vec<u8> = conn
+            .query_row("SELECT payload FROM outbox", [], |row| row.get(0))
+            .expect("settled reconciliation payload");
+        let digest = Sha256::digest(&payload);
+        conn.execute(
+            "UPDATE outbox SET payload = X'', compacted_payload_sha256 = ?1",
+            [digest.as_slice()],
+        )
+        .expect("compact reconciled settlement payload");
+        drop(conn);
+        assert_eq!(
+            store
+                .record_reconciliation(&claim, finding)
+                .expect("exact compacted settlement replay"),
+            state,
+        );
         drop(store);
 
         let conn = open_raw(&path);

@@ -1,10 +1,23 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
+use crate::kernel::command_bus;
 use crate::kernel::store::StoreError;
+
+pub(crate) const DEFAULT_OUTBOX_CLEANUP_BATCH_ROWS: u32 = 128;
+const MAX_OUTBOX_CLEANUP_BATCH_ROWS: u32 = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutboxPayloadCleanup {
+    pub rows_compacted: u64,
+    /// Logical effect-document bytes cleared; this does not promise file shrinkage.
+    pub payload_bytes_reclaimed: u64,
+    pub has_more: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StoreMaintenanceReport {
     pub wal: WalCheckpointOutcome,
+    pub outbox_payloads: OutboxPayloadCleanup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,15 +33,36 @@ pub(crate) enum WalCheckpointOutcome {
     },
 }
 
-pub(crate) fn run(conn: &Connection) -> Result<StoreMaintenanceReport, StoreError> {
+pub(crate) fn run(
+    conn: &mut Connection,
+    outbox_cleanup_batch_rows: u32,
+) -> Result<StoreMaintenanceReport, StoreError> {
+    if outbox_cleanup_batch_rows == 0 || outbox_cleanup_batch_rows > MAX_OUTBOX_CLEANUP_BATCH_ROWS {
+        return Err(StoreError::ConstraintViolation);
+    }
     quick_health_check(conn)?;
-    let wal = with_full_synchronous(conn, |conn| {
+    let (outbox_payloads, wal) = with_full_synchronous(conn, |conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (rows_compacted, payload_bytes_reclaimed, has_more) =
+            command_bus::compact_terminal_outbox_payloads_in_tx(&tx, outbox_cleanup_batch_rows)?;
+        tx.commit()?;
+        let outbox_payloads = OutboxPayloadCleanup {
+            rows_compacted,
+            payload_bytes_reclaimed,
+            has_more,
+        };
         let row: (i64, i64, i64) = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
-        decode_wal_checkpoint_row(row.0, row.1, row.2)
+        Ok((
+            outbox_payloads,
+            decode_wal_checkpoint_row(row.0, row.1, row.2)?,
+        ))
     })?;
-    Ok(StoreMaintenanceReport { wal })
+    Ok(StoreMaintenanceReport {
+        wal,
+        outbox_payloads,
+    })
 }
 
 fn quick_health_check(conn: &Connection) -> Result<(), StoreError> {
@@ -48,8 +82,8 @@ fn quick_health_check(conn: &Connection) -> Result<(), StoreError> {
 }
 
 pub(crate) fn with_full_synchronous<T>(
-    conn: &Connection,
-    action: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    conn: &mut Connection,
+    action: impl FnOnce(&mut Connection) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
     let action_result = set_synchronous(conn, "FULL", 2).and_then(|()| action(conn));
     let restore_result = set_synchronous(conn, "NORMAL", 1);
@@ -146,5 +180,15 @@ mod tests {
                 "invalid checkpoint row must fail closed: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn outbox_cleanup_batch_limit_is_nonzero_and_hard_bounded() {
+        let mut conn = Connection::open_in_memory().expect("memory database");
+        assert_eq!(run(&mut conn, 0), Err(StoreError::ConstraintViolation));
+        assert_eq!(
+            run(&mut conn, MAX_OUTBOX_CLEANUP_BATCH_ROWS + 1),
+            Err(StoreError::ConstraintViolation)
+        );
     }
 }
