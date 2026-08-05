@@ -1,16 +1,309 @@
 use std::io::Cursor;
 
 use rmp::Marker;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
+use serde::ser::{self, SerializeMap};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::domain::ClientId;
 
 use super::frame::MAX_PHYSICAL_FRAME_BYTES;
-use super::{FrameLimits, FrameLimitsError};
+use super::{
+    CapabilitySet, FrameLimits, FrameLimitsError, ProtocolVersion, VersionNegotiationError,
+};
 
+pub const MAX_CLIENT_BUILD_BYTES: u32 = 128;
 pub const MAX_MESSAGEPACK_DEPTH: u16 = 32;
 pub const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 1_000;
 pub const MAX_MESSAGEPACK_VALUES: u32 = 65_536;
 const MESSAGEPACK_STACK_SLOTS: usize = MAX_MESSAGEPACK_DEPTH as usize + 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientBuildError {
+    Empty,
+    TooLong { declared: u64, maximum: u32 },
+}
+
+impl std::fmt::Display for ClientBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "client build identifier must be nonempty"),
+            Self::TooLong { declared, maximum } => write!(
+                f,
+                "client build identifier length {declared} exceeds maximum {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientBuildError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientHelloError {
+    Build(ClientBuildError),
+    FrameLimits(FrameLimitsError),
+    Version(VersionNegotiationError),
+}
+
+impl std::fmt::Display for ClientHelloError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(error) => error.fmt(f),
+            Self::FrameLimits(error) => error.fmt(f),
+            Self::Version(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ClientHelloError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(error) => Some(error),
+            Self::FrameLimits(error) => Some(error),
+            Self::Version(error) => Some(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHello {
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub client_build: String,
+    pub client_id: ClientId,
+    pub requested: CapabilitySet,
+    pub limits: FrameLimits,
+}
+
+impl Serialize for ClientHello {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("protocol_major", &self.protocol_major)?;
+        map.serialize_entry("protocol_minor", &self.protocol_minor)?;
+        map.serialize_entry("client_build", &self.client_build)?;
+        map.serialize_entry("client_id", &self.client_id)?;
+        map.serialize_entry("requested", &self.requested)?;
+        map.serialize_entry("limits", &self.limits)?;
+        map.end()
+    }
+}
+
+const CLIENT_HELLO_FIELDS: &[&str] = &[
+    "protocol_major",
+    "protocol_minor",
+    "client_build",
+    "client_id",
+    "requested",
+    "limits",
+];
+
+enum ClientHelloField {
+    ProtocolMajor,
+    ProtocolMinor,
+    ClientBuild,
+    ClientId,
+    Requested,
+    Limits,
+}
+
+impl<'de> Deserialize<'de> for ClientHelloField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ClientHelloField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a ClientHello field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "protocol_major" => Ok(ClientHelloField::ProtocolMajor),
+                    "protocol_minor" => Ok(ClientHelloField::ProtocolMinor),
+                    "client_build" => Ok(ClientHelloField::ClientBuild),
+                    "client_id" => Ok(ClientHelloField::ClientId),
+                    "requested" => Ok(ClientHelloField::Requested),
+                    "limits" => Ok(ClientHelloField::Limits),
+                    _ => Err(de::Error::unknown_field(value, CLIENT_HELLO_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientHello {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ClientHelloVisitor;
+
+        impl<'de> Visitor<'de> for ClientHelloVisitor {
+            type Value = ClientHello;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named ClientHello map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut protocol_major = None;
+                let mut protocol_minor = None;
+                let mut client_build = None;
+                let mut client_id = None;
+                let mut requested = None;
+                let mut limits = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ClientHelloField::ProtocolMajor => {
+                            if protocol_major.is_some() {
+                                return Err(de::Error::duplicate_field("protocol_major"));
+                            }
+                            protocol_major = Some(map.next_value()?);
+                        }
+                        ClientHelloField::ProtocolMinor => {
+                            if protocol_minor.is_some() {
+                                return Err(de::Error::duplicate_field("protocol_minor"));
+                            }
+                            protocol_minor = Some(map.next_value()?);
+                        }
+                        ClientHelloField::ClientBuild => {
+                            if client_build.is_some() {
+                                return Err(de::Error::duplicate_field("client_build"));
+                            }
+                            client_build = Some(map.next_value()?);
+                        }
+                        ClientHelloField::ClientId => {
+                            if client_id.is_some() {
+                                return Err(de::Error::duplicate_field("client_id"));
+                            }
+                            client_id = Some(map.next_value()?);
+                        }
+                        ClientHelloField::Requested => {
+                            if requested.is_some() {
+                                return Err(de::Error::duplicate_field("requested"));
+                            }
+                            requested = Some(map.next_value()?);
+                        }
+                        ClientHelloField::Limits => {
+                            if limits.is_some() {
+                                return Err(de::Error::duplicate_field("limits"));
+                            }
+                            limits = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let hello = ClientHello {
+                    protocol_major: protocol_major
+                        .ok_or_else(|| de::Error::missing_field("protocol_major"))?,
+                    protocol_minor: protocol_minor
+                        .ok_or_else(|| de::Error::missing_field("protocol_minor"))?,
+                    client_build: client_build
+                        .ok_or_else(|| de::Error::missing_field("client_build"))?,
+                    client_id: client_id.ok_or_else(|| de::Error::missing_field("client_id"))?,
+                    requested: requested.ok_or_else(|| de::Error::missing_field("requested"))?,
+                    limits: limits.ok_or_else(|| de::Error::missing_field("limits"))?,
+                };
+                hello.validate().map_err(de::Error::custom)?;
+                Ok(hello)
+            }
+        }
+
+        deserializer.deserialize_map(ClientHelloVisitor)
+    }
+}
+
+impl ClientHello {
+    pub fn new(
+        client_build: impl Into<String>,
+        client_id: ClientId,
+        requested: CapabilitySet,
+        limits: FrameLimits,
+    ) -> Result<Self, ClientHelloError> {
+        let hello = Self {
+            protocol_major: super::PROTOCOL_MAJOR,
+            protocol_minor: super::PROTOCOL_MINOR,
+            client_build: client_build.into(),
+            client_id,
+            requested,
+            limits,
+        };
+        hello.validate()?;
+        Ok(hello)
+    }
+
+    pub fn validate(&self) -> Result<(), ClientHelloError> {
+        validate_client_build(&self.client_build).map_err(ClientHelloError::Build)?;
+        self.limits
+            .validate_offer()
+            .map_err(ClientHelloError::FrameLimits)
+    }
+
+    pub fn negotiate(
+        &self,
+        supported: CapabilitySet,
+        local_limits: FrameLimits,
+    ) -> Result<NegotiatedParameters, ClientHelloError> {
+        self.validate()?;
+        let version = ProtocolVersion::current()
+            .negotiate(ProtocolVersion::new(
+                self.protocol_major,
+                self.protocol_minor,
+            ))
+            .map_err(ClientHelloError::Version)?;
+        let limits = local_limits
+            .negotiate(self.limits)
+            .map_err(ClientHelloError::FrameLimits)?;
+        Ok(NegotiatedParameters {
+            version,
+            client_id: self.client_id,
+            capabilities: supported.intersection(self.requested),
+            limits,
+        })
+    }
+}
+
+/// Validated handshake result used by the host without creating a Phase 1
+/// server wire shape. `ServerHello` remains owned by the authenticated Phase 2
+/// connection contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedParameters {
+    pub version: ProtocolVersion,
+    pub client_id: ClientId,
+    pub capabilities: CapabilitySet,
+    pub limits: FrameLimits,
+}
+
+fn validate_client_build(value: &str) -> Result<(), ClientBuildError> {
+    let declared = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    if declared == 0 {
+        return Err(ClientBuildError::Empty);
+    }
+    if declared > u64::from(MAX_CLIENT_BUILD_BYTES) {
+        return Err(ClientBuildError::TooLong {
+            declared,
+            maximum: MAX_CLIENT_BUILD_BYTES,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessagePackLengthKind {

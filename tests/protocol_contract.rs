@@ -2,11 +2,13 @@
 
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
+use devmanager::domain::ClientId;
 use devmanager::protocol::{
-    Capability, CapabilitySet, FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec,
-    MessagePackError, MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError,
-    ProtocolVersion, VersionNegotiationError, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
+    FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
+    PhysicalFrameCodec, PhysicalFrameError, ProtocolVersion, VersionNegotiationError,
+    MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH,
+    MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -506,5 +508,256 @@ fn protocol_messagepack_codec_bounds_depth_and_total_values() {
         Err(MessagePackError::ValueCountExceeded {
             maximum: MAX_MESSAGEPACK_VALUES,
         })
+    );
+}
+
+fn protocol_client_id(tail: u8) -> ClientId {
+    ClientId::from_bytes([
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        tail,
+    ])
+    .expect("client id")
+}
+
+#[test]
+fn protocol_client_hello_round_trips_and_negotiates_without_freezing_server_hello() {
+    let unknown_bit = 1_u64 << 63;
+    let requested = CapabilitySet::from_bits(
+        Capability::PagedSnapshots.bit() | Capability::EventReplay.bit() | unknown_bit,
+    );
+    let offered_limits = FrameLimits {
+        max_physical_frame_bytes: 64 * 1024,
+        max_reassembled_message_bytes: 32 * 1024 * 1024,
+        max_page_items: 250,
+        max_page_encoded_bytes: 1024 * 1024,
+    };
+    let hello = ClientHello::new(
+        "devmanager/0.4.2",
+        protocol_client_id(0x41),
+        requested,
+        offered_limits,
+    )
+    .expect("valid hello");
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    let encoded = codec.encode(&hello).expect("encode hello");
+    assert_eq!(encoded[0], 0x86, "ClientHello is a six-field named map");
+    assert_eq!(
+        rmp_serde::to_vec(&hello).expect("direct serialization")[0],
+        0x86,
+        "ClientHello never exposes a compact tuple wire shape"
+    );
+    let decoded = codec.decode::<ClientHello>(&encoded).expect("decode hello");
+    assert_eq!(decoded, hello);
+    assert!(decoded.requested.contains_bit(unknown_bit));
+
+    let negotiated = decoded
+        .negotiate(
+            CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::OperationSettlement,
+            ]),
+            FrameLimits::v1_default(),
+        )
+        .expect("negotiate hello");
+    assert_eq!(negotiated.version, ProtocolVersion::current());
+    assert_eq!(negotiated.client_id, protocol_client_id(0x41));
+    assert_eq!(
+        negotiated.capabilities,
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots])
+    );
+    assert_eq!(
+        negotiated.limits,
+        FrameLimits {
+            max_physical_frame_bytes: 64 * 1024,
+            max_reassembled_message_bytes: 16 * 1024 * 1024,
+            max_page_items: 250,
+            max_page_encoded_bytes: 512 * 1024,
+        }
+    );
+}
+
+#[derive(serde::Serialize)]
+struct RawClientHello {
+    protocol_major: u16,
+    protocol_minor: u16,
+    client_build: String,
+    client_id: Vec<u8>,
+    requested: CapabilitySet,
+    limits: RawHelloLimits,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct RawHelloLimits {
+    max_physical_frame_bytes: u32,
+    max_reassembled_message_bytes: u32,
+    max_page_items: u32,
+    max_page_encoded_bytes: u32,
+}
+
+impl From<FrameLimits> for RawHelloLimits {
+    fn from(value: FrameLimits) -> Self {
+        Self {
+            max_physical_frame_bytes: value.max_physical_frame_bytes,
+            max_reassembled_message_bytes: value.max_reassembled_message_bytes,
+            max_page_items: value.max_page_items,
+            max_page_encoded_bytes: value.max_page_encoded_bytes,
+        }
+    }
+}
+
+fn raw_client_hello() -> RawClientHello {
+    RawClientHello {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        client_build: "devmanager/0.4.2".to_string(),
+        client_id: protocol_client_id(0x42).as_bytes().to_vec(),
+        requested: CapabilitySet::empty(),
+        limits: FrameLimits::v1_default().into(),
+    }
+}
+
+#[test]
+fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
+    let client_id = protocol_client_id(0x43);
+    let requested = CapabilitySet::empty();
+    let limits = FrameLimits::v1_default();
+    assert_eq!(
+        ClientHello::new("", client_id, requested, limits),
+        Err(ClientHelloError::Build(ClientBuildError::Empty))
+    );
+    ClientHello::new(
+        "x".repeat(usize::try_from(MAX_CLIENT_BUILD_BYTES).unwrap()),
+        client_id,
+        requested,
+        limits,
+    )
+    .expect("the exact build limit is valid");
+    assert_eq!(
+        ClientHello::new(
+            "x".repeat(usize::try_from(MAX_CLIENT_BUILD_BYTES).unwrap() + 1),
+            client_id,
+            requested,
+            limits,
+        ),
+        Err(ClientHelloError::Build(ClientBuildError::TooLong {
+            declared: u64::from(MAX_CLIENT_BUILD_BYTES) + 1,
+            maximum: MAX_CLIENT_BUILD_BYTES,
+        }))
+    );
+
+    let codec = MessagePackCodec::from_limits(limits).expect("codec");
+    let forged_empty = ClientHello {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        client_build: String::new(),
+        client_id,
+        requested,
+        limits,
+    };
+    assert_eq!(
+        codec.encode(&forged_empty),
+        Err(MessagePackError::Encode),
+        "public fields cannot bypass encode validation"
+    );
+
+    let mut invalid = raw_client_hello();
+    invalid.client_build.clear();
+    let bytes = rmp_serde::to_vec_named(&invalid).expect("raw empty build");
+    assert_eq!(
+        codec.decode::<ClientHello>(&bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    invalid = raw_client_hello();
+    invalid.client_build = "x".repeat(usize::try_from(MAX_CLIENT_BUILD_BYTES).unwrap() + 1);
+    let bytes = rmp_serde::to_vec_named(&invalid).expect("raw long build");
+    assert_eq!(
+        codec.decode::<ClientHello>(&bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    invalid = raw_client_hello();
+    invalid.client_id = vec![0; 16];
+    let bytes = rmp_serde::to_vec_named(&invalid).expect("raw malformed uuid");
+    assert_eq!(
+        codec.decode::<ClientHello>(&bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    invalid = raw_client_hello();
+    invalid.limits.max_physical_frame_bytes = 0;
+    let bytes = rmp_serde::to_vec_named(&invalid).expect("raw zero limits");
+    assert_eq!(
+        codec.decode::<ClientHello>(&bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    let valid = ClientHello::new("devmanager/0.4.2", client_id, requested, limits).unwrap();
+    let compact_tuple = (
+        PROTOCOL_MAJOR,
+        PROTOCOL_MINOR,
+        "devmanager/0.4.2",
+        client_id.as_bytes().to_vec(),
+        requested,
+        RawHelloLimits::from(limits),
+    );
+    let compact_bytes = rmp_serde::to_vec(&compact_tuple).expect("compact tuple fixture");
+    assert_eq!(compact_bytes[0], 0x96);
+    assert_eq!(
+        codec.decode::<ClientHello>(&compact_bytes),
+        Err(MessagePackError::Decode),
+        "only the named-map wire shape is accepted"
+    );
+
+    let mut duplicate = codec.encode(&valid).expect("valid hello");
+    assert_eq!(duplicate[0], 0x86);
+    duplicate[0] = 0x87;
+    duplicate.extend(rmp_serde::to_vec(&"client_build").unwrap());
+    duplicate.extend(rmp_serde::to_vec(&"duplicate").unwrap());
+    assert_eq!(
+        codec.decode::<ClientHello>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = codec.encode(&valid).expect("valid hello");
+    unknown[0] = 0x87;
+    unknown.extend(rmp_serde::to_vec(&"future_field").unwrap());
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<ClientHello>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut trailing = codec.encode(&valid).expect("valid hello");
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<ClientHello>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
+    );
+}
+
+#[test]
+fn protocol_client_hello_decodes_incompatible_major_then_rejects_negotiation() {
+    let mut raw = raw_client_hello();
+    raw.protocol_major = PROTOCOL_MAJOR + 1;
+    raw.protocol_minor = 99;
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let bytes = rmp_serde::to_vec_named(&raw).expect("encode future hello");
+    let decoded = codec
+        .decode::<ClientHello>(&bytes)
+        .expect("compatibility is not a decode concern");
+
+    assert_eq!(decoded.protocol_major, PROTOCOL_MAJOR + 1);
+    assert_eq!(
+        decoded.negotiate(CapabilitySet::empty(), FrameLimits::v1_default(),),
+        Err(ClientHelloError::Version(
+            VersionNegotiationError::IncompatibleMajor {
+                local: PROTOCOL_MAJOR,
+                peer: PROTOCOL_MAJOR + 1,
+            }
+        ))
     );
 }

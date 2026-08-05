@@ -9,8 +9,9 @@ pub use capabilities::{
     PROTOCOL_MINOR,
 };
 pub use envelope::{
-    MessagePackCodec, MessagePackError, MessagePackLengthKind, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
+    ClientBuildError, ClientHello, ClientHelloError, MessagePackCodec, MessagePackError,
+    MessagePackLengthKind, NegotiatedParameters, MAX_CLIENT_BUILD_BYTES,
+    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
 };
 pub use frame::{
     FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError,
