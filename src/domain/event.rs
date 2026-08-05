@@ -9,8 +9,8 @@ use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
 use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
 use crate::domain::operation::{
-    validate_outcome_fence, CancellationReason, OperationErrorCode, OperationUncertaintyCode,
-    OutcomeFenceError,
+    validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
+    OperationUncertaintyCode, OutcomeFenceError, OutcomeSource,
 };
 use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
@@ -110,6 +110,7 @@ pub struct OperationSettledFact {
     pub action_epoch: Option<u64>,
     pub resource_id: Option<ResourceId>,
     pub runtime_generation: Option<u64>,
+    pub source: OutcomeSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,7 @@ pub struct OperationFailedFact {
     pub action_epoch: Option<u64>,
     pub resource_id: Option<ResourceId>,
     pub runtime_generation: Option<u64>,
+    pub source: OutcomeSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +159,7 @@ struct OperationSettledFactWire {
     action_epoch: Option<u64>,
     resource_id: Option<ResourceId>,
     runtime_generation: Option<u64>,
+    source: OutcomeSource,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,6 +172,7 @@ struct OperationFailedFactWire {
     action_epoch: Option<u64>,
     resource_id: Option<ResourceId>,
     runtime_generation: Option<u64>,
+    source: OutcomeSource,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,6 +200,7 @@ struct OperationUncertainFactWire {
 }
 
 impl OperationSettledFact {
+    /// Dispatch convenience: preserves the historical `new` call shape.
     pub fn new(
         command_id: CommandId,
         operation_id: OperationId,
@@ -205,7 +210,30 @@ impl OperationSettledFact {
         resource_id: Option<ResourceId>,
         runtime_generation: Option<u64>,
     ) -> Result<Self, OutcomeFenceError> {
+        Self::with_source(
+            command_id,
+            operation_id,
+            settled_at_ms,
+            result_event_ids,
+            action_epoch,
+            resource_id,
+            runtime_generation,
+            OutcomeSource::Dispatch,
+        )
+    }
+
+    pub fn with_source(
+        command_id: CommandId,
+        operation_id: OperationId,
+        settled_at_ms: i64,
+        result_event_ids: Vec<EventId>,
+        action_epoch: Option<u64>,
+        resource_id: Option<ResourceId>,
+        runtime_generation: Option<u64>,
+        source: OutcomeSource,
+    ) -> Result<Self, OutcomeFenceError> {
         validate_outcome_fence(resource_id, runtime_generation)?;
+        validate_terminal_fact_source(&source)?;
         Ok(Self {
             command_id,
             operation_id,
@@ -214,11 +242,13 @@ impl OperationSettledFact {
             action_epoch,
             resource_id,
             runtime_generation,
+            source,
         })
     }
 }
 
 impl OperationFailedFact {
+    /// Dispatch convenience: preserves the historical `new` call shape.
     pub fn new(
         command_id: CommandId,
         operation_id: OperationId,
@@ -228,7 +258,30 @@ impl OperationFailedFact {
         resource_id: Option<ResourceId>,
         runtime_generation: Option<u64>,
     ) -> Result<Self, OutcomeFenceError> {
+        Self::with_source(
+            command_id,
+            operation_id,
+            settled_at_ms,
+            code,
+            action_epoch,
+            resource_id,
+            runtime_generation,
+            OutcomeSource::Dispatch,
+        )
+    }
+
+    pub fn with_source(
+        command_id: CommandId,
+        operation_id: OperationId,
+        settled_at_ms: i64,
+        code: OperationErrorCode,
+        action_epoch: Option<u64>,
+        resource_id: Option<ResourceId>,
+        runtime_generation: Option<u64>,
+        source: OutcomeSource,
+    ) -> Result<Self, OutcomeFenceError> {
         validate_outcome_fence(resource_id, runtime_generation)?;
+        validate_terminal_fact_source(&source)?;
         Ok(Self {
             command_id,
             operation_id,
@@ -237,6 +290,7 @@ impl OperationFailedFact {
             action_epoch,
             resource_id,
             runtime_generation,
+            source,
         })
     }
 }
@@ -297,6 +351,7 @@ impl Serialize for OperationSettledFact {
             action_epoch: self.action_epoch,
             resource_id: self.resource_id,
             runtime_generation: self.runtime_generation,
+            source: self.source.clone(),
         }
         .serialize(serializer)
     }
@@ -305,7 +360,7 @@ impl Serialize for OperationSettledFact {
 impl<'de> Deserialize<'de> for OperationSettledFact {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = OperationSettledFactWire::deserialize(deserializer)?;
-        Self::new(
+        Self::with_source(
             wire.command_id,
             wire.operation_id,
             wire.settled_at_ms,
@@ -313,6 +368,7 @@ impl<'de> Deserialize<'de> for OperationSettledFact {
             wire.action_epoch,
             wire.resource_id,
             wire.runtime_generation,
+            wire.source,
         )
         .map_err(de::Error::custom)
     }
@@ -328,6 +384,7 @@ impl Serialize for OperationFailedFact {
             action_epoch: self.action_epoch,
             resource_id: self.resource_id,
             runtime_generation: self.runtime_generation,
+            source: self.source.clone(),
         }
         .serialize(serializer)
     }
@@ -336,7 +393,7 @@ impl Serialize for OperationFailedFact {
 impl<'de> Deserialize<'de> for OperationFailedFact {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = OperationFailedFactWire::deserialize(deserializer)?;
-        Self::new(
+        Self::with_source(
             wire.command_id,
             wire.operation_id,
             wire.settled_at_ms,
@@ -344,6 +401,7 @@ impl<'de> Deserialize<'de> for OperationFailedFact {
             wire.action_epoch,
             wire.resource_id,
             wire.runtime_generation,
+            wire.source,
         )
         .map_err(de::Error::custom)
     }

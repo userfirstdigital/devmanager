@@ -1,8 +1,8 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OpenFlags, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::domain::event::{
@@ -21,6 +21,7 @@ const BUSY_TIMEOUT_MS: i64 = 5_000;
 
 /// Opaque SQLite-backed kernel store. No public connection accessor.
 pub struct KernelStore {
+    path: PathBuf,
     conn: Connection,
 }
 
@@ -43,6 +44,10 @@ pub enum StoreError {
     Busy,
     Corruption,
     Truncated,
+    ConstraintViolation,
+    StaleFence,
+    ConflictingOutcome,
+    MissingOperation,
     IntegrityCheckFailed(String),
     MigrationTooNew { found: i64, supported: i64 },
     MigrationChanged { version: i64 },
@@ -62,6 +67,10 @@ impl fmt::Display for StoreError {
             Self::Busy => write!(f, "sqlite busy"),
             Self::Corruption => write!(f, "database corruption detected"),
             Self::Truncated => write!(f, "database file is truncated"),
+            Self::ConstraintViolation => write!(f, "sqlite constraint violation"),
+            Self::StaleFence => write!(f, "stale operation fence"),
+            Self::ConflictingOutcome => write!(f, "conflicting operation outcome"),
+            Self::MissingOperation => write!(f, "operation not found"),
             Self::IntegrityCheckFailed(msg) => write!(f, "integrity check failed: {msg}"),
             Self::MigrationTooNew { found, supported } => {
                 write!(
@@ -82,7 +91,7 @@ impl fmt::Display for StoreError {
             Self::IntegerOutOfRange { field, value } => {
                 write!(f, "integer out of range for {field}: {value}")
             }
-            Self::CodecMismatch { detail } => write!(f, "event codec mismatch: {detail}"),
+            Self::CodecMismatch { detail } => write!(f, "codec mismatch: {detail}"),
             Self::EventDecode(msg) => write!(f, "event decode error: {msg}"),
             Self::Projection(msg) => write!(f, "projection error: {msg}"),
         }
@@ -101,8 +110,12 @@ impl KernelStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         classify_path_before_open(path)?;
         let conn = Connection::open(path).map_err(map_open_error)?;
+        let canonical = std::fs::canonicalize(path).map_err(|e| StoreError::Io(e.to_string()))?;
         configure_connection(&conn)?;
-        let mut store = Self { conn };
+        let mut store = Self {
+            path: canonical,
+            conn,
+        };
         store.migrate()?;
         store.integrity_check()?;
         Ok(store)
@@ -113,6 +126,19 @@ impl KernelStore {
         let result = rebuild_projections_tx(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Canonical database path retained for private snapshot connections.
+    #[allow(dead_code)] // reserved for Task 1.4+ snapshot loading
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Open a crate-private read-only/query-only connection for snapshot loading.
+    /// Never exposed on the public API and never writable.
+    #[allow(dead_code)] // reserved for Task 1.4+ snapshot loading
+    pub(crate) fn open_query_connection(&self) -> Result<Connection, StoreError> {
+        open_readonly_query_connection(&self.path)
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
@@ -255,6 +281,54 @@ fn map_open_error(err: rusqlite::Error) -> StoreError {
     }
 }
 
+#[allow(dead_code)] // reserved for Task 1.4+ snapshot loading
+fn open_readonly_query_connection(path: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(map_sqlite_error_owned)?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        u64::try_from(BUSY_TIMEOUT_MS).expect("positive"),
+    ))
+    .map_err(map_sqlite_error_owned)?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;\n\
+         PRAGMA query_only = ON;",
+    )
+    .map_err(map_sqlite_error_owned)?;
+    let busy_timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+        .map_err(map_sqlite_error_owned)?;
+    if busy_timeout != BUSY_TIMEOUT_MS {
+        return Err(StoreError::Sqlite(format!(
+            "busy_timeout expected {BUSY_TIMEOUT_MS}, got {busy_timeout}"
+        )));
+    }
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
+        .map_err(map_sqlite_error_owned)?;
+    if foreign_keys != 1 {
+        return Err(StoreError::Sqlite(
+            "foreign_keys pragma did not enable on query connection".into(),
+        ));
+    }
+    let query_only: i64 = conn
+        .query_row("PRAGMA query_only;", [], |row| row.get(0))
+        .map_err(map_sqlite_error_owned)?;
+    if query_only != 1 {
+        return Err(StoreError::Sqlite(format!(
+            "query_only pragma expected 1, got {query_only}"
+        )));
+    }
+    Ok(conn)
+}
+
+#[allow(dead_code)] // helper for read-only opener
+fn map_sqlite_error_owned(err: rusqlite::Error) -> StoreError {
+    map_sqlite_error(&err)
+}
+
 fn map_sqlite_error(err: &rusqlite::Error) -> StoreError {
     match err {
         rusqlite::Error::SqliteFailure(code, _)
@@ -267,6 +341,11 @@ fn map_sqlite_error(err: &rusqlite::Error) -> StoreError {
             if code.code == rusqlite::ErrorCode::DatabaseCorrupt =>
         {
             StoreError::Corruption
+        }
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            StoreError::ConstraintViolation
         }
         other => StoreError::Sqlite(other.to_string()),
     }
@@ -765,4 +844,111 @@ fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreErro
     rmp_serde::from_slice(payload).map_err(|err| StoreError::CodecMismatch {
         detail: err.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi::Error as FfiError;
+    use tempfile::TempDir;
+
+    #[test]
+    fn command_contract_maps_sqlite_constraint_busy_and_corruption() {
+        let constraint = rusqlite::Error::SqliteFailure(
+            FfiError::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE constraint failed".into()),
+        );
+        assert_eq!(
+            map_sqlite_error(&constraint),
+            StoreError::ConstraintViolation
+        );
+
+        let busy = rusqlite::Error::SqliteFailure(
+            FfiError::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        );
+        assert_eq!(map_sqlite_error(&busy), StoreError::Busy);
+
+        let locked = rusqlite::Error::SqliteFailure(
+            FfiError::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
+        );
+        assert_eq!(map_sqlite_error(&locked), StoreError::Busy);
+
+        let corrupt = rusqlite::Error::SqliteFailure(
+            FfiError::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        );
+        assert_eq!(map_sqlite_error(&corrupt), StoreError::Corruption);
+
+        // Typed variants reserved for later execute/record_outcome paths.
+        assert_ne!(StoreError::StaleFence, StoreError::ConflictingOutcome);
+        assert_ne!(
+            StoreError::MissingOperation,
+            StoreError::ConstraintViolation
+        );
+    }
+
+    #[test]
+    fn command_contract_readonly_connection_rejects_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let via_dot = dir.path().join(".").join("kernel.sqlite3");
+        let store = KernelStore::open(&via_dot).expect("open");
+        let canonical = std::fs::canonicalize(&path).expect("canonicalize");
+        assert_eq!(
+            store.path(),
+            canonical.as_path(),
+            "store must retain canonical absolute path"
+        );
+        let debug = format!("{store:?}");
+        assert_eq!(debug, "KernelStore");
+        assert!(
+            !debug.to_lowercase().contains("sqlite"),
+            "Debug must stay opaque, got {debug}"
+        );
+        assert!(
+            !debug.contains(canonical.to_string_lossy().as_ref()),
+            "Debug must not reveal filesystem path"
+        );
+
+        let conn = store.open_query_connection().expect("readonly");
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .expect("busy_timeout");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT_MS);
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
+            .expect("foreign_keys");
+        assert_eq!(foreign_keys, 1);
+        let query_only: i64 = conn
+            .query_row("PRAGMA query_only;", [], |row| row.get(0))
+            .expect("query_only");
+        assert_eq!(query_only, 1);
+
+        let err = conn
+            .execute("CREATE TABLE forbidden(x INTEGER)", [])
+            .expect_err("writes must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only") || msg.contains("query_only"),
+            "expected read-only failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn command_contract_codec_mismatch_display_is_generic() {
+        let err = StoreError::CodecMismatch {
+            detail: "receipt schema_version 2 != 1".into(),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("codec mismatch"),
+            "display should describe codec mismatch, got {text}"
+        );
+        assert!(
+            !text.contains("event codec mismatch"),
+            "display must not hard-code event-only wording, got {text}"
+        );
+    }
 }

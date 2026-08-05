@@ -29,8 +29,10 @@ pub use id::{
     TerminalId, TransferId,
 };
 pub use operation::{
-    validate_outcome_fence, CancellationReason, OperationErrorCode, OperationFacts, OperationState,
-    OperationUncertaintyCode, OutcomeFenceError,
+    validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,
+    CancellationReason, OperationErrorCode, OperationFacts, OperationOutcome, OperationOutcomeKind,
+    OperationState, OperationUncertaintyCode, OutcomeFenceError, OutcomeSource, ResourceFence,
+    MAX_EXTERNAL_IDENTITY_BYTES,
 };
 pub use query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult};
 pub use resource::{

@@ -16,7 +16,8 @@ use devmanager::domain::id::{
     ProjectId, RequestId, ResourceId, TaskId,
 };
 use devmanager::domain::operation::{
-    CancellationReason, OperationErrorCode, OperationState, OperationUncertaintyCode,
+    CancellationReason, OperationErrorCode, OperationOutcome, OperationOutcomeKind, OperationState,
+    OperationUncertaintyCode, OutcomeSource, ResourceFence, MAX_EXTERNAL_IDENTITY_BYTES,
 };
 use devmanager::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
@@ -2333,4 +2334,243 @@ fn operation_accepted_resource_fence_is_paired() {
     let pure_packed = rmp_serde::to_vec(&pure_event).expect("pure msgpack");
     let pure_mp: Event = rmp_serde::from_slice(&pure_packed).expect("pure msgpack rt");
     assert_eq!(pure_mp, pure_event);
+}
+
+#[test]
+fn command_contract_outcome_rejects_invalid_source_kind_and_identity() {
+    let op = operation_id(0x71);
+    let fence = ResourceFence::new(resource_id(0x57), 2);
+
+    let settled = OperationOutcome::new(
+        op,
+        1_000,
+        Some(1),
+        Some(fence),
+        OutcomeSource::Dispatch,
+        OperationOutcomeKind::Settled {
+            result_event_ids: vec![event_id(0x80)],
+        },
+    )
+    .expect("dispatch settled");
+    assert!(settled.resource_fence.is_some());
+    let encoded = serde_json::to_value(&settled).expect("outcome json");
+    assert!(
+        encoded.get("command_id").is_none(),
+        "OperationOutcome must not carry command_id"
+    );
+    let round: OperationOutcome = serde_json::from_value(encoded).expect("outcome json rt");
+    assert_eq!(round, settled);
+
+    let packed = rmp_serde::to_vec(&settled).expect("outcome msgpack");
+    let mp: OperationOutcome = rmp_serde::from_slice(&packed).expect("outcome msgpack rt");
+    assert_eq!(mp, settled);
+
+    assert!(
+        OperationOutcome::new(
+            op,
+            1_000,
+            None,
+            None,
+            OutcomeSource::verified_reconciliation(0, "ext-1").expect("identity"),
+            OperationOutcomeKind::Cancelled {
+                reason: CancellationReason::Superseded,
+            },
+        )
+        .is_err(),
+        "verified reconciliation cannot cancel"
+    );
+    assert!(
+        OperationOutcome::new(
+            op,
+            1_000,
+            None,
+            None,
+            OutcomeSource::verified_reconciliation(0, "ext-1").expect("identity"),
+            OperationOutcomeKind::Uncertain {
+                code: OperationUncertaintyCode::AmbiguousDispatch,
+            },
+        )
+        .is_err(),
+        "verified reconciliation cannot mark uncertain"
+    );
+    assert!(
+        OutcomeSource::verified_reconciliation(0, "   ").is_err(),
+        "blank external identity must fail"
+    );
+    assert!(
+        OutcomeSource::verified_reconciliation(0, "x".repeat(MAX_EXTERNAL_IDENTITY_BYTES + 1))
+            .is_err(),
+        "oversized external identity must fail"
+    );
+
+    let bad_identity = serde_json::json!({
+        "operation_id": op.to_string(),
+        "occurred_at_ms": 1,
+        "action_epoch": null,
+        "resource_fence": null,
+        "source": {
+            "verified_reconciliation": {
+                "effect_index": 0,
+                "external_identity": "  padded  "
+            }
+        },
+        "kind": {
+            "settled": { "result_event_ids": [event_id(0x80).to_string()] }
+        }
+    });
+    assert!(
+        serde_json::from_value::<OperationOutcome>(bad_identity).is_err(),
+        "serde must not accept non-canonical external identity"
+    );
+
+    let partial_fence = serde_json::json!({
+        "operation_id": op.to_string(),
+        "occurred_at_ms": 1,
+        "action_epoch": null,
+        "resource_fence": {
+            "resource_id": resource_id(0x57).to_string()
+        },
+        "source": "dispatch",
+        "kind": { "failed": { "code": "side_effect_failed" } }
+    });
+    assert!(
+        serde_json::from_value::<OperationOutcome>(partial_fence).is_err(),
+        "partial resource fence must fail"
+    );
+
+    let unknown_kind_field = serde_json::json!({
+        "operation_id": op.to_string(),
+        "occurred_at_ms": 1,
+        "action_epoch": null,
+        "resource_fence": null,
+        "source": "dispatch",
+        "kind": {
+            "settled": {
+                "result_event_ids": [event_id(0x80).to_string()],
+                "extra": true
+            }
+        }
+    });
+    assert!(
+        serde_json::from_value::<OperationOutcome>(unknown_kind_field.clone()).is_err(),
+        "unknown fields inside outcome kind must fail JSON decode"
+    );
+    let unknown_kind_mp = rmp_serde::to_vec_named(&unknown_kind_field).expect("pack unknown kind");
+    assert!(
+        rmp_serde::from_slice::<OperationOutcome>(&unknown_kind_mp).is_err(),
+        "unknown fields inside outcome kind must fail MessagePack decode"
+    );
+
+    let unknown_source_field = serde_json::json!({
+        "operation_id": op.to_string(),
+        "occurred_at_ms": 1,
+        "action_epoch": null,
+        "resource_fence": null,
+        "source": {
+            "verified_reconciliation": {
+                "effect_index": 0,
+                "external_identity": "ext-1",
+                "extra": true
+            }
+        },
+        "kind": { "failed": { "code": "side_effect_failed" } }
+    });
+    assert!(
+        serde_json::from_value::<OperationOutcome>(unknown_source_field).is_err(),
+        "unknown fields inside outcome source must fail"
+    );
+}
+
+#[test]
+fn command_contract_settled_failed_facts_persist_source() {
+    let dispatch_settled = OperationSettledFact::new(
+        command_id(0x3b),
+        operation_id(0x61),
+        1_725_000_000_400,
+        vec![event_id(0x80)],
+        Some(1),
+        Some(resource_id(0x57)),
+        Some(2),
+    )
+    .expect("dispatch convenience");
+    assert_eq!(dispatch_settled.source, OutcomeSource::Dispatch);
+
+    let reconciled = OperationSettledFact::with_source(
+        command_id(0x3b),
+        operation_id(0x61),
+        1_725_000_000_401,
+        vec![event_id(0x81)],
+        Some(1),
+        Some(resource_id(0x57)),
+        Some(2),
+        OutcomeSource::verified_reconciliation(1, "provider:job-9").expect("identity"),
+    )
+    .expect("reconciled settled");
+    assert!(matches!(
+        reconciled.source,
+        OutcomeSource::VerifiedReconciliation { .. }
+    ));
+
+    let failed = OperationFailedFact::new(
+        command_id(0x3b),
+        operation_id(0x61),
+        1_725_000_000_410,
+        OperationErrorCode::SideEffectFailed,
+        Some(1),
+        None,
+        None,
+    )
+    .expect("dispatch failed convenience");
+    assert_eq!(failed.source, OutcomeSource::Dispatch);
+
+    let failed_reconciled = OperationFailedFact::with_source(
+        command_id(0x3b),
+        operation_id(0x61),
+        1_725_000_000_411,
+        OperationErrorCode::SideEffectFailed,
+        Some(1),
+        None,
+        None,
+        OutcomeSource::verified_reconciliation(0, "ext-fail").expect("identity"),
+    )
+    .expect("reconciled failed");
+
+    for event in [
+        Event::OperationSettled(dispatch_settled.clone()),
+        Event::OperationSettled(reconciled.clone()),
+        Event::OperationFailed(failed.clone()),
+        Event::OperationFailed(failed_reconciled.clone()),
+    ] {
+        let json = serde_json::to_value(&event).expect("json");
+        assert!(json["payload"].get("source").is_some());
+        let rt: Event = serde_json::from_value(json).expect("json rt");
+        assert_eq!(rt, event);
+        let packed = rmp_serde::to_vec(&event).expect("msgpack");
+        let mp: Event = rmp_serde::from_slice(&packed).expect("msgpack rt");
+        assert_eq!(mp, event);
+    }
+
+    let missing_source = serde_json::json!({
+        "schema_version": 1,
+        "event_type": "operation.settled",
+        "payload": {
+            "command_id": command_id(0x3b).to_string(),
+            "operation_id": operation_id(0x61).to_string(),
+            "settled_at_ms": 1,
+            "result_event_ids": [],
+            "action_epoch": null,
+            "resource_id": null,
+            "runtime_generation": null
+        }
+    });
+    assert!(
+        serde_json::from_value::<Event>(missing_source).is_err(),
+        "settled facts must require source on the wire"
+    );
+
+    assert_golden_event(
+        "operation_settled.json",
+        &Event::OperationSettled(dispatch_settled),
+    );
+    assert_golden_event("operation_failed.json", &Event::OperationFailed(failed));
 }

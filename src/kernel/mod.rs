@@ -3,6 +3,7 @@
 //! Schema and projector internals stay crate-private. Callers only see
 //! domain-safe store APIs — never rusqlite types or a connection accessor.
 
+mod outbox;
 mod projector;
 mod schema;
 mod store;

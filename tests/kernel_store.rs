@@ -1580,3 +1580,281 @@ fn schema_operation_outcome_requires_matching_command_id() {
         .unwrap();
     assert_eq!(state, "accepted");
 }
+
+fn seed_accepted_operation(
+    path: &Path,
+    task: TaskId,
+    cmd: CommandId,
+    op: OperationId,
+    resource: Option<(ResourceId, u64)>,
+    action_epoch: Option<u64>,
+) {
+    let conn = open_raw(path);
+    conn.execute(
+        "INSERT INTO command_receipts(
+            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 1, 1)",
+        rusqlite::params![
+            cmd.as_bytes().as_slice(),
+            client_id(0x01).as_bytes().as_slice(),
+            task.as_bytes().as_slice(),
+            vec![1u8, 2, 3],
+        ],
+    )
+    .expect("receipt");
+    insert_event(
+        &conn,
+        event_id(0xE0),
+        Some(task),
+        Some(1),
+        "task.created",
+        i64::from(EVENT_SCHEMA_VERSION),
+        1_000,
+        &task_created_payload(task),
+    );
+    let (resource_id, runtime_generation) = match resource {
+        Some((id, gen)) => (Some(id), Some(gen)),
+        None => (None, None),
+    };
+    let accepted = OperationAcceptedFact::new(
+        cmd,
+        op,
+        1_100,
+        action_epoch,
+        resource_id,
+        runtime_generation,
+    )
+    .expect("accepted");
+    insert_event(
+        &conn,
+        event_id(0xE1),
+        Some(task),
+        None,
+        "operation.accepted",
+        i64::from(EVENT_SCHEMA_VERSION),
+        1_100,
+        &rmp_serde::to_vec(&accepted).unwrap(),
+    );
+}
+
+#[test]
+fn command_contract_projector_accepts_dispatch_from_accepted_only() {
+    use devmanager::domain::operation::OutcomeSource;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    drop(KernelStore::open(&path).expect("open"));
+
+    let task = task_id(0x40);
+    let cmd = command_id(0x41);
+    let op = operation_id(0x42);
+    seed_accepted_operation(&path, task, cmd, op, None, None);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("accept rebuild");
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        let settled =
+            OperationSettledFact::new(cmd, op, 1_200, vec![event_id(0x90)], None, None, None)
+                .expect("dispatch settled");
+        assert_eq!(settled.source, OutcomeSource::Dispatch);
+        insert_event(
+            &conn,
+            event_id(0xE2),
+            Some(task),
+            None,
+            "operation.settled",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_200,
+            &rmp_serde::to_vec(&settled).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("dispatch settle");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM operations WHERE operation_id = ?1",
+            [op.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "settled");
+}
+
+#[test]
+fn command_contract_projector_rejects_reconciliation_from_accepted() {
+    use devmanager::domain::operation::OutcomeSource;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    drop(KernelStore::open(&path).expect("open"));
+
+    let task = task_id(0x50);
+    let cmd = command_id(0x51);
+    let op = operation_id(0x52);
+    seed_accepted_operation(&path, task, cmd, op, None, None);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("accept rebuild");
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        let settled = OperationSettledFact::with_source(
+            cmd,
+            op,
+            1_200,
+            vec![event_id(0x91)],
+            None,
+            None,
+            None,
+            OutcomeSource::verified_reconciliation(0, "ext-too-early").expect("identity"),
+        )
+        .expect("reconciled settled");
+        insert_event(
+            &conn,
+            event_id(0xE3),
+            Some(task),
+            None,
+            "operation.settled",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_200,
+            &rmp_serde::to_vec(&settled).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .rebuild_projections()
+        .expect_err("accepted cannot take verified reconciliation");
+    assert!(
+        matches!(err, StoreError::Projection(_)),
+        "expected projection fence, got {err:?}"
+    );
+}
+
+#[test]
+fn command_contract_projector_uncertain_resolves_only_via_reconciliation() {
+    use devmanager::domain::event::OperationUncertainFact;
+    use devmanager::domain::operation::{OperationUncertaintyCode, OutcomeSource};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    drop(KernelStore::open(&path).expect("open"));
+
+    let task = task_id(0x60);
+    let cmd = command_id(0x61);
+    let op = operation_id(0x62);
+    seed_accepted_operation(&path, task, cmd, op, None, None);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("accept rebuild");
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        let uncertain = OperationUncertainFact::new(
+            cmd,
+            op,
+            1_200,
+            OperationUncertaintyCode::AmbiguousDispatch,
+            None,
+            None,
+            None,
+        )
+        .expect("uncertain");
+        insert_event(
+            &conn,
+            event_id(0xE4),
+            Some(task),
+            None,
+            "operation.uncertain",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_200,
+            &rmp_serde::to_vec(&uncertain).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.rebuild_projections().expect("uncertain rebuild");
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        let dispatch_settle =
+            OperationSettledFact::new(cmd, op, 1_300, vec![event_id(0x92)], None, None, None)
+                .expect("dispatch");
+        insert_event(
+            &conn,
+            event_id(0xE5),
+            Some(task),
+            None,
+            "operation.settled",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_300,
+            &rmp_serde::to_vec(&dispatch_settle).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .rebuild_projections()
+        .expect_err("uncertain rejects dispatch settlement");
+    assert!(
+        matches!(err, StoreError::Projection(_)),
+        "expected projection error, got {err:?}"
+    );
+    drop(store);
+
+    {
+        let conn = open_raw(&path);
+        conn.execute(
+            "DELETE FROM events WHERE event_type = 'operation.settled'",
+            [],
+        )
+        .unwrap();
+        let reconciled = OperationSettledFact::with_source(
+            cmd,
+            op,
+            1_400,
+            vec![event_id(0x93)],
+            None,
+            None,
+            None,
+            OutcomeSource::verified_reconciliation(0, "provider:proof").expect("identity"),
+        )
+        .expect("reconciled");
+        insert_event(
+            &conn,
+            event_id(0xE6),
+            Some(task),
+            None,
+            "operation.settled",
+            i64::from(EVENT_SCHEMA_VERSION),
+            1_400,
+            &rmp_serde::to_vec(&reconciled).unwrap(),
+        );
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store
+        .rebuild_projections()
+        .expect("uncertain resolves via verified reconciliation");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM operations WHERE operation_id = ?1",
+            [op.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "settled");
+}

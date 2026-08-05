@@ -36,7 +36,7 @@ pub struct CommandEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommandReceipt {
     Accepted {
         command_id: CommandId,

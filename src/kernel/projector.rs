@@ -5,7 +5,9 @@ use rusqlite::Transaction;
 use crate::domain::agent::AgentRole;
 use crate::domain::event::{DomainEvent, Event};
 use crate::domain::id::{AgentSessionId, CommandId, ResourceId, TaskId};
-use crate::domain::operation::{CancellationReason, OperationErrorCode, OperationUncertaintyCode};
+use crate::domain::operation::{
+    CancellationReason, OperationErrorCode, OperationUncertaintyCode, OutcomeSource,
+};
 use crate::domain::resource::ResourceLifecycle;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskLifecycle,
@@ -344,6 +346,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                Some(&fact.source),
                 "settled",
                 Some(pack(&fact.result_event_ids)?),
                 None,
@@ -360,6 +363,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                Some(&fact.source),
                 "failed",
                 None,
                 Some(error_code_text(fact.code)),
@@ -376,6 +380,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                None,
                 "cancelled",
                 None,
                 Some(cancel_text(fact.reason)),
@@ -392,6 +397,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                None,
                 "uncertain",
                 None,
                 Some(uncertain_text(fact.code)),
@@ -656,6 +662,7 @@ fn apply_operation_outcome(
     action_epoch: Option<u64>,
     resource_id: Option<crate::domain::id::ResourceId>,
     runtime_generation: Option<u64>,
+    source: Option<&OutcomeSource>,
     state: &str,
     result: Option<Vec<u8>>,
     outcome_code: Option<&str>,
@@ -703,11 +710,30 @@ fn apply_operation_outcome(
         }
         Err(err) => return Err(err.into()),
     };
-    if stored_state != "accepted" {
-        return Err(StoreError::Projection(format!(
-            "operation state {stored_state} is not accepted"
-        )));
+
+    match (stored_state.as_str(), source, state) {
+        ("accepted", None, "cancelled" | "uncertain") => {}
+        ("accepted", Some(OutcomeSource::Dispatch), "settled" | "failed") => {}
+        ("uncertain", Some(OutcomeSource::VerifiedReconciliation { .. }), "settled" | "failed") => {
+        }
+        ("accepted", Some(OutcomeSource::VerifiedReconciliation { .. }), "settled" | "failed") => {
+            return Err(StoreError::Projection(
+                "accepted operations accept only Dispatch terminal facts".into(),
+            ))
+        }
+        ("uncertain", Some(OutcomeSource::Dispatch), "settled" | "failed") => {
+            return Err(StoreError::Projection(
+                "uncertain operations accept only VerifiedReconciliation Settled/Failed facts"
+                    .into(),
+            ))
+        }
+        (other, _, _) => {
+            return Err(StoreError::Projection(format!(
+                "operation state {other} cannot transition to {state} with the provided source"
+            )))
+        }
     }
+
     if stored_command.as_slice() != command_id.as_bytes().as_slice() {
         return Err(StoreError::Projection(
             "operation command_id fence mismatch".into(),
