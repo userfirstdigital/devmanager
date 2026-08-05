@@ -21,6 +21,7 @@
 - Host recovery reports facts honestly. It may reconcile a resource recipe, but may not claim a prior process survived unless Windows identity checks prove it.
 - `devmanager-next` and its profile remain development-only and are deleted/renamed at final cutover.
 - Host diagnostics are structured, bounded, and redacted before enqueue. Raw content capture is an explicit time-bounded local diagnostic mode, never a default log level.
+- Phase 0 ships only a ValidateOnly isolation scaffold. Complete real `Start-NativeNext.ps1` / `Stop-NativeNext.ps1` lifecycle only after `devmanager-host` and `devmanager-next` binaries plus attach/quit commands exist in this phase. Phase 2 may launch/quit an otherwise process-empty host; Phase 3 is the first zero-orphan acceptance gate (Job Object membership / `ACTIVE_PROCESS_ZERO`). Do not dilute the Rust host authority model with speculative PowerShell process supervision.
 
 ---
 
@@ -178,12 +179,13 @@
 
 ### Task 2.11: Prove the multi-process host vertical slice
 
-**Files:** `tests/host_lifecycle.rs`, `scripts/native-next/Invoke-HostSoak.ps1`, `docs/replacement-deletion-ledger.md`
+**Files:** `tests/host_lifecycle.rs`, `scripts/native-next/Invoke-HostSoak.ps1`, `scripts/native-next/Start-NativeNext.ps1`, `scripts/native-next/Stop-NativeNext.ps1`, `scripts/native-next/NativeNext.ps1`, `docs/replacement-deletion-ledger.md`
 
+- [ ] **Step 0: Replace the Phase 0 ValidateOnly scaffold** with real Start/Stop lifecycle only after `devmanager-host`/`devmanager-next` binaries and attach/quit commands exist. Keep Capture/Assert guards. Do not reintroduce PowerShell PID/name authority; process ownership remains Rust host + Phase 3 Job Objects.
 - [ ] **Step 1: Add a test helper** that builds `devmanager-host`, starts it under a temporary profile, attaches two real client processes, exchanges commands/events, kills one client, restarts it, and requests full quit.
 - [ ] **Step 2: Run** the test before the soak script exists and record the red missing-script/coverage result.
 - [ ] **Step 3: Create `Invoke-HostSoak.ps1`** to repeat attach/detach/reconnect 100 times, randomly interrupt clients, sample host handle/thread/memory counts, and fail on monotonic leaks beyond explicit tolerance.
-- [ ] **Step 4: Assert after full quit** that the named pipe is gone, the lock is released, the host PID is dead, the SQLite integrity check passes, and no development child process remains.
+- [ ] **Step 4: Assert after full quit** that the named pipe is gone, the lock is released, the host PID is dead, the SQLite integrity check passes, and no development child process remains. Phase 2 may prove launch/quit of an otherwise process-empty host; residual orphan acceptance remains Phase 3.
 - [ ] **Step 5: Run the shared conformance cases** for initial snapshot, durable replay, ephemeral coalescing, forced resync, operation settlement after reconnect, admission-close race, and host/client attach latency. Write immutable baseline manifests/traces and rebuild the query index.
 - [ ] **Step 6: Update the deletion ledger** with the temporary `devmanager-next` entry and any bridge/re-export introduced so far.
 - [ ] **Step 7: Run** the soak plus all Phase 2 tests; commit as `test(host): prove durable multiprocess lifecycle`.

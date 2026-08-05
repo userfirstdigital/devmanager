@@ -45,3 +45,6 @@ serviceAccountKey.json
 /.worktrees/
 /.superpowers/
 /target-live-dev
+/.devmanager-next/
+/target-native-next/
+/target-live-native-next/

@@ -39,10 +39,11 @@
 - Create: `scripts/native-next/Isolation.ps1` — shared path, process, hash, and evidence functions.
 - Create: `scripts/native-next/Capture-ProductionBaseline.ps1` — read-only baseline JSON.
 - Create: `scripts/native-next/Assert-ProductionUnchanged.ps1` — fail-closed comparator.
-- Create: `scripts/native-next/Start-NativeNext.ps1` — isolated build/copy/start launcher.
-- Create: `scripts/native-next/Stop-NativeNext.ps1` — terminate only exact development executable paths and descendants.
+- Create: `scripts/native-next/Start-NativeNext.ps1` — Phase 0 ValidateOnly isolation scaffold (real launch deferred to Phase 2).
+- Create: `scripts/native-next/Stop-NativeNext.ps1` — Phase 0 ValidateOnly isolation scaffold (real stop deferred to Phase 2; zero-orphan to Phase 3).
+- Create: `scripts/native-next/NativeNext.ps1` — shared path/env validation library for the scaffold.
 - Create: `scripts/native-next/Invoke-PhaseGate.ps1` — announced command execution plus before/after evidence and cleanup.
-- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1` — read-only machine/installed idle and isolated cold-start baseline.
+- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1` — read-only machine/installed idle reference; isolated cold-start keys deferred until Phase 2 Start/Stop exist.
 - Create: `scripts/native-next/Invoke-Conformance.ps1` — shared case/arm runner under the Phase 0 production guard.
 - Create: `src/conformance/mod.rs` — conformance API exports.
 - Create: `src/conformance/manifest.rs` — immutable run/case/arm/environment manifest.
@@ -232,76 +233,48 @@ git add scripts/native-next tests/development_isolation.rs
 git commit -m "chore: guard installed DevManager during development"
 ```
 
-### Task 0.3: Add the isolated build/start/stop launcher
+### Task 0.3: Add the isolated validation scaffold (not a real launcher)
 
 **Files:**
+- Create: `scripts/native-next/NativeNext.ps1`
 - Create: `scripts/native-next/Start-NativeNext.ps1`
 - Create: `scripts/native-next/Stop-NativeNext.ps1`
 - Modify: `.gitignore`
 - Test: `tests/development_isolation.rs`
 
 **Interfaces:**
-- Produces: development binaries only beneath `target-native-next` and `target-live-native-next`.
-- Sets: `DEVMANAGER_PROFILE=native-next-dev`, `DEVMANAGER_INSTANCE_LABEL=Next`, `DEVMANAGER_RUNTIME_KIND=native-next`.
-- Stop authority: executable path under the resolved worktree's `target-live-native-next`; never process name alone.
+- Produces: worktree-derived fully-qualified plans for `target-native-next`, `target-live-native-next`, `.devmanager-next/runtime.json` (path only), and evidence roots.
+- Sets (plan only): `DEVMANAGER_PROFILE=native-next-dev`, `DEVMANAGER_INSTANCE_LABEL=Next`, `DEVMANAGER_RUNTIME_KIND=native-next`.
+- Phase 0 boundary: real build/copy/start/stop/kill/ctl/runtime IO is unavailable until Phase 2; zero-orphan acceptance waits for Phase 3 Job Object proof.
 
-- [ ] **Step 1: Add failing launcher contract tests**
+- [ ] **Step 1: Add failing scaffold contract tests**
 
-```rust
-#[test]
-fn next_launcher_uses_an_explicit_profile_and_private_targets() {
-    let source = std::fs::read_to_string("scripts/native-next/Start-NativeNext.ps1").unwrap();
-    for required in [
-        "native-next-dev",
-        "target-native-next",
-        "target-live-native-next",
-        "DEVMANAGER_INSTANCE_LABEL",
-        "Capture-ProductionBaseline.ps1",
-        "Assert-ProductionUnchanged.ps1",
-    ] {
-        assert!(source.contains(required), "missing {required}");
-    }
-    assert!(!source.contains("Stop-Process -Name"));
-}
-```
+Assert wrappers expose only `-ValidateOnly`; `NativeNext.ps1` plans exact contained paths/env; speculative process/cargo/runtime helpers are absent; non-ValidateOnly refuses before Capture/Assert; ValidateOnly invokes Capture+Assert only.
 
-- [ ] **Step 2: Run the focused test and observe the absent-script failure**
+- [ ] **Step 2: Run focused tests and observe RED against any overbuilt lifecycle harness**
 
-Run: `cargo test --test development_isolation next_launcher_uses_an_explicit_profile_and_private_targets -- --exact`
+Run: `cargo test --test development_isolation next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle -- --exact`
 
-- [ ] **Step 3: Implement exact-path launch and stop behavior**
+- [ ] **Step 3: Implement the ValidateOnly scaffold**
 
-`Start-NativeNext.ps1` must:
+`Start-NativeNext.ps1` / `Stop-NativeNext.ps1`:
 
-1. Capture the production baseline.
-2. Build `--bin devmanager-next` and `--bin devmanager-host` into `target-native-next`.
-3. Copy only those build artifacts and PDBs to `target-live-native-next` after exact-path stale-process cleanup.
-4. Set the three required environment variables on both processes.
-5. Launch the host hidden, wait for its readiness command, then launch the desktop.
-6. Record both exact executable paths and process identities beneath `.devmanager-next/runtime.json`.
-7. Compare production state before returning.
+1. Without `-ValidateOnly`, throw immediately that real lifecycle is deferred to Phase 2 (before Capture/Assert or other IO).
+2. With `-ValidateOnly`, derive/validate the isolated path+env plan, capture protected production state, compare it, and return success.
+3. May write only protected evidence under `/.devmanager-next/evidence`.
+4. Must never build, copy, start, stop, kill, invoke ctl, or create/read/write/remove `runtime.json`.
 
-Until the binaries exist in Phase 2/5, `-ValidateOnly` performs steps 1, path validation, environment construction, and comparison without building or starting anything.
+Ignore anchors: `/.devmanager-next/`, `/target-native-next/`, `/target-live-native-next/`.
 
-`Stop-NativeNext.ps1` reads `runtime.json`, verifies each resolved executable remains inside this worktree's live directory, terminates the development desktop first, requests host shutdown when available, escalates only against recorded development PIDs, verifies zero descendants, and removes only the runtime evidence file.
+- [ ] **Step 4: Exercise ValidateOnly through Codex-owned machine review** (worker runs synthetic/copied harness only)
 
-- [ ] **Step 4: Validate without launching binaries**
-
-Run:
-
-```powershell
-pwsh -NoProfile -File scripts/native-next/Start-NativeNext.ps1 -ValidateOnly
-pwsh -NoProfile -File scripts/native-next/Stop-NativeNext.ps1 -ValidateOnly
-cargo test --test development_isolation next_launcher_uses_an_explicit_profile_and_private_targets -- --exact
-```
-
-Expected: all pass; no process is started.
+Expected: ValidateOnly passes; no process is started; non-ValidateOnly refuses closed.
 
 - [ ] **Step 5: Review and commit**
 
 ```powershell
 git add .gitignore scripts/native-next tests/development_isolation.rs
-git commit -m "chore: add isolated native-next launcher"
+git commit -m "chore: add isolated native-next validation scaffold"
 ```
 
 ### Task 0.4: Add one guarded phase-gate runner
@@ -432,13 +405,13 @@ git commit -m "docs: define replacement isolation and deletion gates"
 - Modify: `tests/development_isolation.rs`
 
 **Interfaces:**
-- Produces ignored `performance.json` with reference hardware, idle samples, and isolated cold-start measurements.
+- Produces ignored `performance.json` with reference hardware and installed idle samples; isolated cold-start keys may be defined as unavailable/`pending-phase-2` until real Start/Stop exist.
 - Produces committed metric definitions/budgets used unchanged by Phases 3, 5, 7, 8, 9, 10, and 11.
-- Never sends input, changes priority/affinity, opens configuration files, restarts the installed process, or launches against the production profile.
+- Never sends input, changes priority/affinity, opens configuration files, restarts the installed process, or launches against the production profile. Phase 0 must not invoke real Start/Stop lifecycle for measurement.
 
 - [ ] **Step 1: Write the failing safety/shape tests**
 
-Add `performance_baseline_is_read_only_and_profile_guarded` and `performance_budget_defines_every_program_metric`. Assert the script exposes only `-InstalledReadOnly`, `-IsolatedColdStart`, `-DurationSeconds`, and `-EvidenceDirectory`; the isolated mode requires `native-next-dev`; the installed mode contains no stop/kill/input/window-message/file-content operations.
+Add `performance_baseline_is_read_only_and_profile_guarded` and `performance_budget_defines_every_program_metric`. Assert the script exposes only `-InstalledReadOnly`, `-IsolatedColdStart`, `-DurationSeconds`, and `-EvidenceDirectory`; `-IsolatedColdStart` in Phase 0 records the metric contract/availability only (no process launch); the installed mode contains no stop/kill/input/window-message/file-content operations.
 
 - [ ] **Step 2: Run and observe the expected failure**
 
@@ -450,7 +423,7 @@ Expected: missing script/budget contract.
 
 - [ ] **Step 3: Implement read-only measurement**
 
-Record Windows/build, CPU model/logical processor count, physical memory, active display sizes/scales, sample interval, and monotonic timestamps. For an already-running installed DevManager, sample only cumulative CPU time, working/private bytes, handles, and threads for 120 seconds by PID plus creation time. For the isolated mode, use `Start-NativeNext.ps1`, measure process start to first responsive top-level window and host-ready handshake, then stop only the exact isolated executable tree.
+Record Windows/build, CPU model/logical processor count, physical memory, active display sizes/scales, sample interval, and monotonic timestamps. For an already-running installed DevManager, sample only cumulative CPU time, working/private bytes, handles, and threads for 120 seconds by PID plus creation time. For isolated cold-start measurement, Phase 0 may only define the metric contract and capture the installed reference; it must not claim an isolated start measurement until Phase 2 provides real `Start-NativeNext` lifecycle against `devmanager-host`/`devmanager-next`.
 
 - [ ] **Step 4: Lock metric definitions and initial budgets**
 
@@ -464,7 +437,7 @@ pwsh -NoProfile -File scripts/native-next/Capture-PerformanceBaseline.ps1 -Isola
 cargo test --test development_isolation performance_ -- --nocapture
 ```
 
-Expected: the installed PID/start time remain unchanged, production files are unopened/unchanged, the isolated process is gone, and `performance.json` contains all metric keys plus availability/evidence rather than invented zeroes.
+Expected: the installed PID/start time remain unchanged, production files are unopened/unchanged, no isolated process is started, and `performance.json` contains installed samples plus cold-start keys marked unavailable until Phase 2 (no invented zeroes).
 
 - [ ] **Step 6: Commit**
 
@@ -619,10 +592,10 @@ Expected: commands pass, production comparison is unchanged, no disposable proce
 
 - Named path tests prove `native-next-dev` cannot alias production.
 - Baseline/comparison scripts pass on the real machine without reading `session.json`.
-- `-ValidateOnly` launch/stop checks start no processes.
+- `-ValidateOnly` start/stop scaffolds start no processes and refuse real lifecycle without the switch.
 - Guarded command evidence records exit codes and cleanup.
 - Deletion ledger covers every old architecture owner.
-- Performance measurement definitions and a read-only/isolated baseline are captured before replacement implementation.
+- Performance measurement definitions and a read-only installed reference are captured; isolated cold-start measurement is deferred until Phase 2 Start/Stop exist.
 - The deterministic conformance case runs baseline/variant arms with immutable manifests, resumable bounded traces, no raw content, and unchanged production evidence.
 - Full serial library baseline is green or any pre-existing failure is recorded before Phase 1.
 - Installed DevManager PID/start time and production `config.json`/`remote.json` remain unchanged.

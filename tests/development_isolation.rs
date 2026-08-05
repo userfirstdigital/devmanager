@@ -816,6 +816,263 @@ Write-Output 'SYNTHETIC_ISOLATION_OK'
     assert!(!fixture.evidence_dir.starts_with(&real_production));
 }
 
+#[test]
+fn next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle() {
+    let library = std::fs::read_to_string("scripts/native-next/NativeNext.ps1").unwrap();
+    let start = std::fs::read_to_string("scripts/native-next/Start-NativeNext.ps1").unwrap();
+    let stop = std::fs::read_to_string("scripts/native-next/Stop-NativeNext.ps1").unwrap();
+
+    for required in [
+        "native-next-dev",
+        "target-native-next",
+        "target-live-native-next",
+        "DEVMANAGER_PROFILE",
+        "DEVMANAGER_INSTANCE_LABEL",
+        "DEVMANAGER_RUNTIME_KIND",
+        "Capture-ProductionBaseline.ps1",
+        "Assert-ProductionUnchanged.ps1",
+        "Get-NativeNextValidationPlan",
+        "Invoke-NativeNextStartValidation",
+        "Invoke-NativeNextStopValidation",
+    ] {
+        assert!(library.contains(required), "NativeNext.ps1 missing {required}");
+    }
+
+    for forbidden in [
+        "Kill($true)",
+        "Stop-Process",
+        "Get-CimInstance",
+        "Get-Process",
+        "taskkill",
+        "Write-NativeNextRuntimeJson",
+        "Read-NativeNextRuntime",
+        "Remove-NativeNextRuntimeJson",
+        "Invoke-NativeNextBuildAndCopy",
+        "cargo build",
+        "ctl status",
+        "ctl shutdown",
+        "Open-NativeNextVerifiedProcess",
+        "Get-NativeNextDescendantIdentities",
+        "Start-Sleep",
+    ] {
+        assert!(
+            !library.contains(forbidden),
+            "NativeNext.ps1 must not contain speculative lifecycle token {forbidden}"
+        );
+        assert!(!start.contains(forbidden), "Start must not contain {forbidden}");
+        assert!(!stop.contains(forbidden), "Stop must not contain {forbidden}");
+    }
+
+    assert!(start.contains("ValidateOnly"));
+    assert!(start.contains("NativeNext.ps1"));
+    assert!(stop.contains("ValidateOnly"));
+    assert!(stop.contains("NativeNext.ps1"));
+    assert!(
+        library.contains("Phase 2") || start.contains("Phase 2") || stop.contains("Phase 2"),
+        "refusal/docs must name Phase 2 deferral"
+    );
+    assert!(
+        start.lines().count() < 40 && stop.lines().count() < 40,
+        "wrappers must stay tiny"
+    );
+    assert!(
+        library.lines().count() < 220,
+        "Phase 0 NativeNext.ps1 must stay a small validation scaffold (got {} lines)",
+        library.lines().count()
+    );
+}
+
+#[test]
+fn native_next_validation_scaffold_behavior_matches_phase0_boundary() {
+    let fixture = SyntheticIsolationFixture::create();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$harness = Join-Path '{evidence}' 'scaffold-harness'
+$scriptRoot = Join-Path $harness 'scripts\native-next'
+$worktree = $harness
+New-Item -ItemType Directory -Force -Path $scriptRoot | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $worktree '.devmanager-next\evidence\current') | Out-Null
+Set-Content -LiteralPath (Join-Path $worktree 'Cargo.toml') -Value "[package]`nname='x'`nversion='0.0.0'`n" -Encoding utf8
+
+Copy-Item 'scripts/native-next/Isolation.ps1' (Join-Path $scriptRoot 'Isolation.ps1') -Force
+Copy-Item 'scripts/native-next/NativeNext.ps1' (Join-Path $scriptRoot 'NativeNext.ps1') -Force
+Copy-Item 'scripts/native-next/Start-NativeNext.ps1' (Join-Path $scriptRoot 'Start-NativeNext.ps1') -Force
+Copy-Item 'scripts/native-next/Stop-NativeNext.ps1' (Join-Path $scriptRoot 'Stop-NativeNext.ps1') -Force
+
+$marker = Join-Path $harness 'calls.txt'
+Set-Content -LiteralPath $marker -Value '' -Encoding utf8
+
+@'
+param([Parameter(Mandatory=$true)][string]$OutputPath)
+Add-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent) 'calls.txt') -Value 'capture'
+$dir = Split-Path -Parent $OutputPath
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath $OutputPath -Value '{{"ok":true}}' -Encoding utf8
+'@ | Set-Content (Join-Path $scriptRoot 'Capture-ProductionBaseline.ps1') -Encoding utf8
+
+@'
+param([Parameter(Mandatory=$true)][string]$BaselinePath)
+Add-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent) 'calls.txt') -Value 'assert'
+if (-not (Test-Path -LiteralPath $BaselinePath)) {{ throw "missing baseline" }}
+'@ | Set-Content (Join-Path $scriptRoot 'Assert-ProductionUnchanged.ps1') -Encoding utf8
+
+$start = Join-Path $scriptRoot 'Start-NativeNext.ps1'
+$stop = Join-Path $scriptRoot 'Stop-NativeNext.ps1'
+$runtimeJson = Join-Path $worktree '.devmanager-next\runtime.json'
+
+Set-Content -LiteralPath $marker -Value '' -Encoding utf8
+$refuseOut = & pwsh -NoProfile -File $start 2>&1 | Out-String
+if ($LASTEXITCODE -eq 0) {{ throw 'Start without ValidateOnly must fail' }}
+if ($refuseOut -notmatch 'Phase 2|unavailable|supervisor|Rust host') {{
+    throw "missing lifecycle refusal message: $refuseOut"
+}}
+$calls = @(Get-Content $marker -ErrorAction SilentlyContinue | Where-Object {{ $_ }})
+if ($calls.Count -ne 0) {{ throw "non-ValidateOnly must not call capture/assert; got: $($calls -join ',')" }}
+
+$refuseStop = & pwsh -NoProfile -File $stop 2>&1 | Out-String
+if ($LASTEXITCODE -eq 0) {{ throw 'Stop without ValidateOnly must fail' }}
+$calls = @(Get-Content $marker -ErrorAction SilentlyContinue | Where-Object {{ $_ }})
+if ($calls.Count -ne 0) {{ throw 'Stop non-ValidateOnly must not call capture/assert' }}
+
+Set-Content -LiteralPath $marker -Value '' -Encoding utf8
+$startOut = & pwsh -NoProfile -File $start -ValidateOnly 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {{ throw "Start ValidateOnly failed: $startOut" }}
+$stopOut = & pwsh -NoProfile -File $stop -ValidateOnly 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {{ throw "Stop ValidateOnly failed: $stopOut" }}
+if (Test-Path -LiteralPath $runtimeJson) {{ throw 'ValidateOnly must not create runtime.json' }}
+
+$calls = @(Get-Content $marker | Where-Object {{ $_ }})
+if (($calls | Where-Object {{ $_ -eq 'capture' }}).Count -lt 1) {{ throw 'expected capture' }}
+if (($calls | Where-Object {{ $_ -eq 'assert' }}).Count -lt 1) {{ throw 'expected assert' }}
+foreach ($bad in @('cargo','copy','kill','ctl','start-host','build','runtime-write')) {{
+    if ($calls -contains $bad) {{ throw "forbidden sentinel $bad" }}
+}}
+if ($startOut -notmatch 'ValidateOnly') {{ throw 'Start output missing ValidateOnly' }}
+if ($stopOut -notmatch 'ValidateOnly') {{ throw 'Stop output missing ValidateOnly' }}
+
+. (Join-Path $scriptRoot 'Isolation.ps1')
+. (Join-Path $scriptRoot 'NativeNext.ps1')
+$plan = Get-NativeNextValidationPlan -ScriptRoot $scriptRoot
+$envMap = Get-NativeNextChildEnvironment
+if ($envMap.DEVMANAGER_PROFILE -ne 'native-next-dev') {{ throw 'bad profile' }}
+if ($envMap.DEVMANAGER_INSTANCE_LABEL -ne 'Next') {{ throw 'bad label' }}
+if ($envMap.DEVMANAGER_RUNTIME_KIND -ne 'native-next') {{ throw 'bad kind' }}
+foreach ($path in @($plan.buildTargetDir, $plan.liveDir, $plan.runtimeJson, $plan.evidenceRoot)) {{
+    if (-not [System.IO.Path]::IsPathFullyQualified($path)) {{ throw "not FQ: $path" }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $path -AncestorPath $plan.worktreeRoot)) {{
+        throw "escapes worktree: $path"
+    }}
+}}
+if ((Split-Path -Leaf $plan.buildTargetDir) -ne 'target-native-next') {{ throw 'bad build dir' }}
+if ((Split-Path -Leaf $plan.liveDir) -ne 'target-live-native-next') {{ throw 'bad live dir' }}
+
+Write-Output 'SCAFFOLD_BEHAVIOR_OK'
+"#,
+        evidence = ps_literal(&fixture.evidence_dir),
+    );
+
+    let output = run_pwsh(&script);
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SCAFFOLD_BEHAVIOR_OK"),
+        "missing success marker"
+    );
+}
+
+#[test]
+fn native_next_non_validate_only_refuses_before_dot_sourcing_helpers() {
+    let fixture = SyntheticIsolationFixture::create();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$empty = Join-Path '{evidence}' 'empty-wrapper-dir'
+New-Item -ItemType Directory -Force -Path $empty | Out-Null
+foreach ($name in @('Start-NativeNext.ps1', 'Stop-NativeNext.ps1')) {{
+    $dest = Join-Path $empty $name
+    Copy-Item (Join-Path 'scripts/native-next' $name) $dest -Force
+    if (Test-Path (Join-Path $empty 'Isolation.ps1')) {{ throw 'helpers must be absent' }}
+    if (Test-Path (Join-Path $empty 'NativeNext.ps1')) {{ throw 'helpers must be absent' }}
+    $out = & pwsh -NoProfile -File $dest 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {{ throw "$name without ValidateOnly must fail" }}
+    if ($out -match 'Isolation\.ps1' -or $out -match '(?<![A-Za-z-])NativeNext\.ps1') {{
+        throw "$name must refuse before helper IO; got: $out"
+    }}
+    if ($out -match 'does not exist|cannot be loaded|cannot find path|The term .+ is not recognized') {{
+        throw "$name must refuse before helper IO; got: $out"
+    }}
+    if ($out -notmatch 'Phase 2|unavailable|Rust host|supervisor') {{
+        throw "$name missing Phase 2 refusal: $out"
+    }}
+}}
+Write-Output 'REFUSE_BEFORE_DOTSOURCE_OK'
+"#,
+        evidence = ps_literal(&fixture.evidence_dir),
+    );
+
+    let output = run_pwsh(&script);
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("REFUSE_BEFORE_DOTSOURCE_OK"),
+        "missing success marker"
+    );
+}
+
+#[test]
+fn native_next_wrappers_expose_only_validate_only_and_parse() {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+foreach ($path in @(
+        'scripts/native-next/NativeNext.ps1',
+        'scripts/native-next/Start-NativeNext.ps1',
+        'scripts/native-next/Stop-NativeNext.ps1'
+    )) {
+    $tokens = $null
+    $errors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) {
+        throw ("parse errors for {0}: {1}" -f $path, (($errors | ForEach-Object { $_.ToString() }) -join '; '))
+    }
+}
+foreach ($path in @('scripts/native-next/Start-NativeNext.ps1', 'scripts/native-next/Stop-NativeNext.ps1')) {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    $params = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    if ($params.Count -ne 1 -or $params[0] -ne 'ValidateOnly') {
+        throw ("{0} params must be exactly ValidateOnly; got: {1}" -f $path, ($params -join ','))
+    }
+}
+Write-Output 'SCAFFOLD_PARSE_OK'
+"#;
+
+    let output = run_pwsh(script);
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SCAFFOLD_PARSE_OK"),
+        "missing success marker"
+    );
+}
+
 struct SyntheticIsolationFixture {
     _temp: tempfile::TempDir,
     production_root: PathBuf,
