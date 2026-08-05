@@ -400,6 +400,30 @@ function Get-DevManagerObservedProcessIdentity {
     return Get-DevManagerProcessInventoryEntry -CimProcess $match[0] -RequireCompleteIdentity:$RequireCompleteIdentity
 }
 
+function Get-DevManagerRefreshedCimProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$ProcessId
+    )
+
+    try {
+        $refreshRows = @(Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop)
+    }
+    catch {
+        throw "CIM lookup failed while refreshing attributable process Id=${ProcessId}: $($_.Exception.Message)"
+    }
+    if ($refreshRows.Count -eq 0) { return $null }
+    if ($refreshRows.Count -ne 1) {
+        throw "Ambiguous CIM refresh for attributable process Id=${ProcessId}."
+    }
+
+    $refreshed = $refreshRows[0]
+    if ($null -eq $refreshed.ProcessId -or -not (Test-DevManagerIntegralNumber -Value $refreshed.ProcessId) -or [uint32]$refreshed.ProcessId -ne $ProcessId) {
+        throw "Mismatched ProcessId for refreshed attributable process Id=${ProcessId}."
+    }
+    return $refreshed
+}
+
 function Update-DevManagerObservedProcessTree {
     param(
         [Parameter(Mandatory = $true)]
@@ -418,6 +442,13 @@ function Update-DevManagerObservedProcessTree {
         $CimProcesses = @($CimProcesses)
     }
 
+    # PIDs are only traversal links. ObservedByKey remains the generation-aware
+    # authority (PID + executable + creation time) for live residue decisions.
+    $lineagePids = New-Object 'System.Collections.Generic.HashSet[uint32]'
+    foreach ($trackedPid in $TrackedPids) {
+        $null = $lineagePids.Add([uint32]$trackedPid)
+    }
+
     $changed = $true
     while ($changed) {
         $changed = $false
@@ -426,14 +457,39 @@ function Update-DevManagerObservedProcessTree {
             if (-not (Test-DevManagerIntegralNumber -Value $proc.ParentProcessId)) { continue }
             $pidValue = [uint32]$proc.ProcessId
             $parentId = [uint32]$proc.ParentProcessId
-            if (-not $TrackedPids.Contains($parentId)) { continue }
-            if ($TrackedPids.Contains($pidValue)) { continue }
-            $entry = Get-DevManagerProcessInventoryEntry -CimProcess $proc -RequireCompleteIdentity
-            $key = Get-DevManagerProcessInventoryIdentityKey -Process $entry
-            if (-not $ObservedByKey.ContainsKey($key)) {
-                $ObservedByKey[$key] = $entry
+            if (-not $lineagePids.Contains($parentId)) { continue }
+
+            $entry = Get-DevManagerProcessInventoryEntry -CimProcess $proc
+            if ($null -eq $entry) {
+                # Snapshot may tear down with null ExecutablePath/CreationDate after exit.
+                # Confirm via a fresh PID-specific lookup before failing closed.
+                $refreshed = Get-DevManagerRefreshedCimProcess -ProcessId $pidValue
+                if ($null -eq $refreshed) {
+                    # The process exited, but descendants from this same CIM snapshot
+                    # or a later quiet-window poll can outlive it. Keep a gate-lifetime
+                    # lineage tombstone; ObservedByKey remains the live authority.
+                    $null = $TrackedPids.Add($pidValue)
+                    if ($lineagePids.Add($pidValue)) { $changed = $true }
+                    continue
+                }
+                if ($null -eq $refreshed.PSObject.Properties['ParentProcessId'] -or -not (Test-DevManagerIntegralNumber -Value $refreshed.ParentProcessId)) {
+                    throw "Missing or invalid ParentProcessId for refreshed attributable process Id=${pidValue}."
+                }
+                if (-not $lineagePids.Contains([uint32]$refreshed.ParentProcessId)) {
+                    # PID reuse under a different parent is not live attributable,
+                    # but the old snapshot generation may have surviving children.
+                    $null = $TrackedPids.Add($pidValue)
+                    if ($lineagePids.Add($pidValue)) { $changed = $true }
+                    continue
+                }
+                $entry = Get-DevManagerProcessInventoryEntry -CimProcess $refreshed -RequireCompleteIdentity
             }
+
+            $key = Get-DevManagerProcessInventoryIdentityKey -Process $entry
+            if ($ObservedByKey.ContainsKey($key)) { continue }
+            $ObservedByKey[$key] = $entry
             $null = $TrackedPids.Add($pidValue)
+            $null = $lineagePids.Add($pidValue)
             $changed = $true
         }
     }
@@ -464,16 +520,19 @@ function Get-DevManagerPhaseGateResidueProcesses {
     }
 
     $liveByKey = @{}
+    $refreshedEntries = New-Object System.Collections.Generic.List[object]
     foreach ($proc in $CimProcesses) {
         if ($null -eq $proc.ProcessId) { continue }
         $entry = Get-DevManagerProcessInventoryEntry -CimProcess $proc
         if ($null -eq $entry) {
-            foreach ($observed in $ObservedByKey.Values) {
-                if ([uint32]$observed.processId -eq [uint32]$proc.ProcessId) {
-                    $null = Get-DevManagerProcessInventoryEntry -CimProcess $proc -RequireCompleteIdentity
-                }
-            }
-            continue
+            $observedPid = @($ObservedByKey.Values | Where-Object {
+                    [uint32]$_.processId -eq [uint32]$proc.ProcessId
+                })
+            if ($observedPid.Count -eq 0) { continue }
+            $refreshed = Get-DevManagerRefreshedCimProcess -ProcessId ([uint32]$proc.ProcessId)
+            if ($null -eq $refreshed) { continue }
+            $entry = Get-DevManagerProcessInventoryEntry -CimProcess $refreshed -RequireCompleteIdentity
+            $refreshedEntries.Add($entry)
         }
         $liveByKey[(Get-DevManagerProcessInventoryIdentityKey -Process $entry)] = $entry
     }
@@ -485,6 +544,15 @@ function Get-DevManagerPhaseGateResidueProcesses {
         }
     }
     foreach ($entry in @(Get-DevManagerDisposableDevelopmentProcesses -WorktreeRoot $WorktreeRoot -CimProcesses $CimProcesses)) {
+        $key = Get-DevManagerProcessInventoryIdentityKey -Process $entry
+        if ($beforeKeys.Contains($key)) { continue }
+        if ($ObservedByKey.ContainsKey($key)) { continue }
+        $residue.Add($entry)
+    }
+    foreach ($entry in $refreshedEntries) {
+        if (-not (Test-DevManagerWorktreeTargetExecutable -ExecutablePath ([string]$entry.executablePath) -WorktreeRoot $WorktreeRoot)) {
+            continue
+        }
         $key = Get-DevManagerProcessInventoryIdentityKey -Process $entry
         if ($beforeKeys.Contains($key)) { continue }
         if ($ObservedByKey.ContainsKey($key)) { continue }

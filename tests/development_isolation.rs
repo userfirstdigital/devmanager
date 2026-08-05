@@ -1186,6 +1186,297 @@ Write-Output 'PHASE_GATE_RECIPE_OK'
     );
 }
 
+#[test]
+fn phase_gate_observed_tree_ignores_transient_incomplete_descendants_after_pid_refresh() {
+    let fixture = SyntheticIsolationFixture::create();
+    let script_path = fixture
+        .evidence_dir
+        .join("phase-gate-incomplete-descendant-refresh.ps1");
+    let body = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$harness = Join-Path '{evidence}' 'incomplete-descendant-refresh'
+New-Item -ItemType Directory -Force -Path $harness | Out-Null
+. 'scripts/native-next/Isolation.ps1'
+. 'scripts/native-next/PhaseGate.ps1'
+
+$script:RefreshRows = @()
+$script:RefreshFailure = $null
+function Get-CimInstance {{
+  param(
+    [string]$ClassName,
+    [string]$Filter,
+    [object]$ErrorAction
+  )
+  if ($ClassName -ne 'Win32_Process' -or $Filter -ne 'ProcessId = 40') {{
+    throw "unexpected refresh query: class=$ClassName filter=$Filter"
+  }}
+  if ($null -ne $script:RefreshFailure) {{ throw $script:RefreshFailure }}
+  return @($script:RefreshRows)
+}}
+
+function New-ObservedState {{
+  $observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+  $tracked = New-Object 'System.Collections.Generic.HashSet[uint32]'
+  [void]$tracked.Add([uint32]10)
+  $root = [pscustomobject]@{{
+    processId = [uint32]10
+    executablePath = (Join-Path $harness 'target\root.exe')
+    creationDate = '20260101120000.000000-000'
+    parentProcessId = [uint32]1
+  }}
+  $observed[(Get-DevManagerProcessInventoryIdentityKey -Process $root)] = $root
+  [pscustomobject]@{{ Observed = $observed; Tracked = $tracked; Root = $root }}
+}}
+
+$incompleteChild = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = [uint32]10
+  ExecutablePath = $null
+  CreationDate = $null
+}}
+$snapshot = @(
+  [pscustomobject]@{{
+    ProcessId = [uint32]10
+    ParentProcessId = [uint32]1
+    ExecutablePath = (Join-Path $harness 'target\root.exe')
+    CreationDate = '20260101120000.000000-000'
+  }},
+  $incompleteChild
+)
+$grandchild = [pscustomobject]@{{
+  ProcessId = [uint32]50
+  ParentProcessId = [uint32]40
+  ExecutablePath = (Join-Path $harness 'outside\grandchild.exe')
+  CreationDate = '20260101120130.000000-000'
+}}
+$snapshotWithGrandchild = @($snapshot) + @($grandchild)
+
+# An exited incomplete child is lineage-only, but its surviving grandchild is still attributed.
+$gone = New-ObservedState
+$script:RefreshRows = @()
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $gone.Observed `
+  -TrackedPids $gone.Tracked `
+  -CimProcesses $snapshotWithGrandchild
+if (-not $gone.Tracked.Contains([uint32]40)) {{ throw 'gone incomplete descendant must remain a lineage tombstone' }}
+if (@($gone.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
+  throw 'gone incomplete descendant must not be observed as live'
+}}
+if (-not $gone.Tracked.Contains([uint32]50)) {{ throw 'surviving grandchild of gone child must be tracked' }}
+if (@($gone.Observed.Values | Where-Object {{ $_.processId -eq 50 }}).Count -ne 1) {{
+  throw 'surviving grandchild of gone child must be observed'
+}}
+
+# The lineage tombstone survives into a later poll where the grandchild first appears.
+$crossPoll = New-ObservedState
+$script:RefreshRows = @()
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $crossPoll.Observed `
+  -TrackedPids $crossPoll.Tracked `
+  -CimProcesses $snapshot
+if (-not $crossPoll.Tracked.Contains([uint32]40)) {{ throw 'poll one must retain vanished intermediate lineage' }}
+if (@($crossPoll.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
+  throw 'poll one lineage tombstone must not become live evidence'
+}}
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $crossPoll.Observed `
+  -TrackedPids $crossPoll.Tracked `
+  -CimProcesses @($snapshot[0], $grandchild)
+if (-not $crossPoll.Tracked.Contains([uint32]50)) {{ throw 'poll two grandchild must traverse vanished parent lineage' }}
+if (@($crossPoll.Observed.Values | Where-Object {{ $_.processId -eq 50 }}).Count -ne 1) {{
+  throw 'poll two grandchild must be observed'
+}}
+
+# Fail closed when the PID-specific refresh still returns a live incomplete row.
+$liveIncomplete = New-ObservedState
+$script:RefreshRows = @($incompleteChild)
+$failed = $false
+try {{
+  Update-DevManagerObservedProcessTree `
+    -ObservedByKey $liveIncomplete.Observed `
+    -TrackedPids $liveIncomplete.Tracked `
+    -CimProcesses $snapshot
+}} catch {{
+  $failed = $true
+  if ("$($_.Exception.Message)" -notmatch 'Missing executable path or CreationDate for attributable process Id=40') {{
+    throw "unexpected live-incomplete error: $($_.Exception.Message)"
+  }}
+}}
+if (-not $failed) {{ throw 'expected live incomplete refresh to fail closed' }}
+if ($liveIncomplete.Tracked.Contains([uint32]40)) {{ throw 'failed live incomplete must not be tracked' }}
+
+# Complete refresh attributes only while ParentProcessId remains tracked.
+$completeRefresh = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = [uint32]10
+  ExecutablePath = (Join-Path $harness 'target\child.exe')
+  CreationDate = '20260101120100.000000-000'
+}}
+$attributed = New-ObservedState
+$script:RefreshRows = @($completeRefresh)
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $attributed.Observed `
+  -TrackedPids $attributed.Tracked `
+  -CimProcesses $snapshot
+if (-not $attributed.Tracked.Contains([uint32]40)) {{ throw 'complete refresh with tracked parent must attribute' }}
+$childKey = Get-DevManagerProcessInventoryIdentityKey -Process ([pscustomobject]@{{
+  processId = [uint32]40
+  executablePath = (Join-Path $harness 'target\child.exe')
+  creationDate = '20260101120100.000000-000'
+}})
+if (-not $attributed.Observed.ContainsKey($childKey)) {{ throw 'complete refresh must observe refreshed identity' }}
+
+# A later process generation reusing a tracked PID under a tracked parent is distinct.
+$newGeneration = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = [uint32]10
+  ExecutablePath = (Join-Path $harness 'target\child-v2.exe')
+  CreationDate = '20260101120115.000000-000'
+}}
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $attributed.Observed `
+  -TrackedPids $attributed.Tracked `
+  -CimProcesses @($snapshot[0], $newGeneration)
+$newGenerationKey = Get-DevManagerProcessInventoryIdentityKey -Process ([pscustomobject]@{{
+  processId = [uint32]40
+  executablePath = (Join-Path $harness 'target\child-v2.exe')
+  creationDate = '20260101120115.000000-000'
+}})
+if (-not $attributed.Observed.ContainsKey($newGenerationKey)) {{ throw 'reused tracked PID generation must be observed by full identity' }}
+
+# PID reuse with a different parent must not be misattributed.
+$reused = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = [uint32]999
+  ExecutablePath = (Join-Path $harness 'target\reused.exe')
+  CreationDate = '20260101120200.000000-000'
+}}
+$reuseState = New-ObservedState
+$script:RefreshRows = @($reused)
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $reuseState.Observed `
+  -TrackedPids $reuseState.Tracked `
+  -CimProcesses $snapshotWithGrandchild
+if (-not $reuseState.Tracked.Contains([uint32]40)) {{ throw 'old PID generation must remain a lineage tombstone' }}
+if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
+  throw 'PID reused under a different parent must not be observed as live attributable'
+}}
+if (-not $reuseState.Tracked.Contains([uint32]50)) {{ throw 'snapshot grandchild across reused parent PID must be tracked' }}
+if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 50 }}).Count -ne 1) {{
+  throw 'snapshot grandchild across reused parent PID must be observed'
+}}
+
+# A refreshed live row without trustworthy parent identity remains unverifiable.
+$missingParent = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = $null
+  ExecutablePath = (Join-Path $harness 'target\child.exe')
+  CreationDate = '20260101120300.000000-000'
+}}
+$missingParentState = New-ObservedState
+$script:RefreshRows = @($missingParent)
+$failed = $false
+try {{
+  Update-DevManagerObservedProcessTree `
+    -ObservedByKey $missingParentState.Observed `
+    -TrackedPids $missingParentState.Tracked `
+    -CimProcesses $snapshot
+}} catch {{
+  $failed = $true
+  if ("$($_.Exception.Message)" -notmatch 'Missing or invalid ParentProcessId for refreshed attributable process Id=40') {{
+    throw "unexpected missing-parent error: $($_.Exception.Message)"
+  }}
+}}
+if (-not $failed) {{ throw 'expected refreshed live row with missing parent to fail closed' }}
+
+# A failed liveness/identity refresh cannot be interpreted as process exit.
+$refreshFailureState = New-ObservedState
+$script:RefreshRows = @()
+$script:RefreshFailure = 'synthetic refresh failure'
+$failed = $false
+try {{
+  Update-DevManagerObservedProcessTree `
+    -ObservedByKey $refreshFailureState.Observed `
+    -TrackedPids $refreshFailureState.Tracked `
+    -CimProcesses $snapshot
+}} catch {{
+  $failed = $true
+  if ("$($_.Exception.Message)" -notmatch 'CIM lookup failed while refreshing attributable process Id=40') {{
+    throw "unexpected refresh-failure error: $($_.Exception.Message)"
+  }}
+}}
+if (-not $failed) {{ throw 'expected refresh failure to fail closed' }}
+$script:RefreshFailure = $null
+
+# Final residue classification uses the same PID-specific confirmation rule.
+$residueState = New-ObservedState
+$observedChild = [pscustomobject]@{{
+  processId = [uint32]40
+  parentProcessId = [uint32]10
+  executablePath = (Join-Path $harness 'target\child.exe')
+  creationDate = '20260101120100.000000-000'
+}}
+$residueState.Observed[(Get-DevManagerProcessInventoryIdentityKey -Process $observedChild)] = $observedChild
+$script:RefreshRows = @()
+$residue = @(Get-DevManagerPhaseGateResidueProcesses `
+  -WorktreeRoot $harness `
+  -ObservedByKey $residueState.Observed `
+  -BeforeProcesses @() `
+  -CimProcesses @($incompleteChild))
+if ($residue.Count -ne 0) {{ throw 'exited incomplete observed process must not be residue' }}
+
+$script:RefreshRows = @($incompleteChild)
+$failed = $false
+try {{
+  $null = Get-DevManagerPhaseGateResidueProcesses `
+    -WorktreeRoot $harness `
+    -ObservedByKey $residueState.Observed `
+    -BeforeProcesses @() `
+    -CimProcesses @($incompleteChild)
+}} catch {{
+  $failed = $true
+  if ("$($_.Exception.Message)" -notmatch 'Missing executable path or CreationDate for attributable process Id=40') {{
+    throw "unexpected live residue identity error: $($_.Exception.Message)"
+  }}
+}}
+if (-not $failed) {{ throw 'expected live incomplete observed residue to fail closed' }}
+
+$script:RefreshRows = @($completeRefresh)
+$residue = @(Get-DevManagerPhaseGateResidueProcesses `
+  -WorktreeRoot $harness `
+  -ObservedByKey $residueState.Observed `
+  -BeforeProcesses @() `
+  -CimProcesses @($incompleteChild))
+if ($residue.Count -ne 1 -or [uint32]$residue[0].processId -ne 40) {{
+  throw 'complete refreshed observed process must remain residue'
+}}
+
+Write-Output 'INCOMPLETE_DESCENDANT_REFRESH_OK'
+"#,
+        evidence = ps_literal(&fixture.evidence_dir),
+    );
+    fs::write(&script_path, &body).expect("write incomplete descendant refresh script");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            script_path.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("pwsh");
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("INCOMPLETE_DESCENDANT_REFRESH_OK"),
+        "missing success marker"
+    );
+}
 
 #[test]
 fn next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle() {
@@ -1206,7 +1497,10 @@ fn next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle() {
         "Invoke-NativeNextStartValidation",
         "Invoke-NativeNextStopValidation",
     ] {
-        assert!(library.contains(required), "NativeNext.ps1 missing {required}");
+        assert!(
+            library.contains(required),
+            "NativeNext.ps1 missing {required}"
+        );
     }
 
     for forbidden in [
@@ -1230,8 +1524,14 @@ fn next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle() {
             !library.contains(forbidden),
             "NativeNext.ps1 must not contain speculative lifecycle token {forbidden}"
         );
-        assert!(!start.contains(forbidden), "Start must not contain {forbidden}");
-        assert!(!stop.contains(forbidden), "Stop must not contain {forbidden}");
+        assert!(
+            !start.contains(forbidden),
+            "Start must not contain {forbidden}"
+        );
+        assert!(
+            !stop.contains(forbidden),
+            "Stop must not contain {forbidden}"
+        );
     }
 
     assert!(start.contains("ValidateOnly"));
