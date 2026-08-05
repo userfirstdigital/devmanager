@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
+use crate::domain::event::DomainEvent;
 use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
 use crate::domain::operation::OperationFacts;
 use crate::domain::resource::ResourceFacts;
@@ -188,5 +189,17 @@ pub struct SnapshotPage {
     pub items: Vec<SnapshotItem>,
     /// Exact canonical MessagePack size of this page body.
     pub encoded_bytes: u32,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+/// One bounded page from a replay session pinned to a durable high-water mark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventPage {
+    /// Exclusive sequence boundary used to produce this page.
+    pub after_sequence: u64,
+    /// Fixed high-water sequence captured when replay began.
+    pub through_sequence: u64,
+    pub events: Vec<DomainEvent>,
     pub next_cursor: Option<Vec<u8>>,
 }

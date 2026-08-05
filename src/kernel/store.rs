@@ -666,21 +666,16 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
         let occurred_at_ms: i64 = row.get(6)?;
         let payload: Vec<u8> = row.get(7)?;
 
-        let event = decode_stored_event(&event_type, schema_version, &payload)?;
-        let domain = DomainEvent {
-            id: event_id_from_bytes(&event_id_bytes)?,
-            task_id: match task_id_bytes {
-                Some(bytes) => Some(task_id_from_bytes(&bytes)?),
-                None => None,
-            },
-            sequence: u64_from_nonnegative_i64("events.sequence", sequence)?,
-            task_revision: match task_revision {
-                Some(v) => Some(u64_from_nonnegative_i64("events.task_revision", v)?),
-                None => None,
-            },
+        let domain = decode_stored_domain_event(
+            sequence,
+            &event_id_bytes,
+            task_id_bytes.as_deref(),
+            task_revision,
+            &event_type,
+            schema_version,
             occurred_at_ms,
-            payload: event,
-        };
+            &payload,
+        )?;
         projector::apply_event(tx, &domain, true)?;
         events_replayed = events_replayed
             .checked_add(1)
@@ -1033,6 +1028,33 @@ pub(crate) fn decode_stored_event(
         });
     }
     Ok(event)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_stored_domain_event(
+    sequence: i64,
+    event_id_bytes: &[u8],
+    task_id_bytes: Option<&[u8]>,
+    task_revision: Option<i64>,
+    event_type: &str,
+    schema_version: i64,
+    occurred_at_ms: i64,
+    payload: &[u8],
+) -> Result<DomainEvent, StoreError> {
+    Ok(DomainEvent {
+        id: event_id_from_bytes(event_id_bytes)?,
+        task_id: match task_id_bytes {
+            Some(bytes) => Some(task_id_from_bytes(bytes)?),
+            None => None,
+        },
+        sequence: u64_from_nonnegative_i64("events.sequence", sequence)?,
+        task_revision: match task_revision {
+            Some(value) => Some(u64_from_nonnegative_i64("events.task_revision", value)?),
+            None => None,
+        },
+        occurred_at_ms,
+        payload: decode_stored_event(event_type, schema_version, payload)?,
+    })
 }
 
 fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreError> {

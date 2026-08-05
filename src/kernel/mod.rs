@@ -8,6 +8,7 @@ mod dispatch;
 mod lineage;
 mod outbox;
 mod projector;
+mod replay;
 mod runtime;
 mod schema;
 mod snapshot;
