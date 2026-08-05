@@ -36,6 +36,7 @@ pub struct OperationAcceptedFact {
     pub operation_id: OperationId,
     pub accepted_at_ms: i64,
     pub action_epoch: Option<u64>,
+    pub resource_id: Option<ResourceId>,
     pub runtime_generation: Option<u64>,
 }
 
@@ -45,13 +46,16 @@ impl OperationAcceptedFact {
         operation_id: OperationId,
         accepted_at_ms: i64,
         action_epoch: Option<u64>,
+        resource_id: Option<ResourceId>,
         runtime_generation: Option<u64>,
     ) -> Result<Self, OutcomeFenceError> {
+        validate_outcome_fence(resource_id, runtime_generation)?;
         Ok(Self {
             command_id,
             operation_id,
             accepted_at_ms,
             action_epoch,
+            resource_id,
             runtime_generation,
         })
     }
@@ -64,6 +68,7 @@ struct OperationAcceptedFactWire {
     operation_id: OperationId,
     accepted_at_ms: i64,
     action_epoch: Option<u64>,
+    resource_id: Option<ResourceId>,
     runtime_generation: Option<u64>,
 }
 
@@ -74,6 +79,7 @@ impl Serialize for OperationAcceptedFact {
             operation_id: self.operation_id,
             accepted_at_ms: self.accepted_at_ms,
             action_epoch: self.action_epoch,
+            resource_id: self.resource_id,
             runtime_generation: self.runtime_generation,
         }
         .serialize(serializer)
@@ -88,6 +94,7 @@ impl<'de> Deserialize<'de> for OperationAcceptedFact {
             wire.operation_id,
             wire.accepted_at_ms,
             wire.action_epoch,
+            wire.resource_id,
             wire.runtime_generation,
         )
         .map_err(de::Error::custom)

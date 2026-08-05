@@ -1476,6 +1476,7 @@ fn golden_event_serialization_fixtures() {
                 operation_id(0x61),
                 1_725_000_000_390,
                 Some(1),
+                Some(resource_id(0x57)),
                 Some(2),
             )
             .expect("accepted"),
@@ -2097,8 +2098,15 @@ fn forged_resource_and_agent_registration_are_rejected() {
 fn operation_accepted_is_rebuildable_and_not_settlement() {
     let task = task_id(0x08);
     let snap = create_task(None, task, 1, 0x09);
-    let fact = OperationAcceptedFact::new(command_id(0x0a), operation_id(0x0b), 10, Some(0), None)
-        .expect("accepted fact");
+    let fact = OperationAcceptedFact::new(
+        command_id(0x0a),
+        operation_id(0x0b),
+        10,
+        Some(0),
+        Some(resource_id(0x57)),
+        Some(2),
+    )
+    .expect("accepted fact");
     let event = domain_event(
         event_id(0x0c),
         Some(task),
@@ -2137,6 +2145,11 @@ fn operation_accepted_is_rebuildable_and_not_settlement() {
         golden_val["payload"].get("task_id").is_none(),
         "golden accepted payload must omit task_id"
     );
+    assert_eq!(
+        golden_val["payload"]["resource_id"],
+        serde_json::json!(resource_id(0x57).to_string())
+    );
+    assert_eq!(golden_val["payload"]["runtime_generation"], 2);
     let golden_event: Event =
         serde_json::from_value(golden_val.clone()).expect("golden Event decode");
     let golden_domain = DomainEvent {
@@ -2172,6 +2185,7 @@ fn operation_accepted_is_rebuildable_and_not_settlement() {
             "task_id": task.to_string(),
             "accepted_at_ms": 10,
             "action_epoch": 0,
+            "resource_id": null,
             "runtime_generation": null
         }
     });
@@ -2194,4 +2208,129 @@ fn operation_accepted_is_rebuildable_and_not_settlement() {
         ),
         Err(ApplyError::TaskMismatch)
     ));
+}
+
+#[test]
+fn operation_accepted_resource_fence_is_paired() {
+    assert!(
+        OperationAcceptedFact::new(
+            command_id(0x3b),
+            operation_id(0x61),
+            1,
+            Some(0),
+            Some(resource_id(0x57)),
+            None,
+        )
+        .is_err(),
+        "resource_id without runtime_generation must fail"
+    );
+    assert!(
+        OperationAcceptedFact::new(
+            command_id(0x3b),
+            operation_id(0x61),
+            1,
+            Some(0),
+            None,
+            Some(2),
+        )
+        .is_err(),
+        "runtime_generation without resource_id must fail"
+    );
+
+    #[derive(serde::Serialize)]
+    struct EventWire<P> {
+        schema_version: u32,
+        event_type: &'static str,
+        payload: P,
+    }
+    #[derive(serde::Serialize)]
+    struct AcceptedPartial {
+        command_id: String,
+        operation_id: String,
+        accepted_at_ms: i64,
+        action_epoch: Option<u64>,
+        resource_id: Option<String>,
+        runtime_generation: Option<u64>,
+    }
+
+    let partial_resource_only = serde_json::json!({
+        "schema_version": 1,
+        "event_type": "operation.accepted",
+        "payload": {
+            "command_id": command_id(0x3b).to_string(),
+            "operation_id": operation_id(0x61).to_string(),
+            "accepted_at_ms": 1,
+            "action_epoch": 0,
+            "resource_id": resource_id(0x57).to_string(),
+            "runtime_generation": null
+        }
+    });
+    assert!(serde_json::from_value::<Event>(partial_resource_only).is_err());
+    let partial_generation_only = serde_json::json!({
+        "schema_version": 1,
+        "event_type": "operation.accepted",
+        "payload": {
+            "command_id": command_id(0x3b).to_string(),
+            "operation_id": operation_id(0x61).to_string(),
+            "accepted_at_ms": 1,
+            "action_epoch": 0,
+            "resource_id": null,
+            "runtime_generation": 2
+        }
+    });
+    assert!(serde_json::from_value::<Event>(partial_generation_only).is_err());
+
+    let mp_resource_only = rmp_serde::to_vec(&EventWire {
+        schema_version: 1,
+        event_type: "operation.accepted",
+        payload: AcceptedPartial {
+            command_id: command_id(0x3b).to_string(),
+            operation_id: operation_id(0x61).to_string(),
+            accepted_at_ms: 1,
+            action_epoch: Some(0),
+            resource_id: Some(resource_id(0x57).to_string()),
+            runtime_generation: None,
+        },
+    })
+    .expect("msgpack resource-only");
+    assert!(rmp_serde::from_slice::<Event>(&mp_resource_only).is_err());
+    let mp_generation_only = rmp_serde::to_vec(&EventWire {
+        schema_version: 1,
+        event_type: "operation.accepted",
+        payload: AcceptedPartial {
+            command_id: command_id(0x3b).to_string(),
+            operation_id: operation_id(0x61).to_string(),
+            accepted_at_ms: 1,
+            action_epoch: Some(0),
+            resource_id: None,
+            runtime_generation: Some(2),
+        },
+    })
+    .expect("msgpack generation-only");
+    assert!(rmp_serde::from_slice::<Event>(&mp_generation_only).is_err());
+
+    let pure = OperationAcceptedFact::new(
+        command_id(0x3b),
+        operation_id(0x61),
+        42,
+        Some(0),
+        None,
+        None,
+    )
+    .expect("pure accepted fact");
+    let pure_event = Event::OperationAccepted(pure.clone());
+    assert!(!pure_event.is_task_mutation());
+    assert!(!matches!(pure_event, Event::OperationSettled(_)));
+    let pure_json = serde_json::to_value(&pure_event).expect("pure json");
+    assert!(pure_json["payload"].get("task_id").is_none());
+    assert_eq!(pure_json["payload"]["resource_id"], serde_json::Value::Null);
+    assert_eq!(
+        pure_json["payload"]["runtime_generation"],
+        serde_json::Value::Null
+    );
+    let pure_json_rt: Event = serde_json::from_value(pure_json).expect("pure json rt");
+    assert_eq!(pure_json_rt, pure_event);
+    let pure_packed = rmp_serde::to_vec(&pure_event).expect("pure msgpack");
+    let pure_mp: Event = rmp_serde::from_slice(&pure_packed).expect("pure msgpack rt");
+    assert_eq!(pure_mp, pure_event);
 }
