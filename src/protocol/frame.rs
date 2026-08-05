@@ -213,6 +213,11 @@ impl PhysicalFrameCodec {
         self.max_payload_bytes
     }
 
+    /// Validate a decoded four-byte big-endian length before allocating payload storage.
+    pub fn validated_payload_len(self, header: [u8; 4]) -> Result<usize, PhysicalFrameError> {
+        self.validate_declared(u32::from_be_bytes(header))
+    }
+
     fn validate_declared(self, declared: u32) -> Result<usize, PhysicalFrameError> {
         if declared == 0 {
             return Err(PhysicalFrameError::Empty);

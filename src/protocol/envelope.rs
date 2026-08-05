@@ -1,9 +1,12 @@
+use std::fmt;
 use std::io::Cursor;
 
 use rmp::Marker;
-use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
+use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::ser::{self, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use uuid::{Uuid, Variant};
 
 use crate::domain::ClientId;
 
@@ -17,6 +20,109 @@ pub const MAX_MESSAGEPACK_DEPTH: u16 = 32;
 pub const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 1_000;
 pub const MAX_MESSAGEPACK_VALUES: u32 = 65_536;
 const MESSAGEPACK_STACK_SLOTS: usize = MAX_MESSAGEPACK_DEPTH as usize + 1;
+
+/// Domain-separated SHA-256 binding for a normalized named profile.
+pub const PROFILE_FINGERPRINT_DOMAIN: &[u8] = b"devmanager.pipe.v1\0";
+
+/// Exact 32-byte profile binding used by pipe endpoints and Hello documents.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileFingerprint([u8; 32]);
+
+impl ProfileFingerprint {
+    /// Hash an already-normalized named profile segment.
+    pub fn hash_normalized(normalized: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(PROFILE_FINGERPRINT_DOMAIN);
+        hasher.update(normalized.as_bytes());
+        Self(hasher.finalize().into())
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        let mut hex = String::with_capacity(64);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    }
+}
+
+impl fmt::Debug for ProfileFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ProfileFingerprint")
+            .field(&self.to_hex())
+            .finish()
+    }
+}
+
+impl Serialize for ProfileFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FingerprintVisitor;
+
+        impl<'de> Visitor<'de> for FingerprintVisitor {
+            type Value = ProfileFingerprint;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a 32-byte profile fingerprint")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let bytes: [u8; 32] = value
+                    .try_into()
+                    .map_err(|_| de::Error::invalid_length(value.len(), &self))?;
+                Ok(ProfileFingerprint::from_bytes(bytes))
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&value)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; 32];
+                for (index, slot) in bytes.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::invalid_length(33, &self));
+                }
+                Ok(ProfileFingerprint::from_bytes(bytes))
+            }
+        }
+
+        deserializer.deserialize_bytes(FingerprintVisitor)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientBuildError {
@@ -71,6 +177,7 @@ pub struct ClientHello {
     pub protocol_minor: u16,
     pub client_build: String,
     pub client_id: ClientId,
+    pub profile_fingerprint: ProfileFingerprint,
     pub requested: CapabilitySet,
     pub limits: FrameLimits,
 }
@@ -81,11 +188,12 @@ impl Serialize for ClientHello {
         S: Serializer,
     {
         self.validate().map_err(ser::Error::custom)?;
-        let mut map = serializer.serialize_map(Some(6))?;
+        let mut map = serializer.serialize_map(Some(7))?;
         map.serialize_entry("protocol_major", &self.protocol_major)?;
         map.serialize_entry("protocol_minor", &self.protocol_minor)?;
         map.serialize_entry("client_build", &self.client_build)?;
         map.serialize_entry("client_id", &self.client_id)?;
+        map.serialize_entry("profile_fingerprint", &self.profile_fingerprint)?;
         map.serialize_entry("requested", &self.requested)?;
         map.serialize_entry("limits", &self.limits)?;
         map.end()
@@ -97,6 +205,7 @@ const CLIENT_HELLO_FIELDS: &[&str] = &[
     "protocol_minor",
     "client_build",
     "client_id",
+    "profile_fingerprint",
     "requested",
     "limits",
 ];
@@ -106,6 +215,7 @@ enum ClientHelloField {
     ProtocolMinor,
     ClientBuild,
     ClientId,
+    ProfileFingerprint,
     Requested,
     Limits,
 }
@@ -133,6 +243,7 @@ impl<'de> Deserialize<'de> for ClientHelloField {
                     "protocol_minor" => Ok(ClientHelloField::ProtocolMinor),
                     "client_build" => Ok(ClientHelloField::ClientBuild),
                     "client_id" => Ok(ClientHelloField::ClientId),
+                    "profile_fingerprint" => Ok(ClientHelloField::ProfileFingerprint),
                     "requested" => Ok(ClientHelloField::Requested),
                     "limits" => Ok(ClientHelloField::Limits),
                     _ => Err(de::Error::unknown_field(value, CLIENT_HELLO_FIELDS)),
@@ -166,6 +277,7 @@ impl<'de> Deserialize<'de> for ClientHello {
                 let mut protocol_minor = None;
                 let mut client_build = None;
                 let mut client_id = None;
+                let mut profile_fingerprint = None;
                 let mut requested = None;
                 let mut limits = None;
 
@@ -195,6 +307,12 @@ impl<'de> Deserialize<'de> for ClientHello {
                             }
                             client_id = Some(map.next_value()?);
                         }
+                        ClientHelloField::ProfileFingerprint => {
+                            if profile_fingerprint.is_some() {
+                                return Err(de::Error::duplicate_field("profile_fingerprint"));
+                            }
+                            profile_fingerprint = Some(map.next_value()?);
+                        }
                         ClientHelloField::Requested => {
                             if requested.is_some() {
                                 return Err(de::Error::duplicate_field("requested"));
@@ -218,6 +336,8 @@ impl<'de> Deserialize<'de> for ClientHello {
                     client_build: client_build
                         .ok_or_else(|| de::Error::missing_field("client_build"))?,
                     client_id: client_id.ok_or_else(|| de::Error::missing_field("client_id"))?,
+                    profile_fingerprint: profile_fingerprint
+                        .ok_or_else(|| de::Error::missing_field("profile_fingerprint"))?,
                     requested: requested.ok_or_else(|| de::Error::missing_field("requested"))?,
                     limits: limits.ok_or_else(|| de::Error::missing_field("limits"))?,
                 };
@@ -234,6 +354,7 @@ impl ClientHello {
     pub fn new(
         client_build: impl Into<String>,
         client_id: ClientId,
+        profile_fingerprint: ProfileFingerprint,
         requested: CapabilitySet,
         limits: FrameLimits,
     ) -> Result<Self, ClientHelloError> {
@@ -242,6 +363,7 @@ impl ClientHello {
             protocol_minor: super::PROTOCOL_MINOR,
             client_build: client_build.into(),
             client_id,
+            profile_fingerprint,
             requested,
             limits,
         };
@@ -280,15 +402,312 @@ impl ClientHello {
     }
 }
 
-/// Validated handshake result used by the host without creating a Phase 1
-/// server wire shape. `ServerHello` remains owned by the authenticated Phase 2
-/// connection contract.
+/// Validated handshake result shared by ClientHello negotiation and ServerHello.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegotiatedParameters {
     pub version: ProtocolVersion,
     pub client_id: ClientId,
     pub capabilities: CapabilitySet,
     pub limits: FrameLimits,
+}
+
+pub const MAX_SERVER_BUILD_BYTES: u32 = MAX_CLIENT_BUILD_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerBuildError {
+    Empty,
+    TooLong { declared: u64, maximum: u32 },
+}
+
+impl std::fmt::Display for ServerBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "server build identifier must be nonempty"),
+            Self::TooLong { declared, maximum } => write!(
+                f,
+                "server build identifier length {declared} exceeds maximum {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ServerBuildError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerHelloError {
+    Build(ServerBuildError),
+    FrameLimits(FrameLimitsError),
+    InvalidUuid { field: &'static str },
+}
+
+impl std::fmt::Display for ServerHelloError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(error) => error.fmt(f),
+            Self::FrameLimits(error) => error.fmt(f),
+            Self::InvalidUuid { field } => {
+                write!(f, "server hello field {field} must be a UUIDv7")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerHelloError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(error) => Some(error),
+            Self::FrameLimits(error) => Some(error),
+            Self::InvalidUuid { .. } => None,
+        }
+    }
+}
+
+/// Strict named-map ServerHello returned after a successful ClientHello negotiation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHello {
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub server_build: String,
+    pub host_boot_id: Uuid,
+    pub connection_id: Uuid,
+    pub profile_fingerprint: ProfileFingerprint,
+    pub granted: CapabilitySet,
+    pub limits: FrameLimits,
+}
+
+impl Serialize for ServerHello {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(ser::Error::custom)?;
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("protocol_major", &self.protocol_major)?;
+        map.serialize_entry("protocol_minor", &self.protocol_minor)?;
+        map.serialize_entry("server_build", &self.server_build)?;
+        map.serialize_entry("host_boot_id", &self.host_boot_id)?;
+        map.serialize_entry("connection_id", &self.connection_id)?;
+        map.serialize_entry("profile_fingerprint", &self.profile_fingerprint)?;
+        map.serialize_entry("granted", &self.granted)?;
+        map.serialize_entry("limits", &self.limits)?;
+        map.end()
+    }
+}
+
+const SERVER_HELLO_FIELDS: &[&str] = &[
+    "protocol_major",
+    "protocol_minor",
+    "server_build",
+    "host_boot_id",
+    "connection_id",
+    "profile_fingerprint",
+    "granted",
+    "limits",
+];
+
+enum ServerHelloField {
+    ProtocolMajor,
+    ProtocolMinor,
+    ServerBuild,
+    HostBootId,
+    ConnectionId,
+    ProfileFingerprint,
+    Granted,
+    Limits,
+}
+
+impl<'de> Deserialize<'de> for ServerHelloField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ServerHelloField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a ServerHello field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "protocol_major" => Ok(ServerHelloField::ProtocolMajor),
+                    "protocol_minor" => Ok(ServerHelloField::ProtocolMinor),
+                    "server_build" => Ok(ServerHelloField::ServerBuild),
+                    "host_boot_id" => Ok(ServerHelloField::HostBootId),
+                    "connection_id" => Ok(ServerHelloField::ConnectionId),
+                    "profile_fingerprint" => Ok(ServerHelloField::ProfileFingerprint),
+                    "granted" => Ok(ServerHelloField::Granted),
+                    "limits" => Ok(ServerHelloField::Limits),
+                    _ => Err(de::Error::unknown_field(value, SERVER_HELLO_FIELDS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerHello {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ServerHelloVisitor;
+
+        impl<'de> Visitor<'de> for ServerHelloVisitor {
+            type Value = ServerHello;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named ServerHello map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut protocol_major = None;
+                let mut protocol_minor = None;
+                let mut server_build = None;
+                let mut host_boot_id = None;
+                let mut connection_id = None;
+                let mut profile_fingerprint = None;
+                let mut granted = None;
+                let mut limits = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ServerHelloField::ProtocolMajor => {
+                            if protocol_major.is_some() {
+                                return Err(de::Error::duplicate_field("protocol_major"));
+                            }
+                            protocol_major = Some(map.next_value()?);
+                        }
+                        ServerHelloField::ProtocolMinor => {
+                            if protocol_minor.is_some() {
+                                return Err(de::Error::duplicate_field("protocol_minor"));
+                            }
+                            protocol_minor = Some(map.next_value()?);
+                        }
+                        ServerHelloField::ServerBuild => {
+                            if server_build.is_some() {
+                                return Err(de::Error::duplicate_field("server_build"));
+                            }
+                            server_build = Some(map.next_value()?);
+                        }
+                        ServerHelloField::HostBootId => {
+                            if host_boot_id.is_some() {
+                                return Err(de::Error::duplicate_field("host_boot_id"));
+                            }
+                            host_boot_id = Some(map.next_value()?);
+                        }
+                        ServerHelloField::ConnectionId => {
+                            if connection_id.is_some() {
+                                return Err(de::Error::duplicate_field("connection_id"));
+                            }
+                            connection_id = Some(map.next_value()?);
+                        }
+                        ServerHelloField::ProfileFingerprint => {
+                            if profile_fingerprint.is_some() {
+                                return Err(de::Error::duplicate_field("profile_fingerprint"));
+                            }
+                            profile_fingerprint = Some(map.next_value()?);
+                        }
+                        ServerHelloField::Granted => {
+                            if granted.is_some() {
+                                return Err(de::Error::duplicate_field("granted"));
+                            }
+                            granted = Some(map.next_value()?);
+                        }
+                        ServerHelloField::Limits => {
+                            if limits.is_some() {
+                                return Err(de::Error::duplicate_field("limits"));
+                            }
+                            limits = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let hello = ServerHello {
+                    protocol_major: protocol_major
+                        .ok_or_else(|| de::Error::missing_field("protocol_major"))?,
+                    protocol_minor: protocol_minor
+                        .ok_or_else(|| de::Error::missing_field("protocol_minor"))?,
+                    server_build: server_build
+                        .ok_or_else(|| de::Error::missing_field("server_build"))?,
+                    host_boot_id: host_boot_id
+                        .ok_or_else(|| de::Error::missing_field("host_boot_id"))?,
+                    connection_id: connection_id
+                        .ok_or_else(|| de::Error::missing_field("connection_id"))?,
+                    profile_fingerprint: profile_fingerprint
+                        .ok_or_else(|| de::Error::missing_field("profile_fingerprint"))?,
+                    granted: granted.ok_or_else(|| de::Error::missing_field("granted"))?,
+                    limits: limits.ok_or_else(|| de::Error::missing_field("limits"))?,
+                };
+                hello.validate().map_err(de::Error::custom)?;
+                Ok(hello)
+            }
+        }
+
+        deserializer.deserialize_map(ServerHelloVisitor)
+    }
+}
+
+impl ServerHello {
+    pub fn from_negotiated(
+        server_build: impl Into<String>,
+        host_boot_id: Uuid,
+        profile_fingerprint: ProfileFingerprint,
+        negotiated: NegotiatedParameters,
+    ) -> Result<Self, ServerHelloError> {
+        let hello = Self {
+            protocol_major: negotiated.version.major,
+            protocol_minor: negotiated.version.minor,
+            server_build: server_build.into(),
+            host_boot_id,
+            connection_id: Uuid::now_v7(),
+            profile_fingerprint,
+            granted: negotiated.capabilities,
+            limits: negotiated.limits,
+        };
+        hello.validate()?;
+        Ok(hello)
+    }
+
+    pub fn validate(&self) -> Result<(), ServerHelloError> {
+        validate_server_build(&self.server_build).map_err(ServerHelloError::Build)?;
+        self.limits
+            .validate_offer()
+            .map_err(ServerHelloError::FrameLimits)?;
+        validate_uuid_v7(self.host_boot_id, "host_boot_id")?;
+        validate_uuid_v7(self.connection_id, "connection_id")?;
+        Ok(())
+    }
+}
+
+fn validate_uuid_v7(value: Uuid, field: &'static str) -> Result<(), ServerHelloError> {
+    if value.get_version_num() != 7 || value.get_variant() != Variant::RFC4122 {
+        return Err(ServerHelloError::InvalidUuid { field });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod uuid_v7_tests {
+    use super::validate_uuid_v7;
+    use uuid::Uuid;
+
+    #[test]
+    fn server_hello_uuid_requires_version_7_and_rfc4122_variant() {
+        let ok = Uuid::now_v7();
+        assert!(validate_uuid_v7(ok, "connection_id").is_ok());
+        let nil = Uuid::nil();
+        assert!(validate_uuid_v7(nil, "connection_id").is_err());
+    }
 }
 
 fn validate_client_build(value: &str) -> Result<(), ClientBuildError> {
@@ -300,6 +719,20 @@ fn validate_client_build(value: &str) -> Result<(), ClientBuildError> {
         return Err(ClientBuildError::TooLong {
             declared,
             maximum: MAX_CLIENT_BUILD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_server_build(value: &str) -> Result<(), ServerBuildError> {
+    let declared = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    if declared == 0 {
+        return Err(ServerBuildError::Empty);
+    }
+    if declared > u64::from(MAX_SERVER_BUILD_BYTES) {
+        return Err(ServerBuildError::TooLong {
+            declared,
+            maximum: MAX_SERVER_BUILD_BYTES,
         });
     }
     Ok(())

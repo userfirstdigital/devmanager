@@ -11,9 +11,9 @@ use devmanager::domain::{
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
     FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
-    PhysicalFrameCodec, PhysicalFrameError, ProtocolVersion, VersionNegotiationError,
-    MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH,
-    MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint, ProtocolVersion,
+    VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
+    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -527,6 +527,10 @@ fn protocol_client_id(tail: u8) -> ClientId {
     ClientId::from_bytes(protocol_uuid_v7(tail)).expect("client id")
 }
 
+fn protocol_profile_fingerprint(tail: u8) -> ProfileFingerprint {
+    ProfileFingerprint::hash_normalized(&format!("contract-profile-{tail:02x}"))
+}
+
 fn protocol_command_id(tail: u8) -> CommandId {
     CommandId::from_bytes(protocol_uuid_v7(tail)).expect("command id")
 }
@@ -562,6 +566,7 @@ fn protocol_client_hello_round_trips_and_negotiates_without_freezing_server_hell
     let hello = ClientHello::new(
         "devmanager/0.4.2",
         protocol_client_id(0x41),
+        protocol_profile_fingerprint(0x41),
         requested,
         offered_limits,
     )
@@ -569,10 +574,10 @@ fn protocol_client_hello_round_trips_and_negotiates_without_freezing_server_hell
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
 
     let encoded = codec.encode(&hello).expect("encode hello");
-    assert_eq!(encoded[0], 0x86, "ClientHello is a six-field named map");
+    assert_eq!(encoded[0], 0x87, "ClientHello is a seven-field named map");
     assert_eq!(
         rmp_serde::to_vec(&hello).expect("direct serialization")[0],
-        0x86,
+        0x87,
         "ClientHello never exposes a compact tuple wire shape"
     );
     let decoded = codec.decode::<ClientHello>(&encoded).expect("decode hello");
@@ -611,6 +616,7 @@ struct RawClientHello {
     protocol_minor: u16,
     client_build: String,
     client_id: Vec<u8>,
+    profile_fingerprint: Vec<u8>,
     requested: CapabilitySet,
     limits: RawHelloLimits,
 }
@@ -640,6 +646,7 @@ fn raw_client_hello() -> RawClientHello {
         protocol_minor: PROTOCOL_MINOR,
         client_build: "devmanager/0.4.2".to_string(),
         client_id: protocol_client_id(0x42).as_bytes().to_vec(),
+        profile_fingerprint: protocol_profile_fingerprint(0x42).as_bytes().to_vec(),
         requested: CapabilitySet::empty(),
         limits: FrameLimits::v1_default().into(),
     }
@@ -648,15 +655,17 @@ fn raw_client_hello() -> RawClientHello {
 #[test]
 fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
     let client_id = protocol_client_id(0x43);
+    let fingerprint = protocol_profile_fingerprint(0x43);
     let requested = CapabilitySet::empty();
     let limits = FrameLimits::v1_default();
     assert_eq!(
-        ClientHello::new("", client_id, requested, limits),
+        ClientHello::new("", client_id, fingerprint, requested, limits),
         Err(ClientHelloError::Build(ClientBuildError::Empty))
     );
     ClientHello::new(
         "x".repeat(usize::try_from(MAX_CLIENT_BUILD_BYTES).unwrap()),
         client_id,
+        fingerprint,
         requested,
         limits,
     )
@@ -665,6 +674,7 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
         ClientHello::new(
             "x".repeat(usize::try_from(MAX_CLIENT_BUILD_BYTES).unwrap() + 1),
             client_id,
+            fingerprint,
             requested,
             limits,
         ),
@@ -680,6 +690,7 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
         protocol_minor: PROTOCOL_MINOR,
         client_build: String::new(),
         client_id,
+        profile_fingerprint: fingerprint,
         requested,
         limits,
     };
@@ -714,6 +725,14 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
     );
 
     invalid = raw_client_hello();
+    invalid.profile_fingerprint = vec![0; 16];
+    let bytes = rmp_serde::to_vec_named(&invalid).expect("raw short fingerprint");
+    assert_eq!(
+        codec.decode::<ClientHello>(&bytes),
+        Err(MessagePackError::Decode)
+    );
+
+    invalid = raw_client_hello();
     invalid.limits.max_physical_frame_bytes = 0;
     let bytes = rmp_serde::to_vec_named(&invalid).expect("raw zero limits");
     assert_eq!(
@@ -721,17 +740,25 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
         Err(MessagePackError::Decode)
     );
 
-    let valid = ClientHello::new("devmanager/0.4.2", client_id, requested, limits).unwrap();
+    let valid = ClientHello::new(
+        "devmanager/0.4.2",
+        client_id,
+        fingerprint,
+        requested,
+        limits,
+    )
+    .unwrap();
     let compact_tuple = (
         PROTOCOL_MAJOR,
         PROTOCOL_MINOR,
         "devmanager/0.4.2",
         client_id.as_bytes().to_vec(),
+        fingerprint.as_bytes().to_vec(),
         requested,
         RawHelloLimits::from(limits),
     );
     let compact_bytes = rmp_serde::to_vec(&compact_tuple).expect("compact tuple fixture");
-    assert_eq!(compact_bytes[0], 0x96);
+    assert_eq!(compact_bytes[0], 0x97);
     assert_eq!(
         codec.decode::<ClientHello>(&compact_bytes),
         Err(MessagePackError::Decode),
@@ -739,8 +766,8 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
     );
 
     let mut duplicate = codec.encode(&valid).expect("valid hello");
-    assert_eq!(duplicate[0], 0x86);
-    duplicate[0] = 0x87;
+    assert_eq!(duplicate[0], 0x87);
+    duplicate[0] = 0x88;
     duplicate.extend(rmp_serde::to_vec(&"client_build").unwrap());
     duplicate.extend(rmp_serde::to_vec(&"duplicate").unwrap());
     assert_eq!(
@@ -749,7 +776,7 @@ fn protocol_client_hello_rejects_invalid_fields_and_document_shape() {
     );
 
     let mut unknown = codec.encode(&valid).expect("valid hello");
-    unknown[0] = 0x87;
+    unknown[0] = 0x88;
     unknown.extend(rmp_serde::to_vec(&"future_field").unwrap());
     unknown.push(0xc0);
     assert_eq!(

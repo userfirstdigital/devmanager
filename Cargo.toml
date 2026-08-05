@@ -52,7 +52,13 @@ zeroize = { version = "1.8", features = ["derive"] }
 raw-window-handle = "0.6"
 wry = { version = "=0.55.1", default-features = false, features = ["devtools", "protocol", "os-webview"] }
 webview2-com = "=0.38.2"
-windows = { version = "=0.61.3", features = ["Win32_Storage_FileSystem"] }
+windows = { version = "=0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
