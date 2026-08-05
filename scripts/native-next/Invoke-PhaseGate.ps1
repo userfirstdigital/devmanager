@@ -26,14 +26,7 @@ $protectedRoot = Get-DevManagerProductionRoot
 
 # Reject unknown recipes before any baseline/evidence work.
 $plan = Resolve-DevManagerPhaseGateRecipe -Recipe $Recipe -WorktreeRoot $worktreeRoot
-foreach ($requiredEnv in @('DEVMANAGER_PROFILE', 'DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND', 'CARGO_TARGET_DIR')) {
-    if (-not $plan.environment.Contains($requiredEnv)) {
-        throw "Execution plan missing required environment key '$requiredEnv'."
-    }
-}
-if ([string]$plan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {
-    throw "Execution plan must force DEVMANAGER_PROFILE=native-next-dev."
-}
+Assert-DevManagerPhaseGateExecutionPlan -Plan $plan
 
 $run = New-DevManagerPhaseGateRunDirectory `
     -Phase $phaseName `
@@ -91,6 +84,7 @@ function Write-PhaseGateVerification {
         arguments             = [string[]]$plan.arguments
         workingDirectory      = [string]$plan.workingDirectory
         environment           = [pscustomobject]$plan.environment
+        environmentRemovals   = [string[]]@($plan.environmentRemovals)
         exitCode              = $(if ($null -eq $exitCode) { $null } else { [int]$exitCode })
         durationMs            = $durationMs
         processStartSucceeded = [bool]$processStartSucceeded
@@ -166,9 +160,7 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $false
     $startInfo.WorkingDirectory = [string]$plan.workingDirectory
-    foreach ($key in @($plan.environment.Keys)) {
-        $startInfo.Environment[[string]$key] = [string]$plan.environment[$key]
-    }
+    Set-DevManagerPhaseGateProcessEnvironment -StartInfo $startInfo -Plan $plan
     foreach ($arg in @($plan.arguments)) {
         [void]$startInfo.ArgumentList.Add([string]$arg)
     }

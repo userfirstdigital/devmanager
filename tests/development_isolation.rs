@@ -848,6 +848,8 @@ fn phase_gate_wraps_commands_with_baseline_and_cleanup_checks() {
         "-All",
         "evidenceWriteFailed",
         "unavailable",
+        "Set-DevManagerPhaseGateProcessEnvironment",
+        "environmentRemovals",
     ] {
         assert!(
             source.contains(required) || phase_gate.contains(required),
@@ -888,8 +890,9 @@ fn phase_gate_wraps_commands_with_baseline_and_cleanup_checks() {
         );
     }
 
+    let source_normalized = source.replace("\r\n", "\n");
     assert!(
-        source.contains(
+        source_normalized.contains(
             "$evidenceWriteFailed = $true\n        $observationFailure = [string]$_.Exception.Message"
         ),
         "a failed real after-inventory publication must stay an evidence failure even if the fallback envelope publishes"
@@ -1040,6 +1043,42 @@ foreach ($bad in @('cargo-build','pwsh-file','../escape','phase-00-tests')) {{
   $rej = $false; try {{ $null = Resolve-DevManagerPhaseGateRecipe -Recipe $bad -WorktreeRoot $harness }} catch {{ $rej = $true }}
   if (-not $rej) {{ throw "reject $bad" }}
 }}
+$libPlan = Resolve-DevManagerPhaseGateRecipe -Recipe 'library-tests-serial' -WorktreeRoot $harness
+$isoPlan = Resolve-DevManagerPhaseGateRecipe -Recipe 'development-isolation-tests' -WorktreeRoot $harness
+Assert-DevManagerPhaseGateExecutionPlan -Plan $libPlan
+Assert-DevManagerPhaseGateExecutionPlan -Plan $isoPlan
+if ($libPlan.environment.Contains('DEVMANAGER_PROFILE')) {{ throw 'library plan must omit DEVMANAGER_PROFILE override' }}
+$libRemovals = @($libPlan.environmentRemovals)
+if (($libRemovals -join ',') -cne 'DEVMANAGER_PROFILE') {{ throw ("library removals must be exact DEVMANAGER_PROFILE; got: {{0}}" -f ($libRemovals -join ',')) }}
+if (-not $isoPlan.environment.Contains('DEVMANAGER_PROFILE') -or [string]$isoPlan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{
+  throw 'integration plan must force DEVMANAGER_PROFILE=native-next-dev'
+}}
+if (@($isoPlan.environmentRemovals).Count -ne 0) {{ throw 'integration plan must not remove DEVMANAGER_PROFILE' }}
+foreach ($shared in @('DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','CARGO_TARGET_DIR')) {{
+  if (-not $libPlan.environment.Contains($shared)) {{ throw "library missing $shared" }}
+  if (-not $isoPlan.environment.Contains($shared)) {{ throw "integration missing $shared" }}
+}}
+$priorProfile = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE', 'Process')
+try {{
+  [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', 'poison-parent-profile', 'Process')
+  $psiLib = [System.Diagnostics.ProcessStartInfo]::new()
+  $psiLib.UseShellExecute = $false
+  if (-not $psiLib.Environment.ContainsKey('DEVMANAGER_PROFILE')) {{ throw 'expected poisoned parent profile to be inherited into StartInfo' }}
+  Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiLib -Plan $libPlan
+  if ($psiLib.Environment.ContainsKey('DEVMANAGER_PROFILE')) {{ throw 'library plan must remove poisoned DEVMANAGER_PROFILE' }}
+  if ([string]$psiLib.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw 'library label override' }}
+  if ([string]$psiLib.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw 'library kind override' }}
+  $psiIso = [System.Diagnostics.ProcessStartInfo]::new()
+  $psiIso.UseShellExecute = $false
+  Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiIso -Plan $isoPlan
+  if ([string]$psiIso.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw 'integration must force named profile over poison' }}
+}} finally {{
+  if ($null -eq $priorProfile) {{
+    [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', $null, 'Process')
+  }} else {{
+    [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', $priorProfile, 'Process')
+  }}
+}}
 $observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
 $tracked = New-Object 'System.Collections.Generic.HashSet[uint32]'
 [void]$tracked.Add([uint32]10)
@@ -1112,6 +1151,8 @@ $v = Get-Content (Join-Path $runDir 'verification.json') -Raw | ConvertFrom-Json
 if ($v.recipe -ne 'cargo-version' -or -not [bool]$v.longRustRun -or $v.cleanupResult -ne 'clean') {{ throw 'verification ok fields' }}
 if ($null -ne $v.PSObject.Properties['verificationWriteFailure']) {{ throw 'verificationWriteFailure must stay local-only' }}
 if ($null -ne $v.PSObject.Properties['allowDevelopmentProcesses']) {{ throw 'allowDevelopmentProcesses must be removed' }}
+if ($null -eq $v.PSObject.Properties['environmentRemovals']) {{ throw 'verification must record environmentRemovals names' }}
+if (@($v.environmentRemovals).Count -ne 0) {{ throw 'cargo-version must not remove profile' }}
 if (-not (Test-Path -LiteralPath (Join-Path $runDir 'processes-after.json'))) {{ throw 'after artifact required' }}
 $pub = Join-Path $evidenceRoot 'phase-00\runs\pub\verification.json'
 New-Item -ItemType Directory -Force -Path (Split-Path $pub -Parent) | Out-Null

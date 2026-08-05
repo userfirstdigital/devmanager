@@ -111,19 +111,106 @@ function Resolve-DevManagerPhaseGateRecipe {
 
     $arguments = [string[]]@($table[$name])
     $environment = [ordered]@{
-        DEVMANAGER_PROFILE        = 'native-next-dev'
         DEVMANAGER_INSTANCE_LABEL = 'Next'
         DEVMANAGER_RUNTIME_KIND   = 'native-next'
         CARGO_TARGET_DIR          = $cargoTargetDir
     }
+    $environmentRemovals = [string[]]@()
+    if ($name -eq 'library-tests-serial') {
+        # AGENTS.md: complete lib suite must not receive an external DEVMANAGER_PROFILE.
+        $environmentRemovals = [string[]]@('DEVMANAGER_PROFILE')
+    }
+    else {
+        $environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+    }
 
     return [pscustomobject]@{
-        recipe           = $name
-        executable       = $resolved
-        arguments        = $arguments
-        workingDirectory = [System.IO.Path]::GetFullPath($worktree)
-        cargoTargetDir   = $cargoTargetDir
-        environment      = $environment
+        recipe               = $name
+        executable           = $resolved
+        arguments            = $arguments
+        workingDirectory     = [System.IO.Path]::GetFullPath($worktree)
+        cargoTargetDir       = $cargoTargetDir
+        environment          = $environment
+        environmentRemovals  = $environmentRemovals
+    }
+}
+
+function Assert-DevManagerPhaseGateExecutionPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    if ($null -eq $Plan) {
+        throw 'Phase-gate execution plan is null.'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Plan.recipe)) {
+        throw 'Phase-gate execution plan is missing recipe.'
+    }
+    if ($null -eq $Plan.environment) {
+        throw 'Phase-gate execution plan is missing environment overrides.'
+    }
+    if ($null -eq $Plan.environmentRemovals) {
+        throw 'Phase-gate execution plan is missing environmentRemovals.'
+    }
+
+    foreach ($requiredEnv in @('DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND', 'CARGO_TARGET_DIR')) {
+        if (-not $Plan.environment.Contains($requiredEnv)) {
+            throw "Execution plan missing required environment key '$requiredEnv'."
+        }
+    }
+    if ([string]$Plan.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {
+        throw "Execution plan must force DEVMANAGER_INSTANCE_LABEL=Next."
+    }
+    if ([string]$Plan.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {
+        throw "Execution plan must force DEVMANAGER_RUNTIME_KIND=native-next."
+    }
+
+    $removals = [string[]]@($Plan.environmentRemovals)
+    if ([string]$Plan.recipe -eq 'library-tests-serial') {
+        if ($Plan.environment.Contains('DEVMANAGER_PROFILE')) {
+            throw "library-tests-serial must not include a DEVMANAGER_PROFILE override."
+        }
+        if (($removals -join ',') -cne 'DEVMANAGER_PROFILE') {
+            throw "library-tests-serial environmentRemovals must be exactly DEVMANAGER_PROFILE (got: $($removals -join ', '))."
+        }
+    }
+    else {
+        if (-not $Plan.environment.Contains('DEVMANAGER_PROFILE')) {
+            throw "Execution plan missing required environment key 'DEVMANAGER_PROFILE'."
+        }
+        if ([string]$Plan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {
+            throw "Execution plan must force DEVMANAGER_PROFILE=native-next-dev."
+        }
+        if ($removals -contains 'DEVMANAGER_PROFILE') {
+            throw "Non-library Phase 0 recipes must not remove DEVMANAGER_PROFILE."
+        }
+        if ($removals.Count -ne 0) {
+            throw "Non-library Phase 0 recipes must not declare environmentRemovals (got: $($removals -join ', '))."
+        }
+    }
+}
+
+function Set-DevManagerPhaseGateProcessEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    Assert-DevManagerPhaseGateExecutionPlan -Plan $Plan
+
+    foreach ($key in @($Plan.environmentRemovals)) {
+        $name = [string]$key
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($StartInfo.Environment.ContainsKey($name)) {
+            [void]$StartInfo.Environment.Remove($name)
+        }
+    }
+
+    foreach ($key in @($Plan.environment.Keys)) {
+        $StartInfo.Environment[[string]$key] = [string]$Plan.environment[$key]
     }
 }
 
