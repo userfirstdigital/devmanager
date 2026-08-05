@@ -1474,7 +1474,6 @@ fn golden_event_serialization_fixtures() {
             OperationAcceptedFact::new(
                 command_id(0x3b),
                 operation_id(0x61),
-                Some(task),
                 1_725_000_000_390,
                 Some(1),
                 Some(2),
@@ -2098,15 +2097,8 @@ fn forged_resource_and_agent_registration_are_rejected() {
 fn operation_accepted_is_rebuildable_and_not_settlement() {
     let task = task_id(0x08);
     let snap = create_task(None, task, 1, 0x09);
-    let fact = OperationAcceptedFact::new(
-        command_id(0x0a),
-        operation_id(0x0b),
-        Some(task),
-        10,
-        Some(0),
-        None,
-    )
-    .expect("accepted fact");
+    let fact = OperationAcceptedFact::new(command_id(0x0a), operation_id(0x0b), 10, Some(0), None)
+        .expect("accepted fact");
     let event = domain_event(
         event_id(0x0c),
         Some(task),
@@ -2123,54 +2115,83 @@ fn operation_accepted_is_rebuildable_and_not_settlement() {
         Event::OperationSettled(_)
     ));
 
-    let mismatched = OperationAcceptedFact::new(
-        command_id(0x0a),
-        operation_id(0x0b),
-        Some(task_id(0x0d)),
-        10,
-        Some(0),
-        None,
-    )
-    .expect("fact");
+    // One-truth: DomainEvent.task_id is sole task scope; accepted payload has no task_id.
+    let json = serde_json::to_value(&event).expect("domain json");
+    assert_eq!(json["task_id"], serde_json::json!(task.to_string()));
+    assert!(
+        json["payload"]["payload"].get("task_id").is_none(),
+        "accepted Event payload must not carry task_id"
+    );
+    let json_rt: DomainEvent = serde_json::from_value(json.clone()).expect("domain json rt");
+    assert_eq!(json_rt.task_id, Some(task));
+    assert_eq!(json_rt, event);
+
+    let packed = rmp_serde::to_vec(&event).expect("domain msgpack");
+    let mp_rt: DomainEvent = rmp_serde::from_slice(&packed).expect("domain msgpack rt");
+    assert_eq!(mp_rt.task_id, Some(task));
+    assert_eq!(mp_rt, event);
+
+    let golden = fs::read_to_string(fixture_path("operation_accepted.json")).expect("fixture");
+    let golden_val: serde_json::Value = serde_json::from_str(golden.trim()).expect("parse golden");
+    assert!(
+        golden_val["payload"].get("task_id").is_none(),
+        "golden accepted payload must omit task_id"
+    );
+    let golden_event: Event =
+        serde_json::from_value(golden_val.clone()).expect("golden Event decode");
+    let golden_domain = DomainEvent {
+        id: event_id(0x3c),
+        task_id: Some(task),
+        sequence: 9,
+        task_revision: Some(1),
+        occurred_at_ms: 1_725_000_000_390,
+        payload: golden_event.clone(),
+    };
+    let golden_domain_json = serde_json::to_value(&golden_domain).expect("golden domain json");
+    assert_eq!(
+        golden_domain_json["task_id"],
+        serde_json::json!(task.to_string())
+    );
+    assert_eq!(golden_domain_json["payload"], golden_val);
+    let golden_domain_rt: DomainEvent =
+        serde_json::from_value(golden_domain_json).expect("golden domain json rt");
+    assert_eq!(golden_domain_rt.task_id, Some(task));
+    assert_eq!(golden_domain_rt.payload, golden_event);
+    let golden_packed = rmp_serde::to_vec(&golden_domain).expect("golden domain msgpack");
+    let golden_mp: DomainEvent =
+        rmp_serde::from_slice(&golden_packed).expect("golden domain msgpack rt");
+    assert_eq!(golden_mp.task_id, Some(task));
+    assert_eq!(golden_mp.payload, golden_event);
+
+    let stale_payload_task = serde_json::json!({
+        "schema_version": 1,
+        "event_type": "operation.accepted",
+        "payload": {
+            "command_id": command_id(0x0a).to_string(),
+            "operation_id": operation_id(0x0b).to_string(),
+            "task_id": task.to_string(),
+            "accepted_at_ms": 10,
+            "action_epoch": 0,
+            "runtime_generation": null
+        }
+    });
+    assert!(
+        serde_json::from_value::<Event>(stale_payload_task).is_err(),
+        "accepted payload must reject unknown/duplicate task_id field"
+    );
+
     assert!(matches!(
         apply(
-            Some(snap.clone()),
+            Some(snap),
             &domain_event(
                 event_id(0x0e),
-                Some(task),
+                Some(task_id(0x0d)),
                 2,
                 Some(1),
                 11,
-                Event::OperationAccepted(mismatched),
+                Event::OperationAccepted(fact),
             ),
         ),
         Err(ApplyError::TaskMismatch)
     ));
-
-    let missing_fact_task = OperationAcceptedFact::new(
-        command_id(0x0a),
-        operation_id(0x0b),
-        None,
-        10,
-        Some(0),
-        None,
-    )
-    .expect("fact with None task_id");
-    assert!(
-        matches!(
-            apply(
-                Some(snap),
-                &domain_event(
-                    event_id(0x0f),
-                    Some(task),
-                    2,
-                    Some(1),
-                    11,
-                    Event::OperationAccepted(missing_fact_task),
-                ),
-            ),
-            Err(ApplyError::TaskMismatch)
-        ),
-        "fact.task_id None must not apply inside a task-scoped DomainEvent"
-    );
 }

@@ -34,7 +34,6 @@ pub struct DomainEvent {
 pub struct OperationAcceptedFact {
     pub command_id: CommandId,
     pub operation_id: OperationId,
-    pub task_id: Option<TaskId>,
     pub accepted_at_ms: i64,
     pub action_epoch: Option<u64>,
     pub runtime_generation: Option<u64>,
@@ -44,7 +43,6 @@ impl OperationAcceptedFact {
     pub fn new(
         command_id: CommandId,
         operation_id: OperationId,
-        task_id: Option<TaskId>,
         accepted_at_ms: i64,
         action_epoch: Option<u64>,
         runtime_generation: Option<u64>,
@@ -52,7 +50,6 @@ impl OperationAcceptedFact {
         Ok(Self {
             command_id,
             operation_id,
-            task_id,
             accepted_at_ms,
             action_epoch,
             runtime_generation,
@@ -65,7 +62,6 @@ impl OperationAcceptedFact {
 struct OperationAcceptedFactWire {
     command_id: CommandId,
     operation_id: OperationId,
-    task_id: Option<TaskId>,
     accepted_at_ms: i64,
     action_epoch: Option<u64>,
     runtime_generation: Option<u64>,
@@ -76,7 +72,6 @@ impl Serialize for OperationAcceptedFact {
         OperationAcceptedFactWire {
             command_id: self.command_id,
             operation_id: self.operation_id,
-            task_id: self.task_id,
             accepted_at_ms: self.accepted_at_ms,
             action_epoch: self.action_epoch,
             runtime_generation: self.runtime_generation,
@@ -91,7 +86,6 @@ impl<'de> Deserialize<'de> for OperationAcceptedFact {
         Self::new(
             wire.command_id,
             wire.operation_id,
-            wire.task_id,
             wire.accepted_at_ms,
             wire.action_epoch,
             wire.runtime_generation,
@@ -881,12 +875,9 @@ pub fn apply(
                 resources: BTreeMap::new(),
             })
         }
-        Event::OperationAccepted(fact) => {
+        Event::OperationAccepted(_fact) => {
             let snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
             require_matching_task_id(&snap, event)?;
-            if fact.task_id != event.task_id {
-                return Err(ApplyError::TaskMismatch);
-            }
             Ok(snap)
         }
         Event::OperationSettled(_)
