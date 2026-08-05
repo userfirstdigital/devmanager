@@ -930,6 +930,22 @@ fn resource_release_completion_is_generation_fenced() {
         completed.resources.get(&resource.id).map(|r| r.lifecycle),
         Some(ResourceLifecycle::Released)
     );
+    assert_eq!(
+        releasing
+            .resources
+            .get(&resource.id)
+            .map(|r| r.updated_at_ms),
+        Some(1_725_000_000_630),
+        "ReleaseBegun must stamp updated_at_ms from occurred_at"
+    );
+    assert_eq!(
+        completed
+            .resources
+            .get(&resource.id)
+            .map(|r| r.updated_at_ms),
+        Some(1_725_000_000_670),
+        "ResourceReleased must stamp updated_at_ms from occurred_at"
+    );
 
     assert!(matches!(
         apply(
@@ -962,6 +978,146 @@ fn resource_release_completion_is_generation_fenced() {
         ),
         Err(RejectionCode::InvalidTransition)
     ));
+}
+
+#[test]
+fn task_archived_rejects_live_resources_but_allows_later_reopen_register() {
+    let task = task_id(0xf0);
+    let snap = create_task(None, task, 1, 0xf1);
+    let resource = ResourceFacts {
+        id: resource_id(0xf2),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 1,
+        updated_at_ms: 1,
+    };
+    let with_resource = apply(
+        Some(snap),
+        &domain_event(
+            event_id(0xf3),
+            Some(task),
+            2,
+            Some(2),
+            1_725_000_000_700,
+            Event::ResourceRegistered {
+                resource: resource.clone(),
+            },
+        ),
+    )
+    .expect("register");
+    let closing = apply(
+        Some(with_resource),
+        &domain_event(
+            event_id(0xf4),
+            Some(task),
+            3,
+            Some(3),
+            1_725_000_000_710,
+            Event::TaskCloseBegun { action_epoch: 1 },
+        ),
+    )
+    .expect("close begun");
+    assert!(
+        matches!(
+            apply(
+                Some(closing.clone()),
+                &domain_event(
+                    event_id(0xf5),
+                    Some(task),
+                    4,
+                    Some(4),
+                    1_725_000_000_720,
+                    Event::TaskArchived,
+                ),
+            ),
+            Err(ApplyError::InvalidTransition)
+        ),
+        "archive with Active resource must fail"
+    );
+
+    let releasing = apply(
+        Some(closing),
+        &domain_event(
+            event_id(0xf6),
+            Some(task),
+            4,
+            Some(4),
+            1_725_000_000_730,
+            Event::ResourceReleaseBegun {
+                resource_id: resource.id,
+                runtime_generation: 1,
+            },
+        ),
+    )
+    .expect("release begun");
+    let released = apply(
+        Some(releasing),
+        &domain_event(
+            event_id(0xf7),
+            Some(task),
+            5,
+            Some(5),
+            1_725_000_000_740,
+            Event::ResourceReleased {
+                resource_id: resource.id,
+                runtime_generation: 1,
+            },
+        ),
+    )
+    .expect("released");
+    let archived = apply(
+        Some(released),
+        &domain_event(
+            event_id(0xf8),
+            Some(task),
+            6,
+            Some(6),
+            1_725_000_000_750,
+            Event::TaskArchived,
+        ),
+    )
+    .expect("archive after release");
+    assert_eq!(archived.task.lifecycle, TaskLifecycle::Archived);
+
+    let reopened = apply(
+        Some(archived),
+        &domain_event(
+            event_id(0xf9),
+            Some(task),
+            7,
+            Some(7),
+            1_725_000_000_760,
+            Event::TaskReopened,
+        ),
+    )
+    .expect("reopen");
+    let later = ResourceFacts {
+        id: resource_id(0xfa),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 40, rows: 12 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    let after_register = apply(
+        Some(reopened),
+        &domain_event(
+            event_id(0xfb),
+            Some(task),
+            8,
+            Some(8),
+            1_725_000_000_770,
+            Event::ResourceRegistered { resource: later },
+        ),
+    )
+    .expect("register after reopen");
+    assert_eq!(after_register.task.lifecycle, TaskLifecycle::Open);
+    assert!(after_register.resources.contains_key(&resource_id(0xfa)));
 }
 
 #[test]

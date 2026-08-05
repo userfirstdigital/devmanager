@@ -4,6 +4,7 @@
 //! domain-safe store APIs — never rusqlite types or a connection accessor.
 
 mod command_bus;
+mod lineage;
 mod outbox;
 mod projector;
 mod schema;

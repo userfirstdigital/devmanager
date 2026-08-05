@@ -984,7 +984,7 @@ pub fn apply(
             let mut snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
             require_matching_task_id(&snap, event)?;
             let next_revision = require_next_revision(&snap, event)?;
-            apply_into(&mut snap, other)?;
+            apply_into(&mut snap, other, event.occurred_at_ms)?;
             snap.task.revision = next_revision;
             Ok(snap)
         }
@@ -1014,7 +1014,11 @@ fn require_next_revision(snap: &TaskSnapshot, event: &DomainEvent) -> Result<u64
     Ok(expected)
 }
 
-fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError> {
+fn apply_into(
+    snap: &mut TaskSnapshot,
+    payload: &Event,
+    occurred_at_ms: i64,
+) -> Result<(), ApplyError> {
     match payload {
         Event::TaskRenamed { title } => {
             let title = TaskFacts::canonicalize_title(title.clone())
@@ -1048,6 +1052,14 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
         }
         Event::TaskArchived => {
             if snap.task.lifecycle != TaskLifecycle::Closing {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if snap.resources.values().any(|resource| {
+                matches!(
+                    resource.lifecycle,
+                    ResourceLifecycle::Active | ResourceLifecycle::Releasing
+                )
+            }) {
                 return Err(ApplyError::InvalidTransition);
             }
             snap.task.lifecycle = TaskLifecycle::Archived;
@@ -1123,6 +1135,7 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
                 return Err(ApplyError::InvalidTransition);
             }
             resource.lifecycle = ResourceLifecycle::Releasing;
+            resource.updated_at_ms = occurred_at_ms;
         }
         Event::ResourceReleased {
             resource_id,
@@ -1143,6 +1156,7 @@ fn apply_into(snap: &mut TaskSnapshot, payload: &Event) -> Result<(), ApplyError
                 return Err(ApplyError::InvalidTransition);
             }
             resource.lifecycle = ResourceLifecycle::Released;
+            resource.updated_at_ms = occurred_at_ms;
         }
         Event::TaskCreated { .. }
         | Event::OperationAccepted(_)

@@ -1,10 +1,10 @@
 //! Deterministic projection functions. No clocks, randomness, filesystem, or network.
 
-use rusqlite::Transaction;
+use rusqlite::{OptionalExtension, Transaction};
 
 use crate::domain::agent::AgentRole;
 use crate::domain::event::{DomainEvent, Event};
-use crate::domain::id::{AgentSessionId, CommandId, ResourceId, TaskId};
+use crate::domain::id::{AgentSessionId, CommandId, EventId, ResourceId, TaskId};
 use crate::domain::operation::{
     CancellationReason, OperationErrorCode, OperationUncertaintyCode, OutcomeFenceError,
     OutcomeSource,
@@ -13,7 +13,14 @@ use crate::domain::resource::ResourceLifecycle;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskLifecycle,
 };
-use crate::kernel::store::{u64_to_sqlite_i64, StoreError};
+use crate::kernel::lineage::{
+    classify_operation_settled_fact, classify_settled_lineage_fence, is_derived_lifecycle_result,
+    reject_pure_non_settled_terminal, validate_pure_settled_lineage,
+    validate_side_effect_settled_has_prior_derived, SettledLineageKind,
+};
+use crate::kernel::store::{
+    decode_stored_event, u64_from_nonnegative_i64, u64_to_sqlite_i64, StoreError,
+};
 
 /// Apply one event into projection tables (stable or shadow_*).
 pub(crate) fn apply_event(
@@ -21,6 +28,7 @@ pub(crate) fn apply_event(
     event: &DomainEvent,
     shadow: bool,
 ) -> Result<(), StoreError> {
+    enforce_envelope_task_revision_rule(event)?;
     match &event.payload {
         Event::TaskCreated {
             task,
@@ -317,6 +325,18 @@ pub(crate) fn apply_event(
         }
         Event::OperationAccepted(fact) => {
             require_valid_operation_fact(fact.validate())?;
+            classify_settled_lineage_fence(
+                fact.action_epoch,
+                fact.resource_id,
+                fact.runtime_generation,
+                true,
+            )?;
+            if event.occurred_at_ms != fact.accepted_at_ms {
+                return Err(StoreError::Projection(
+                    "operation.accepted envelope occurred_at_ms must equal fact.accepted_at_ms"
+                        .into(),
+                ));
+            }
             // operations.task_id comes only from DomainEvent.task_id.
             let table = table_name("operations", shadow);
             tx.execute(
@@ -340,6 +360,18 @@ pub(crate) fn apply_event(
         }
         Event::OperationSettled(fact) => {
             require_valid_operation_fact(fact.validate())?;
+            let kind = classify_settled_lineage_fence(
+                fact.action_epoch,
+                fact.resource_id,
+                fact.runtime_generation,
+                true,
+            )?;
+            if event.occurred_at_ms != fact.settled_at_ms {
+                return Err(StoreError::Projection(
+                    "operation.settled envelope occurred_at_ms must equal fact.settled_at_ms"
+                        .into(),
+                ));
+            }
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -355,9 +387,24 @@ pub(crate) fn apply_event(
                 None,
                 fact.settled_at_ms,
             )?;
+            if matches!(kind, SettledLineageKind::Pure) {
+                validate_pure_settled_against_history(tx, shadow, event, fact)?;
+            }
         }
         Event::OperationFailed(fact) => {
             require_valid_operation_fact(fact.validate())?;
+            let kind = classify_settled_lineage_fence(
+                fact.action_epoch,
+                fact.resource_id,
+                fact.runtime_generation,
+                true,
+            )?;
+            reject_pure_non_settled_terminal(kind, true)?;
+            if event.occurred_at_ms != fact.settled_at_ms {
+                return Err(StoreError::Projection(
+                    "operation.failed envelope occurred_at_ms must equal fact.settled_at_ms".into(),
+                ));
+            }
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -376,6 +423,19 @@ pub(crate) fn apply_event(
         }
         Event::OperationCancelled(fact) => {
             require_valid_operation_fact(fact.validate())?;
+            let kind = classify_settled_lineage_fence(
+                fact.action_epoch,
+                fact.resource_id,
+                fact.runtime_generation,
+                true,
+            )?;
+            reject_pure_non_settled_terminal(kind, true)?;
+            if event.occurred_at_ms != fact.settled_at_ms {
+                return Err(StoreError::Projection(
+                    "operation.cancelled envelope occurred_at_ms must equal fact.settled_at_ms"
+                        .into(),
+                ));
+            }
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -394,6 +454,19 @@ pub(crate) fn apply_event(
         }
         Event::OperationUncertain(fact) => {
             require_valid_operation_fact(fact.validate())?;
+            let kind = classify_settled_lineage_fence(
+                fact.action_epoch,
+                fact.resource_id,
+                fact.runtime_generation,
+                true,
+            )?;
+            reject_pure_non_settled_terminal(kind, true)?;
+            if event.occurred_at_ms != fact.observed_at_ms {
+                return Err(StoreError::Projection(
+                    "operation.uncertain envelope occurred_at_ms must equal fact.observed_at_ms"
+                        .into(),
+                ));
+            }
             apply_operation_outcome(
                 tx,
                 shadow,
@@ -411,6 +484,7 @@ pub(crate) fn apply_event(
             )?;
         }
     }
+    enforce_derived_result_lineage(tx, event)?;
     Ok(())
 }
 
@@ -558,6 +632,34 @@ fn require_archive(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Resul
             "task.archived requires closing lifecycle, found {lifecycle}"
         )));
     }
+    let table = table_name("resources", shadow);
+    let mut stmt = tx.prepare(&format!(
+        "SELECT owner_kind, lifecycle FROM {table} WHERE task_id = ?1"
+    ))?;
+    let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (owner_kind, resource_lifecycle) = row?;
+        if owner_kind != "task" {
+            return Err(StoreError::Projection(format!(
+                "task.archived rejects non-task resource owner_kind {owner_kind}"
+            )));
+        }
+        match resource_lifecycle.as_str() {
+            "released" => {}
+            "active" | "releasing" => {
+                return Err(StoreError::Projection(format!(
+                    "task.archived rejects live resource lifecycle {resource_lifecycle}"
+                )));
+            }
+            other => {
+                return Err(StoreError::Projection(format!(
+                    "task.archived rejects malformed resource lifecycle {other}"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -683,11 +785,14 @@ fn apply_operation_outcome(
             Option<Vec<u8>>,
             Option<i64>,
             String,
+            i64,
+            Option<i64>,
         ),
         rusqlite::Error,
     > = tx.query_row(
         &format!(
-            "SELECT command_id, task_id, action_epoch, resource_id, runtime_generation, state
+            "SELECT command_id, task_id, action_epoch, resource_id, runtime_generation, state,
+                    accepted_at_ms, outcome_at_ms
              FROM {table} WHERE operation_id = ?1"
         ),
         [operation_id.as_slice()],
@@ -699,6 +804,8 @@ fn apply_operation_outcome(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
             ))
         },
     );
@@ -709,6 +816,8 @@ fn apply_operation_outcome(
         stored_resource,
         stored_generation,
         stored_state,
+        accepted_at_ms,
+        prior_outcome_at_ms,
     ) = match row {
         Ok(v) => v,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
@@ -717,10 +826,38 @@ fn apply_operation_outcome(
         Err(err) => return Err(err.into()),
     };
 
+    if outcome_at_ms < accepted_at_ms {
+        return Err(StoreError::Projection(
+            "operation outcome time cannot predate acceptance".into(),
+        ));
+    }
+
     match (stored_state.as_str(), source, state) {
-        ("accepted", None, "cancelled" | "uncertain") => {}
-        ("accepted", Some(OutcomeSource::Dispatch), "settled" | "failed") => {}
+        ("accepted", None, "cancelled" | "uncertain") => {
+            if prior_outcome_at_ms.is_some() {
+                return Err(StoreError::Projection(
+                    "accepted operation must not already carry outcome_at_ms".into(),
+                ));
+            }
+        }
+        ("accepted", Some(OutcomeSource::Dispatch), "settled" | "failed") => {
+            if prior_outcome_at_ms.is_some() {
+                return Err(StoreError::Projection(
+                    "accepted operation must not already carry outcome_at_ms".into(),
+                ));
+            }
+        }
         ("uncertain", Some(OutcomeSource::VerifiedReconciliation { .. }), "settled" | "failed") => {
+            let Some(uncertain_at) = prior_outcome_at_ms else {
+                return Err(StoreError::Projection(
+                    "uncertain operation requires prior outcome_at_ms".into(),
+                ));
+            };
+            if outcome_at_ms < uncertain_at {
+                return Err(StoreError::Projection(
+                    "reconciliation outcome cannot predate uncertainty observation".into(),
+                ));
+            }
         }
         ("accepted", Some(OutcomeSource::VerifiedReconciliation { .. }), "settled" | "failed") => {
             return Err(StoreError::Projection(
@@ -737,6 +874,18 @@ fn apply_operation_outcome(
             return Err(StoreError::Projection(format!(
                 "operation state {other} cannot transition to {state} with the provided source"
             )))
+        }
+    }
+
+    if let Some(OutcomeSource::VerifiedReconciliation { effect_index, .. }) = source {
+        if matches!(state, "settled" | "failed") {
+            validate_verified_reconciliation_outbox(
+                tx,
+                operation_id,
+                *effect_index,
+                state,
+                shadow,
+            )?;
         }
     }
 
@@ -785,6 +934,376 @@ fn apply_operation_outcome(
     )?;
     require_one_change(tx, "operation outcome")?;
     Ok(())
+}
+
+fn enforce_envelope_task_revision_rule(event: &DomainEvent) -> Result<(), StoreError> {
+    let is_mutation = event.payload.is_task_mutation();
+    match (is_mutation, event.task_revision.is_some()) {
+        (true, false) => Err(StoreError::Projection(format!(
+            "event {} requires task_revision",
+            event.payload.event_type()
+        ))),
+        (false, true) => Err(StoreError::Projection(format!(
+            "event {} requires NULL task_revision",
+            event.payload.event_type()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn validate_verified_reconciliation_outbox(
+    tx: &Transaction<'_>,
+    operation_id: &[u8; 16],
+    effect_index: u32,
+    target_state: &str,
+    shadow: bool,
+) -> Result<(), StoreError> {
+    if effect_index != 0 {
+        return Err(StoreError::Projection(
+            "verified reconciliation requires effect_index 0".into(),
+        ));
+    }
+    let mut stmt = tx.prepare(
+        "SELECT effect_index, state, leased_until_ms, last_error_class
+         FROM outbox
+         WHERE operation_id = ?1
+         ORDER BY effect_index ASC",
+    )?;
+    let rows = stmt.query_map([operation_id.as_slice()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut collected = Vec::new();
+    for row in rows {
+        collected.push(row?);
+    }
+    if collected.len() != 1 {
+        return Err(StoreError::Projection(
+            "verified reconciliation requires exactly one durable outbox effect row".into(),
+        ));
+    }
+    let (row_index, row_state, leased_until_ms, last_error_class) = &collected[0];
+    if *row_index != 0 {
+        return Err(StoreError::Projection(
+            "verified reconciliation requires durable outbox effect_index 0".into(),
+        ));
+    }
+    if *row_index != i64::from(effect_index) {
+        return Err(StoreError::Projection(format!(
+            "verified reconciliation effect_index {effect_index} does not match durable outbox {row_index}"
+        )));
+    }
+    if shadow {
+        if row_state != target_state {
+            return Err(StoreError::Projection(format!(
+                "shadow verified reconciliation requires retained outbox state {target_state}, found {row_state}"
+            )));
+        }
+        if leased_until_ms.is_some() {
+            return Err(StoreError::Projection(
+                "shadow verified reconciliation requires cleared outbox lease".into(),
+            ));
+        }
+        let expected_error = match target_state {
+            "settled" => None,
+            "failed" => Some("side_effect_failed"),
+            other => {
+                return Err(StoreError::Projection(format!(
+                    "unsupported verified reconciliation target state {other}"
+                )))
+            }
+        };
+        if last_error_class.as_deref() != expected_error {
+            return Err(StoreError::Projection(
+                "shadow verified reconciliation outbox last_error_class mismatch".into(),
+            ));
+        }
+    } else if row_state != "uncertain" {
+        return Err(StoreError::Projection(format!(
+            "live verified reconciliation requires uncertain outbox, found {row_state}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pure_settled_against_history(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    event: &DomainEvent,
+    fact: &crate::domain::event::OperationSettledFact,
+) -> Result<(), StoreError> {
+    let table = table_name("operations", shadow);
+    let accepted_at_ms: i64 = tx.query_row(
+        &format!("SELECT accepted_at_ms FROM {table} WHERE operation_id = ?1"),
+        [fact.operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let prior = load_prior_event_row(tx, event.sequence)?;
+    let accepted_arg = prior
+        .as_ref()
+        .map(|(id, payload, rev, at, task)| (*id, payload, *rev, *at, *task));
+    let decision_count = fact.result_event_ids.len();
+    let accepted_sequence = event
+        .sequence
+        .checked_sub(1)
+        .ok_or_else(|| StoreError::Projection("pure settle missing accepted sequence".into()))?;
+    let decision_count_u64 = u64::try_from(decision_count)
+        .map_err(|_| StoreError::Projection("pure settle decision count overflow".into()))?;
+    let first_decision = accepted_sequence
+        .checked_sub(decision_count_u64)
+        .ok_or_else(|| StoreError::Projection("pure settle decision window underflows".into()))?;
+    let mut owned_decisions = Vec::with_capacity(decision_count);
+    for offset in 0..decision_count {
+        let offset_u64 = u64::try_from(offset)
+            .map_err(|_| StoreError::Projection("pure settle decision offset overflow".into()))?;
+        let sequence = first_decision.checked_add(offset_u64).ok_or_else(|| {
+            StoreError::Projection("pure settle decision sequence overflow".into())
+        })?;
+        let row = load_event_at_sequence(tx, sequence)?.ok_or_else(|| {
+            StoreError::Projection("pure settle missing contiguous decision fact".into())
+        })?;
+        owned_decisions.push(row);
+    }
+    let decision_refs: Vec<(EventId, &Event, Option<u64>, i64, Option<TaskId>)> = owned_decisions
+        .iter()
+        .map(|(id, ev, rev, at, task)| (*id, ev, *rev, *at, *task))
+        .collect();
+    // validate_pure_settled_lineage wants owned Event in the slice — pass clones via owned vec
+    let decision_owned: Vec<(EventId, Event, Option<u64>, i64, Option<TaskId>)> =
+        owned_decisions.clone();
+    let _ = decision_refs;
+    validate_pure_settled_lineage(
+        fact,
+        event.occurred_at_ms,
+        event.task_id,
+        accepted_at_ms,
+        accepted_arg,
+        &decision_owned,
+        true,
+    )?;
+    Ok(())
+}
+
+fn load_event_at_sequence(
+    tx: &Transaction<'_>,
+    sequence: u64,
+) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
+    let row: Option<(
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        String,
+        i64,
+        Vec<u8>,
+        i64,
+    )> = tx
+        .query_row(
+            "SELECT event_id, task_id, task_revision, event_type, schema_version, payload,
+                    occurred_at_ms
+             FROM events WHERE sequence = ?1",
+            [u64_to_sqlite_i64("events.sequence", sequence)?],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        event_id_bytes,
+        task_bytes,
+        task_revision,
+        event_type,
+        schema_version,
+        payload,
+        occurred_at_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let event_id = event_id_from_bytes_local(&event_id_bytes)?;
+    let task_id = match task_bytes {
+        Some(bytes) => Some(task_id_from_bytes_local(&bytes)?),
+        None => None,
+    };
+    let task_revision = match task_revision {
+        Some(v) => Some(u64_from_nonnegative_i64("events.task_revision", v)?),
+        None => None,
+    };
+    let decoded = decode_stored_event(&event_type, schema_version, &payload)?;
+    Ok(Some((
+        event_id,
+        decoded,
+        task_revision,
+        occurred_at_ms,
+        task_id,
+    )))
+}
+
+fn enforce_derived_result_lineage(
+    tx: &Transaction<'_>,
+    event: &DomainEvent,
+) -> Result<(), StoreError> {
+    let prior = load_prior_event_row(tx, event.sequence)?;
+    match &event.payload {
+        Event::OperationSettled(fact) => {
+            let kind = classify_operation_settled_fact(fact, true)?;
+            let prior_arg = prior
+                .as_ref()
+                .map(|(id, payload, rev, at, task)| (*id, payload, *rev, *at, *task));
+            validate_side_effect_settled_has_prior_derived(
+                fact,
+                event.occurred_at_ms,
+                event.task_id,
+                prior_arg,
+                true,
+            )?;
+            if matches!(kind, SettledLineageKind::Pure) {
+                if let Some((_, payload, _, _, _)) = &prior {
+                    if is_derived_lifecycle_result(payload) {
+                        return Err(StoreError::Projection(
+                            "derived lifecycle result is missing immediately following side-effect operation.settled"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            if let Some((_, payload, _, _, _)) = &prior {
+                if is_derived_lifecycle_result(payload) {
+                    return Err(StoreError::Projection(
+                        "derived lifecycle result is missing immediately following operation.settled"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn load_prior_event_row(
+    tx: &Transaction<'_>,
+    sequence: u64,
+) -> Result<Option<(EventId, Event, Option<u64>, i64, Option<TaskId>)>, StoreError> {
+    if sequence == 0 {
+        return Ok(None);
+    }
+    // Adjacency is the immediately previous *existing* durable row, not sequence-1
+    // (AUTOINCREMENT gaps must not hide orphan derived results).
+    let row: Option<(
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        String,
+        i64,
+        Vec<u8>,
+        i64,
+    )> = tx
+        .query_row(
+            "SELECT event_id, task_id, task_revision, event_type, schema_version, payload,
+                    occurred_at_ms
+             FROM events
+             WHERE sequence < ?1
+             ORDER BY sequence DESC
+             LIMIT 1",
+            [u64_to_sqlite_i64("events.sequence", sequence)?],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        event_id_bytes,
+        task_bytes,
+        task_revision,
+        event_type,
+        schema_version,
+        payload,
+        occurred_at_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let event_id = event_id_from_bytes_local(&event_id_bytes)?;
+    let task_id = match task_bytes {
+        Some(bytes) => Some(task_id_from_bytes_local(&bytes)?),
+        None => None,
+    };
+    let task_revision = match task_revision {
+        Some(v) => Some(u64_from_nonnegative_i64("events.task_revision", v)?),
+        None => None,
+    };
+    let decoded = decode_stored_event(&event_type, schema_version, &payload)?;
+    Ok(Some((
+        event_id,
+        decoded,
+        task_revision,
+        occurred_at_ms,
+        task_id,
+    )))
+}
+
+/// Rebuild flush: last durable event must not be an orphan derived result.
+pub(crate) fn ensure_no_trailing_orphan_derived(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let row: Option<(String, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT event_type, schema_version, payload FROM events
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((event_type, schema_version, payload)) = row else {
+        return Ok(());
+    };
+    let decoded = decode_stored_event(&event_type, schema_version, &payload)?;
+    if is_derived_lifecycle_result(&decoded) {
+        return Err(StoreError::Projection(
+            "derived lifecycle result is missing immediately following operation.settled".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_id_from_bytes_local(bytes: &[u8]) -> Result<EventId, StoreError> {
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| {
+        StoreError::Projection(format!(
+            "events.event_id must be 16 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    EventId::from_bytes(arr).map_err(|e| StoreError::Projection(e.to_string()))
+}
+
+fn task_id_from_bytes_local(bytes: &[u8]) -> Result<TaskId, StoreError> {
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| {
+        StoreError::Projection(format!(
+            "events.task_id must be 16 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    TaskId::from_bytes(arr).map_err(|e| StoreError::Projection(e.to_string()))
 }
 
 fn table_name(base: &str, shadow: bool) -> String {

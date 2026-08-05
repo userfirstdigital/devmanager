@@ -15,6 +15,7 @@ use crate::domain::event::{
     EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, TaskId};
+use crate::domain::operation::{OperationOutcome, OperationState};
 use crate::kernel::command_bus;
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
@@ -133,6 +134,14 @@ impl KernelStore {
     /// Execute a command in one IMMEDIATE writer transaction.
     pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
         command_bus::execute(self, envelope)
+    }
+
+    /// Record a fenced side-effect outcome in one IMMEDIATE writer transaction.
+    pub fn record_outcome(
+        &mut self,
+        outcome: OperationOutcome,
+    ) -> Result<OperationState, StoreError> {
+        command_bus::record_outcome(self, outcome)
     }
 
     /// Canonical database path retained for private snapshot connections.
@@ -537,6 +546,7 @@ fn rebuild_projections_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, Sto
     }
     drop(rows);
     drop(stmt);
+    projector::ensure_no_trailing_orphan_derived(tx)?;
 
     let mut drift_detected = false;
     for &table in PROJECTION_TABLES {
@@ -936,7 +946,7 @@ mod tests {
             StoreError::Corruption
         );
 
-        // Typed variants reserved for later execute/record_outcome paths.
+        // Typed variants exercised by execute/record_outcome paths.
         assert_ne!(StoreError::StaleFence, StoreError::ConflictingOutcome);
         assert_ne!(
             StoreError::MissingOperation,
