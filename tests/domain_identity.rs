@@ -76,6 +76,20 @@ fn typed_ids_serde_round_trip() {
 }
 
 #[test]
+fn typed_ids_messagepack_round_trip() {
+    let id = TaskId::new();
+    let packed = rmp_serde::to_vec(&id).expect("messagepack serialize TaskId");
+    // Default binary MessagePack encodes Uuid as 16 raw bytes (bin), not a 36-char string.
+    assert!(
+        packed.len() < 24,
+        "expected compact binary UUID encoding, got len={} bytes={packed:02x?}",
+        packed.len()
+    );
+    let restored: TaskId = rmp_serde::from_slice(&packed).expect("messagepack deserialize TaskId");
+    assert_eq!(id.as_bytes(), restored.as_bytes());
+}
+
+#[test]
 fn typed_ids_serde_rejects_non_version_7() {
     // RFC 4122 UUID version 4 serialized as a UUID string (current wire shape).
     const UUID_V4_JSON: &str = "\"550e8400-e29b-41d4-a716-446655440000\"";
@@ -270,6 +284,119 @@ fn workspace_and_assignment_validate_paths_and_principals() {
     assert!(matches!(main, WorkspaceRef::Main));
     let local = TaskAssignment::LocalOwner;
     assert!(matches!(local, TaskAssignment::LocalOwner));
+}
+
+#[test]
+fn task_facts_serde_preserves_persisted_fields_and_rejects_malformed() {
+    let workspace =
+        WorkspaceRef::worktree(PathBuf::from(r"C:\code\proj\.worktrees\a"), "feature/x")
+            .expect("workspace");
+    let assignment =
+        TaskAssignment::external_principal("org", "user@example.com").expect("assignment");
+    let mut facts = TaskFacts::new(
+        EnvironmentId::new(),
+        "Ship kernel slice",
+        Some("Typed identities first".into()),
+        ProjectId::new(),
+        workspace,
+        assignment,
+        1_725_000_000_000,
+    )
+    .expect("task facts");
+    facts.lifecycle = TaskLifecycle::Closing;
+    facts.action_epoch = 3;
+    facts.revision = 9;
+
+    let json = serde_json::to_string(&facts).expect("json serialize");
+    let json_restored: TaskFacts = serde_json::from_str(&json).expect("json deserialize");
+    assert_eq!(json_restored.id.as_bytes(), facts.id.as_bytes());
+    assert_eq!(json_restored.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(json_restored.action_epoch, 3);
+    assert_eq!(json_restored.revision, 9);
+    assert_eq!(json_restored.created_at_ms, facts.created_at_ms);
+
+    let packed = rmp_serde::to_vec(&facts).expect("msgpack serialize");
+    let msg_restored: TaskFacts = rmp_serde::from_slice(&packed).expect("msgpack deserialize");
+    assert_eq!(msg_restored.id.as_bytes(), facts.id.as_bytes());
+    assert_eq!(msg_restored.revision, 9);
+    assert_eq!(msg_restored.action_epoch, 3);
+    assert_eq!(msg_restored.lifecycle, TaskLifecycle::Closing);
+
+    // Blank title bypasses TaskFacts::new when Deserialize is derived.
+    let blank_title = json.replace("Ship kernel slice", "   ");
+    assert!(
+        serde_json::from_str::<TaskFacts>(&blank_title).is_err(),
+        "JSON deserialize must reject blank title"
+    );
+
+    let blank_description = json.replace("Typed identities first", "  ");
+    assert!(
+        serde_json::from_str::<TaskFacts>(&blank_description).is_err(),
+        "JSON deserialize must reject blank description"
+    );
+
+    let empty_path_workspace = serde_json::json!({
+        "Worktree": { "path": "", "branch": "main" }
+    });
+    assert!(
+        serde_json::from_value::<WorkspaceRef>(empty_path_workspace).is_err(),
+        "JSON deserialize must reject empty worktree path"
+    );
+
+    let empty_principal = serde_json::json!({
+        "ExternalPrincipal": { "authority": " ", "subject": "user" }
+    });
+    assert!(
+        serde_json::from_value::<TaskAssignment>(empty_principal).is_err(),
+        "JSON deserialize must reject empty principal authority"
+    );
+
+    #[derive(serde::Serialize)]
+    struct MalformedTaskFacts {
+        id: TaskId,
+        environment_id: EnvironmentId,
+        title: String,
+        description: Option<String>,
+        project_id: ProjectId,
+        workspace: WorkspaceRef,
+        assignment: TaskAssignment,
+        lifecycle: TaskLifecycle,
+        action_epoch: u64,
+        revision: u64,
+        created_at_ms: i64,
+    }
+
+    let malformed = MalformedTaskFacts {
+        id: facts.id,
+        environment_id: facts.environment_id,
+        title: "   ".into(),
+        description: facts.description.clone(),
+        project_id: facts.project_id,
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        lifecycle: facts.lifecycle,
+        action_epoch: facts.action_epoch,
+        revision: facts.revision,
+        created_at_ms: facts.created_at_ms,
+    };
+    let malformed_packed = rmp_serde::to_vec(&malformed).expect("msgpack malformed");
+    assert!(
+        rmp_serde::from_slice::<TaskFacts>(&malformed_packed).is_err(),
+        "MessagePack deserialize must reject blank title"
+    );
+
+    #[derive(serde::Serialize)]
+    enum WorkspaceRefMalformed {
+        External { path: String },
+    }
+    let empty_external_packed = rmp_serde::to_vec(&WorkspaceRefMalformed::External {
+        path: String::new(),
+    })
+    .expect("msgpack empty external");
+    assert!(
+        rmp_serde::from_slice::<WorkspaceRef>(&empty_external_packed).is_err(),
+        "MessagePack deserialize must reject empty external path"
+    );
 }
 
 #[test]

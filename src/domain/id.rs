@@ -89,7 +89,7 @@ macro_rules! define_id {
             where
                 S: Serializer,
             {
-                // Retain the transparent UUID string wire shape.
+                // Preserve Uuid's human-readable string / binary-bytes wire shapes.
                 self.0.serialize(serializer)
             }
         }
@@ -124,9 +124,36 @@ macro_rules! define_id {
                             .map_err(|_| de::Error::custom("UUID must be exactly 16 bytes"))?;
                         $name::from_bytes(bytes).map_err(de::Error::custom)
                     }
+
+                    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        self.visit_bytes(&value)
+                    }
+
+                    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: de::SeqAccess<'de>,
+                    {
+                        let mut bytes = [0u8; 16];
+                        for (index, slot) in bytes.iter_mut().enumerate() {
+                            *slot = seq
+                                .next_element()?
+                                .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+                        }
+                        if seq.next_element::<u8>()?.is_some() {
+                            return Err(de::Error::invalid_length(17, &self));
+                        }
+                        $name::from_bytes(bytes).map_err(de::Error::custom)
+                    }
                 }
 
-                deserializer.deserialize_str(IdVisitor)
+                if deserializer.is_human_readable() {
+                    deserializer.deserialize_str(IdVisitor)
+                } else {
+                    deserializer.deserialize_bytes(IdVisitor)
+                }
             }
         }
     };

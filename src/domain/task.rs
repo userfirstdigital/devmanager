@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::id::{EnvironmentId, ProjectId, TaskId};
@@ -29,7 +30,7 @@ impl std::fmt::Display for TaskValidationError {
 
 impl std::error::Error for TaskValidationError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum WorkspaceRef {
     Main,
     Worktree { path: PathBuf, branch: String },
@@ -52,6 +53,28 @@ impl WorkspaceRef {
     }
 }
 
+impl<'de> Deserialize<'de> for WorkspaceRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum WorkspaceRefWire {
+            Main,
+            Worktree { path: PathBuf, branch: String },
+            External { path: PathBuf },
+        }
+
+        match WorkspaceRefWire::deserialize(deserializer)? {
+            WorkspaceRefWire::Main => Ok(Self::Main),
+            WorkspaceRefWire::Worktree { path, branch } => {
+                Self::worktree(path, branch).map_err(de::Error::custom)
+            }
+            WorkspaceRefWire::External { path } => Self::external(path).map_err(de::Error::custom),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskLifecycle {
     Open,
@@ -59,7 +82,7 @@ pub enum TaskLifecycle {
     Archived,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TaskAssignment {
     LocalOwner,
     ExternalPrincipal { authority: String, subject: String },
@@ -80,7 +103,27 @@ impl TaskAssignment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for TaskAssignment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum TaskAssignmentWire {
+            LocalOwner,
+            ExternalPrincipal { authority: String, subject: String },
+        }
+
+        match TaskAssignmentWire::deserialize(deserializer)? {
+            TaskAssignmentWire::LocalOwner => Ok(Self::LocalOwner),
+            TaskAssignmentWire::ExternalPrincipal { authority, subject } => {
+                Self::external_principal(authority, subject).map_err(de::Error::custom)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskFacts {
     pub id: TaskId,
     pub environment_id: EnvironmentId,
@@ -126,6 +169,54 @@ impl TaskFacts {
             action_epoch: 0,
             revision: 0,
             created_at_ms,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskFacts {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TaskFactsWire {
+            id: TaskId,
+            environment_id: EnvironmentId,
+            title: String,
+            description: Option<String>,
+            project_id: ProjectId,
+            workspace: WorkspaceRef,
+            assignment: TaskAssignment,
+            lifecycle: TaskLifecycle,
+            action_epoch: u64,
+            revision: u64,
+            created_at_ms: i64,
+        }
+
+        let wire = TaskFactsWire::deserialize(deserializer)?;
+        let title = validate_non_empty(wire.title, TaskValidationError::EmptyTitle)
+            .map_err(de::Error::custom)?;
+        let description = match wire.description {
+            Some(value) => Some(
+                validate_non_empty(value, TaskValidationError::EmptyDescription)
+                    .map_err(de::Error::custom)?,
+            ),
+            None => None,
+        };
+
+        // Preserve every persisted identity/lifecycle/revision/timestamp field from the wire.
+        Ok(Self {
+            id: wire.id,
+            environment_id: wire.environment_id,
+            title,
+            description,
+            project_id: wire.project_id,
+            workspace: wire.workspace,
+            assignment: wire.assignment,
+            lifecycle: wire.lifecycle,
+            action_epoch: wire.action_epoch,
+            revision: wire.revision,
+            created_at_ms: wire.created_at_ms,
         })
     }
 }
