@@ -19,7 +19,7 @@ pub(crate) const EFFECT_SCHEMA_VERSION: u32 = 1;
 /// Stable destination class stored in `outbox.destination_class`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DestinationClass {
+pub enum DestinationClass {
     TaskTeardown,
     ResourceRelease,
 }
@@ -45,7 +45,7 @@ impl DestinationClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ReplayPolicy {
+pub enum ReplayPolicy {
     RetrySafe,
     ReconcileBeforeRetry,
     NoAutomaticRetry,
@@ -74,7 +74,7 @@ impl ReplayPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Effect {
+pub enum Effect {
     BeginTaskTeardown {
         task_id: TaskId,
         action_epoch: u64,
@@ -103,7 +103,7 @@ pub(crate) struct PlannedEffect {
 /// Deterministic external retry identity. Stable across retries; not the row PK.
 #[cfg_attr(not(test), allow(dead_code))] // exercised by dispatch/outcome slices next
 pub(crate) fn external_idempotency_key(operation_id: OperationId, effect_index: u32) -> String {
-    format!("{operation_id}:{effect_index}")
+    format!("v1:{operation_id}:{effect_index}")
 }
 
 /// Pure planner: maps accepted decision facts + pre-command snapshot to effects.
@@ -825,12 +825,10 @@ mod tests {
             "multiple side-effect decision facts must fail for current commands"
         );
 
+        let operation_id = OperationId::from_bytes(fixed_uuid_v7(0x30)).unwrap();
         assert_eq!(
-            external_idempotency_key(OperationId::from_bytes(fixed_uuid_v7(0x30)).unwrap(), 0),
-            format!(
-                "{}:0",
-                OperationId::from_bytes(fixed_uuid_v7(0x30)).unwrap()
-            )
+            external_idempotency_key(operation_id, 0),
+            format!("v1:{operation_id}:0")
         );
     }
 }

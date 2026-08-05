@@ -155,8 +155,12 @@ fn record_outcome_in_tx(
             if !outcome.source.is_dispatch() {
                 return Err(StoreError::ConflictingOutcome);
             }
-            if outbox.state != "pending" {
-                return Err(StoreError::Corruption);
+            match outbox.state.as_str() {
+                "claimed" | "dispatching" => {
+                    return Err(StoreError::InvalidDispatchTransition);
+                }
+                "pending" => {}
+                _ => return Err(StoreError::Corruption),
             }
             if outcome.occurred_at_ms < operation.accepted_at_ms {
                 return Err(StoreError::StaleFence);
@@ -303,6 +307,73 @@ fn load_receipt_correlation(
         committed_sequence,
         created_at_ms,
     })
+}
+
+/// Revalidate the complete accepted side-effect lineage before a claim can expose
+/// or begin external work. This intentionally reuses the same strict receipt path
+/// as duplicate command/outcome handling so no forged extra outbox row can dispatch.
+pub(crate) fn validate_dispatch_candidate_lineage(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+) -> Result<(crate::kernel::outbox::PlannedEffectDocument, OperationFence), StoreError> {
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    require_accepted_dispatch_operation(&operation)?;
+    let command_id = load_operation_command_id(tx, operation_id)?;
+    let receipt_row = load_receipt_correlation(tx, command_id)?;
+    let CommandReceipt::Accepted {
+        command_id: receipt_command_id,
+        operation_id: receipt_operation_id,
+        event_ids,
+        task_revision,
+    } = &receipt_row.receipt
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if *receipt_command_id != command_id || *receipt_operation_id != operation_id {
+        return Err(StoreError::Corruption);
+    }
+    let committed_sequence = receipt_row
+        .committed_sequence
+        .map(|sequence| u64_to_sqlite_i64("command_receipts.committed_sequence", sequence))
+        .transpose()?;
+    validate_accepted_receipt_correlation(
+        tx,
+        command_id,
+        operation_id,
+        event_ids,
+        *task_revision,
+        receipt_row.task_id,
+        committed_sequence,
+        receipt_row.created_at_ms,
+    )?;
+
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    require_accepted_dispatch_operation(&operation)?;
+    let rows = load_outbox_rows(tx, operation_id)?;
+    if rows.len() != 1 || rows[0].outbox_id != outbox_id {
+        return Err(StoreError::Corruption);
+    }
+    let row = &rows[0];
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    let fence = operation_fence_from_projection(&operation)?;
+    let document =
+        decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
+    validate_effect_matches_fence(&document.effect, task_id, fence)?;
+    require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    Ok((document, fence))
+}
+
+fn require_accepted_dispatch_operation(
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    match operation.state.as_str() {
+        "accepted" => Ok(()),
+        "settled" | "failed" | "cancelled" | "uncertain" => Err(StoreError::StaleFence),
+        _ => Err(StoreError::Corruption),
+    }
 }
 
 /// When the operations projection row is absent, distinguish a genuinely unknown
@@ -934,7 +1005,7 @@ fn apply_new_outcome(
     let (resource_id, runtime_generation) = ResourceFence::into_parts(outcome.resource_fence);
     let outcome_event_id = EventId::new();
 
-    // New Dispatch outcomes against a claimed pending row must not predate dispatch start.
+    // Dispatch outcomes against a row that already started must not predate start.
     if matches!(outcome.source, OutcomeSource::Dispatch)
         && expected_outbox_state == "pending"
         && outbox.attempts > 0
@@ -1134,16 +1205,17 @@ fn transition_outbox(
     let changed = tx.execute(
         "UPDATE outbox
          SET state = ?1, leased_until_ms = NULL, last_error_class = ?2
-         WHERE outbox_id = ?3 AND state = ?4",
+         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
         rusqlite::params![
             next_state,
             last_error_class,
             outbox.outbox_id.as_bytes().as_slice(),
             expected_state,
+            outbox.lease_generation,
         ],
     )?;
     if changed != 1 {
-        return Err(StoreError::Corruption);
+        return Err(StoreError::InvalidDispatchTransition);
     }
     Ok(())
 }
@@ -1532,7 +1604,7 @@ fn validate_side_effect_accepted_receipt(
             {
                 return Err(StoreError::Corruption);
             }
-            validate_side_effect_pending_outbox(
+            validate_side_effect_active_outbox(
                 outbox_rows,
                 &expected_effects,
                 expected_operation_id,
@@ -1568,7 +1640,7 @@ fn validate_side_effect_accepted_receipt(
     }
 }
 
-fn validate_side_effect_pending_outbox(
+fn validate_side_effect_active_outbox(
     outbox_rows: &[OutboxRow],
     expected_effects: &[PlannedEffect],
     expected_operation_id: OperationId,
@@ -1590,38 +1662,26 @@ fn validate_side_effect_pending_outbox(
         if row.event_sequence != committed_sequence {
             return Err(StoreError::Corruption);
         }
-        if row.state != "pending" || row.last_error_class.is_some() {
+        if row.lease_generation < 0 {
             return Err(StoreError::Corruption);
         }
-        validate_pending_outbox_dispatch_metadata(row, accepted_at_ms)?;
+        match row.state.as_str() {
+            "pending" | "claimed" | "dispatching" => {
+                validate_nonterminal_outbox_dispatch_metadata(row, accepted_at_ms)?;
+            }
+            // e2 reserved names (reconcile_required/reconciling/uncertain) are never
+            // legitimate on an accepted-operation receipt in this slice.
+            _ => return Err(StoreError::Corruption),
+        }
+        if row.state == "pending" && row.last_error_class.is_some() {
+            return Err(StoreError::Corruption);
+        }
         let decoded =
             decode_effect_document(&row.payload, &row.destination_class, &row.replay_policy)?;
         if decoded != planned.document {
             return Err(StoreError::Corruption);
         }
-        match &decoded.effect {
-            Effect::BeginTaskTeardown {
-                task_id,
-                action_epoch,
-            } => {
-                if *task_id != scope || Some(*action_epoch) != fence.action_epoch {
-                    return Err(StoreError::Corruption);
-                }
-            }
-            Effect::ReleaseResource {
-                task_id,
-                action_epoch,
-                resource_fence,
-            } => {
-                if *task_id != scope
-                    || Some(*action_epoch) != fence.action_epoch
-                    || Some(resource_fence.resource_id) != fence.resource_id
-                    || Some(resource_fence.runtime_generation) != fence.runtime_generation
-                {
-                    return Err(StoreError::Corruption);
-                }
-            }
-        }
+        validate_effect_matches_fence(&decoded.effect, scope, fence)?;
     }
     Ok(())
 }
@@ -1673,6 +1733,8 @@ fn validate_side_effect_terminal_receipt(
             || row.state != expected_outbox_state
             || row.leased_until_ms.is_some()
             || row.last_error_class.as_deref() != expected_error
+            || row.lease_generation < 0
+            || row.reconciliation_receipt.is_some()
         {
             return Err(StoreError::Corruption);
         }
@@ -1703,35 +1765,79 @@ fn validate_side_effect_terminal_receipt(
     Ok(())
 }
 
-fn validate_pending_outbox_dispatch_metadata(
+fn validate_nonterminal_outbox_dispatch_metadata(
     row: &OutboxRow,
     accepted_at_ms: i64,
 ) -> Result<(), StoreError> {
+    if row.lease_generation < 0 {
+        return Err(StoreError::Corruption);
+    }
     if row.attempts < 0 {
         return Err(StoreError::Corruption);
     }
-    if row.attempts == 0 {
-        // Synthetic direct outcomes for this slice: no claim/dispatch metadata yet.
-        if row.dispatch_started_at_ms.is_some()
-            || row.leased_until_ms.is_some()
-            || row.available_at_ms != accepted_at_ms
-        {
-            return Err(StoreError::Corruption);
+    match row.state.as_str() {
+        "pending" => {
+            if row.attempts == 0 {
+                if row.dispatch_started_at_ms.is_some()
+                    || row.leased_until_ms.is_some()
+                    || (row.lease_generation == 0 && row.available_at_ms != accepted_at_ms)
+                    || (row.lease_generation > 0 && row.available_at_ms < accepted_at_ms)
+                {
+                    return Err(StoreError::Corruption);
+                }
+            } else {
+                let Some(started) = row.dispatch_started_at_ms else {
+                    return Err(StoreError::Corruption);
+                };
+                if row.available_at_ms < accepted_at_ms || row.available_at_ms > started {
+                    return Err(StoreError::Corruption);
+                }
+                if let Some(lease) = row.leased_until_ms {
+                    if lease < started {
+                        return Err(StoreError::Corruption);
+                    }
+                }
+            }
         }
-    } else {
-        let Some(started) = row.dispatch_started_at_ms else {
-            return Err(StoreError::Corruption);
-        };
-        // accepted_at <= available_at <= dispatch_started (lease may still be live).
-        if row.available_at_ms < accepted_at_ms || row.available_at_ms > started {
-            return Err(StoreError::Corruption);
-        }
-        if let Some(lease) = row.leased_until_ms {
-            // A live lease must not predate dispatch start (hence not acceptance/availability).
-            if lease < started {
+        "claimed" => {
+            if row.lease_generation <= 0
+                || row.attempts != 0
+                || row.leased_until_ms.is_none()
+                || row.dispatch_started_at_ms.is_some()
+                || row.available_at_ms < accepted_at_ms
+                || row.last_error_class.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            if row.leased_until_ms.ok_or(StoreError::Corruption)? <= row.available_at_ms {
                 return Err(StoreError::Corruption);
             }
         }
+        "dispatching" => {
+            if row.lease_generation <= 0
+                || row.attempts <= 0
+                || row.leased_until_ms.is_none()
+                || row.last_error_class.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            let Some(started) = row.dispatch_started_at_ms else {
+                return Err(StoreError::Corruption);
+            };
+            if row.available_at_ms < accepted_at_ms || row.available_at_ms > started {
+                return Err(StoreError::Corruption);
+            }
+            let Some(lease) = row.leased_until_ms else {
+                return Err(StoreError::Corruption);
+            };
+            if lease <= started {
+                return Err(StoreError::Corruption);
+            }
+        }
+        _ => return Err(StoreError::Corruption),
+    }
+    if row.reconciliation_receipt.is_some() {
+        return Err(StoreError::Corruption);
     }
     Ok(())
 }
@@ -1745,7 +1851,10 @@ fn validate_terminal_outbox_dispatch_metadata(
         return Err(StoreError::Corruption);
     }
     if row.attempts == 0 {
-        if row.dispatch_started_at_ms.is_some() || row.available_at_ms != accepted_at_ms {
+        if row.dispatch_started_at_ms.is_some()
+            || (row.lease_generation == 0 && row.available_at_ms != accepted_at_ms)
+            || (row.lease_generation > 0 && row.available_at_ms < accepted_at_ms)
+        {
             return Err(StoreError::Corruption);
         }
     } else {
@@ -3030,21 +3139,24 @@ struct EventRow {
     occurred_at_ms: i64,
 }
 
-struct OutboxRow {
-    #[allow(dead_code)] // validated on read; retained for later dispatch slices
-    outbox_id: OutboxId,
-    operation_id: OperationId,
-    effect_index: i64,
-    event_sequence: u64,
-    destination_class: String,
-    replay_policy: String,
-    payload: Vec<u8>,
-    state: String,
-    available_at_ms: i64,
-    leased_until_ms: Option<i64>,
-    dispatch_started_at_ms: Option<i64>,
-    attempts: i64,
-    last_error_class: Option<String>,
+pub(crate) struct OutboxRow {
+    pub(crate) outbox_id: OutboxId,
+    pub(crate) operation_id: OperationId,
+    pub(crate) effect_index: i64,
+    pub(crate) event_sequence: u64,
+    pub(crate) destination_class: String,
+    pub(crate) replay_policy: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) state: String,
+    pub(crate) available_at_ms: i64,
+    pub(crate) leased_until_ms: Option<i64>,
+    pub(crate) dispatch_started_at_ms: Option<i64>,
+    pub(crate) attempts: i64,
+    pub(crate) last_error_class: Option<String>,
+    pub(crate) lease_generation: i64,
+    /// V2 column reserved for e2; must remain NULL and unused in e1.
+    #[allow(dead_code)]
+    pub(crate) reconciliation_receipt: Option<Vec<u8>>,
 }
 
 fn load_outbox_rows(
@@ -3054,7 +3166,8 @@ fn load_outbox_rows(
     let mut stmt = tx.prepare(
         "SELECT outbox_id, operation_id, effect_index, event_sequence, destination_class,
                 replay_policy, payload, state, available_at_ms, leased_until_ms,
-                dispatch_started_at_ms, attempts, last_error_class
+                dispatch_started_at_ms, attempts, last_error_class, lease_generation,
+                reconciliation_receipt
          FROM outbox
          WHERE operation_id = ?1
          ORDER BY effect_index ASC",
@@ -3074,6 +3187,8 @@ fn load_outbox_rows(
             row.get::<_, Option<i64>>(10)?,
             row.get::<_, i64>(11)?,
             row.get::<_, Option<String>>(12)?,
+            row.get::<_, i64>(13)?,
+            row.get::<_, Option<Vec<u8>>>(14)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -3093,6 +3208,8 @@ fn load_outbox_rows(
             dispatch_started_at_ms,
             attempts,
             last_error_class,
+            lease_generation,
+            reconciliation_receipt,
         ) = row?;
         if effect_index != expected_index {
             return Err(StoreError::Corruption);
@@ -3101,6 +3218,9 @@ fn load_outbox_rows(
             .checked_add(1)
             .ok_or(StoreError::Corruption)?;
         if event_sequence < 0 {
+            return Err(StoreError::Corruption);
+        }
+        if lease_generation < 0 {
             return Err(StoreError::Corruption);
         }
         out.push(OutboxRow {
@@ -3117,9 +3237,99 @@ fn load_outbox_rows(
             dispatch_started_at_ms,
             attempts,
             last_error_class,
+            lease_generation,
+            reconciliation_receipt,
         });
     }
     Ok(out)
+}
+
+pub(crate) fn load_outbox_row_by_id(
+    tx: &Transaction<'_>,
+    outbox_id: OutboxId,
+) -> Result<Option<OutboxRow>, StoreError> {
+    let row: Option<(
+        Vec<u8>,
+        i64,
+        i64,
+        String,
+        String,
+        Vec<u8>,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Option<String>,
+        i64,
+        Option<Vec<u8>>,
+    )> = tx
+        .query_row(
+            "SELECT operation_id, effect_index, event_sequence, destination_class,
+                    replay_policy, payload, state, available_at_ms, leased_until_ms,
+                    dispatch_started_at_ms, attempts, last_error_class, lease_generation,
+                    reconciliation_receipt
+             FROM outbox WHERE outbox_id = ?1",
+            [outbox_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        operation_id_bytes,
+        effect_index,
+        event_sequence,
+        destination_class,
+        replay_policy,
+        payload,
+        state,
+        available_at_ms,
+        leased_until_ms,
+        dispatch_started_at_ms,
+        attempts,
+        last_error_class,
+        lease_generation,
+        reconciliation_receipt,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if event_sequence < 0 || lease_generation < 0 {
+        return Err(StoreError::Corruption);
+    }
+    Ok(Some(OutboxRow {
+        outbox_id,
+        operation_id: id16::<OperationId>("outbox.operation_id", &operation_id_bytes)?,
+        effect_index,
+        event_sequence: u64_from_nonnegative_i64("outbox.event_sequence", event_sequence)?,
+        destination_class,
+        replay_policy,
+        payload,
+        state,
+        available_at_ms,
+        leased_until_ms,
+        dispatch_started_at_ms,
+        attempts,
+        last_error_class,
+        lease_generation,
+        reconciliation_receipt,
+    }))
 }
 
 fn load_event_row_at_sequence(tx: &Transaction<'_>, sequence: u64) -> Result<EventRow, StoreError> {

@@ -119,10 +119,22 @@ CREATE INDEX idx_outbox_delivery_state ON outbox(state, available_at_ms);\n\
 CREATE INDEX idx_resources_active ON resources(task_id, resource_kind) WHERE lifecycle = 'active';\n\
 ";
 
+const V2_SQL: &str = "\
+ALTER TABLE outbox ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0);\n\
+ALTER TABLE outbox ADD COLUMN reconciliation_receipt BLOB;\n\
+CREATE INDEX idx_outbox_claim_ready ON outbox(state, available_at_ms, leased_until_ms);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
     0xf0, 0x0e, 0x77, 0x41, 0x27, 0x0f, 0xfb, 0x07, 0xb0, 0xde, 0x82, 0x32, 0x63, 0xe2, 0x52, 0x1f,
+];
+
+/// Compiled SHA-256 of [`V2_SQL`]. Do not change V2_SQL without updating this literal.
+pub(crate) const V2_SHA256: [u8; 32] = [
+    0xa7, 0x80, 0x18, 0xb1, 0x02, 0x8f, 0xca, 0x90, 0x82, 0x46, 0x57, 0x61, 0x7f, 0xce, 0x53, 0x66,
+    0x94, 0x31, 0x2f, 0x51, 0x27, 0x4a, 0x84, 0x98, 0x24, 0xa2, 0x0a, 0x01, 0xa1, 0x46, 0x78, 0xcb,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -152,12 +164,25 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 hex_lower(&V1_SHA256),
                 "V1_SHA256_HEX must match V1_SHA256"
             );
-            let migrations = vec![Migration {
-                version: 1,
-                name: "v1_initial",
-                sql: V1_SQL,
-                sha256: V1_SHA256,
-            }];
+            assert_eq!(
+                V2_SHA256,
+                sha256_bytes(V2_SQL),
+                "V2_SHA256 literal must match V2_SQL bytes"
+            );
+            let migrations = vec![
+                Migration {
+                    version: 1,
+                    name: "v1_initial",
+                    sql: V1_SQL,
+                    sha256: V1_SHA256,
+                },
+                Migration {
+                    version: 2,
+                    name: "v2_outbox_dispatch_fence",
+                    sql: V2_SQL,
+                    sha256: V2_SHA256,
+                },
+            ];
             verify_manifest(&migrations);
             migrations
         })
@@ -209,3 +234,164 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "artifacts",
     "resources",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::StoreError;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    #[test]
+    fn schema_v1_upgrades_to_v2_without_rewriting_v1_record() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v1.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(V1_SQL).expect("apply v1");
+            conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                 VALUES (1, 'v1_initial', 1, ?1)",
+                rusqlite::params![V1_SHA256.as_slice()],
+            )
+            .expect("record v1");
+            conn.pragma_update(None, "foreign_keys", false)
+                .expect("disable foreign keys for isolated legacy-row fixture");
+            conn.execute(
+                "INSERT INTO outbox(
+                    outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                    replay_policy, payload, state, available_at_ms, leased_until_ms,
+                    dispatch_started_at_ms, attempts, last_error_class
+                 ) VALUES (?1, ?2, 0, 7, 'task_teardown', 'retry_safe', X'0102',
+                           'pending', 11, NULL, NULL, 0, NULL)",
+                rusqlite::params![&[0x11u8; 16], &[0x22u8; 16]],
+            )
+            .expect("seed existing v1 outbox row");
+        }
+
+        let store = crate::kernel::KernelStore::open(&path).expect("upgrade open");
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen raw");
+        let (v1_name, v1_applied_at, v1_sha): (String, i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT name, applied_at_ms, sha256 FROM schema_migrations WHERE version = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(v1_name, "v1_initial");
+        assert_eq!(v1_applied_at, 1);
+        assert_eq!(v1_sha.as_slice(), V1_SHA256.as_slice());
+
+        let (v2_name, v2_sha): (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT name, sha256 FROM schema_migrations WHERE version = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v2_name, "v2_outbox_dispatch_fence");
+        assert_eq!(v2_sha.as_slice(), V2_SHA256.as_slice());
+
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(outbox)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(cols.iter().any(|c| c == "lease_generation"));
+        assert!(cols.iter().any(|c| c == "reconciliation_receipt"));
+
+        let existing: Vec<rusqlite::types::Value> = conn
+            .query_row(
+                "SELECT outbox_id, operation_id, effect_index, event_sequence,
+                        destination_class, replay_policy, payload, state, available_at_ms,
+                        leased_until_ms, dispatch_started_at_ms, attempts, last_error_class,
+                        lease_generation, reconciliation_receipt
+                 FROM outbox",
+                [],
+                |row| (0..15).map(|column| row.get(column)).collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            existing,
+            vec![
+                rusqlite::types::Value::Blob(vec![0x11; 16]),
+                rusqlite::types::Value::Blob(vec![0x22; 16]),
+                rusqlite::types::Value::Integer(0),
+                rusqlite::types::Value::Integer(7),
+                rusqlite::types::Value::Text("task_teardown".into()),
+                rusqlite::types::Value::Text("retry_safe".into()),
+                rusqlite::types::Value::Blob(vec![0x01, 0x02]),
+                rusqlite::types::Value::Text("pending".into()),
+                rusqlite::types::Value::Integer(11),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Integer(0),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Integer(0),
+                rusqlite::types::Value::Null,
+            ],
+            "V2 must preserve every V1 outbox column and initialize only its two additions",
+        );
+
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_outbox_claim_ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn schema_v2_failure_rolls_back_columns_and_history() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v1-conflict.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(V1_SQL).expect("apply v1");
+            conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                 VALUES (1, 'v1_initial', 1, ?1)",
+                rusqlite::params![V1_SHA256.as_slice()],
+            )
+            .expect("record v1");
+            conn.execute("CREATE INDEX idx_outbox_claim_ready ON tasks(task_id)", [])
+                .expect("reserve v2 index name");
+        }
+
+        let error = crate::kernel::KernelStore::open(&path).expect_err("v2 must fail");
+        assert!(
+            matches!(
+                error,
+                StoreError::MigrationInterrupted | StoreError::Sqlite(_)
+            ),
+            "unexpected migration failure: {error:?}"
+        );
+
+        let conn = Connection::open(&path).expect("reopen raw");
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(outbox)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert!(!columns.iter().any(|column| column == "lease_generation"));
+        assert!(!columns
+            .iter()
+            .any(|column| column == "reconciliation_receipt"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+}

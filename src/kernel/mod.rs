@@ -4,10 +4,13 @@
 //! domain-safe store APIs — never rusqlite types or a connection accessor.
 
 mod command_bus;
+mod dispatch;
 mod lineage;
 mod outbox;
 mod projector;
 mod schema;
 mod store;
 
+pub use dispatch::{DispatchClaim, DispatchPermit};
+pub use outbox::{DestinationClass, Effect, ReplayPolicy};
 pub use store::{KernelStore, ProjectionRebuild, StoreError};

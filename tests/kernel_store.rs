@@ -1,5 +1,8 @@
+//! Integration tests for [`devmanager::kernel::KernelStore`].
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::artifact::ArtifactContentRef;
@@ -28,7 +31,9 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
-use devmanager::kernel::{KernelStore, ProjectionRebuild, StoreError};
+use devmanager::kernel::{
+    DestinationClass, Effect, KernelStore, ProjectionRebuild, ReplayPolicy, StoreError,
+};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use tempfile::TempDir;
@@ -236,6 +241,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             "idx_events_task_revision".to_string(),
             "idx_events_task_sequence".to_string(),
             "idx_operations_state".to_string(),
+            "idx_outbox_claim_ready".to_string(),
             "idx_outbox_delivery_state".to_string(),
             "idx_resources_active".to_string(),
         ]
@@ -249,16 +255,22 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
     // foreign_keys / synchronous / busy_timeout are per-connection and applied on
     // KernelStore::open; FK enforcement is covered by schema_foreign_keys_are_enforced.
 
-    let (version, name, sha): (i64, String, Vec<u8>) = conn
-        .query_row(
-            "SELECT version, name, sha256 FROM schema_migrations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("migration row");
-    assert_eq!(version, 1);
-    assert_eq!(name, "v1_initial");
-    assert_eq!(sha.len(), 32);
+    let rows: Vec<(i64, String, Vec<u8>)> = {
+        let mut stmt = conn
+            .prepare("SELECT version, name, sha256 FROM schema_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, "v1_initial");
+    assert_eq!(rows[0].2.len(), 32);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, "v2_outbox_dispatch_fence");
+    assert_eq!(rows[1].2.len(), 32);
 
     let resource_notnull: i64 = conn
         .query_row(
@@ -331,7 +343,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (2, 'v2_future', 1, ?1)",
+             VALUES (3, 'v3_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");
@@ -4101,7 +4113,7 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
 }
 
 fn external_idempotency_key(operation_id: OperationId, effect_index: u32) -> String {
-    format!("{operation_id}:{effect_index}")
+    format!("v1:{operation_id}:{effect_index}")
 }
 
 fn load_outbox_row(
@@ -4303,7 +4315,7 @@ fn command_side_effect_begin_close_accepts_pending_outbox_without_settlement() {
     assert!(!payload.is_empty());
     assert_eq!(
         external_idempotency_key(operation_id, 0),
-        format!("{operation_id}:0")
+        format!("v1:{operation_id}:0")
     );
 }
 
@@ -10745,4 +10757,710 @@ fn command_outcome_release_epoch_tamper_detected_from_task_history() {
     drop(store);
     let conn = open_raw(&path);
     assert_eq!(count_table(&conn, "events"), events_before);
+}
+
+#[test]
+fn dispatch_claim_pending_to_claimed_begin_without_exposing_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xA1);
+    create_open_task(&mut store, task, command_id(0xA2));
+    let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xA3), 1);
+
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("pending row claimable");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let (
+        _outbox_id,
+        _effect_index,
+        _event_sequence,
+        destination,
+        policy,
+        _payload,
+        state,
+        _available_at,
+        leased,
+        dispatch_started,
+        attempts,
+        last_error,
+    ) = load_outbox_row(&conn, operation_id);
+    let lease_generation: i64 = conn
+        .query_row(
+            "SELECT lease_generation FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reconciliation_receipt: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT reconciliation_receipt FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "claimed");
+    assert_eq!(lease_generation, 1);
+    assert!(leased.is_some(), "claimed rows require a live lease");
+    assert!(dispatch_started.is_none(), "claim must not start dispatch");
+    assert_eq!(attempts, 0, "claim must not increment attempts");
+    assert!(last_error.is_none());
+    assert!(reconciliation_receipt.is_none());
+    assert_eq!(destination, "task_teardown");
+    assert_eq!(policy, "retry_safe");
+    let accepted_ms = accepted_at_ms(&conn, operation_id);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let bare_err = store
+        .record_outcome(settle_close_outcome(
+            operation_id,
+            accepted_ms + 1,
+            1,
+            event_id(0xA4),
+        ))
+        .expect_err("bare outcome must reject claimed");
+    assert!(
+        matches!(bare_err, StoreError::InvalidDispatchTransition),
+        "claimed bare outcome must be InvalidDispatchTransition, got {bare_err:?}"
+    );
+
+    let permit = store.begin_dispatch(&claim).expect("begin");
+    assert_eq!(
+        permit.effect(),
+        &Effect::BeginTaskTeardown {
+            task_id: task,
+            action_epoch: 1,
+        }
+    );
+    assert_eq!(permit.destination_class(), DestinationClass::TaskTeardown);
+    assert_eq!(permit.replay_policy(), ReplayPolicy::RetrySafe);
+    assert_eq!(permit.attempt(), 1);
+    assert_eq!(
+        permit.external_idempotency_key(),
+        external_idempotency_key_v1(operation_id, 0)
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    let (_, _, _, _, _, _, state, _, leased, dispatch_started, attempts, _) =
+        load_outbox_row(&conn, operation_id);
+    assert_eq!(state, "dispatching");
+    assert_eq!(attempts, 1);
+    assert!(dispatch_started.is_some());
+    assert!(leased.is_some());
+    let lease_generation: i64 = conn
+        .query_row(
+            "SELECT lease_generation FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        lease_generation, 1,
+        "begin must not change lease generation"
+    );
+}
+
+#[test]
+fn dispatch_claim_release_preserves_permanent_receipt_and_delay() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB1);
+    let close_command = command_id(0xB2);
+    create_open_task(&mut store, task, command_id(0xB0));
+    let envelope = command_envelope(close_command, Some(task), Some(1), Command::BeginCloseTask);
+    let original = store.execute(envelope.clone()).expect("accept close");
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("claimable");
+    store
+        .release_dispatch_claim(&claim, Duration::from_secs(30))
+        .expect("release");
+
+    assert_eq!(
+        store.execute(envelope).expect("duplicate receipt"),
+        original,
+        "release must not poison permanent command idempotency"
+    );
+    assert!(
+        store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim lookup")
+            .is_none(),
+        "released work must respect its next-available delay"
+    );
+
+    drop(store);
+    let conn = open_raw(&path);
+    let (state, lease, attempts, generation): (String, Option<i64>, i64, i64) = conn
+        .query_row(
+            "SELECT state, leased_until_ms, attempts, lease_generation FROM outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert!(lease.is_none());
+    assert_eq!(attempts, 0);
+    assert_eq!(generation, 1);
+}
+
+#[test]
+fn dispatch_claim_expired_reclaim_fences_old_generation() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xB4);
+    create_open_task(&mut store, task, command_id(0xB3));
+    accept_begin_close(&mut store, task, command_id(0xB5), 1);
+    let first = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("first claim")
+        .expect("claimable");
+    drop(store);
+
+    let conn = open_raw(&path);
+    expire_claim_lease(&conn);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let second = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("reclaim")
+        .expect("expired pre-start claim is reclaimable");
+    assert_eq!(
+        store.begin_dispatch(&first).unwrap_err(),
+        StoreError::StaleClaim,
+        "the superseded generation must never start"
+    );
+    let permit = store.begin_dispatch(&second).expect("current claim starts");
+    assert_eq!(permit.attempt(), 1);
+}
+
+#[test]
+fn dispatch_claim_full_lineage_rejects_extra_effect_and_reserved_metadata() {
+    for (label, tamper) in [
+        ("extra effect", 0u8),
+        ("reserved reconciliation metadata", 1u8),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xB7 + tamper);
+        create_open_task(&mut store, task, command_id(0xB6 + tamper));
+        let (operation_id, _) = accept_begin_close(&mut store, task, command_id(0xB9 + tamper), 1);
+        drop(store);
+
+        let conn = open_raw(&path);
+        if tamper == 0 {
+            let (sequence, destination, policy, payload, available): (
+                i64,
+                String,
+                String,
+                Vec<u8>,
+                i64,
+            ) = conn
+                .query_row(
+                    "SELECT event_sequence, destination_class, replay_policy, payload,
+                            available_at_ms FROM outbox WHERE operation_id = ?1",
+                    [operation_id.as_bytes().as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO outbox(
+                    outbox_id, operation_id, effect_index, event_sequence, destination_class,
+                    replay_policy, payload, state, available_at_ms, leased_until_ms,
+                    dispatch_started_at_ms, attempts, last_error_class,
+                    lease_generation, reconciliation_receipt
+                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, NULL, 0,
+                           NULL, 0, NULL)",
+                rusqlite::params![
+                    fixed_uuid_v7(0xEF).as_slice(),
+                    operation_id.as_bytes().as_slice(),
+                    sequence,
+                    destination,
+                    policy,
+                    payload,
+                    available,
+                ],
+            )
+            .expect("forge extra outbox effect");
+        } else {
+            conn.execute("UPDATE outbox SET reconciliation_receipt = X'01'", [])
+                .expect("tamper reserved metadata");
+        }
+        let outbox_before = count_table(&conn, "outbox");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        assert_eq!(
+            store
+                .claim_next_dispatch(Duration::from_secs(30))
+                .expect_err(label),
+            StoreError::Corruption,
+            "{label}"
+        );
+        drop(store);
+        let conn = open_raw(&path);
+        assert_eq!(count_table(&conn, "outbox"), outbox_before, "{label}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE state <> 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "{label} must not partially claim"
+        );
+    }
+}
+
+#[test]
+fn dispatch_claim_begin_rejects_malformed_claim_metadata_without_writes() {
+    for (label, sql) in [
+        ("missing lease", "UPDATE outbox SET leased_until_ms = NULL"),
+        (
+            "prestarted claim",
+            "UPDATE outbox SET attempts = 1, dispatch_started_at_ms = available_at_ms",
+        ),
+        (
+            "claim error metadata",
+            "UPDATE outbox SET last_error_class = 'unexpected'",
+        ),
+        (
+            "reserved reconciliation metadata",
+            "UPDATE outbox SET reconciliation_receipt = X'01'",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xC1);
+        create_open_task(&mut store, task, command_id(0xC0));
+        accept_begin_close(&mut store, task, command_id(0xC2), 1);
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("claimable");
+        drop(store);
+
+        let conn = open_raw(&path);
+        conn.execute(sql, []).expect(label);
+        let events_before = count_table(&conn, "events");
+        drop(conn);
+
+        let mut store = KernelStore::open(&path).expect("reopen");
+        if label == "missing lease" {
+            assert_eq!(
+                store
+                    .claim_next_dispatch(Duration::from_secs(30))
+                    .expect_err("unleased claimed row must fail closed"),
+                StoreError::Corruption,
+            );
+        }
+        assert_eq!(
+            store.begin_dispatch(&claim).expect_err(label),
+            StoreError::Corruption,
+            "{label}"
+        );
+        drop(store);
+        let conn = open_raw(&path);
+        assert_eq!(count_table(&conn, "events"), events_before, "{label}");
+        let state: String = conn
+            .query_row("SELECT state FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "claimed", "{label}");
+    }
+}
+
+#[test]
+fn dispatch_claim_renew_and_release_require_live_state() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xC4);
+    create_open_task(&mut store, task, command_id(0xC3));
+    accept_begin_close(&mut store, task, command_id(0xC5), 1);
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("claimable");
+    let renewed = store
+        .renew_dispatch_claim(&claim, Duration::from_secs(60))
+        .expect("renew");
+    store
+        .release_dispatch_claim(&renewed, Duration::from_secs(30))
+        .expect("release");
+    assert_eq!(
+        store.begin_dispatch(&renewed).unwrap_err(),
+        StoreError::InvalidDispatchTransition
+    );
+    assert_eq!(
+        store
+            .renew_dispatch_claim(&renewed, Duration::from_secs(60))
+            .unwrap_err(),
+        StoreError::InvalidDispatchTransition
+    );
+    assert_eq!(
+        store
+            .claim_next_dispatch(Duration::ZERO)
+            .expect_err("zero lease"),
+        StoreError::InvalidLeaseDuration
+    );
+}
+
+#[test]
+fn dispatch_claim_orders_candidates_and_excludes_terminal_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let first_task = task_id(0xD1);
+    let second_task = task_id(0xD2);
+    create_open_task(&mut store, first_task, command_id(0xD3));
+    create_open_task(&mut store, second_task, command_id(0xD4));
+    let (first_operation, _) = accept_begin_close(&mut store, first_task, command_id(0xD5), 1);
+    let (second_operation, _) = accept_begin_close(&mut store, second_task, command_id(0xD6), 1);
+
+    let first_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("first ordered claim")
+        .expect("first candidate");
+    drop(store);
+    let conn = open_raw(&path);
+    let first_state: String = conn
+        .query_row(
+            "SELECT state FROM outbox WHERE operation_id = ?1",
+            [first_operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let second_state: String = conn
+        .query_row(
+            "SELECT state FROM outbox WHERE operation_id = ?1",
+            [second_operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let second_accepted_at = accepted_at_ms(&conn, second_operation);
+    assert_eq!(first_state, "claimed");
+    assert_eq!(second_state, "pending");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store.begin_dispatch(&first_claim).expect("begin first");
+    let second_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("skip dispatching")
+        .expect("second candidate");
+    store
+        .release_dispatch_claim(&second_claim, Duration::from_secs(30))
+        .expect("release second");
+    store
+        .record_outcome(settle_close_outcome(
+            second_operation,
+            second_accepted_at + 1,
+            1,
+            event_id(0xDE),
+        ))
+        .expect("terminalize released pending row");
+    assert!(
+        store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("no ready candidate")
+            .is_none(),
+        "dispatching and delayed rows must be excluded"
+    );
+}
+
+#[test]
+fn dispatch_claim_expired_reconcile_policy_is_safe_before_start() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xD8);
+    let resource = resource_id(0xD9);
+    create_open_task(&mut store, task, command_id(0xD7));
+    drop(store);
+    seed_active_resource(&path, task, resource, 4);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    accept_release_resource(&mut store, task, command_id(0xDA), resource, 2);
+    let first = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("first claim")
+        .expect("claimable release");
+    drop(store);
+    let conn = open_raw(&path);
+    expire_claim_lease(&conn);
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen after expiry");
+    let second = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("reclaim")
+        .expect("all policies reclaim before dispatch starts");
+    assert_eq!(
+        store.begin_dispatch(&first).unwrap_err(),
+        StoreError::StaleClaim
+    );
+    let permit = store
+        .begin_dispatch(&second)
+        .expect("current release starts");
+    assert_eq!(permit.replay_policy(), ReplayPolicy::ReconcileBeforeRetry);
+    assert_eq!(permit.attempt(), 1);
+}
+
+#[test]
+fn dispatch_claim_begin_rechecks_current_task_fence() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+    let task = task_id(0xDC);
+    create_open_task(&mut store, task, command_id(0xDB));
+    accept_begin_close(&mut store, task, command_id(0xDD), 1);
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("claimable");
+    drop(store);
+
+    let conn = open_raw(&path);
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'open' WHERE task_id = ?1",
+        [task.as_bytes().as_slice()],
+    )
+    .expect("tamper current fence");
+    let attempts_before: i64 = conn
+        .query_row("SELECT attempts FROM outbox", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    assert!(
+        matches!(
+            store.begin_dispatch(&claim).expect_err("stale task fence"),
+            StoreError::Corruption | StoreError::StaleFence
+        ),
+        "current task fence must fail closed"
+    );
+    drop(store);
+    let conn = open_raw(&path);
+    assert_eq!(
+        conn.query_row("SELECT attempts FROM outbox", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        attempts_before,
+        "failed begin must not increment attempts"
+    );
+}
+
+#[test]
+fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let superseded_task = task_id(0xE1);
+    create_open_task(&mut store, superseded_task, command_id(0xE2));
+    let (superseded_operation, _) =
+        accept_begin_close(&mut store, superseded_task, command_id(0xE3), 1);
+    store
+        .execute(command_envelope(
+            command_id(0xE4),
+            Some(superseded_task),
+            Some(2),
+            Command::ReopenTask,
+        ))
+        .expect("legitimately supersede close ownership");
+
+    let prestarted_task = task_id(0xE5);
+    create_open_task(&mut store, prestarted_task, command_id(0xE6));
+    let (prestarted_operation, _) =
+        accept_begin_close(&mut store, prestarted_task, command_id(0xE7), 1);
+
+    let ready_task = task_id(0xE8);
+    create_open_task(&mut store, ready_task, command_id(0xE9));
+    let (ready_operation, _) = accept_begin_close(&mut store, ready_task, command_id(0xEA), 1);
+    drop(store);
+
+    let conn = open_raw(&path);
+    let prestarted_at = accepted_at_ms(&conn, prestarted_operation);
+    conn.execute(
+        "UPDATE outbox
+         SET attempts = 1, dispatch_started_at_ms = ?1
+         WHERE operation_id = ?2",
+        rusqlite::params![prestarted_at, prestarted_operation.as_bytes().as_slice()],
+    )
+    .expect("seed e1-ineligible legacy pending metadata");
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("scan candidates")
+        .expect("later valid work must remain claimable");
+    let permit = store.begin_dispatch(&claim).expect("begin ready work");
+    assert_eq!(
+        permit.effect(),
+        &Effect::BeginTaskTeardown {
+            task_id: ready_task,
+            action_epoch: 1,
+        }
+    );
+    drop(store);
+
+    let conn = open_raw(&path);
+    for (operation_id, expected) in [
+        (superseded_operation, "pending"),
+        (prestarted_operation, "pending"),
+        (ready_operation, "dispatching"),
+    ] {
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM outbox WHERE operation_id = ?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected);
+    }
+}
+
+#[test]
+fn dispatch_claim_clock_rollback_preserves_durable_time_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut store = KernelStore::open(&path).expect("open");
+
+    let release_task = task_id(0xEB);
+    create_open_task(&mut store, release_task, command_id(0xEC));
+    let (release_operation, _) = accept_begin_close(&mut store, release_task, command_id(0xED), 1);
+    let begin_task = task_id(0xEE);
+    create_open_task(&mut store, begin_task, command_id(0xEF));
+    let (begin_operation, _) = accept_begin_close(&mut store, begin_task, command_id(0xF0), 1);
+
+    let release_claim = store
+        .claim_next_dispatch(Duration::from_secs(300))
+        .expect("claim release fixture")
+        .expect("release fixture ready");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let release_lease: i64 = conn
+        .query_row(
+            "SELECT leased_until_ms FROM outbox WHERE operation_id = ?1",
+            [release_operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let release_floor = release_lease - 1_000;
+    conn.execute(
+        "UPDATE outbox SET available_at_ms = ?1 WHERE operation_id = ?2",
+        rusqlite::params![release_floor, release_operation.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    store
+        .release_dispatch_claim(&release_claim, Duration::from_millis(1))
+        .expect("release uses durable availability floor");
+    let begin_claim = store
+        .claim_next_dispatch(Duration::from_secs(300))
+        .expect("claim second fixture")
+        .expect("second fixture ready");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let released_available: i64 = conn
+        .query_row(
+            "SELECT available_at_ms FROM outbox WHERE operation_id = ?1",
+            [release_operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(released_available > release_floor);
+    let begin_lease: i64 = conn
+        .query_row(
+            "SELECT leased_until_ms FROM outbox WHERE operation_id = ?1",
+            [begin_operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let begin_floor = begin_lease - 1_000;
+    conn.execute(
+        "UPDATE outbox SET available_at_ms = ?1 WHERE operation_id = ?2",
+        rusqlite::params![begin_floor, begin_operation.as_bytes().as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = KernelStore::open(&path).expect("reopen for renewal");
+    let renewed = store
+        .renew_dispatch_claim(&begin_claim, Duration::from_millis(1))
+        .expect("renew from durable lease floor despite wall-clock rollback");
+    store
+        .begin_dispatch(&renewed)
+        .expect("begin from durable availability floor");
+    drop(store);
+
+    let conn = open_raw(&path);
+    let (renewed_lease, started): (i64, i64) = conn
+        .query_row(
+            "SELECT leased_until_ms, dispatch_started_at_ms
+             FROM outbox WHERE operation_id = ?1",
+            [begin_operation.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(renewed_lease > begin_lease);
+    assert!(started >= begin_floor);
+    assert!(started < renewed_lease);
+}
+
+fn external_idempotency_key_v1(operation_id: OperationId, effect_index: u32) -> String {
+    format!("v1:{operation_id}:{effect_index}")
+}
+
+fn expire_claim_lease(conn: &Connection) {
+    let available_at_ms: i64 = conn
+        .query_row(
+            "SELECT available_at_ms FROM outbox WHERE state = 'claimed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("claimed availability");
+    let expired_at_ms = loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis();
+        let now = i64::try_from(now).expect("test clock fits i64");
+        if now > available_at_ms {
+            break now;
+        }
+        std::thread::yield_now();
+    };
+    conn.execute(
+        "UPDATE outbox SET leased_until_ms = ?1 WHERE state = 'claimed'",
+        [expired_at_ms],
+    )
+    .expect("expire claim with valid chronology");
 }

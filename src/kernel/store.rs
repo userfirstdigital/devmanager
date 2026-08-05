@@ -1,8 +1,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
@@ -14,13 +14,18 @@ use crate::domain::event::{
     TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
     EVENT_SCHEMA_VERSION,
 };
-use crate::domain::id::{EventId, TaskId};
-use crate::domain::operation::{OperationOutcome, OperationState};
-use crate::kernel::command_bus;
+use crate::domain::id::{EventId, OutboxId, TaskId};
+use crate::domain::operation::{OperationOutcome, OperationState, ResourceFence};
+use crate::kernel::command_bus::{
+    self, load_outbox_row_by_id, validate_dispatch_candidate_lineage, OutboxRow,
+};
+use crate::kernel::dispatch::{DispatchClaim, DispatchPermit};
+use crate::kernel::outbox::external_idempotency_key;
 use crate::kernel::projector;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
+const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
 
 /// Opaque SQLite-backed kernel store. No public connection accessor.
 pub struct KernelStore {
@@ -60,6 +65,10 @@ pub enum StoreError {
     CodecMismatch { detail: String },
     EventDecode(String),
     Projection(String),
+    InvalidLeaseDuration,
+    StaleClaim,
+    ExpiredClaim,
+    InvalidDispatchTransition,
 }
 
 impl fmt::Display for StoreError {
@@ -97,6 +106,10 @@ impl fmt::Display for StoreError {
             Self::CodecMismatch { detail } => write!(f, "codec mismatch: {detail}"),
             Self::EventDecode(msg) => write!(f, "event decode error: {msg}"),
             Self::Projection(msg) => write!(f, "projection error: {msg}"),
+            Self::InvalidLeaseDuration => write!(f, "invalid dispatch lease duration"),
+            Self::StaleClaim => write!(f, "stale dispatch claim"),
+            Self::ExpiredClaim => write!(f, "expired dispatch claim"),
+            Self::InvalidDispatchTransition => write!(f, "invalid dispatch transition"),
         }
     }
 }
@@ -136,12 +149,53 @@ impl KernelStore {
         command_bus::execute(self, envelope)
     }
 
-    /// Record a fenced side-effect outcome in one IMMEDIATE writer transaction.
+    /// Temporary pre-e2 outcome API for pending rows only.
+    ///
+    /// Rejects `claimed` / `dispatching` rows. Not the safe dispatcher callback path;
+    /// e2 replaces this with permit-bound terminal callbacks.
     pub fn record_outcome(
         &mut self,
         outcome: OperationOutcome,
     ) -> Result<OperationState, StoreError> {
         command_bus::record_outcome(self, outcome)
+    }
+
+    /// Claim the next dispatch-ready outbox row under a bounded lease fence.
+    pub fn claim_next_dispatch(
+        &mut self,
+        lease: Duration,
+    ) -> Result<Option<DispatchClaim>, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms))
+    }
+
+    /// Renew an active dispatch lease when the claim generation still matches.
+    pub fn renew_dispatch_claim(
+        &mut self,
+        claim: &DispatchClaim,
+        lease: Duration,
+    ) -> Result<DispatchClaim, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            renew_dispatch_claim_in_tx(tx, now_ms()?, claim, lease_ms)
+        })
+    }
+
+    /// Release a pre-dispatch claim without incrementing attempts or generation.
+    pub fn release_dispatch_claim(
+        &mut self,
+        claim: &DispatchClaim,
+        next_available: Duration,
+    ) -> Result<(), StoreError> {
+        let delay_ms = validate_dispatch_lease_ms(next_available)?;
+        self.with_immediate_transaction(|tx| {
+            release_dispatch_claim_in_tx(tx, claim, now_ms()?, delay_ms)
+        })
+    }
+
+    /// Begin dispatch for a live claim, returning an authorizing permit.
+    pub fn begin_dispatch(&mut self, claim: &DispatchClaim) -> Result<DispatchPermit, StoreError> {
+        self.with_immediate_transaction(|tx| begin_dispatch_in_tx(tx, now_ms()?, claim))
     }
 
     /// Canonical database path retained for private snapshot connections.
@@ -892,6 +946,385 @@ fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreErro
     rmp_serde::from_slice(payload).map_err(|err| StoreError::CodecMismatch {
         detail: err.to_string(),
     })
+}
+
+fn validate_dispatch_lease_ms(lease: Duration) -> Result<i64, StoreError> {
+    if lease.is_zero() {
+        return Err(StoreError::InvalidLeaseDuration);
+    }
+    let ms = i64::try_from(lease.as_millis()).map_err(|_| StoreError::InvalidLeaseDuration)?;
+    if ms <= 0 || ms > MAX_DISPATCH_LEASE_MS {
+        return Err(StoreError::InvalidLeaseDuration);
+    }
+    Ok(ms)
+}
+
+fn lease_deadline(now_ms: i64, lease_ms: i64) -> Result<i64, StoreError> {
+    now_ms
+        .checked_add(lease_ms)
+        .ok_or(StoreError::IntegerOutOfRange {
+            field: "leased_until_ms",
+            value: u64::MAX,
+        })
+}
+
+fn verify_claim_generation(
+    row: &OutboxRow,
+    claim: &DispatchClaim,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    if row.lease_generation != claim.lease_generation() {
+        return Err(StoreError::StaleClaim);
+    }
+    let leased_until = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+    if leased_until <= now_ms {
+        return Err(StoreError::ExpiredClaim);
+    }
+    Ok(())
+}
+
+fn revalidate_outbox_effect(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+) -> Result<
+    (
+        crate::kernel::outbox::PlannedEffectDocument,
+        crate::kernel::outbox::OperationFence,
+    ),
+    StoreError,
+> {
+    validate_dispatch_candidate_lineage(tx, row.operation_id, row.outbox_id)
+}
+
+fn parse_outbox_id(bytes: &[u8]) -> Result<OutboxId, StoreError> {
+    let array: [u8; 16] = bytes.try_into().map_err(|_| StoreError::Corruption)?;
+    OutboxId::from_bytes(array).map_err(|_| StoreError::Corruption)
+}
+
+fn parse_operation_id(bytes: &[u8]) -> Result<crate::domain::id::OperationId, StoreError> {
+    let array: [u8; 16] = bytes.try_into().map_err(|_| StoreError::Corruption)?;
+    crate::domain::id::OperationId::from_bytes(array).map_err(|_| StoreError::Corruption)
+}
+
+fn load_next_dispatch_candidate(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    after: Option<&OutboxRow>,
+) -> Result<Option<OutboxRow>, StoreError> {
+    let after_available_at = after.map(|row| row.available_at_ms);
+    let after_event_sequence = after
+        .map(|row| u64_to_sqlite_i64("outbox.event_sequence", row.event_sequence))
+        .transpose()?;
+    let after_effect_index = after.map(|row| row.effect_index);
+    let after_outbox_id = after.map(|row| row.outbox_id.as_bytes().as_slice());
+    let row: Option<(
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        i64,
+        String,
+        String,
+        Vec<u8>,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Option<String>,
+        i64,
+        Option<Vec<u8>>,
+    )> = tx
+        .query_row(
+            "SELECT o.outbox_id, o.operation_id, o.effect_index, o.event_sequence,
+                    o.destination_class, o.replay_policy, o.payload, o.state,
+                    o.available_at_ms, o.leased_until_ms, o.dispatch_started_at_ms,
+                    o.attempts, o.last_error_class, o.lease_generation,
+                    o.reconciliation_receipt
+             FROM outbox o
+             JOIN operations op ON op.operation_id = o.operation_id
+             WHERE op.state = 'accepted'
+               AND (
+                 (o.state = 'pending' AND o.available_at_ms <= ?1)
+                 OR (
+                   o.state = 'claimed'
+                   AND o.available_at_ms <= ?1
+                   AND (o.leased_until_ms IS NULL OR o.leased_until_ms <= ?1)
+                 )
+               )
+               AND (
+                 ?2 IS NULL
+                 OR o.available_at_ms > ?2
+                 OR (o.available_at_ms = ?2 AND o.event_sequence > ?3)
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index > ?4
+                 )
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index = ?4 AND o.outbox_id > ?5
+                 )
+               )
+             ORDER BY o.available_at_ms ASC, o.event_sequence ASC,
+                      o.effect_index ASC, o.outbox_id ASC
+             LIMIT 1",
+            rusqlite::params![
+                now_ms,
+                after_available_at,
+                after_event_sequence,
+                after_effect_index,
+                after_outbox_id,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        outbox_id_bytes,
+        operation_id_bytes,
+        effect_index,
+        event_sequence,
+        destination_class,
+        replay_policy,
+        payload,
+        state,
+        available_at_ms,
+        leased_until_ms,
+        dispatch_started_at_ms,
+        attempts,
+        last_error_class,
+        lease_generation,
+        reconciliation_receipt,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if event_sequence < 0 || lease_generation < 0 {
+        return Err(StoreError::Corruption);
+    }
+    Ok(Some(OutboxRow {
+        outbox_id: parse_outbox_id(&outbox_id_bytes)?,
+        operation_id: parse_operation_id(&operation_id_bytes)?,
+        effect_index,
+        event_sequence: u64_from_nonnegative_i64("outbox.event_sequence", event_sequence)?,
+        destination_class,
+        replay_policy,
+        payload,
+        state,
+        available_at_ms,
+        leased_until_ms,
+        dispatch_started_at_ms,
+        attempts,
+        last_error_class,
+        lease_generation,
+        reconciliation_receipt,
+    }))
+}
+
+fn build_dispatch_permit(
+    row: &OutboxRow,
+    effect_doc: crate::kernel::outbox::PlannedEffectDocument,
+    fence: crate::kernel::outbox::OperationFence,
+) -> Result<DispatchPermit, StoreError> {
+    let effect_index = u32::try_from(row.effect_index).map_err(|_| StoreError::Corruption)?;
+    let resource_fence = ResourceFence::from_parts(fence.resource_id, fence.runtime_generation)
+        .map_err(|_| StoreError::Corruption)?;
+    let attempt = u64_from_nonnegative_i64("outbox.attempts", row.attempts)?;
+    Ok(DispatchPermit::new(
+        row.outbox_id,
+        row.lease_generation,
+        row.operation_id,
+        effect_index,
+        attempt,
+        effect_doc,
+        external_idempotency_key(row.operation_id, effect_index),
+        fence.action_epoch,
+        resource_fence,
+    ))
+}
+
+fn claim_outbox_row(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+    now_ms: i64,
+    lease_ms: i64,
+    expected_state: &str,
+) -> Result<DispatchClaim, StoreError> {
+    let leased_until = lease_deadline(now_ms, lease_ms)?;
+    let next_generation = row
+        .lease_generation
+        .checked_add(1)
+        .ok_or(StoreError::Corruption)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = 'claimed', lease_generation = ?1, leased_until_ms = ?2
+         WHERE outbox_id = ?3 AND state = ?4 AND lease_generation = ?5",
+        rusqlite::params![
+            next_generation,
+            leased_until,
+            row.outbox_id.as_bytes().as_slice(),
+            expected_state,
+            row.lease_generation,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    Ok(DispatchClaim::new(row.outbox_id, next_generation))
+}
+
+fn claim_next_dispatch_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<Option<DispatchClaim>, StoreError> {
+    let mut prior_candidate = None;
+    loop {
+        let Some(row) = load_next_dispatch_candidate(tx, now_ms, prior_candidate.as_ref())? else {
+            return Ok(None);
+        };
+        match revalidate_outbox_effect(tx, &row) {
+            Ok(_) => {}
+            Err(StoreError::StaleFence) => {
+                prior_candidate = Some(row);
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        match row.state.as_str() {
+            // Before e2, a pending row that already crossed the dispatch-start
+            // boundary can only be completed through the temporary outcome API.
+            "pending" if row.attempts > 0 => {
+                prior_candidate = Some(row);
+            }
+            "pending" | "claimed" => {
+                return Ok(Some(claim_outbox_row(
+                    tx,
+                    &row,
+                    now_ms,
+                    lease_ms,
+                    row.state.as_str(),
+                )?));
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+}
+
+fn release_dispatch_claim_in_tx(
+    tx: &Transaction<'_>,
+    claim: &DispatchClaim,
+    now_ms: i64,
+    delay_ms: i64,
+) -> Result<(), StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if row.state != "claimed" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    revalidate_outbox_effect(tx, &row)?;
+    verify_claim_generation(&row, claim, now_ms)?;
+    let available_at = lease_deadline(now_ms.max(row.available_at_ms), delay_ms)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = 'pending', leased_until_ms = NULL, available_at_ms = ?1
+         WHERE outbox_id = ?2 AND state = 'claimed' AND lease_generation = ?3",
+        rusqlite::params![
+            available_at,
+            claim.outbox_id().as_bytes().as_slice(),
+            claim.lease_generation(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    Ok(())
+}
+
+fn renew_dispatch_claim_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    claim: &DispatchClaim,
+    lease_ms: i64,
+) -> Result<DispatchClaim, StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if row.state != "claimed" && row.state != "dispatching" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    revalidate_outbox_effect(tx, &row)?;
+    verify_claim_generation(&row, claim, now_ms)?;
+    let prior = row.leased_until_ms.ok_or(StoreError::StaleClaim)?;
+    let leased_until = lease_deadline(now_ms.max(prior), lease_ms)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET leased_until_ms = ?1
+         WHERE outbox_id = ?2 AND lease_generation = ?3 AND state IN ('claimed', 'dispatching')",
+        rusqlite::params![
+            leased_until,
+            claim.outbox_id().as_bytes().as_slice(),
+            claim.lease_generation(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleClaim);
+    }
+    Ok(DispatchClaim::new(
+        claim.outbox_id(),
+        claim.lease_generation(),
+    ))
+}
+
+fn begin_dispatch_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    claim: &DispatchClaim,
+) -> Result<DispatchPermit, StoreError> {
+    let row = load_outbox_row_by_id(tx, claim.outbox_id())?.ok_or(StoreError::StaleClaim)?;
+    if row.state != "claimed" {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let (effect_doc, fence) = revalidate_outbox_effect(tx, &row)?;
+    verify_claim_generation(&row, claim, now_ms)?;
+    let dispatch_started_at = now_ms.max(row.available_at_ms);
+    let leased_until = row.leased_until_ms.ok_or(StoreError::Corruption)?;
+    if dispatch_started_at >= leased_until {
+        return Err(StoreError::Corruption);
+    }
+    let next_attempts = row.attempts.checked_add(1).ok_or(StoreError::Corruption)?;
+    let changed = tx.execute(
+        "UPDATE outbox
+         SET state = 'dispatching', attempts = ?1, dispatch_started_at_ms = ?2
+         WHERE outbox_id = ?3 AND state = 'claimed' AND lease_generation = ?4",
+        rusqlite::params![
+            next_attempts,
+            dispatch_started_at,
+            claim.outbox_id().as_bytes().as_slice(),
+            claim.lease_generation(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let mut permit_row = row;
+    permit_row.state = "dispatching".into();
+    permit_row.attempts = next_attempts;
+    permit_row.dispatch_started_at_ms = Some(dispatch_started_at);
+    build_dispatch_permit(&permit_row, effect_doc, fence)
 }
 
 #[cfg(test)]
