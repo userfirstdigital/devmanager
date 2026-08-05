@@ -4,6 +4,7 @@ pub mod assets;
 pub mod browser;
 pub mod config;
 pub mod diagnostics;
+pub mod domain;
 pub mod git;
 pub mod icons;
 pub mod models;

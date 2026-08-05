@@ -6,7 +6,7 @@
 
 **Architecture:** The Rust host and its SQLite database are authoritative for personal prompts, versions, history, and ordered chains. Saved prompts and retention-governed recent submitted prompts are durable local records; only the FTS5 search index is rebuildable and updated by a bounded background worker. A delivered-input settlement and its history row commit atomically, so a crash cannot acknowledge delivery and lose the recent prompt. GPUI renders the library, version diff, and linear chain editor. Provider-native slash commands remain live provider capabilities and never merge into the saved library. Phase 9 carries the same host projection to paired remote clients; Phase 10 adds separately published organization prompts.
 
-**Tech Stack:** Rust 1.94.0, rusqlite 0.40.1 bundled SQLite/FTS5, `similar = "=3.1.2"` with Apache-2.0 license, GPUI/gpui-component, Phase 1 command/event/store/protocol contracts, Phase 5 design system.
+**Tech Stack:** Rust 1.94.0, rusqlite 0.39.0 bundled SQLite/FTS5, `similar = "=3.1.2"` with Apache-2.0 license, GPUI/gpui-component, Phase 1 command/event/store/protocol contracts, Phase 5 design system.
 
 ## Global Constraints
 

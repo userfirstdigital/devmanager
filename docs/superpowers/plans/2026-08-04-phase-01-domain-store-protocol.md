@@ -6,7 +6,7 @@
 
 **Architecture:** Domain facts use typed UUIDv7 identifiers and pure deterministic transitions. Each accepted command commits its operation record, events, read projections, command receipt, and side-effect outbox records in one SQLite transaction; acceptance never claims the side effect settled. Clients exchange negotiated bounded MessagePack frames and recover from paged snapshots plus ordered events. Large messages use resumable chunks with strict physical/reassembled limits; neither GPUI nor web types are allowed in this layer.
 
-**Tech Stack:** Rust 1.94.0, serde, rmp-serde, rusqlite 0.40.1 with bundled SQLite, uuid 1.24.0 with v7/serde, tempfile.
+**Tech Stack:** Rust 1.94.0, serde, rmp-serde, rusqlite 0.39.0 with bundled SQLite, uuid 1.24.0 with v7/serde, tempfile.
 
 ## Global Constraints
 
@@ -97,7 +97,7 @@ pub struct TaskFacts {
 
 - [ ] **Step 1: Write the failing identity tests** in `tests/domain_identity.rs` for UUIDv7 generation, serde round-trip, display/parse round-trip, invalid-version rejection, and compile-time non-interchangeability using `static_assertions::assert_not_impl_any!`.
 - [ ] **Step 2: Run** `cargo test --test domain_identity -- --nocapture` directly in the isolated worktree and retain the unresolved `devmanager::domain` failure. This test is pure and has no persistence/runtime/process surface.
-- [ ] **Step 3: Add** `rusqlite = { version = "0.40.1", features = ["bundled"] }`; retain the Phase 0 `uuid = { version = "1.24.0", features = ["v7", "serde"] }`; implement a private `define_id!` macro whose public types validate UUID version 7 when parsed from external text.
+- [ ] **Step 3: Add** `rusqlite = { version = "0.39.0", features = ["bundled"] }`; retain the Phase 0 `uuid = { version = "1.24.0", features = ["v7", "serde"] }`; implement a private `define_id!` macro whose public types validate UUID version 7 at every external decoding boundary, including text, bytes, and serde.
 - [ ] **Step 4: Define** `EnvironmentId`, `ProjectId`, `TaskId`, `AgentSessionId`, `ArtifactId`, `ResourceId`, `TerminalId`, `BrowserContextId`, `ServiceId`, `ClientId`, `CommandId`, `RequestId`, `OperationId`, `TransferId`, `SubscriptionId`, and `EventId`; expose UUID bytes for persistence without exposing cross-type conversion.
 - [ ] **Step 5: Define** `WorkspaceRef::{Main, Worktree { path, branch }, External { path }}`, `TaskLifecycle::{Open, Closing, Archived}`, `TaskAssignment::{LocalOwner, ExternalPrincipal { authority, subject }}`, and fact records for task, agent, artifact, and resource ownership. Validate titles, descriptions, principal references, and paths at construction boundaries.
 - [ ] **Step 6: Run** `cargo test --test domain_identity -- --nocapture` and confirm all identity tests pass.

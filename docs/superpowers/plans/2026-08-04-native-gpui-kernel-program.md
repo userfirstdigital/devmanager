@@ -6,7 +6,7 @@
 
 **Architecture:** One long-lived `devmanager-host` process owns task facts, SQLite, PTYs, complete process trees, providers, browser contexts, files, Git, services, and Connect synchronization. The native GPUI desktop and web/mobile clients send versioned commands and consume snapshots plus ordered events; no presentation client owns execution. Implementation is divided into independently reviewable phase plans because the approved design spans several subsystems and repositories.
 
-**Tech Stack:** Rust 1.94.0, GPUI 0.2.2, gpui-component 0.5.1, Tokio, MessagePack via `rmp-serde`, SQLite/FTS5 via rusqlite 0.40.1, `similar` 3.1.2, UUID 1.24.0, portable-pty, alacritty_terminal, WebView2/Wry, React 18/TypeScript/Vite for web clients, Node 24 for DevManager web and Node 22 for Portal, Express/Sequelize/PostgreSQL for the proprietary Connect control plane.
+**Tech Stack:** Rust 1.94.0, GPUI 0.2.2, gpui-component 0.5.1, Tokio, MessagePack via `rmp-serde`, SQLite/FTS5 via rusqlite 0.39.0, `similar` 3.1.2, UUID 1.24.0, portable-pty, alacritty_terminal, WebView2/Wry, React 18/TypeScript/Vite for web clients, Node 24 for DevManager web and Node 22 for Portal, Express/Sequelize/PostgreSQL for the proprietary Connect control plane.
 
 ## Global Constraints
 
