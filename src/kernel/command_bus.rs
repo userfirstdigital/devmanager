@@ -2,8 +2,13 @@
 //! snapshot load, decide, plan, receipt, append, projection, and optional outbox.
 //!
 //! Side-effect acceptance does not claim settlement or dispatch external work.
+//!
+//! [`CommandBus`] is the host-facing facade that owns [`KernelStore`] without
+//! exposing SQLite.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
@@ -38,6 +43,48 @@ use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
     StoreError,
 };
+
+/// Host-facing command facade. Owns the durable store; does not expose SQLite.
+pub struct CommandBus {
+    store: KernelStore,
+}
+
+impl fmt::Debug for CommandBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CommandBus")
+    }
+}
+
+impl CommandBus {
+    /// Open (or create) the kernel database at `path`.
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            store: KernelStore::open(path)?,
+        })
+    }
+
+    /// Execute a command through the owned store.
+    pub fn execute(&mut self, envelope: CommandEnvelope) -> Result<CommandReceipt, StoreError> {
+        self.store.execute(envelope)
+    }
+
+    /// Query durable operation status without creating operations.
+    pub fn operation_status(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<OperationState>, StoreError> {
+        self.store.operation_status(operation_id)
+    }
+
+    /// Load one task snapshot through a short-lived read-only query transaction.
+    pub fn task_snapshot(&self, task_id: TaskId) -> Result<Option<TaskSnapshot>, StoreError> {
+        let conn = self.store.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let snapshot = load_task_snapshot(&tx, task_id)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+}
 
 pub(crate) fn execute(
     store: &mut KernelStore,

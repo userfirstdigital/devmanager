@@ -15,6 +15,7 @@ mod schema;
 mod snapshot;
 mod store;
 
+pub use command_bus::CommandBus;
 pub use dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
     ReconciliationFinding, ReconciliationOrigin,
