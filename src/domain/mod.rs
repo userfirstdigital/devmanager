@@ -25,8 +25,8 @@ pub use event::{
 };
 pub use id::{
     AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
-    IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SubscriptionId,
-    TaskId, TerminalId, TransferId,
+    IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId,
+    SubscriptionId, TaskId, TerminalId, TransferId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,
@@ -39,7 +39,7 @@ pub use resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
     ResourceValidationError,
 };
-pub use snapshot::TaskSnapshot;
+pub use snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem};
 pub use task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, TaskValidationError, VisibleTaskStatus, WorkspaceRef,

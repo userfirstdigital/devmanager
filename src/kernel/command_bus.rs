@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
@@ -4171,17 +4171,17 @@ fn append_and_project(
     Ok(sequence)
 }
 
-fn load_task_snapshot(
-    tx: &Transaction<'_>,
+pub(crate) fn load_task_snapshot(
+    conn: &Connection,
     task_id: TaskId,
 ) -> Result<Option<TaskSnapshot>, StoreError> {
-    let Some(task_row) = load_task_row(tx, task_id)? else {
+    let Some(task_row) = load_task_row(conn, task_id)? else {
         return Ok(None);
     };
 
-    let agents = load_agents(tx, task_id)?;
-    let artifacts = load_artifacts(tx, task_id)?;
-    let resources = load_resources(tx, task_id)?;
+    let agents = load_agents(conn, task_id)?;
+    let artifacts = load_artifacts(conn, task_id)?;
+    let resources = load_resources(conn, task_id)?;
 
     if let Some(primary_id) = task_row.primary_agent_id {
         let Some(agent) = agents.get(&primary_id) else {
@@ -4248,11 +4248,8 @@ struct LoadedTaskRow {
     primary_agent_id: Option<AgentSessionId>,
 }
 
-fn load_task_row(
-    tx: &Transaction<'_>,
-    task_id: TaskId,
-) -> Result<Option<LoadedTaskRow>, StoreError> {
-    let row = tx
+fn load_task_row(conn: &Connection, task_id: TaskId) -> Result<Option<LoadedTaskRow>, StoreError> {
+    let row = conn
         .query_row(
             "SELECT environment_id, project_id, title, description, workspace, assignment,
                     lifecycle, action_epoch, revision, connectivity, attention, activity,
@@ -4334,10 +4331,10 @@ fn load_task_row(
 }
 
 fn load_agents(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     task_id: TaskId,
 ) -> Result<BTreeMap<AgentSessionId, AgentSessionFacts>, StoreError> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT agent_session_id, role, provider_kind, provider_session_id, lifecycle,
                 runtime_generation, revision
          FROM agent_sessions WHERE task_id = ?1 ORDER BY agent_session_id ASC",
@@ -4387,10 +4384,10 @@ fn load_agents(
 }
 
 fn load_artifacts(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     task_id: TaskId,
 ) -> Result<BTreeMap<ArtifactId, ArtifactFacts>, StoreError> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT artifact_id, kind, label, content_ref, sha256, privacy_class, created_at_ms
          FROM artifacts WHERE task_id = ?1 ORDER BY artifact_id ASC",
     )?;
@@ -4435,10 +4432,10 @@ fn load_artifacts(
 }
 
 fn load_resources(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     task_id: TaskId,
 ) -> Result<BTreeMap<ResourceId, ResourceFacts>, StoreError> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT resource_id, owner_kind, resource_kind, recipe, lifecycle,
                 runtime_generation, updated_at_ms
          FROM resources WHERE task_id = ?1 ORDER BY resource_id ASC",

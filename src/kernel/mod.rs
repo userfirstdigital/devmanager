@@ -10,6 +10,7 @@ mod outbox;
 mod projector;
 mod runtime;
 mod schema;
+mod snapshot;
 mod store;
 
 pub use dispatch::{
