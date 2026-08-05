@@ -8,6 +8,7 @@ mod dispatch;
 mod lineage;
 mod outbox;
 mod projector;
+mod runtime;
 mod schema;
 mod store;
 
@@ -16,4 +17,5 @@ pub use dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 pub use outbox::{DestinationClass, Effect, ReplayPolicy};
+pub use runtime::{CompletionDisposition, RuntimePresence, RuntimeRegistry, RuntimeRegistryError};
 pub use store::{KernelStore, ProjectionRebuild, StoreError};
