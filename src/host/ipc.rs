@@ -22,12 +22,44 @@ use crate::protocol::{
 };
 
 use super::connection::{
-    dispatch_authenticated_request, ConnectionOutputHandle, HostRequestHandle,
-    HOST_DURABLE_OUTPUT_QUEUE_CAPACITY, HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
+    dispatch_authenticated_request, ConnectionOutputHandle, DuplexExecuteCompletion,
+    HostRequestHandle, HOST_DURABLE_OUTPUT_QUEUE_CAPACITY, HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
 };
 
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reader disposition after applying one duplex execute completion to the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplexCompletionAdmit {
+    Continue,
+    AwaitDetachShutdown,
+}
+
+/// Non-async critical-lane routing for one duplex execute completion.
+///
+/// `ExecutorAdmittedQuitReceipt` enqueues nothing. `CallerMustWrite` enqueues one
+/// critical frame (detach uses shutdown-after-write).
+pub(crate) fn admit_duplex_completion(
+    output: &ConnectionOutputHandle,
+    is_detach: bool,
+    completion: DuplexExecuteCompletion,
+) -> Result<DuplexCompletionAdmit, IpcError> {
+    match completion {
+        DuplexExecuteCompletion::CallerMustWrite(response) => {
+            if is_detach {
+                output.try_enqueue_critical_shutdown_after_write(response)?;
+                Ok(DuplexCompletionAdmit::AwaitDetachShutdown)
+            } else {
+                output.try_enqueue_critical(response)?;
+                Ok(DuplexCompletionAdmit::Continue)
+            }
+        }
+        DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { .. } => {
+            Ok(DuplexCompletionAdmit::Continue)
+        }
+    }
+}
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounded post-Hello host→client critical output queue capacity.
 const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
@@ -789,12 +821,10 @@ async fn windows_serve_duplex(
                         .decode::<ClientRequest>(&payload)
                         .map_err(IpcError::MessagePack)?;
                     let is_detach = matches!(request, ClientRequest::Detach(_));
-                    let response = requests.execute(negotiated, request).await?;
-                    if is_detach {
-                        // Critical detach ack: shutdown only after successful write.
-                        // Admit once, then refuse further requests on this reader.
-                        reader_output.try_enqueue_critical_shutdown_after_write(response)?;
-                        loop {
+                    let completion = requests.execute_for_duplex(negotiated, request).await?;
+                    match admit_duplex_completion(&reader_output, is_detach, completion)? {
+                        DuplexCompletionAdmit::Continue => {}
+                        DuplexCompletionAdmit::AwaitDetachShutdown => loop {
                             if *reader_shutdown.borrow() {
                                 return Err(IpcError::Unavailable);
                             }
@@ -802,11 +832,8 @@ async fn windows_serve_duplex(
                                 .changed()
                                 .await
                                 .map_err(|_| IpcError::Unavailable)?;
-                        }
+                        },
                     }
-                    // Critical traffic must not block the executor/other clients: if the
-                    // client is not draining, fail closed for this connection only.
-                    reader_output.try_enqueue_critical(response)?;
                 }
             }
         }
@@ -1296,5 +1323,58 @@ mod tests {
             matches!(result, Err(IpcError::Timeout)),
             "blocked post-Hello write must time out, got {result:?}"
         );
+    }
+
+    #[test]
+    fn admit_duplex_completion_enqueues_zero_one_or_detach() {
+        use super::super::connection::{ConnectionOutputHandle, DuplexExecuteCompletion};
+        use super::{admit_duplex_completion, DuplexCompletionAdmit};
+        use crate::domain::id::{OperationId, RequestId};
+        use crate::domain::query::{QueryOutcome, QueryReply};
+        use crate::protocol::ServerMessage;
+
+        let reply = ServerMessage::QueryReply(QueryReply {
+            request_id: RequestId::new(),
+            outcome: QueryOutcome::Err(crate::domain::query::QueryError::NotFound),
+        });
+
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 1, 1);
+        assert_eq!(
+            admit_duplex_completion(
+                &out,
+                false,
+                DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt {
+                    operation_id: OperationId::new(),
+                },
+            )
+            .expect("admitted"),
+            DuplexCompletionAdmit::Continue
+        );
+        assert!(ports.try_recv_prioritized().is_none());
+
+        assert_eq!(
+            admit_duplex_completion(
+                &out,
+                false,
+                DuplexExecuteCompletion::CallerMustWrite(reply.clone()),
+            )
+            .expect("caller"),
+            DuplexCompletionAdmit::Continue
+        );
+        assert!(matches!(
+            ports.try_recv_prioritized().expect("one frame").message(),
+            ServerMessage::QueryReply(_)
+        ));
+        assert!(ports.try_recv_prioritized().is_none());
+
+        assert_eq!(
+            admit_duplex_completion(&out, true, DuplexExecuteCompletion::CallerMustWrite(reply),)
+                .expect("detach"),
+            DuplexCompletionAdmit::AwaitDetachShutdown
+        );
+        let detach = ports.try_recv_prioritized().expect("detach frame");
+        assert!(matches!(detach.message(), ServerMessage::QueryReply(_)));
+        detach.after_successful_write();
+        assert!(out.is_shutdown_requested());
     }
 }

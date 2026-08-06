@@ -17,8 +17,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::domain::command::Command;
-use crate::domain::id::{ArtifactId, SnapshotId, SubscriptionId, TaskId};
+use crate::domain::command::{Command, CommandReceipt};
+use crate::domain::id::{ArtifactId, OperationId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
@@ -58,11 +58,34 @@ const MAX_EVENT_REPLAY_SESSIONS: usize = 32;
 const EVENT_REPLAY_IDLE_TTL: Duration = Duration::from_secs(30);
 const EVENT_REPLAY_REAPER_PERIOD: Duration = Duration::from_secs(1);
 
+/// Internal completion routing for one host request job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRequestCompletionRouting {
+    /// Caller (reader / one-shot serve) owns writing the response frame.
+    CallerOwned,
+    /// Executor may directly admit an accepted ConfirmHostQuit receipt.
+    ExecutorOwnsAcceptedHostQuitReceipt,
+}
+
+/// Crate-private duplex execute completion: either the reader must write, or the
+/// executor already admitted the quit receipt onto the critical lane.
+#[derive(Debug)]
+pub(crate) enum DuplexExecuteCompletion {
+    CallerMustWrite(ServerMessage),
+    ExecutorAdmittedQuitReceipt { operation_id: OperationId },
+}
+
 struct HostRequestJob {
     negotiated: NegotiatedParameters,
     request: ClientRequest,
     output_id: Option<ConnectionOutputId>,
-    reply: oneshot::Sender<Result<ServerMessage, IpcError>>,
+    routing: HostRequestCompletionRouting,
+    reply: oneshot::Sender<Result<DuplexExecuteCompletion, IpcError>>,
+}
+
+struct PendingQuitReceiptAck {
+    operation_id: OperationId,
+    ack: PhysicalWriteAck,
 }
 
 enum ExecutorControl {
@@ -82,6 +105,11 @@ enum ExecutorControl {
     #[cfg(test)]
     RunMaintenanceOnce {
         ack: oneshot::Sender<Result<(), StoreError>>,
+    },
+    #[cfg(test)]
+    TakePendingQuitReceiptAck {
+        id: ConnectionOutputId,
+        ack: oneshot::Sender<Option<(OperationId, PhysicalWriteAck)>>,
     },
 }
 
@@ -494,17 +522,67 @@ impl HostRequestHandle {
         negotiated: NegotiatedParameters,
         request: ClientRequest,
     ) -> Result<ServerMessage, IpcError> {
+        match self
+            .submit(
+                negotiated,
+                request,
+                HostRequestCompletionRouting::CallerOwned,
+            )
+            .await?
+        {
+            DuplexExecuteCompletion::CallerMustWrite(message) => Ok(message),
+            DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { .. } => {
+                Err(IpcError::Unavailable)
+            }
+        }
+    }
+
+    /// Duplex path: may return executor-admitted quit receipt (reader must not enqueue).
+    pub(crate) async fn execute_for_duplex(
+        &self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        self.submit(
+            negotiated,
+            request,
+            HostRequestCompletionRouting::ExecutorOwnsAcceptedHostQuitReceipt,
+        )
+        .await
+    }
+
+    async fn submit(
+        &self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+        routing: HostRequestCompletionRouting,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HostRequestJob {
                 negotiated,
                 request,
                 output_id: self.output_id,
+                routing,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| IpcError::Unavailable)?;
         reply_rx.await.map_err(|_| IpcError::Unavailable)?
+    }
+
+    /// Test seam: take the pending accepted-quit receipt ack for one output, if any.
+    #[cfg(test)]
+    pub(crate) async fn take_pending_quit_receipt_ack(
+        &self,
+        id: ConnectionOutputId,
+    ) -> Result<Option<(OperationId, PhysicalWriteAck)>, IpcError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::TakePendingQuitReceiptAck { id, ack: ack_tx })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        ack_rx.await.map_err(|_| IpcError::Unavailable)
     }
 }
 
@@ -518,6 +596,8 @@ pub struct HostRequestExecutor {
     replay_registry: EventReplayRegistry,
     artifact_content_registry: ArtifactContentRegistry,
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
+    /// Latest accepted ConfirmHostQuit receipt ack per output (for terminal drain).
+    pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
 }
 
 impl HostRequestExecutor {
@@ -558,6 +638,7 @@ impl HostRequestExecutor {
             replay_registry: EventReplayRegistry::new(),
             artifact_content_registry: ArtifactContentRegistry::new(),
             outputs: HashMap::new(),
+            pending_quit_receipt_acks: HashMap::new(),
         };
         let join = tokio::spawn(async move {
             executor.run(schedule_automatic_maintenance).await;
@@ -577,7 +658,7 @@ impl HostRequestExecutor {
                     let Some(job) = job else {
                         break;
                     };
-                    let result = self.dispatch(job.negotiated, job.request, job.output_id);
+                    let result = self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing);
                     // If the connection task went away, drop the reply; do not panic.
                     let _ = job.reply.send(result);
                 }
@@ -618,6 +699,14 @@ impl HostRequestExecutor {
                         ExecutorControl::RunMaintenanceOnce { ack } => {
                             let result = self.run_one_cleanup_or_teardown_unit();
                             let _ = ack.send(result);
+                        }
+                        #[cfg(test)]
+                        ExecutorControl::TakePendingQuitReceiptAck { id, ack } => {
+                            let taken = self
+                                .pending_quit_receipt_acks
+                                .remove(&id)
+                                .map(|pending| (pending.operation_id, pending.ack));
+                            let _ = ack.send(taken);
                         }
                     }
                 }
@@ -663,6 +752,7 @@ impl HostRequestExecutor {
     }
 
     fn detach_output(&mut self, id: ConnectionOutputId) {
+        self.pending_quit_receipt_acks.remove(&id);
         if let Some(output) = self.outputs.remove(&id) {
             output.request_shutdown();
         }
@@ -675,6 +765,7 @@ impl HostRequestExecutor {
         &mut self,
         id: ConnectionOutputId,
     ) -> Option<ConnectionOutputHandle> {
+        self.pending_quit_receipt_acks.remove(&id);
         let output = self.outputs.remove(&id);
         self.replay_registry.remove_for_output(id);
         output
@@ -718,6 +809,52 @@ impl HostRequestExecutor {
         for id in dead {
             self.detach_output(id);
         }
+    }
+
+    fn dispatch_job(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+        output_id: Option<ConnectionOutputId>,
+        routing: HostRequestCompletionRouting,
+    ) -> Result<DuplexExecuteCompletion, IpcError> {
+        let is_confirm_host_quit = matches!(
+            &request,
+            ClientRequest::Command(envelope)
+                if matches!(envelope.command, Command::ConfirmHostQuit(_))
+        );
+        let response = self.dispatch(negotiated, request, output_id)?;
+        if !matches!(
+            routing,
+            HostRequestCompletionRouting::ExecutorOwnsAcceptedHostQuitReceipt
+        ) {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(response));
+        }
+        // lookup_receipt is command_id-keyed: a ConfirmHostQuit-shaped request can
+        // surface a prior non-quit Accepted. Own only the durable host-admission
+        // receipt shape (task_revision None, exactly one event_id).
+        let operation_id = match (&response, is_confirm_host_quit) {
+            (
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+                    operation_id,
+                    task_revision: None,
+                    event_ids,
+                    ..
+                }),
+                true,
+            ) if event_ids.len() == 1 => *operation_id,
+            _ => return Ok(DuplexExecuteCompletion::CallerMustWrite(response)),
+        };
+        let Some(output_id) = output_id else {
+            return Err(IpcError::Unavailable);
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return Err(IpcError::Unavailable);
+        };
+        let ack = output.try_enqueue_critical_tracked(response)?;
+        self.pending_quit_receipt_acks
+            .insert(output_id, PendingQuitReceiptAck { operation_id, ack });
+        Ok(DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id })
     }
 
     fn dispatch(
@@ -1631,6 +1768,56 @@ pub(crate) enum DurableAdmitResult {
     ShutdownRequested,
 }
 
+/// Outcome observed when polling a [`PhysicalWriteAck`] without awaiting.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhysicalWriteAckStatus {
+    Pending,
+    Succeeded,
+    Aborted,
+}
+
+/// Per-frame, non-Clone wait handle for one successful physical write.
+///
+/// Success is reported only after [`PrioritizedOutbound::after_successful_write`].
+/// Dropping the outbound acknowledger (encode/write/cancel/drop without success)
+/// reports aborted.
+#[derive(Debug)]
+pub(crate) struct PhysicalWriteAck {
+    rx: oneshot::Receiver<()>,
+}
+
+impl PhysicalWriteAck {
+    pub(crate) async fn wait(self) -> Result<(), ()> {
+        self.rx.await.map_err(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&mut self) -> PhysicalWriteAckStatus {
+        match self.rx.try_recv() {
+            Ok(()) => PhysicalWriteAckStatus::Succeeded,
+            Err(oneshot::error::TryRecvError::Empty) => PhysicalWriteAckStatus::Pending,
+            Err(oneshot::error::TryRecvError::Closed) => PhysicalWriteAckStatus::Aborted,
+        }
+    }
+}
+
+/// Private sender half; drop aborts the paired [`PhysicalWriteAck`].
+struct PhysicalWriteAcknowledger {
+    tx: oneshot::Sender<()>,
+}
+
+impl PhysicalWriteAcknowledger {
+    fn pair() -> (PhysicalWriteAck, Self) {
+        let (tx, rx) = oneshot::channel();
+        (PhysicalWriteAck { rx }, Self { tx })
+    }
+
+    fn acknowledge(self) {
+        let _ = self.tx.send(());
+    }
+}
+
 /// Critical outbound keeps the owned semaphore permit alive until dropped after
 /// the physical write returns (success or failure).
 pub(crate) struct CriticalOutbound {
@@ -1641,6 +1828,7 @@ pub(crate) struct CriticalOutbound {
     live_resync: Option<LiveResyncMaterialization>,
     /// Explicit detach: request connection shutdown only after the ack write.
     shutdown_after_successful_write: Option<ConnectionOutputHandle>,
+    write_ack: Option<PhysicalWriteAcknowledger>,
 }
 
 struct LiveResyncMaterialization {
@@ -1730,6 +1918,9 @@ impl PrioritizedOutbound {
             Self::Critical(outbound) => {
                 if let Some(handle) = outbound.shutdown_after_successful_write {
                     handle.request_shutdown();
+                }
+                if let Some(ack) = outbound.write_ack {
+                    ack.acknowledge();
                 }
             }
             Self::Durable(outbound) => outbound.commit_physical_write(),
@@ -2087,7 +2278,8 @@ impl ConnectionOutputHandle {
     }
 
     pub(crate) fn try_enqueue_critical(&self, message: ServerMessage) -> Result<(), IpcError> {
-        self.try_enqueue_critical_outbound(message, None, false)
+        self.try_enqueue_critical_outbound(message, None, false, false)
+            .map(|_| ())
     }
 
     /// Admit a critical message that requests shutdown only after a successful write.
@@ -2095,7 +2287,18 @@ impl ConnectionOutputHandle {
         &self,
         message: ServerMessage,
     ) -> Result<(), IpcError> {
-        self.try_enqueue_critical_outbound(message, None, true)
+        self.try_enqueue_critical_outbound(message, None, true, false)
+            .map(|_| ())
+    }
+
+    /// Tracked critical admission: returns a [`PhysicalWriteAck`] while preserving
+    /// synchronous nonblocking permit/channel admission.
+    pub(crate) fn try_enqueue_critical_tracked(
+        &self,
+        message: ServerMessage,
+    ) -> Result<PhysicalWriteAck, IpcError> {
+        self.try_enqueue_critical_outbound(message, None, false, true)?
+            .ok_or(IpcError::Unavailable)
     }
 
     fn try_enqueue_critical_outbound(
@@ -2103,7 +2306,8 @@ impl ConnectionOutputHandle {
         message: ServerMessage,
         live_resync: Option<LiveResyncMaterialization>,
         shutdown_after_successful_write: bool,
-    ) -> Result<(), IpcError> {
+        tracked: bool,
+    ) -> Result<Option<PhysicalWriteAck>, IpcError> {
         if self.is_shutdown_requested() {
             return Err(IpcError::Unavailable);
         }
@@ -2116,17 +2320,25 @@ impl ConnectionOutputHandle {
                 IpcError::Unavailable
             })?;
         let shutdown_after_successful_write = shutdown_after_successful_write.then(|| self.clone());
+        let (ack, write_ack) = if tracked {
+            let (ack, acknowledger) = PhysicalWriteAcknowledger::pair();
+            (Some(ack), Some(acknowledger))
+        } else {
+            (None, None)
+        };
         self.critical_tx
             .send(CriticalOutbound {
                 message,
                 _permit: permit,
                 live_resync,
                 shutdown_after_successful_write,
+                write_ack,
             })
             .map_err(|_| {
                 self.request_shutdown();
                 IpcError::Unavailable
-            })
+            })?;
+        Ok(ack)
     }
 
     /// Cancel the live stream generation and attempt one critical ResyncRequired.
@@ -2158,8 +2370,9 @@ impl ConnectionOutputHandle {
                 newest_sequence_hint: newest_sequence,
             }),
             false,
+            false,
         ) {
-            Ok(()) => DurableAdmitResult::ResyncAdmitted {
+            Ok(_) => DurableAdmitResult::ResyncAdmitted {
                 last_delivered_sequence,
                 newest_sequence,
             },
@@ -2345,13 +2558,18 @@ mod output_tests {
     use std::time::Duration;
 
     use super::{
-        ConnectionOutputHandle, DurableAdmitResult, EphemeralAdmitResult, LiveStreamState,
+        ConnectionOutputHandle, DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult,
+        HostRequestExecutor, HostRequestHandle, LiveStreamState, PhysicalWriteAckStatus,
         PrioritizedOutbound, StreamMaterializer,
     };
     use crate::domain::event::{DomainEvent, Event};
     use crate::domain::id::{EventId, RequestId, ResourceId, SubscriptionId};
     use crate::domain::query::{QueryOutcome, QueryReply};
-    use crate::protocol::{ServerMessage, StreamFrame, StreamKey, StreamPayloadKind};
+    use crate::domain::ClientId;
+    use crate::protocol::{
+        ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
+        StreamPayloadKind,
+    };
     use std::sync::Arc;
 
     fn sample_event(sequence: u64) -> DomainEvent {
@@ -4261,5 +4479,452 @@ mod output_tests {
         executor.abort();
         let _ = executor.await;
         let _ = TaskLifecycle::Open;
+    }
+
+    fn host_shutdown_negotiated(client: ClientId) -> NegotiatedParameters {
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            limits: FrameLimits::v1_default(),
+        }
+    }
+
+    fn inspect_quit_request(client: ClientId) -> ClientRequest {
+        use crate::domain::id::RequestId;
+        use crate::domain::query::{Query, QueryEnvelope};
+        ClientRequest::Query(QueryEnvelope {
+            request_id: RequestId::new(),
+            client_id: client,
+            task_id: None,
+            query: Query::InspectHostQuit,
+        })
+    }
+
+    fn confirm_quit_request(
+        client: ClientId,
+        command_id: crate::domain::id::CommandId,
+        inspection_id: u64,
+    ) -> ClientRequest {
+        use crate::domain::command::{Command, CommandEnvelope, ConfirmHostQuitIntent};
+        ClientRequest::Command(CommandEnvelope {
+            command_id,
+            client_id: client,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_700,
+            expected_task_revision: None,
+            command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                inspection_id,
+                allow_uninspected_worktrees: true,
+            }),
+        })
+    }
+
+    async fn inspection_id_for(
+        handle: &HostRequestHandle,
+        negotiated: NegotiatedParameters,
+        client: ClientId,
+    ) -> u64 {
+        match handle
+            .execute(negotiated, inspect_quit_request(client))
+            .await
+            .expect("inspect")
+        {
+            ServerMessage::QueryReply(reply) => match reply.outcome {
+                crate::domain::query::QueryOutcome::Ok(
+                    crate::domain::query::QueryResult::HostQuitInspection { inspection },
+                ) => inspection.inspection_id,
+                other => panic!("expected HostQuitInspection, got {other:?}"),
+            },
+            other => panic!("expected QueryReply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracked_critical_ack_pending_until_after_successful_write_and_aborts_on_drop() {
+        let (handle, mut ports) = ConnectionOutputHandle::new(2, 1, 1);
+        let mut ack = handle
+            .try_enqueue_critical_tracked(sample_reply())
+            .expect("tracked critical admit");
+        assert_eq!(ack.status(), PhysicalWriteAckStatus::Pending);
+        let outbound = ports
+            .try_recv_prioritized()
+            .expect("dequeue tracked critical");
+        assert_eq!(ack.status(), PhysicalWriteAckStatus::Pending);
+        outbound.after_successful_write();
+        assert!(ack.wait().await.is_ok());
+
+        let mut aborted = handle
+            .try_enqueue_critical_tracked(sample_reply())
+            .expect("second tracked critical");
+        drop(ports.try_recv_prioritized().expect("dequeue second"));
+        assert_eq!(aborted.status(), PhysicalWriteAckStatus::Aborted);
+    }
+
+    #[test]
+    fn tracked_critical_full_and_closed_fail_closed_without_ack() {
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        handle.try_enqueue_critical(sample_reply()).expect("fill");
+        assert!(handle.try_enqueue_critical_tracked(sample_reply()).is_err());
+        assert!(handle.is_shutdown_requested());
+        let _ = ports.try_recv_prioritized();
+
+        let (closed, ports) = ConnectionOutputHandle::new(1, 1, 1);
+        drop(ports);
+        closed.request_shutdown();
+        assert!(closed.try_enqueue_critical_tracked(sample_reply()).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_execute_accepted_confirm_host_quit_returns_server_message() {
+        use crate::domain::command::CommandReceipt;
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("ordinary-quit.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let client = ClientId::new();
+        let negotiated = host_shutdown_negotiated(client);
+        let handle = requests.with_output(reg.id());
+        let inspection_id = inspection_id_for(&handle, negotiated.clone(), client).await;
+
+        let confirm = handle
+            .execute(
+                negotiated,
+                confirm_quit_request(client, CommandId::new(), inspection_id),
+            )
+            .await
+            .expect("ordinary execute");
+        assert!(matches!(
+            confirm,
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+        ));
+        assert!(ports.try_recv_prioritized().is_none());
+        assert!(requests
+            .take_pending_quit_receipt_ack(reg.id())
+            .await
+            .expect("take")
+            .is_none());
+
+        drop(reg);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplex_accepted_confirm_host_quit_executor_admits_tracked_critical_receipt() {
+        use crate::domain::command::CommandReceipt;
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-quit-admit.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let client = ClientId::new();
+        let negotiated = host_shutdown_negotiated(client);
+        let handle = requests.with_output(reg.id());
+        let inspection_id = inspection_id_for(&handle, negotiated.clone(), client).await;
+
+        let completion = handle
+            .execute_for_duplex(
+                negotiated,
+                confirm_quit_request(client, CommandId::new(), inspection_id),
+            )
+            .await
+            .expect("duplex quit");
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = completion
+        else {
+            panic!("expected ExecutorAdmittedQuitReceipt, got {completion:?}");
+        };
+        let outbound = ports.try_recv_prioritized().expect("one critical receipt");
+        match outbound.message() {
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+                operation_id: wired,
+                task_revision: None,
+                event_ids,
+                ..
+            }) => {
+                assert_eq!(*wired, operation_id);
+                assert_eq!(event_ids.len(), 1);
+            }
+            other => panic!("expected host-admission Accepted, got {other:?}"),
+        }
+        assert!(ports.try_recv_prioritized().is_none());
+
+        let (stored_op, mut stored_ack) = requests
+            .take_pending_quit_receipt_ack(reg.id())
+            .await
+            .expect("take")
+            .expect("stored ack");
+        assert_eq!(stored_op, operation_id);
+        assert_eq!(stored_ack.status(), PhysicalWriteAckStatus::Pending);
+        outbound.after_successful_write();
+        assert_eq!(stored_ack.status(), PhysicalWriteAckStatus::Succeeded);
+
+        drop(reg);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplex_non_quit_rejected_quit_and_command_id_collision_remain_caller_owned() {
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
+        };
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            WorkspaceRef,
+        };
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-caller-owned.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let client = ClientId::new();
+        let negotiated = host_shutdown_negotiated(client);
+        let handle = requests.with_output(reg.id());
+
+        let inspect = handle
+            .execute_for_duplex(negotiated.clone(), inspect_quit_request(client))
+            .await
+            .expect("inspect");
+        assert!(matches!(
+            inspect,
+            DuplexExecuteCompletion::CallerMustWrite(ServerMessage::QueryReply(_))
+        ));
+        assert!(ports.try_recv_prioritized().is_none());
+
+        let rejected = handle
+            .execute_for_duplex(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: Some(TaskId::new()),
+                    issued_at_ms: 1_725_000_000_701,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(
+                        crate::domain::command::ConfirmHostQuitIntent {
+                            inspection_id: 0,
+                            allow_uninspected_worktrees: true,
+                        },
+                    ),
+                }),
+            )
+            .await
+            .expect("rejected");
+        assert!(matches!(
+            rejected,
+            DuplexExecuteCompletion::CallerMustWrite(ServerMessage::CommandReceipt(
+                CommandReceipt::Rejected {
+                    code: RejectionCode::InvalidTransition,
+                    ..
+                }
+            ))
+        ));
+
+        let reused_command_id = CommandId::new();
+        let created = handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: reused_command_id,
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_702,
+                    expected_task_revision: None,
+                    command: Command::CreateTask(CreateTaskIntent {
+                        id: TaskId::new(),
+                        environment_id: EnvironmentId::new(),
+                        title: "collision".into(),
+                        description: None,
+                        project_id: ProjectId::new(),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await
+            .expect("create task");
+        let ServerMessage::CommandReceipt(CommandReceipt::Accepted {
+            task_revision: Some(_),
+            ..
+        }) = created
+        else {
+            panic!("expected task Accepted with revision, got {created:?}");
+        };
+
+        let collision = handle
+            .execute_for_duplex(
+                negotiated,
+                confirm_quit_request(client, reused_command_id, 0),
+            )
+            .await
+            .expect("collision duplex");
+        match collision {
+            DuplexExecuteCompletion::CallerMustWrite(ServerMessage::CommandReceipt(
+                CommandReceipt::Accepted {
+                    task_revision: Some(_),
+                    ..
+                },
+            )) => {}
+            other => panic!("collision must stay caller-owned non-quit Accepted, got {other:?}"),
+        }
+        assert!(ports.try_recv_prioritized().is_none());
+        assert!(requests
+            .take_pending_quit_receipt_ack(reg.id())
+            .await
+            .expect("take")
+            .is_none());
+
+        drop(reg);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplex_accepted_quit_missing_then_retry_admits_on_healthy_output() {
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-quit-missing.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client = ClientId::new();
+        let negotiated = host_shutdown_negotiated(client);
+        let inspection_id = inspection_id_for(&requests, negotiated.clone(), client).await;
+        let command_id = CommandId::new();
+
+        let missing = requests
+            .execute_for_duplex(
+                negotiated.clone(),
+                confirm_quit_request(client, command_id, inspection_id),
+            )
+            .await;
+        assert!(matches!(missing, Err(crate::host::IpcError::Unavailable)));
+
+        let (out, mut ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let output_id = reg.id();
+        let handle = requests.with_output(output_id);
+        let retry = handle
+            .execute_for_duplex(
+                negotiated,
+                confirm_quit_request(client, command_id, inspection_id),
+            )
+            .await
+            .expect("retry");
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = retry else {
+            panic!("expected ExecutorAdmittedQuitReceipt, got {retry:?}");
+        };
+        let frame = ports.try_recv_prioritized().expect("one critical");
+        match frame.message() {
+            ServerMessage::CommandReceipt(crate::domain::command::CommandReceipt::Accepted {
+                operation_id: wired,
+                ..
+            }) => assert_eq!(*wired, operation_id),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        assert!(ports.try_recv_prioritized().is_none());
+        let (stored_op, mut ack) = requests
+            .take_pending_quit_receipt_ack(output_id)
+            .await
+            .expect("take")
+            .expect("pending ack after admit");
+        assert_eq!(stored_op, operation_id);
+        assert_eq!(ack.status(), PhysicalWriteAckStatus::Pending);
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplex_accepted_quit_full_then_retry_on_fresh_output_and_detach_clears_ack() {
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-quit-full.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let (out, mut ports) = ConnectionOutputHandle::new(1, 8, 1);
+        let output_id = out.id();
+        let reg = requests
+            .register_output(out.clone())
+            .await
+            .expect("register");
+        let client = ClientId::new();
+        let negotiated = host_shutdown_negotiated(client);
+        let handle = requests.with_output(reg.id());
+        out.try_enqueue_critical(sample_reply()).expect("fill");
+        let inspection_id = inspection_id_for(&handle, negotiated.clone(), client).await;
+        let command_id = CommandId::new();
+
+        let full = handle
+            .execute_for_duplex(
+                negotiated.clone(),
+                confirm_quit_request(client, command_id, inspection_id),
+            )
+            .await;
+        assert!(matches!(full, Err(crate::host::IpcError::Unavailable)));
+        assert!(out.is_shutdown_requested());
+        assert!(requests
+            .take_pending_quit_receipt_ack(output_id)
+            .await
+            .expect("take")
+            .is_none());
+        assert!(matches!(
+            ports.try_recv_prioritized().expect("filler").message(),
+            ServerMessage::QueryReply(_)
+        ));
+        drop(reg);
+
+        let (healthy, mut healthy_ports) = ConnectionOutputHandle::new(4, 8, 1);
+        let healthy_id = healthy.id();
+        let reg = requests
+            .register_output(healthy)
+            .await
+            .expect("register healthy");
+        let handle = requests.with_output(reg.id());
+        let retry = handle
+            .execute_for_duplex(
+                negotiated,
+                confirm_quit_request(client, command_id, inspection_id),
+            )
+            .await
+            .expect("retry");
+        assert!(matches!(
+            retry,
+            DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { .. }
+        ));
+        assert!(healthy_ports.try_recv_prioritized().is_some());
+        // Detach clears the pending map without requiring a take first.
+        drop(reg);
+        assert!(requests
+            .take_pending_quit_receipt_ack(healthy_id)
+            .await
+            .expect("cleared")
+            .is_none());
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
     }
 }
