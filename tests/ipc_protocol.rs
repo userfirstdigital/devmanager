@@ -19,9 +19,13 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
+    UnsolicitedServerMessage,
 };
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
-use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+use devmanager::domain::event::{DomainEvent, Event};
+use devmanager::domain::id::{
+    CommandId, EnvironmentId, EventId, ProjectId, RequestId, SubscriptionId, TaskId,
+};
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
 use devmanager::domain::task::{
@@ -30,12 +34,12 @@ use devmanager::domain::task::{
 use devmanager::domain::ClientId;
 use devmanager::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,
-    HelloListener, IpcError,
+    HelloListener, HostRequestExecutor, IpcError,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{
-    Capability, CapabilitySet, ClientHello, FrameLimits, PhysicalFrameError, ProtocolVersion,
-    MAX_PHYSICAL_FRAME_BYTES,
+    Capability, CapabilitySet, ClientHello, ClientRequest, FrameLimits, PhysicalFrameError,
+    ProtocolVersion, ServerMessage, MAX_PHYSICAL_FRAME_BYTES,
 };
 
 const OUTER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,7 +185,7 @@ async fn pipe_request_create_retry_then_task_read() {
                 FrameLimits::v1_default(),
             )
             .expect("client hello");
-            let mut client = connect(&endpoint, &hello).await.expect("connect");
+            let client = connect(&endpoint, &hello).await.expect("connect");
             assert_eq!(client.client_id(), client_id);
 
             let first = client
@@ -689,5 +693,497 @@ async fn client_reconnect_resolves_tracked_operation_while_host_database_is_lock
         .expect("host2 join timeout")
         .expect("host2");
 
+    drop(root);
+}
+
+fn create_intent(task: TaskId, title: &str) -> CreateTaskIntent {
+    CreateTaskIntent {
+        id: task,
+        environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x71)).expect("env"),
+        title: title.into(),
+        description: None,
+        project_id: ProjectId::from_bytes(fixed_uuid_v7(0x72)).expect("project"),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        created_at_ms: 1_725_000_000_000,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplex_client_correlates_interleaved_command_and_query_replies() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let profile = unique_profile("ix");
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let client_id = protocol_client_id(0x81);
+    let task = TaskId::from_bytes(fixed_uuid_v7(0x82)).expect("task");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x83)).expect("command");
+    let request_id = RequestId::from_bytes(fixed_uuid_v7(0x84)).expect("request");
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id: Uuid::now_v7(),
+            server_build: "devmanager-host/0.4.2".into(),
+            supported: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let server = tokio::spawn(async move {
+        let mut host = listener.accept().await.expect("accept");
+        let first = host.read_request().await.expect("read first");
+        let second = host.read_request().await.expect("read second");
+        let (command_env, query_env) = match (first, second) {
+            (ClientRequest::Command(command), ClientRequest::Query(query)) => (command, query),
+            (ClientRequest::Query(query), ClientRequest::Command(command)) => (command, query),
+            other => panic!("unexpected request pair: {other:?}"),
+        };
+        assert_eq!(command_env.command_id, command_id);
+        assert_eq!(query_env.request_id, request_id);
+
+        // Reply out of order: query first, then command receipt.
+        host.write_message(&ServerMessage::QueryReply(
+            devmanager::domain::query::QueryReply {
+                request_id,
+                outcome: QueryOutcome::Err(devmanager::domain::query::QueryError::NotFound),
+            },
+        ))
+        .await
+        .expect("write query reply first");
+        host.write_message(&ServerMessage::CommandReceipt(CommandReceipt::Rejected {
+            command_id,
+            code: devmanager::domain::command::RejectionCode::NotFound,
+            current_revision: None,
+        }))
+        .await
+        .expect("write command receipt second");
+    });
+
+    let client = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            let hello = ClientHello::new(
+                "devmanager/0.4.2",
+                client_id,
+                fingerprint,
+                CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+                FrameLimits::v1_default(),
+            )
+            .expect("hello");
+            let connection = connect(&endpoint, &hello).await.expect("connect");
+            let command = connection.execute_command(CommandEnvelope {
+                command_id,
+                client_id,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_100,
+                expected_task_revision: None,
+                command: Command::CreateTask(create_intent(task, "interleave")),
+            });
+            let query = connection.query(QueryEnvelope {
+                request_id,
+                client_id,
+                task_id: Some(task),
+                query: Query::TaskSnapshot,
+            });
+            let (receipt, reply) = tokio::join!(command, query);
+            (
+                receipt.expect("command receipt"),
+                reply.expect("query reply"),
+            )
+        }
+    });
+
+    timeout(OUTER_TIMEOUT, server)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+    let (receipt, reply) = timeout(OUTER_TIMEOUT, client)
+        .await
+        .expect("client timeout")
+        .expect("client join");
+    assert!(matches!(
+        receipt,
+        CommandReceipt::Rejected {
+            command_id: rejected,
+            ..
+        } if rejected == command_id
+    ));
+    assert_eq!(reply.request_id, request_id);
+    drop(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplex_client_wrong_correlation_fails_closed_and_drains_waiter_as_unavailable() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let profile = unique_profile("wc");
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let client_id = protocol_client_id(0xb1);
+    let request_id = RequestId::from_bytes(fixed_uuid_v7(0xb2)).expect("request");
+    let wrong_request_id = RequestId::from_bytes(fixed_uuid_v7(0xb3)).expect("wrong request");
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id: Uuid::now_v7(),
+            server_build: "devmanager-host/0.4.2".into(),
+            supported: CapabilitySet::empty(),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let server = tokio::spawn(async move {
+        let mut host = listener.accept().await.expect("accept");
+        let request = host.read_request().await.expect("read query");
+        assert!(matches!(request, ClientRequest::Query(_)));
+        host.write_message(&ServerMessage::QueryReply(
+            devmanager::domain::query::QueryReply {
+                request_id: wrong_request_id,
+                outcome: QueryOutcome::Err(devmanager::domain::query::QueryError::NotFound),
+            },
+        ))
+        .await
+        .expect("write wrongly correlated reply");
+    });
+
+    let hello = ClientHello::new(
+        "devmanager/0.4.2",
+        client_id,
+        fingerprint,
+        CapabilitySet::empty(),
+        FrameLimits::v1_default(),
+    )
+    .expect("hello");
+    let connection = connect(&endpoint, &hello).await.expect("connect");
+    let query = connection
+        .query(QueryEnvelope {
+            request_id,
+            client_id,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        })
+        .await;
+    assert!(
+        matches!(query, Err(IpcError::Unavailable)),
+        "pending waiter must receive Unavailable after connection poison, got {query:?}"
+    );
+    assert!(connection.is_poisoned());
+    let blocked = connection
+        .query(QueryEnvelope {
+            request_id: RequestId::from_bytes(fixed_uuid_v7(0xb4)).expect("blocked request"),
+            client_id,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        })
+        .await;
+    assert!(matches!(blocked, Err(IpcError::ConnectionPoisoned)));
+
+    timeout(OUTER_TIMEOUT, server)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+    drop(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplex_client_routes_unsolicited_durable_message() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let profile = unique_profile("us");
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let client_id = protocol_client_id(0x85);
+    let subscription_id = SubscriptionId::from_bytes(fixed_uuid_v7(0x86)).expect("sub");
+    let request_id = RequestId::from_bytes(fixed_uuid_v7(0x87)).expect("request");
+    let event = DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(0x88)).expect("event id"),
+        task_id: None,
+        sequence: 9,
+        task_revision: None,
+        occurred_at_ms: 1_725_000_000_900,
+        payload: Event::TaskRenamed {
+            title: "unsolicited".into(),
+        },
+    };
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id: Uuid::now_v7(),
+            server_build: "devmanager-host/0.4.2".into(),
+            supported: CapabilitySet::empty(),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let server = tokio::spawn({
+        let event = event.clone();
+        async move {
+            let mut host = listener.accept().await.expect("accept");
+            let request = host.read_request().await.expect("read query");
+            assert!(matches!(request, ClientRequest::Query(_)));
+            host.write_message(&ServerMessage::DurableEvent {
+                subscription_id,
+                event,
+            })
+            .await
+            .expect("write durable");
+            host.write_message(&ServerMessage::QueryReply(
+                devmanager::domain::query::QueryReply {
+                    request_id,
+                    outcome: QueryOutcome::Err(devmanager::domain::query::QueryError::NotFound),
+                },
+            ))
+            .await
+            .expect("write query reply");
+        }
+    });
+
+    let client = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let event = event.clone();
+        async move {
+            let hello = ClientHello::new(
+                "devmanager/0.4.2",
+                client_id,
+                fingerprint,
+                CapabilitySet::empty(),
+                FrameLimits::v1_default(),
+            )
+            .expect("hello");
+            let connection = connect(&endpoint, &hello).await.expect("connect");
+            let query = connection.query(QueryEnvelope {
+                request_id,
+                client_id,
+                task_id: None,
+                query: Query::TaskSnapshot,
+            });
+            let unsolicited = connection.recv_unsolicited();
+            let (reply, message) = tokio::join!(query, unsolicited);
+            (reply.expect("query"), message.expect("unsolicited"), event)
+        }
+    });
+
+    timeout(OUTER_TIMEOUT, server)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+    let (reply, message, expected_event) = timeout(OUTER_TIMEOUT, client)
+        .await
+        .expect("client timeout")
+        .expect("client join");
+    assert_eq!(reply.request_id, request_id);
+    match message {
+        UnsolicitedServerMessage::DurableEvent {
+            subscription_id: got_sub,
+            event: got_event,
+        } => {
+            assert_eq!(got_sub, subscription_id);
+            assert_eq!(got_event, expected_event);
+        }
+        other => panic!("expected DurableEvent, got {other:?}"),
+    }
+    drop(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_in_flight_ids_are_rejected_before_write() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let profile = unique_profile("du");
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let client_id = protocol_client_id(0x89);
+    let task = TaskId::from_bytes(fixed_uuid_v7(0x8a)).expect("task");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x8b)).expect("command");
+    let (seen_tx, seen_rx) = oneshot::channel::<()>();
+    let (check_tx, check_rx) = oneshot::channel::<()>();
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id: Uuid::now_v7(),
+            server_build: "devmanager-host/0.4.2".into(),
+            supported: CapabilitySet::empty(),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let server = tokio::spawn(async move {
+        let mut host = listener.accept().await.expect("accept");
+        let request = host.read_request().await.expect("first request");
+        assert!(matches!(request, ClientRequest::Command(_)));
+        let _ = seen_tx.send(());
+        check_rx.await.expect("duplicate check release");
+        let second = timeout(Duration::from_millis(200), host.read_request()).await;
+        assert!(
+            second.is_err(),
+            "duplicate must not write a second request frame"
+        );
+    });
+
+    let hello = ClientHello::new(
+        "devmanager/0.4.2",
+        client_id,
+        fingerprint,
+        CapabilitySet::empty(),
+        FrameLimits::v1_default(),
+    )
+    .expect("hello");
+    let connection = connect(&endpoint, &hello).await.expect("connect");
+    let envelope = CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::CreateTask(create_intent(task, "dup")),
+    };
+    let inflight = {
+        let connection = connection.clone();
+        let envelope = envelope.clone();
+        tokio::spawn(async move { connection.execute_command(envelope).await })
+    };
+    timeout(OUTER_TIMEOUT, seen_rx)
+        .await
+        .expect("seen timeout")
+        .expect("seen");
+    let duplicate = connection.execute_command(envelope).await;
+    assert!(
+        matches!(duplicate, Err(IpcError::DuplicateInFlight)),
+        "expected DuplicateInFlight, got {duplicate:?}"
+    );
+    assert!(
+        !connection.is_poisoned(),
+        "duplicate local rejection must not poison the connection"
+    );
+    check_tx.send(()).expect("release duplicate check");
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server cleanup timeout")
+        .expect("server join");
+    let inflight = timeout(Duration::from_secs(2), inflight)
+        .await
+        .expect("inflight cleanup timeout")
+        .expect("inflight join");
+    assert!(matches!(inflight, Err(IpcError::Unavailable)));
+    drop(connection);
+    drop(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnected_client_does_not_interrupt_other_connection() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let db_path = root.path().join("kernel.sqlite3");
+    let profile = unique_profile("cq");
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let client_a = protocol_client_id(0x8c);
+    let client_b = protocol_client_id(0x8d);
+    let (bound_tx, bound_rx) = oneshot::channel::<()>();
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id: Uuid::now_v7(),
+            server_build: "devmanager-host/0.4.2".into(),
+            supported: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let host = tokio::spawn(async move {
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start(bus);
+        let _ = bound_tx.send(());
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut accept = Box::pin(listener.accept_with_successor());
+        // A failed connection owns only its own reader/writer pair. The second
+        // connection continues through the same host executor.
+        for _ in 0..2 {
+            let (accepted, next) = accept.await.expect("preserve listener");
+            accept = Box::pin(next.accept_with_successor());
+            let connection = accepted.expect("handshake");
+            let handle = requests.clone();
+            tasks.spawn(async move {
+                let _ = connection.serve_duplex(handle).await;
+            });
+        }
+        // Keep serving until both connection tasks finish or outer timeout cancels.
+        while tasks.join_next().await.is_some() {}
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    });
+
+    timeout(OUTER_TIMEOUT, bound_rx)
+        .await
+        .expect("bound timeout")
+        .expect("bound");
+
+    // Client A completes Hello and then disappears without a request. Its host
+    // reader reaches EOF, supervision drains that connection's writer, and the
+    // shared executor remains available to client B.
+    let hello_a = ClientHello::new(
+        "devmanager/0.4.2",
+        client_a,
+        fingerprint,
+        CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+        FrameLimits::v1_default(),
+    )
+    .expect("hello a");
+    let disconnected = connect(&endpoint, &hello_a).await.expect("connect a");
+    drop(disconnected);
+
+    let healthy = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            let hello = ClientHello::new(
+                "devmanager/0.4.2",
+                client_b,
+                fingerprint,
+                CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+                FrameLimits::v1_default(),
+            )
+            .expect("hello b");
+            let connection = connect(&endpoint, &hello).await.expect("connect b");
+            let task = TaskId::from_bytes(fixed_uuid_v7(0xa0)).expect("task");
+            let command_id = CommandId::from_bytes(fixed_uuid_v7(0xa1)).expect("command");
+            let receipt = connection
+                .execute_command(CommandEnvelope {
+                    command_id,
+                    client_id: client_b,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_100,
+                    expected_task_revision: None,
+                    command: Command::CreateTask(create_intent(task, "healthy")),
+                })
+                .await
+                .expect("healthy client must still execute");
+            assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+        }
+    });
+
+    timeout(OUTER_TIMEOUT, healthy)
+        .await
+        .expect("healthy timeout")
+        .expect("healthy join");
+    timeout(Duration::from_secs(5), host)
+        .await
+        .expect("host cleanup timeout")
+        .expect("host join");
     drop(root);
 }

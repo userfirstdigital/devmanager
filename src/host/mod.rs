@@ -10,7 +10,8 @@ mod lock;
 pub use connection::{HostRequestExecutor, HostRequestHandle, HOST_REQUEST_QUEUE_CAPACITY};
 pub(crate) use ipc::{
     codecs_for_limits, handshake_codecs, handshake_timeout, read_physical_frame,
-    request_completion_timeout, write_physical_frame,
+    read_physical_frame_idle_then_deadline, request_completion_timeout, supervise_duplex_halves,
+    write_physical_frame, write_physical_frame_with_deadline,
 };
 pub use ipc::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,

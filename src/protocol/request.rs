@@ -5,6 +5,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
+use crate::domain::event::DomainEvent;
+use crate::domain::id::SubscriptionId;
 use crate::domain::query::{QueryEnvelope, QueryReply};
 
 /// One client-initiated request on an authenticated connection.
@@ -101,14 +103,59 @@ impl<'de> Deserialize<'de> for ClientRequest {
     }
 }
 
-/// One host response to a [`ClientRequest`].
+/// One host-originated message on an authenticated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerResponse {
+pub enum ServerMessage {
     CommandReceipt(CommandReceipt),
     QueryReply(QueryReply),
+    DurableEvent {
+        subscription_id: SubscriptionId,
+        event: DomainEvent,
+    },
+    ResyncRequired {
+        subscription_id: SubscriptionId,
+        last_delivered_sequence: u64,
+        newest_sequence: u64,
+    },
 }
 
-impl Serialize for ServerResponse {
+struct DurableEventPayloadRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    event: &'a DomainEvent,
+}
+
+impl Serialize for DurableEventPayloadRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("event", self.event)?;
+        map.end()
+    }
+}
+
+struct ResyncRequiredPayloadRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    last_delivered_sequence: u64,
+    newest_sequence: u64,
+}
+
+impl Serialize for ResyncRequiredPayloadRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("last_delivered_sequence", &self.last_delivered_sequence)?;
+        map.serialize_entry("newest_sequence", &self.newest_sequence)?;
+        map.end()
+    }
+}
+
+impl Serialize for ServerMessage {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -117,17 +164,41 @@ impl Serialize for ServerResponse {
         match self {
             Self::CommandReceipt(receipt) => map.serialize_entry("command_receipt", receipt)?,
             Self::QueryReply(reply) => map.serialize_entry("query_reply", reply)?,
+            Self::DurableEvent {
+                subscription_id,
+                event,
+            } => map.serialize_entry(
+                "durable_event",
+                &DurableEventPayloadRef {
+                    subscription_id,
+                    event,
+                },
+            )?,
+            Self::ResyncRequired {
+                subscription_id,
+                last_delivered_sequence,
+                newest_sequence,
+            } => map.serialize_entry(
+                "resync_required",
+                &ResyncRequiredPayloadRef {
+                    subscription_id,
+                    last_delivered_sequence: *last_delivered_sequence,
+                    newest_sequence: *newest_sequence,
+                },
+            )?,
         }
         map.end()
     }
 }
 
-enum ServerResponseVariant {
+enum ServerMessageVariant {
     CommandReceipt,
     QueryReply,
+    DurableEvent,
+    ResyncRequired,
 }
 
-impl<'de> Deserialize<'de> for ServerResponseVariant {
+impl<'de> Deserialize<'de> for ServerMessageVariant {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -135,10 +206,11 @@ impl<'de> Deserialize<'de> for ServerResponseVariant {
         struct VariantVisitor;
 
         impl Visitor<'_> for VariantVisitor {
-            type Value = ServerResponseVariant;
+            type Value = ServerMessageVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("command_receipt or query_reply")
+                formatter
+                    .write_str("command_receipt, query_reply, durable_event, or resync_required")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -146,11 +218,18 @@ impl<'de> Deserialize<'de> for ServerResponseVariant {
                 E: de::Error,
             {
                 match value {
-                    "command_receipt" => Ok(ServerResponseVariant::CommandReceipt),
-                    "query_reply" => Ok(ServerResponseVariant::QueryReply),
+                    "command_receipt" => Ok(ServerMessageVariant::CommandReceipt),
+                    "query_reply" => Ok(ServerMessageVariant::QueryReply),
+                    "durable_event" => Ok(ServerMessageVariant::DurableEvent),
+                    "resync_required" => Ok(ServerMessageVariant::ResyncRequired),
                     _ => Err(de::Error::unknown_variant(
                         value,
-                        &["command_receipt", "query_reply"],
+                        &[
+                            "command_receipt",
+                            "query_reply",
+                            "durable_event",
+                            "resync_required",
+                        ],
                     )),
                 }
             }
@@ -160,18 +239,217 @@ impl<'de> Deserialize<'de> for ServerResponseVariant {
     }
 }
 
-impl<'de> Deserialize<'de> for ServerResponse {
+enum DurableEventField {
+    SubscriptionId,
+    Event,
+}
+
+impl<'de> Deserialize<'de> for DurableEventField {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct ServerResponseVisitor;
+        struct FieldVisitor;
 
-        impl<'de> Visitor<'de> for ServerResponseVisitor {
-            type Value = ServerResponse;
+        impl Visitor<'_> for FieldVisitor {
+            type Value = DurableEventField;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a one-entry named ServerResponse map")
+                formatter.write_str("subscription_id or event")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(DurableEventField::SubscriptionId),
+                    "event" => Ok(DurableEventField::Event),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["subscription_id", "event"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct DurableEventPayload {
+    subscription_id: SubscriptionId,
+    event: DomainEvent,
+}
+
+impl<'de> Deserialize<'de> for DurableEventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = DurableEventPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named durable_event payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut event = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        DurableEventField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        DurableEventField::Event => {
+                            if event.is_some() {
+                                return Err(de::Error::duplicate_field("event"));
+                            }
+                            event = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(DurableEventPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    event: event.ok_or_else(|| de::Error::missing_field("event"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+enum ResyncRequiredField {
+    SubscriptionId,
+    LastDeliveredSequence,
+    NewestSequence,
+}
+
+impl<'de> Deserialize<'de> for ResyncRequiredField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ResyncRequiredField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id, last_delivered_sequence, or newest_sequence")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ResyncRequiredField::SubscriptionId),
+                    "last_delivered_sequence" => Ok(ResyncRequiredField::LastDeliveredSequence),
+                    "newest_sequence" => Ok(ResyncRequiredField::NewestSequence),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &[
+                            "subscription_id",
+                            "last_delivered_sequence",
+                            "newest_sequence",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct ResyncRequiredPayload {
+    subscription_id: SubscriptionId,
+    last_delivered_sequence: u64,
+    newest_sequence: u64,
+}
+
+impl<'de> Deserialize<'de> for ResyncRequiredPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ResyncRequiredPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named resync_required payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut last_delivered_sequence = None;
+                let mut newest_sequence = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ResyncRequiredField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        ResyncRequiredField::LastDeliveredSequence => {
+                            if last_delivered_sequence.is_some() {
+                                return Err(de::Error::duplicate_field("last_delivered_sequence"));
+                            }
+                            last_delivered_sequence = Some(map.next_value()?);
+                        }
+                        ResyncRequiredField::NewestSequence => {
+                            if newest_sequence.is_some() {
+                                return Err(de::Error::duplicate_field("newest_sequence"));
+                            }
+                            newest_sequence = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ResyncRequiredPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    last_delivered_sequence: last_delivered_sequence
+                        .ok_or_else(|| de::Error::missing_field("last_delivered_sequence"))?,
+                    newest_sequence: newest_sequence
+                        .ok_or_else(|| de::Error::missing_field("newest_sequence"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ServerMessageVisitor;
+
+        impl<'de> Visitor<'de> for ServerMessageVisitor {
+            type Value = ServerMessage;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a one-entry named ServerMessage map")
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -180,24 +458,39 @@ impl<'de> Deserialize<'de> for ServerResponse {
             {
                 let variant = map
                     .next_key()?
-                    .ok_or_else(|| de::Error::custom("ServerResponse variant is missing"))?;
-                let response = match variant {
-                    ServerResponseVariant::CommandReceipt => {
-                        ServerResponse::CommandReceipt(map.next_value()?)
+                    .ok_or_else(|| de::Error::custom("ServerMessage variant is missing"))?;
+                let message = match variant {
+                    ServerMessageVariant::CommandReceipt => {
+                        ServerMessage::CommandReceipt(map.next_value()?)
                     }
-                    ServerResponseVariant::QueryReply => {
-                        ServerResponse::QueryReply(map.next_value()?)
+                    ServerMessageVariant::QueryReply => {
+                        ServerMessage::QueryReply(map.next_value()?)
+                    }
+                    ServerMessageVariant::DurableEvent => {
+                        let payload: DurableEventPayload = map.next_value()?;
+                        ServerMessage::DurableEvent {
+                            subscription_id: payload.subscription_id,
+                            event: payload.event,
+                        }
+                    }
+                    ServerMessageVariant::ResyncRequired => {
+                        let payload: ResyncRequiredPayload = map.next_value()?;
+                        ServerMessage::ResyncRequired {
+                            subscription_id: payload.subscription_id,
+                            last_delivered_sequence: payload.last_delivered_sequence,
+                            newest_sequence: payload.newest_sequence,
+                        }
                     }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
-                        "ServerResponse must contain exactly one variant",
+                        "ServerMessage must contain exactly one variant",
                     ));
                 }
-                Ok(response)
+                Ok(message)
             }
         }
 
-        deserializer.deserialize_map(ServerResponseVisitor)
+        deserializer.deserialize_map(ServerMessageVisitor)
     }
 }

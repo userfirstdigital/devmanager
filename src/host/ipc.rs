@@ -1,11 +1,16 @@
 //! Profile-scoped named-pipe ClientHello/ServerHello handshake transport.
 //!
-//! After Hello, each connection serves synchronous ClientRequest/ServerResponse
-//! frames. Concurrent connections submit decoded requests to the single
-//! host-owned CommandBus executor; transport tasks never touch the bus.
-//! Snapshots, subscriptions, and fan-out live later.
+//! After Hello, each production connection owns one reader half and one writer
+//! half. The reader decodes ClientRequest frames and submits them to the
+//! host-owned CommandBus executor; the writer owns all post-Hello ServerMessage
+//! writes through a bounded critical output channel. Snapshots, subscriptions,
+//! and fan-out live later.
 
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use uuid::Uuid;
 
@@ -16,6 +21,7 @@ use crate::protocol::{
     Capability, CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits,
     MessagePackCodec, MessagePackError, NegotiatedParameters, PhysicalFrameCodec,
     PhysicalFrameError, ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
+    ServerMessage,
 };
 
 use super::connection::{dispatch_authenticated_request, HostRequestHandle};
@@ -23,11 +29,49 @@ use super::connection::{dispatch_authenticated_request, HostRequestHandle};
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded post-Hello host→client critical output queue capacity.
+const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
 // SnapshotPage/EventPage encoded_bytes cover the page body, not the surrounding
-// QueryResult/QueryReply/ServerResponse named maps. Protocol v1 sends that
+// QueryResult/QueryReply/ServerMessage named maps. Protocol v1 sends that
 // wrapped response in one physical frame, so reserve bounded headroom for the
 // fixed correlation/envelope fields before granting PagedSnapshots or EventReplay.
 const PAGE_RESPONSE_ENVELOPE_HEADROOM_BYTES: u32 = 1024;
+
+#[derive(Clone)]
+struct CriticalAdmission {
+    slots: Arc<Semaphore>,
+}
+
+impl CriticalAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(capacity.max(1))),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, IpcError> {
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| IpcError::Unavailable)
+    }
+}
+
+pub(crate) async fn supervise_duplex_halves<R, W>(reader: R, writer: W) -> Result<(), IpcError>
+where
+    R: Future<Output = Result<(), IpcError>>,
+    W: Future<Output = Result<(), IpcError>>,
+{
+    tokio::pin!(reader);
+    tokio::pin!(writer);
+    tokio::select! {
+        result = &mut reader => result,
+        result = &mut writer => match result {
+            Ok(()) => Err(IpcError::Unavailable),
+            Err(error) => Err(error),
+        },
+    }
+}
 
 /// Exact protected two-ACE SDDL form: LocalSystem + one caller-supplied user SID.
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
@@ -68,6 +112,7 @@ pub enum IpcError {
     Unauthorized,
     UnexpectedResponse,
     CorrelationMismatch,
+    DuplicateInFlight,
     ConnectionPoisoned,
     Busy,
     Unavailable,
@@ -102,6 +147,9 @@ impl std::fmt::Display for IpcError {
             Self::CorrelationMismatch => {
                 write!(f, "response correlation id did not match the request")
             }
+            Self::DuplicateInFlight => {
+                write!(f, "duplicate in-flight command or request id")
+            }
             Self::ConnectionPoisoned => {
                 write!(
                     f,
@@ -132,6 +180,7 @@ impl std::error::Error for IpcError {
             | Self::Unauthorized
             | Self::UnexpectedResponse
             | Self::CorrelationMismatch
+            | Self::DuplicateInFlight
             | Self::ConnectionPoisoned
             | Self::Busy
             | Self::Unavailable
@@ -288,7 +337,7 @@ impl HelloListener {
     }
 }
 
-/// Host-side authenticated pipe after Hello, serving one request at a time.
+/// Host-side authenticated pipe after Hello.
 pub struct HostConnection {
     client_id: ClientId,
     negotiated: NegotiatedParameters,
@@ -329,7 +378,7 @@ impl HostConnection {
     ///
     /// Exclusive compatibility path used by ipc_protocol tests: dispatches
     /// directly against a caller-owned [`CommandBus`]. Concurrent host serving
-    /// uses [`Self::serve_request_on_executor`] instead.
+    /// uses [`Self::serve_duplex`] instead.
     pub async fn serve_request(&mut self, bus: &mut CommandBus) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
         #[cfg(windows)]
@@ -362,6 +411,49 @@ impl HostConnection {
         {
             let _ = requests;
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
+        }
+    }
+
+    /// Read one authenticated client request (scripted-host / test helper).
+    pub async fn read_request(&mut self) -> Result<ClientRequest, IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            let result = windows_read_request(self).await;
+            connection_fail_closed(&mut self.poisoned, result)
+        }
+        #[cfg(not(windows))]
+        {
+            connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
+        }
+    }
+
+    /// Write one server message (scripted-host / test helper).
+    pub async fn write_message(&mut self, message: &ServerMessage) -> Result<(), IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            let result = windows_write_message(self, message).await;
+            connection_fail_closed(&mut self.poisoned, result)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = message;
+            connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
+        }
+    }
+
+    /// Production duplex serve: one reader owner, one writer owner, until disconnect.
+    pub async fn serve_duplex(self, requests: HostRequestHandle) -> Result<(), IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            windows_serve_duplex(self, requests, HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = requests;
+            Err(IpcError::Unsupported)
         }
     }
 }
@@ -526,6 +618,115 @@ async fn windows_serve_request_on_executor(
     .map_err(|_| IpcError::Timeout)?
 }
 
+#[cfg(windows)]
+async fn windows_read_request(connection: &mut HostConnection) -> Result<ClientRequest, IpcError> {
+    let first = read_first_request_byte_idle(&mut connection.pipe).await?;
+    tokio::time::timeout(REQUEST_COMPLETION_TIMEOUT, async {
+        let payload =
+            read_physical_frame_after_first_byte(&mut connection.pipe, &connection.physical, first)
+                .await?;
+        connection
+            .message
+            .decode::<ClientRequest>(&payload)
+            .map_err(IpcError::MessagePack)
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)?
+}
+
+#[cfg(windows)]
+async fn windows_write_message(
+    connection: &mut HostConnection,
+    message: &ServerMessage,
+) -> Result<(), IpcError> {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::timeout(REQUEST_COMPLETION_TIMEOUT, async {
+        let encoded = connection
+            .message
+            .encode(message)
+            .map_err(IpcError::MessagePack)?;
+        write_physical_frame(&mut connection.pipe, &connection.physical, &encoded).await?;
+        connection.pipe.flush().await.map_err(IpcError::Io)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)?
+}
+
+#[cfg(windows)]
+async fn windows_serve_duplex(
+    connection: HostConnection,
+    requests: HostRequestHandle,
+    critical_capacity: usize,
+) -> Result<(), IpcError> {
+    use tokio::sync::mpsc;
+
+    struct CriticalOutbound {
+        message: ServerMessage,
+        _permit: OwnedSemaphorePermit,
+    }
+
+    let HostConnection {
+        negotiated,
+        physical,
+        message,
+        pipe,
+        ..
+    } = connection;
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    // Semaphore slots are held from enqueue until the pipe write completes so a
+    // blocked writer still counts against critical capacity.
+    let critical_admission = CriticalAdmission::new(critical_capacity);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<CriticalOutbound>();
+
+    let writer = async move {
+        while let Some(outbound) = out_rx.recv().await {
+            let encoded = message
+                .encode(&outbound.message)
+                .map_err(IpcError::MessagePack)?;
+            write_physical_frame_with_deadline(
+                &mut writer,
+                &physical,
+                &encoded,
+                REQUEST_COMPLETION_TIMEOUT,
+            )
+            .await?;
+            drop(outbound._permit);
+        }
+        Err::<(), IpcError>(IpcError::Unavailable)
+    };
+
+    // Reader and writer must observe each other: a writer failure while the
+    // reader is idle on the first request byte must tear down the connection
+    // rather than leave a half-open pipe orphaned.
+    let reader = async move {
+        loop {
+            let payload = read_physical_frame_idle_then_deadline(
+                &mut reader,
+                &physical,
+                REQUEST_COMPLETION_TIMEOUT,
+            )
+            .await?;
+            let request = message
+                .decode::<ClientRequest>(&payload)
+                .map_err(IpcError::MessagePack)?;
+            let response = requests.execute(negotiated, request).await?;
+            // Critical traffic must not block the executor/other clients: if the
+            // client is not draining, fail closed for this connection only.
+            let permit = critical_admission.try_acquire()?;
+            out_tx
+                .send(CriticalOutbound {
+                    message: response,
+                    _permit: permit,
+                })
+                .map_err(|_| IpcError::Unavailable)?;
+        }
+    };
+
+    supervise_duplex_halves(reader, writer).await
+}
+
 fn connection_ensure_live(poisoned: bool) -> Result<(), IpcError> {
     if poisoned {
         Err(IpcError::ConnectionPoisoned)
@@ -572,10 +773,8 @@ where
     Ok(first[0])
 }
 
-/// After the first byte is observed, finish one physical frame under `completion`.
-/// Production uses the same idle-first-byte + completion split with a longer body;
-/// this helper exists so unit tests can inject a short deadline.
-#[cfg(test)]
+/// Wait indefinitely for a frame's first byte, then require the remaining frame
+/// to complete within `completion`.
 pub(crate) async fn read_physical_frame_idle_then_deadline<R>(
     reader: &mut R,
     codec: &PhysicalFrameCodec,
@@ -659,6 +858,24 @@ where
         }
     })?;
     Ok(())
+}
+
+pub(crate) async fn write_physical_frame_with_deadline<W>(
+    writer: &mut W,
+    codec: &PhysicalFrameCodec,
+    payload: &[u8],
+    completion: Duration,
+) -> Result<(), IpcError>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    tokio::time::timeout(completion, async {
+        write_physical_frame(writer, codec, payload).await?;
+        writer.flush().await.map_err(IpcError::Io)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)?
 }
 
 pub(crate) fn handshake_timeout() -> Duration {
@@ -782,7 +999,8 @@ mod tests {
 
     use super::{
         connection_ensure_live, connection_fail_closed, protected_pipe_sddl,
-        read_physical_frame_idle_then_deadline, IpcError,
+        read_physical_frame_idle_then_deadline, supervise_duplex_halves,
+        write_physical_frame_with_deadline, CriticalAdmission, IpcError,
     };
     use crate::protocol::{FrameLimits, PhysicalFrameCodec};
 
@@ -891,6 +1109,111 @@ mod tests {
         assert!(
             matches!(result, Err(IpcError::Timeout)),
             "partial header after first byte must fail under the injected completion deadline, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn critical_admission_rejects_without_waiting_and_releases_on_drop() {
+        let admission = CriticalAdmission::new(1);
+        let first = admission.try_acquire().expect("first critical slot");
+        assert!(matches!(
+            admission.try_acquire(),
+            Err(IpcError::Unavailable)
+        ));
+        drop(first);
+        assert!(admission.try_acquire().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplex_supervision_drains_idle_sibling_after_writer_failure() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_signal = DropSignal(Some(dropped_tx));
+        let reader = async move {
+            let _signal = reader_signal;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), IpcError>(())
+        };
+        let writer = async { Err::<(), IpcError>(IpcError::Unauthorized) };
+
+        let result = supervise_duplex_halves(reader, writer).await;
+        assert!(matches!(result, Err(IpcError::Unauthorized)));
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("idle sibling must be drained before supervision returns")
+            .expect("drop signal");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_duplex_supervisor_drops_both_owned_halves() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
+        let (writer_dropped_tx, writer_dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_signal = DropSignal(Some(reader_dropped_tx));
+        let writer_signal = DropSignal(Some(writer_dropped_tx));
+        let reader = async move {
+            let _signal = reader_signal;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), IpcError>(())
+        };
+        let writer = async move {
+            let _signal = writer_signal;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), IpcError>(())
+        };
+
+        let supervisor = tokio::spawn(supervise_duplex_halves(reader, writer));
+        started_rx.await.expect("supervisor started");
+        supervisor.abort();
+        let joined = supervisor.await;
+        assert!(joined.is_err_and(|error| error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(1), reader_dropped_rx)
+            .await
+            .expect("reader half drop timeout")
+            .expect("reader half drop signal");
+        tokio::time::timeout(Duration::from_secs(1), writer_dropped_rx)
+            .await
+            .expect("writer half drop timeout")
+            .expect("writer half drop signal");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_hello_write_has_a_completion_deadline() {
+        let codec = PhysicalFrameCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+        let (mut writer, _unread_peer) = tokio::io::duplex(8);
+        let result = write_physical_frame_with_deadline(
+            &mut writer,
+            &codec,
+            &[0x5a; 64],
+            Duration::from_millis(40),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IpcError::Timeout)),
+            "blocked post-Hello write must time out, got {result:?}"
         );
     }
 }

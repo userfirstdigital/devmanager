@@ -20,4 +20,4 @@ pub use frame::{
     FrameLimitField, FrameLimits, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError,
     MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
-pub use request::{ClientRequest, ServerResponse};
+pub use request::{ClientRequest, ServerMessage};

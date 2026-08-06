@@ -22,7 +22,7 @@ use crate::domain::ClientId;
 use crate::kernel::{
     CommandBus, EventReplaySession, ReplayError, SnapshotError, SnapshotSession, StoreError,
 };
-use crate::protocol::{Capability, ClientRequest, NegotiatedParameters, ServerResponse};
+use crate::protocol::{Capability, ClientRequest, NegotiatedParameters, ServerMessage};
 
 use super::ipc::IpcError;
 
@@ -43,7 +43,7 @@ const EVENT_REPLAY_REAPER_PERIOD: Duration = Duration::from_secs(1);
 struct HostRequestJob {
     negotiated: NegotiatedParameters,
     request: ClientRequest,
-    reply: oneshot::Sender<Result<ServerResponse, IpcError>>,
+    reply: oneshot::Sender<Result<ServerMessage, IpcError>>,
 }
 
 struct SnapshotRegistryEntry {
@@ -239,7 +239,7 @@ impl HostRequestHandle {
         &self,
         negotiated: NegotiatedParameters,
         request: ClientRequest,
-    ) -> Result<ServerResponse, IpcError> {
+    ) -> Result<ServerMessage, IpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HostRequestJob {
@@ -308,21 +308,21 @@ impl HostRequestExecutor {
         &mut self,
         negotiated: NegotiatedParameters,
         request: ClientRequest,
-    ) -> Result<ServerResponse, IpcError> {
+    ) -> Result<ServerMessage, IpcError> {
         match request {
             ClientRequest::Command(envelope) => {
                 if envelope.client_id != negotiated.client_id {
                     return Err(IpcError::Unauthorized);
                 }
                 let receipt = self.bus.execute(envelope).map_err(map_store_error)?;
-                Ok(ServerResponse::CommandReceipt(receipt))
+                Ok(ServerMessage::CommandReceipt(receipt))
             }
             ClientRequest::Query(envelope) => {
                 if envelope.client_id != negotiated.client_id {
                     return Err(IpcError::Unauthorized);
                 }
                 let reply = self.dispatch_query(negotiated, envelope)?;
-                Ok(ServerResponse::QueryReply(reply))
+                Ok(ServerMessage::QueryReply(reply))
             }
         }
     }
@@ -686,14 +686,14 @@ pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     bus: &mut CommandBus,
     request: ClientRequest,
-) -> Result<ServerResponse, IpcError> {
+) -> Result<ServerMessage, IpcError> {
     match request {
         ClientRequest::Command(envelope) => {
             if envelope.client_id != authenticated_client_id {
                 return Err(IpcError::Unauthorized);
             }
             let receipt = bus.execute(envelope).map_err(map_store_error)?;
-            Ok(ServerResponse::CommandReceipt(receipt))
+            Ok(ServerMessage::CommandReceipt(receipt))
         }
         ClientRequest::Query(envelope) => {
             if envelope.client_id != authenticated_client_id {
@@ -705,7 +705,7 @@ pub(crate) fn dispatch_authenticated_request(
                 | Query::OpenEventReplay { .. }
                 | Query::ContinueEventReplay { .. }
                 | Query::ReleaseEventReplay { .. } => {
-                    return Ok(ServerResponse::QueryReply(QueryReply {
+                    return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                     }));
@@ -713,7 +713,7 @@ pub(crate) fn dispatch_authenticated_request(
                 Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }
             let reply = bus.query(envelope).map_err(map_store_error)?;
-            Ok(ServerResponse::QueryReply(reply))
+            Ok(ServerMessage::QueryReply(reply))
         }
     }
 }

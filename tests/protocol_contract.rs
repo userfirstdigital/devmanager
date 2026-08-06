@@ -4,9 +4,9 @@ use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
     CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
-    CreateTaskIntent, EnvironmentId, EventId, EventPage, OperationErrorCode, OperationId,
-    OperationState, OperationUncertaintyCode, ProjectId, Query, QueryEnvelope, QueryError,
-    QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness,
+    CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage, OperationErrorCode,
+    OperationId, OperationState, OperationUncertaintyCode, ProjectId, Query, QueryEnvelope,
+    QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness,
     SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskId,
     WorkspaceRef,
 };
@@ -14,7 +14,7 @@ use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
     FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError,
     MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint,
-    ProtocolVersion, ServerResponse, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
+    ProtocolVersion, ServerMessage, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
     MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -1984,23 +1984,23 @@ fn protocol_client_request_and_server_response_are_one_strict_named_variant() {
         );
     }
 
-    let receipt = ServerResponse::CommandReceipt(CommandReceipt::Accepted {
+    let receipt = ServerMessage::CommandReceipt(CommandReceipt::Accepted {
         command_id: protocol_command_id(0xb6),
         operation_id: protocol_operation_id(0xb7),
         task_revision: Some(1),
         event_ids: vec![protocol_event_id(0xb8)],
     });
-    let reply = ServerResponse::QueryReply(QueryReply {
+    let reply = ServerMessage::QueryReply(QueryReply {
         request_id: protocol_request_id(0xb9),
         outcome: QueryOutcome::Err(QueryError::NotFound),
     });
     for response in [&receipt, &reply] {
-        let encoded = codec.encode(response).expect("encode server response");
-        assert_eq!(encoded[0], 0x81, "ServerResponse is a one-entry map");
+        let encoded = codec.encode(response).expect("encode server message");
+        assert_eq!(encoded[0], 0x81, "ServerMessage is a one-entry map");
         assert_eq!(
             &codec
-                .decode::<ServerResponse>(&encoded)
-                .expect("decode server response"),
+                .decode::<ServerMessage>(&encoded)
+                .expect("decode server message"),
             response
         );
     }
@@ -2022,10 +2022,186 @@ fn protocol_client_request_and_server_response_are_one_strict_named_variant() {
         FutureResponse,
     }
     assert_eq!(
-        codec.decode::<ServerResponse>(
+        codec.decode::<ServerMessage>(
             &rmp_serde::to_vec_named(&RawUnknownResponse::FutureResponse).unwrap()
         ),
         Err(MessagePackError::Decode)
+    );
+}
+
+#[test]
+fn protocol_server_message_unsolicited_variants_are_strict_named_maps() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let event = DomainEvent {
+        id: protocol_event_id(0xd1),
+        task_id: Some(protocol_task_id(0xd2)),
+        sequence: 7,
+        task_revision: Some(3),
+        occurred_at_ms: 1_725_000_000_700,
+        payload: Event::TaskRenamed {
+            title: "Duplex event".into(),
+        },
+    };
+    let durable = ServerMessage::DurableEvent {
+        subscription_id: protocol_subscription_id(0xd3),
+        event: event.clone(),
+    };
+    let resync = ServerMessage::ResyncRequired {
+        subscription_id: protocol_subscription_id(0xd4),
+        last_delivered_sequence: 7,
+        newest_sequence: 12,
+    };
+
+    for message in [&durable, &resync] {
+        let encoded = codec.encode(message).expect("encode unsolicited");
+        assert_eq!(
+            encoded[0], 0x81,
+            "ServerMessage unsolicited is a one-entry map"
+        );
+        assert_eq!(
+            &codec
+                .decode::<ServerMessage>(&encoded)
+                .expect("decode unsolicited"),
+            message
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    struct OpenDurablePayload {
+        subscription_id: SubscriptionId,
+        event: DomainEvent,
+        future_field: bool,
+    }
+    struct OpenDurable {
+        event: DomainEvent,
+    }
+    impl serde::Serialize for OpenDurable {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "durable_event",
+                &OpenDurablePayload {
+                    subscription_id: protocol_subscription_id(0xd5),
+                    event: self.event.clone(),
+                    future_field: true,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(
+            &rmp_serde::to_vec_named(&OpenDurable {
+                event: event.clone()
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "durable_event must reject unknown payload fields"
+    );
+
+    #[derive(serde::Serialize)]
+    struct MissingResyncPayload {
+        subscription_id: SubscriptionId,
+        last_delivered_sequence: u64,
+    }
+    struct MissingResync;
+    impl serde::Serialize for MissingResync {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "resync_required",
+                &MissingResyncPayload {
+                    subscription_id: protocol_subscription_id(0xd6),
+                    last_delivered_sequence: 1,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(&rmp_serde::to_vec_named(&MissingResync).unwrap()),
+        Err(MessagePackError::Decode),
+        "resync_required must reject missing newest_sequence"
+    );
+
+    #[derive(serde::Serialize)]
+    struct PositionalDurable(SubscriptionId, DomainEvent);
+    struct PositionalDurableMessage {
+        event: DomainEvent,
+    }
+    impl serde::Serialize for PositionalDurableMessage {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "durable_event",
+                &PositionalDurable(protocol_subscription_id(0xd7), self.event.clone()),
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(
+            &rmp_serde::to_vec_named(&PositionalDurableMessage {
+                event: event.clone()
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "durable_event must reject positional payload forms"
+    );
+
+    #[derive(serde::Serialize)]
+    struct ExactDurablePayload {
+        subscription_id: SubscriptionId,
+        event: DomainEvent,
+    }
+    struct MultipleVariants {
+        event: DomainEvent,
+    }
+    impl serde::Serialize for MultipleVariants {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry(
+                "command_receipt",
+                &CommandReceipt::Rejected {
+                    command_id: protocol_command_id(0xd8),
+                    code: RejectionCode::NotFound,
+                    current_revision: None,
+                },
+            )?;
+            map.serialize_entry(
+                "durable_event",
+                &ExactDurablePayload {
+                    subscription_id: protocol_subscription_id(0xd9),
+                    event: self.event.clone(),
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(
+            &rmp_serde::to_vec_named(&MultipleVariants { event }).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "ServerMessage must reject multiple top-level variants"
     );
 }
 

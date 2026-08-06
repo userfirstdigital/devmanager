@@ -650,15 +650,9 @@ fn spawn_connection_task(
     requests: HostRequestHandle,
 ) {
     tasks.spawn(async move {
-        let mut connection = connection;
-        loop {
-            match connection.serve_request_on_executor(&requests).await {
-                Ok(()) => {}
-                // EOF, malformed input, timeout, and request errors poison only
-                // this connection task. Other clients and the accept loop continue.
-                Err(_) => break,
-            }
-        }
+        // Duplex serve owns reader+writer halves until disconnect; abort/drain
+        // of this JoinSet task reaps both halves with the connection lifecycle.
+        let _ = connection.serve_duplex(requests).await;
     });
 }
 

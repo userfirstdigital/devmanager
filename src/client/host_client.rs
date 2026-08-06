@@ -19,7 +19,7 @@ use crate::host::{
 use crate::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits, ServerHello};
 
 use super::action::task_show_query;
-use super::{connect, ClientConnection};
+use super::connection::{connect, ClientConnection};
 
 /// Caller-owned connection configuration. `client_id` is never rotated here.
 #[derive(Debug, Clone)]
@@ -141,11 +141,12 @@ impl HostClient {
             return Err(IpcError::Unauthorized);
         }
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection.execute_command(envelope).await
         };
         let receipt = match outcome {
             Ok(receipt) => receipt,
+            Err(IpcError::DuplicateInFlight) => return Err(IpcError::DuplicateInFlight),
             Err(error) => {
                 self.retire_connection();
                 return Err(error);
@@ -166,7 +167,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(task_show_query(request_id, client_id, task_id))
                 .await
@@ -212,7 +213,7 @@ impl HostClient {
         let client_id = self.config.client_id;
         let expected_snapshot_id = snapshot_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -272,7 +273,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -318,7 +319,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -371,7 +372,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -426,7 +427,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -476,7 +477,7 @@ impl HostClient {
         let request_id = RequestId::new();
         let client_id = self.config.client_id;
         let outcome = {
-            let connection = self.live_connection_mut()?;
+            let connection = self.live_connection()?;
             connection
                 .query(QueryEnvelope {
                     request_id,
@@ -515,8 +516,8 @@ impl HostClient {
         }
     }
 
-    fn live_connection_mut(&mut self) -> Result<&mut ClientConnection, IpcError> {
-        self.connection.as_mut().ok_or(IpcError::Unavailable)
+    fn live_connection(&self) -> Result<&ClientConnection, IpcError> {
+        self.connection.as_ref().ok_or(IpcError::Unavailable)
     }
 
     fn retire_connection(&mut self) {
@@ -658,7 +659,7 @@ async fn open_connection(
     )
     .map_err(IpcError::ClientHello)?;
     let connection = connect(endpoint, &hello).await?;
-    let server_hello = connection.server_hello().clone();
+    let server_hello = connection.server_hello();
     Ok((connection, server_hello))
 }
 
