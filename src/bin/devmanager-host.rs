@@ -14,8 +14,8 @@ use std::time::Duration;
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use devmanager::domain::ClientId;
 use devmanager::host::{
-    AcceptHelloConfig, HelloListener, HostConnection, HostLock, HostLockError, HostRequestExecutor,
-    HostRequestHandle, HOST_EXIT_ALREADY_RUNNING,
+    AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostLock, HostLockError,
+    HostRequestExecutor, HostRequestHandle, HostRestartDisposition, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -99,6 +99,11 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         let host_boot_id = host_lock.identity().boot_id;
         let bus = CommandBus::open(&paths.database)
             .map_err(|error| format!("failed to open host command bus: {error}"))?;
+        let Some(bus) = prepare_host_bus_before_bind(bus)? else {
+            // Ready settle or Closed: exclusive bus consumed; never construct the
+            // runtime or reach HelloListener::bind.
+            return Ok(());
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -113,6 +118,26 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         ))?;
         drop(host_lock);
         Ok(())
+    }
+}
+
+/// One-way pre-bind ownership gate: only ServeResume/ServeInspection may return
+/// the bus for runtime construction and HelloListener::bind.
+#[cfg(all(windows, debug_assertions))]
+fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus>, HostRunError> {
+    match HostCleanupWorker::restart_disposition(&bus)
+        .map_err(|error| format!("failed to read host restart disposition: {error}"))?
+    {
+        HostRestartDisposition::ServeResume | HostRestartDisposition::ServeInspection { .. } => {
+            Ok(Some(bus))
+        }
+        HostRestartDisposition::ReadyToArmAndSettle { .. } => {
+            HostCleanupWorker::settle_success(&mut bus).map_err(|error| {
+                format!("failed to settle successful host cleanup before bind: {error}")
+            })?;
+            Ok(None)
+        }
+        HostRestartDisposition::Closed { .. } => Ok(None),
     }
 }
 

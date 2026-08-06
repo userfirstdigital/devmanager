@@ -44,6 +44,7 @@ use devmanager::domain::{
 };
 use devmanager::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, HostIdentity, IpcError,
+    HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
 use rusqlite::Connection;
@@ -110,6 +111,11 @@ impl ChildGuard {
     }
 
     fn exited_diagnostics(&mut self, status: ExitStatus) -> String {
+        let stderr = self.take_exited_stderr();
+        format!("{status}; stderr={stderr:?}")
+    }
+
+    fn take_exited_stderr(&mut self) -> String {
         let mut stderr = String::new();
         if let Some(mut pipe) = self
             .child
@@ -120,7 +126,7 @@ impl ChildGuard {
         {
             let _ = pipe.read_to_string(&mut stderr);
         }
-        format!("{status}; stderr={stderr:?}")
+        stderr
     }
 
     fn terminate_and_wait_bounded(&mut self, deadline: Duration) -> Result<ExitStatus, String> {
@@ -152,6 +158,12 @@ impl ChildGuard {
                 Err(error) => return Err(format!("wait exact host pid {pid}: {error}")),
             }
         }
+    }
+
+    /// Drop the OS process handle after exit so stale `host.lock` identity can
+    /// clear (Windows keeps the process object alive while any handle remains).
+    fn release_exited_process_handle(&mut self) {
+        let _ = self.child.take();
     }
 }
 
@@ -3503,4 +3515,325 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
         .expect("terminate exact ChildGuard");
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+fn count_events(path: &Path) -> i64 {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open sqlite read-only event count");
+    conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events")
+}
+
+fn count_operation_settled(path: &Path) -> i64 {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open sqlite read-only settled count");
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'operation.settled'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("count operation.settled")
+}
+
+fn read_latest_operation_settled_fact(
+    path: &Path,
+) -> (i64, devmanager::domain::event::OperationSettledFact) {
+    use devmanager::domain::event::OperationSettledFact;
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open sqlite read-only settled payload");
+    let (sequence, payload): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT sequence, payload FROM events
+             WHERE event_type = 'operation.settled'
+             ORDER BY sequence DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("latest operation.settled row");
+    let fact: OperationSettledFact = rmp_serde::from_slice(&payload).expect("decode settled fact");
+    (sequence, fact)
+}
+
+async fn wait_for_exit_before_pipe_accept(
+    host: &mut ChildGuard,
+    profile: &str,
+    overall_deadline: Instant,
+) -> ExitStatus {
+    let connect_config = HostClientConfig {
+        named_profile: profile.to_string(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7f)).expect("probe client"),
+        requested: CapabilitySet::from_capabilities([Capability::HostShutdown]),
+        limits: FrameLimits::v1_default(),
+    };
+    loop {
+        if let Some(status) = host.try_wait().expect("poll host for pre-bind exit") {
+            return status;
+        }
+        match timeout(
+            CONNECT_ATTEMPT_TIMEOUT.min(overall_deadline.saturating_duration_since(Instant::now())),
+            HostClient::connect(connect_config.clone()),
+        )
+        .await
+        {
+            Ok(Ok(_client)) => {
+                panic!("host accepted a pipe connection before pre-bind disposition exit");
+            }
+            Ok(Err(IpcError::Io(_) | IpcError::Unavailable | IpcError::Timeout)) | Err(_) => {}
+            Ok(Err(error)) => {
+                panic!("unexpected connect error while waiting for pre-bind exit: {error}")
+            }
+        }
+        assert!(
+            Instant::now() < overall_deadline,
+            "timed out waiting for pre-bind disposition exit"
+        );
+        sleep(POLL).await;
+    }
+}
+
+/// Retry only exact HostLock AlreadyRunning (exit 75) or known transient stale-prior
+/// verification diagnostics from HostLock after a killed child handle is released.
+fn is_retryable_host_lock_contention(status: ExitStatus, stderr: &str) -> bool {
+    if status.code() == Some(i32::from(HOST_EXIT_ALREADY_RUNNING)) {
+        return true;
+    }
+    stderr.contains("unable to verify creation ticks for prior host pid")
+        || stderr.contains("unable to verify executable path for prior host pid")
+}
+
+/// Spawn isolated hosts until one completes the real HostLock acquire → pre-bind
+/// disposition path successfully. Retries only narrow HostLock contention/stale-prior
+/// shapes after releasing each exited child handle. Never edits host.lock and never
+/// HostLock::acquire from the test process.
+async fn spawn_and_require_prebind_exit(config_base: &Path, profile: &str) {
+    let overall_deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        assert!(
+            Instant::now() < overall_deadline,
+            "timed out retrying real host relaunch for pre-bind disposition exit"
+        );
+        let mut host = ChildGuard::spawn(host_command(config_base, profile));
+        let status = wait_for_exit_before_pipe_accept(&mut host, profile, overall_deadline).await;
+        if status.success() {
+            assert!(host.try_wait().expect("pre-bind success poll").is_some());
+            host.release_exited_process_handle();
+            return;
+        }
+        let stderr = host.take_exited_stderr();
+        let diagnostics = format!("{status}; stderr={stderr:?}");
+        if !is_retryable_host_lock_contention(status, &stderr) {
+            panic!(
+                "non-retryable pre-bind host failure (disposition/settle/startup must fail closed): {diagnostics}"
+            );
+        }
+        host.release_exited_process_handle();
+        sleep(POLL).await;
+    }
+}
+
+/// Crash at all-success Accepted/Ready, then prove Ready settle and Closed no-op
+/// both exit successfully before HelloListener::bind / pipe accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_restart_settles_before_bind_then_closed_exits_without_event() {
+    use devmanager::domain::event::Event;
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+    use devmanager::kernel::CommandBus;
+
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x60)).expect("client");
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::HostShutdown,
+        Capability::PagedSnapshots,
+        Capability::EventReplay,
+    ]);
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+
+    let mut sub = ClientSubscription::new();
+    sub.synchronize(&mut client)
+        .await
+        .expect("pre-confirm synchronize");
+    assert_eq!(sub.state(), ClientSubscriptionState::Ready);
+
+    let inspection = client
+        .inspect_host_quit()
+        .await
+        .expect("inspect transport")
+        .expect("inspect query");
+    let confirm_command_id =
+        CommandId::from_bytes(fixed_uuid_v7(0x61)).expect("confirm command id");
+    let confirm = client
+        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
+        .await
+        .expect("confirm transport");
+    let operation_id = match &confirm {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision: None,
+            ..
+        } => *operation_id,
+        other => panic!("expected taskless Accepted, got {other:?}"),
+    };
+
+    let expected_order = HostCleanupBranch::ORDER;
+    let mut observed = Vec::new();
+    let mut branch_event_ids = Vec::new();
+    let mut final_branch_sequence = None;
+    let started = Instant::now();
+    while observed.len() < expected_order.len() {
+        if let Some(status) = host.try_wait().expect("poll host while waiting cleanup") {
+            let diagnostics = host.exited_diagnostics(status);
+            panic!("foreground host exited during cleanup journal: {diagnostics}");
+        }
+        let update = timeout(READY_TIMEOUT, sub.recv_and_apply(&client))
+            .await
+            .expect("live cleanup apply stayed bounded")
+            .expect("live cleanup apply");
+        match update {
+            SubscriptionUpdate::DurableEvent(event) => {
+                if let Event::HostCleanupBranchCompleted {
+                    operation_id: event_op,
+                    action_epoch,
+                    branch,
+                    outcome,
+                } = event.payload
+                {
+                    assert_eq!(event_op, operation_id);
+                    assert_eq!(action_epoch, 1);
+                    assert_eq!(outcome, HostCleanupBranchOutcome::succeeded());
+                    branch_event_ids.push(event.id);
+                    observed.push(branch);
+                    final_branch_sequence = Some(event.sequence);
+                }
+            }
+            other => panic!("unexpected subscription update while waiting cleanup: {other:?}"),
+        }
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "timed out waiting for four HostCleanupBranchCompleted events; observed={observed:?}"
+        );
+    }
+    assert_eq!(observed.as_slice(), &expected_order);
+    assert_eq!(branch_event_ids.len(), expected_order.len());
+    let final_branch_sequence =
+        final_branch_sequence.expect("fourth HostCleanupBranchCompleted sequence");
+
+    let status = client
+        .refresh_operation(operation_id)
+        .await
+        .expect("status transport")
+        .expect("status query");
+    assert_eq!(status, OperationState::Accepted);
+
+    client.disconnect();
+    let crash_status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate Ready host as crash boundary");
+    assert!(
+        !crash_status.success(),
+        "simulated crash termination should be non-success"
+    );
+    assert!(host.try_wait().expect("crash exit poll").is_some());
+    host.release_exited_process_handle();
+
+    let events_at_ready = count_events(&paths.database);
+    assert_eq!(
+        count_operation_settled(&paths.database),
+        0,
+        "Ready crash boundary must not yet have OperationSettled"
+    );
+    {
+        let bus = CommandBus::open(&paths.database).expect("open bus at Ready crash boundary");
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("ready disposition"),
+            HostRestartDisposition::ReadyToArmAndSettle {
+                operation_id,
+                action_epoch: 1,
+            }
+        );
+    }
+
+    // Ready relaunch: settle exactly once, exit before bind, release HostLock.
+    spawn_and_require_prebind_exit(config_base.path(), &profile).await;
+
+    assert_eq!(
+        count_events(&paths.database),
+        events_at_ready + 1,
+        "Ready relaunch must append exactly one durable event"
+    );
+    assert_eq!(count_operation_settled(&paths.database), 1);
+    let (settled_sequence, settled_fact) = read_latest_operation_settled_fact(&paths.database);
+    assert_eq!(settled_fact.operation_id, operation_id);
+    assert_eq!(settled_fact.command_id, confirm_command_id);
+    assert_eq!(settled_fact.action_epoch, Some(1));
+    assert_eq!(
+        settled_fact.result_event_ids, branch_event_ids,
+        "settled result_event_ids must equal the exact ordered cleanup branch event ids"
+    );
+    assert!(settled_fact.settled_at_ms > 0);
+    assert_eq!(
+        settled_sequence as u64,
+        final_branch_sequence + 1,
+        "OperationSettled must be the immediate successor of the fourth cleanup branch"
+    );
+
+    {
+        let bus = CommandBus::open(&paths.database).expect("open bus after settle");
+        assert_eq!(
+            bus.operation_status(operation_id)
+                .expect("operation status")
+                .expect("quit operation present"),
+            OperationState::Settled {
+                settled_at_ms: settled_fact.settled_at_ms,
+                result_event_ids: settled_fact.result_event_ids.clone(),
+            }
+        );
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("closed disposition"),
+            HostRestartDisposition::Closed {
+                operation_id,
+                action_epoch: 1,
+                settled_at_ms: settled_fact.settled_at_ms,
+            }
+        );
+    }
+
+    let events_after_settle = count_events(&paths.database);
+
+    // Closed relaunch: exit before bind with no additional event; lock free again.
+    spawn_and_require_prebind_exit(config_base.path(), &profile).await;
+
+    assert_eq!(
+        count_events(&paths.database),
+        events_after_settle,
+        "Closed relaunch must append no event"
+    );
+    assert_eq!(count_operation_settled(&paths.database), 1);
+    let (again_sequence, again_fact) = read_latest_operation_settled_fact(&paths.database);
+    assert_eq!(again_sequence, settled_sequence);
+    assert_eq!(again_fact, settled_fact);
+
+    // Second Closed pass proves the prior Closed exit released HostLock.
+    spawn_and_require_prebind_exit(config_base.path(), &profile).await;
+    assert_eq!(count_events(&paths.database), events_after_settle);
+    assert_eq!(count_operation_settled(&paths.database), 1);
 }
