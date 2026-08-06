@@ -17,8 +17,10 @@
 - Child membership comes from the Job Object, not a one-time parent-PID walk. Parent-PID enumeration may enrich labels but is not ownership truth.
 - A cached, cycle-safe Toolhelp snapshot and per-resource environment marker may enrich foreground-process labels and recover attribution through shells, following Herdr's Windows approach; neither may grant ownership, kill authority, or override Job membership.
 - Closing a terminal view or desktop client does not close its PTY. Closing a task or full quit invokes explicit supervisor teardown.
+- Live client detach/reattach, host/process restart, provider exact-resume, and optional terminal-history recovery are distinct states. A restart creates a new PTY generation and must never present pre-crash process state as still live; provider conversation identity remains governed by the Phase 4 correlated-session contract.
 - Once Task/host admission is `Closing`, no new root, PTY, input, service operation, or retry may enter that scope. Every completion is fenced by owner, action epoch, resource ID, generation, PID, and creation time.
 - One PTY read feeds one canonical grid. Semantic and raw views do not create extra readers or provider processes.
+- Keep `alacritty_terminal` as the canonical grid engine. Herdr's PTY actor and control-lease patterns are implementation references, not a dependency or terminal-engine migration; reconsider Ghostty VT only if the committed ANSI corpus demonstrates a material compatibility gap.
 - CPU shown by default is process-tree CPU divided by logical processor count and clamped to `0..=100`, matching Task Manager's whole-machine convention. Raw core-equivalent percent stays diagnostics-only.
 - Process enumeration, job queries, port probes, quota probes, and resource aggregation execute on scheduled workers outside terminal reads, input, layout, and paint.
 - Real executable names remain unchanged. Better Task Manager attribution comes from command-line labels and in-app process trees, not executable copying or spoofing.
@@ -137,7 +139,7 @@ impl TerminalService {
 }
 ```
 
-- [ ] **Step 1: Add failing tests** `terminal_survives_client_disconnect`, `one_pty_reader_feeds_canonical_grid`, `ansi_vt_corpus_matches_expected_grid`, `utf8_split_across_reads_is_preserved`, `wide_and_combining_cells_round_trip`, `cursor_modes_and_alternate_screen_round_trip`, `bracketed_paste_and_mouse_modes_round_trip`, `osc8_links_are_sanitized`, `osc52_requires_clipboard_policy`, `resize_is_serialized_with_output`, and `terminal_close_waits_for_job_zero`.
+- [ ] **Step 1: Add failing tests** `terminal_survives_client_disconnect`, `host_restart_never_reuses_live_pty_generation`, `provider_resume_identity_is_independent_of_pty_generation`, `one_pty_reader_feeds_canonical_grid`, `ansi_vt_corpus_matches_expected_grid`, `utf8_split_across_reads_is_preserved`, `wide_and_combining_cells_round_trip`, `cursor_modes_and_alternate_screen_round_trip`, `bracketed_paste_and_mouse_modes_round_trip`, `osc8_links_are_sanitized`, `osc52_requires_clipboard_policy`, `resize_is_serialized_with_output`, and `terminal_close_waits_for_job_zero`.
 - [ ] **Step 2: Run** `cargo test --test terminal_service -- --nocapture` and capture the red output.
 - [ ] **Step 3: Refactor `TerminalSession`** into host-only PTY handles, a single reader task, bounded input channel, and canonical alacritty grid. Remove GPUI window/entity ownership from the session core.
 - [ ] **Step 4: Route terminal launch through `ProcessSupervisor`** so PTY root and descendants share the Task-owned Job. Store only restart recipe/metadata durably; PTY handles and parser grids remain runtime state.
@@ -148,11 +150,11 @@ impl TerminalService {
 
 **Files:** `src/terminal/{protocol,replica,view}.rs`, `src/protocol/{capabilities,envelope}.rs`, `src/host/connection.rs`, `src/client/model.rs`, `tests/terminal_replication.rs`
 
-- [ ] **Step 1: Write failing tests** `snapshot_then_deltas_matches_host_grid`, `gap_requests_snapshot`, `slow_client_coalesces_to_snapshot`, `two_clients_have_independent_scroll_offsets`, `selection_and_search_are_client_local`, `bounded_scrollback_emits_truncation_marker`, `long_scrollback_memory_is_bounded`, and `resize_authority_uses_visible_primary_view`.
+- [ ] **Step 1: Write failing tests** `snapshot_then_deltas_matches_host_grid`, `gap_requests_snapshot`, `slow_client_coalesces_to_snapshot`, `two_clients_have_independent_scroll_offsets`, `selection_and_search_are_client_local`, `bounded_scrollback_emits_truncation_marker`, `long_scrollback_memory_is_bounded`, `authorized_devices_alternate_without_control_lease`, `watcher_input_is_rejected_by_permission`, `concurrent_resize_last_valid_view_sequence_wins`, and `disconnect_clears_resize_preference`.
 - [ ] **Step 2: Run** `cargo test --test terminal_replication -- --nocapture` and record the red result.
 - [ ] **Step 3: Define** `TerminalSnapshot { terminal_id, generation, sequence, size, cursor, modes, title, rows }` and compact `TerminalDelta` operations for changed rows, scroll, cursor, mode, title, and exit.
 - [ ] **Step 4: Implement `TerminalReplica`** in client space. It applies only contiguous deltas for matching generation; any gap/generation mismatch clears pending operations and requests a snapshot.
-- [ ] **Step 5: Keep scroll offset, selection, hover, search/find state, and copy mode per client.** Bound host scrollback by rows/bytes, surface an explicit truncation marker, and keep only PTY size shared; resolve competing visible sizes with an explicit active-view lease and debounce.
+- [ ] **Step 5: Keep scroll offset, selection, hover, search/find state, and copy mode per client.** Bound host scrollback by rows/bytes, surface an explicit truncation marker, and keep only PTY size shared. Track an ephemeral `TerminalViewPreference { terminal_id, terminal_generation, client_id, view_sequence, visible_size }` only to choose and debounce the latest valid visible resize; disconnect/revocation clears it. It grants no input authority, cannot block another authorized owner device or collaborator, and never becomes durable device ownership. Watchers remain read-only because of their capability grant, not because another client holds control.
 - [ ] **Step 6: Put deltas on the bulk lane**, coalesce dirty rows under pressure, and guarantee that receipts/approval events stay deliverable.
 - [ ] **Step 7: Run** replication tests including a 10 MB output fixture; commit as `feat(terminal): replicate canonical terminal state`.
 
@@ -162,7 +164,7 @@ impl TerminalService {
 
 - [ ] **Step 1: Write failing tests** for monotonically sequenced input, duplicate input retry, stale-focus rejection, sidebar mouse-down followed by terminal mouse-up, task switch while a choice prompt is visible, and IME/paste delivery after focus confirmation.
 - [ ] **Step 2: Run** `cargo test --test input_routing -- --nocapture` and retain the red result.
-- [ ] **Step 3: Define `InputEnvelope`** with `client_id`, `input_id`, `terminal_id`, `terminal_generation`, `focus_epoch`, and bytes. The host acknowledges accepted/duplicate/rejected input IDs.
+- [ ] **Step 3: Define `InputEnvelope`** with `client_id`, `input_id`, `terminal_id`, `terminal_generation`, `focus_epoch`, and bytes. The host permission-checks each mutation independently, deduplicates `input_id`, atomically assigns the next per-terminal accepted sequence, and acknowledges accepted/duplicate/rejected input. There is no client control lease: any authorized owner device or collaborator may submit the next input, while stale generation/focus or read-only grants are rejected without forwarding bytes to the PTY.
 - [ ] **Step 4: Increment `focus_epoch`** on task/view switch and require a completed click sequence inside the terminal content after activation before mouse-derived terminal input is eligible.
 - [ ] **Step 5: Consume the navigation click** at the sidebar/shell layer; clear hover/pressed terminal state on deactivate; reject queued input for an older focus epoch. Keyboard focus may be deliberately restored after activation without synthesizing Enter or mouse coordinates.
 - [ ] **Step 6: Preserve terminal protocol bytes exactly** for keyboard, paste, mouse reporting, and IME commit; semantic answer controls issue provider commands rather than fabricated terminal clicks.
