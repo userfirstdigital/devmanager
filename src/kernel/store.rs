@@ -231,6 +231,15 @@ impl KernelStore {
         })
     }
 
+    /// Explicit all-success host-cleanup settle (c8b post-arm path only).
+    pub(crate) fn settle_host_cleanup_success(
+        &mut self,
+    ) -> Result<(OperationId, u64, i64, Vec<EventId>), StoreError> {
+        self.with_immediate_transaction(|tx| {
+            command_bus::settle_host_cleanup_success_in_tx(tx, now_ms()?)
+        })
+    }
+
     /// Renew an active dispatch lease when the claim generation still matches.
     pub fn renew_dispatch_claim(
         &mut self,

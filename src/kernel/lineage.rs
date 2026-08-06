@@ -145,7 +145,7 @@ pub(crate) fn validate_side_effect_settled_against_derived(
     if matches!(kind, SettledLineageKind::HostAdmission) {
         return Err(mismatch(
             as_projection,
-            "host-admission settlement is not permitted until branch-aware settlement",
+            "host-admission settlement is not derived from a lifecycle result",
         ));
     }
     if fact.result_event_ids.len() != 1 || fact.result_event_ids[0] != derived_id {
@@ -218,7 +218,7 @@ pub(crate) fn validate_side_effect_settled_has_prior_derived(
     if matches!(kind, SettledLineageKind::HostAdmission) {
         return Err(mismatch(
             as_projection,
-            "host-admission settlement is not permitted until branch-aware settlement",
+            "host-admission settlement is not derived from a lifecycle result",
         ));
     }
     let Some((derived_id, derived, derived_revision, derived_occurred, derived_task)) = prior
@@ -363,6 +363,127 @@ pub(crate) fn validate_host_admission_cleanup_failed_lineage(
         return Err(mismatch(
             as_projection,
             "host-admission CleanupFailed must not predate the final cleanup branch timestamp",
+        ));
+    }
+    Ok(())
+}
+
+/// Host-admission `operation.settled` is valid only after a complete all-Succeeded
+/// four-branch cleanup journal. The settle fact must immediately follow the exact
+/// global TaskTeardowns `HostCleanupBranchCompleted` for the same operation/epoch;
+/// that predecessor event_id must be the fourth ordered `result_event_id`. Later
+/// unrelated durable events after the settle terminal remain allowed.
+pub(crate) fn validate_host_admission_settled_lineage(
+    fact: &OperationSettledFact,
+    settled_occurred_at_ms: i64,
+    prior: Option<(EventId, &Event, Option<u64>, i64, Option<TaskId>)>,
+    ordered_branch_event_ids: &[EventId],
+    journal: &[(HostCleanupBranch, HostCleanupBranchOutcome)],
+    journal_max_completed_at_ms: i64,
+    accepted_at_ms: i64,
+    expected_command_id: CommandId,
+    expected_operation_id: OperationId,
+    expected_action_epoch: u64,
+    as_projection: bool,
+) -> Result<(), StoreError> {
+    if settled_occurred_at_ms != fact.settled_at_ms {
+        return Err(mismatch(
+            as_projection,
+            "host-admission operation.settled occurred_at_ms must equal fact.settled_at_ms",
+        ));
+    }
+    if fact.command_id != expected_command_id
+        || fact.operation_id != expected_operation_id
+        || fact.action_epoch != Some(expected_action_epoch)
+        || fact.resource_id.is_some()
+        || fact.runtime_generation.is_some()
+        || !fact.source.is_dispatch()
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled fact must match accepted ConfirmHostQuit identity/fence",
+        ));
+    }
+    if journal.len() != HostCleanupBranch::ORDER.len() {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled requires a complete four-branch cleanup journal",
+        ));
+    }
+    for (idx, (branch, outcome)) in journal.iter().enumerate() {
+        if *branch != HostCleanupBranch::ORDER[idx] {
+            return Err(mismatch(
+                as_projection,
+                "host-admission OperationSettled journal must follow fixed branch ORDER",
+            ));
+        }
+        if !matches!(outcome, HostCleanupBranchOutcome::Succeeded) {
+            return Err(mismatch(
+                as_projection,
+                "host-admission OperationSettled requires every cleanup branch Succeeded",
+            ));
+        }
+    }
+    if ordered_branch_event_ids.len() != HostCleanupBranch::ORDER.len()
+        || fact.result_event_ids.as_slice() != ordered_branch_event_ids
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled result_event_ids must equal ORDER branch event ids",
+        ));
+    }
+    let Some((prior_id, prior_event, prior_revision, _prior_occurred, prior_task)) = prior else {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled must immediately follow the final cleanup branch event",
+        ));
+    };
+    if prior_task.is_some() || prior_revision.is_some() {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled prior cleanup event must be global-scoped",
+        ));
+    }
+    let Event::HostCleanupBranchCompleted {
+        operation_id: prior_operation_id,
+        action_epoch: prior_epoch,
+        branch: prior_branch,
+        outcome: prior_outcome,
+    } = prior_event
+    else {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled must immediately follow host.cleanup_branch_completed",
+        ));
+    };
+    if *prior_operation_id != expected_operation_id
+        || *prior_epoch != expected_action_epoch
+        || *prior_branch != HostCleanupBranch::TaskTeardowns
+        || !matches!(prior_outcome, HostCleanupBranchOutcome::Succeeded)
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled must immediately follow the TaskTeardowns branch event",
+        ));
+    }
+    let fourth = ordered_branch_event_ids.last().copied().ok_or_else(|| {
+        mismatch(
+            as_projection,
+            "host-admission OperationSettled requires four ordered branch event ids",
+        )
+    })?;
+    if prior_id != fourth || fact.result_event_ids.last().copied() != Some(fourth) {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled predecessor must be the fourth ordered result_event_id",
+        ));
+    }
+    if settled_occurred_at_ms < accepted_at_ms
+        || settled_occurred_at_ms < journal_max_completed_at_ms
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission OperationSettled must not predate acceptance or final branch completion",
         ));
     }
     Ok(())

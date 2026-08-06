@@ -20,5 +20,6 @@ pub use ipc::{
 };
 pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
 pub use shutdown::{
-    HostCleanupProgress, HostCleanupWorker, ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
+    HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,
+    ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
 };

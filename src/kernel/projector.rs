@@ -17,8 +17,8 @@ use crate::domain::task::{
 use crate::kernel::lineage::{
     classify_operation_settled_fact, classify_settled_lineage_fence, is_derived_lifecycle_result,
     reject_pure_non_settled_terminal, validate_host_admission_cleanup_failed_lineage,
-    validate_pure_settled_lineage, validate_side_effect_settled_has_prior_derived,
-    SettledLineageKind,
+    validate_host_admission_settled_lineage, validate_pure_settled_lineage,
+    validate_side_effect_settled_has_prior_derived, SettledLineageKind,
 };
 use crate::kernel::store::{
     decode_stored_event, u64_from_nonnegative_i64, u64_to_sqlite_i64, StoreError,
@@ -516,10 +516,58 @@ pub(crate) fn apply_event(
                 true,
             )?;
             if matches!(kind, SettledLineageKind::HostAdmission) {
-                return Err(StoreError::Projection(
-                    "host-admission settlement is not permitted until branch-aware settlement"
-                        .into(),
-                ));
+                if event.task_id.is_some() || event.task_revision.is_some() {
+                    return Err(StoreError::Projection(
+                        "host-admission operation.settled requires NULL task_id and task_revision"
+                            .into(),
+                    ));
+                }
+                if event.occurred_at_ms != fact.settled_at_ms {
+                    return Err(StoreError::Projection(
+                        "operation.settled envelope occurred_at_ms must equal fact.settled_at_ms"
+                            .into(),
+                    ));
+                }
+                let (journal, journal_max_completed_at_ms) =
+                    load_host_cleanup_journal_outcomes(tx, shadow, fact.operation_id)?;
+                let ordered_branch_event_ids =
+                    load_ordered_host_cleanup_branch_event_ids(tx, shadow, fact.operation_id)?;
+                let accepted_at_ms = load_operation_accepted_at_ms(tx, shadow, fact.operation_id)?;
+                let prior = load_prior_event_row(tx, event.sequence)?;
+                let prior_ref = prior
+                    .as_ref()
+                    .map(|(id, ev, rev, occurred, task)| (*id, ev, *rev, *occurred, *task));
+                validate_host_admission_settled_lineage(
+                    fact,
+                    event.occurred_at_ms,
+                    prior_ref,
+                    &ordered_branch_event_ids,
+                    &journal,
+                    journal_max_completed_at_ms,
+                    accepted_at_ms,
+                    fact.command_id,
+                    fact.operation_id,
+                    fact.action_epoch.ok_or(StoreError::Projection(
+                        "host-admission OperationSettled requires action_epoch".into(),
+                    ))?,
+                    true,
+                )?;
+                apply_operation_outcome(
+                    tx,
+                    shadow,
+                    event.task_id,
+                    fact.command_id,
+                    fact.operation_id.as_bytes(),
+                    fact.action_epoch,
+                    fact.resource_id,
+                    fact.runtime_generation,
+                    Some(&fact.source),
+                    "settled",
+                    Some(pack(&fact.result_event_ids)?),
+                    None,
+                    fact.settled_at_ms,
+                )?;
+                return Ok(());
             }
             if event.occurred_at_ms != fact.settled_at_ms {
                 return Err(StoreError::Projection(
@@ -556,6 +604,12 @@ pub(crate) fn apply_event(
                 true,
             )?;
             if matches!(kind, SettledLineageKind::HostAdmission) {
+                if event.task_id.is_some() || event.task_revision.is_some() {
+                    return Err(StoreError::Projection(
+                        "host-admission operation.failed requires NULL task_id and task_revision"
+                            .into(),
+                    ));
+                }
                 let (journal, journal_max_completed_at_ms) =
                     load_host_cleanup_journal_outcomes(tx, shadow, fact.operation_id)?;
                 let prior = load_prior_event_row(tx, event.sequence)?;
@@ -1666,6 +1720,90 @@ fn load_host_cleanup_journal_outcomes(
         return Ok((journal, 0));
     }
     Ok((journal, max_completed_at_ms))
+}
+
+fn load_ordered_host_cleanup_branch_event_ids(
+    tx: &Transaction<'_>,
+    _shadow: bool,
+    operation_id: crate::domain::id::OperationId,
+) -> Result<Vec<EventId>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT event_id, task_id, task_revision, schema_version, payload
+         FROM events
+         WHERE event_type = 'host.cleanup_branch_completed'
+         ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    })?;
+    // Preserve observed durable sequence order; do not rebuild from enum ORDER via HashMap.
+    let mut observed = Vec::with_capacity(HostCleanupBranch::ORDER.len());
+    for row in rows {
+        let (event_id_bytes, task_id, task_revision, schema_version, payload) = row?;
+        if task_id.is_some() || task_revision.is_some() {
+            return Err(StoreError::Projection(
+                "host.cleanup_branch_completed requires NULL task scope".into(),
+            ));
+        }
+        let event_id = EventId::from_bytes({
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&event_id_bytes);
+            bytes
+        })
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+        let decoded =
+            decode_stored_event("host.cleanup_branch_completed", schema_version, &payload)?;
+        let Event::HostCleanupBranchCompleted {
+            operation_id: fact_operation_id,
+            branch,
+            ..
+        } = decoded
+        else {
+            return Err(StoreError::Projection(
+                "host.cleanup_branch_completed decode mismatch".into(),
+            ));
+        };
+        if fact_operation_id != operation_id {
+            continue;
+        }
+        observed.push((branch, event_id));
+    }
+    if observed.len() != HostCleanupBranch::ORDER.len() {
+        return Err(StoreError::Projection(
+            "host-admission settlement requires all ORDER branch event ids".into(),
+        ));
+    }
+    let mut ordered = Vec::with_capacity(HostCleanupBranch::ORDER.len());
+    for (idx, (branch, event_id)) in observed.into_iter().enumerate() {
+        if branch != HostCleanupBranch::ORDER[idx] {
+            return Err(StoreError::Projection(
+                "host.cleanup_branch_completed durable sequence must match HostCleanupBranch::ORDER"
+                    .into(),
+            ));
+        }
+        ordered.push(event_id);
+    }
+    Ok(ordered)
+}
+
+fn load_operation_accepted_at_ms(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    operation_id: crate::domain::id::OperationId,
+) -> Result<i64, StoreError> {
+    let table = table_name("operations", shadow);
+    let accepted_at_ms: i64 = tx.query_row(
+        &format!("SELECT accepted_at_ms FROM {table} WHERE operation_id = ?1"),
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(accepted_at_ms)
 }
 
 fn require_valid_operation_fact(result: Result<(), OutcomeFenceError>) -> Result<(), StoreError> {

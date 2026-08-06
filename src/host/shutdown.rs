@@ -119,4 +119,87 @@ impl HostCleanupWorker {
             }),
         }
     }
+
+    /// Explicit all-success settle for c8b after physical exit is armed.
+    ///
+    /// Maintenance must never call this; exact retry is idempotent.
+    pub fn settle_success(
+        bus: &mut CommandBus,
+    ) -> Result<HostCleanupSuccessSettlement, StoreError> {
+        let (operation_id, action_epoch, settled_at_ms, result_event_ids) =
+            bus.settle_host_cleanup_success()?;
+        Ok(HostCleanupSuccessSettlement {
+            operation_id,
+            action_epoch,
+            settled_at_ms,
+            result_event_ids,
+        })
+    }
+
+    /// Read-only durable restart disposition for bind/serve decisions.
+    pub fn restart_disposition(bus: &CommandBus) -> Result<HostRestartDisposition, StoreError> {
+        Ok(match bus.host_restart_disposition()? {
+            crate::kernel::HostRestartDispositionUnit::ServeResume => {
+                HostRestartDisposition::ServeResume
+            }
+            crate::kernel::HostRestartDispositionUnit::ServeInspection {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
+            } => HostRestartDisposition::ServeInspection {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
+            },
+            crate::kernel::HostRestartDispositionUnit::ReadyToArmAndSettle {
+                operation_id,
+                action_epoch,
+            } => HostRestartDisposition::ReadyToArmAndSettle {
+                operation_id,
+                action_epoch,
+            },
+            crate::kernel::HostRestartDispositionUnit::Closed {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
+            } => HostRestartDisposition::Closed {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
+            },
+        })
+    }
+}
+
+/// Exact all-success host-cleanup settlement recorded by [`HostCleanupWorker::settle_success`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCleanupSuccessSettlement {
+    pub operation_id: OperationId,
+    pub action_epoch: u64,
+    pub settled_at_ms: i64,
+    pub result_event_ids: Vec<crate::domain::id::EventId>,
+}
+
+/// Read-only durable restart disposition derived from Closing admission state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRestartDisposition {
+    /// No Closing admission, or Accepted without a complete all-success journal.
+    ServeResume,
+    /// Exact durable `OperationFailed(CleanupFailed)`; keep serving for inspection.
+    ServeInspection {
+        operation_id: OperationId,
+        action_epoch: u64,
+        settled_at_ms: i64,
+    },
+    /// Complete all-success Accepted journal; arm physical exit then settle.
+    ReadyToArmAndSettle {
+        operation_id: OperationId,
+        action_epoch: u64,
+    },
+    /// Exact all-success `OperationSettled`; exit before binding a new listener.
+    Closed {
+        operation_id: OperationId,
+        action_epoch: u64,
+        settled_at_ms: i64,
+    },
 }

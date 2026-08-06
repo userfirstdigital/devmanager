@@ -1143,12 +1143,8 @@ fn host_admission_settlement_is_rejected_and_rolls_back() {
         .rebuild_projections()
         .expect_err("HostAdmission settlement must fail closed");
     assert!(
-        matches!(
-            &err,
-            StoreError::Projection(detail)
-                if detail.contains("host-admission settlement is not permitted")
-        ),
-        "settlement must fail at the explicit HostAdmission lineage gate, got {err:?}"
+        matches!(&err, StoreError::Projection(detail) if detail.contains("host-admission")),
+        "settlement must fail at the HostAdmission lineage gate, got {err:?}"
     );
     drop(store);
 
@@ -3177,4 +3173,1246 @@ fn host_cleanup_failed_lineage_survives_later_valid_side_effect_settlement() {
         HostCleanupWorker::run_once(&mut bus).expect("still idle"),
         HostCleanupProgress::Idle
     );
+}
+
+fn host_cleanup_branch_event_ids_in_order(path: &Path) -> Vec<devmanager::domain::id::EventId> {
+    use std::collections::HashMap;
+
+    use devmanager::domain::event::HostCleanupBranchCompletedPayload;
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::domain::id::EventId;
+
+    let conn = open_raw(path);
+    let mut stmt = conn
+        .prepare(
+            "SELECT event_id, payload
+             FROM events
+             WHERE event_type = 'host.cleanup_branch_completed'
+             ORDER BY sequence ASC",
+        )
+        .expect("prepare");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .expect("query");
+    let mut by_branch = HashMap::new();
+    for row in rows {
+        let (event_id_bytes, payload) = row.expect("row");
+        let event_id = EventId::from_bytes({
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&event_id_bytes);
+            bytes
+        })
+        .expect("event id");
+        let decoded: HostCleanupBranchCompletedPayload =
+            rmp_serde::from_slice(&payload).expect("decode branch payload");
+        assert!(
+            by_branch.insert(decoded.branch, event_id).is_none(),
+            "duplicate branch event"
+        );
+    }
+    HostCleanupBranch::ORDER
+        .iter()
+        .map(|branch| {
+            *by_branch
+                .get(branch)
+                .unwrap_or_else(|| panic!("missing {branch:?}"))
+        })
+        .collect()
+}
+
+#[test]
+fn host_cleanup_all_success_settle_once_idempotent_reopen_and_rebuild() {
+    use devmanager::domain::event::{Event, OperationSettledFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::domain::operation::{OperationState, OutcomeSource};
+    use devmanager::host::{
+        HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker,
+        HostRestartDisposition,
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open");
+    let quit_op = confirm_host_quit(&mut bus);
+    drive_four_cleanup_branches(&mut bus, quit_op);
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("ready"),
+        HostCleanupProgress::ReadyToExit {
+            operation_id: quit_op,
+            action_epoch: 1,
+        }
+    );
+    let expected_ids = host_cleanup_branch_event_ids_in_order(&path);
+    assert_eq!(expected_ids.len(), HostCleanupBranch::ORDER.len());
+    let events_before = count_table(&path, "events");
+
+    let first = HostCleanupWorker::settle_success(&mut bus).expect("settle once");
+    assert_eq!(
+        first,
+        HostCleanupSuccessSettlement {
+            operation_id: quit_op,
+            action_epoch: 1,
+            settled_at_ms: first.settled_at_ms,
+            result_event_ids: expected_ids.clone(),
+        }
+    );
+    assert!(first.settled_at_ms > 0);
+    assert_eq!(count_table(&path, "events"), events_before + 1);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("settled"),
+        Some(OperationState::Settled {
+            settled_at_ms: first.settled_at_ms,
+            result_event_ids: expected_ids.clone(),
+        })
+    );
+    assert_eq!(
+        HostCleanupWorker::restart_disposition(&bus).expect("closed"),
+        HostRestartDisposition::Closed {
+            operation_id: quit_op,
+            action_epoch: 1,
+            settled_at_ms: first.settled_at_ms,
+        }
+    );
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("idle after settle"),
+        HostCleanupProgress::Idle
+    );
+
+    let second = HostCleanupWorker::settle_success(&mut bus).expect("idempotent");
+    assert_eq!(second, first);
+    assert_eq!(count_table(&path, "events"), events_before + 1);
+
+    drop(bus);
+    {
+        let mut bus = CommandBus::open(&path).expect("reopen");
+        let third = HostCleanupWorker::settle_success(&mut bus).expect("reopen idempotent");
+        assert_eq!(third, first);
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("idle reopen"),
+            HostCleanupProgress::Idle
+        );
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("still closed"),
+            HostRestartDisposition::Closed {
+                operation_id: quit_op,
+                action_epoch: 1,
+                settled_at_ms: first.settled_at_ms,
+            }
+        );
+    }
+
+    {
+        let conn = open_raw(&path);
+        let (event_type, schema_version, payload, occurred_at, task_id, task_revision): (
+            String,
+            i64,
+            Vec<u8>,
+            i64,
+            Option<Vec<u8>>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT event_type, schema_version, payload, occurred_at_ms, task_id, task_revision
+                 FROM events
+                 WHERE event_type = 'operation.settled'
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("settled row");
+        assert_eq!(event_type, "operation.settled");
+        assert_eq!(schema_version, i64::from(EVENT_SCHEMA_VERSION));
+        assert!(task_id.is_none());
+        assert!(task_revision.is_none());
+        assert_eq!(occurred_at, first.settled_at_ms);
+        let fact: OperationSettledFact = rmp_serde::from_slice(&payload).expect("fact");
+        assert_eq!(fact.command_id, quit_command_id());
+        assert_eq!(fact.operation_id, quit_op);
+        assert_eq!(fact.settled_at_ms, first.settled_at_ms);
+        assert_eq!(fact.result_event_ids, expected_ids);
+        assert_eq!(fact.action_epoch, Some(1));
+        assert!(fact.resource_id.is_none());
+        assert!(fact.runtime_generation.is_none());
+        assert_eq!(fact.source, OutcomeSource::Dispatch);
+        let _ = Event::OperationSettled(fact);
+    }
+
+    {
+        let mut store = KernelStore::open(&path).expect("rebuild");
+        let rebuild = store.rebuild_projections().expect("rebuild");
+        assert!(rebuild.events_replayed > 0);
+        assert_eq!(
+            store.operation_status(quit_op).expect("status"),
+            Some(OperationState::Settled {
+                settled_at_ms: first.settled_at_ms,
+                result_event_ids: expected_ids,
+            })
+        );
+    }
+}
+
+#[test]
+fn host_cleanup_forged_success_settlement_table_is_runtime_and_rebuild_corruption() {
+    use devmanager::domain::event::{OperationSettledFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::OutcomeSource;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    #[derive(Clone, Copy)]
+    enum ForgeCase {
+        SwappedResultIds,
+        ForeignResultId,
+        MissingResultId,
+        WrongSource,
+        WrongEpoch,
+        TaskScoped,
+        PredatingFinalBranch,
+        ExtraMatchingTerminal,
+        EventOnlyWhileAccepted,
+        ProjectionOnlyMismatch,
+    }
+
+    for (idx, case) in [
+        ForgeCase::SwappedResultIds,
+        ForgeCase::ForeignResultId,
+        ForgeCase::MissingResultId,
+        ForgeCase::WrongSource,
+        ForgeCase::WrongEpoch,
+        ForgeCase::TaskScoped,
+        ForgeCase::PredatingFinalBranch,
+        ForgeCase::ExtraMatchingTerminal,
+        ForgeCase::EventOnlyWhileAccepted,
+        ForgeCase::ProjectionOnlyMismatch,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let (quit_op, branch_ids, accepted_at, final_branch_at) = {
+            let mut bus = CommandBus::open(&path).expect("open");
+            let quit_op = confirm_host_quit(&mut bus);
+            drive_four_cleanup_branches(&mut bus, quit_op);
+            assert!(matches!(
+                HostCleanupWorker::run_once(&mut bus).expect("ready"),
+                HostCleanupProgress::ReadyToExit { .. }
+            ));
+            let branch_ids = host_cleanup_branch_event_ids_in_order(&path);
+            let accepted_at: i64 = {
+                let conn = open_raw(&path);
+                conn.query_row(
+                    "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                    [quit_op.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("accepted")
+            };
+            let final_branch_at: i64 = {
+                let conn = open_raw(&path);
+                conn.query_row(
+                    "SELECT completed_at_ms FROM host_cleanup_branches
+                     WHERE operation_id = ?1 AND branch = ?2",
+                    rusqlite::params![
+                        quit_op.as_bytes().as_slice(),
+                        HostCleanupBranch::TaskTeardowns.as_str(),
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("final branch")
+            };
+            (quit_op, branch_ids, accepted_at, final_branch_at)
+        };
+
+        match case {
+            ForgeCase::EventOnlyWhileAccepted => {
+                let conn = open_raw(&path);
+                let ids = branch_ids.clone();
+                let settled = OperationSettledFact::with_source(
+                    quit_command_id(),
+                    quit_op,
+                    final_branch_at + 1,
+                    ids,
+                    Some(1),
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("fact");
+                conn.execute(
+                    "INSERT INTO events (
+                        event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                     ) VALUES (?1, NULL, NULL, 'operation.settled', ?2, ?3, ?4)",
+                    rusqlite::params![
+                        EventId::from_bytes(fixed_uuid_v7(0x80 + idx as u8))
+                            .expect("eid")
+                            .as_bytes()
+                            .as_slice(),
+                        i64::from(EVENT_SCHEMA_VERSION),
+                        final_branch_at + 1,
+                        rmp_serde::to_vec(&settled).expect("pack"),
+                    ],
+                )
+                .expect("forge event-only");
+                let state: String = conn
+                    .query_row(
+                        "SELECT state FROM operations WHERE operation_id = ?1",
+                        [quit_op.as_bytes().as_slice()],
+                        |row| row.get(0),
+                    )
+                    .expect("state");
+                assert_eq!(state, "accepted");
+                let bus = CommandBus::open(&path).expect("reopen");
+                let err = bus
+                    .operation_status(quit_op)
+                    .expect_err("event-only settle must corrupt Accepted");
+                assert_eq!(err, StoreError::Corruption);
+                continue;
+            }
+            ForgeCase::ProjectionOnlyMismatch => {
+                let mut bus = CommandBus::open(&path).expect("open settle");
+                let settlement =
+                    HostCleanupWorker::settle_success(&mut bus).expect("legitimate settle");
+                drop(bus);
+                let conn = open_raw(&path);
+                conn.execute(
+                    "UPDATE operations SET result = NULL WHERE operation_id = ?1",
+                    [quit_op.as_bytes().as_slice()],
+                )
+                .expect("tamper projection");
+                let _ = settlement;
+                let bus = CommandBus::open(&path).expect("reopen");
+                let err = bus
+                    .operation_status(quit_op)
+                    .expect_err("projection-only mismatch must corrupt");
+                assert_eq!(err, StoreError::Corruption);
+                continue;
+            }
+            ForgeCase::ExtraMatchingTerminal => {
+                let mut bus = CommandBus::open(&path).expect("open settle");
+                let settlement =
+                    HostCleanupWorker::settle_success(&mut bus).expect("legitimate settle");
+                drop(bus);
+                let conn = open_raw(&path);
+                let settled = OperationSettledFact::with_source(
+                    quit_command_id(),
+                    quit_op,
+                    settlement.settled_at_ms + 1,
+                    branch_ids.clone(),
+                    Some(1),
+                    None,
+                    None,
+                    OutcomeSource::Dispatch,
+                )
+                .expect("extra");
+                conn.execute(
+                    "INSERT INTO events (
+                        event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                     ) VALUES (?1, NULL, NULL, 'operation.settled', ?2, ?3, ?4)",
+                    rusqlite::params![
+                        EventId::from_bytes(fixed_uuid_v7(0x90 + idx as u8))
+                            .expect("eid")
+                            .as_bytes()
+                            .as_slice(),
+                        i64::from(EVENT_SCHEMA_VERSION),
+                        settlement.settled_at_ms + 1,
+                        rmp_serde::to_vec(&settled).expect("pack"),
+                    ],
+                )
+                .expect("extra terminal");
+                let bus = CommandBus::open(&path).expect("reopen");
+                let err = bus
+                    .operation_status(quit_op)
+                    .expect_err("extra matching terminal must corrupt");
+                assert_eq!(err, StoreError::Corruption);
+                continue;
+            }
+            _ => {}
+        }
+
+        let (result_ids, source, epoch, task_scope, occurred_at) = match case {
+            ForgeCase::SwappedResultIds => {
+                let mut ids = branch_ids.clone();
+                ids.swap(0, 1);
+                (
+                    ids,
+                    OutcomeSource::Dispatch,
+                    Some(1u64),
+                    false,
+                    final_branch_at + 1,
+                )
+            }
+            ForgeCase::ForeignResultId => {
+                let mut ids = branch_ids.clone();
+                ids[2] = EventId::from_bytes(fixed_uuid_v7(0xA0 + idx as u8)).expect("foreign");
+                (
+                    ids,
+                    OutcomeSource::Dispatch,
+                    Some(1),
+                    false,
+                    final_branch_at + 1,
+                )
+            }
+            ForgeCase::MissingResultId => (
+                branch_ids[..3].to_vec(),
+                OutcomeSource::Dispatch,
+                Some(1),
+                false,
+                final_branch_at + 1,
+            ),
+            ForgeCase::WrongSource => (
+                branch_ids.clone(),
+                OutcomeSource::verified_reconciliation(0, "foreign-host-settle").expect("source"),
+                Some(1),
+                false,
+                final_branch_at + 1,
+            ),
+            ForgeCase::WrongEpoch => (
+                branch_ids.clone(),
+                OutcomeSource::Dispatch,
+                Some(2),
+                false,
+                final_branch_at + 1,
+            ),
+            ForgeCase::TaskScoped => (
+                branch_ids.clone(),
+                OutcomeSource::Dispatch,
+                Some(1),
+                true,
+                final_branch_at + 1,
+            ),
+            ForgeCase::PredatingFinalBranch => (
+                branch_ids.clone(),
+                OutcomeSource::Dispatch,
+                Some(1),
+                false,
+                final_branch_at.saturating_sub(1).max(accepted_at),
+            ),
+            _ => unreachable!(),
+        };
+
+        let occurred_at = if matches!(case, ForgeCase::PredatingFinalBranch) {
+            // Force strictly before final branch completion when clocks allow.
+            if final_branch_at > accepted_at {
+                final_branch_at - 1
+            } else {
+                accepted_at
+            }
+        } else {
+            occurred_at
+        };
+
+        {
+            let conn = open_raw(&path);
+            let settled = OperationSettledFact::with_source(
+                quit_command_id(),
+                quit_op,
+                occurred_at,
+                result_ids,
+                epoch,
+                None,
+                None,
+                source,
+            )
+            .expect("fact");
+            let task_bytes = if task_scope {
+                Some(task_id(0xB0 + idx as u8).as_bytes().to_vec())
+            } else {
+                None
+            };
+            conn.execute(
+                "INSERT INTO events (
+                    event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                 ) VALUES (?1, ?2, NULL, 'operation.settled', ?3, ?4, ?5)",
+                rusqlite::params![
+                    EventId::from_bytes(fixed_uuid_v7(0xC0 + idx as u8))
+                        .expect("eid")
+                        .as_bytes()
+                        .as_slice(),
+                    task_bytes,
+                    i64::from(EVENT_SCHEMA_VERSION),
+                    occurred_at,
+                    rmp_serde::to_vec(&settled).expect("pack"),
+                ],
+            )
+            .expect("forge settled");
+        }
+
+        let before_ops = count_table(&path, "operations");
+        let before_admission = host_admission_row(&path);
+        let mut store = KernelStore::open(&path).expect("rebuild store");
+        let err = store
+            .rebuild_projections()
+            .expect_err(&format!("forge case {idx} must fail rebuild"));
+        assert!(
+            matches!(err, StoreError::Projection(_) | StoreError::Corruption),
+            "case {idx} expected fail-closed, got {err:?}"
+        );
+        drop(store);
+        assert_eq!(count_table(&path, "operations"), before_ops);
+        assert_eq!(host_admission_row(&path), before_admission);
+    }
+}
+
+#[test]
+fn host_restart_disposition_covers_incomplete_failed_ready_and_closed() {
+    use devmanager::domain::operation::OperationErrorCode;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker, HostRestartDisposition};
+
+    // No Closing admission.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let bus = CommandBus::open(&path).expect("open");
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("open"),
+            HostRestartDisposition::ServeResume
+        );
+    }
+
+    // Incomplete Accepted journal.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        assert!(matches!(
+            HostCleanupWorker::run_once(&mut bus).expect("first branch"),
+            HostCleanupProgress::BranchCompleted { .. }
+        ));
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("incomplete"),
+            HostRestartDisposition::ServeResume
+        );
+        assert_eq!(
+            bus.operation_status(quit_op).expect("accepted"),
+            Some(devmanager::domain::operation::OperationState::Accepted)
+        );
+    }
+
+    // Exact CleanupFailed.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0xD1);
+        bus.execute(envelope(
+            command_id(0xD2),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_open_agent(&mut bus, task, command_id(0xD3), 1);
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let failed = HostCleanupWorker::run_once(&mut bus).expect("terminalize");
+        let HostCleanupProgress::Failed {
+            operation_id,
+            action_epoch,
+            settled_at_ms,
+        } = failed
+        else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(operation_id, quit_op);
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("inspect"),
+            HostRestartDisposition::ServeInspection {
+                operation_id: quit_op,
+                action_epoch,
+                settled_at_ms,
+            }
+        );
+        assert_eq!(
+            bus.operation_status(quit_op).expect("failed"),
+            Some(devmanager::domain::operation::OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::CleanupFailed,
+            })
+        );
+    }
+
+    // Complete all-success Accepted => ReadyToArmAndSettle.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("ready"),
+            HostCleanupProgress::ReadyToExit {
+                operation_id: quit_op,
+                action_epoch: 1,
+            }
+        );
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("ready"),
+            HostRestartDisposition::ReadyToArmAndSettle {
+                operation_id: quit_op,
+                action_epoch: 1,
+            }
+        );
+        // Maintenance still does not settle.
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("still ready"),
+            HostCleanupProgress::ReadyToExit {
+                operation_id: quit_op,
+                action_epoch: 1,
+            }
+        );
+    }
+
+    // Exact Settled => Closed (covered primarily by settle test; assert here too).
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+        let settlement = HostCleanupWorker::settle_success(&mut bus).expect("settle");
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("closed"),
+            HostRestartDisposition::Closed {
+                operation_id: quit_op,
+                action_epoch: 1,
+                settled_at_ms: settlement.settled_at_ms,
+            }
+        );
+    }
+}
+
+#[test]
+fn host_cleanup_settled_must_immediately_follow_task_teardowns_predecessor() {
+    use devmanager::domain::event::{
+        OperationSettledFact, TaskRenamedPayload, EVENT_SCHEMA_VERSION,
+    };
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::OutcomeSource;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, branch_ids, final_at, task) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0x9A);
+        bus.execute(envelope(
+            command_id(0x9B),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create task before quit");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        assert!(matches!(
+            HostCleanupWorker::run_once(&mut bus).expect("ready"),
+            HostCleanupProgress::ReadyToExit { .. }
+        ));
+        let branch_ids = host_cleanup_branch_event_ids_in_order(&path);
+        let final_at: i64 = {
+            let conn = open_raw(&path);
+            conn.query_row(
+                "SELECT MAX(completed_at_ms) FROM host_cleanup_branches WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("max completed")
+        };
+        (quit_op, branch_ids, final_at, task)
+    };
+
+    // Replay-valid unrelated task mutation between final TaskTeardowns and host settle.
+    {
+        let conn = open_raw(&path);
+        let payload = TaskRenamedPayload {
+            title: "separator-before-host-settle".into(),
+        };
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, ?2, ?3, 'task.renamed', ?4, ?5, ?6)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x9C))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                task.as_bytes().as_slice(),
+                2_i64,
+                i64::from(EVENT_SCHEMA_VERSION),
+                final_at + 1,
+                rmp_serde::to_vec(&payload).expect("pack"),
+            ],
+        )
+        .expect("separator task.renamed");
+    }
+
+    {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let err = HostCleanupWorker::settle_success(&mut bus)
+            .expect_err("separator before settle must fail closed");
+        assert_eq!(err, StoreError::Corruption);
+    }
+
+    {
+        let conn = open_raw(&path);
+        let settled = OperationSettledFact::with_source(
+            quit_command_id(),
+            quit_op,
+            final_at + 2,
+            branch_ids.clone(),
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.settled', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x91))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                final_at + 2,
+                rmp_serde::to_vec(&settled).expect("pack"),
+            ],
+        )
+        .expect("forge separated settle");
+        conn.execute(
+            "UPDATE operations
+             SET state = 'settled', result = ?1, outcome_at_ms = ?2, outcome_code = NULL
+             WHERE operation_id = ?3",
+            rusqlite::params![
+                rmp_serde::to_vec(&branch_ids).expect("pack ids"),
+                final_at + 2,
+                quit_op.as_bytes().as_slice(),
+            ],
+        )
+        .expect("project settle");
+    }
+
+    let bus = CommandBus::open(&path).expect("reopen");
+    let err = bus
+        .operation_status(quit_op)
+        .expect_err("separated settle must corrupt runtime status");
+    assert_eq!(err, StoreError::Corruption);
+    drop(bus);
+
+    let before_ops = count_table(&path, "operations");
+    let mut store = KernelStore::open(&path).expect("rebuild store");
+    let err = store
+        .rebuild_projections()
+        .expect_err("separated settle must fail rebuild due to predecessor violation");
+    assert!(
+        matches!(err, StoreError::Projection(_) | StoreError::Corruption),
+        "got {err:?}"
+    );
+    drop(store);
+    assert_eq!(count_table(&path, "operations"), before_ops);
+}
+
+#[test]
+fn host_cleanup_settled_survives_later_unrelated_valid_global_event() {
+    use devmanager::domain::event::{TaskRenamedPayload, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::OperationState;
+    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open");
+    let task = task_id(0x97);
+    bus.execute(envelope(
+        command_id(0x98),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create task before quit");
+    let quit_op = confirm_host_quit(&mut bus);
+    drive_four_cleanup_branches(&mut bus, quit_op);
+    let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+    let settlement = HostCleanupWorker::settle_success(&mut bus).expect("settle");
+    let expected_ids = settlement.result_event_ids.clone();
+    drop(bus);
+
+    {
+        let conn = open_raw(&path);
+        let payload = TaskRenamedPayload {
+            title: "later-unrelated-rename".into(),
+        };
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, ?2, ?3, 'task.renamed', ?4, ?5, ?6)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x99))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                task.as_bytes().as_slice(),
+                2_i64,
+                i64::from(EVENT_SCHEMA_VERSION),
+                settlement.settled_at_ms + 5,
+                rmp_serde::to_vec(&payload).expect("pack"),
+            ],
+        )
+        .expect("later unrelated task.renamed");
+    }
+
+    let mut bus = CommandBus::open(&path).expect("reopen");
+    assert_eq!(
+        bus.operation_status(quit_op).expect("status"),
+        Some(OperationState::Settled {
+            settled_at_ms: settlement.settled_at_ms,
+            result_event_ids: expected_ids.clone(),
+        })
+    );
+    assert_eq!(
+        HostCleanupWorker::restart_disposition(&bus).expect("closed"),
+        HostRestartDisposition::Closed {
+            operation_id: quit_op,
+            action_epoch: 1,
+            settled_at_ms: settlement.settled_at_ms,
+        }
+    );
+    let again = HostCleanupWorker::settle_success(&mut bus).expect("idempotent after later event");
+    assert_eq!(again, settlement);
+
+    let mut store = KernelStore::open(&path).expect("rebuild");
+    store
+        .rebuild_projections()
+        .expect("rebuild after later event");
+    assert_eq!(
+        store.operation_status(quit_op).expect("status"),
+        Some(OperationState::Settled {
+            settled_at_ms: settlement.settled_at_ms,
+            result_event_ids: expected_ids,
+        })
+    );
+}
+
+#[test]
+fn host_restart_disposition_orphaned_host_quit_lineage_without_admission_is_corruption() {
+    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+    use devmanager::kernel::StoreError;
+
+    {
+        let dir = TempDir::new().expect("pristine");
+        let path = temp_db_path(&dir);
+        let bus = CommandBus::open(&path).expect("open");
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("pristine"),
+            HostRestartDisposition::ServeResume
+        );
+    }
+
+    // Just-confirmed quit with no cleanup branches: delete only admission + HostCloseBegun.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let _quit_op = confirm_host_quit(&mut bus);
+        drop(bus);
+        {
+            let conn = open_raw(&path);
+            assert_eq!(
+                conn.execute("DELETE FROM host_admission", [])
+                    .expect("delete admission"),
+                1
+            );
+            assert_eq!(
+                conn.execute(
+                    "DELETE FROM events WHERE event_type = 'host.close_begun'",
+                    [],
+                )
+                .expect("delete close begun"),
+                1
+            );
+            let branches: i64 = conn
+                .query_row("SELECT COUNT(*) FROM host_cleanup_branches", [], |row| {
+                    row.get(0)
+                })
+                .expect("branches");
+            assert_eq!(branches, 0);
+        }
+        let bus = CommandBus::open(&path).expect("reopen");
+        let err = HostCleanupWorker::restart_disposition(&bus)
+            .expect_err("remaining accepted HostAdmission operation/fact/receipt must corrupt");
+        assert_eq!(err, StoreError::Corruption);
+    }
+
+    // Settled: delete admission + close + cleanup branch events/projection; leave accepted/settled lineage.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+        HostCleanupWorker::settle_success(&mut bus).expect("settle");
+        drop(bus);
+        {
+            let conn = open_raw(&path);
+            assert_eq!(
+                conn.execute("DELETE FROM host_admission", [])
+                    .expect("delete admission"),
+                1
+            );
+            assert!(
+                conn.execute(
+                    "DELETE FROM events WHERE event_type = 'host.close_begun'",
+                    [],
+                )
+                .expect("delete close")
+                    >= 1
+            );
+            assert!(
+                conn.execute(
+                    "DELETE FROM events WHERE event_type = 'host.cleanup_branch_completed'",
+                    [],
+                )
+                .expect("delete branch events")
+                    >= 4
+            );
+            assert!(
+                conn.execute("DELETE FROM host_cleanup_branches", [])
+                    .expect("delete branch projection")
+                    >= 4
+            );
+            let accepted: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'operation.accepted'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("accepted remains");
+            assert!(accepted >= 1);
+            let settled: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'operation.settled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("settled remains");
+            assert!(settled >= 1);
+        }
+        let bus = CommandBus::open(&path).expect("reopen");
+        let err = HostCleanupWorker::restart_disposition(&bus)
+            .expect_err("remaining settled HostAdmission lineage must corrupt");
+        assert_eq!(err, StoreError::Corruption);
+    }
+}
+
+#[test]
+fn host_cleanup_revision_only_terminal_scope_is_projector_corruption() {
+    use devmanager::domain::event::{
+        OperationFailedFact, OperationSettledFact, EVENT_SCHEMA_VERSION,
+    };
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{OperationErrorCode, OutcomeSource};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    // Settled with task_revision only.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let (quit_op, branch_ids, final_at) = {
+            let mut bus = CommandBus::open(&path).expect("open");
+            let quit_op = confirm_host_quit(&mut bus);
+            drive_four_cleanup_branches(&mut bus, quit_op);
+            let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+            let branch_ids = host_cleanup_branch_event_ids_in_order(&path);
+            let final_at: i64 = {
+                let conn = open_raw(&path);
+                conn.query_row(
+                    "SELECT MAX(completed_at_ms) FROM host_cleanup_branches WHERE operation_id = ?1",
+                    [quit_op.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("max")
+            };
+            (quit_op, branch_ids, final_at)
+        };
+        {
+            let conn = open_raw(&path);
+            let settled = OperationSettledFact::with_source(
+                quit_command_id(),
+                quit_op,
+                final_at + 1,
+                branch_ids,
+                Some(1),
+                None,
+                None,
+                OutcomeSource::Dispatch,
+            )
+            .expect("fact");
+            conn.execute(
+                "INSERT INTO events (
+                    event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                 ) VALUES (?1, NULL, ?2, 'operation.settled', ?3, ?4, ?5)",
+                rusqlite::params![
+                    EventId::from_bytes(fixed_uuid_v7(0x92))
+                        .expect("eid")
+                        .as_bytes()
+                        .as_slice(),
+                    1_i64,
+                    i64::from(EVENT_SCHEMA_VERSION),
+                    final_at + 1,
+                    rmp_serde::to_vec(&settled).expect("pack"),
+                ],
+            )
+            .expect("forge revision-only settle");
+        }
+        let before = host_admission_row(&path);
+        let mut store = KernelStore::open(&path).expect("rebuild");
+        let err = store
+            .rebuild_projections()
+            .expect_err("revision-only settle must fail");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+        drop(store);
+        assert_eq!(host_admission_row(&path), before);
+    }
+
+    // CleanupFailed with task_revision only.
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let (quit_op, final_at) = {
+            let mut bus = CommandBus::open(&path).expect("open");
+            let task = task_id(0x93);
+            bus.execute(envelope(
+                command_id(0x94),
+                None,
+                None,
+                Command::CreateTask(create_task(task)),
+            ))
+            .expect("create");
+            register_open_agent(&mut bus, task, command_id(0x95), 1);
+            let quit_op = confirm_host_quit(&mut bus);
+            drive_four_cleanup_branches(&mut bus, quit_op);
+            let final_at: i64 = {
+                let conn = open_raw(&path);
+                conn.query_row(
+                    "SELECT completed_at_ms FROM host_cleanup_branches
+                     WHERE operation_id = ?1 AND branch = 'task_teardowns'",
+                    [quit_op.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("final")
+            };
+            (quit_op, final_at)
+        };
+        {
+            let conn = open_raw(&path);
+            let failed = OperationFailedFact::with_source(
+                quit_command_id(),
+                quit_op,
+                final_at + 1,
+                OperationErrorCode::CleanupFailed,
+                Some(1),
+                None,
+                None,
+                OutcomeSource::Dispatch,
+            )
+            .expect("fact");
+            conn.execute(
+                "INSERT INTO events (
+                    event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                 ) VALUES (?1, NULL, ?2, 'operation.failed', ?3, ?4, ?5)",
+                rusqlite::params![
+                    EventId::from_bytes(fixed_uuid_v7(0x96))
+                        .expect("eid")
+                        .as_bytes()
+                        .as_slice(),
+                    1_i64,
+                    i64::from(EVENT_SCHEMA_VERSION),
+                    final_at + 1,
+                    rmp_serde::to_vec(&failed).expect("pack"),
+                ],
+            )
+            .expect("forge revision-only failed");
+        }
+        let before = host_admission_row(&path);
+        let mut store = KernelStore::open(&path).expect("rebuild");
+        let err = store
+            .rebuild_projections()
+            .expect_err("revision-only CleanupFailed must fail");
+        assert!(matches!(err, StoreError::Projection(_)), "got {err:?}");
+        drop(store);
+        assert_eq!(host_admission_row(&path), before);
+        let _ = HostCleanupProgress::Idle;
+    }
+}
+
+#[test]
+fn host_cleanup_matching_terminal_with_invalid_event_id_is_runtime_corruption() {
+    use devmanager::host::HostCleanupWorker;
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let quit_op = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+        HostCleanupWorker::settle_success(&mut bus).expect("settle");
+        quit_op
+    };
+
+    {
+        let conn = open_raw(&path);
+        // 16 bytes, not UUID v7 (version nibble is 0).
+        let invalid = [0u8; 16];
+        let updated = conn
+            .execute(
+                "UPDATE events SET event_id = ?1 WHERE event_type = 'operation.settled'",
+                [invalid.as_slice()],
+            )
+            .expect("corrupt event_id");
+        assert_eq!(updated, 1);
+    }
+
+    let bus = CommandBus::open(&path).expect("reopen");
+    let err = bus
+        .operation_status(quit_op)
+        .expect_err("invalid terminal event_id must corrupt without panic");
+    assert_eq!(err, StoreError::Corruption);
+}
+
+#[test]
+fn host_cleanup_swapped_earlier_branch_sequences_fail_runtime_and_rebuild() {
+    use devmanager::domain::event::HostCleanupBranchCompletedPayload;
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::domain::operation::OperationState;
+    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, settlement) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let _ = HostCleanupWorker::run_once(&mut bus).expect("ready");
+        let settlement = HostCleanupWorker::settle_success(&mut bus).expect("settle");
+        assert_eq!(
+            bus.operation_status(quit_op).expect("valid status"),
+            Some(OperationState::Settled {
+                settled_at_ms: settlement.settled_at_ms,
+                result_event_ids: settlement.result_event_ids.clone(),
+            })
+        );
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("closed"),
+            HostRestartDisposition::Closed {
+                operation_id: quit_op,
+                action_epoch: 1,
+                settled_at_ms: settlement.settled_at_ms,
+            }
+        );
+        (quit_op, settlement)
+    };
+
+    {
+        let conn = open_raw(&path);
+        let mut stmt = conn
+            .prepare(
+                "SELECT sequence, payload FROM events
+                 WHERE event_type = 'host.cleanup_branch_completed'
+                 ORDER BY sequence ASC",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("query");
+        let mut agent_seq = None;
+        let mut resources_seq = None;
+        let mut teardowns_seq = None;
+        for row in rows {
+            let (sequence, payload) = row.expect("row");
+            let decoded: HostCleanupBranchCompletedPayload =
+                rmp_serde::from_slice(&payload).expect("decode");
+            match decoded.branch {
+                HostCleanupBranch::AgentSessions => agent_seq = Some(sequence),
+                HostCleanupBranch::Resources => resources_seq = Some(sequence),
+                HostCleanupBranch::TaskTeardowns => teardowns_seq = Some(sequence),
+                HostCleanupBranch::OutstandingEffects => {}
+            }
+        }
+        let agent_seq = agent_seq.expect("agent branch");
+        let resources_seq = resources_seq.expect("resources branch");
+        let teardowns_seq = teardowns_seq.expect("teardowns branch");
+        assert!(agent_seq < resources_seq && resources_seq < teardowns_seq);
+
+        // Swap only the two earlier branch sequences; leave TaskTeardowns in place.
+        // Use a temporary negative PK so sqlite_sequence is not advanced.
+        conn.execute(
+            "UPDATE events SET sequence = -1 WHERE sequence = ?1",
+            [agent_seq],
+        )
+        .expect("park agent");
+        conn.execute(
+            "UPDATE events SET sequence = ?1 WHERE sequence = ?2",
+            rusqlite::params![agent_seq, resources_seq],
+        )
+        .expect("move resources into agent slot");
+        conn.execute(
+            "UPDATE events SET sequence = ?1 WHERE sequence = -1",
+            [resources_seq],
+        )
+        .expect("move agent into resources slot");
+    }
+
+    let mut bus = CommandBus::open(&path).expect("reopen after swap");
+    let err = bus
+        .operation_status(quit_op)
+        .expect_err("swapped earlier branch sequences must corrupt status");
+    assert_eq!(err, StoreError::Corruption);
+    let err = HostCleanupWorker::restart_disposition(&bus)
+        .expect_err("swapped earlier branch sequences must corrupt disposition");
+    assert_eq!(err, StoreError::Corruption);
+    let err = HostCleanupWorker::settle_success(&mut bus)
+        .expect_err("swapped earlier branch sequences must corrupt idempotent settle");
+    assert_eq!(err, StoreError::Corruption);
+    drop(bus);
+
+    let before_admission = host_admission_row(&path);
+    let before_ops = count_table(&path, "operations");
+    let mut store = KernelStore::open(&path).expect("rebuild store");
+    let err = store
+        .rebuild_projections()
+        .expect_err("swapped earlier branch sequences must fail rebuild");
+    assert!(
+        matches!(err, StoreError::Projection(_) | StoreError::Corruption),
+        "got {err:?}"
+    );
+    drop(store);
+    assert_eq!(host_admission_row(&path), before_admission);
+    assert_eq!(count_table(&path, "operations"), before_ops);
+    let _ = settlement;
 }
