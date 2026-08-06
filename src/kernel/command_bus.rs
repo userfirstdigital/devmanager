@@ -1764,6 +1764,141 @@ fn transition_outbox(
     Ok(())
 }
 
+/// Atomically supersede the exact untouched BeginTaskTeardown lineage before Reopen
+/// commits TaskReopened. Missing/duplicate/wrong/started close ownership fails closed.
+fn cancel_untouched_begin_close_for_reopen(
+    tx: &Transaction<'_>,
+    task_id: TaskId,
+    action_epoch: u64,
+    settled_at_ms: i64,
+) -> Result<(), StoreError> {
+    let epoch_i64 = u64_to_sqlite_i64("tasks.action_epoch", action_epoch)?;
+    let operation_ids = {
+        let mut stmt = tx.prepare(
+            "SELECT operation_id FROM operations
+             WHERE task_id = ?1 AND action_epoch = ?2 AND state = 'accepted'
+             ORDER BY operation_id",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![task_id.as_bytes().as_slice(), epoch_i64],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(id16::<OperationId>("operations.operation_id", &row?)?);
+        }
+        ids
+    };
+    if operation_ids.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    let operation_id = operation_ids[0];
+
+    let command_id = load_operation_command_id(tx, operation_id)?;
+    let receipt_row = load_receipt_correlation(tx, command_id)?;
+    let CommandReceipt::Accepted {
+        command_id: receipt_command_id,
+        operation_id: receipt_operation_id,
+        event_ids,
+        task_revision,
+    } = &receipt_row.receipt
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if *receipt_command_id != command_id
+        || *receipt_operation_id != operation_id
+        || receipt_row.task_id != Some(task_id)
+    {
+        return Err(StoreError::Corruption);
+    }
+    let committed_sequence = receipt_row
+        .committed_sequence
+        .map(|sequence| u64_to_sqlite_i64("command_receipts.committed_sequence", sequence))
+        .transpose()?;
+    validate_accepted_receipt_correlation(
+        tx,
+        command_id,
+        operation_id,
+        event_ids,
+        *task_revision,
+        receipt_row.task_id,
+        committed_sequence,
+        receipt_row.created_at_ms,
+    )?;
+
+    let operation =
+        load_operation_projection_by_id(tx, operation_id)?.ok_or(StoreError::Corruption)?;
+    require_accepted_dispatch_operation(&operation)?;
+    if operation.task_id != Some(task_id) {
+        return Err(StoreError::Corruption);
+    }
+    let fence = operation_fence_from_projection(&operation)?;
+    if fence.action_epoch != Some(action_epoch)
+        || fence.resource_id.is_some()
+        || fence.runtime_generation.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    if settled_at_ms < operation.accepted_at_ms {
+        return Err(StoreError::Corruption);
+    }
+
+    let outbox_rows = load_outbox_rows(tx, operation_id)?;
+    if outbox_rows.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    let outbox = &outbox_rows[0];
+    let document = decode_full_outbox_payload(outbox)?;
+    validate_effect_matches_fence(&document.effect, task_id, fence)?;
+    let Effect::BeginTaskTeardown {
+        task_id: effect_task,
+        action_epoch: effect_epoch,
+    } = &document.effect
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if *effect_task != task_id || *effect_epoch != action_epoch {
+        return Err(StoreError::Corruption);
+    }
+    require_current_effect_ownership(tx, task_id, &document.effect, fence)?;
+    validate_nonterminal_outbox_dispatch_metadata(
+        outbox,
+        operation.accepted_at_ms,
+        document.replay_policy,
+    )?;
+    match outbox.state.as_str() {
+        "pending" | "claimed" => {}
+        _ => return Err(StoreError::Corruption),
+    }
+    if outbox.attempts != 0
+        || outbox.dispatch_started_at_ms.is_some()
+        || outbox.reconciliation_receipt.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+
+    let cancelled = OperationCancelledFact::new(
+        command_id,
+        operation_id,
+        settled_at_ms,
+        CancellationReason::Superseded,
+        fence.action_epoch,
+        fence.resource_id,
+        fence.runtime_generation,
+    )
+    .map_err(|_| StoreError::ConstraintViolation)?;
+    append_and_project(
+        tx,
+        EventId::new(),
+        Some(task_id),
+        None,
+        settled_at_ms,
+        Event::OperationCancelled(cancelled),
+    )?;
+    transition_outbox(tx, outbox, &outbox.state, "cancelled", Some("superseded"))?;
+    Ok(())
+}
+
 fn execute_in_tx(
     tx: &Transaction<'_>,
     envelope: CommandEnvelope,
@@ -1809,6 +1944,18 @@ fn execute_in_tx(
             };
             let planned = plan_effects(snapshot.as_ref(), task_id, &decision)?;
             if planned.is_empty() {
+                if matches!(envelope.command, Command::ReopenTask) {
+                    if let Some(snap) = snapshot.as_ref() {
+                        if snap.task.lifecycle == TaskLifecycle::Closing {
+                            cancel_untouched_begin_close_for_reopen(
+                                tx,
+                                task_id,
+                                snap.task.action_epoch,
+                                accepted_at_ms,
+                            )?;
+                        }
+                    }
+                }
                 persist_pure_acceptance(
                     tx,
                     &envelope,

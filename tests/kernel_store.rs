@@ -9373,6 +9373,16 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
             Command::ReopenTask,
         ))
         .expect("legitimately supersede close ownership");
+    match store
+        .operation_status(superseded_operation)
+        .expect("superseded status")
+    {
+        Some(OperationState::Cancelled {
+            reason: CancellationReason::Superseded,
+            ..
+        }) => {}
+        other => panic!("legitimate reopen must cancel the close operation, got {other:?}"),
+    }
 
     let prestarted_task = task_id(0xE5);
     create_open_task(&mut store, prestarted_task, command_id(0xE6));
@@ -9385,6 +9395,21 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
     drop(store);
 
     let conn = open_raw(&path);
+    let (superseded_state, superseded_error, superseded_lease): (
+        String,
+        Option<String>,
+        Option<i64>,
+    ) = conn
+        .query_row(
+            "SELECT state, last_error_class, leased_until_ms
+             FROM outbox WHERE operation_id = ?1",
+            [superseded_operation.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(superseded_state, "cancelled");
+    assert_eq!(superseded_error.as_deref(), Some("superseded"));
+    assert!(superseded_lease.is_none());
     let prestarted_at = accepted_at_ms(&conn, prestarted_operation);
     conn.execute(
         "UPDATE outbox
@@ -9410,14 +9435,14 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
     );
     assert_eq!(
         store.claim_next_dispatch(Duration::from_secs(30)),
-        Err(StoreError::StaleFence),
-        "a stale row must stay visible after later valid work is claimed",
+        Ok(None),
+        "cancelled superseded close leaves no stale claim source; prestarted legacy row stays ineligible/skipped",
     );
     drop(store);
 
     let conn = open_raw(&path);
     for (operation_id, expected) in [
-        (superseded_operation, "pending"),
+        (superseded_operation, "cancelled"),
         (prestarted_operation, "pending"),
         (ready_operation, "dispatching"),
     ] {
@@ -9430,6 +9455,15 @@ fn dispatch_claim_skips_superseded_and_prestarted_pending_rows() {
             .unwrap();
         assert_eq!(state, expected);
     }
+    let (prestarted_attempts, prestarted_started): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT attempts, dispatch_started_at_ms FROM outbox WHERE operation_id = ?1",
+            [prestarted_operation.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(prestarted_attempts, 1);
+    assert!(prestarted_started.is_some());
 }
 
 #[test]
