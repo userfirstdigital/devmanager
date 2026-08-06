@@ -48,7 +48,15 @@ impl From<String> for HostRunError {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let mut argv = std::env::args().skip(1).peekable();
+    // Dispatch ctl before foreground-host bootstrap so CLI never parses or uses
+    // --parent-pid, --config-base, or HostLock.
+    if argv.peek().map(String::as_str) == Some("ctl") {
+        argv.next();
+        return devmanager::client::dispatch_ctl_from_args(argv);
+    }
+
+    match run(argv.collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(HostRunError::AlreadyRunning(message)) => {
             let _ = writeln!(io::stderr(), "devmanager-host: {message}");
@@ -61,9 +69,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), HostRunError> {
+fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
     #[cfg(not(debug_assertions))]
     {
+        let _ = raw_args;
         return Err(HostRunError::Message(
             "release host startup is deferred until Phase 11".to_string(),
         ));
@@ -71,6 +80,7 @@ fn run() -> Result<(), HostRunError> {
 
     #[cfg(not(windows))]
     {
+        let _ = raw_args;
         return Err(HostRunError::Message(
             "devmanager-host requires Windows".to_string(),
         ));
@@ -78,7 +88,7 @@ fn run() -> Result<(), HostRunError> {
 
     #[cfg(all(windows, debug_assertions))]
     {
-        let args = parse_args(std::env::args().skip(1))?;
+        let args = parse_args(raw_args)?;
         let paths = prepare_debug_paths(&args)?;
         let parent = open_and_validate_parent(args.parent_pid)?;
         let host_lock = acquire_lock(&paths.profile_root, &args.profile)?;
@@ -102,10 +112,7 @@ fn run() -> Result<(), HostRunError> {
 }
 
 #[cfg(all(windows, debug_assertions))]
-fn parse_args<I>(raw: I) -> Result<HostArgs, String>
-where
-    I: IntoIterator<Item = String>,
-{
+fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let mut foreground = false;
     let mut profile: Option<String> = None;
     let mut instance_label: Option<String> = None;

@@ -107,6 +107,18 @@ impl HostClient {
         self.server_hello.host_boot_id
     }
 
+    pub fn server_build(&self) -> &str {
+        &self.server_hello.server_build
+    }
+
+    pub fn protocol_major(&self) -> u16 {
+        self.server_hello.protocol_major
+    }
+
+    pub fn protocol_minor(&self) -> u16 {
+        self.server_hello.protocol_minor
+    }
+
     pub fn tracked_operation(&self, operation_id: OperationId) -> Option<&TrackedOperation> {
         self.tracked.get(&operation_id)
     }

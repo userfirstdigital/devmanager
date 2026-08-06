@@ -1,0 +1,414 @@
+//! Phase 2.4 CLI client acceptance: shared action catalog + host ctl.
+//!
+//! Every fixture uses a process-unique TempDir config base and a unique named
+//! debug profile. Never resolve or touch installed DevManager APPDATA, and
+//! never read or hash session.json.
+
+#![cfg(windows)]
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+use devmanager::client::action::{
+    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+};
+use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::host::HostIdentity;
+
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const CTL_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL: Duration = Duration::from_millis(25);
+
+fn host_exe() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_devmanager-host"))
+}
+
+fn unique_profile() -> String {
+    format!("cli{}{}", std::process::id(), Uuid::now_v7().simple())
+}
+
+fn scrub_env(command: &mut ProcessCommand) {
+    command
+        .env_remove("DEVMANAGER_PROFILE")
+        .env_remove("DEVMANAGER_CONFIG_DIR")
+        .env_remove("DEVMANAGER_APP_IDENTITY");
+}
+
+fn isolated_paths(base: &TempDir, profile: &str) -> ResolvedAppPaths {
+    let root = base.path();
+    assert!(
+        root.starts_with(std::env::temp_dir()),
+        "fixture must stay beneath the process temp directory"
+    );
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        assert!(
+            !root.starts_with(Path::new(&appdata)),
+            "fixture must stay outside APPDATA"
+        );
+    }
+
+    let paths = resolve_app_paths(
+        root,
+        AppProfile::named(profile).expect("valid named profile"),
+        BuildKind::Debug,
+    )
+    .expect("resolve isolated debug paths");
+    assert_eq!(paths.root.parent(), Some(root));
+    paths
+}
+
+fn read_identity(path: &Path) -> Option<HostIdentity> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn spawn(mut command: ProcessCommand) -> Self {
+        let child = command.spawn().expect("spawn child");
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("child still owned").id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.as_mut().expect("child still owned").try_wait()
+    }
+
+    fn exited_diagnostics(&mut self, status: ExitStatus) -> String {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self
+            .child
+            .as_mut()
+            .expect("child still owned")
+            .stderr
+            .take()
+        {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        format!("{status}; stderr={stderr:?}")
+    }
+
+    fn terminate_and_wait_bounded(&mut self, deadline: Duration) -> Result<ExitStatus, String> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| "child already taken".to_string())?;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll child before termination: {error}"))?
+        {
+            return Ok(status);
+        }
+
+        let pid = child.id();
+        child
+            .kill()
+            .map_err(|error| format!("kill exact pid {pid}: {error}"))?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if started.elapsed() < deadline => thread::sleep(POLL),
+                Ok(None) => {
+                    return Err(format!("exact pid {pid} did not exit within {deadline:?}"))
+                }
+                Err(error) => return Err(format!("wait exact pid {pid}: {error}")),
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let started = Instant::now();
+        while started.elapsed() < TERMINATE_TIMEOUT {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => thread::sleep(POLL),
+            }
+        }
+    }
+}
+
+fn host_command(config_base: &Path, profile: &str) -> ProcessCommand {
+    let mut command = ProcessCommand::new(host_exe());
+    scrub_env(&mut command);
+    command
+        .arg("--foreground")
+        .arg("--profile")
+        .arg(profile)
+        .arg("--instance-label")
+        .arg("CLI Client Test")
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .arg("--config-base")
+        .arg(config_base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn ctl_command(args: &[&str]) -> ProcessCommand {
+    let mut command = ProcessCommand::new(host_exe());
+    scrub_env(&mut command);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn run_ctl_bounded(args: &[&str]) -> Output {
+    let mut child = ChildGuard::spawn(ctl_command(args));
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let owned = child.child.take().expect("child finished");
+                return owned.wait_with_output().expect("collect ctl stdout/stderr");
+            }
+            Ok(None) if started.elapsed() < CTL_TIMEOUT => thread::sleep(POLL),
+            Ok(None) => {
+                let _ = child.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
+                panic!("ctl {:?} exceeded {CTL_TIMEOUT:?}", args);
+            }
+            Err(error) => panic!("poll ctl {:?}: {error}", args),
+        }
+    }
+}
+
+fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = host.try_wait().expect("poll host while waiting for lock") {
+            let diagnostics = host.exited_diagnostics(status);
+            panic!("foreground host exited before lock readiness: {diagnostics}");
+        }
+        if let Some(identity) = read_identity(lock_path) {
+            if identity.pid == host.id() {
+                return identity;
+            }
+        }
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "timed out waiting for host identity at {}",
+            lock_path.display()
+        );
+        thread::sleep(POLL);
+    }
+}
+
+#[test]
+fn action_catalog_ids_are_unique_and_read_only() {
+    let catalog = action::catalog();
+    assert_eq!(
+        catalog.len(),
+        2,
+        "slice exposes only host.actions and host.status"
+    );
+
+    let mut ids = Vec::new();
+    for action in catalog {
+        assert!(!action.id.is_empty(), "action id must be nonempty");
+        assert!(
+            !ids.contains(&action.id),
+            "duplicate stable action id: {}",
+            action.id
+        );
+        ids.push(action.id);
+        assert_eq!(action.risk, ActionRisk::ReadOnly);
+        assert_eq!(action.scope, ActionScope::Host);
+        assert!(!action.title.is_empty());
+        assert!(!action.description.is_empty());
+        assert!(!action.keywords.is_empty());
+    }
+
+    assert!(ids.contains(&ACTION_HOST_ACTIONS));
+    assert!(ids.contains(&ACTION_HOST_STATUS));
+    assert!(action::require_unique_ids().is_ok());
+}
+
+#[test]
+fn ctl_actions_json_is_stable_unique_and_offline() {
+    let first = run_ctl_bounded(&["ctl", "actions", "--json"]);
+    assert!(
+        first.status.success(),
+        "ctl actions --json must succeed offline; status={}; stderr={}",
+        first.status,
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = run_ctl_bounded(&["ctl", "actions", "--json"]);
+    assert!(second.status.success());
+    assert_eq!(
+        first.stdout, second.stdout,
+        "actions JSON must be byte-stable across invocations"
+    );
+
+    let doc: Value = serde_json::from_slice(&first.stdout).expect("actions JSON");
+    assert_eq!(doc["schema_version"], 1);
+    let actions = doc["actions"].as_array().expect("actions array");
+    let mut ids = Vec::new();
+    for action in actions {
+        let id = action["id"].as_str().expect("action id string");
+        assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
+        ids.push(id.to_string());
+        assert_eq!(action["risk"], "read_only");
+        assert_eq!(action["scope"], "host");
+        assert!(action["title"].as_str().unwrap().len() > 0);
+        assert!(action["description"].as_str().unwrap().len() > 0);
+        assert!(action["keywords"].as_array().unwrap().len() > 0);
+        assert!(action.get("required_capability").is_some());
+    }
+    assert!(ids.iter().any(|id| id == ACTION_HOST_ACTIONS));
+    assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
+    assert!(
+        String::from_utf8_lossy(&first.stderr).trim().is_empty(),
+        "successful actions JSON must not emit failure diagnostics on stderr"
+    );
+}
+
+#[test]
+fn ctl_status_attaches_without_taking_host_lock() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original = wait_for_identity(&mut host, &lock_path);
+
+    let output = run_ctl_bounded(&["ctl", "status", "--profile", &profile, "--json"]);
+    assert!(
+        output.status.success(),
+        "ctl status must attach; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = read_identity(&lock_path).expect("host lock after ctl status");
+    assert_eq!(after.pid, original.pid);
+    assert_eq!(after.boot_id, original.boot_id);
+    assert_eq!(after.profile, original.profile);
+    assert!(
+        host.try_wait().expect("poll host after ctl").is_none(),
+        "ctl status must leave the foreground host running"
+    );
+
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["action_id"], ACTION_HOST_STATUS);
+    assert_eq!(doc["profile"], profile);
+    assert_eq!(doc["host_boot_id"], original.boot_id.to_string());
+    assert!(doc["connection_id"].as_str().unwrap().len() > 0);
+    assert!(doc.get("granted_capabilities").is_some());
+    assert!(
+        doc["server_build"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("devmanager-host/"),
+        "server_build should come from ServerHello"
+    );
+    assert_eq!(doc["protocol_major"], 1);
+    assert!(doc["protocol_minor"].as_u64().is_some());
+
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[test]
+fn ctl_status_exits_nonzero_when_host_absent() {
+    let profile = unique_profile();
+    let output = run_ctl_bounded(&["ctl", "status", "--profile", &profile, "--json"]);
+    assert!(
+        !output.status.success(),
+        "status without a host must fail nonzero"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "failure must not emit a JSON success document"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.trim().is_empty(),
+        "failure must emit bounded diagnostics on stderr"
+    );
+    assert!(
+        stderr.len() < 8 * 1024,
+        "stderr diagnostics must stay bounded"
+    );
+}
+
+#[test]
+fn ctl_rejects_unknown_commands_and_invalid_profiles() {
+    let unknown = run_ctl_bounded(&["ctl", "not-a-command", "--json"]);
+    assert!(!unknown.status.success());
+    assert!(unknown.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&unknown.stderr).trim().is_empty());
+
+    let missing_json = run_ctl_bounded(&["ctl", "actions"]);
+    assert!(!missing_json.status.success());
+    assert!(missing_json.stdout.is_empty());
+
+    let production = run_ctl_bounded(&["ctl", "status", "--profile", "production", "--json"]);
+    assert!(!production.status.success());
+    assert!(production.stdout.is_empty());
+    let production_err = String::from_utf8_lossy(&production.stderr);
+    assert!(
+        production_err.to_ascii_lowercase().contains("production")
+            || production_err.to_ascii_lowercase().contains("profile"),
+        "invalid production profile must be rejected with a profile diagnostic"
+    );
+
+    let empty = run_ctl_bounded(&["ctl", "status", "--profile", "", "--json"]);
+    assert!(!empty.status.success());
+    assert!(empty.stdout.is_empty());
+
+    let duplicate = run_ctl_bounded(&[
+        "ctl",
+        "status",
+        "--profile",
+        "dupprofile",
+        "--profile",
+        "other",
+        "--json",
+    ]);
+    assert!(!duplicate.status.success());
+    assert!(duplicate.stdout.is_empty());
+
+    let junk = run_ctl_bounded(&["ctl", "actions", "--json", "--extra"]);
+    assert!(!junk.status.success());
+    assert!(junk.stdout.is_empty());
+
+    let oversized = format!("--{}", "x".repeat(16 * 1024));
+    let bounded = run_ctl_bounded(&["ctl", "actions", "--json", &oversized]);
+    assert!(!bounded.status.success());
+    assert!(bounded.stdout.is_empty());
+    assert!(
+        bounded.stderr.len() < 2 * 1024,
+        "all CLI diagnostics must be bounded"
+    );
+}

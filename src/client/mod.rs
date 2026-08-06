@@ -1,8 +1,15 @@
 //! Minimal local ClientHello helper, synchronous request/reply connection, and
 //! the reusable HostClient wrapper for profile-derived attach/reconnect.
 
+pub mod action;
+pub mod cli;
 mod host_client;
 
+pub use action::{
+    catalog, require_unique_ids, ActionDescriptor, ActionRisk, ActionScope, ACTION_HOST_ACTIONS,
+    ACTION_HOST_STATUS,
+};
+pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
 pub use host_client::{HostClient, HostClientConfig, TrackedOperation};
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
