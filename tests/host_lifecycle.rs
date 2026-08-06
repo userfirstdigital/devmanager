@@ -2188,12 +2188,45 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         CommandReceipt::Accepted { .. }
     ));
 
+    let existing_resource_id =
+        ResourceId::from_bytes(fixed_uuid_v7(0xe7)).expect("existing resource id");
+    let register_existing = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xe8))
+            .expect("register existing command id"),
+        client_id: client_a_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_150,
+        expected_task_revision: Some(1),
+        command: Command::RegisterResource {
+            resource: ResourceFacts {
+                id: existing_resource_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+                updated_at_ms: 1_725_000_000_150,
+            },
+        },
+    };
+    assert!(matches!(
+        client_a
+            .execute_command(register_existing)
+            .await
+            .expect("client A registers active Task-owned terminal"),
+        CommandReceipt::Accepted {
+            task_revision: Some(2),
+            ..
+        }
+    ));
+
     let begin_close = CommandEnvelope {
         command_id: CommandId::from_bytes(fixed_uuid_v7(0xe6)).expect("begin close command id"),
         client_id: client_a_id,
         task_id: Some(task_id),
         issued_at_ms: 1_725_000_000_200,
-        expected_task_revision: Some(1),
+        expected_task_revision: Some(2),
         command: Command::BeginCloseTask,
     };
     let close_receipt = client_a
@@ -2209,8 +2242,8 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         } => {
             assert_eq!(
                 task_revision,
-                Some(2),
-                "begin close must advance to revision 2"
+                Some(3),
+                "begin close must advance to revision 3 after resource registration"
             );
             assert_eq!(
                 event_ids.len(),
@@ -2230,19 +2263,20 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("known close operation");
     assert!(
         matches!(close_state, OperationState::Accepted),
-        "close must remain Accepted before drain; got {close_state:?}"
+        "close must remain Accepted while Task-owned resources block drain; got {close_state:?}"
     );
 
-    let resource_id = ResourceId::from_bytes(fixed_uuid_v7(0xe7)).expect("resource id");
+    let rejected_resource_id =
+        ResourceId::from_bytes(fixed_uuid_v7(0xe9)).expect("rejected resource id");
     let register = CommandEnvelope {
-        command_id: CommandId::from_bytes(fixed_uuid_v7(0xe8)).expect("register command id"),
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xea)).expect("register command id"),
         client_id: client_b_id,
         task_id: Some(task_id),
         issued_at_ms: 1_725_000_000_300,
-        expected_task_revision: Some(2),
+        expected_task_revision: Some(3),
         command: Command::RegisterResource {
             resource: ResourceFacts {
-                id: resource_id,
+                id: rejected_resource_id,
                 task_id: Some(task_id),
                 owner_kind: OwnerKind::Task,
                 resource_kind: ResourceKind::Terminal,
@@ -2260,9 +2294,9 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
     assert_eq!(
         rejected,
         CommandReceipt::Rejected {
-            command_id: CommandId::from_bytes(fixed_uuid_v7(0xe8)).expect("register command id"),
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xea)).expect("register command id"),
             code: RejectionCode::Closing,
-            current_revision: Some(2),
+            current_revision: Some(3),
         }
     );
 
@@ -2273,7 +2307,7 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("task snapshot query");
     assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Closing);
     assert_eq!(snapshot.task.action_epoch, 1);
-    assert_eq!(snapshot.task.revision, 2);
+    assert_eq!(snapshot.task.revision, 3);
 
     let resources = client_b
         .snapshot_page(SnapshotSection::Resources, None, None)
@@ -2281,9 +2315,19 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
         .expect("resources snapshot transport")
         .expect("resources snapshot query");
     assert!(
+        resources.items.iter().any(|item| matches!(
+            item,
+            SnapshotItem::Resource(facts)
+                if facts.id == existing_resource_id
+                    && facts.lifecycle == ResourceLifecycle::Active
+                    && facts.owner_kind == OwnerKind::Task
+        )),
+        "pre-existing Active Task-owned terminal must remain while teardown stays pending"
+    );
+    assert!(
         !resources.items.iter().any(|item| matches!(
             item,
-            SnapshotItem::Resource(facts) if facts.id == resource_id
+            SnapshotItem::Resource(facts) if facts.id == rejected_resource_id
         )),
         "rejected resource must be absent from durable resources"
     );
@@ -2310,6 +2354,133 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
 
     client_a.disconnect();
     client_b.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_begin_close_settles_and_archives_via_host_maintenance() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::PagedSnapshots,
+    ]);
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0xf0)).expect("client id");
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+
+    let (create, _, task_id) = create_task_named(
+        client_id,
+        0xf1,
+        0xf2,
+        0xf3,
+        0xf4,
+        "Empty close maintenance settle",
+    );
+    assert!(matches!(
+        client
+            .execute_command(create)
+            .await
+            .expect("create empty task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let begin_close = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xf5)).expect("begin close command id"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_200,
+        expected_task_revision: Some(1),
+        command: Command::BeginCloseTask,
+    };
+    let close_receipt = client
+        .execute_command(begin_close)
+        .await
+        .expect("begin close empty task");
+    let close_operation_id = match close_receipt {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision,
+            event_ids,
+            ..
+        } => {
+            assert_eq!(
+                task_revision,
+                Some(2),
+                "empty begin close advances to revision 2"
+            );
+            assert_eq!(
+                event_ids.len(),
+                1,
+                "begin close must emit exactly one decision event"
+            );
+            operation_id
+        }
+        other => panic!("expected Accepted begin close, got {other:?}"),
+    };
+
+    // Receipt already proves Accepted. Do not assert intermediate Accepted/Closing
+    // via refresh — maintenance may settle before the next poll on a loaded machine.
+    let started = Instant::now();
+    let (settled_state, archived_snapshot) = loop {
+        if let Some(status) = host.try_wait().expect("poll host while waiting for settle") {
+            let diagnostics = host.exited_diagnostics(status);
+            panic!("foreground host exited before empty-close settle: {diagnostics}");
+        }
+
+        let state = client
+            .refresh_operation(close_operation_id)
+            .await
+            .expect("refresh close while waiting for settle")
+            .expect("known close operation while waiting");
+        let snapshot = client
+            .task_snapshot(task_id)
+            .await
+            .expect("task snapshot while waiting for archive")
+            .expect("task present while waiting");
+
+        if matches!(state, OperationState::Settled { .. })
+            && snapshot.task.lifecycle == TaskLifecycle::Archived
+        {
+            break (state, snapshot);
+        }
+
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "timed out waiting for empty BeginClose to settle and archive; last state={state:?} lifecycle={:?}",
+            snapshot.task.lifecycle
+        );
+        sleep(POLL).await;
+    };
+
+    assert!(matches!(settled_state, OperationState::Settled { .. }));
+    assert_eq!(archived_snapshot.task.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived_snapshot.task.revision, 3);
+    assert_eq!(archived_snapshot.task.action_epoch, 1);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    assert!(paths.database.exists());
+
+    client.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

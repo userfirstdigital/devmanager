@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::domain::id::{ArtifactId, SnapshotId, SubscriptionId, TaskId};
@@ -33,6 +33,7 @@ use crate::protocol::{
 };
 
 use super::ipc::IpcError;
+use super::shutdown::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
 
 /// Fixed capacity for the host request queue.
 ///
@@ -530,7 +531,10 @@ impl HostRequestExecutor {
     }
 
     async fn run(&mut self) {
-        let mut reaper = interval(SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD));
+        // `interval` ticks immediately. Delay the first maintenance pass so
+        // startup does not race an eager teardown scan.
+        let period = SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD);
+        let mut reaper = interval_at(tokio::time::Instant::now() + period, period);
         reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -585,6 +589,15 @@ impl HostRequestExecutor {
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
+                    // At most one process-empty teardown per maintenance tick.
+                    // StoreError fails closed so host supervision sees unexpected exit.
+                    match ProcessEmptyTeardownWorker::run_once(&mut self.bus) {
+                        Ok(ProcessEmptyTeardown::Idle) => {}
+                        Ok(ProcessEmptyTeardown::Settled { .. }) => {
+                            self.fan_out_live_durable_events();
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
         }
