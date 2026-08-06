@@ -48,6 +48,7 @@ pub struct AcceptedHello {
 pub enum IpcError {
     InvalidProfile(String),
     Unsupported,
+    UnsupportedCapability,
     Io(std::io::Error),
     Timeout,
     Frame(PhysicalFrameError),
@@ -70,6 +71,9 @@ impl std::fmt::Display for IpcError {
         match self {
             Self::InvalidProfile(name) => write!(f, "invalid host ipc profile name: {name:?}"),
             Self::Unsupported => write!(f, "named-pipe ipc is unsupported on this platform"),
+            Self::UnsupportedCapability => {
+                write!(f, "requested capability is not granted on this connection")
+            }
             Self::Io(error) => write!(f, "named-pipe ipc I/O error: {error}"),
             Self::Timeout => write!(f, "named-pipe operation timed out"),
             Self::Frame(error) => error.fmt(f),
@@ -113,6 +117,7 @@ impl std::error::Error for IpcError {
             Self::ServerHello(error) => Some(error),
             Self::InvalidProfile(_)
             | Self::Unsupported
+            | Self::UnsupportedCapability
             | Self::Timeout
             | Self::ProfileMismatch
             | Self::HelloInconsistent

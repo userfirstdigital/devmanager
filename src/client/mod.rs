@@ -1,7 +1,9 @@
-//! Minimal local ClientHello helper and synchronous request/reply connection.
-//!
-//! This is intentionally not the reusable HostClient multiplexer planned for
-//! later Phase 2 work.
+//! Minimal local ClientHello helper, synchronous request/reply connection, and
+//! the reusable HostClient wrapper for profile-derived attach/reconnect.
+
+mod host_client;
+
+pub use host_client::{HostClient, HostClientConfig, TrackedOperation};
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::id::CommandId;

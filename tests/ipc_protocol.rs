@@ -6,18 +6,23 @@
 
 #![cfg(windows)]
 
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use devmanager::client::{connect, perform_client_hello};
+use devmanager::client::{
+    connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
+};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
 use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
@@ -476,4 +481,215 @@ async fn pipe_oversized_header_is_rejected_before_payload_allocation() {
         }
         other => panic!("expected oversized frame rejection, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_reconnect_resolves_tracked_operation_while_host_database_is_locked() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let db_path = root.path().join("kernel.sqlite3");
+
+    let profile = unique_profile("hc");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let host_boot_id = Uuid::now_v7();
+    let client_id = protocol_client_id(0x61);
+    let task = TaskId::from_bytes(fixed_uuid_v7(0x62)).expect("task");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x63)).expect("command");
+    let requested = CapabilitySet::from_capabilities([Capability::OperationSettlement]);
+    let hello_config = AcceptHelloConfig {
+        host_boot_id,
+        server_build: "devmanager-host/0.4.2".to_string(),
+        supported: requested,
+        local_limits: FrameLimits::v1_default(),
+    };
+
+    let create = CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::CreateTask(CreateTaskIntent {
+            id: task,
+            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x64)).expect("env"),
+            title: "HostClient reconnect settle".into(),
+            description: None,
+            project_id: ProjectId::from_bytes(fixed_uuid_v7(0x65)).expect("project"),
+            workspace: WorkspaceRef::Main,
+            assignment: TaskAssignment::LocalOwner,
+            created_at_ms: 1_725_000_000_000,
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        }),
+    };
+
+    let (bound1_tx, bound1_rx) = oneshot::channel::<()>();
+    let (hello1_tx, hello1_rx) = oneshot::channel();
+    let db_path_host1 = db_path.clone();
+    let profile_host1 = profile.clone();
+    let hello_config_host1 = hello_config.clone();
+    let host1 = tokio::spawn(async move {
+        let listener = HelloListener::bind(&profile_host1, hello_config_host1).expect("bind1");
+        let _ = bound1_tx.send(());
+        let mut connection = listener.accept().await.expect("accept1");
+        let accepted = connection.accepted_hello();
+        let mut bus = CommandBus::open(&db_path_host1).expect("open bus1");
+        connection
+            .serve_request(&mut bus)
+            .await
+            .expect("serve create");
+        let _ = hello1_tx.send(accepted);
+        drop(connection);
+        drop(bus);
+    });
+
+    timeout(OUTER_TIMEOUT, bound1_rx)
+        .await
+        .expect("bound1 timeout")
+        .expect("bound1");
+
+    let mut client = timeout(OUTER_TIMEOUT, async {
+        HostClient::connect(HostClientConfig {
+            named_profile: profile.clone(),
+            client_build: "devmanager/0.4.2".to_string(),
+            client_id,
+            requested,
+            limits: FrameLimits::v1_default(),
+        })
+        .await
+    })
+    .await
+    .expect("connect timeout")
+    .expect("HostClient connect");
+
+    assert_eq!(client.client_id(), client_id);
+    assert_eq!(client.endpoint(), endpoint);
+    assert_eq!(client.granted_capabilities(), requested);
+
+    let receipt = timeout(OUTER_TIMEOUT, client.execute_command(create))
+        .await
+        .expect("execute timeout")
+        .expect("execute create");
+    let operation_id = match receipt {
+        CommandReceipt::Accepted {
+            operation_id,
+            command_id: accepted_command,
+            ..
+        } => {
+            assert_eq!(accepted_command, command_id);
+            operation_id
+        }
+        other => panic!("expected Accepted receipt, got {other:?}"),
+    };
+    assert!(matches!(
+        client.tracked_operation(operation_id),
+        Some(TrackedOperation::Pending {
+            command_id: tracked_command
+        }) if *tracked_command == command_id
+    ));
+
+    let accepted1 = timeout(OUTER_TIMEOUT, hello1_rx)
+        .await
+        .expect("hello1 timeout")
+        .expect("hello1");
+    assert_eq!(accepted1.client_id, client_id);
+    let connection_id_1 = accepted1.server_hello.connection_id;
+    assert_eq!(client.connection_id(), connection_id_1);
+    timeout(OUTER_TIMEOUT, host1)
+        .await
+        .expect("host1 join timeout")
+        .expect("host1");
+
+    client.disconnect();
+    assert!(
+        matches!(
+            client.tracked_operation(operation_id),
+            Some(TrackedOperation::Pending { .. })
+        ),
+        "disconnect must preserve pending tracking"
+    );
+
+    let (bound2_tx, bound2_rx) = oneshot::channel::<()>();
+    let (hello2_tx, hello2_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let db_path_host2 = db_path.clone();
+    let profile_host2 = profile.clone();
+    let hello_config_host2 = hello_config.clone();
+    let host2 = tokio::spawn(async move {
+        let listener = HelloListener::bind(&profile_host2, hello_config_host2).expect("bind2");
+        let _ = bound2_tx.send(());
+        let mut connection = listener.accept().await.expect("accept2");
+        let accepted = connection.accepted_hello();
+        let _ = hello2_tx.send(accepted);
+        release_rx.await.expect("release signal");
+        let mut bus = CommandBus::open(&db_path_host2).expect("open bus2 after release");
+        connection
+            .serve_request(&mut bus)
+            .await
+            .expect("serve operation status");
+    });
+
+    timeout(OUTER_TIMEOUT, bound2_rx)
+        .await
+        .expect("bound2 timeout")
+        .expect("bound2");
+
+    // This is a focused attach-path proof: reconnect does not need the active
+    // host database. The later child-process gate observes canonical client
+    // handles across the complete lifecycle.
+    let canary = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&db_path)
+        .expect("exclusive hold on kernel.sqlite3");
+
+    timeout(OUTER_TIMEOUT, client.reconnect())
+        .await
+        .expect("reconnect timeout")
+        .expect("reconnect while kernel db exclusively held");
+
+    let accepted2 = timeout(OUTER_TIMEOUT, hello2_rx)
+        .await
+        .expect("hello2 timeout")
+        .expect("hello2");
+    assert_eq!(accepted2.client_id, client_id);
+    assert_eq!(accepted1.client_id, accepted2.client_id);
+    let connection_id_2 = accepted2.server_hello.connection_id;
+    assert_ne!(connection_id_1, connection_id_2);
+    assert_eq!(client.client_id(), client_id);
+    assert_eq!(client.connection_id(), connection_id_2);
+    assert_eq!(client.granted_capabilities(), requested);
+    assert!(matches!(
+        client.tracked_operation(operation_id),
+        Some(TrackedOperation::Pending { .. })
+    ));
+
+    drop(canary);
+    let _ = release_tx.send(());
+
+    let state = timeout(OUTER_TIMEOUT, client.refresh_operation(operation_id))
+        .await
+        .expect("refresh timeout")
+        .expect("refresh operation")
+        .expect("operation status query outcome");
+    assert!(
+        matches!(state, OperationState::Settled { .. }),
+        "expected Settled after refresh, got {state:?}"
+    );
+    assert!(matches!(
+        client.tracked_operation(operation_id),
+        Some(TrackedOperation::Resolved {
+            command_id: tracked_command,
+            state: OperationState::Settled { .. },
+        }) if *tracked_command == command_id
+    ));
+
+    timeout(OUTER_TIMEOUT, host2)
+        .await
+        .expect("host2 join timeout")
+        .expect("host2");
+
+    drop(root);
 }
