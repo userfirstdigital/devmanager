@@ -1397,6 +1397,22 @@ fn protocol_operation_state_preserves_every_closed_named_shape() {
         rmp_serde::to_vec(&"side_effect_failed").unwrap()
     );
     assert_eq!(
+        rmp_serde::to_vec(&OperationErrorCode::CleanupFailed).unwrap(),
+        rmp_serde::to_vec(&"cleanup_failed").unwrap()
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<OperationErrorCode>(&rmp_serde::to_vec(&"cleanup_failed").unwrap())
+            .expect("decode cleanup_failed"),
+        OperationErrorCode::CleanupFailed
+    );
+    assert!(
+        rmp_serde::from_slice::<OperationErrorCode>(
+            &rmp_serde::to_vec(&"not_a_real_error_code").unwrap()
+        )
+        .is_err(),
+        "unknown OperationErrorCode must reject"
+    );
+    assert_eq!(
         rmp_serde::to_vec(&CancellationReason::Superseded).unwrap(),
         rmp_serde::to_vec(&"superseded").unwrap()
     );
@@ -1413,6 +1429,10 @@ fn protocol_operation_state_preserves_every_closed_named_shape() {
         OperationState::Failed {
             settled_at_ms: 1_725_000_000_300,
             code: OperationErrorCode::SideEffectFailed,
+        },
+        OperationState::Failed {
+            settled_at_ms: 1_725_000_000_303,
+            code: OperationErrorCode::CleanupFailed,
         },
         OperationState::Cancelled {
             settled_at_ms: 1_725_000_000_301,

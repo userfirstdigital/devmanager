@@ -14,6 +14,7 @@ pub const MAX_EXTERNAL_IDENTITY_BYTES: usize = 256;
 #[serde(rename_all = "snake_case")]
 pub enum OperationErrorCode {
     SideEffectFailed,
+    CleanupFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,6 +67,7 @@ macro_rules! impl_named_code_deserialize {
 
 impl_named_code_deserialize!(OperationErrorCode, "a named OperationErrorCode", {
     SideEffectFailed => "side_effect_failed",
+    CleanupFailed => "cleanup_failed",
 });
 impl_named_code_deserialize!(CancellationReason, "a named CancellationReason", {
     Superseded => "superseded",

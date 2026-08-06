@@ -48,7 +48,7 @@ impl ProcessEmptyTeardownWorker {
 /// Result of one Closing host-cleanup journal advancement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostCleanupProgress {
-    /// Host admission is Open, or every fixed branch is already journaled.
+    /// Host admission is Open, journal already terminalized, or nothing to do.
     Idle,
     /// TaskTeardowns settled one process-empty teardown without terminalizing.
     Progressed {
@@ -61,6 +61,17 @@ pub enum HostCleanupProgress {
         action_epoch: u64,
         branch: HostCleanupBranch,
         outcome: HostCleanupBranchOutcome,
+    },
+    /// Complete all-success journal; physical exit is deferred to a later slice.
+    ReadyToExit {
+        operation_id: OperationId,
+        action_epoch: u64,
+    },
+    /// Complete journal with ≥1 failed branch; durable `OperationFailed(CleanupFailed)` appended.
+    Failed {
+        operation_id: OperationId,
+        action_epoch: u64,
+        settled_at_ms: i64,
     },
 }
 
@@ -89,6 +100,22 @@ impl HostCleanupWorker {
                 action_epoch,
                 branch,
                 outcome,
+            }),
+            HostCleanupUnit::ReadyToExit {
+                operation_id,
+                action_epoch,
+            } => Ok(HostCleanupProgress::ReadyToExit {
+                operation_id,
+                action_epoch,
+            }),
+            HostCleanupUnit::Failed {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
+            } => Ok(HostCleanupProgress::Failed {
+                operation_id,
+                action_epoch,
+                settled_at_ms,
             }),
         }
     }

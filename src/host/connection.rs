@@ -645,9 +645,10 @@ impl HostRequestExecutor {
         let closing = self.bus.host_admission_is_closing()?;
         let fan_out = if closing {
             match HostCleanupWorker::run_once(&mut self.bus)? {
-                HostCleanupProgress::Idle => false,
+                HostCleanupProgress::Idle | HostCleanupProgress::ReadyToExit { .. } => false,
                 HostCleanupProgress::Progressed { .. }
-                | HostCleanupProgress::BranchCompleted { .. } => true,
+                | HostCleanupProgress::BranchCompleted { .. }
+                | HostCleanupProgress::Failed { .. } => true,
             }
         } else {
             match ProcessEmptyTeardownWorker::run_once(&mut self.bus)? {
@@ -4000,5 +4001,265 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_cleanup_executor_maintenance_fans_out_cleanup_failed() {
+        use super::{
+            ConnectionOutputId, HostRequestExecutor, OutputInspection, PrioritizedOutbound,
+        };
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
+        };
+        use crate::domain::event::Event;
+        use crate::domain::id::{
+            AgentSessionId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId,
+        };
+        use crate::domain::operation::OperationErrorCode;
+        use crate::domain::query::{Query, QueryEnvelope};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskLifecycle, WorkspaceRef,
+        };
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{
+            Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
+            ProtocolVersion, ServerMessage,
+        };
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-failed-fanout.db");
+        {
+            let mut bus = CommandBus::open(&db_path).expect("seed");
+            let task = TaskId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x41,
+            ])
+            .expect("task");
+            bus.execute(CommandEnvelope {
+                command_id: CommandId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x42,
+                ])
+                .expect("create cmd"),
+                client_id: ClientId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x20,
+                ])
+                .expect("client"),
+                task_id: None,
+                issued_at_ms: 1_725_000_000_100,
+                expected_task_revision: None,
+                command: Command::CreateTask(CreateTaskIntent {
+                    id: task,
+                    environment_id: EnvironmentId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x21,
+                    ])
+                    .expect("env"),
+                    title: "cleanup failed fanout".into(),
+                    description: None,
+                    project_id: ProjectId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x22,
+                    ])
+                    .expect("project"),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    created_at_ms: 1_725_000_000_000,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                }),
+            })
+            .expect("create");
+            bus.execute(CommandEnvelope {
+                command_id: CommandId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x43,
+                ])
+                .expect("agent cmd"),
+                client_id: ClientId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x20,
+                ])
+                .expect("client"),
+                task_id: Some(task),
+                issued_at_ms: 1_725_000_000_100,
+                expected_task_revision: Some(1),
+                command: Command::RegisterAgentSession {
+                    agent: AgentSessionFacts {
+                        id: AgentSessionId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0xa1,
+                        ])
+                        .expect("agent"),
+                        task_id: task,
+                        role: AgentRole::Primary,
+                        provider_kind: "claude".into(),
+                        provider_session_id: Some("session-fanout".into()),
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 0,
+                        revision: 0,
+                    },
+                },
+            })
+            .expect("register agent");
+        }
+
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let id = Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf1,
+        ]);
+        let (out, mut ports) = ConnectionOutputHandle::with_connection_id(id, 4, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf2,
+        ])
+        .expect("client");
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::HostShutdown,
+                Capability::EventReplay,
+                Capability::PagedSnapshots,
+            ]),
+            limits: FrameLimits::v1_default(),
+        };
+        let handle = requests.with_output(reg.id());
+        let open = handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf4,
+                    ])
+                    .expect("req"),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open replay");
+        assert!(matches!(open, ServerMessage::QueryReply(_)));
+
+        let inspect = handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf5,
+                    ])
+                    .expect("inspect req"),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::InspectHostQuit,
+                }),
+            )
+            .await
+            .expect("inspect quit");
+        let inspection_id = match inspect {
+            ServerMessage::QueryReply(reply) => match reply.outcome {
+                crate::domain::query::QueryOutcome::Ok(
+                    crate::domain::query::QueryResult::HostQuitInspection { inspection },
+                ) => inspection.inspection_id,
+                other => panic!("expected HostQuitInspection, got {other:?}"),
+            },
+            other => panic!("expected QueryReply, got {other:?}"),
+        };
+
+        let confirm = handle
+            .execute(
+                negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf3,
+                    ])
+                    .expect("cmd"),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_500,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                        inspection_id,
+                        allow_uninspected_worktrees: true,
+                    }),
+                }),
+            )
+            .await
+            .expect("confirm");
+        let quit_op = match confirm {
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted { operation_id, .. }) => {
+                operation_id
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        for _ in 0..4 {
+            requests.run_maintenance_once().await.expect("branch tick");
+        }
+        while let Some(outbound) = ports.try_recv_prioritized() {
+            let _ = outbound;
+        }
+
+        requests
+            .run_maintenance_once()
+            .await
+            .expect("failure terminal tick");
+        let mut saw_failed = false;
+        while let Some(outbound) = ports.try_recv_prioritized() {
+            if matches!(&outbound, PrioritizedOutbound::Durable(_)) {
+                if let ServerMessage::DurableEvent { event, .. } = outbound.message() {
+                    if let Event::OperationFailed(fact) = &event.payload {
+                        assert_eq!(fact.operation_id, quit_op);
+                        assert_eq!(fact.code, OperationErrorCode::CleanupFailed);
+                        assert_eq!(fact.action_epoch, Some(1));
+                        saw_failed = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_failed,
+            "Failed terminalization must fan out OperationFailed"
+        );
+
+        let inspect = requests
+            .inspect_output(ConnectionOutputId::from_uuid(id))
+            .await
+            .expect("inspect");
+        assert_eq!(
+            inspect,
+            OutputInspection {
+                registered: true,
+                live_bound: true,
+            }
+        );
+
+        requests
+            .run_maintenance_once()
+            .await
+            .expect("post-terminal idle");
+        assert!(
+            ports.try_recv_prioritized().is_none(),
+            "idempotent Idle must not invent additional durables"
+        );
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+        let _ = TaskLifecycle::Open;
     }
 }

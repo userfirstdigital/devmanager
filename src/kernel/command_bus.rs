@@ -71,6 +71,15 @@ pub(crate) enum HostCleanupUnit {
         branch: HostCleanupBranch,
         outcome: HostCleanupBranchOutcome,
     },
+    ReadyToExit {
+        operation_id: OperationId,
+        action_epoch: u64,
+    },
+    Failed {
+        operation_id: OperationId,
+        action_epoch: u64,
+        settled_at_ms: i64,
+    },
 }
 
 /// Host-facing command facade. Owns the durable store; does not expose SQLite.
@@ -335,15 +344,17 @@ fn operation_state_from_validated_projection(
         }
         "failed" => {
             let settled_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
-            if settled_at_ms < operation.accepted_at_ms
-                || operation.result.is_some()
-                || operation.outcome_code.as_deref() != Some("side_effect_failed")
-            {
+            if settled_at_ms < operation.accepted_at_ms || operation.result.is_some() {
                 return Err(StoreError::Corruption);
             }
+            let code = match operation.outcome_code.as_deref() {
+                Some("side_effect_failed") => OperationErrorCode::SideEffectFailed,
+                Some("cleanup_failed") => OperationErrorCode::CleanupFailed,
+                _ => return Err(StoreError::Corruption),
+            };
             Ok(OperationState::Failed {
                 settled_at_ms,
-                code: OperationErrorCode::SideEffectFailed,
+                code,
             })
         }
         "cancelled" => {
@@ -403,6 +414,16 @@ mod operation_status_tests {
                 OperationState::Failed {
                     settled_at_ms: 120,
                     code: OperationErrorCode::SideEffectFailed,
+                },
+            ),
+            (
+                "failed",
+                None,
+                Some("cleanup_failed"),
+                Some(125),
+                OperationState::Failed {
+                    settled_at_ms: 125,
+                    code: OperationErrorCode::CleanupFailed,
                 },
             ),
             (
@@ -2215,10 +2236,6 @@ pub(crate) fn validate_rebuilt_host_admission(tx: &Transaction<'_>) -> Result<()
     if operation.task_id.is_some()
         || operation.resource_id.is_some()
         || operation.runtime_generation.is_some()
-        || operation.state != "accepted"
-        || operation.result.is_some()
-        || operation.outcome_code.is_some()
-        || operation.outcome_at_ms.is_some()
     {
         return Err(StoreError::Corruption);
     }
@@ -2229,6 +2246,33 @@ pub(crate) fn validate_rebuilt_host_admission(tx: &Transaction<'_>) -> Result<()
     if admission.action_epoch != action_epoch || admission.updated_at_ms != operation.accepted_at_ms
     {
         return Err(StoreError::Corruption);
+    }
+
+    match operation.state.as_str() {
+        "accepted" => {
+            if operation.result.is_some()
+                || operation.outcome_code.is_some()
+                || operation.outcome_at_ms.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+        }
+        "failed" => {
+            if operation.result.is_some()
+                || operation.outcome_code.as_deref() != Some("cleanup_failed")
+                || operation.outcome_at_ms.is_none()
+            {
+                return Err(StoreError::Corruption);
+            }
+            let journal = load_ordered_host_cleanup_journal_outcomes(tx, admission.operation_id)?;
+            if !journal
+                .iter()
+                .any(|(_, outcome)| matches!(outcome, HostCleanupBranchOutcome::Failed { .. }))
+            {
+                return Err(StoreError::Corruption);
+            }
+        }
+        _ => return Err(StoreError::Corruption),
     }
 
     let command_bytes: Vec<u8> = tx.query_row(
@@ -2517,10 +2561,6 @@ fn validate_host_admission_accepted_receipt(
     if operation.task_id.is_some()
         || operation.resource_id.is_some()
         || operation.runtime_generation.is_some()
-        || operation.state != "accepted"
-        || operation.result.is_some()
-        || operation.outcome_code.is_some()
-        || operation.outcome_at_ms.is_some()
     {
         return Err(StoreError::Corruption);
     }
@@ -2609,7 +2649,228 @@ fn validate_host_admission_accepted_receipt(
     {
         return Err(StoreError::Corruption);
     }
+
+    match operation.state.as_str() {
+        "accepted" => {
+            if operation.result.is_some()
+                || operation.outcome_code.is_some()
+                || operation.outcome_at_ms.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            // Event-only forged host terminals must fail closed while projection
+            // still reports Accepted.
+            require_host_operation_terminal_match_count(tx, command_id, expected_operation_id, 0)?;
+            Ok(())
+        }
+        "failed" => {
+            if operation.result.is_some()
+                || operation.outcome_code.as_deref() != Some("cleanup_failed")
+            {
+                return Err(StoreError::Corruption);
+            }
+            let settled_at_ms = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
+            validate_current_host_cleanup_journal(tx, &admission)?;
+            let journal = load_ordered_host_cleanup_journal_outcomes(tx, expected_operation_id)?;
+            let journal_max_completed_at_ms =
+                host_cleanup_journal_max_completed_at(tx, expected_operation_id)?;
+            let terminal =
+                require_exact_host_cleanup_failed_terminal(tx, command_id, expected_operation_id)?;
+            if terminal.occurred_at_ms != settled_at_ms
+                || terminal.fact.settled_at_ms != settled_at_ms
+                || terminal.fact.code != OperationErrorCode::CleanupFailed
+                || !terminal.fact.source.is_dispatch()
+                || terminal.fact.action_epoch != Some(action_epoch)
+                || terminal.fact.command_id != command_id
+                || terminal.fact.operation_id != expected_operation_id
+                || terminal.fact.resource_id.is_some()
+                || terminal.fact.runtime_generation.is_some()
+                || terminal.task_id.is_some()
+                || terminal.task_revision.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            let prior = load_global_event_before(tx, terminal.sequence)?;
+            crate::kernel::lineage::validate_host_admission_cleanup_failed_lineage(
+                &terminal.fact,
+                settled_at_ms,
+                prior
+                    .as_ref()
+                    .map(|(id, ev, rev, occurred, task)| (*id, ev, *rev, *occurred, *task)),
+                &journal,
+                journal_max_completed_at_ms,
+                command_id,
+                expected_operation_id,
+                action_epoch,
+                false,
+            )?;
+            Ok(())
+        }
+        _ => Err(StoreError::Corruption),
+    }
+}
+
+struct HostCleanupFailedTerminal {
+    sequence: u64,
+    occurred_at_ms: i64,
+    task_id: Option<TaskId>,
+    task_revision: Option<u64>,
+    fact: OperationFailedFact,
+}
+
+enum HostOperationTerminalKind {
+    Settled,
+    Failed(OperationFailedFact),
+    Cancelled,
+    Uncertain,
+}
+
+struct HostOperationTerminalMatch {
+    sequence: u64,
+    occurred_at_ms: i64,
+    task_id: Option<TaskId>,
+    task_revision: Option<u64>,
+    kind: HostOperationTerminalKind,
+}
+
+/// Scan all durable operation terminal kinds for host quit identity matches.
+/// One-sided command_id/operation_id matches are Corruption; unrelated terminals are ignored.
+fn scan_host_operation_terminals(
+    tx: &Connection,
+    expected_command_id: CommandId,
+    expected_operation_id: OperationId,
+) -> Result<Vec<HostOperationTerminalMatch>, StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT sequence, event_id, task_id, task_revision, event_type, schema_version, payload, occurred_at_ms
+         FROM events
+         WHERE event_type IN (
+             'operation.settled',
+             'operation.failed',
+             'operation.cancelled',
+             'operation.uncertain'
+         )
+         ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    })?;
+    let mut matches = Vec::new();
+    for row in rows {
+        let (
+            sequence_i64,
+            _event_id_bytes,
+            task_bytes,
+            task_revision,
+            event_type,
+            schema_version,
+            payload,
+            occurred_at_ms,
+        ) = row?;
+        let sequence = u64_from_nonnegative_i64("events.sequence", sequence_i64)?;
+        let event =
+            crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
+        let (command_id, operation_id, kind) = match event {
+            Event::OperationSettled(fact) => (
+                fact.command_id,
+                fact.operation_id,
+                HostOperationTerminalKind::Settled,
+            ),
+            Event::OperationFailed(fact) => (
+                fact.command_id,
+                fact.operation_id,
+                HostOperationTerminalKind::Failed(fact),
+            ),
+            Event::OperationCancelled(fact) => (
+                fact.command_id,
+                fact.operation_id,
+                HostOperationTerminalKind::Cancelled,
+            ),
+            Event::OperationUncertain(fact) => (
+                fact.command_id,
+                fact.operation_id,
+                HostOperationTerminalKind::Uncertain,
+            ),
+            _ => return Err(StoreError::Corruption),
+        };
+        let command_match = command_id == expected_command_id;
+        let operation_match = operation_id == expected_operation_id;
+        match (command_match, operation_match) {
+            (false, false) => continue,
+            (true, true) => {
+                let task_id = parse_optional_task_scope("events.task_id", task_bytes)?;
+                let task_revision = match task_revision {
+                    Some(v) => Some(u64_from_nonnegative_i64("events.task_revision", v)?),
+                    None => None,
+                };
+                matches.push(HostOperationTerminalMatch {
+                    sequence,
+                    occurred_at_ms,
+                    task_id,
+                    task_revision,
+                    kind,
+                });
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+    Ok(matches)
+}
+
+fn require_host_operation_terminal_match_count(
+    tx: &Connection,
+    expected_command_id: CommandId,
+    expected_operation_id: OperationId,
+    expected_count: usize,
+) -> Result<(), StoreError> {
+    let matches = scan_host_operation_terminals(tx, expected_command_id, expected_operation_id)?;
+    if matches.len() != expected_count {
+        return Err(StoreError::Corruption);
+    }
     Ok(())
+}
+
+fn require_exact_host_cleanup_failed_terminal(
+    tx: &Connection,
+    expected_command_id: CommandId,
+    expected_operation_id: OperationId,
+) -> Result<HostCleanupFailedTerminal, StoreError> {
+    let mut matches =
+        scan_host_operation_terminals(tx, expected_command_id, expected_operation_id)?;
+    if matches.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    let matched = matches.remove(0);
+    let HostOperationTerminalKind::Failed(fact) = matched.kind else {
+        return Err(StoreError::Corruption);
+    };
+    Ok(HostCleanupFailedTerminal {
+        sequence: matched.sequence,
+        occurred_at_ms: matched.occurred_at_ms,
+        task_id: matched.task_id,
+        task_revision: matched.task_revision,
+        fact,
+    })
+}
+
+fn host_cleanup_journal_max_completed_at(
+    tx: &Connection,
+    operation_id: OperationId,
+) -> Result<i64, StoreError> {
+    let max_completed: Option<i64> = tx.query_row(
+        "SELECT MAX(completed_at_ms) FROM host_cleanup_branches WHERE operation_id = ?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    max_completed.ok_or(StoreError::Corruption)
 }
 
 fn validate_pure_accepted_receipt(
@@ -4007,6 +4268,7 @@ fn enforce_command_decision_lifecycle_gate(
 fn error_code_text(value: OperationErrorCode) -> &'static str {
     match value {
         OperationErrorCode::SideEffectFailed => "side_effect_failed",
+        OperationErrorCode::CleanupFailed => "cleanup_failed",
     }
 }
 
@@ -6029,7 +6291,7 @@ pub(crate) fn advance_next_host_cleanup_unit_in_tx(
     };
     validate_current_host_cleanup_journal(tx, &admission)?;
     let Some(branch) = next_absent_host_cleanup_branch(tx, admission.operation_id)? else {
-        return Ok(HostCleanupUnit::Idle);
+        return finalize_complete_host_cleanup_journal_in_tx(tx, &admission, now_ms);
     };
 
     match branch {
@@ -6141,6 +6403,145 @@ fn next_absent_host_cleanup_branch(
         }
     }
     Ok(next)
+}
+
+fn load_ordered_host_cleanup_journal_outcomes(
+    tx: &Connection,
+    operation_id: OperationId,
+) -> Result<Vec<(HostCleanupBranch, HostCleanupBranchOutcome)>, StoreError> {
+    let mut journal = Vec::with_capacity(HostCleanupBranch::ORDER.len());
+    for branch in HostCleanupBranch::ORDER {
+        let row: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT result, remaining_count FROM host_cleanup_branches
+                 WHERE operation_id = ?1 AND branch = ?2",
+                rusqlite::params![operation_id.as_bytes().as_slice(), branch.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((result, remaining_count)) = row else {
+            break;
+        };
+        let remaining =
+            u64_from_nonnegative_i64("host_cleanup_branches.remaining_count", remaining_count)?;
+        let outcome = match result.as_str() {
+            "succeeded" if remaining == 0 => HostCleanupBranchOutcome::succeeded(),
+            "failed" => {
+                HostCleanupBranchOutcome::failed(remaining).ok_or(StoreError::Corruption)?
+            }
+            _ => return Err(StoreError::Corruption),
+        };
+        journal.push((branch, outcome));
+    }
+    if journal.len() != HostCleanupBranch::ORDER.len() {
+        return Err(StoreError::Corruption);
+    }
+    Ok(journal)
+}
+
+fn finalize_complete_host_cleanup_journal_in_tx(
+    tx: &Transaction<'_>,
+    admission: &HostAdmissionRow,
+    now_ms: i64,
+) -> Result<HostCleanupUnit, StoreError> {
+    let operation = load_operation_projection_by_id(tx, admission.operation_id)?
+        .ok_or(StoreError::Corruption)?;
+    match operation.state.as_str() {
+        "failed" => {
+            if operation.outcome_code.as_deref() != Some("cleanup_failed")
+                || operation.result.is_some()
+                || operation.outcome_at_ms.is_none()
+            {
+                return Err(StoreError::Corruption);
+            }
+            Ok(HostCleanupUnit::Idle)
+        }
+        "accepted" => {
+            if operation.result.is_some()
+                || operation.outcome_code.is_some()
+                || operation.outcome_at_ms.is_some()
+            {
+                return Err(StoreError::Corruption);
+            }
+            let journal = load_ordered_host_cleanup_journal_outcomes(tx, admission.operation_id)?;
+            let any_failed = journal
+                .iter()
+                .any(|(_, outcome)| matches!(outcome, HostCleanupBranchOutcome::Failed { .. }));
+            if !any_failed {
+                return Ok(HostCleanupUnit::ReadyToExit {
+                    operation_id: admission.operation_id,
+                    action_epoch: admission.action_epoch,
+                });
+            }
+            terminalize_host_cleanup_failed_in_tx(tx, admission, &operation, &journal, now_ms)
+        }
+        _ => Err(StoreError::Corruption),
+    }
+}
+
+fn terminalize_host_cleanup_failed_in_tx(
+    tx: &Transaction<'_>,
+    admission: &HostAdmissionRow,
+    operation: &OperationProjectionRow,
+    journal: &[(HostCleanupBranch, HostCleanupBranchOutcome)],
+    now_ms: i64,
+) -> Result<HostCleanupUnit, StoreError> {
+    let command_bytes: Vec<u8> = tx.query_row(
+        "SELECT command_id FROM operations WHERE operation_id = ?1",
+        [admission.operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let command_id = id16::<CommandId>("operations.command_id", &command_bytes)?;
+    if operation.accepted_at_ms > now_ms {
+        return Err(StoreError::Corruption);
+    }
+    let failed = OperationFailedFact::with_source(
+        command_id,
+        admission.operation_id,
+        now_ms,
+        OperationErrorCode::CleanupFailed,
+        Some(admission.action_epoch),
+        None,
+        None,
+        OutcomeSource::Dispatch,
+    )
+    .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let max_sequence: i64 =
+        tx.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+    let next_sequence = u64_from_nonnegative_i64("events.sequence", max_sequence)?
+        .checked_add(1)
+        .ok_or(StoreError::Corruption)?;
+    let prior = load_global_event_before(tx, next_sequence)?;
+    let journal_max_completed_at_ms =
+        host_cleanup_journal_max_completed_at(tx, admission.operation_id)?;
+    crate::kernel::lineage::validate_host_admission_cleanup_failed_lineage(
+        &failed,
+        now_ms,
+        prior
+            .as_ref()
+            .map(|(id, ev, rev, occurred, task)| (*id, ev, *rev, *occurred, *task)),
+        journal,
+        journal_max_completed_at_ms,
+        command_id,
+        admission.operation_id,
+        admission.action_epoch,
+        false,
+    )?;
+    append_and_project(
+        tx,
+        EventId::new(),
+        None,
+        None,
+        now_ms,
+        Event::OperationFailed(failed),
+    )?;
+    Ok(HostCleanupUnit::Failed {
+        operation_id: admission.operation_id,
+        action_epoch: admission.action_epoch,
+        settled_at_ms: now_ms,
+    })
 }
 
 fn complete_host_cleanup_branch(

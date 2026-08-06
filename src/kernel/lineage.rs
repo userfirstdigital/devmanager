@@ -2,8 +2,10 @@
 //! strict task-history validation. One coherent model; callers map to
 //! Corruption (runtime integrity) or Projection (rebuild/projector).
 
-use crate::domain::event::{Event, OperationSettledFact};
-use crate::domain::id::{EventId, ResourceId, TaskId};
+use crate::domain::event::{Event, OperationFailedFact, OperationSettledFact};
+use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+use crate::domain::id::{CommandId, EventId, OperationId, ResourceId, TaskId};
+use crate::domain::operation::OperationErrorCode;
 use crate::kernel::store::StoreError;
 
 fn mismatch(as_projection: bool, detail: &str) -> StoreError {
@@ -246,17 +248,121 @@ pub(crate) fn validate_side_effect_settled_has_prior_derived(
 }
 
 /// Pure all-none operations are synchronous Dispatch settles only.
+/// Host-admission failure is permitted only through the exact CleanupFailed journal path.
 pub(crate) fn reject_pure_non_settled_terminal(
     kind: SettledLineageKind,
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    if matches!(
-        kind,
-        SettledLineageKind::Pure | SettledLineageKind::HostAdmission
-    ) {
+    if matches!(kind, SettledLineageKind::Pure) {
         return Err(mismatch(
             as_projection,
-            "pure/host-admission operation cannot become failed, cancelled, or uncertain",
+            "pure operation cannot become failed, cancelled, or uncertain",
+        ));
+    }
+    if matches!(kind, SettledLineageKind::HostAdmission) {
+        return Err(mismatch(
+            as_projection,
+            "host-admission operation cannot become cancelled, uncertain, or non-cleanup failed",
+        ));
+    }
+    Ok(())
+}
+
+/// Host-admission `operation.failed` is valid only for CleanupFailed after a complete
+/// event-backed four-branch journal that contains at least one Failed branch, with the
+/// failed fact immediately following the final branch event.
+pub(crate) fn validate_host_admission_cleanup_failed_lineage(
+    fact: &OperationFailedFact,
+    failed_occurred_at_ms: i64,
+    prior: Option<(EventId, &Event, Option<u64>, i64, Option<TaskId>)>,
+    journal: &[(HostCleanupBranch, HostCleanupBranchOutcome)],
+    journal_max_completed_at_ms: i64,
+    expected_command_id: CommandId,
+    expected_operation_id: OperationId,
+    expected_action_epoch: u64,
+    as_projection: bool,
+) -> Result<(), StoreError> {
+    if failed_occurred_at_ms != fact.settled_at_ms {
+        return Err(mismatch(
+            as_projection,
+            "host-admission operation.failed occurred_at_ms must equal fact.settled_at_ms",
+        ));
+    }
+    if fact.command_id != expected_command_id
+        || fact.operation_id != expected_operation_id
+        || fact.action_epoch != Some(expected_action_epoch)
+        || fact.resource_id.is_some()
+        || fact.runtime_generation.is_some()
+        || fact.code != OperationErrorCode::CleanupFailed
+        || !fact.source.is_dispatch()
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed fact must match accepted ConfirmHostQuit identity/fence",
+        ));
+    }
+    if journal.len() != HostCleanupBranch::ORDER.len() {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed requires a complete four-branch cleanup journal",
+        ));
+    }
+    let mut any_failed = false;
+    for (idx, (branch, outcome)) in journal.iter().enumerate() {
+        if HostCleanupBranch::ORDER.get(idx) != Some(branch) {
+            return Err(mismatch(
+                as_projection,
+                "host-admission CleanupFailed journal must follow fixed branch ORDER",
+            ));
+        }
+        if matches!(outcome, HostCleanupBranchOutcome::Failed { .. }) {
+            any_failed = true;
+        }
+    }
+    if !any_failed {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed requires at least one failed cleanup branch",
+        ));
+    }
+    let Some((_, prior_event, prior_revision, prior_occurred, prior_task)) = prior else {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed must immediately follow the final cleanup branch event",
+        ));
+    };
+    if prior_revision.is_some() || prior_task.is_some() {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed prior cleanup event must be global-scoped",
+        ));
+    }
+    let Event::HostCleanupBranchCompleted {
+        operation_id,
+        action_epoch,
+        branch,
+        ..
+    } = prior_event
+    else {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed must immediately follow host.cleanup_branch_completed",
+        ));
+    };
+    if *operation_id != expected_operation_id
+        || *action_epoch != expected_action_epoch
+        || *branch != HostCleanupBranch::TaskTeardowns
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed must immediately follow the TaskTeardowns branch event",
+        ));
+    }
+    if failed_occurred_at_ms < prior_occurred || failed_occurred_at_ms < journal_max_completed_at_ms
+    {
+        return Err(mismatch(
+            as_projection,
+            "host-admission CleanupFailed must not predate the final cleanup branch timestamp",
         ));
     }
     Ok(())

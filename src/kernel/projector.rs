@@ -16,8 +16,9 @@ use crate::domain::task::{
 };
 use crate::kernel::lineage::{
     classify_operation_settled_fact, classify_settled_lineage_fence, is_derived_lifecycle_result,
-    reject_pure_non_settled_terminal, validate_pure_settled_lineage,
-    validate_side_effect_settled_has_prior_derived, SettledLineageKind,
+    reject_pure_non_settled_terminal, validate_host_admission_cleanup_failed_lineage,
+    validate_pure_settled_lineage, validate_side_effect_settled_has_prior_derived,
+    SettledLineageKind,
 };
 use crate::kernel::store::{
     decode_stored_event, u64_from_nonnegative_i64, u64_to_sqlite_i64, StoreError,
@@ -554,7 +555,29 @@ pub(crate) fn apply_event(
                 event.task_id,
                 true,
             )?;
-            reject_pure_non_settled_terminal(kind, true)?;
+            if matches!(kind, SettledLineageKind::HostAdmission) {
+                let (journal, journal_max_completed_at_ms) =
+                    load_host_cleanup_journal_outcomes(tx, shadow, fact.operation_id)?;
+                let prior = load_prior_event_row(tx, event.sequence)?;
+                let prior_ref = prior
+                    .as_ref()
+                    .map(|(id, ev, rev, occurred, task)| (*id, ev, *rev, *occurred, *task));
+                validate_host_admission_cleanup_failed_lineage(
+                    fact,
+                    event.occurred_at_ms,
+                    prior_ref,
+                    &journal,
+                    journal_max_completed_at_ms,
+                    fact.command_id,
+                    fact.operation_id,
+                    fact.action_epoch.ok_or(StoreError::Projection(
+                        "host-admission CleanupFailed requires action_epoch".into(),
+                    ))?,
+                    true,
+                )?;
+            } else {
+                reject_pure_non_settled_terminal(kind, true)?;
+            }
             if event.occurred_at_ms != fact.settled_at_ms {
                 return Err(StoreError::Projection(
                     "operation.failed envelope occurred_at_ms must equal fact.settled_at_ms".into(),
@@ -1583,6 +1606,7 @@ fn resource_lifecycle_text(value: ResourceLifecycle) -> &'static str {
 fn error_code_text(value: OperationErrorCode) -> &'static str {
     match value {
         OperationErrorCode::SideEffectFailed => "side_effect_failed",
+        OperationErrorCode::CleanupFailed => "cleanup_failed",
     }
 }
 
@@ -1596,6 +1620,52 @@ fn uncertain_text(value: OperationUncertaintyCode) -> &'static str {
     match value {
         OperationUncertaintyCode::AmbiguousDispatch => "ambiguous_dispatch",
     }
+}
+
+fn load_host_cleanup_journal_outcomes(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    operation_id: crate::domain::id::OperationId,
+) -> Result<(Vec<(HostCleanupBranch, HostCleanupBranchOutcome)>, i64), StoreError> {
+    let table = table_name("host_cleanup_branches", shadow);
+    let mut journal = Vec::with_capacity(HostCleanupBranch::ORDER.len());
+    let mut max_completed_at_ms = i64::MIN;
+    for branch in HostCleanupBranch::ORDER {
+        let row: Option<(String, i64, i64)> = tx
+            .query_row(
+                &format!(
+                    "SELECT result, remaining_count, completed_at_ms FROM {table}
+                     WHERE operation_id = ?1 AND branch = ?2"
+                ),
+                rusqlite::params![operation_id.as_bytes().as_slice(), branch.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((result, remaining_count, completed_at_ms)) = row else {
+            break;
+        };
+        let remaining =
+            u64_from_nonnegative_i64("host_cleanup_branches.remaining_count", remaining_count)?;
+        let outcome = match result.as_str() {
+            "succeeded" if remaining == 0 => HostCleanupBranchOutcome::succeeded(),
+            "failed" => HostCleanupBranchOutcome::failed(remaining).ok_or_else(|| {
+                StoreError::Projection(
+                    "host_cleanup_branches Failed requires remaining_count > 0".into(),
+                )
+            })?,
+            _ => {
+                return Err(StoreError::Projection(
+                    "host_cleanup_branches result must be succeeded or failed".into(),
+                ))
+            }
+        };
+        max_completed_at_ms = max_completed_at_ms.max(completed_at_ms);
+        journal.push((branch, outcome));
+    }
+    if journal.is_empty() {
+        return Ok((journal, 0));
+    }
+    Ok((journal, max_completed_at_ms))
 }
 
 fn require_valid_operation_fact(result: Result<(), OutcomeFenceError>) -> Result<(), StoreError> {

@@ -3174,3 +3174,333 @@ async fn confirmed_quit_runs_cleanup_on_single_executor_but_keeps_foreground_hos
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_host_running() {
+    use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+    use devmanager::domain::event::Event;
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::id::AgentSessionId;
+    use devmanager::domain::operation::OperationErrorCode;
+
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x50)).expect("client");
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::HostShutdown,
+        Capability::PagedSnapshots,
+        Capability::EventReplay,
+    ]);
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+
+    let (create, _, task_id) =
+        create_task_named(client_id, 0x51, 0x52, 0x53, 0x54, "cleanup-failed residue");
+    assert!(matches!(
+        client.execute_command(create).await.expect("create task"),
+        CommandReceipt::Accepted { .. }
+    ));
+    let register_agent = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x55)).expect("register agent"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_150,
+        expected_task_revision: Some(1),
+        command: Command::RegisterAgentSession {
+            agent: AgentSessionFacts {
+                id: AgentSessionId::from_bytes(fixed_uuid_v7(0x56)).expect("agent"),
+                task_id,
+                role: AgentRole::Primary,
+                provider_kind: "claude".into(),
+                provider_session_id: Some("cleanup-failed-session".into()),
+                lifecycle: AgentSessionLifecycle::Open,
+                runtime_generation: 0,
+                revision: 0,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register_agent)
+            .await
+            .expect("register open agent"),
+        CommandReceipt::Accepted {
+            task_revision: Some(2),
+            ..
+        }
+    ));
+
+    let mut sub = ClientSubscription::new();
+    sub.synchronize(&mut client)
+        .await
+        .expect("pre-confirm synchronize");
+    assert_eq!(sub.state(), ClientSubscriptionState::Ready);
+    let pre_close_cursor = sub.model().expect("model").last_applied_sequence();
+
+    let inspection = client
+        .inspect_host_quit()
+        .await
+        .expect("inspect transport")
+        .expect("inspect query");
+    assert!(
+        !inspection.agents.is_empty(),
+        "open agent must appear as durable quit residue"
+    );
+    let confirm_command_id =
+        CommandId::from_bytes(fixed_uuid_v7(0x57)).expect("confirm command id");
+    let confirm = client
+        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
+        .await
+        .expect("confirm transport");
+    let operation_id = match &confirm {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision: None,
+            ..
+        } => *operation_id,
+        other => panic!("expected taskless Accepted, got {other:?}"),
+    };
+
+    let expected_order = HostCleanupBranch::ORDER;
+    let mut saw_close_begun = false;
+    let mut saw_operation_accepted = false;
+    let mut observed_branches = Vec::new();
+    let mut failed_fact = None;
+    let started = Instant::now();
+    while failed_fact.is_none() {
+        if let Some(status) = host
+            .try_wait()
+            .expect("poll host while waiting cleanup failure")
+        {
+            let diagnostics = host.exited_diagnostics(status);
+            panic!("foreground host exited during cleanup failure journal: {diagnostics}");
+        }
+        let update = timeout(READY_TIMEOUT, sub.recv_and_apply(&client))
+            .await
+            .expect("live cleanup/failure apply stayed bounded")
+            .expect("live cleanup/failure apply");
+        match update {
+            SubscriptionUpdate::DurableEvent(event) => match event.payload {
+                Event::HostCloseBegun {
+                    operation_id: event_op,
+                    action_epoch,
+                    inspection_id,
+                } => {
+                    assert!(!saw_close_begun, "HostCloseBegun must be unique");
+                    assert!(
+                        observed_branches.is_empty(),
+                        "HostCloseBegun must precede cleanup branches"
+                    );
+                    assert_eq!(event_op, operation_id);
+                    assert_eq!(action_epoch, 1);
+                    assert_eq!(inspection_id, inspection.inspection_id);
+                    saw_close_begun = true;
+                }
+                Event::OperationAccepted(fact) => {
+                    assert!(
+                        saw_close_begun,
+                        "OperationAccepted must follow HostCloseBegun"
+                    );
+                    assert!(
+                        !saw_operation_accepted,
+                        "host quit OperationAccepted must be unique"
+                    );
+                    assert_eq!(fact.command_id, confirm_command_id);
+                    assert_eq!(fact.operation_id, operation_id);
+                    assert_eq!(fact.action_epoch, Some(1));
+                    assert!(fact.resource_id.is_none());
+                    assert!(fact.runtime_generation.is_none());
+                    saw_operation_accepted = true;
+                }
+                Event::HostCleanupBranchCompleted {
+                    operation_id: event_op,
+                    action_epoch,
+                    branch,
+                    outcome,
+                } => {
+                    assert!(
+                        saw_close_begun && saw_operation_accepted,
+                        "cleanup branches must follow the durable admission pair"
+                    );
+                    assert_eq!(event_op, operation_id);
+                    assert_eq!(action_epoch, 1);
+                    assert!(
+                        matches!(
+                            outcome,
+                            HostCleanupBranchOutcome::Succeeded
+                                | HostCleanupBranchOutcome::Failed { .. }
+                        ),
+                        "branch outcome must be Succeeded or Failed, got {outcome:?}"
+                    );
+                    observed_branches.push(branch);
+                }
+                Event::OperationFailed(fact) => {
+                    assert!(
+                        saw_close_begun && saw_operation_accepted,
+                        "CleanupFailed must follow the durable admission pair"
+                    );
+                    assert_eq!(fact.operation_id, operation_id);
+                    assert_eq!(fact.command_id, confirm_command_id);
+                    assert_eq!(fact.code, OperationErrorCode::CleanupFailed);
+                    assert_eq!(fact.action_epoch, Some(1));
+                    assert_eq!(observed_branches.as_slice(), &expected_order);
+                    failed_fact = Some((event.sequence, fact.settled_at_ms));
+                }
+                other => {
+                    panic!("unexpected durable payload while waiting CleanupFailed: {other:?}")
+                }
+            },
+            other => {
+                panic!("unexpected subscription update while waiting CleanupFailed: {other:?}")
+            }
+        }
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "timed out waiting for CleanupFailed; branches={observed_branches:?}"
+        );
+    }
+    let (failed_sequence, settled_at_ms) = failed_fact.expect("failed fact");
+    assert!(
+        observed_branches
+            .iter()
+            .zip(expected_order.iter())
+            .all(|(got, expected)| got == expected),
+        "live cleanup branches must follow fixed ORDER: {observed_branches:?}"
+    );
+
+    let status = client
+        .refresh_operation(operation_id)
+        .await
+        .expect("status transport")
+        .expect("status query");
+    assert_eq!(
+        status,
+        OperationState::Failed {
+            settled_at_ms,
+            code: OperationErrorCode::CleanupFailed,
+        }
+    );
+
+    let mid_identity = read_identity(&lock_path).expect("mid host identity");
+    assert_eq!(mid_identity.pid, original_identity.pid);
+    assert_eq!(mid_identity.boot_id, original_identity.boot_id);
+    assert!(
+        host.try_wait()
+            .expect("poll host after CleanupFailed")
+            .is_none(),
+        "CleanupFailed must keep the foreground host running"
+    );
+
+    client.disconnect();
+
+    let fresh_id = ClientId::from_bytes(fixed_uuid_v7(0x58)).expect("fresh client");
+    let mut fresh = connect_bounded(
+        &HostClientConfig {
+            named_profile: profile.clone(),
+            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+            client_id: fresh_id,
+            requested,
+            limits: FrameLimits::v1_default(),
+        },
+        &mut host,
+    )
+    .await;
+    assert_eq!(
+        fresh.host_boot_id(),
+        original_identity.boot_id,
+        "fresh client must attach to the same host boot"
+    );
+
+    let mut replayed_branches = Vec::new();
+    let mut replayed_failures = 0u32;
+    let mut batch = fresh
+        .open_event_replay(pre_close_cursor)
+        .await
+        .expect("replay open transport")
+        .expect("replay open query");
+    loop {
+        for event in &batch.page.events {
+            match &event.payload {
+                Event::HostCleanupBranchCompleted {
+                    operation_id: event_op,
+                    branch,
+                    ..
+                } if *event_op == operation_id => {
+                    replayed_branches.push(*branch);
+                }
+                Event::OperationFailed(fact) if fact.operation_id == operation_id => {
+                    assert_eq!(fact.code, OperationErrorCode::CleanupFailed);
+                    assert_eq!(event.sequence, failed_sequence);
+                    replayed_failures += 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(cursor) = batch.page.next_cursor.clone() else {
+            break;
+        };
+        batch = fresh
+            .continue_event_replay(batch.subscription_id, cursor)
+            .await
+            .expect("replay continue transport")
+            .expect("replay continue query");
+    }
+    fresh
+        .release_event_replay(batch.subscription_id)
+        .await
+        .expect("release replay transport")
+        .expect("release replay query");
+    assert_eq!(
+        replayed_branches.as_slice(),
+        &expected_order,
+        "reconnect replay must yield the same four cleanup branch events"
+    );
+    assert_eq!(
+        replayed_failures, 1,
+        "reconnect replay must include CleanupFailed exactly once"
+    );
+
+    let status = fresh
+        .refresh_operation(operation_id)
+        .await
+        .expect("fresh status transport")
+        .expect("fresh status query");
+    assert_eq!(
+        status,
+        OperationState::Failed {
+            settled_at_ms,
+            code: OperationErrorCode::CleanupFailed,
+        }
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    assert!(
+        host.try_wait()
+            .expect("poll host after fresh attach")
+            .is_none(),
+        "listener must still accept connections after CleanupFailed"
+    );
+
+    fresh.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact ChildGuard");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}

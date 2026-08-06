@@ -1453,16 +1453,22 @@ fn host_cleanup_advances_one_durable_branch_per_pass_and_resumes_after_reopen() 
     }
 
     assert_eq!(
-        HostCleanupWorker::run_once(&mut bus).expect("idle after four"),
-        HostCleanupProgress::Idle
+        HostCleanupWorker::run_once(&mut bus).expect("ready after four successes"),
+        HostCleanupProgress::ReadyToExit {
+            operation_id: quit_op,
+            action_epoch: 1,
+        }
     );
     drop(bus);
 
     {
         let mut bus = CommandBus::open(&path).expect("reopen after crash barrier");
         assert_eq!(
-            HostCleanupWorker::run_once(&mut bus).expect("resume idle"),
-            HostCleanupProgress::Idle
+            HostCleanupWorker::run_once(&mut bus).expect("resume ready"),
+            HostCleanupProgress::ReadyToExit {
+                operation_id: quit_op,
+                action_epoch: 1,
+            }
         );
     }
 
@@ -1722,8 +1728,11 @@ fn host_cleanup_task_branch_reuses_bounded_process_empty_teardown() {
         }
     );
     assert_eq!(
-        HostCleanupWorker::run_once(&mut bus).expect("idle"),
-        HostCleanupProgress::Idle
+        HostCleanupWorker::run_once(&mut bus).expect("ready after teardown branch"),
+        HostCleanupProgress::ReadyToExit {
+            operation_id: quit_op,
+            action_epoch: 1,
+        }
     );
     assert_eq!(
         bus.operation_status(quit_op).expect("quit still accepted"),
@@ -2219,4 +2228,953 @@ fn host_cleanup_branch_wrong_operation_epoch_or_duplicate_is_corruption_and_roll
         "duplicate must fail at projection gate, got {err:?}"
     );
     assert_eq!(host_cleanup_branch_rows(&path), before_rows);
+}
+
+fn drive_four_cleanup_branches(bus: &mut CommandBus, quit_op: OperationId) {
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    for branch in HostCleanupBranch::ORDER {
+        let progress = HostCleanupWorker::run_once(bus).expect("branch");
+        match progress {
+            HostCleanupProgress::BranchCompleted {
+                operation_id,
+                action_epoch,
+                branch: got,
+                ..
+            } => {
+                assert_eq!(operation_id, quit_op);
+                assert_eq!(action_epoch, 1);
+                assert_eq!(got, branch);
+            }
+            other => panic!("expected BranchCompleted for {branch:?}, got {other:?}"),
+        }
+    }
+}
+
+fn operation_failed_event_count(path: &Path) -> i64 {
+    let conn = open_raw(path);
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'operation.failed'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("count failed")
+}
+
+fn quit_command_id() -> CommandId {
+    command_id(0xF0)
+}
+
+#[test]
+fn host_cleanup_failed_journal_terminalizes_once_as_cleanup_failed() {
+    use devmanager::domain::operation::{OperationErrorCode, OperationState};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open");
+    let task = task_id(0x11);
+    bus.execute(envelope(
+        command_id(0x12),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create");
+    register_open_agent(&mut bus, task, command_id(0x13), 1);
+    let quit_op = confirm_host_quit(&mut bus);
+    let outbox_before = count_table(&path, "outbox");
+    let events_before_terminal = {
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        assert!(host_cleanup_branch_rows(&path)
+            .iter()
+            .any(|row| row.2 == "failed"));
+        assert_eq!(
+            bus.operation_status(quit_op).expect("pre-terminal"),
+            Some(OperationState::Accepted)
+        );
+        count_table(&path, "events")
+    };
+
+    let failed = HostCleanupWorker::run_once(&mut bus).expect("terminalize");
+    let HostCleanupProgress::Failed {
+        operation_id,
+        action_epoch,
+        settled_at_ms,
+    } = failed
+    else {
+        panic!("expected Failed progress, got {failed:?}");
+    };
+    assert_eq!(operation_id, quit_op);
+    assert_eq!(action_epoch, 1);
+    assert!(settled_at_ms > 0);
+    assert_eq!(count_table(&path, "events"), events_before_terminal + 1);
+    assert_eq!(operation_failed_event_count(&path), 1);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("failed status"),
+        Some(OperationState::Failed {
+            settled_at_ms,
+            code: OperationErrorCode::CleanupFailed,
+        })
+    );
+    assert!(
+        host_admission_row(&path).is_some(),
+        "admission stays Closing"
+    );
+    assert_eq!(count_table(&path, "outbox"), outbox_before);
+    assert_eq!(outbox_count_for_operation(&path, quit_op), 0);
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("idempotent"),
+        HostCleanupProgress::Idle
+    );
+    assert_eq!(operation_failed_event_count(&path), 1);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("still failed"),
+        Some(OperationState::Failed {
+            settled_at_ms,
+            code: OperationErrorCode::CleanupFailed,
+        })
+    );
+}
+
+#[test]
+fn host_cleanup_all_success_journal_reports_ready_to_exit_without_settling() {
+    use devmanager::domain::operation::OperationState;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open");
+    let quit_op = confirm_host_quit(&mut bus);
+    let events_after_journal = {
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        count_table(&path, "events")
+    };
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("ready"),
+        HostCleanupProgress::ReadyToExit {
+            operation_id: quit_op,
+            action_epoch: 1,
+        }
+    );
+    assert_eq!(count_table(&path, "events"), events_after_journal);
+    assert_eq!(operation_failed_event_count(&path), 0);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("accepted"),
+        Some(OperationState::Accepted)
+    );
+    assert!(host_admission_row(&path).is_some());
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("ready stable"),
+        HostCleanupProgress::ReadyToExit {
+            operation_id: quit_op,
+            action_epoch: 1,
+        }
+    );
+    assert_eq!(count_table(&path, "events"), events_after_journal);
+}
+
+#[test]
+fn host_cleanup_failed_terminal_resumes_once_across_reopen() {
+    use devmanager::domain::operation::{OperationErrorCode, OperationState};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let quit_op = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0x21);
+        bus.execute(envelope(
+            command_id(0x22),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_open_agent(&mut bus, task, command_id(0x23), 1);
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        quit_op
+    };
+    assert_eq!(operation_failed_event_count(&path), 0);
+    assert_eq!(
+        {
+            let bus = CommandBus::open(&path).expect("status");
+            bus.operation_status(quit_op).expect("status")
+        },
+        Some(OperationState::Accepted)
+    );
+
+    let settled_at_ms = {
+        let mut bus = CommandBus::open(&path).expect("reopen terminal pass");
+        let failed = HostCleanupWorker::run_once(&mut bus).expect("terminalize after crash");
+        let HostCleanupProgress::Failed {
+            operation_id,
+            settled_at_ms,
+            ..
+        } = failed
+        else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(operation_id, quit_op);
+        settled_at_ms
+    };
+    assert_eq!(operation_failed_event_count(&path), 1);
+
+    {
+        let mut bus = CommandBus::open(&path).expect("reopen after terminal");
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("idle"),
+            HostCleanupProgress::Idle
+        );
+        assert_eq!(
+            bus.operation_status(quit_op).expect("failed"),
+            Some(OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::CleanupFailed,
+            })
+        );
+    }
+    assert_eq!(operation_failed_event_count(&path), 1);
+}
+
+#[test]
+fn host_cleanup_premature_or_wrong_failure_is_rejected_at_runtime_and_rebuild() {
+    use devmanager::domain::event::{OperationFailedFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{OperationErrorCode, OutcomeSource};
+    use devmanager::kernel::{KernelStore, StoreError};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, accepted_at_ms) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        let accepted_at_ms: i64 = {
+            let conn = open_raw(&path);
+            conn.query_row(
+                "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("accepted_at")
+        };
+        (quit_op, accepted_at_ms)
+    };
+    let admission_before = host_admission_row(&path).expect("closing");
+    let ops_state_before = {
+        let conn = open_raw(&path);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("state");
+        state
+    };
+
+    {
+        let conn = open_raw(&path);
+        let failed = OperationFailedFact::with_source(
+            quit_command_id(),
+            quit_op,
+            accepted_at_ms + 1,
+            OperationErrorCode::CleanupFailed,
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.failed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x31))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                accepted_at_ms + 1,
+                rmp_serde::to_vec(&failed).expect("pack"),
+            ],
+        )
+        .expect("forge premature failure");
+    }
+    {
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store
+            .rebuild_projections()
+            .expect_err("premature failure must fail closed");
+        assert!(
+            matches!(
+                &err,
+                StoreError::Projection(detail)
+                    if detail.contains("host-admission")
+                        || detail.contains("cleanup")
+                        || detail.contains("failed")
+            ),
+            "premature host-admission failure must fail at projection gate, got {err:?}"
+        );
+    }
+    assert_eq!(
+        host_admission_row(&path).expect("still closing"),
+        admission_before
+    );
+    {
+        let conn = open_raw(&path);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("state");
+        assert_eq!(state, ops_state_before);
+    }
+
+    // Success journal must not accept a following CleanupFailed fact.
+    let dir2 = TempDir::new().expect("tempdir2");
+    let path2 = temp_db_path(&dir2);
+    let (quit_op2, accepted_at_ms2) = {
+        let mut bus = CommandBus::open(&path2).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        assert!(host_cleanup_branch_rows(&path2)
+            .iter()
+            .all(|row| row.2 == "succeeded"));
+        let accepted_at_ms: i64 = {
+            let conn = open_raw(&path2);
+            conn.query_row(
+                "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("accepted_at")
+        };
+        (quit_op, accepted_at_ms)
+    };
+    let before_rows = host_cleanup_branch_rows(&path2);
+    {
+        let conn = open_raw(&path2);
+        let failed = OperationFailedFact::with_source(
+            quit_command_id(),
+            quit_op2,
+            accepted_at_ms2 + 50,
+            OperationErrorCode::CleanupFailed,
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.failed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x32))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                accepted_at_ms2 + 50,
+                rmp_serde::to_vec(&failed).expect("pack"),
+            ],
+        )
+        .expect("forge success-journal failure");
+    }
+    {
+        let mut store = KernelStore::open(&path2).expect("reopen");
+        let err = store
+            .rebuild_projections()
+            .expect_err("success journal failure must fail closed");
+        assert!(
+            matches!(&err, StoreError::Projection(_)),
+            "success-journal CleanupFailed must fail rebuild, got {err:?}"
+        );
+    }
+    assert_eq!(host_cleanup_branch_rows(&path2), before_rows);
+
+    // Wrong error code on an otherwise complete failed journal.
+    let dir3 = TempDir::new().expect("tempdir3");
+    let path3 = temp_db_path(&dir3);
+    let (quit_op3, accepted_at_ms3) = {
+        let mut bus = CommandBus::open(&path3).expect("open");
+        let task = task_id(0x33);
+        bus.execute(envelope(
+            command_id(0x34),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_open_agent(&mut bus, task, command_id(0x35), 1);
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let accepted_at_ms: i64 = {
+            let conn = open_raw(&path3);
+            conn.query_row(
+                "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("accepted_at")
+        };
+        (quit_op, accepted_at_ms)
+    };
+    let before_rows3 = host_cleanup_branch_rows(&path3);
+    {
+        let conn = open_raw(&path3);
+        let failed = OperationFailedFact::with_source(
+            quit_command_id(),
+            quit_op3,
+            accepted_at_ms3 + 50,
+            OperationErrorCode::SideEffectFailed,
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.failed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x36))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                accepted_at_ms3 + 50,
+                rmp_serde::to_vec(&failed).expect("pack"),
+            ],
+        )
+        .expect("forge wrong code");
+    }
+    {
+        let mut store = KernelStore::open(&path3).expect("reopen");
+        let err = store
+            .rebuild_projections()
+            .expect_err("wrong code must fail closed");
+        assert!(
+            matches!(&err, StoreError::Projection(_)),
+            "wrong host-admission failure code must fail rebuild, got {err:?}"
+        );
+    }
+    assert_eq!(host_cleanup_branch_rows(&path3), before_rows3);
+}
+
+#[test]
+fn host_cleanup_event_only_forged_failure_is_runtime_corruption_while_accepted() {
+    use devmanager::domain::event::{OperationFailedFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{OperationErrorCode, OutcomeSource};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, accepted_at_ms) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        let accepted_at_ms: i64 = {
+            let conn = open_raw(&path);
+            conn.query_row(
+                "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("accepted_at")
+        };
+        (quit_op, accepted_at_ms)
+    };
+    {
+        let conn = open_raw(&path);
+        let failed = OperationFailedFact::with_source(
+            quit_command_id(),
+            quit_op,
+            accepted_at_ms + 1,
+            OperationErrorCode::CleanupFailed,
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.failed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x51))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                accepted_at_ms + 1,
+                rmp_serde::to_vec(&failed).expect("pack"),
+            ],
+        )
+        .expect("forge event-only failure");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("projection still accepted");
+        assert_eq!(state, "accepted");
+    }
+
+    let bus = CommandBus::open(&path).expect("reopen");
+    let err = bus
+        .operation_status(quit_op)
+        .expect_err("event-only forged failure must corrupt Accepted receipt lookup");
+    assert_eq!(err, StoreError::Corruption);
+}
+
+#[test]
+fn host_cleanup_event_only_forged_non_failed_terminals_are_runtime_corruption_while_accepted() {
+    use devmanager::domain::event::{
+        OperationCancelledFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
+    };
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{
+        CancellationReason, OperationUncertaintyCode, OutcomeSource,
+    };
+    use devmanager::kernel::StoreError;
+
+    #[derive(Clone, Copy)]
+    enum ForgedKind {
+        Settled,
+        Cancelled,
+        Uncertain,
+    }
+
+    for (idx, kind) in [
+        ForgedKind::Settled,
+        ForgedKind::Cancelled,
+        ForgedKind::Uncertain,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = TempDir::new().expect("tempdir");
+        let path = temp_db_path(&dir);
+        let (quit_op, accepted_at_ms) = {
+            let mut bus = CommandBus::open(&path).expect("open");
+            let quit_op = confirm_host_quit(&mut bus);
+            let accepted_at_ms: i64 = {
+                let conn = open_raw(&path);
+                conn.query_row(
+                    "SELECT accepted_at_ms FROM operations WHERE operation_id = ?1",
+                    [quit_op.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("accepted_at")
+            };
+            (quit_op, accepted_at_ms)
+        };
+        let occurred_at = accepted_at_ms + 1;
+        let (event_type, payload) = match kind {
+            ForgedKind::Settled => (
+                "operation.settled",
+                rmp_serde::to_vec(
+                    &OperationSettledFact::with_source(
+                        quit_command_id(),
+                        quit_op,
+                        occurred_at,
+                        vec![],
+                        Some(1),
+                        None,
+                        None,
+                        OutcomeSource::Dispatch,
+                    )
+                    .expect("settled"),
+                )
+                .expect("pack"),
+            ),
+            ForgedKind::Cancelled => (
+                "operation.cancelled",
+                rmp_serde::to_vec(
+                    &OperationCancelledFact::new(
+                        quit_command_id(),
+                        quit_op,
+                        occurred_at,
+                        CancellationReason::Superseded,
+                        Some(1),
+                        None,
+                        None,
+                    )
+                    .expect("cancelled"),
+                )
+                .expect("pack"),
+            ),
+            ForgedKind::Uncertain => (
+                "operation.uncertain",
+                rmp_serde::to_vec(
+                    &OperationUncertainFact::new(
+                        quit_command_id(),
+                        quit_op,
+                        occurred_at,
+                        OperationUncertaintyCode::AmbiguousDispatch,
+                        Some(1),
+                        None,
+                        None,
+                    )
+                    .expect("uncertain"),
+                )
+                .expect("pack"),
+            ),
+        };
+        {
+            let conn = open_raw(&path);
+            conn.execute(
+                "INSERT INTO events (
+                    event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+                 ) VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    EventId::from_bytes(fixed_uuid_v7(0x70 + idx as u8))
+                        .expect("eid")
+                        .as_bytes()
+                        .as_slice(),
+                    event_type,
+                    i64::from(EVENT_SCHEMA_VERSION),
+                    occurred_at,
+                    payload,
+                ],
+            )
+            .expect("forge event-only terminal");
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM operations WHERE operation_id = ?1",
+                    [quit_op.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("projection still accepted");
+            assert_eq!(state, "accepted", "{event_type} forge must leave Accepted");
+        }
+
+        let bus = CommandBus::open(&path).expect("reopen");
+        let err = bus.operation_status(quit_op).expect_err(&format!(
+            "event-only forged {event_type} must corrupt Accepted receipt lookup"
+        ));
+        assert_eq!(err, StoreError::Corruption, "{event_type}");
+    }
+}
+
+#[test]
+fn host_cleanup_extra_matching_terminal_beside_cleanup_failed_is_runtime_corruption() {
+    use devmanager::domain::event::{OperationSettledFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{OperationErrorCode, OperationState, OutcomeSource};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, settled_at_ms) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0x71);
+        bus.execute(envelope(
+            command_id(0x72),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_open_agent(&mut bus, task, command_id(0x73), 1);
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let failed = HostCleanupWorker::run_once(&mut bus).expect("terminalize");
+        let HostCleanupProgress::Failed {
+            operation_id,
+            settled_at_ms,
+            ..
+        } = failed
+        else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(operation_id, quit_op);
+        assert_eq!(
+            bus.operation_status(quit_op).expect("failed status"),
+            Some(OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::CleanupFailed,
+            })
+        );
+        (quit_op, settled_at_ms)
+    };
+
+    {
+        let conn = open_raw(&path);
+        let settled = OperationSettledFact::with_source(
+            quit_command_id(),
+            quit_op,
+            settled_at_ms + 1,
+            vec![],
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("extra settled");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.settled', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x74))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                settled_at_ms + 1,
+                rmp_serde::to_vec(&settled).expect("pack"),
+            ],
+        )
+        .expect("forge extra matching settled terminal");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("projection remains failed");
+        assert_eq!(state, "failed");
+    }
+
+    let bus = CommandBus::open(&path).expect("reopen");
+    let err = bus
+        .operation_status(quit_op)
+        .expect_err("extra matching terminal beside CleanupFailed must corrupt");
+    assert_eq!(err, StoreError::Corruption);
+}
+
+#[test]
+fn host_cleanup_failed_fact_predating_final_branch_rebuild_rolls_back() {
+    use devmanager::domain::event::{OperationFailedFact, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::id::EventId;
+    use devmanager::domain::operation::{OperationErrorCode, OutcomeSource};
+    use devmanager::kernel::{KernelStore, StoreError};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, final_branch_at, admission_before, ops_before) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0x52);
+        bus.execute(envelope(
+            command_id(0x53),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_open_agent(&mut bus, task, command_id(0x54), 1);
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        let final_branch_at: i64 = {
+            let conn = open_raw(&path);
+            conn.query_row(
+                "SELECT completed_at_ms FROM host_cleanup_branches
+                 WHERE operation_id = ?1 AND branch = 'task_teardowns'",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("final branch")
+        };
+        (
+            quit_op,
+            final_branch_at,
+            host_admission_row(&path).expect("closing"),
+            count_table(&path, "operations"),
+        )
+    };
+
+    {
+        let conn = open_raw(&path);
+        let early = final_branch_at.saturating_sub(1);
+        assert!(early < final_branch_at);
+        let failed = OperationFailedFact::with_source(
+            quit_command_id(),
+            quit_op,
+            early,
+            OperationErrorCode::CleanupFailed,
+            Some(1),
+            None,
+            None,
+            OutcomeSource::Dispatch,
+        )
+        .expect("fact");
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'operation.failed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0x55))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                early,
+                rmp_serde::to_vec(&failed).expect("pack"),
+            ],
+        )
+        .expect("forge predating failure immediately after final branch");
+    }
+
+    let before_rows = host_cleanup_branch_rows(&path);
+    {
+        let mut store = KernelStore::open(&path).expect("reopen");
+        let err = store
+            .rebuild_projections()
+            .expect_err("predating CleanupFailed must fail closed");
+        assert!(
+            matches!(&err, StoreError::Projection(_)),
+            "predating failure must fail rebuild, got {err:?}"
+        );
+    }
+    assert_eq!(host_cleanup_branch_rows(&path), before_rows);
+    assert_eq!(
+        host_admission_row(&path).expect("closing"),
+        admission_before
+    );
+    assert_eq!(count_table(&path, "operations"), ops_before);
+    {
+        let conn = open_raw(&path);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [quit_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("state");
+        assert_eq!(state, "accepted");
+    }
+}
+
+#[test]
+fn host_cleanup_failed_lineage_survives_later_valid_side_effect_settlement() {
+    use std::time::Duration;
+
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::domain::operation::{OperationErrorCode, OperationState, ResourceFence};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::{DispatchCompletion, Effect, KernelStore};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let (quit_op, release_op, task, resource, settled_at_ms) = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let task = task_id(0x61);
+        let resource = resource_id(0x62);
+        bus.execute(envelope(
+            command_id(0x63),
+            None,
+            None,
+            Command::CreateTask(create_task(task)),
+        ))
+        .expect("create");
+        register_active_terminal(&mut bus, task, command_id(0x64), resource, 1);
+        let release_op = {
+            let receipt = bus
+                .execute(envelope(
+                    command_id(0x65),
+                    Some(task),
+                    Some(2),
+                    Command::ReleaseResource {
+                        resource_id: resource,
+                    },
+                ))
+                .expect("begin release");
+            match receipt {
+                CommandReceipt::Accepted { operation_id, .. } => operation_id,
+                other => panic!("expected release accepted, got {other:?}"),
+            }
+        };
+        let quit_op = confirm_host_quit(&mut bus);
+        drive_four_cleanup_branches(&mut bus, quit_op);
+        assert!(host_cleanup_branch_rows(&path).iter().any(|row| {
+            row.1 == HostCleanupBranch::OutstandingEffects.as_str() && row.2 == "failed"
+        }));
+        let failed = HostCleanupWorker::run_once(&mut bus).expect("terminalize");
+        let HostCleanupProgress::Failed {
+            operation_id,
+            settled_at_ms,
+            ..
+        } = failed
+        else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(operation_id, quit_op);
+        (quit_op, release_op, task, resource, settled_at_ms)
+    };
+
+    {
+        let mut store = KernelStore::open(&path).expect("dispatch store");
+        let claim = store
+            .claim_next_dispatch(Duration::from_secs(30))
+            .expect("claim")
+            .expect("pending release ready");
+        let permit = store.begin_dispatch(&claim).expect("begin");
+        assert_eq!(
+            permit.effect(),
+            &Effect::ReleaseResource {
+                task_id: task,
+                action_epoch: 0,
+                resource_fence: ResourceFence::new(resource, 0),
+            }
+        );
+        let state = store
+            .record_dispatch_completion(&permit, DispatchCompletion::Settled)
+            .expect("settle release after host CleanupFailed");
+        assert!(matches!(state, OperationState::Settled { .. }));
+        assert_eq!(
+            store.operation_status(release_op).expect("release status"),
+            Some(state)
+        );
+    }
+
+    {
+        let mut bus = CommandBus::open(&path).expect("reopen bus");
+        assert_eq!(
+            bus.operation_status(quit_op).expect("quit status"),
+            Some(OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::CleanupFailed,
+            })
+        );
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("idle"),
+            HostCleanupProgress::Idle
+        );
+    }
+
+    {
+        let mut store = KernelStore::open(&path).expect("rebuild store");
+        let rebuild = store
+            .rebuild_projections()
+            .expect("rebuild after later settle");
+        assert!(rebuild.events_replayed > 0);
+        assert_eq!(
+            store.operation_status(quit_op).expect("quit after rebuild"),
+            Some(OperationState::Failed {
+                settled_at_ms,
+                code: OperationErrorCode::CleanupFailed,
+            })
+        );
+    }
+
+    let mut bus = CommandBus::open(&path).expect("final idle");
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("still idle"),
+        HostCleanupProgress::Idle
+    );
 }
