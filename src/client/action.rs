@@ -1,11 +1,12 @@
 //! Shared action catalog for CLI and future GPUI clients.
 //!
-//! This slice exposes `host.actions`, `host.status`, `task.show`, and
-//! `task.create`. It is intentionally not a dynamic plugin framework.
+//! This slice exposes `host.actions`, `host.status`, `task.show`,
+//! `task.create`, and `task.rename`. It is intentionally not a dynamic
+//! plugin framework.
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
+use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent, RenameTaskIntent};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
@@ -22,6 +23,8 @@ pub const ACTION_HOST_STATUS: &str = "host.status";
 pub const ACTION_TASK_SHOW: &str = "task.show";
 /// Stable id for creating one Task through the host command boundary.
 pub const ACTION_TASK_CREATE: &str = "task.create";
+/// Stable id for renaming one Task through the host command boundary.
+pub const ACTION_TASK_RENAME: &str = "task.rename";
 
 /// Where an action applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +46,7 @@ pub enum ActionArgumentSchema {
     None,
     TaskId,
     TaskCreateV1,
+    TaskRenameV1,
 }
 
 /// Static metadata for one catalog action.
@@ -99,6 +103,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::TaskCreateV1,
     },
+    ActionDescriptor {
+        id: ACTION_TASK_RENAME,
+        title: "Rename task",
+        description: "Rename one Task through the host command boundary.",
+        keywords: &["task", "rename", "title", "edit"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskRenameV1,
+    },
 ];
 
 /// Caller-owned `task.create` arguments validated before transport.
@@ -111,6 +125,14 @@ pub struct TaskCreateArguments {
     pub description: Option<String>,
     pub project_id: ProjectId,
     pub workspace: WorkspaceRef,
+}
+
+/// Caller-owned `task.rename` arguments validated before transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRenameArguments {
+    pub task_id: TaskId,
+    pub title: String,
 }
 
 /// Return the closed catalog for this slice.
@@ -177,12 +199,32 @@ pub fn task_create_command(
     })
 }
 
+/// Build the shared `task.rename` mutation after local canonicalization.
+pub fn task_rename_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    args: TaskRenameArguments,
+) -> Result<CommandEnvelope, TaskValidationError> {
+    let title = TaskFacts::canonicalize_title(args.title)?;
+    Ok(CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(args.task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::RenameTask(RenameTaskIntent { title }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog, require_unique_ids, task_create_command, task_show_query, ActionArgumentSchema,
-        ActionRisk, ActionScope, TaskCreateArguments, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
-        ACTION_TASK_CREATE, ACTION_TASK_SHOW,
+        catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
+        ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskRenameArguments,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_RENAME,
+        ACTION_TASK_SHOW,
     };
     use crate::domain::command::Command;
     use crate::domain::query::Query;
@@ -199,7 +241,8 @@ mod tests {
         assert!(ids.contains(&ACTION_HOST_STATUS));
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(ids.contains(&ACTION_TASK_CREATE));
-        assert_eq!(ids.len(), 4);
+        assert!(ids.contains(&ACTION_TASK_RENAME));
+        assert_eq!(ids.len(), 5);
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
             let (expected_scope, expected_risk, expected_schema) = match action.id {
@@ -212,6 +255,11 @@ mod tests {
                     ActionScope::Host,
                     ActionRisk::Mutating,
                     ActionArgumentSchema::TaskCreateV1,
+                ),
+                ACTION_TASK_RENAME => (
+                    ActionScope::Task,
+                    ActionRisk::Mutating,
+                    ActionArgumentSchema::TaskRenameV1,
                 ),
                 _ => (
                     ActionScope::Host,
@@ -302,5 +350,50 @@ mod tests {
             },
         );
         assert!(result.is_err(), "blank titles must fail before transport");
+    }
+
+    #[test]
+    fn task_rename_factory_binds_task_and_expected_revision() {
+        let command_id = CommandId::new();
+        let client_id = ClientId::new();
+        let task_id = TaskId::new();
+        let envelope = task_rename_command(
+            command_id,
+            client_id,
+            1_725_000_000_100,
+            7,
+            TaskRenameArguments {
+                task_id,
+                title: "Renamed Task".into(),
+            },
+        )
+        .expect("valid task.rename arguments");
+
+        assert_eq!(envelope.command_id, command_id);
+        assert_eq!(envelope.client_id, client_id);
+        assert_eq!(envelope.task_id, Some(task_id));
+        assert_eq!(envelope.expected_task_revision, Some(7));
+        let Command::RenameTask(intent) = envelope.command else {
+            panic!("task.rename must build RenameTask");
+        };
+        assert_eq!(intent.title, "Renamed Task");
+    }
+
+    #[test]
+    fn task_rename_factory_rejects_blank_title_before_transport() {
+        let result = task_rename_command(
+            CommandId::new(),
+            ClientId::new(),
+            1_725_000_000_100,
+            1,
+            TaskRenameArguments {
+                task_id: TaskId::new(),
+                title: "  ".into(),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "blank rename titles must fail before transport"
+        );
     }
 }

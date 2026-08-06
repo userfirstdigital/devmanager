@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use devmanager::client::action::{
     self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_SHOW,
+    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
@@ -274,8 +274,8 @@ fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        4,
-        "slice exposes host.actions, host.status, task.show, and task.create"
+        5,
+        "slice exposes host.actions, host.status, task.show, task.create, and task.rename"
     );
 
     let mut ids = Vec::new();
@@ -287,13 +287,13 @@ fn action_catalog_ids_are_unique_and_classified() {
             action.id
         );
         ids.push(action.id);
-        let expected_risk = if action.id == ACTION_TASK_CREATE {
+        let expected_risk = if matches!(action.id, ACTION_TASK_CREATE | ACTION_TASK_RENAME) {
             ActionRisk::Mutating
         } else {
             ActionRisk::ReadOnly
         };
         assert_eq!(action.risk, expected_risk);
-        let expected_scope = if action.id == ACTION_TASK_SHOW {
+        let expected_scope = if matches!(action.id, ACTION_TASK_SHOW | ACTION_TASK_RENAME) {
             ActionScope::Task
         } else {
             ActionScope::Host
@@ -308,6 +308,7 @@ fn action_catalog_ids_are_unique_and_classified() {
     assert!(ids.contains(&ACTION_HOST_STATUS));
     assert!(ids.contains(&ACTION_TASK_SHOW));
     assert!(ids.contains(&ACTION_TASK_CREATE));
+    assert!(ids.contains(&ACTION_TASK_RENAME));
     assert!(action::require_unique_ids().is_ok());
 }
 
@@ -335,13 +336,13 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         let id = action["id"].as_str().expect("action id string");
         assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
         ids.push(id.to_string());
-        let expected_risk = if id == ACTION_TASK_CREATE {
+        let expected_risk = if matches!(id, ACTION_TASK_CREATE | ACTION_TASK_RENAME) {
             "mutating"
         } else {
             "read_only"
         };
         assert_eq!(action["risk"], expected_risk);
-        let expected_scope = if id == ACTION_TASK_SHOW {
+        let expected_scope = if matches!(id, ACTION_TASK_SHOW | ACTION_TASK_RENAME) {
             "task"
         } else {
             "host"
@@ -373,11 +374,23 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
                 );
             }
         }
+        if id == ACTION_TASK_RENAME {
+            let required = schema["required"]
+                .as_array()
+                .expect("rename required fields");
+            for field in ["task_id", "title"] {
+                assert!(
+                    required.iter().any(|value| value == field),
+                    "task.rename schema must require {field}"
+                );
+            }
+        }
     }
     assert!(ids.iter().any(|id| id == ACTION_HOST_ACTIONS));
     assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
     assert!(ids.iter().any(|id| id == ACTION_TASK_SHOW));
     assert!(ids.iter().any(|id| id == ACTION_TASK_CREATE));
+    assert!(ids.iter().any(|id| id == ACTION_TASK_RENAME));
     assert!(
         String::from_utf8_lossy(&first.stderr).trim().is_empty(),
         "successful actions JSON must not emit failure diagnostics on stderr"
@@ -625,6 +638,94 @@ fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
 }
 
 #[test]
+fn ctl_invoke_task_rename_requires_current_revision_without_taking_host_lock() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let task_id = seed_task(&paths);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original = wait_for_identity(&mut host, &lock_path);
+    let arguments = serde_json::json!({
+        "task_id": task_id,
+        "title": "Renamed Through CLI"
+    })
+    .to_string();
+
+    let output = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        &profile,
+        "--action",
+        ACTION_TASK_RENAME,
+        "--arguments-json",
+        &arguments,
+        "--expected-task-revision",
+        "1",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "ctl invoke task.rename must succeed; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("rename JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["action_id"], ACTION_TASK_RENAME);
+    assert_eq!(doc["profile"], profile);
+    assert_eq!(doc["task_id"], task_id.to_string());
+    assert_eq!(doc["receipt"]["accepted"]["task_revision"], 2);
+
+    let shown = run_ctl_bounded(&[
+        "ctl",
+        "task-show",
+        "--profile",
+        &profile,
+        "--task-id",
+        &task_id.to_string(),
+        "--json",
+    ]);
+    assert!(shown.status.success(), "renamed task must remain queryable");
+    let shown_doc: Value = serde_json::from_slice(&shown.stdout).expect("task-show JSON");
+    assert_eq!(
+        shown_doc["snapshot"]["task"]["title"],
+        "Renamed Through CLI"
+    );
+    assert_eq!(shown_doc["snapshot"]["task"]["revision"], 2);
+
+    let stale = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        &profile,
+        "--action",
+        ACTION_TASK_RENAME,
+        "--arguments-json",
+        &arguments,
+        "--expected-task-revision",
+        "1",
+        "--json",
+    ]);
+    assert!(!stale.status.success(), "stale rename must reject");
+    assert!(stale.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("revision_conflict"));
+
+    let after = read_identity(&lock_path).expect("host lock after task.rename");
+    assert_eq!(after.pid, original.pid);
+    assert_eq!(after.boot_id, original.boot_id);
+    assert!(host.try_wait().expect("poll host after rename").is_none());
+
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[test]
 fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     let unknown = run_ctl_bounded(&["ctl", "not-a-command", "--json"]);
     assert!(!unknown.status.success());
@@ -719,6 +820,22 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     assert!(!create_revision.status.success());
     assert!(create_revision.stdout.is_empty());
     assert!(String::from_utf8_lossy(&create_revision.stderr)
+        .contains("requires expected-task-revision"));
+
+    let rename_without_revision = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        "validprofile",
+        "--action",
+        ACTION_TASK_RENAME,
+        "--arguments-json",
+        "{}",
+        "--json",
+    ]);
+    assert!(!rename_without_revision.status.success());
+    assert!(rename_without_revision.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rename_without_revision.stderr)
         .contains("requires expected-task-revision"));
 
     let junk = run_ctl_bounded(&["ctl", "actions", "--json", "--extra"]);

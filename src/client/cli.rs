@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use super::action::{
-    self, task_create_command, ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments,
-    ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_SHOW,
+    self, task_create_command, task_rename_command, ActionArgumentSchema, ActionRisk, ActionScope,
+    TaskCreateArguments, TaskRenameArguments, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
+    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
@@ -411,6 +412,15 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
             },
             "required": ["task_id", "environment_id", "title", "project_id", "workspace"],
         }),
+        ActionArgumentSchema::TaskRenameV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "title": { "type": "string", "minLength": 1 },
+            },
+            "required": ["task_id", "title"],
+        }),
     }
 }
 
@@ -578,6 +588,32 @@ fn invoke_json_document(
                 runtime.block_on(task_create_invoke_async(profile, arguments_json))
             }
         }
+        ACTION_TASK_RENAME => {
+            let Some(expected_task_revision) = expected_task_revision else {
+                return Err(CliError::new("task.rename requires expected-task-revision"));
+            };
+            #[cfg(not(windows))]
+            {
+                let _ = profile;
+                let _ = arguments_json;
+                let _ = expected_task_revision;
+                return Err(CliError::new("ctl invoke requires Windows"));
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        CliError::new(format!("failed to build ctl runtime: {error}"))
+                    })?;
+                runtime.block_on(task_rename_invoke_async(
+                    profile,
+                    arguments_json,
+                    expected_task_revision,
+                ))
+            }
+        }
         other => Err(CliError::new(format!("unsupported action id: {other}"))),
     }
 }
@@ -594,7 +630,7 @@ async fn task_create_invoke_async(profile: &str, arguments_json: &str) -> Result
         .map_err(|error| CliError::new(format!("invalid task.create arguments: {error}")))?;
 
     let mut client = connect_profile_client(profile, client_id).await?;
-    let receipt = execute_command_with_reconnect(&mut client, envelope).await?;
+    let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_CREATE).await?;
     match &receipt {
         CommandReceipt::Accepted { .. } => {
             let doc = json!({
@@ -609,6 +645,48 @@ async fn task_create_invoke_async(profile: &str, arguments_json: &str) -> Result
         }
         CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
             "task.create rejected: {}",
+            rejection_code_name(*code)
+        ))),
+    }
+}
+
+#[cfg(windows)]
+async fn task_rename_invoke_async(
+    profile: &str,
+    arguments_json: &str,
+    expected_task_revision: u64,
+) -> Result<String, CliError> {
+    let args: TaskRenameArguments = serde_json::from_str(arguments_json)
+        .map_err(|error| CliError::new(format!("invalid task.rename arguments JSON: {error}")))?;
+    let task_id = args.task_id;
+    let client_id = ClientId::new();
+    let command_id = CommandId::new();
+    let issued_at_ms = unix_epoch_ms()?;
+    let envelope = task_rename_command(
+        command_id,
+        client_id,
+        issued_at_ms,
+        expected_task_revision,
+        args,
+    )
+    .map_err(|error| CliError::new(format!("invalid task.rename arguments: {error}")))?;
+
+    let mut client = connect_profile_client(profile, client_id).await?;
+    let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_RENAME).await?;
+    match &receipt {
+        CommandReceipt::Accepted { .. } => {
+            let doc = json!({
+                "schema_version": SCHEMA_VERSION,
+                "action_id": ACTION_TASK_RENAME,
+                "profile": profile,
+                "task_id": task_id,
+                "receipt": receipt,
+            });
+            serde_json::to_string(&doc)
+                .map_err(|error| CliError::new(format!("failed to encode invoke JSON: {error}")))
+        }
+        CommandReceipt::Rejected { code, .. } => Err(CliError::new(format!(
+            "task.rename rejected: {}",
             rejection_code_name(*code)
         ))),
     }
@@ -637,13 +715,14 @@ fn unix_epoch_ms() -> Result<i64, CliError> {
 async fn execute_command_with_reconnect(
     client: &mut HostClient,
     envelope: CommandEnvelope,
+    action_id: &str,
 ) -> Result<CommandReceipt, CliError> {
     let deadline = tokio::time::Instant::now() + COMMAND_REPLAY_TIMEOUT;
     for attempt in 0..MAX_COMMAND_ATTEMPTS {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             client.disconnect();
-            return Err(command_replay_timeout_error());
+            return Err(command_replay_timeout_error(action_id));
         }
         let outcome =
             tokio::time::timeout(remaining, client.execute_command(envelope.clone())).await;
@@ -652,34 +731,35 @@ async fn execute_command_with_reconnect(
             Ok(Err(error))
                 if is_retryable_connect_error(&error) && attempt + 1 < MAX_COMMAND_ATTEMPTS =>
             {
-                reconnect_before_deadline(client, deadline).await?;
+                reconnect_before_deadline(client, deadline, action_id).await?;
             }
             Ok(Err(error)) => {
                 return Err(CliError::new(format!(
-                    "task.create command failed: {error}"
+                    "{action_id} command failed: {error}"
                 )))
             }
             Err(_) => {
                 client.disconnect();
-                return Err(command_replay_timeout_error());
+                return Err(command_replay_timeout_error(action_id));
             }
         }
     }
-    Err(CliError::new(
-        "task.create command exhausted its bounded replay attempts",
-    ))
+    Err(CliError::new(format!(
+        "{action_id} command exhausted its bounded replay attempts"
+    )))
 }
 
 #[cfg(windows)]
 async fn reconnect_before_deadline(
     client: &mut HostClient,
     deadline: tokio::time::Instant,
+    action_id: &str,
 ) -> Result<(), CliError> {
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             client.disconnect();
-            return Err(command_replay_timeout_error());
+            return Err(command_replay_timeout_error(action_id));
         }
         match tokio::time::timeout(remaining, client.reconnect()).await {
             Ok(Ok(())) => return Ok(()),
@@ -687,21 +767,23 @@ async fn reconnect_before_deadline(
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     client.disconnect();
-                    return Err(command_replay_timeout_error());
+                    return Err(command_replay_timeout_error(action_id));
                 }
                 tokio::time::sleep(STATUS_CONNECT_POLL.min(remaining)).await;
             }
             Ok(Err(error)) => return Err(map_connect_error(error)),
             Err(_) => {
                 client.disconnect();
-                return Err(command_replay_timeout_error());
+                return Err(command_replay_timeout_error(action_id));
             }
         }
     }
 }
 
-fn command_replay_timeout_error() -> CliError {
-    CliError::new("task.create command exceeded its bounded reconnect/replay window")
+fn command_replay_timeout_error(action_id: &str) -> CliError {
+    CliError::new(format!(
+        "{action_id} command exceeded its bounded reconnect/replay window"
+    ))
 }
 
 #[cfg(windows)]
