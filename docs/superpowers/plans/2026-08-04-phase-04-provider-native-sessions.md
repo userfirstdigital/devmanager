@@ -152,13 +152,14 @@ pub trait ProviderAdapter: Send + Sync {
 
 **Files:** `src/providers/input.rs`, `src/domain/{command,event}.rs`, `src/protocol/envelope.rs`, `tests/provider_input.rs`
 
-- [ ] **Step 1: Write failing tests** for `SendNow`, `SteerCurrentTurn`, `QueueFollowUp`, `AnswerQuestion`, `ResolveApproval`, `StopTurn`, accepted-versus-delivered settlement, duplicate request IDs, two-device first-answer-wins, stale action epoch/runtime generation, stale question ID, and unsupported provider action.
+- [ ] **Step 1: Write failing tests** for `SendNow`, `SteerCurrentTurn`, `QueueFollowUp`, `AnswerQuestion`, `ResolveApproval`, `StopTurn`, atomic send-and-wait registration, accepted-versus-delivered settlement, duplicate request IDs, two-device first-answer-wins, stale action epoch/runtime generation, replacement runtimes not satisfying an older wait, stale question ID, and unsupported provider action.
 - [ ] **Step 2: Run** `cargo test --test provider_input -- --nocapture` and save the red result.
 - [ ] **Step 3: Define commands with explicit target** Task/Agent/generation/turn/question/approval IDs. A semantic action may map to provider-native control or exact terminal bytes, but the mapping lives only in that provider adapter.
 - [ ] **Step 4: Serialize provider input through one per-session sequencer** and persist the accepted intent/OperationId before side-effect delivery. Retry of the client command returns the same receipt/OperationId; it does not write the prompt bytes again. Unless a provider exposes proven idempotent delivery, classify the outbox effect `NoAutomaticRetry`; adapters report delivered, duplicate, rejected, uncertain, or cancelled without changing an accepted receipt into a false success.
-- [ ] **Step 5: Implement first-answer-wins atomically** at the kernel boundary using question/approval request ID, task action epoch, runtime generation, and granted capability. Later answers get an `AlreadyResolved` receipt with the winning timestamp/device, not another input write, and every stale presentation dismisses on the settlement event.
-- [ ] **Step 6: Register provider actions in the shared `ActionCatalog`** and expose availability from capability/current turn state. Do not show `Restart`; `New conversation` creates a new AgentSession identity.
-- [ ] **Step 7: Run** input tests and commit as `feat(providers): add exact semantic input controls`.
+- [ ] **Step 5: Make prompt plus optional wait one atomic host operation.** Register the waiter in the same per-session sequencer operation that accepts the prompt, pin it to the exact AgentSession/runtime generation/turn, and allow only a matching later settlement to resolve it. Do not compose this from separate send and subscribe calls, and do not let a replacement runtime satisfy the older wait.
+- [ ] **Step 6: Implement first-answer-wins atomically** at the kernel boundary using question/approval request ID, task action epoch, runtime generation, and granted capability. Later answers get an `AlreadyResolved` receipt with the winning timestamp/device, not another input write, and every stale presentation dismisses on the settlement event.
+- [ ] **Step 7: Register provider actions in the shared `ActionCatalog`** and expose availability from capability/current turn state. Do not show `Restart`; `New conversation` creates a new AgentSession identity.
+- [ ] **Step 8: Run** input tests and commit as `feat(providers): add exact semantic input controls`.
 
 ### Task 4.8: Implement Primary plus optional specialists without replacing native harnesses
 
