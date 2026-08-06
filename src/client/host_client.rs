@@ -19,7 +19,7 @@ use crate::host::{
 use crate::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits, ServerHello};
 
 use super::action::task_show_query;
-use super::connection::{connect, ClientConnection};
+use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
 
 /// Caller-owned connection configuration. `client_id` is never rotated here.
 #[derive(Debug, Clone)]
@@ -514,6 +514,14 @@ impl HostClient {
                 Ok(Ok(state))
             }
         }
+    }
+
+    /// Receive the next unsolicited durable/resync message from the live connection.
+    ///
+    /// Live events may arrive before a correlated open reply; this exposes the
+    /// existing connection inbox without inventing a second queue.
+    pub async fn recv_unsolicited(&self) -> Result<UnsolicitedServerMessage, IpcError> {
+        self.live_connection()?.recv_unsolicited().await
     }
 
     fn live_connection(&self) -> Result<&ClientConnection, IpcError> {

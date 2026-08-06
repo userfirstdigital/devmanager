@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
+    UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
@@ -834,6 +835,221 @@ async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable
     assert_eq!(
         released,
         Err(devmanager::domain::query::QueryError::NotFound)
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    writer.disconnect();
+    reader.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let writer_id = ClientId::from_bytes(fixed_uuid_v7(0xb0)).expect("writer client id");
+    let reader_id = ClientId::from_bytes(fixed_uuid_v7(0xb1)).expect("reader client id");
+    let mut limits = FrameLimits::v1_default();
+    limits.max_page_items = 1;
+    let requested = CapabilitySet::from_capabilities([Capability::EventReplay]);
+    let writer_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: writer_id,
+        requested,
+        limits,
+    };
+    let reader_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: reader_id,
+        requested,
+        limits,
+    };
+    let mut writer = connect_bounded(&writer_config, &mut host).await;
+    let mut reader = connect_bounded(&reader_config, &mut host).await;
+
+    let (first_create, _, _) =
+        create_task_named(writer_id, 0xb2, 0xb3, 0xb4, 0xb5, "Live tail first task");
+    let (second_create, _, _) =
+        create_task_named(writer_id, 0xb6, 0xb7, 0xb8, 0xb9, "Live tail second task");
+    assert!(matches!(
+        writer
+            .execute_command(first_create)
+            .await
+            .expect("create first live-tail task"),
+        CommandReceipt::Accepted { .. }
+    ));
+    assert!(matches!(
+        writer
+            .execute_command(second_create)
+            .await
+            .expect("create second live-tail task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let first = reader
+        .open_event_replay(0)
+        .await
+        .expect("open event replay transport")
+        .expect("open event replay query");
+    let subscription_id = first.subscription_id;
+    let frozen_through = first.page.through_sequence;
+    let mut observed = first
+        .page
+        .events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    let mut cursor = first.page.next_cursor.clone();
+    assert!(
+        cursor.is_some(),
+        "one-item pages must leave frozen replay incomplete"
+    );
+
+    let (post_freeze_create, post_command_id, _) = create_task_named(
+        writer_id,
+        0xba,
+        0xbb,
+        0xbc,
+        0xbd,
+        "After open before frozen complete",
+    );
+    let post_receipt = writer
+        .execute_command(post_freeze_create.clone())
+        .await
+        .expect("create task after open before frozen completion");
+    assert!(
+        matches!(post_receipt, CommandReceipt::Accepted { .. }),
+        "expected accepted receipt after open, got {post_receipt:?}"
+    );
+
+    let probe = writer
+        .open_event_replay(frozen_through)
+        .await
+        .expect("probe replay transport")
+        .expect("probe replay query");
+    let post_through = probe.page.through_sequence;
+    assert!(
+        post_through > frozen_through,
+        "post-open command must advance durable high-water beyond frozen through"
+    );
+    writer
+        .release_event_replay(probe.subscription_id)
+        .await
+        .expect("release probe transport")
+        .expect("release probe query");
+
+    while let Some(resume_cursor) = cursor {
+        let page = reader
+            .continue_event_replay(subscription_id, resume_cursor)
+            .await
+            .expect("continue frozen replay transport")
+            .expect("continue frozen replay query");
+        assert_eq!(page.subscription_id, subscription_id);
+        assert_eq!(page.page.through_sequence, frozen_through);
+        assert!(
+            page.page
+                .events
+                .iter()
+                .all(|event| event.sequence <= frozen_through),
+            "frozen pagination must not include post-freeze sequences"
+        );
+        observed.extend(page.page.events.iter().map(|event| event.sequence));
+        cursor = page.page.next_cursor;
+    }
+    assert_eq!(observed.last().copied(), Some(frozen_through));
+    assert!(observed.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let expected_live = (frozen_through + 1)..=post_through;
+    let expected_count = usize::try_from(post_through - frozen_through).expect("range fits");
+    let mut live_sequences = Vec::with_capacity(expected_count);
+    while live_sequences.len() < expected_count {
+        let live = timeout(READY_TIMEOUT, reader.recv_unsolicited())
+            .await
+            .expect("live durable event stayed bounded")
+            .expect("live durable event transport");
+        let UnsolicitedServerMessage::DurableEvent {
+            subscription_id: live_sub,
+            event: live_event,
+        } = live
+        else {
+            panic!("expected live DurableEvent, got {live:?}");
+        };
+        assert_eq!(live_sub, subscription_id);
+        assert!(
+            expected_live.contains(&live_event.sequence),
+            "live sequence {} outside {}..={}",
+            live_event.sequence,
+            frozen_through + 1,
+            post_through
+        );
+        assert!(
+            live_sequences
+                .last()
+                .is_none_or(|previous| *previous < live_event.sequence),
+            "live durable events must be strictly ordered without duplicates"
+        );
+        live_sequences.push(live_event.sequence);
+    }
+    assert_eq!(
+        live_sequences,
+        expected_live.collect::<Vec<_>>(),
+        "live delivery must be exactly frozen_through+1..=post_through once"
+    );
+
+    let retry = writer
+        .execute_command(post_freeze_create)
+        .await
+        .expect("exact command retry transport");
+    assert!(
+        matches!(
+            retry,
+            CommandReceipt::Accepted {
+                command_id,
+                ..
+            } if command_id == post_command_id
+        ),
+        "exact retry must remain accepted for the same command id"
+    );
+    let duplicate = timeout(Duration::from_millis(300), reader.recv_unsolicited()).await;
+    assert!(
+        duplicate.is_err(),
+        "exact command retry must not redeliver already-admitted live sequences"
+    );
+
+    reader
+        .release_event_replay(subscription_id)
+        .await
+        .expect("release live subscription transport")
+        .expect("release live subscription query");
+
+    let (after_release_create, _, _) =
+        create_task_named(writer_id, 0xbe, 0xbf, 0xc0, 0xc1, "After release");
+    assert!(matches!(
+        writer
+            .execute_command(after_release_create)
+            .await
+            .expect("create task after release"),
+        CommandReceipt::Accepted { .. }
+    ));
+    let post_release = timeout(Duration::from_millis(300), reader.recv_unsolicited()).await;
+    assert!(
+        post_release.is_err(),
+        "release must stop later live durable delivery"
     );
 
     let final_identity = read_identity(&lock_path).expect("final host identity");

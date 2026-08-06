@@ -30,3 +30,16 @@
   Claude/Codex `SessionStart` hooks, preserve it while its tab remains open, and
   never infer it from cwd, timestamps, or transcript ordering. An exact-resume
   failure must remain visible and must not fall back to a fresh conversation.
+
+## Host transport ownership and wire truth
+
+- Arm RAII cleanup ownership before the first await that can transfer a resource
+  into an executor or registry, and remove the resource immediately when its
+  registration acknowledgement cannot be delivered.
+- Keep bounded-output admission permits owned through encode, physical write,
+  and flush. Cancellation generations may suppress only queued writes that have
+  not started; every successful in-flight write still advances the physical
+  delivery cursor.
+- Finalize resync fields that claim wire delivery in the single writer after any
+  earlier in-flight frame settles. Release, resync, retarget, and output shutdown
+  must invalidate queued generations and leave no executor-held connection owner.
