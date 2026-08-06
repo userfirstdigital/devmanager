@@ -1,7 +1,9 @@
 //! Profile-scoped named-pipe ClientHello/ServerHello handshake transport.
 //!
-//! After Hello, one connection serves synchronous ClientRequest/ServerResponse
-//! frames through the host-owned CommandBus. Multiplexing and reconnect live later.
+//! After Hello, each connection serves synchronous ClientRequest/ServerResponse
+//! frames. Concurrent connections submit decoded requests to the single
+//! host-owned CommandBus executor; transport tasks never touch the bus.
+//! Snapshots, subscriptions, and fan-out live later.
 
 use std::time::Duration;
 
@@ -10,12 +12,13 @@ use uuid::Uuid;
 use crate::config::paths::AppProfile;
 use crate::domain::ClientId;
 use crate::kernel::CommandBus;
-use crate::kernel::StoreError;
 use crate::protocol::{
     CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits, MessagePackCodec,
     MessagePackError, NegotiatedParameters, PhysicalFrameCodec, PhysicalFrameError,
-    ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError, ServerResponse,
+    ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
 };
+
+use super::connection::{dispatch_authenticated_request, HostRequestHandle};
 
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,13 +132,6 @@ impl std::error::Error for IpcError {
             | Self::Unavailable
             | Self::Security(_) => None,
         }
-    }
-}
-
-fn map_store_error(error: StoreError) -> IpcError {
-    match error {
-        StoreError::Busy => IpcError::Busy,
-        _ => IpcError::Unavailable,
     }
 }
 
@@ -300,6 +296,10 @@ impl HostConnection {
     }
 
     /// Wait indefinitely for the first request byte, then complete under one deadline.
+    ///
+    /// Exclusive compatibility path used by ipc_protocol tests: dispatches
+    /// directly against a caller-owned [`CommandBus`]. Concurrent host serving
+    /// uses [`Self::serve_request_on_executor`] instead.
     pub async fn serve_request(&mut self, bus: &mut CommandBus) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
         #[cfg(windows)]
@@ -310,6 +310,27 @@ impl HostConnection {
         #[cfg(not(windows))]
         {
             let _ = bus;
+            connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
+        }
+    }
+
+    /// Serve one request via the host-owned CommandBus executor.
+    ///
+    /// Fully reads and decodes the client request, awaits the executor reply,
+    /// then encodes and writes the response. Never receives or calls CommandBus.
+    pub async fn serve_request_on_executor(
+        &mut self,
+        requests: &HostRequestHandle,
+    ) -> Result<(), IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            let result = windows_serve_request_on_executor(self, requests).await;
+            connection_fail_closed(&mut self.poisoned, result)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = requests;
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
         }
     }
@@ -431,7 +452,36 @@ async fn windows_serve_request(
             .message
             .decode::<ClientRequest>(&payload)
             .map_err(IpcError::MessagePack)?;
-        let response = dispatch_request(connection.client_id, bus, request)?;
+        let response = dispatch_authenticated_request(connection.client_id, bus, request)?;
+        let encoded = connection
+            .message
+            .encode(&response)
+            .map_err(IpcError::MessagePack)?;
+        write_physical_frame(&mut connection.pipe, &connection.physical, &encoded).await?;
+        connection.pipe.flush().await.map_err(IpcError::Io)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)?
+}
+
+#[cfg(windows)]
+async fn windows_serve_request_on_executor(
+    connection: &mut HostConnection,
+    requests: &HostRequestHandle,
+) -> Result<(), IpcError> {
+    use tokio::io::AsyncWriteExt;
+
+    let first = read_first_request_byte_idle(&mut connection.pipe).await?;
+    tokio::time::timeout(REQUEST_COMPLETION_TIMEOUT, async {
+        let payload =
+            read_physical_frame_after_first_byte(&mut connection.pipe, &connection.physical, first)
+                .await?;
+        let request = connection
+            .message
+            .decode::<ClientRequest>(&payload)
+            .map_err(IpcError::MessagePack)?;
+        let response = requests.execute(connection.client_id, request).await?;
         let encoded = connection
             .message
             .encode(&response)
@@ -460,29 +510,6 @@ fn connection_fail_closed<T>(
         *poisoned = true;
     }
     result
-}
-
-fn dispatch_request(
-    authenticated_client_id: ClientId,
-    bus: &mut CommandBus,
-    request: ClientRequest,
-) -> Result<ServerResponse, IpcError> {
-    match request {
-        ClientRequest::Command(envelope) => {
-            if envelope.client_id != authenticated_client_id {
-                return Err(IpcError::Unauthorized);
-            }
-            let receipt = bus.execute(envelope).map_err(map_store_error)?;
-            Ok(ServerResponse::CommandReceipt(receipt))
-        }
-        ClientRequest::Query(envelope) => {
-            if envelope.client_id != authenticated_client_id {
-                return Err(IpcError::Unauthorized);
-            }
-            let reply = bus.query(envelope).map_err(map_store_error)?;
-            Ok(ServerResponse::QueryReply(reply))
-        }
-    }
 }
 
 pub(crate) async fn read_physical_frame<R>(

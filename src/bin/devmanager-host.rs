@@ -1,8 +1,9 @@
 //! Development foreground `devmanager-host` entry for Phase 2 ownership.
 //!
-//! This binary owns one profile lock and one writable command bus, accepts
-//! authenticated clients sequentially, and remains bound to its exact parent
-//! process. It does not yet own Phase 3 supervised resources.
+//! This binary owns one profile lock and one writable command bus executor,
+//! accepts authenticated clients concurrently on tracked tasks, and remains
+//! bound to its exact parent process. It does not yet own Phase 3 supervised
+//! resources.
 
 use std::fs;
 use std::io::{self, Write};
@@ -12,7 +13,8 @@ use std::time::Duration;
 
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use devmanager::host::{
-    AcceptHelloConfig, HelloListener, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING,
+    AcceptHelloConfig, HelloListener, HostConnection, HostLock, HostLockError, HostRequestExecutor,
+    HostRequestHandle, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -550,11 +552,122 @@ async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
 }
 
 #[cfg(all(windows, debug_assertions))]
+fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
+    if error.is_panic() {
+        format!("{context} panicked")
+    } else if error.is_cancelled() {
+        format!("{context} was cancelled")
+    } else {
+        format!("{context} failed: {error}")
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+async fn abort_and_drain_connection_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Result<(), String> {
+    tasks.abort_all();
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) if first_error.is_none() => {
+                first_error = Some(join_error_message("connection task", error));
+            }
+            Err(_) => {}
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(all(windows, debug_assertions))]
+async fn stop_request_executor(executor_task: tokio::task::JoinHandle<()>) -> Result<(), String> {
+    // Cancel the executor at its next await point, then reap it before the host
+    // releases ownership. Synchronous dispatch remains atomic on this runtime.
+    executor_task.abort();
+    match executor_task.await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(join_error_message("command-bus executor", error)),
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+enum HostLoopExit {
+    Parent(Result<(), String>),
+    Listener(String),
+    Executor(Result<(), tokio::task::JoinError>),
+    Connection(tokio::task::JoinError),
+}
+
+#[cfg(all(windows, debug_assertions))]
+async fn finish_supervised_host(
+    exit: HostLoopExit,
+    connection_tasks: &mut tokio::task::JoinSet<()>,
+    request_handle: HostRequestHandle,
+    executor_task: tokio::task::JoinHandle<()>,
+) -> Result<(), String> {
+    let executor_already_joined = matches!(&exit, HostLoopExit::Executor(_));
+    let mut errors = Vec::new();
+    match exit {
+        HostLoopExit::Parent(Ok(())) => {}
+        HostLoopExit::Parent(Err(error)) | HostLoopExit::Listener(error) => errors.push(error),
+        HostLoopExit::Executor(Ok(())) => {
+            errors.push("command-bus executor exited unexpectedly".to_string())
+        }
+        HostLoopExit::Executor(Err(error)) => {
+            errors.push(join_error_message("command-bus executor", error))
+        }
+        HostLoopExit::Connection(error) => {
+            errors.push(join_error_message("connection task", error))
+        }
+    }
+
+    if let Err(error) = abort_and_drain_connection_tasks(connection_tasks).await {
+        errors.push(error);
+    }
+    // Connection tasks are now gone, so dropping the root handle closes the
+    // request queue without leaving any sender clone alive.
+    drop(request_handle);
+    if executor_already_joined {
+        drop(executor_task);
+    } else if let Err(error) = stop_request_executor(executor_task).await {
+        errors.push(error);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+fn spawn_connection_task(
+    tasks: &mut tokio::task::JoinSet<()>,
+    connection: HostConnection,
+    requests: HostRequestHandle,
+) {
+    tasks.spawn(async move {
+        let mut connection = connection;
+        loop {
+            match connection.serve_request_on_executor(&requests).await {
+                Ok(()) => {}
+                // EOF, malformed input, timeout, and request errors poison only
+                // this connection task. Other clients and the accept loop continue.
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+#[cfg(all(windows, debug_assertions))]
 async fn serve_foreground_host(
     profile: &str,
     parent: ParentProcess,
     host_boot_id: Uuid,
-    mut bus: CommandBus,
+    bus: CommandBus,
 ) -> Result<(), String> {
     let hello_config = AcceptHelloConfig {
         host_boot_id,
@@ -565,37 +678,57 @@ async fn serve_foreground_host(
 
     // The first instance proves no pre-existing pipe server is present. Each
     // later instance is created by this same lock owner before the connected
-    // instance is served, so clients never depend on a close/rebind gap.
-    let mut listener = HelloListener::bind(profile, hello_config)
+    // instance is handed to a connection task, so clients never depend on a
+    // close/rebind gap.
+    let listener = HelloListener::bind(profile, hello_config)
         .map_err(|error| format!("failed to bind host pipe: {error}"))?;
 
-    loop {
-        let (accepted, next_listener) = tokio::select! {
-            parent_result = wait_for_parent_exit(&parent) => return parent_result,
-            accepted = listener.accept_with_successor() => accepted.map_err(|error| {
-                format!("failed to preserve host pipe listener: {error}")
-            })?,
-        };
-        listener = next_listener;
+    // One CommandBus executor owns all mutate/query dispatch. Transport tasks
+    // only submit through HostRequestHandle.
+    let (request_handle, mut executor_task) = HostRequestExecutor::start(bus);
+    let mut connection_tasks = tokio::task::JoinSet::new();
+    // `accept_with_successor` owns its listener. Keep the future pinned across
+    // unrelated task-completion branches so a normal client disconnect never
+    // cancels and drops the sole pending listener.
+    let mut accept_task = Box::pin(listener.accept_with_successor());
 
-        let mut connection = match accepted {
-            Ok(connection) => connection,
-            // Handshake failures belong only to the attempted connection. The
-            // successor was secured before the untrusted Hello was decoded.
-            Err(_) => continue,
-        };
-
-        loop {
-            let served = tokio::select! {
-                parent_result = wait_for_parent_exit(&parent) => return parent_result,
-                served = connection.serve_request(&mut bus) => served,
-            };
-            match served {
-                Ok(()) => {}
-                // EOF, malformed input, timeout, and request errors poison only
-                // this connection. Dropping it returns the host to accept.
-                Err(_) => break,
+    let exit = loop {
+        tokio::select! {
+            parent_result = wait_for_parent_exit(&parent) => {
+                break HostLoopExit::Parent(parent_result);
+            }
+            executor_result = &mut executor_task => {
+                break HostLoopExit::Executor(executor_result);
+            }
+            connection_result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                match connection_result {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => break HostLoopExit::Connection(error),
+                    None => {}
+                }
+            }
+            accepted_result = &mut accept_task => {
+                let (accepted, next_listener) = match accepted_result {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        break HostLoopExit::Listener(format!(
+                            "failed to preserve host pipe listener: {error}"
+                        ));
+                    }
+                };
+                accept_task = Box::pin(next_listener.accept_with_successor());
+                // Handshake failures belong only to the attempted connection.
+                // The secured successor remains pending for another client.
+                if let Ok(connection) = accepted {
+                    spawn_connection_task(
+                        &mut connection_tasks,
+                        connection,
+                        request_handle.clone(),
+                    );
+                }
             }
         }
-    }
+    };
+
+    finish_supervised_host(exit, &mut connection_tasks, request_handle, executor_task).await
 }

@@ -3,9 +3,11 @@
 //! The host lock binds to an explicitly supplied profile root and never
 //! resolves installed app-data paths on its own.
 
+mod connection;
 mod ipc;
 mod lock;
 
+pub use connection::{HostRequestExecutor, HostRequestHandle, HOST_REQUEST_QUEUE_CAPACITY};
 pub(crate) use ipc::{
     codecs_for_limits, handshake_codecs, handshake_timeout, read_physical_frame,
     request_completion_timeout, write_physical_frame,

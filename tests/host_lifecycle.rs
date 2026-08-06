@@ -395,3 +395,88 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_clients_attach_concurrently_and_share_one_command_bus() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let requested = CapabilitySet::from_capabilities([Capability::OperationSettlement]);
+    let client_a_id = ClientId::from_bytes(fixed_uuid_v7(0x80)).expect("client A id");
+    let client_a_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: client_a_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client_a = connect_bounded(&client_a_config, &mut host).await;
+
+    let client_b_id = ClientId::from_bytes(fixed_uuid_v7(0x81)).expect("client B id");
+    let client_b_config = HostClientConfig {
+        named_profile: profile,
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: client_b_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client_b = timeout(
+        CONNECT_ATTEMPT_TIMEOUT,
+        HostClient::connect(client_b_config),
+    )
+    .await
+    .expect("second client attach must not wait for client A to disconnect")
+    .expect("second client attach");
+
+    assert_eq!(client_a.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client_b.host_boot_id(), original_identity.boot_id);
+    assert_ne!(client_a.connection_id(), client_b.connection_id());
+
+    let (create, _command_id, task_id) = create_task(client_a_id);
+    let receipt = client_a
+        .execute_command(create)
+        .await
+        .expect("client A creates through shared command bus");
+    assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+
+    let snapshot = client_b
+        .task_snapshot(task_id)
+        .await
+        .expect("client B task query transport")
+        .expect("client B sees client A task");
+    assert_eq!(snapshot.task.id, task_id);
+    assert_eq!(snapshot.task.title, "Foreground host reconnect");
+
+    client_a.disconnect();
+    let snapshot_while_a_is_detached = client_b
+        .task_snapshot(task_id)
+        .await
+        .expect("client B stays usable after client A disconnects")
+        .expect("client B still sees client A task");
+    assert_eq!(snapshot_while_a_is_detached.task.id, task_id);
+
+    reconnect_bounded(&mut client_a, &mut host).await;
+    let snapshot_after_a_reconnects = client_a
+        .task_snapshot(task_id)
+        .await
+        .expect("client A query after reconnect transport")
+        .expect("client A sees shared task after reconnect");
+    assert_eq!(snapshot_after_a_reconnects.task.id, task_id);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    client_a.disconnect();
+    client_b.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
