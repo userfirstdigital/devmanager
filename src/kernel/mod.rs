@@ -26,4 +26,5 @@ pub use runtime::{
     CompletionDisposition, RecoveringResource, RuntimePresence, RuntimeRegistry,
     RuntimeRegistryError,
 };
+pub(crate) use snapshot::{SnapshotError, SnapshotSession};
 pub use store::{KernelStore, ProjectionRebuild, StoreError};

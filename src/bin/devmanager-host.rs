@@ -672,7 +672,10 @@ async fn serve_foreground_host(
     let hello_config = AcceptHelloConfig {
         host_boot_id,
         server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
-        supported: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+        supported: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::OperationSettlement,
+        ]),
         local_limits: FrameLimits::v1_default(),
     };
 

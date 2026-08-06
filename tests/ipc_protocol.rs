@@ -335,7 +335,8 @@ async fn pipe_hello_round_trip_negotiates_minimums() {
     assert_eq!(accepted.negotiated.version, ProtocolVersion::current());
     assert_eq!(
         accepted.negotiated.capabilities,
-        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay])
+        CapabilitySet::from_capabilities([Capability::EventReplay]),
+        "paged snapshots must not be granted when one negotiated page cannot fit in one negotiated v1 physical frame"
     );
     assert_eq!(
         accepted.negotiated.limits,
@@ -362,7 +363,7 @@ async fn pipe_hello_round_trip_negotiates_minimums() {
     assert_eq!(server_hello.connection_id.get_version_num(), 7);
     assert_eq!(
         server_hello.granted,
-        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay])
+        CapabilitySet::from_capabilities([Capability::EventReplay])
     );
     assert_eq!(server_hello.limits, accepted.negotiated.limits);
     assert_eq!(accepted.server_hello, server_hello);

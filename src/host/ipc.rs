@@ -13,9 +13,9 @@ use crate::config::paths::AppProfile;
 use crate::domain::ClientId;
 use crate::kernel::CommandBus;
 use crate::protocol::{
-    CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits, MessagePackCodec,
-    MessagePackError, NegotiatedParameters, PhysicalFrameCodec, PhysicalFrameError,
-    ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
+    Capability, CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits,
+    MessagePackCodec, MessagePackError, NegotiatedParameters, PhysicalFrameCodec,
+    PhysicalFrameError, ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError,
 };
 
 use super::connection::{dispatch_authenticated_request, HostRequestHandle};
@@ -23,6 +23,11 @@ use super::connection::{dispatch_authenticated_request, HostRequestHandle};
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+// SnapshotPage::encoded_bytes covers the page body, not the surrounding
+// QueryResult/QueryReply/ServerResponse named maps. Protocol v1 sends that
+// wrapped response in one physical frame, so reserve bounded headroom for the
+// fixed correlation/envelope fields before granting PagedSnapshots.
+const PAGED_SNAPSHOT_RESPONSE_ENVELOPE_HEADROOM_BYTES: u32 = 1024;
 
 /// Exact protected two-ACE SDDL form: LocalSystem + one caller-supplied user SID.
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
@@ -174,6 +179,28 @@ fn negotiated_codecs(
     let message = MessagePackCodec::from_limits(limits)
         .map_err(|error| IpcError::ClientHello(ClientHelloError::FrameLimits(error)))?;
     Ok((physical, message))
+}
+
+fn fence_capabilities_by_transport(mut negotiated: NegotiatedParameters) -> NegotiatedParameters {
+    if negotiated.capabilities.contains(Capability::PagedSnapshots)
+        && !paged_snapshot_response_fits_transport(negotiated.limits)
+    {
+        negotiated.capabilities = CapabilitySet::from_bits(
+            negotiated.capabilities.bits() & !Capability::PagedSnapshots.bit(),
+        );
+    }
+    negotiated
+}
+
+fn paged_snapshot_response_fits_transport(limits: FrameLimits) -> bool {
+    let Some(required_payload_bytes) = limits
+        .max_page_encoded_bytes
+        .checked_add(PAGED_SNAPSHOT_RESPONSE_ENVELOPE_HEADROOM_BYTES)
+    else {
+        return false;
+    };
+    required_payload_bytes <= limits.max_physical_frame_bytes
+        && required_payload_bytes <= limits.max_reassembled_message_bytes
 }
 
 /// Bound named-pipe listener that accepts exactly one ClientHello.
@@ -404,9 +431,11 @@ async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostCon
         if hello.profile_fingerprint != listener.expected_fingerprint {
             return Err(IpcError::ProfileMismatch);
         }
-        let negotiated = hello
-            .negotiate(listener.config.supported, listener.config.local_limits)
-            .map_err(IpcError::ClientHello)?;
+        let negotiated = fence_capabilities_by_transport(
+            hello
+                .negotiate(listener.config.supported, listener.config.local_limits)
+                .map_err(IpcError::ClientHello)?,
+        );
         let server_hello = ServerHello::from_negotiated(
             listener.config.server_build.clone(),
             listener.config.host_boot_id,
@@ -481,7 +510,7 @@ async fn windows_serve_request_on_executor(
             .message
             .decode::<ClientRequest>(&payload)
             .map_err(IpcError::MessagePack)?;
-        let response = requests.execute(connection.client_id, request).await?;
+        let response = requests.execute(connection.negotiated, request).await?;
         let encoded = connection
             .message
             .encode(&response)

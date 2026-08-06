@@ -101,7 +101,6 @@ struct SnapshotCursorDocument {
 ///
 /// The owned connection holds a deferred read transaction open. Dropping this
 /// value releases the view; no OS process or other runtime resource is owned.
-#[allow(dead_code)] // consumed by the bounded host registry in a later phase
 pub(crate) struct SnapshotSession {
     snapshot_id: SnapshotId,
     through_sequence: u64,
@@ -122,7 +121,6 @@ impl fmt::Debug for SnapshotSession {
 
 impl KernelStore {
     /// Pin a read-only snapshot at the current global durable event sequence.
-    #[allow(dead_code)] // consumed by the bounded host registry in a later phase
     pub(crate) fn begin_snapshot(
         &self,
         limits: PageLimits,
@@ -146,8 +144,11 @@ impl KernelStore {
 }
 
 impl SnapshotSession {
+    pub(crate) fn snapshot_id(&self) -> SnapshotId {
+        self.snapshot_id
+    }
+
     /// Read one bounded section page from the view pinned by `begin_snapshot`.
-    #[allow(dead_code)] // consumed by the bounded host registry in a later phase
     pub(crate) fn page(
         &self,
         section: SnapshotSection,

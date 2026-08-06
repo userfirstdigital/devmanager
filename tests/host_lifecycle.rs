@@ -21,6 +21,7 @@ use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, Resolv
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
 use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
 use devmanager::domain::operation::OperationState;
+use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
 };
@@ -238,9 +239,16 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     ]
 }
 
-fn create_task(client_id: ClientId) -> (CommandEnvelope, CommandId, TaskId) {
-    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x71)).expect("command id");
-    let task_id = TaskId::from_bytes(fixed_uuid_v7(0x72)).expect("task id");
+fn create_task_named(
+    client_id: ClientId,
+    command_tail: u8,
+    task_tail: u8,
+    environment_tail: u8,
+    project_tail: u8,
+    title: &str,
+) -> (CommandEnvelope, CommandId, TaskId) {
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(command_tail)).expect("command id");
+    let task_id = TaskId::from_bytes(fixed_uuid_v7(task_tail)).expect("task id");
     (
         CommandEnvelope {
             command_id,
@@ -250,11 +258,11 @@ fn create_task(client_id: ClientId) -> (CommandEnvelope, CommandId, TaskId) {
             expected_task_revision: None,
             command: Command::CreateTask(CreateTaskIntent {
                 id: task_id,
-                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x73))
+                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(environment_tail))
                     .expect("environment id"),
-                title: "Foreground host reconnect".into(),
+                title: title.into(),
                 description: None,
-                project_id: ProjectId::from_bytes(fixed_uuid_v7(0x74)).expect("project id"),
+                project_id: ProjectId::from_bytes(fixed_uuid_v7(project_tail)).expect("project id"),
                 workspace: WorkspaceRef::Main,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_000,
@@ -266,6 +274,17 @@ fn create_task(client_id: ClientId) -> (CommandEnvelope, CommandId, TaskId) {
         },
         command_id,
         task_id,
+    )
+}
+
+fn create_task(client_id: ClientId) -> (CommandEnvelope, CommandId, TaskId) {
+    create_task_named(
+        client_id,
+        0x71,
+        0x72,
+        0x73,
+        0x74,
+        "Foreground host reconnect",
     )
 }
 
@@ -474,6 +493,140 @@ async fn two_clients_attach_concurrently_and_share_one_command_bus() {
 
     client_a.disconnect();
     client_b.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x90)).expect("snapshot client id");
+    let mut limits = FrameLimits::v1_default();
+    limits.max_page_items = 1;
+    let config = HostClientConfig {
+        named_profile: profile,
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested: CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+        limits,
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert!(client
+        .granted_capabilities()
+        .contains(Capability::PagedSnapshots));
+
+    let (first_create, _, first_task_id) =
+        create_task_named(client_id, 0x91, 0x92, 0x93, 0x94, "First paged task");
+    let (second_create, _, second_task_id) =
+        create_task_named(client_id, 0x95, 0x96, 0x97, 0x98, "Second paged task");
+    assert!(matches!(
+        client
+            .execute_command(first_create)
+            .await
+            .expect("create first paged task"),
+        CommandReceipt::Accepted { .. }
+    ));
+    assert!(matches!(
+        client
+            .execute_command(second_create)
+            .await
+            .expect("create second paged task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let first_page = client
+        .snapshot_page(SnapshotSection::Tasks, None, None)
+        .await
+        .expect("first snapshot page transport")
+        .expect("first snapshot page query");
+    assert_eq!(first_page.section, SnapshotSection::Tasks);
+    assert_eq!(first_page.items.len(), 1);
+    let SnapshotItem::Task(first_item) = &first_page.items[0] else {
+        panic!("tasks page must contain only task items");
+    };
+    assert_eq!(first_item.task.id, first_task_id);
+    let valid_cursor = first_page
+        .next_cursor
+        .clone()
+        .expect("first page must continue");
+
+    let mut tampered_cursor = valid_cursor.clone();
+    tampered_cursor[0] ^= 0x01;
+    let tampered = client
+        .snapshot_page(
+            SnapshotSection::Tasks,
+            Some(first_page.snapshot_id),
+            Some(tampered_cursor),
+        )
+        .await
+        .expect("tampered cursor transport");
+    assert_eq!(
+        tampered,
+        Err(devmanager::domain::query::QueryError::InvalidRequest)
+    );
+
+    let (third_create, _, third_task_id) =
+        create_task_named(client_id, 0x99, 0x9a, 0x9b, 0x9c, "Post-snapshot task");
+    assert!(matches!(
+        client
+            .execute_command(third_create)
+            .await
+            .expect("create task after snapshot pin"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let second_page = client
+        .snapshot_page(
+            SnapshotSection::Tasks,
+            Some(first_page.snapshot_id),
+            Some(valid_cursor.clone()),
+        )
+        .await
+        .expect("second snapshot page transport")
+        .expect("second snapshot page query");
+    assert_eq!(second_page.snapshot_id, first_page.snapshot_id);
+    assert_eq!(second_page.through_sequence, first_page.through_sequence);
+    assert_eq!(second_page.items.len(), 1);
+    let SnapshotItem::Task(second_item) = &second_page.items[0] else {
+        panic!("tasks page must contain only task items");
+    };
+    assert_eq!(second_item.task.id, second_task_id);
+    assert_ne!(second_item.task.id, third_task_id);
+    assert!(second_page.next_cursor.is_none());
+
+    client
+        .release_snapshot(first_page.snapshot_id)
+        .await
+        .expect("release snapshot transport")
+        .expect("release snapshot query");
+    let released = client
+        .snapshot_page(
+            SnapshotSection::Tasks,
+            Some(first_page.snapshot_id),
+            Some(valid_cursor),
+        )
+        .await
+        .expect("released snapshot lookup transport");
+    assert_eq!(
+        released,
+        Err(devmanager::domain::query::QueryError::NotFound)
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    client.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

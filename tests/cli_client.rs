@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use devmanager::client::action::{
     self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
@@ -30,6 +30,7 @@ use devmanager::domain::task::{
 use devmanager::domain::ClientId;
 use devmanager::host::HostIdentity;
 use devmanager::kernel::CommandBus;
+use devmanager::protocol::Capability;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CTL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,12 +52,12 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     ]
 }
 
-fn seed_task(paths: &ResolvedAppPaths) -> TaskId {
-    fs::create_dir(&paths.root).expect("create isolated profile root");
+fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskId {
+    fs::create_dir_all(&paths.root).expect("create isolated profile root");
     let mut bus = CommandBus::open(&paths.database).expect("open isolated seed command bus");
-    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x60)).expect("seed client id");
-    let task_id = TaskId::from_bytes(fixed_uuid_v7(0x61)).expect("seed task id");
-    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x62)).expect("seed command id");
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(base)).expect("seed client id");
+    let task_id = TaskId::from_bytes(fixed_uuid_v7(base + 1)).expect("seed task id");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(base + 2)).expect("seed command id");
     let receipt = bus
         .execute(CommandEnvelope {
             command_id,
@@ -66,11 +67,11 @@ fn seed_task(paths: &ResolvedAppPaths) -> TaskId {
             expected_task_revision: None,
             command: Command::CreateTask(CreateTaskIntent {
                 id: task_id,
-                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x63))
+                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(base + 3))
                     .expect("environment id"),
-                title: "Task Show Target".into(),
+                title: title.into(),
                 description: Some("Read through the host query boundary".into()),
-                project_id: ProjectId::from_bytes(fixed_uuid_v7(0x64)).expect("project id"),
+                project_id: ProjectId::from_bytes(fixed_uuid_v7(base + 4)).expect("project id"),
                 workspace: WorkspaceRef::Main,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_000,
@@ -84,6 +85,10 @@ fn seed_task(paths: &ResolvedAppPaths) -> TaskId {
     assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
     drop(bus);
     task_id
+}
+
+fn seed_task(paths: &ResolvedAppPaths) -> TaskId {
+    seed_task_with_base(paths, 0x60, "Task Show Target")
 }
 
 fn scrub_env(command: &mut ProcessCommand) {
@@ -274,8 +279,8 @@ fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        5,
-        "slice exposes host.actions, host.status, task.show, task.create, and task.rename"
+        6,
+        "slice exposes host.actions, host.status, task.list/show/create/rename"
     );
 
     let mut ids = Vec::new();
@@ -306,10 +311,19 @@ fn action_catalog_ids_are_unique_and_classified() {
 
     assert!(ids.contains(&ACTION_HOST_ACTIONS));
     assert!(ids.contains(&ACTION_HOST_STATUS));
+    assert!(ids.contains(&ACTION_TASK_LIST));
     assert!(ids.contains(&ACTION_TASK_SHOW));
     assert!(ids.contains(&ACTION_TASK_CREATE));
     assert!(ids.contains(&ACTION_TASK_RENAME));
     assert!(action::require_unique_ids().is_ok());
+    let task_list = catalog
+        .iter()
+        .find(|action| action.id == ACTION_TASK_LIST)
+        .expect("task.list action");
+    assert_eq!(
+        task_list.required_capability,
+        Some(Capability::PagedSnapshots)
+    );
 }
 
 #[test]
@@ -388,6 +402,7 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
     }
     assert!(ids.iter().any(|id| id == ACTION_HOST_ACTIONS));
     assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
+    assert!(ids.iter().any(|id| id == ACTION_TASK_LIST));
     assert!(ids.iter().any(|id| id == ACTION_TASK_SHOW));
     assert!(ids.iter().any(|id| id == ACTION_TASK_CREATE));
     assert!(ids.iter().any(|id| id == ACTION_TASK_RENAME));
@@ -532,6 +547,59 @@ fn ctl_task_show_queries_seeded_task_without_taking_host_lock() {
     assert!(host
         .try_wait()
         .expect("poll host after missing task query")
+        .is_none());
+
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[test]
+fn ctl_tasks_lists_seeded_tasks_through_paged_snapshot_without_taking_host_lock() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let first_task_id = seed_task_with_base(&paths, 0x60, "First Listed Task");
+    let second_task_id = seed_task_with_base(&paths, 0x65, "Second Listed Task");
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original = wait_for_identity(&mut host, &lock_path);
+
+    let output = run_ctl_bounded(&["ctl", "tasks", "--profile", &profile, "--json"]);
+    assert!(
+        output.status.success(),
+        "ctl tasks must succeed; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).trim().is_empty(),
+        "successful task list must not emit diagnostics"
+    );
+
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("tasks JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["action_id"], ACTION_TASK_LIST);
+    assert_eq!(doc["profile"], profile);
+    assert!(doc["snapshot_id"].as_str().is_some());
+    assert!(doc["through_sequence"].as_u64().unwrap_or_default() >= 2);
+    assert!(doc["page_count"].as_u64().unwrap_or_default() >= 1);
+    let tasks = doc["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0]["task"]["id"], first_task_id.to_string());
+    assert_eq!(tasks[0]["task"]["title"], "First Listed Task");
+    assert_eq!(tasks[1]["task"]["id"], second_task_id.to_string());
+    assert_eq!(tasks[1]["task"]["title"], "Second Listed Task");
+
+    let after = read_identity(&lock_path).expect("host lock after ctl tasks");
+    assert_eq!(after.pid, original.pid);
+    assert_eq!(after.boot_id, original.boot_id);
+    assert!(host
+        .try_wait()
+        .expect("poll host after ctl tasks")
         .is_none());
 
     let status = host

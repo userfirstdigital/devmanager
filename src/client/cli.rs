@@ -1,5 +1,6 @@
 //! Strict `devmanager-host ctl` parsing and versioned JSON output.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,14 +10,16 @@ use serde_json::json;
 use super::action::{
     self, task_create_command, task_rename_command, ActionArgumentSchema, ActionRisk, ActionScope,
     TaskCreateArguments, TaskRenameArguments, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
-    ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+    ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use super::{HostClient, HostClientConfig};
 use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
+use crate::domain::id::SnapshotId;
 use crate::domain::query::QueryError;
+use crate::domain::snapshot::{SnapshotItem, SnapshotSection, TaskSnapshotItem};
 use crate::domain::{ClientId, CommandId, TaskId};
 use crate::host::IpcError;
-use crate::protocol::{CapabilitySet, FrameLimits};
+use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 
 const SCHEMA_VERSION: u16 = 1;
 const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,12 +28,17 @@ const COMMAND_REPLAY_TIMEOUT: Duration = Duration::from_secs(16);
 const MAX_COMMAND_ATTEMPTS: usize = 2;
 const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
 const MAX_ARGUMENTS_JSON_BYTES: usize = 64 * 1024;
+const MAX_TASK_LIST_PAGES: usize = 1_024;
+const MAX_TASK_LIST_ITEMS: usize = 100_000;
 
 /// Parsed ctl invocation for this lean slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtlCommand {
     Actions,
     Status {
+        profile: String,
+    },
+    Tasks {
         profile: String,
     },
     TaskShow {
@@ -88,6 +96,7 @@ where
     match subcommand.as_str() {
         "actions" => parse_actions(args),
         "status" => parse_status(args),
+        "tasks" => parse_tasks(args),
         "task-show" => parse_task_show(args),
         "invoke" => parse_invoke(args),
         other => Err(CliError::new(format!("unknown ctl subcommand: {other}"))),
@@ -154,6 +163,43 @@ where
     let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
     let profile = validate_ctl_profile(&profile)?;
     Ok(CtlCommand::Status { profile })
+}
+
+fn parse_tasks<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    Ok(CtlCommand::Tasks { profile })
 }
 
 fn parse_task_show<I>(mut args: I) -> Result<CtlCommand, CliError>
@@ -453,6 +499,10 @@ pub fn run_ctl(command: CtlCommand) -> Result<(), CliError> {
             let document = status_json_document(&profile)?;
             write_stdout(&document)
         }
+        CtlCommand::Tasks { profile } => {
+            let document = tasks_json_document(&profile)?;
+            write_stdout(&document)
+        }
         CtlCommand::TaskShow { profile, task_id } => {
             let document = task_show_json_document(&profile, task_id)?;
             write_stdout(&document)
@@ -493,7 +543,7 @@ fn status_json_document(profile: &str) -> Result<String, CliError> {
 
 #[cfg(windows)]
 async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
-    let client = connect_profile_client(profile, ClientId::new()).await?;
+    let client = connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
 
     let doc = json!({
         "schema_version": SCHEMA_VERSION,
@@ -508,6 +558,152 @@ async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
     });
     serde_json::to_string(&doc)
         .map_err(|error| CliError::new(format!("failed to encode status JSON: {error}")))
+}
+
+fn tasks_json_document(profile: &str) -> Result<String, CliError> {
+    #[cfg(not(windows))]
+    {
+        let _ = profile;
+        return Err(CliError::new("ctl tasks requires Windows"));
+    }
+
+    #[cfg(windows)]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CliError::new(format!("failed to build ctl runtime: {error}")))?;
+        runtime.block_on(tasks_json_document_async(profile))
+    }
+}
+
+#[cfg(windows)]
+async fn tasks_json_document_async(profile: &str) -> Result<String, CliError> {
+    let mut client = connect_profile_client(
+        profile,
+        ClientId::new(),
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+    )
+    .await?;
+    if !client
+        .granted_capabilities()
+        .contains(Capability::PagedSnapshots)
+    {
+        return Err(CliError::new(
+            "host did not grant required paged_snapshots capability",
+        ));
+    }
+
+    let mut opened: Option<SnapshotId> = None;
+    let result = assemble_task_list(&mut client, profile, &mut opened).await;
+    if let Some(snapshot_id) = opened {
+        let _ = client.release_snapshot(snapshot_id).await;
+    }
+    result
+}
+
+#[cfg(windows)]
+async fn assemble_task_list(
+    client: &mut HostClient,
+    profile: &str,
+    opened: &mut Option<SnapshotId>,
+) -> Result<String, CliError> {
+    let mut tasks: Vec<TaskSnapshotItem> = Vec::new();
+    let mut seen_cursors: HashSet<Vec<u8>> = HashSet::new();
+    let mut page_count: u64 = 0;
+    let mut snapshot_id: Option<SnapshotId> = None;
+    let mut through_sequence: Option<u64> = None;
+    let mut resume_cursor: Option<Vec<u8>> = None;
+
+    loop {
+        if page_count as usize >= MAX_TASK_LIST_PAGES {
+            return Err(CliError::new("task.list exceeded finite page bound"));
+        }
+        let requested_id = snapshot_id;
+        let page = match client
+            .snapshot_page(SnapshotSection::Tasks, requested_id, resume_cursor.clone())
+            .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(QueryError::NotFound)) => {
+                return Err(CliError::new("task.list snapshot was not found"))
+            }
+            Ok(Err(QueryError::Unauthorized)) => {
+                return Err(CliError::new("task.list query was unauthorized"))
+            }
+            Ok(Err(QueryError::InvalidRequest)) => {
+                return Err(CliError::new("task.list query was invalid"))
+            }
+            Ok(Err(QueryError::UnsupportedCapability)) => {
+                return Err(CliError::new("task.list query capability is unsupported"))
+            }
+            Err(error) => return Err(CliError::new(format!("task.list query failed: {error}"))),
+        };
+
+        *opened = Some(page.snapshot_id);
+        if let Some(expected) = snapshot_id {
+            if page.snapshot_id != expected {
+                return Err(CliError::new(
+                    "task.list snapshot identity drifted across pages",
+                ));
+            }
+        } else {
+            snapshot_id = Some(page.snapshot_id);
+        }
+        if let Some(expected) = through_sequence {
+            if page.through_sequence != expected {
+                return Err(CliError::new(
+                    "task.list through_sequence drifted across pages",
+                ));
+            }
+        } else {
+            through_sequence = Some(page.through_sequence);
+        }
+        if page.section != SnapshotSection::Tasks {
+            return Err(CliError::new("task.list returned a non-tasks section"));
+        }
+
+        for item in &page.items {
+            let SnapshotItem::Task(task_item) = item else {
+                return Err(CliError::new(
+                    "task.list page contained a non-task snapshot item",
+                ));
+            };
+            if tasks.len() >= MAX_TASK_LIST_ITEMS {
+                return Err(CliError::new("task.list exceeded finite item bound"));
+            }
+            tasks.push(task_item.clone());
+        }
+        page_count += 1;
+
+        match page.next_cursor {
+            Some(cursor) => {
+                if !seen_cursors.insert(cursor.clone()) {
+                    return Err(CliError::new(
+                        "task.list observed a repeated snapshot cursor",
+                    ));
+                }
+                resume_cursor = Some(cursor);
+            }
+            None => break,
+        }
+    }
+
+    let snapshot_id = snapshot_id.ok_or_else(|| CliError::new("task.list produced no pages"))?;
+    let through_sequence =
+        through_sequence.ok_or_else(|| CliError::new("task.list produced no pages"))?;
+
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "action_id": ACTION_TASK_LIST,
+        "profile": profile,
+        "snapshot_id": snapshot_id,
+        "through_sequence": through_sequence,
+        "page_count": page_count,
+        "tasks": tasks,
+    });
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode tasks JSON: {error}")))
 }
 
 fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, CliError> {
@@ -530,7 +726,8 @@ fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, Cli
 
 #[cfg(windows)]
 async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result<String, CliError> {
-    let mut client = connect_profile_client(profile, ClientId::new()).await?;
+    let mut client =
+        connect_profile_client(profile, ClientId::new(), CapabilitySet::empty()).await?;
     let snapshot = match client.task_snapshot(task_id).await {
         Ok(Ok(snapshot)) => snapshot,
         Ok(Err(QueryError::NotFound)) => {
@@ -629,7 +826,7 @@ async fn task_create_invoke_async(profile: &str, arguments_json: &str) -> Result
     let envelope = task_create_command(command_id, client_id, issued_at_ms, args)
         .map_err(|error| CliError::new(format!("invalid task.create arguments: {error}")))?;
 
-    let mut client = connect_profile_client(profile, client_id).await?;
+    let mut client = connect_profile_client(profile, client_id, CapabilitySet::empty()).await?;
     let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_CREATE).await?;
     match &receipt {
         CommandReceipt::Accepted { .. } => {
@@ -671,7 +868,7 @@ async fn task_rename_invoke_async(
     )
     .map_err(|error| CliError::new(format!("invalid task.rename arguments: {error}")))?;
 
-    let mut client = connect_profile_client(profile, client_id).await?;
+    let mut client = connect_profile_client(profile, client_id, CapabilitySet::empty()).await?;
     let receipt = execute_command_with_reconnect(&mut client, envelope, ACTION_TASK_RENAME).await?;
     match &receipt {
         CommandReceipt::Accepted { .. } => {
@@ -790,12 +987,13 @@ fn command_replay_timeout_error(action_id: &str) -> CliError {
 async fn connect_profile_client(
     profile: &str,
     client_id: ClientId,
+    requested: CapabilitySet,
 ) -> Result<HostClient, CliError> {
     let config = HostClientConfig {
         named_profile: profile.to_string(),
         client_build: format!("devmanager-host-ctl/{}", env!("CARGO_PKG_VERSION")),
         client_id,
-        requested: CapabilitySet::empty(),
+        requested,
         limits: FrameLimits::v1_default(),
     };
 
@@ -884,6 +1082,12 @@ mod tests {
         assert_eq!(
             parse_ctl_args(["status", "--profile", "Alpha_1", "--json"]).expect("status"),
             CtlCommand::Status {
+                profile: "alpha_1".to_string()
+            }
+        );
+        assert_eq!(
+            parse_ctl_args(["tasks", "--profile", "Alpha_1", "--json"]).expect("tasks"),
+            CtlCommand::Tasks {
                 profile: "alpha_1".to_string()
             }
         );

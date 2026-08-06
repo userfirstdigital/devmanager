@@ -2,9 +2,9 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::domain::id::{ClientId, OperationId, RequestId, TaskId};
+use crate::domain::id::{ClientId, OperationId, RequestId, SnapshotId, TaskId};
 use crate::domain::operation::OperationState;
-use crate::domain::snapshot::TaskSnapshotItem;
+use crate::domain::snapshot::{SnapshotPage, SnapshotSection, TaskSnapshotItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryEnvelope {
@@ -141,6 +141,15 @@ pub enum Query {
     },
     /// Task scope is taken from [`QueryEnvelope::task_id`].
     TaskSnapshot,
+    /// Open (`snapshot_id` and `resume_cursor` both absent) or resume (both present).
+    SnapshotPage {
+        section: SnapshotSection,
+        snapshot_id: Option<SnapshotId>,
+        resume_cursor: Option<Vec<u8>>,
+    },
+    ReleaseSnapshot {
+        snapshot_id: SnapshotId,
+    },
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -169,6 +178,40 @@ impl Serialize for EmptyNamedMap {
     }
 }
 
+struct SnapshotPageQueryRef<'a> {
+    section: &'a SnapshotSection,
+    snapshot_id: &'a Option<SnapshotId>,
+    resume_cursor: &'a Option<Vec<u8>>,
+}
+
+impl Serialize for SnapshotPageQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("section", self.section)?;
+        map.serialize_entry("snapshot_id", self.snapshot_id)?;
+        map.serialize_entry("resume_cursor", self.resume_cursor)?;
+        map.end()
+    }
+}
+
+struct ReleaseSnapshotQueryRef<'a> {
+    snapshot_id: &'a SnapshotId,
+}
+
+impl Serialize for ReleaseSnapshotQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("snapshot_id", self.snapshot_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for Query {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -181,6 +224,21 @@ impl Serialize for Query {
                 &OperationStatusQueryRef { operation_id },
             )?,
             Self::TaskSnapshot => map.serialize_entry("task_snapshot", &EmptyNamedMap)?,
+            Self::SnapshotPage {
+                section,
+                snapshot_id,
+                resume_cursor,
+            } => map.serialize_entry(
+                "snapshot_page",
+                &SnapshotPageQueryRef {
+                    section,
+                    snapshot_id,
+                    resume_cursor,
+                },
+            )?,
+            Self::ReleaseSnapshot { snapshot_id } => {
+                map.serialize_entry("release_snapshot", &ReleaseSnapshotQueryRef { snapshot_id })?
+            }
         }
         map.end()
     }
@@ -189,6 +247,8 @@ impl Serialize for Query {
 enum QueryVariant {
     OperationStatus,
     TaskSnapshot,
+    SnapshotPage,
+    ReleaseSnapshot,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -202,7 +262,9 @@ impl<'de> Deserialize<'de> for QueryVariant {
             type Value = QueryVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("operation_status or task_snapshot")
+                formatter.write_str(
+                    "operation_status, task_snapshot, snapshot_page, or release_snapshot",
+                )
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -212,9 +274,16 @@ impl<'de> Deserialize<'de> for QueryVariant {
                 match value {
                     "operation_status" => Ok(QueryVariant::OperationStatus),
                     "task_snapshot" => Ok(QueryVariant::TaskSnapshot),
+                    "snapshot_page" => Ok(QueryVariant::SnapshotPage),
+                    "release_snapshot" => Ok(QueryVariant::ReleaseSnapshot),
                     _ => Err(de::Error::unknown_variant(
                         value,
-                        &["operation_status", "task_snapshot"],
+                        &[
+                            "operation_status",
+                            "task_snapshot",
+                            "snapshot_page",
+                            "release_snapshot",
+                        ],
                     )),
                 }
             }
@@ -330,6 +399,188 @@ impl<'de> Deserialize<'de> for EmptyNamedMap {
     }
 }
 
+struct SnapshotPageQueryPayload {
+    section: SnapshotSection,
+    snapshot_id: Option<SnapshotId>,
+    resume_cursor: Option<Vec<u8>>,
+}
+
+enum SnapshotPageQueryField {
+    Section,
+    SnapshotId,
+    ResumeCursor,
+}
+
+impl<'de> Deserialize<'de> for SnapshotPageQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = SnapshotPageQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("section, snapshot_id, or resume_cursor")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "section" => Ok(SnapshotPageQueryField::Section),
+                    "snapshot_id" => Ok(SnapshotPageQueryField::SnapshotId),
+                    "resume_cursor" => Ok(SnapshotPageQueryField::ResumeCursor),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["section", "snapshot_id", "resume_cursor"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotPageQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = SnapshotPageQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named snapshot_page query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut section = None;
+                let mut snapshot_id: Option<Option<SnapshotId>> = None;
+                let mut resume_cursor: Option<Option<Vec<u8>>> = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        SnapshotPageQueryField::Section => {
+                            if section.is_some() {
+                                return Err(de::Error::duplicate_field("section"));
+                            }
+                            section = Some(map.next_value()?);
+                        }
+                        SnapshotPageQueryField::SnapshotId => {
+                            if snapshot_id.is_some() {
+                                return Err(de::Error::duplicate_field("snapshot_id"));
+                            }
+                            snapshot_id = Some(map.next_value()?);
+                        }
+                        SnapshotPageQueryField::ResumeCursor => {
+                            if resume_cursor.is_some() {
+                                return Err(de::Error::duplicate_field("resume_cursor"));
+                            }
+                            resume_cursor = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                Ok(SnapshotPageQueryPayload {
+                    section: section.ok_or_else(|| de::Error::missing_field("section"))?,
+                    snapshot_id: snapshot_id
+                        .ok_or_else(|| de::Error::missing_field("snapshot_id"))?,
+                    resume_cursor: resume_cursor
+                        .ok_or_else(|| de::Error::missing_field("resume_cursor"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ReleaseSnapshotQueryPayload {
+    snapshot_id: SnapshotId,
+}
+
+enum ReleaseSnapshotQueryField {
+    SnapshotId,
+}
+
+impl<'de> Deserialize<'de> for ReleaseSnapshotQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ReleaseSnapshotQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("snapshot_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "snapshot_id" => Ok(ReleaseSnapshotQueryField::SnapshotId),
+                    _ => Err(de::Error::unknown_field(value, &["snapshot_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseSnapshotQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ReleaseSnapshotQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named release_snapshot query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut snapshot_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ReleaseSnapshotQueryField::SnapshotId => {
+                            if snapshot_id.is_some() {
+                                return Err(de::Error::duplicate_field("snapshot_id"));
+                            }
+                            snapshot_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ReleaseSnapshotQueryPayload {
+                    snapshot_id: snapshot_id
+                        .ok_or_else(|| de::Error::missing_field("snapshot_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for Query {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -362,6 +613,20 @@ impl<'de> Deserialize<'de> for Query {
                         let _: EmptyNamedMap = map.next_value()?;
                         Query::TaskSnapshot
                     }
+                    QueryVariant::SnapshotPage => {
+                        let payload: SnapshotPageQueryPayload = map.next_value()?;
+                        Query::SnapshotPage {
+                            section: payload.section,
+                            snapshot_id: payload.snapshot_id,
+                            resume_cursor: payload.resume_cursor,
+                        }
+                    }
+                    QueryVariant::ReleaseSnapshot => {
+                        let payload: ReleaseSnapshotQueryPayload = map.next_value()?;
+                        Query::ReleaseSnapshot {
+                            snapshot_id: payload.snapshot_id,
+                        }
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -382,6 +647,12 @@ pub enum QueryResult {
     },
     TaskSnapshot {
         snapshot: TaskSnapshotItem,
+    },
+    SnapshotPage {
+        page: SnapshotPage,
+    },
+    SnapshotReleased {
+        snapshot_id: SnapshotId,
     },
 }
 
@@ -417,6 +688,36 @@ impl Serialize for TaskSnapshotResultRef<'_> {
     }
 }
 
+struct SnapshotPageResultRef<'a> {
+    page: &'a SnapshotPage,
+}
+
+impl Serialize for SnapshotPageResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("page", self.page)?;
+        map.end()
+    }
+}
+
+struct SnapshotReleasedResultRef<'a> {
+    snapshot_id: &'a SnapshotId,
+}
+
+impl Serialize for SnapshotReleasedResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("snapshot_id", self.snapshot_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for QueryResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -437,6 +738,13 @@ impl Serialize for QueryResult {
             Self::TaskSnapshot { snapshot } => {
                 map.serialize_entry("task_snapshot", &TaskSnapshotResultRef { snapshot })?
             }
+            Self::SnapshotPage { page } => {
+                map.serialize_entry("snapshot_page", &SnapshotPageResultRef { page })?
+            }
+            Self::SnapshotReleased { snapshot_id } => map.serialize_entry(
+                "snapshot_released",
+                &SnapshotReleasedResultRef { snapshot_id },
+            )?,
         }
         map.end()
     }
@@ -445,6 +753,8 @@ impl Serialize for QueryResult {
 enum QueryResultVariant {
     OperationStatus,
     TaskSnapshot,
+    SnapshotPage,
+    SnapshotReleased,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -458,7 +768,9 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
             type Value = QueryResultVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("operation_status or task_snapshot")
+                formatter.write_str(
+                    "operation_status, task_snapshot, snapshot_page, or snapshot_released",
+                )
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -468,9 +780,16 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                 match value {
                     "operation_status" => Ok(QueryResultVariant::OperationStatus),
                     "task_snapshot" => Ok(QueryResultVariant::TaskSnapshot),
+                    "snapshot_page" => Ok(QueryResultVariant::SnapshotPage),
+                    "snapshot_released" => Ok(QueryResultVariant::SnapshotReleased),
                     _ => Err(de::Error::unknown_variant(
                         value,
-                        &["operation_status", "task_snapshot"],
+                        &[
+                            "operation_status",
+                            "task_snapshot",
+                            "snapshot_page",
+                            "snapshot_released",
+                        ],
                     )),
                 }
             }
@@ -646,6 +965,159 @@ impl<'de> Deserialize<'de> for TaskSnapshotResultPayload {
     }
 }
 
+struct SnapshotPageResultPayload {
+    page: SnapshotPage,
+}
+
+enum SnapshotPageResultField {
+    Page,
+}
+
+impl<'de> Deserialize<'de> for SnapshotPageResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = SnapshotPageResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("page")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "page" => Ok(SnapshotPageResultField::Page),
+                    _ => Err(de::Error::unknown_field(value, &["page"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotPageResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = SnapshotPageResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named snapshot_page result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut page = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        SnapshotPageResultField::Page => {
+                            if page.is_some() {
+                                return Err(de::Error::duplicate_field("page"));
+                            }
+                            page = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(SnapshotPageResultPayload {
+                    page: page.ok_or_else(|| de::Error::missing_field("page"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct SnapshotReleasedResultPayload {
+    snapshot_id: SnapshotId,
+}
+
+enum SnapshotReleasedResultField {
+    SnapshotId,
+}
+
+impl<'de> Deserialize<'de> for SnapshotReleasedResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = SnapshotReleasedResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("snapshot_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "snapshot_id" => Ok(SnapshotReleasedResultField::SnapshotId),
+                    _ => Err(de::Error::unknown_field(value, &["snapshot_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotReleasedResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = SnapshotReleasedResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named snapshot_released result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut snapshot_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        SnapshotReleasedResultField::SnapshotId => {
+                            if snapshot_id.is_some() {
+                                return Err(de::Error::duplicate_field("snapshot_id"));
+                            }
+                            snapshot_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(SnapshotReleasedResultPayload {
+                    snapshot_id: snapshot_id
+                        .ok_or_else(|| de::Error::missing_field("snapshot_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -679,6 +1151,16 @@ impl<'de> Deserialize<'de> for QueryResult {
                         let payload: TaskSnapshotResultPayload = map.next_value()?;
                         QueryResult::TaskSnapshot {
                             snapshot: payload.snapshot,
+                        }
+                    }
+                    QueryResultVariant::SnapshotPage => {
+                        let payload: SnapshotPageResultPayload = map.next_value()?;
+                        QueryResult::SnapshotPage { page: payload.page }
+                    }
+                    QueryResultVariant::SnapshotReleased => {
+                        let payload: SnapshotReleasedResultPayload = map.next_value()?;
+                        QueryResult::SnapshotReleased {
+                            snapshot_id: payload.snapshot_id,
                         }
                     }
                 };

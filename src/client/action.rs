@@ -1,6 +1,6 @@
 //! Shared action catalog for CLI and future GPUI clients.
 //!
-//! This slice exposes `host.actions`, `host.status`, `task.show`,
+//! This slice exposes `host.actions`, `host.status`, `task.list`, `task.show`,
 //! `task.create`, and `task.rename`. It is intentionally not a dynamic
 //! plugin framework.
 
@@ -19,6 +19,8 @@ use crate::protocol::Capability;
 pub const ACTION_HOST_ACTIONS: &str = "host.actions";
 /// Stable id for attaching and reporting host status.
 pub const ACTION_HOST_STATUS: &str = "host.status";
+/// Stable id for listing Tasks through the paged snapshot query boundary.
+pub const ACTION_TASK_LIST: &str = "task.list";
 /// Stable id for reading one Task through the host query boundary.
 pub const ACTION_TASK_SHOW: &str = "task.show";
 /// Stable id for creating one Task through the host command boundary.
@@ -80,6 +82,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         keywords: &["status", "host", "hello", "attach"],
         scope: ActionScope::Host,
         required_capability: None,
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::None,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_LIST,
+        title: "List tasks",
+        description: "List Tasks through the host paged snapshot query boundary.",
+        keywords: &["task", "list", "tasks", "snapshot"],
+        scope: ActionScope::Host,
+        required_capability: Some(Capability::PagedSnapshots),
         risk: ActionRisk::ReadOnly,
         argument_schema: ActionArgumentSchema::None,
     },
@@ -223,8 +235,8 @@ mod tests {
     use super::{
         catalog, require_unique_ids, task_create_command, task_rename_command, task_show_query,
         ActionArgumentSchema, ActionRisk, ActionScope, TaskCreateArguments, TaskRenameArguments,
-        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_RENAME,
-        ACTION_TASK_SHOW,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE, ACTION_TASK_LIST,
+        ACTION_TASK_RENAME, ACTION_TASK_SHOW,
     };
     use crate::domain::command::Command;
     use crate::domain::query::Query;
@@ -233,44 +245,57 @@ mod tests {
         WorkspaceRef,
     };
     use crate::domain::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+    use crate::protocol::Capability;
 
     #[test]
     fn catalog_exposes_unique_read_and_create_actions() {
         let ids: Vec<&str> = catalog().iter().map(|action| action.id).collect();
         assert!(ids.contains(&ACTION_HOST_ACTIONS));
         assert!(ids.contains(&ACTION_HOST_STATUS));
+        assert!(ids.contains(&ACTION_TASK_LIST));
         assert!(ids.contains(&ACTION_TASK_SHOW));
         assert!(ids.contains(&ACTION_TASK_CREATE));
         assert!(ids.contains(&ACTION_TASK_RENAME));
-        assert_eq!(ids.len(), 5);
+        assert_eq!(ids.len(), 6);
         require_unique_ids().expect("ids must be unique");
         for action in catalog() {
-            let (expected_scope, expected_risk, expected_schema) = match action.id {
-                ACTION_TASK_SHOW => (
-                    ActionScope::Task,
-                    ActionRisk::ReadOnly,
-                    ActionArgumentSchema::TaskId,
-                ),
-                ACTION_TASK_CREATE => (
-                    ActionScope::Host,
-                    ActionRisk::Mutating,
-                    ActionArgumentSchema::TaskCreateV1,
-                ),
-                ACTION_TASK_RENAME => (
-                    ActionScope::Task,
-                    ActionRisk::Mutating,
-                    ActionArgumentSchema::TaskRenameV1,
-                ),
-                _ => (
-                    ActionScope::Host,
-                    ActionRisk::ReadOnly,
-                    ActionArgumentSchema::None,
-                ),
-            };
+            let (expected_scope, expected_risk, expected_schema, expected_capability) =
+                match action.id {
+                    ACTION_TASK_LIST => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::None,
+                        Some(Capability::PagedSnapshots),
+                    ),
+                    ACTION_TASK_SHOW => (
+                        ActionScope::Task,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::TaskId,
+                        None,
+                    ),
+                    ACTION_TASK_CREATE => (
+                        ActionScope::Host,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskCreateV1,
+                        None,
+                    ),
+                    ACTION_TASK_RENAME => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TaskRenameV1,
+                        None,
+                    ),
+                    _ => (
+                        ActionScope::Host,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::None,
+                        None,
+                    ),
+                };
             assert_eq!(action.scope, expected_scope);
             assert_eq!(action.risk, expected_risk);
             assert_eq!(action.argument_schema, expected_schema);
-            assert!(action.required_capability.is_none());
+            assert_eq!(action.required_capability, expected_capability);
         }
     }
 

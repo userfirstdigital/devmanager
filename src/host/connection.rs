@@ -3,15 +3,24 @@
 //! Transport connection tasks never mutate the bus or projections directly.
 //! They submit decoded requests through [`HostRequestHandle`]; one
 //! [`HostRequestExecutor`] task exclusively owns [`CommandBus`] and services
-//! them in arrival order. This same boundary is the later owner for pinned
-//! SnapshotSession state and ordered fan-out.
+//! them in arrival order. The executor also owns the bounded SnapshotSession
+//! registry for paged snapshot queries.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::{interval, MissedTickBehavior};
 
+use crate::domain::id::SnapshotId;
+use crate::domain::query::{
+    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+};
+use crate::domain::snapshot::{PageLimits, SnapshotSection};
 use crate::domain::ClientId;
-use crate::kernel::{CommandBus, StoreError};
-use crate::protocol::{ClientRequest, ServerResponse};
+use crate::kernel::{CommandBus, SnapshotError, SnapshotSession, StoreError};
+use crate::protocol::{Capability, ClientRequest, NegotiatedParameters, ServerResponse};
 
 use super::ipc::IpcError;
 
@@ -21,10 +30,91 @@ use super::ipc::IpcError;
 /// (bounded backpressure). Requests are never silently dropped.
 pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
 
+const MAX_SNAPSHOT_SESSIONS: usize = 32;
+const SNAPSHOT_IDLE_TTL: Duration = Duration::from_secs(30);
+const SNAPSHOT_REAPER_PERIOD: Duration = Duration::from_secs(1);
+
 struct HostRequestJob {
-    authenticated_client_id: ClientId,
+    negotiated: NegotiatedParameters,
     request: ClientRequest,
     reply: oneshot::Sender<Result<ServerResponse, IpcError>>,
+}
+
+struct SnapshotRegistryEntry {
+    owner: ClientId,
+    session: SnapshotSession,
+    last_touch: Instant,
+}
+
+struct SnapshotRegistry {
+    entries: HashMap<SnapshotId, SnapshotRegistryEntry>,
+}
+
+impl SnapshotRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn reap_idle(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_touch) < SNAPSHOT_IDLE_TTL);
+    }
+
+    fn evict_lru_if_at_capacity(&mut self) {
+        while self.entries.len() >= MAX_SNAPSHOT_SESSIONS {
+            let Some((&victim_id, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touch)
+            else {
+                break;
+            };
+            self.entries.remove(&victim_id);
+        }
+    }
+
+    fn insert(&mut self, owner: ClientId, session: SnapshotSession, now: Instant) {
+        self.evict_lru_if_at_capacity();
+        let snapshot_id = session.snapshot_id();
+        self.entries.insert(
+            snapshot_id,
+            SnapshotRegistryEntry {
+                owner,
+                session,
+                last_touch: now,
+            },
+        );
+    }
+
+    fn touch(&mut self, snapshot_id: SnapshotId, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&snapshot_id) {
+            entry.last_touch = now;
+        }
+    }
+
+    fn remove(&mut self, snapshot_id: SnapshotId) -> Option<SnapshotRegistryEntry> {
+        self.entries.remove(&snapshot_id)
+    }
+
+    fn get(
+        &self,
+        snapshot_id: SnapshotId,
+        requester: ClientId,
+        now: Instant,
+    ) -> Result<&SnapshotSession, QueryError> {
+        let Some(entry) = self.entries.get(&snapshot_id) else {
+            return Err(QueryError::NotFound);
+        };
+        if now.duration_since(entry.last_touch) >= SNAPSHOT_IDLE_TTL {
+            return Err(QueryError::NotFound);
+        }
+        if entry.owner != requester {
+            return Err(QueryError::Unauthorized);
+        }
+        Ok(&entry.session)
+    }
 }
 
 /// Cloneable submit handle for the single host CommandBus executor.
@@ -40,13 +130,13 @@ impl HostRequestHandle {
     /// Returns [`IpcError::Unavailable`] if the executor has stopped.
     pub async fn execute(
         &self,
-        authenticated_client_id: ClientId,
+        negotiated: NegotiatedParameters,
         request: ClientRequest,
     ) -> Result<ServerResponse, IpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HostRequestJob {
-                authenticated_client_id,
+                negotiated,
                 request,
                 reply: reply_tx,
             })
@@ -60,6 +150,7 @@ impl HostRequestHandle {
 pub struct HostRequestExecutor {
     bus: CommandBus,
     rx: mpsc::Receiver<HostRequestJob>,
+    registry: SnapshotRegistry,
 }
 
 impl HostRequestExecutor {
@@ -71,7 +162,11 @@ impl HostRequestExecutor {
     pub fn start(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let handle = HostRequestHandle { tx };
-        let mut executor = Self { bus, rx };
+        let mut executor = Self {
+            bus,
+            rx,
+            registry: SnapshotRegistry::new(),
+        };
         let join = tokio::spawn(async move {
             executor.run().await;
         });
@@ -79,16 +174,190 @@ impl HostRequestExecutor {
     }
 
     async fn run(&mut self) {
-        while let Some(job) = self.rx.recv().await {
-            let result = dispatch_authenticated_request(
-                job.authenticated_client_id,
-                &mut self.bus,
-                job.request,
-            );
-            // If the connection task went away, drop the reply; do not panic.
-            let _ = job.reply.send(result);
+        let mut reaper = interval(SNAPSHOT_REAPER_PERIOD);
+        reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                job = self.rx.recv() => {
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let result = self.dispatch(job.negotiated, job.request);
+                    // If the connection task went away, drop the reply; do not panic.
+                    let _ = job.reply.send(result);
+                }
+                _ = reaper.tick() => {
+                    self.registry.reap_idle(Instant::now());
+                }
+            }
         }
     }
+
+    fn dispatch(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, IpcError> {
+        match request {
+            ClientRequest::Command(envelope) => {
+                if envelope.client_id != negotiated.client_id {
+                    return Err(IpcError::Unauthorized);
+                }
+                let receipt = self.bus.execute(envelope).map_err(map_store_error)?;
+                Ok(ServerResponse::CommandReceipt(receipt))
+            }
+            ClientRequest::Query(envelope) => {
+                if envelope.client_id != negotiated.client_id {
+                    return Err(IpcError::Unauthorized);
+                }
+                let reply = self.dispatch_query(negotiated, envelope)?;
+                Ok(ServerResponse::QueryReply(reply))
+            }
+        }
+    }
+
+    fn dispatch_query(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        envelope: QueryEnvelope,
+    ) -> Result<QueryReply, IpcError> {
+        match envelope.query {
+            Query::SnapshotPage {
+                section,
+                snapshot_id,
+                resume_cursor,
+            } => {
+                if !negotiated.capabilities.contains(Capability::PagedSnapshots) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome =
+                    self.serve_snapshot_page(negotiated, section, snapshot_id, resume_cursor)?;
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::ReleaseSnapshot { snapshot_id } => {
+                if !negotiated.capabilities.contains(Capability::PagedSnapshots) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome = self.serve_release_snapshot(negotiated.client_id, snapshot_id);
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::OperationStatus { .. } | Query::TaskSnapshot => {
+                self.bus.query(envelope).map_err(map_store_error)
+            }
+        }
+    }
+
+    fn serve_snapshot_page(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        section: SnapshotSection,
+        snapshot_id: Option<SnapshotId>,
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<QueryOutcome, IpcError> {
+        match (snapshot_id, resume_cursor) {
+            (None, None) => self.open_snapshot_page(negotiated, section),
+            (Some(snapshot_id), Some(resume_cursor)) => {
+                self.resume_snapshot_page(negotiated.client_id, section, snapshot_id, resume_cursor)
+            }
+            _ => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
+        }
+    }
+
+    fn open_snapshot_page(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        section: SnapshotSection,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.registry.reap_idle(now);
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = self
+            .bus
+            .begin_snapshot(limits)
+            .map_err(map_snapshot_error_transport)?;
+        let page = match session.page(section, None) {
+            Ok(page) => page,
+            Err(error) => return map_snapshot_error(error),
+        };
+        if page.next_cursor.is_some() {
+            self.registry
+                .insert(negotiated.client_id, session, Instant::now());
+        }
+        Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
+    }
+
+    fn resume_snapshot_page(
+        &mut self,
+        requester: ClientId,
+        section: SnapshotSection,
+        snapshot_id: SnapshotId,
+        resume_cursor: Vec<u8>,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.registry.reap_idle(now);
+        // Expire idle entries before serving so TTL maps to NotFound.
+        if let Some(entry) = self.registry.entries.get(&snapshot_id) {
+            if now.duration_since(entry.last_touch) >= SNAPSHOT_IDLE_TTL {
+                self.registry.remove(snapshot_id);
+                return Ok(QueryOutcome::Err(QueryError::NotFound));
+            }
+        }
+        let session = match self.registry.get(snapshot_id, requester, now) {
+            Ok(session) => session,
+            Err(error) => return Ok(QueryOutcome::Err(error)),
+        };
+        let page = match session.page(section, Some(resume_cursor.as_slice())) {
+            Ok(page) => page,
+            Err(error) => {
+                // Cursor/shape failures leave a valid retained session intact.
+                return map_snapshot_error(error);
+            }
+        };
+        let finished = page.next_cursor.is_none();
+        if finished {
+            self.registry.remove(snapshot_id);
+        } else {
+            self.registry.touch(snapshot_id, Instant::now());
+        }
+        Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
+    }
+
+    fn serve_release_snapshot(
+        &mut self,
+        requester: ClientId,
+        snapshot_id: SnapshotId,
+    ) -> QueryOutcome {
+        let now = Instant::now();
+        self.registry.reap_idle(now);
+        match self.registry.entries.get(&snapshot_id) {
+            None => QueryOutcome::Ok(QueryResult::SnapshotReleased { snapshot_id }),
+            Some(entry) if entry.owner != requester => QueryOutcome::Err(QueryError::Unauthorized),
+            Some(_) => {
+                self.registry.remove(snapshot_id);
+                QueryOutcome::Ok(QueryResult::SnapshotReleased { snapshot_id })
+            }
+        }
+    }
+}
+
+fn page_limits_from_negotiated(negotiated: NegotiatedParameters) -> Result<PageLimits, IpcError> {
+    PageLimits::new(
+        negotiated.limits.max_page_items,
+        negotiated.limits.max_page_encoded_bytes,
+    )
+    .map_err(|_| IpcError::Unavailable)
 }
 
 fn map_store_error(error: StoreError) -> IpcError {
@@ -98,10 +367,36 @@ fn map_store_error(error: StoreError) -> IpcError {
     }
 }
 
+fn map_snapshot_error_transport(error: SnapshotError) -> IpcError {
+    match error {
+        SnapshotError::Store(StoreError::Busy) => IpcError::Busy,
+        SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
+            // Open path should not produce cursor errors; treat as unavailable.
+            IpcError::Unavailable
+        }
+        _ => IpcError::Unavailable,
+    }
+}
+
+fn map_snapshot_error(error: SnapshotError) -> Result<QueryOutcome, IpcError> {
+    match error {
+        SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
+            Ok(QueryOutcome::Err(QueryError::InvalidRequest))
+        }
+        SnapshotError::Store(StoreError::Busy) => Err(IpcError::Busy),
+        SnapshotError::Store(_)
+        | SnapshotError::InvalidLimits(_)
+        | SnapshotError::EntropyUnavailable
+        | SnapshotError::PageEnvelopeTooLarge { .. }
+        | SnapshotError::PageItemTooLarge { .. } => Err(IpcError::Unavailable),
+    }
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
-/// Used by the executor boundary and by the exclusive [`super::ipc::HostConnection::serve_request`]
-/// compatibility path.
+/// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
+/// compatibility path. Registry-backed snapshot queries are unsupported here;
+/// the single executor owns that registry.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     bus: &mut CommandBus,
@@ -118,6 +413,15 @@ pub(crate) fn dispatch_authenticated_request(
         ClientRequest::Query(envelope) => {
             if envelope.client_id != authenticated_client_id {
                 return Err(IpcError::Unauthorized);
+            }
+            match &envelope.query {
+                Query::SnapshotPage { .. } | Query::ReleaseSnapshot { .. } => {
+                    return Ok(ServerResponse::QueryReply(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    }));
+                }
+                Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }
             let reply = bus.query(envelope).map_err(map_store_error)?;
             Ok(ServerResponse::QueryReply(reply))

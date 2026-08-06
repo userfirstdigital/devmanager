@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
-use crate::domain::id::{CommandId, OperationId, RequestId, TaskId};
+use crate::domain::id::{CommandId, OperationId, RequestId, SnapshotId, TaskId};
 use crate::domain::operation::OperationState;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
-use crate::domain::snapshot::TaskSnapshotItem;
+use crate::domain::snapshot::{SnapshotPage, SnapshotSection, TaskSnapshotItem};
 use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
@@ -186,6 +186,119 @@ impl HostClient {
         }
     }
 
+    /// Open or resume one paged snapshot section. Requires granted PagedSnapshots.
+    pub async fn snapshot_page(
+        &mut self,
+        section: SnapshotSection,
+        snapshot_id: Option<SnapshotId>,
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<Result<SnapshotPage, QueryError>, IpcError> {
+        if !self
+            .server_hello
+            .granted
+            .contains(Capability::PagedSnapshots)
+        {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let expected_snapshot_id = snapshot_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::SnapshotPage {
+                        section,
+                        snapshot_id,
+                        resume_cursor,
+                    },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::SnapshotPage { page }) => {
+                if page.section != section {
+                    self.retire_connection();
+                    return Err(IpcError::CorrelationMismatch);
+                }
+                if let Some(expected) = expected_snapshot_id {
+                    if page.snapshot_id != expected {
+                        self.retire_connection();
+                        return Err(IpcError::CorrelationMismatch);
+                    }
+                }
+                Ok(Ok(page))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Release a retained snapshot. Requires granted PagedSnapshots.
+    pub async fn release_snapshot(
+        &mut self,
+        snapshot_id: SnapshotId,
+    ) -> Result<Result<(), QueryError>, IpcError> {
+        if !self
+            .server_hello
+            .granted
+            .contains(Capability::PagedSnapshots)
+        {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::ReleaseSnapshot { snapshot_id },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::SnapshotReleased {
+                snapshot_id: released,
+            }) if released == snapshot_id => Ok(Ok(())),
+            QueryOutcome::Ok(QueryResult::SnapshotReleased { .. }) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Correlate a fresh OperationStatus query and resolve terminal states locally.
     pub async fn refresh_operation(
         &mut self,
@@ -301,7 +414,9 @@ fn correlate_operation_status(
                 Ok(state)
             }
         }
-        QueryResult::TaskSnapshot { .. } => Err(IpcError::UnexpectedResponse),
+        QueryResult::TaskSnapshot { .. }
+        | QueryResult::SnapshotPage { .. }
+        | QueryResult::SnapshotReleased { .. } => Err(IpcError::UnexpectedResponse),
     }
 }
 
