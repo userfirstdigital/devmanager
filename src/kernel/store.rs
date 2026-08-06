@@ -20,7 +20,7 @@ use crate::domain::operation::{
 };
 use crate::kernel::command_bus::{
     self, effect_document_for_terminal_replay, load_outbox_row_by_id,
-    validate_dispatch_candidate_lineage, OutboxRow,
+    refuse_archive_with_live_resources, validate_dispatch_candidate_lineage, OutboxRow,
 };
 use crate::kernel::dispatch::{
     ambiguity_disposition, decode_absence_receipt, encode_absence_receipt, AbsenceReceiptDocument,
@@ -28,7 +28,7 @@ use crate::kernel::dispatch::{
     ReconciliationFinding, ReconciliationOrigin,
 };
 use crate::kernel::maintenance;
-use crate::kernel::outbox::{external_idempotency_key, ReplayPolicy};
+use crate::kernel::outbox::{external_idempotency_key, Effect, ReplayPolicy};
 use crate::kernel::projector;
 use crate::kernel::runtime::RecoveringResource;
 use crate::kernel::schema::{self, Migration, PROJECTION_TABLES};
@@ -203,6 +203,21 @@ impl KernelStore {
     ) -> Result<Option<DispatchClaim>, StoreError> {
         let lease_ms = validate_dispatch_lease_ms(lease)?;
         self.with_immediate_transaction(|tx| claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms))
+    }
+
+    /// Settle the next eligible process-empty task teardown under a bounded lease.
+    ///
+    /// Selects only accepted, due `task_teardown` rows whose Closing task has no
+    /// Active/Releasing Task-owned resources. Claim, begin, exact `BeginTaskTeardown`
+    /// validation, and `DispatchCompletion::Settled` run in one IMMEDIATE transaction.
+    pub(crate) fn settle_next_process_empty_task_teardown(
+        &mut self,
+        lease: Duration,
+    ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            settle_next_process_empty_task_teardown_in_tx(tx, now_ms()?, lease_ms)
+        })
     }
 
     /// Renew an active dispatch lease when the claim generation still matches.
@@ -1335,6 +1350,77 @@ fn load_next_dispatch_candidate(
     }))
 }
 
+fn load_next_process_empty_task_teardown_candidate(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    after: Option<&OutboxRow>,
+) -> Result<Option<OutboxRow>, StoreError> {
+    let after_available_at = after.map(|row| row.available_at_ms);
+    let after_event_sequence = after
+        .map(|row| u64_to_sqlite_i64("outbox.event_sequence", row.event_sequence))
+        .transpose()?;
+    let after_effect_index = after.map(|row| row.effect_index);
+    let after_outbox_id = after.map(|row| row.outbox_id.as_bytes().as_slice());
+    let outbox_id_bytes: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT o.outbox_id
+             FROM outbox o
+             JOIN operations op ON op.operation_id = o.operation_id
+             JOIN tasks t ON t.task_id = op.task_id
+             WHERE op.state = 'accepted'
+               AND o.destination_class = 'task_teardown'
+               AND t.lifecycle = 'closing'
+               AND op.action_epoch IS NOT NULL
+               AND t.action_epoch = op.action_epoch
+               AND (
+                 (o.state = 'pending' AND o.available_at_ms <= ?1)
+                 OR (
+                   o.state = 'claimed'
+                   AND o.available_at_ms <= ?1
+                   AND (o.leased_until_ms IS NULL OR o.leased_until_ms <= ?1)
+                 )
+               )
+               AND (
+                 ?2 IS NULL
+                 OR o.available_at_ms > ?2
+                 OR (o.available_at_ms = ?2 AND o.event_sequence > ?3)
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index > ?4
+                 )
+                 OR (
+                   o.available_at_ms = ?2 AND o.event_sequence = ?3
+                   AND o.effect_index = ?4 AND o.outbox_id > ?5
+                 )
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM resources r
+                 WHERE r.task_id = t.task_id
+                   AND r.owner_kind = 'task'
+                   AND r.lifecycle IN ('active', 'releasing')
+               )
+             ORDER BY o.available_at_ms ASC, o.event_sequence ASC,
+                      o.effect_index ASC, o.outbox_id ASC
+             LIMIT 1",
+            rusqlite::params![
+                now_ms,
+                after_available_at,
+                after_event_sequence,
+                after_effect_index,
+                after_outbox_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(outbox_id_bytes) = outbox_id_bytes else {
+        return Ok(None);
+    };
+    let outbox_id = parse_outbox_id(&outbox_id_bytes)?;
+    load_outbox_row_by_id(tx, outbox_id)?
+        .ok_or(StoreError::Corruption)
+        .map(Some)
+}
+
 fn build_dispatch_permit(
     row: &OutboxRow,
     effect_doc: crate::kernel::outbox::PlannedEffectDocument,
@@ -1558,6 +1644,58 @@ fn claim_next_dispatch_in_tx(
                     lease_ms,
                     row.state.as_str(),
                 )?));
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+}
+
+fn settle_next_process_empty_task_teardown_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+    let mut prior_candidate = None;
+    loop {
+        let Some(row) =
+            load_next_process_empty_task_teardown_candidate(tx, now_ms, prior_candidate.as_ref())?
+        else {
+            return Ok(None);
+        };
+        // Earliest selected candidate: lineage/effect/fence failures fail closed immediately.
+        let (effect_doc, _fence) = revalidate_outbox_effect(tx, &row)?;
+        let Effect::BeginTaskTeardown { task_id, .. } = effect_doc.effect else {
+            return Err(StoreError::Corruption);
+        };
+        // Final defensive guard; SQL already excluded Active/Releasing Task-owned rows.
+        refuse_archive_with_live_resources(tx, task_id)?;
+        match row.state.as_str() {
+            "pending" if !pending_dispatch_is_authorized(&row, effect_doc.replay_policy)? => {
+                prior_candidate = Some(row);
+                continue;
+            }
+            "pending" | "claimed" => {
+                let claim = claim_outbox_row(tx, &row, now_ms, lease_ms, row.state.as_str())?;
+                let permit = begin_dispatch_in_tx(tx, now_ms, &claim)?;
+                let Effect::BeginTaskTeardown {
+                    task_id: settled_task,
+                    ..
+                } = permit.effect()
+                else {
+                    return Err(StoreError::Corruption);
+                };
+                let settled_task = *settled_task;
+                let operation_id = permit.operation_id();
+                let state = command_bus::record_dispatch_completion_in_tx(
+                    tx,
+                    &permit,
+                    DispatchCompletion::Settled,
+                    now_ms,
+                )?;
+                if !matches!(state, OperationState::Settled { .. }) {
+                    return Err(StoreError::Corruption);
+                }
+                return Ok(Some((settled_task, operation_id)));
             }
             _ => return Err(StoreError::Corruption),
         }

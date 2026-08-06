@@ -6,6 +6,7 @@
 mod connection;
 mod ipc;
 mod lock;
+mod shutdown;
 
 pub use connection::{HostRequestExecutor, HostRequestHandle, HOST_REQUEST_QUEUE_CAPACITY};
 pub(crate) use ipc::{
@@ -18,3 +19,4 @@ pub use ipc::{
     AcceptedHello, HelloListener, HostConnection, IpcError,
 };
 pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
+pub use shutdown::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};

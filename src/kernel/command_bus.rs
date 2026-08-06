@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
@@ -89,6 +90,17 @@ impl CommandBus {
         let snapshot = load_task_snapshot(&tx, task_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Settle the next eligible process-empty `BeginTaskTeardown`, if any.
+    ///
+    /// Claim, begin, exact-effect validation, and settled completion run inside one
+    /// IMMEDIATE transaction. Only SQL-filtered `task_teardown` candidates are examined.
+    pub(crate) fn settle_next_process_empty_task_teardown(
+        &mut self,
+        lease: Duration,
+    ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+        self.store.settle_next_process_empty_task_teardown(lease)
     }
 
     /// Serve a side-effect-free query through the owned store projections only.
@@ -549,7 +561,7 @@ pub(crate) fn record_dispatch_completion(
     })
 }
 
-fn record_dispatch_completion_in_tx(
+pub(crate) fn record_dispatch_completion_in_tx(
     tx: &Transaction<'_>,
     permit: &DispatchPermit,
     completion: DispatchCompletion,
@@ -1517,7 +1529,7 @@ fn require_current_effect_ownership(
     Ok(())
 }
 
-fn refuse_archive_with_live_resources(
+pub(crate) fn refuse_archive_with_live_resources(
     tx: &Transaction<'_>,
     task_id: TaskId,
 ) -> Result<(), StoreError> {
