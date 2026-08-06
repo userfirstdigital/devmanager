@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
-use devmanager::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, TaskId};
+use devmanager::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
 use devmanager::domain::operation::OperationState;
+use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
 };
@@ -154,4 +155,59 @@ fn command_bus_idempotent_create_survives_reopen() {
         snapshot_after, snapshot_before,
         "task snapshot must survive reopen"
     );
+}
+
+#[test]
+fn command_bus_query_task_snapshot_and_missing_scope() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let task = task_id(0xF1);
+    let cmd = command_id(0xF2);
+    let client = client_id(0x20);
+    let envelope = create_task_envelope(cmd, task);
+
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let _ = bus.execute(envelope).expect("create task");
+
+    let request_id = RequestId::from_bytes(fixed_uuid_v7(0xF3)).expect("request id");
+    let reply = bus
+        .query(QueryEnvelope {
+            request_id,
+            client_id: client,
+            task_id: Some(task),
+            query: Query::TaskSnapshot,
+        })
+        .expect("task snapshot query");
+    assert_eq!(reply.request_id, request_id);
+    match reply.outcome {
+        QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot }) => {
+            assert_eq!(snapshot.task.id, task);
+            assert_eq!(snapshot.task.title, "Headless boundary");
+            assert_eq!(snapshot.task.revision, 1);
+        }
+        other => panic!("expected task snapshot, got {other:?}"),
+    }
+
+    let invalid = bus
+        .query(QueryEnvelope {
+            request_id: RequestId::from_bytes(fixed_uuid_v7(0xF4)).expect("request id"),
+            client_id: client,
+            task_id: None,
+            query: Query::TaskSnapshot,
+        })
+        .expect("missing scope query");
+    assert_eq!(
+        invalid.outcome,
+        QueryOutcome::Err(QueryError::InvalidRequest)
+    );
+
+    let missing = bus
+        .query(QueryEnvelope {
+            request_id: RequestId::from_bytes(fixed_uuid_v7(0xF5)).expect("request id"),
+            client_id: client,
+            task_id: Some(task_id(0xF6)),
+            query: Query::TaskSnapshot,
+        })
+        .expect("missing task query");
+    assert_eq!(missing.outcome, QueryOutcome::Err(QueryError::NotFound));
 }

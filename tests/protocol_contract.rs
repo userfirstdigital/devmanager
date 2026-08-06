@@ -3,17 +3,19 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
-    CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId,
-    OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode, Query,
-    QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId,
-    TaskId,
+    CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
+    CreateTaskIntent, EnvironmentId, EventId, OperationErrorCode, OperationId, OperationState,
+    OperationUncertaintyCode, ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome,
+    QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness, TaskActivity,
+    TaskAssignment, TaskAttention, TaskConnectivity, TaskId, WorkspaceRef,
 };
 use devmanager::protocol::{
-    Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
-    FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
-    PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint, ProtocolVersion,
-    VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
+    FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError,
+    MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint,
+    ProtocolVersion, ServerResponse, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
+    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -1653,6 +1655,7 @@ fn protocol_query_reply_preserves_request_and_operation_correlation() {
             assert_eq!(operation_id, expected_operation_id);
             assert!(matches!(state, OperationState::Settled { .. }));
         }
+        QueryOutcome::Ok(other) => panic!("expected operation status reply, got {other:?}"),
         QueryOutcome::Err(error) => panic!("expected successful reply, got {error:?}"),
     }
 
@@ -1911,5 +1914,471 @@ fn protocol_query_reply_rejects_alternate_or_open_shapes() {
         Err(MessagePackError::TrailingBytes {
             offset: u32::try_from(trailing.len() - 1).unwrap(),
         })
+    );
+}
+
+#[test]
+fn protocol_task_snapshot_query_is_strict_empty_named_payload() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let expected = QueryEnvelope {
+        request_id: protocol_request_id(0xa1),
+        client_id: protocol_client_id(0xa2),
+        task_id: Some(protocol_task_id(0xa3)),
+        query: Query::TaskSnapshot,
+    };
+    let encoded = codec.encode(&expected).expect("encode task snapshot query");
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(&encoded)
+            .expect("decode task snapshot query"),
+        expected
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenTaskSnapshot {
+        TaskSnapshot { future_field: bool },
+    }
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(
+            &rmp_serde::to_vec_named(&raw_query_envelope(RawOpenTaskSnapshot::TaskSnapshot {
+                future_field: true,
+            }))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+}
+
+#[test]
+fn protocol_client_request_and_server_response_are_one_strict_named_variant() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let command = ClientRequest::Command(CommandEnvelope {
+        command_id: protocol_command_id(0xb1),
+        client_id: protocol_client_id(0xb2),
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::BeginCloseTask,
+    });
+    let query = ClientRequest::Query(QueryEnvelope {
+        request_id: protocol_request_id(0xb3),
+        client_id: protocol_client_id(0xb4),
+        task_id: Some(protocol_task_id(0xb5)),
+        query: Query::TaskSnapshot,
+    });
+
+    for request in [&command, &query] {
+        let encoded = codec.encode(request).expect("encode client request");
+        assert_eq!(encoded[0], 0x81, "ClientRequest is a one-entry map");
+        assert_eq!(
+            &codec
+                .decode::<ClientRequest>(&encoded)
+                .expect("decode client request"),
+            request
+        );
+    }
+
+    let receipt = ServerResponse::CommandReceipt(CommandReceipt::Accepted {
+        command_id: protocol_command_id(0xb6),
+        operation_id: protocol_operation_id(0xb7),
+        task_revision: Some(1),
+        event_ids: vec![protocol_event_id(0xb8)],
+    });
+    let reply = ServerResponse::QueryReply(QueryReply {
+        request_id: protocol_request_id(0xb9),
+        outcome: QueryOutcome::Err(QueryError::NotFound),
+    });
+    for response in [&receipt, &reply] {
+        let encoded = codec.encode(response).expect("encode server response");
+        assert_eq!(encoded[0], 0x81, "ServerResponse is a one-entry map");
+        assert_eq!(
+            &codec
+                .decode::<ServerResponse>(&encoded)
+                .expect("decode server response"),
+            response
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawUnknownRequest {
+        FutureRequest,
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(
+            &rmp_serde::to_vec_named(&RawUnknownRequest::FutureRequest).unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawUnknownResponse {
+        FutureResponse,
+    }
+    assert_eq!(
+        codec.decode::<ServerResponse>(
+            &rmp_serde::to_vec_named(&RawUnknownResponse::FutureResponse).unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+}
+
+fn protocol_environment_id(tail: u8) -> EnvironmentId {
+    EnvironmentId::from_bytes(protocol_uuid_v7(tail)).expect("environment id")
+}
+
+fn protocol_project_id(tail: u8) -> ProjectId {
+    ProjectId::from_bytes(protocol_uuid_v7(tail)).expect("project id")
+}
+
+fn protocol_create_task_intent(task_tail: u8) -> CreateTaskIntent {
+    CreateTaskIntent {
+        id: protocol_task_id(task_tail),
+        environment_id: protocol_environment_id(0xc1),
+        title: "Strict create".into(),
+        description: None,
+        project_id: protocol_project_id(0xc2),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        created_at_ms: 1_725_000_000_000,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+    }
+}
+
+#[test]
+fn protocol_client_request_create_task_rejects_unknown_intent_field_and_multiple_variants() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    #[derive(serde::Serialize)]
+    struct RawOpenCreateTaskIntent {
+        id: TaskId,
+        environment_id: EnvironmentId,
+        title: String,
+        description: Option<String>,
+        project_id: ProjectId,
+        workspace: WorkspaceRef,
+        assignment: TaskAssignment,
+        created_at_ms: i64,
+        connectivity: TaskConnectivity,
+        attention: TaskAttention,
+        activity: TaskActivity,
+        review_readiness: ReviewReadiness,
+        future_field: bool,
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenCreateCommand {
+        CreateTask(RawOpenCreateTaskIntent),
+    }
+
+    let intent = protocol_create_task_intent(0xc3);
+    let open_intent = RawOpenCreateTaskIntent {
+        id: intent.id,
+        environment_id: intent.environment_id,
+        title: intent.title.clone(),
+        description: intent.description.clone(),
+        project_id: intent.project_id,
+        workspace: intent.workspace.clone(),
+        assignment: intent.assignment.clone(),
+        created_at_ms: intent.created_at_ms,
+        connectivity: intent.connectivity,
+        attention: intent.attention,
+        activity: intent.activity,
+        review_readiness: intent.review_readiness,
+        future_field: true,
+    };
+    #[derive(serde::Serialize)]
+    struct RawClientCommandRequest<C> {
+        command: RawCommandEnvelope<C>,
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(
+            &rmp_serde::to_vec_named(&RawClientCommandRequest {
+                command: raw_command_envelope(RawOpenCreateCommand::CreateTask(open_intent)),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown CreateTaskIntent field must be rejected"
+    );
+
+    let valid_command = ClientRequest::Command(CommandEnvelope {
+        command_id: protocol_command_id(0xc6),
+        client_id: protocol_client_id(0xc7),
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::CreateTask(protocol_create_task_intent(0xc8)),
+    });
+    assert_eq!(
+        codec
+            .decode::<ClientRequest>(
+                &codec
+                    .encode(&valid_command)
+                    .expect("encode valid create request")
+            )
+            .expect("decode valid create request"),
+        valid_command
+    );
+
+    struct RawMultipleClientRequest;
+    impl serde::Serialize for RawMultipleClientRequest {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry(
+                "command",
+                &CommandEnvelope {
+                    command_id: protocol_command_id(0xc9),
+                    client_id: protocol_client_id(0xca),
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_100,
+                    expected_task_revision: None,
+                    command: Command::BeginCloseTask,
+                },
+            )?;
+            map.serialize_entry(
+                "query",
+                &QueryEnvelope {
+                    request_id: protocol_request_id(0xcb),
+                    client_id: protocol_client_id(0xcc),
+                    task_id: Some(protocol_task_id(0xcd)),
+                    query: Query::TaskSnapshot,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(&rmp_serde::to_vec_named(&RawMultipleClientRequest).unwrap()),
+        Err(MessagePackError::Decode),
+        "ClientRequest must reject multiple top-level variants"
+    );
+}
+
+#[test]
+fn protocol_nested_create_task_snapshot_and_command_reject_unknown_fields() {
+    use devmanager::domain::{AgentSessionId, TaskFacts, TaskLifecycle, TaskSnapshotItem};
+
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let intent = protocol_create_task_intent(0xd1);
+
+    #[derive(serde::Serialize)]
+    struct RawClientCommandRequest<C> {
+        command: RawCommandEnvelope<C>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenWorkspace {
+        Main { future_field: bool },
+    }
+    #[derive(serde::Serialize)]
+    struct RawIntentWithWorkspace {
+        id: TaskId,
+        environment_id: EnvironmentId,
+        title: String,
+        description: Option<String>,
+        project_id: ProjectId,
+        workspace: RawOpenWorkspace,
+        assignment: TaskAssignment,
+        created_at_ms: i64,
+        connectivity: TaskConnectivity,
+        attention: TaskAttention,
+        activity: TaskActivity,
+        review_readiness: ReviewReadiness,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawCreateWithWorkspace {
+        CreateTask(RawIntentWithWorkspace),
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(
+            &rmp_serde::to_vec_named(&RawClientCommandRequest {
+                command: raw_command_envelope(RawCreateWithWorkspace::CreateTask(
+                    RawIntentWithWorkspace {
+                        id: intent.id,
+                        environment_id: intent.environment_id,
+                        title: intent.title.clone(),
+                        description: None,
+                        project_id: intent.project_id,
+                        workspace: RawOpenWorkspace::Main { future_field: true },
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: intent.created_at_ms,
+                        connectivity: intent.connectivity,
+                        attention: intent.attention,
+                        activity: intent.activity,
+                        review_readiness: intent.review_readiness,
+                    },
+                )),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown nested workspace field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenAssignment {
+        LocalOwner { future_field: bool },
+    }
+    #[derive(serde::Serialize)]
+    struct RawIntentWithAssignment {
+        id: TaskId,
+        environment_id: EnvironmentId,
+        title: String,
+        description: Option<String>,
+        project_id: ProjectId,
+        workspace: WorkspaceRef,
+        assignment: RawOpenAssignment,
+        created_at_ms: i64,
+        connectivity: TaskConnectivity,
+        attention: TaskAttention,
+        activity: TaskActivity,
+        review_readiness: ReviewReadiness,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawCreateWithAssignment {
+        CreateTask(RawIntentWithAssignment),
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(
+            &rmp_serde::to_vec_named(&RawClientCommandRequest {
+                command: raw_command_envelope(RawCreateWithAssignment::CreateTask(
+                    RawIntentWithAssignment {
+                        id: intent.id,
+                        environment_id: intent.environment_id,
+                        title: intent.title.clone(),
+                        description: None,
+                        project_id: intent.project_id,
+                        workspace: WorkspaceRef::Main,
+                        assignment: RawOpenAssignment::LocalOwner { future_field: true },
+                        created_at_ms: intent.created_at_ms,
+                        connectivity: intent.connectivity,
+                        attention: intent.attention,
+                        activity: intent.activity,
+                        review_readiness: intent.review_readiness,
+                    },
+                )),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown nested assignment field must be rejected"
+    );
+
+    let task = TaskFacts {
+        id: protocol_task_id(0xd2),
+        environment_id: protocol_environment_id(0xd3),
+        title: "Snap".into(),
+        description: None,
+        project_id: protocol_project_id(0xd4),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        lifecycle: TaskLifecycle::Open,
+        action_epoch: 0,
+        revision: 1,
+        created_at_ms: 1_725_000_000_000,
+    };
+    let _ = TaskSnapshotItem {
+        task: task.clone(),
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+        primary_agent_id: None,
+    };
+    #[derive(serde::Serialize)]
+    struct RawOpenTaskFacts {
+        id: TaskId,
+        environment_id: EnvironmentId,
+        title: String,
+        description: Option<String>,
+        project_id: ProjectId,
+        workspace: WorkspaceRef,
+        assignment: TaskAssignment,
+        lifecycle: TaskLifecycle,
+        action_epoch: u64,
+        revision: u64,
+        created_at_ms: i64,
+        future_field: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct RawOpenSnapshotItem {
+        task: RawOpenTaskFacts,
+        connectivity: TaskConnectivity,
+        attention: TaskAttention,
+        activity: TaskActivity,
+        review_readiness: ReviewReadiness,
+        primary_agent_id: Option<AgentSessionId>,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenQueryResult {
+        TaskSnapshot { snapshot: RawOpenSnapshotItem },
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawOpenQueryResult::TaskSnapshot {
+                snapshot: RawOpenSnapshotItem {
+                    task: RawOpenTaskFacts {
+                        id: task.id,
+                        environment_id: task.environment_id,
+                        title: task.title,
+                        description: None,
+                        project_id: task.project_id,
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: task.created_at_ms,
+                        future_field: true,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                },
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown TaskFacts field in TaskSnapshot must be rejected"
+    );
+
+    let agent = AgentSessionId::from_bytes(protocol_uuid_v7(0xd5)).expect("agent");
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenSetPrimaryAgent {
+        SetPrimaryAgent {
+            agent_session_id: AgentSessionId,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<ClientRequest>(
+            &rmp_serde::to_vec_named(&RawClientCommandRequest {
+                command: raw_command_envelope(RawOpenSetPrimaryAgent::SetPrimaryAgent {
+                    agent_session_id: agent,
+                    future_field: true,
+                }),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown Command struct-variant field must be rejected"
     );
 }

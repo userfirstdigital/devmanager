@@ -1,7 +1,7 @@
 //! Profile-scoped named-pipe ClientHello/ServerHello handshake transport.
 //!
-//! This module is the lean Phase 2 vertical slice: one local client, one
-//! handshake document, then stop. Command routing and reconnect live later.
+//! After Hello, one connection serves synchronous ClientRequest/ServerResponse
+//! frames through the host-owned CommandBus. Multiplexing and reconnect live later.
 
 use std::time::Duration;
 
@@ -9,14 +9,17 @@ use uuid::Uuid;
 
 use crate::config::paths::AppProfile;
 use crate::domain::ClientId;
+use crate::kernel::CommandBus;
+use crate::kernel::StoreError;
 use crate::protocol::{
-    CapabilitySet, ClientHello, ClientHelloError, FrameLimits, MessagePackCodec, MessagePackError,
-    NegotiatedParameters, PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint,
-    ServerBuildError, ServerHello, ServerHelloError,
+    CapabilitySet, ClientHello, ClientHelloError, ClientRequest, FrameLimits, MessagePackCodec,
+    MessagePackError, NegotiatedParameters, PhysicalFrameCodec, PhysicalFrameError,
+    ProfileFingerprint, ServerBuildError, ServerHello, ServerHelloError, ServerResponse,
 };
 
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Exact protected two-ACE SDDL form: LocalSystem + one caller-supplied user SID.
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
@@ -53,6 +56,12 @@ pub enum IpcError {
     ServerHello(ServerHelloError),
     ProfileMismatch,
     HelloInconsistent,
+    Unauthorized,
+    UnexpectedResponse,
+    CorrelationMismatch,
+    ConnectionPoisoned,
+    Busy,
+    Unavailable,
     Security(String),
 }
 
@@ -62,7 +71,7 @@ impl std::fmt::Display for IpcError {
             Self::InvalidProfile(name) => write!(f, "invalid host ipc profile name: {name:?}"),
             Self::Unsupported => write!(f, "named-pipe ipc is unsupported on this platform"),
             Self::Io(error) => write!(f, "named-pipe ipc I/O error: {error}"),
-            Self::Timeout => write!(f, "named-pipe handshake timed out"),
+            Self::Timeout => write!(f, "named-pipe operation timed out"),
             Self::Frame(error) => error.fmt(f),
             Self::MessagePack(error) => error.fmt(f),
             Self::ClientHello(error) => error.fmt(f),
@@ -76,6 +85,19 @@ impl std::fmt::Display for IpcError {
             Self::HelloInconsistent => {
                 write!(f, "server hello is inconsistent with the sent client hello")
             }
+            Self::Unauthorized => write!(f, "request client_id does not match authenticated hello"),
+            Self::UnexpectedResponse => write!(f, "response variant did not match the request"),
+            Self::CorrelationMismatch => {
+                write!(f, "response correlation id did not match the request")
+            }
+            Self::ConnectionPoisoned => {
+                write!(
+                    f,
+                    "named-pipe connection is poisoned and must not be reused"
+                )
+            }
+            Self::Busy => write!(f, "kernel store is busy"),
+            Self::Unavailable => write!(f, "kernel store is temporarily unavailable"),
             Self::Security(message) => write!(f, "named-pipe security error: {message}"),
         }
     }
@@ -94,8 +116,21 @@ impl std::error::Error for IpcError {
             | Self::Timeout
             | Self::ProfileMismatch
             | Self::HelloInconsistent
+            | Self::Unauthorized
+            | Self::UnexpectedResponse
+            | Self::CorrelationMismatch
+            | Self::ConnectionPoisoned
+            | Self::Busy
+            | Self::Unavailable
             | Self::Security(_) => None,
         }
+    }
+}
+
+fn map_store_error(error: StoreError) -> IpcError {
+    match error {
+        StoreError::Busy => IpcError::Busy,
+        _ => IpcError::Unavailable,
     }
 }
 
@@ -123,6 +158,16 @@ fn normalize_named_profile(profile: &str) -> Result<String, IpcError> {
 
 pub(crate) fn handshake_codecs() -> Result<(PhysicalFrameCodec, MessagePackCodec), IpcError> {
     let limits = FrameLimits::v1_default();
+    let physical = PhysicalFrameCodec::from_limits(limits)
+        .map_err(|error| IpcError::ClientHello(ClientHelloError::FrameLimits(error)))?;
+    let message = MessagePackCodec::from_limits(limits)
+        .map_err(|error| IpcError::ClientHello(ClientHelloError::FrameLimits(error)))?;
+    Ok((physical, message))
+}
+
+fn negotiated_codecs(
+    limits: FrameLimits,
+) -> Result<(PhysicalFrameCodec, MessagePackCodec), IpcError> {
     let physical = PhysicalFrameCodec::from_limits(limits)
         .map_err(|error| IpcError::ClientHello(ClientHelloError::FrameLimits(error)))?;
     let message = MessagePackCodec::from_limits(limits)
@@ -173,15 +218,75 @@ impl HelloListener {
         }
     }
 
-    pub async fn accept_hello(self) -> Result<AcceptedHello, IpcError> {
+    /// Accept one connection, complete Hello, and retain the pipe for requests.
+    pub async fn accept(self) -> Result<HostConnection, IpcError> {
         #[cfg(windows)]
         {
-            windows_accept_hello(self).await
+            windows_accept(self).await
         }
         #[cfg(not(windows))]
         {
             let _ = self;
             Err(IpcError::Unsupported)
+        }
+    }
+
+    /// Accept Hello and drop the retained pipe (compatibility wrapper).
+    pub async fn accept_hello(self) -> Result<AcceptedHello, IpcError> {
+        let connection = self.accept().await?;
+        Ok(connection.accepted_hello())
+    }
+}
+
+/// Host-side authenticated pipe after Hello, serving one request at a time.
+pub struct HostConnection {
+    client_id: ClientId,
+    negotiated: NegotiatedParameters,
+    server_hello: ServerHello,
+    physical: PhysicalFrameCodec,
+    message: MessagePackCodec,
+    poisoned: bool,
+    #[cfg(windows)]
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+impl HostConnection {
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub fn negotiated(&self) -> NegotiatedParameters {
+        self.negotiated
+    }
+
+    pub fn server_hello(&self) -> &ServerHello {
+        &self.server_hello
+    }
+
+    pub fn accepted_hello(&self) -> AcceptedHello {
+        AcceptedHello {
+            client_id: self.client_id,
+            negotiated: self.negotiated,
+            server_hello: self.server_hello.clone(),
+        }
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Wait indefinitely for the first request byte, then complete under one deadline.
+    pub async fn serve_request(&mut self, bus: &mut CommandBus) -> Result<(), IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            let result = windows_serve_request(self, bus).await;
+            connection_fail_closed(&mut self.poisoned, result)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = bus;
+            connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
         }
     }
 }
@@ -213,16 +318,16 @@ fn windows_bind(
 }
 
 #[cfg(windows)]
-async fn windows_accept_hello(mut listener: HelloListener) -> Result<AcceptedHello, IpcError> {
+async fn windows_accept(mut listener: HelloListener) -> Result<HostConnection, IpcError> {
     use tokio::io::AsyncWriteExt;
 
-    let (physical, message) = handshake_codecs()?;
+    let (hello_physical, hello_message) = handshake_codecs()?;
     // Idle accept waits for a client indefinitely; host shutdown cancels this later.
     listener.server.connect().await.map_err(IpcError::Io)?;
 
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let payload = read_physical_frame(&mut listener.server, &physical).await?;
-        let hello = message
+    let (client_id, negotiated, server_hello) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let payload = read_physical_frame(&mut listener.server, &hello_physical).await?;
+        let hello = hello_message
             .decode::<ClientHello>(&payload)
             .map_err(IpcError::MessagePack)?;
         if hello.profile_fingerprint != listener.expected_fingerprint {
@@ -238,19 +343,96 @@ async fn windows_accept_hello(mut listener: HelloListener) -> Result<AcceptedHel
             negotiated,
         )
         .map_err(IpcError::ServerHello)?;
-        let encoded = message
+        let encoded = hello_message
             .encode(&server_hello)
             .map_err(IpcError::MessagePack)?;
-        write_physical_frame(&mut listener.server, &physical, &encoded).await?;
+        write_physical_frame(&mut listener.server, &hello_physical, &encoded).await?;
         listener.server.flush().await.map_err(IpcError::Io)?;
-        Ok(AcceptedHello {
-            client_id: negotiated.client_id,
-            negotiated,
-            server_hello,
-        })
+        Ok((negotiated.client_id, negotiated, server_hello))
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)??;
+
+    let (physical, message) = negotiated_codecs(negotiated.limits)?;
+    Ok(HostConnection {
+        client_id,
+        negotiated,
+        server_hello,
+        physical,
+        message,
+        poisoned: false,
+        pipe: listener.server,
+    })
+}
+
+#[cfg(windows)]
+async fn windows_serve_request(
+    connection: &mut HostConnection,
+    bus: &mut CommandBus,
+) -> Result<(), IpcError> {
+    use tokio::io::AsyncWriteExt;
+
+    let first = read_first_request_byte_idle(&mut connection.pipe).await?;
+    tokio::time::timeout(REQUEST_COMPLETION_TIMEOUT, async {
+        let payload =
+            read_physical_frame_after_first_byte(&mut connection.pipe, &connection.physical, first)
+                .await?;
+        let request = connection
+            .message
+            .decode::<ClientRequest>(&payload)
+            .map_err(IpcError::MessagePack)?;
+        let response = dispatch_request(connection.client_id, bus, request)?;
+        let encoded = connection
+            .message
+            .encode(&response)
+            .map_err(IpcError::MessagePack)?;
+        write_physical_frame(&mut connection.pipe, &connection.physical, &encoded).await?;
+        connection.pipe.flush().await.map_err(IpcError::Io)?;
+        Ok(())
     })
     .await
     .map_err(|_| IpcError::Timeout)?
+}
+
+fn connection_ensure_live(poisoned: bool) -> Result<(), IpcError> {
+    if poisoned {
+        Err(IpcError::ConnectionPoisoned)
+    } else {
+        Ok(())
+    }
+}
+
+fn connection_fail_closed<T>(
+    poisoned: &mut bool,
+    result: Result<T, IpcError>,
+) -> Result<T, IpcError> {
+    if result.is_err() {
+        *poisoned = true;
+    }
+    result
+}
+
+fn dispatch_request(
+    authenticated_client_id: ClientId,
+    bus: &mut CommandBus,
+    request: ClientRequest,
+) -> Result<ServerResponse, IpcError> {
+    match request {
+        ClientRequest::Command(envelope) => {
+            if envelope.client_id != authenticated_client_id {
+                return Err(IpcError::Unauthorized);
+            }
+            let receipt = bus.execute(envelope).map_err(map_store_error)?;
+            Ok(ServerResponse::CommandReceipt(receipt))
+        }
+        ClientRequest::Query(envelope) => {
+            if envelope.client_id != authenticated_client_id {
+                return Err(IpcError::Unauthorized);
+            }
+            let reply = bus.query(envelope).map_err(map_store_error)?;
+            Ok(ServerResponse::QueryReply(reply))
+        }
+    }
 }
 
 pub(crate) async fn read_physical_frame<R>(
@@ -265,6 +447,68 @@ where
         .read_exact(&mut header)
         .await
         .map_err(|error| IpcError::Frame(PhysicalFrameError::ReadHeader { kind: error.kind() }))?;
+    read_physical_payload(reader, codec, header).await
+}
+
+/// Wait indefinitely for the first request byte (idle connections do not expire).
+pub(crate) async fn read_first_request_byte_idle<R>(reader: &mut R) -> Result<u8, IpcError>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let mut first = [0_u8; 1];
+    reader
+        .read_exact(&mut first)
+        .await
+        .map_err(|error| IpcError::Frame(PhysicalFrameError::ReadHeader { kind: error.kind() }))?;
+    Ok(first[0])
+}
+
+/// After the first byte is observed, finish one physical frame under `completion`.
+/// Production uses the same idle-first-byte + completion split with a longer body;
+/// this helper exists so unit tests can inject a short deadline.
+#[cfg(test)]
+pub(crate) async fn read_physical_frame_idle_then_deadline<R>(
+    reader: &mut R,
+    codec: &PhysicalFrameCodec,
+    completion: Duration,
+) -> Result<Vec<u8>, IpcError>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let first = read_first_request_byte_idle(reader).await?;
+    tokio::time::timeout(
+        completion,
+        read_physical_frame_after_first_byte(reader, codec, first),
+    )
+    .await
+    .map_err(|_| IpcError::Timeout)?
+}
+
+pub(crate) async fn read_physical_frame_after_first_byte<R>(
+    reader: &mut R,
+    codec: &PhysicalFrameCodec,
+    first: u8,
+) -> Result<Vec<u8>, IpcError>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let mut rest = [0_u8; 3];
+    reader
+        .read_exact(&mut rest)
+        .await
+        .map_err(|error| IpcError::Frame(PhysicalFrameError::ReadHeader { kind: error.kind() }))?;
+    let header = [first, rest[0], rest[1], rest[2]];
+    read_physical_payload(reader, codec, header).await
+}
+
+async fn read_physical_payload<R>(
+    reader: &mut R,
+    codec: &PhysicalFrameCodec,
+    header: [u8; 4],
+) -> Result<Vec<u8>, IpcError>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
     let declared = u32::from_be_bytes(header);
     let payload_len = codec
         .validated_payload_len(header)
@@ -310,6 +554,16 @@ where
 
 pub(crate) fn handshake_timeout() -> Duration {
     HANDSHAKE_TIMEOUT
+}
+
+pub(crate) fn request_completion_timeout() -> Duration {
+    REQUEST_COMPLETION_TIMEOUT
+}
+
+pub(crate) fn codecs_for_limits(
+    limits: FrameLimits,
+) -> Result<(PhysicalFrameCodec, MessagePackCodec), IpcError> {
+    negotiated_codecs(limits)
 }
 
 #[cfg(windows)]
@@ -413,13 +667,65 @@ mod windows_security {
 
 #[cfg(test)]
 mod tests {
-    use super::protected_pipe_sddl;
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::{
+        connection_ensure_live, connection_fail_closed, protected_pipe_sddl,
+        read_physical_frame_idle_then_deadline, IpcError,
+    };
+    use crate::protocol::{FrameLimits, PhysicalFrameCodec};
 
     #[test]
     fn protected_pipe_sddl_is_exact_protected_two_ace_form() {
         assert_eq!(
             protected_pipe_sddl("S-1-5-21-1-2-3-1001"),
             "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)"
+        );
+    }
+
+    #[test]
+    fn fail_closed_poisons_and_blocks_reuse() {
+        let mut poisoned = false;
+        assert!(connection_ensure_live(poisoned).is_ok());
+        assert!(matches!(
+            connection_fail_closed(&mut poisoned, Err::<(), _>(IpcError::Unauthorized)),
+            Err(IpcError::Unauthorized)
+        ));
+        assert!(poisoned);
+        assert!(matches!(
+            connection_ensure_live(poisoned),
+            Err(IpcError::ConnectionPoisoned)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_before_first_byte_then_completion_deadline_on_partial_header() {
+        let codec = PhysicalFrameCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+        let short = Duration::from_millis(40);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        let read_task = tokio::spawn(async move {
+            read_physical_frame_idle_then_deadline(&mut reader, &codec, short).await
+        });
+
+        tokio::time::sleep(short + Duration::from_millis(80)).await;
+        assert!(
+            !read_task.is_finished(),
+            "zero incoming bytes must remain idle beyond the short completion duration"
+        );
+
+        writer.write_all(&[0x00]).await.expect("write first byte");
+        writer.flush().await.expect("flush first byte");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), read_task)
+            .await
+            .expect("join timeout")
+            .expect("task join");
+        assert!(
+            matches!(result, Err(IpcError::Timeout)),
+            "partial header after first byte must fail under the injected completion deadline, got {result:?}"
         );
     }
 }

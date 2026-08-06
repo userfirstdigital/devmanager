@@ -82,7 +82,7 @@ impl<'de> Deserialize<'de> for WorkspaceRef {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum WorkspaceRefWire {
             Main,
             Worktree { path: PathBuf, branch: String },
@@ -225,7 +225,7 @@ impl<'de> Deserialize<'de> for TaskAssignment {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum TaskAssignmentWire {
             LocalOwner,
             ExternalPrincipal { authority: String, subject: String },
@@ -330,6 +330,7 @@ impl<'de> Deserialize<'de> for TaskFacts {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct TaskFactsWire {
             id: TaskId,
             environment_id: EnvironmentId,

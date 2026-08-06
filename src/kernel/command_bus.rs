@@ -27,8 +27,11 @@ use crate::domain::operation::{
     CancellationReason, OperationErrorCode, OperationFacts, OperationOutcome, OperationOutcomeKind,
     OperationState, OperationUncertaintyCode, OutcomeSource, ResourceFence,
 };
+use crate::domain::query::{
+    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+};
 use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle};
-use crate::domain::snapshot::TaskSnapshot;
+use crate::domain::snapshot::{TaskSnapshot, TaskSnapshotItem};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
 };
@@ -83,6 +86,44 @@ impl CommandBus {
         let snapshot = load_task_snapshot(&tx, task_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Serve a side-effect-free query through the owned store projections only.
+    pub fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, StoreError> {
+        let outcome = match envelope.query {
+            Query::OperationStatus { operation_id } => match self.operation_status(operation_id)? {
+                Some(state) => QueryOutcome::Ok(QueryResult::OperationStatus {
+                    operation_id,
+                    state,
+                }),
+                None => QueryOutcome::Err(QueryError::NotFound),
+            },
+            Query::TaskSnapshot => {
+                let Some(task_id) = envelope.task_id else {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                };
+                match self.task_snapshot(task_id)? {
+                    Some(snapshot) => QueryOutcome::Ok(QueryResult::TaskSnapshot {
+                        snapshot: TaskSnapshotItem {
+                            task: snapshot.task,
+                            connectivity: snapshot.connectivity,
+                            attention: snapshot.attention,
+                            activity: snapshot.activity,
+                            review_readiness: snapshot.review_readiness,
+                            primary_agent_id: snapshot.primary_agent_id,
+                        },
+                    }),
+                    None => QueryOutcome::Err(QueryError::NotFound),
+                }
+            }
+        };
+        Ok(QueryReply {
+            request_id: envelope.request_id,
+            outcome,
+        })
     }
 }
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::domain::id::{ClientId, OperationId, RequestId, TaskId};
 use crate::domain::operation::OperationState;
+use crate::domain::snapshot::TaskSnapshotItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryEnvelope {
@@ -135,7 +136,11 @@ impl<'de> Deserialize<'de> for QueryEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
-    OperationStatus { operation_id: OperationId },
+    OperationStatus {
+        operation_id: OperationId,
+    },
+    /// Task scope is taken from [`QueryEnvelope::task_id`].
+    TaskSnapshot,
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -153,6 +158,17 @@ impl Serialize for OperationStatusQueryRef<'_> {
     }
 }
 
+struct EmptyNamedMap;
+
+impl Serialize for EmptyNamedMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_map(Some(0))?.end()
+    }
+}
+
 impl Serialize for Query {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -164,6 +180,7 @@ impl Serialize for Query {
                 "operation_status",
                 &OperationStatusQueryRef { operation_id },
             )?,
+            Self::TaskSnapshot => map.serialize_entry("task_snapshot", &EmptyNamedMap)?,
         }
         map.end()
     }
@@ -171,6 +188,7 @@ impl Serialize for Query {
 
 enum QueryVariant {
     OperationStatus,
+    TaskSnapshot,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -184,7 +202,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
             type Value = QueryVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("operation_status")
+                formatter.write_str("operation_status or task_snapshot")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -193,7 +211,11 @@ impl<'de> Deserialize<'de> for QueryVariant {
             {
                 match value {
                     "operation_status" => Ok(QueryVariant::OperationStatus),
-                    _ => Err(de::Error::unknown_variant(value, &["operation_status"])),
+                    "task_snapshot" => Ok(QueryVariant::TaskSnapshot),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &["operation_status", "task_snapshot"],
+                    )),
                 }
             }
         }
@@ -279,6 +301,35 @@ impl<'de> Deserialize<'de> for OperationStatusQueryPayload {
     }
 }
 
+impl<'de> Deserialize<'de> for EmptyNamedMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EmptyMapVisitor;
+
+        impl<'de> Visitor<'de> for EmptyMapVisitor {
+            type Value = EmptyNamedMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an empty named map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                if let Some(key) = map.next_key::<String>()? {
+                    return Err(de::Error::unknown_field(&key, &[]));
+                }
+                Ok(EmptyNamedMap)
+            }
+        }
+
+        deserializer.deserialize_map(EmptyMapVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for Query {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -307,6 +358,10 @@ impl<'de> Deserialize<'de> for Query {
                             operation_id: payload.operation_id,
                         }
                     }
+                    QueryVariant::TaskSnapshot => {
+                        let _: EmptyNamedMap = map.next_value()?;
+                        Query::TaskSnapshot
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -325,6 +380,9 @@ pub enum QueryResult {
         operation_id: OperationId,
         state: OperationState,
     },
+    TaskSnapshot {
+        snapshot: TaskSnapshotItem,
+    },
 }
 
 struct OperationStatusResultRef<'a> {
@@ -340,6 +398,21 @@ impl Serialize for OperationStatusResultRef<'_> {
         let mut map = serializer.serialize_map(Some(2))?;
         map.serialize_entry("operation_id", self.operation_id)?;
         map.serialize_entry("state", self.state)?;
+        map.end()
+    }
+}
+
+struct TaskSnapshotResultRef<'a> {
+    snapshot: &'a TaskSnapshotItem,
+}
+
+impl Serialize for TaskSnapshotResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("snapshot", self.snapshot)?;
         map.end()
     }
 }
@@ -361,6 +434,9 @@ impl Serialize for QueryResult {
                     state,
                 },
             )?,
+            Self::TaskSnapshot { snapshot } => {
+                map.serialize_entry("task_snapshot", &TaskSnapshotResultRef { snapshot })?
+            }
         }
         map.end()
     }
@@ -368,6 +444,7 @@ impl Serialize for QueryResult {
 
 enum QueryResultVariant {
     OperationStatus,
+    TaskSnapshot,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -381,7 +458,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
             type Value = QueryResultVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("operation_status")
+                formatter.write_str("operation_status or task_snapshot")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -390,7 +467,11 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
             {
                 match value {
                     "operation_status" => Ok(QueryResultVariant::OperationStatus),
-                    _ => Err(de::Error::unknown_variant(value, &["operation_status"])),
+                    "task_snapshot" => Ok(QueryResultVariant::TaskSnapshot),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &["operation_status", "task_snapshot"],
+                    )),
                 }
             }
         }
@@ -489,6 +570,82 @@ impl<'de> Deserialize<'de> for OperationStatusResultPayload {
     }
 }
 
+enum TaskSnapshotResultField {
+    Snapshot,
+}
+
+impl<'de> Deserialize<'de> for TaskSnapshotResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = TaskSnapshotResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("snapshot")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "snapshot" => Ok(TaskSnapshotResultField::Snapshot),
+                    _ => Err(de::Error::unknown_field(value, &["snapshot"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct TaskSnapshotResultPayload {
+    snapshot: TaskSnapshotItem,
+}
+
+impl<'de> Deserialize<'de> for TaskSnapshotResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = TaskSnapshotResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named task_snapshot result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut snapshot = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        TaskSnapshotResultField::Snapshot => {
+                            if snapshot.is_some() {
+                                return Err(de::Error::duplicate_field("snapshot"));
+                            }
+                            snapshot = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(TaskSnapshotResultPayload {
+                    snapshot: snapshot.ok_or_else(|| de::Error::missing_field("snapshot"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -516,6 +673,12 @@ impl<'de> Deserialize<'de> for QueryResult {
                         QueryResult::OperationStatus {
                             operation_id: payload.operation_id,
                             state: payload.state,
+                        }
+                    }
+                    QueryResultVariant::TaskSnapshot => {
+                        let payload: TaskSnapshotResultPayload = map.next_value()?;
+                        QueryResult::TaskSnapshot {
+                            snapshot: payload.snapshot,
                         }
                     }
                 };

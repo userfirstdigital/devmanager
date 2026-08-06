@@ -88,7 +88,7 @@ impl ArtifactContentRef {
 impl<'de> Deserialize<'de> for ArtifactContentRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum ArtifactContentRefWire {
             InlineUtf8(String),
             ContentAddressed { digest_hex: String },
@@ -158,6 +158,7 @@ impl ArtifactFacts {
 impl<'de> Deserialize<'de> for ArtifactFacts {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ArtifactFactsWire {
             id: ArtifactId,
             task_id: TaskId,

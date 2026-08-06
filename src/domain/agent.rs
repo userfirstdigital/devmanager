@@ -60,7 +60,7 @@ impl AgentRole {
 impl<'de> Deserialize<'de> for AgentRole {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum AgentRoleWire {
             Primary,
             Specialist { name: String },
@@ -160,6 +160,7 @@ impl AgentSessionFacts {
 impl<'de> Deserialize<'de> for AgentSessionFacts {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct AgentSessionFactsWire {
             id: AgentSessionId,
             task_id: TaskId,

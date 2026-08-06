@@ -627,6 +627,7 @@ impl<'de> Deserialize<'de> for CommandReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTaskIntent {
     pub id: TaskId,
     pub environment_id: EnvironmentId,
@@ -643,17 +644,19 @@ pub struct CreateTaskIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenameTaskIntent {
     pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetTaskAttentionIntent {
     pub attention: TaskAttention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     CreateTask(CreateTaskIntent),
     RenameTask(RenameTaskIntent),

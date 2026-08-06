@@ -15,12 +15,19 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use devmanager::client::perform_client_hello;
+use devmanager::client::{connect, perform_client_hello};
+use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
+};
 use devmanager::domain::ClientId;
 use devmanager::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,
     HelloListener, IpcError,
 };
+use devmanager::kernel::CommandBus;
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientHello, FrameLimits, PhysicalFrameError, ProtocolVersion,
     MAX_PHYSICAL_FRAME_BYTES,
@@ -66,6 +73,168 @@ fn protocol_client_id(tail: u8) -> ClientId {
     bytes[8] = 0x80;
     bytes[15] = tail;
     ClientId::from_bytes(bytes).expect("client id")
+}
+
+fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+    [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        tail,
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_request_create_retry_then_task_read() {
+    let root = isolation_root();
+    assert_isolated_from_app_data(root.path());
+    let db_path = root.path().join("kernel.sqlite3");
+
+    let profile_uuid = Uuid::now_v7();
+    let profile = format!(
+        "pipe{}{}{}",
+        "rq",
+        std::process::id(),
+        profile_uuid.simple()
+    );
+    assert!(
+        profile.contains(&std::process::id().to_string()),
+        "profile must include pid"
+    );
+    assert!(
+        profile.ends_with(&profile_uuid.simple().to_string()),
+        "profile must include full uuid simple form"
+    );
+    assert_eq!(profile_uuid.get_version_num(), 7);
+
+    let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
+    let host_boot_id = Uuid::now_v7();
+    let client_id = protocol_client_id(0x51);
+    let task = TaskId::from_bytes(fixed_uuid_v7(0x52)).expect("task");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x53)).expect("command");
+    let request_id = RequestId::from_bytes(fixed_uuid_v7(0x54)).expect("request");
+
+    let create = CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::CreateTask(CreateTaskIntent {
+            id: task,
+            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x55)).expect("env"),
+            title: "Pipe create retry".into(),
+            description: None,
+            project_id: ProjectId::from_bytes(fixed_uuid_v7(0x56)).expect("project"),
+            workspace: WorkspaceRef::Main,
+            assignment: TaskAssignment::LocalOwner,
+            created_at_ms: 1_725_000_000_000,
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        }),
+    };
+
+    let listener = HelloListener::bind(
+        &profile,
+        AcceptHelloConfig {
+            host_boot_id,
+            server_build: "devmanager-host/0.4.2".to_string(),
+            supported: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            local_limits: FrameLimits::v1_default(),
+        },
+    )
+    .expect("bind");
+
+    let server_task = tokio::spawn(async move {
+        let mut connection = listener.accept().await.expect("accept connection");
+        let mut bus = CommandBus::open(&db_path).expect("open host command bus");
+        connection
+            .serve_request(&mut bus)
+            .await
+            .expect("serve create");
+        connection
+            .serve_request(&mut bus)
+            .await
+            .expect("serve retry");
+        connection
+            .serve_request(&mut bus)
+            .await
+            .expect("serve task query");
+        connection.accepted_hello()
+    });
+
+    let client_task = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let create = create.clone();
+        async move {
+            let hello = ClientHello::new(
+                "devmanager/0.4.2",
+                client_id,
+                fingerprint,
+                CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+                FrameLimits::v1_default(),
+            )
+            .expect("client hello");
+            let mut client = connect(&endpoint, &hello).await.expect("connect");
+            assert_eq!(client.client_id(), client_id);
+
+            let first = client
+                .execute_command(create.clone())
+                .await
+                .expect("create command");
+            let retry = client
+                .execute_command(create)
+                .await
+                .expect("retry identical command");
+            assert_eq!(
+                first, retry,
+                "identical create must return identical receipt"
+            );
+            let operation_id = first
+                .accepted_operation_id()
+                .expect("create must be accepted");
+            assert_eq!(
+                retry.accepted_operation_id(),
+                Some(operation_id),
+                "retry must preserve OperationId"
+            );
+
+            let reply = client
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: Some(task),
+                    query: Query::TaskSnapshot,
+                })
+                .await
+                .expect("task snapshot query");
+            assert_eq!(reply.request_id, request_id);
+            match reply.outcome {
+                QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot }) => {
+                    assert_eq!(snapshot.task.id, task);
+                    assert_eq!(snapshot.task.title, "Pipe create retry");
+                    assert_eq!(snapshot.task.revision, 1);
+                }
+                other => panic!("expected task snapshot, got {other:?}"),
+            }
+            (first, client.server_hello().clone())
+        }
+    });
+
+    let accepted = timeout(OUTER_TIMEOUT, server_task)
+        .await
+        .expect("server join timeout")
+        .expect("server task");
+    let (receipt, server_hello) = timeout(OUTER_TIMEOUT, client_task)
+        .await
+        .expect("client join timeout")
+        .expect("client task");
+
+    assert_eq!(accepted.client_id, client_id);
+    assert_eq!(server_hello.host_boot_id, host_boot_id);
+    assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+    drop(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

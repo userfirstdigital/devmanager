@@ -122,7 +122,7 @@ impl ResourceRecipe {
 impl<'de> Deserialize<'de> for ResourceRecipe {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum ResourceRecipeWire {
             Terminal { cols: u16, rows: u16 },
             Browser { start_url: String },
@@ -207,6 +207,7 @@ impl ResourceFacts {
 impl<'de> Deserialize<'de> for ResourceFacts {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ResourceFactsWire {
             id: ResourceId,
             task_id: Option<TaskId>,
