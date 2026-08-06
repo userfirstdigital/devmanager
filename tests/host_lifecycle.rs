@@ -18,11 +18,13 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, ClientSubscription, ClientSubscriptionState, HostClient,
-    HostClientConfig, TrackedOperation, UnsolicitedServerMessage,
+    HostClientConfig, SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
-use devmanager::domain::id::{ArtifactId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+use devmanager::domain::id::{
+    ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId, TaskId,
+};
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
@@ -173,6 +175,18 @@ fn host_command(config_base: &Path, profile: &str) -> ProcessCommand {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    command
+}
+
+fn host_command_with_slow_durable_reader(
+    config_base: &Path,
+    profile: &str,
+    slow_client_id: ClientId,
+) -> ProcessCommand {
+    let mut command = host_command(config_base, profile);
+    command
+        .arg("--test-slow-durable-reader-client-id")
+        .arg(slow_client_id.to_string());
     command
 }
 
@@ -1879,6 +1893,235 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
     assert_eq!(final_identity.boot_id, original_identity.boot_id);
 
     replacement.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let healthy_id = ClientId::from_bytes(fixed_uuid_v7(0xc0)).expect("healthy client id");
+    let slow_id = ClientId::from_bytes(fixed_uuid_v7(0xc1)).expect("slow client id");
+
+    let mut host = ChildGuard::spawn(host_command_with_slow_durable_reader(
+        config_base.path(),
+        &profile,
+        slow_id,
+    ));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let requested =
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay]);
+    let healthy_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: healthy_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let slow_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: slow_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+
+    let mut healthy = connect_bounded(&healthy_config, &mut host).await;
+    let mut slow = connect_bounded(&slow_config, &mut host).await;
+
+    let mut healthy_sub = ClientSubscription::new();
+    let mut slow_sub = ClientSubscription::new();
+    healthy_sub
+        .synchronize(&mut healthy)
+        .await
+        .expect("healthy initial synchronize");
+    slow_sub
+        .synchronize(&mut slow)
+        .await
+        .expect("slow initial synchronize");
+    assert_eq!(healthy_sub.state(), ClientSubscriptionState::Ready);
+    assert_eq!(slow_sub.state(), ClientSubscriptionState::Ready);
+    let slow_baseline = slow_sub
+        .model()
+        .expect("slow model")
+        .last_applied_sequence();
+
+    async fn drain_until_task_and_settled_operation(
+        sub: &mut ClientSubscription,
+        client: &HostClient,
+        after_sequence: u64,
+        task_id: TaskId,
+        operation_id: OperationId,
+    ) -> u64 {
+        let mut last_seen = after_sequence;
+        loop {
+            let model = sub.model().expect("model while draining");
+            let task_ready = model.tasks().contains_key(&task_id);
+            let operation_settled = matches!(
+                model.operations().get(&operation_id).map(|op| &op.state),
+                Some(OperationState::Settled { .. })
+            );
+            if task_ready && operation_settled {
+                return model.last_applied_sequence();
+            }
+
+            let update = timeout(READY_TIMEOUT, sub.recv_and_apply(client))
+                .await
+                .expect("healthy durable drain stayed bounded")
+                .expect("healthy durable drain apply");
+            match update {
+                SubscriptionUpdate::DurableEvent(event) => {
+                    assert!(
+                        event.sequence > last_seen,
+                        "live durable events must remain strictly ordered"
+                    );
+                    last_seen = event.sequence;
+                }
+                SubscriptionUpdate::Stream(_) => {}
+                other => panic!("expected durable event while draining, got {other:?}"),
+            }
+        }
+    }
+
+    let (first_create, _first_command_id, first_task_id) =
+        create_task_named(healthy_id, 0xc2, 0xc3, 0xc4, 0xc5, "Slow-reader first task");
+    let first_receipt = healthy
+        .execute_command(first_create)
+        .await
+        .expect("first create transport");
+    let CommandReceipt::Accepted {
+        operation_id: first_operation_id,
+        event_ids: first_event_ids,
+        ..
+    } = first_receipt
+    else {
+        panic!("first create must be accepted, got {first_receipt:?}");
+    };
+    assert_eq!(
+        first_event_ids.len(),
+        1,
+        "pure CreateTask acceptance batch has exactly one decision event"
+    );
+
+    let first_command_high_water = drain_until_task_and_settled_operation(
+        &mut healthy_sub,
+        &healthy,
+        slow_baseline,
+        first_task_id,
+        first_operation_id,
+    )
+    .await;
+    assert_eq!(
+        first_command_high_water,
+        slow_baseline + 3,
+        "first CreateTask must advance exactly three durable events"
+    );
+
+    let (second_create, second_command_id, second_task_id) = create_task_named(
+        healthy_id,
+        0xc6,
+        0xc7,
+        0xc8,
+        0xc9,
+        "Slow-reader second task",
+    );
+    let second_receipt = timeout(
+        Duration::from_secs(2),
+        healthy.execute_command(second_create.clone()),
+    )
+    .await
+    .expect("second create must not be delayed by slow durable reader")
+    .expect("second create transport");
+    let CommandReceipt::Accepted {
+        operation_id: second_operation_id,
+        event_ids: second_event_ids,
+        ..
+    } = second_receipt
+    else {
+        panic!("second create must be accepted, got {second_receipt:?}");
+    };
+    assert_eq!(
+        second_event_ids.len(),
+        1,
+        "pure CreateTask acceptance batch has exactly one decision event"
+    );
+
+    let second_command_high_water = drain_until_task_and_settled_operation(
+        &mut healthy_sub,
+        &healthy,
+        first_command_high_water,
+        second_task_id,
+        second_operation_id,
+    )
+    .await;
+    assert_eq!(
+        second_command_high_water,
+        first_command_high_water + 3,
+        "second CreateTask must advance exactly three durable events"
+    );
+
+    let healthy_model = healthy_sub.model().expect("healthy model after live");
+    assert!(healthy_model.tasks().contains_key(&first_task_id));
+    assert!(healthy_model.tasks().contains_key(&second_task_id));
+    assert_eq!(
+        healthy_model.last_applied_sequence(),
+        second_command_high_water
+    );
+
+    let retry = healthy
+        .execute_command(second_create)
+        .await
+        .expect("exact second create retry");
+    assert!(
+        matches!(
+            retry,
+            CommandReceipt::Accepted {
+                command_id,
+                ..
+            } if command_id == second_command_id
+        ),
+        "healthy subscription must remain usable for exact accepted retry"
+    );
+
+    let resync = loop {
+        let update = timeout(READY_TIMEOUT, slow_sub.recv_and_apply(&slow))
+            .await
+            .expect("slow resync stayed bounded")
+            .expect("slow resync apply");
+        match update {
+            SubscriptionUpdate::ResyncRequired {
+                last_delivered_sequence,
+                newest_sequence,
+            } => break (last_delivered_sequence, newest_sequence),
+            SubscriptionUpdate::Stream(_) => continue,
+            other => panic!("expected critical ResyncRequired for slow client, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        resync.0, slow_baseline,
+        "slow last_delivered_sequence must stay at pre-test physical baseline"
+    );
+    assert!(
+        resync.1 >= second_command_high_water,
+        "slow newest_sequence must include the complete second CreateTask envelope ({second_command_high_water}), got {}",
+        resync.1
+    );
+    assert_eq!(slow_sub.state(), ClientSubscriptionState::NeedsResync);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    healthy.disconnect();
+    slow.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

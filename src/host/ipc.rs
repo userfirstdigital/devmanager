@@ -31,6 +31,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounded post-Hello host→client critical output queue capacity.
 const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
+
+/// Fixed durable capacity for the debug-only slow-reader lifecycle seam.
+///
+/// One pure CreateTask acceptance batch is exactly one decision event plus the
+/// OperationAccepted and OperationSettled envelope events (three durable frames).
+#[cfg(debug_assertions)]
+const TEST_SLOW_DURABLE_READER_CAPACITY: usize = 3;
 // SnapshotPage/EventPage/ArtifactContentPage encoded_bytes cover the page body,
 // not the surrounding QueryResult/QueryReply/ServerMessage named maps. Protocol
 // v1 sends that wrapped response in one physical frame, so reserve bounded
@@ -432,7 +439,44 @@ impl HostConnection {
         connection_ensure_live(self.poisoned)?;
         #[cfg(windows)]
         {
-            windows_serve_duplex(self, requests, HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY).await
+            windows_serve_duplex(
+                self,
+                requests,
+                HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY,
+                HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
+                OutputDrainMode::Prioritized,
+            )
+            .await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = requests;
+            Err(IpcError::Unsupported)
+        }
+    }
+
+    /// Debug-only duplex serve for the slow-durable-reader lifecycle fixture.
+    ///
+    /// Durable capacity is exactly [`TEST_SLOW_DURABLE_READER_CAPACITY`] (one pure
+    /// CreateTask acceptance batch) and the writer drains critical traffic only,
+    /// so a non-draining full durable lane forces that connection alone to
+    /// resynchronize on the next mutation batch.
+    #[cfg(debug_assertions)]
+    pub async fn serve_duplex_for_test_slow_durable_reader(
+        self,
+        requests: HostRequestHandle,
+    ) -> Result<(), IpcError> {
+        connection_ensure_live(self.poisoned)?;
+        #[cfg(windows)]
+        {
+            windows_serve_duplex(
+                self,
+                requests,
+                HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY,
+                TEST_SLOW_DURABLE_READER_CAPACITY,
+                OutputDrainMode::CriticalOnly,
+            )
+            .await
         }
         #[cfg(not(windows))]
         {
@@ -639,10 +683,20 @@ async fn windows_write_message(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
+enum OutputDrainMode {
+    Prioritized,
+    #[cfg(debug_assertions)]
+    CriticalOnly,
+}
+
+#[cfg(windows)]
 async fn windows_serve_duplex(
     connection: HostConnection,
     requests: HostRequestHandle,
     critical_capacity: usize,
+    durable_capacity: usize,
+    drain_mode: OutputDrainMode,
 ) -> Result<(), IpcError> {
     let HostConnection {
         negotiated,
@@ -656,7 +710,7 @@ async fn windows_serve_duplex(
     let (output, mut ports) = ConnectionOutputHandle::with_connection_id(
         server_hello.connection_id,
         critical_capacity,
-        HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
+        durable_capacity,
         HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
     );
     let reader_output = output.clone();
@@ -667,7 +721,15 @@ async fn windows_serve_duplex(
     let physical_for_writer = physical;
 
     let writer = async move {
-        while let Some(mut outbound) = ports.recv_prioritized().await {
+        loop {
+            let next = match drain_mode {
+                OutputDrainMode::Prioritized => ports.recv_prioritized().await,
+                #[cfg(debug_assertions)]
+                OutputDrainMode::CriticalOnly => ports.recv_critical_only().await,
+            };
+            let Some(mut outbound) = next else {
+                break;
+            };
             if !outbound.should_write() {
                 continue;
             }

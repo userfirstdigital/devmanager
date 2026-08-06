@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+use devmanager::domain::ClientId;
 use devmanager::host::{
     AcceptHelloConfig, HelloListener, HostConnection, HostLock, HostLockError, HostRequestExecutor,
     HostRequestHandle, HOST_EXIT_ALREADY_RUNNING,
@@ -30,6 +31,7 @@ struct HostArgs {
     instance_label: String,
     parent_pid: u32,
     config_base: PathBuf,
+    test_slow_durable_reader_client_id: Option<ClientId>,
 }
 
 #[derive(Debug)]
@@ -107,6 +109,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             parent,
             host_boot_id,
             bus,
+            args.test_slow_durable_reader_client_id,
         ))?;
         drop(host_lock);
         Ok(())
@@ -120,6 +123,7 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let mut instance_label: Option<String> = None;
     let mut parent_pid: Option<u32> = None;
     let mut config_base: Option<PathBuf> = None;
+    let mut test_slow_durable_reader_client_id: Option<ClientId> = None;
 
     let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
@@ -169,6 +173,18 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
                     .ok_or_else(|| "missing value for --config-base".to_string())?;
                 config_base = Some(PathBuf::from(value));
             }
+            "--test-slow-durable-reader-client-id" => {
+                if test_slow_durable_reader_client_id.is_some() {
+                    return Err("duplicate --test-slow-durable-reader-client-id".to_string());
+                }
+                let value = args.next().ok_or_else(|| {
+                    "missing value for --test-slow-durable-reader-client-id".to_string()
+                })?;
+                let client_id = ClientId::parse(&value).map_err(|error| {
+                    format!("invalid --test-slow-durable-reader-client-id value: {error}")
+                })?;
+                test_slow_durable_reader_client_id = Some(client_id);
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag: {other}"));
             }
@@ -193,11 +209,16 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let config_base = config_base.ok_or_else(|| "missing required --config-base".to_string())?;
     let config_base = validate_config_base(&config_base)?;
 
+    if test_slow_durable_reader_client_id.is_some() {
+        validate_slow_durable_reader_isolation(&instance_label, &profile, &config_base)?;
+    }
+
     Ok(HostArgs {
         profile,
         instance_label,
         parent_pid,
         config_base,
+        test_slow_durable_reader_client_id,
     })
 }
 
@@ -241,6 +262,38 @@ fn validate_instance_label(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+#[cfg(all(windows, debug_assertions))]
+fn validate_slow_durable_reader_isolation(
+    instance_label: &str,
+    profile: &str,
+    config_base: &Path,
+) -> Result<(), String> {
+    if instance_label != "Lifecycle Test" {
+        return Err(
+            "--test-slow-durable-reader-client-id requires instance label exactly 'Lifecycle Test'"
+                .to_string(),
+        );
+    }
+    if !profile.starts_with("lifecycle") {
+        return Err(
+            "--test-slow-durable-reader-client-id requires a profile that begins with 'lifecycle'"
+                .to_string(),
+        );
+    }
+    let temp_root = std::env::temp_dir().canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize system temp directory for slow-durable-reader isolation: {error}"
+        )
+    })?;
+    if !path_strictly_beneath(config_base, &temp_root) {
+        return Err(format!(
+            "--test-slow-durable-reader-client-id requires config base to be a strict descendant of the system temp root: {}",
+            config_base.display()
+        ));
+    }
+    Ok(())
+}
+
 fn validate_parent_pid_shape(parent_pid: u32) -> Result<(), String> {
     if parent_pid == 0 {
         return Err("parent pid must be nonzero".to_string());
@@ -276,6 +329,10 @@ fn installed_production_root() -> Result<PathBuf, String> {
 
 fn path_equals_or_beneath(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+fn path_strictly_beneath(path: &Path, root: &Path) -> bool {
+    path.starts_with(root) && path != root
 }
 
 fn validate_config_base(config_base: &Path) -> Result<PathBuf, String> {
@@ -648,11 +705,19 @@ fn spawn_connection_task(
     tasks: &mut tokio::task::JoinSet<()>,
     connection: HostConnection,
     requests: HostRequestHandle,
+    slow_durable_reader_client_id: Option<ClientId>,
 ) {
     tasks.spawn(async move {
         // Duplex serve owns reader+writer halves until disconnect; abort/drain
         // of this JoinSet task reaps both halves with the connection lifecycle.
-        let _ = connection.serve_duplex(requests).await;
+        let matched_slow = slow_durable_reader_client_id == Some(connection.client_id());
+        if matched_slow {
+            let _ = connection
+                .serve_duplex_for_test_slow_durable_reader(requests)
+                .await;
+        } else {
+            let _ = connection.serve_duplex(requests).await;
+        }
     });
 }
 
@@ -662,6 +727,7 @@ async fn serve_foreground_host(
     parent: ParentProcess,
     host_boot_id: Uuid,
     bus: CommandBus,
+    slow_durable_reader_client_id: Option<ClientId>,
 ) -> Result<(), String> {
     let hello_config = AcceptHelloConfig {
         host_boot_id,
@@ -724,6 +790,7 @@ async fn serve_foreground_host(
                         &mut connection_tasks,
                         connection,
                         request_handle.clone(),
+                        slow_durable_reader_client_id,
                     );
                 }
             }
@@ -731,4 +798,153 @@ async fn serve_foreground_host(
     };
 
     finish_supervised_host(exit, &mut connection_tasks, request_handle, executor_task).await
+}
+
+#[cfg(all(windows, debug_assertions, test))]
+mod tests {
+    use super::{
+        parse_args, path_strictly_beneath, validate_slow_durable_reader_isolation, HostArgs,
+    };
+    use tempfile::TempDir;
+
+    fn lifecycle_base_args(config_base: &std::path::Path, profile: &str) -> Vec<String> {
+        let parent_pid = match std::process::id() {
+            1 => 2,
+            other => other.saturating_sub(1).max(1),
+        };
+        vec![
+            "--foreground".into(),
+            "--profile".into(),
+            profile.into(),
+            "--instance-label".into(),
+            "Lifecycle Test".into(),
+            "--parent-pid".into(),
+            parent_pid.to_string(),
+            "--config-base".into(),
+            config_base.display().to_string(),
+        ]
+    }
+
+    #[test]
+    fn validate_slow_durable_reader_isolation_accepts_temp_child() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let canonical = config_base
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp child");
+        validate_slow_durable_reader_isolation("Lifecycle Test", "lifecyclefixture", &canonical)
+            .expect("temp child must be accepted");
+        assert!(path_strictly_beneath(
+            &canonical,
+            &std::env::temp_dir().canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn validate_slow_durable_reader_isolation_rejects_wrong_label() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let canonical = config_base
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp child");
+        let error =
+            validate_slow_durable_reader_isolation("Other Label", "lifecyclefixture", &canonical)
+                .expect_err("wrong label must fail");
+        assert!(
+            error.contains("Lifecycle Test"),
+            "error must name the required label: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_slow_durable_reader_isolation_rejects_wrong_profile() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let canonical = config_base
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp child");
+        let error =
+            validate_slow_durable_reader_isolation("Lifecycle Test", "otherprofile", &canonical)
+                .expect_err("wrong profile must fail");
+        assert!(
+            error.contains("lifecycle"),
+            "error must name the required profile prefix: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_slow_durable_reader_isolation_rejects_temp_root_itself() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonicalize system temp root");
+        let error = validate_slow_durable_reader_isolation(
+            "Lifecycle Test",
+            "lifecyclefixture",
+            &temp_root,
+        )
+        .expect_err("temp root itself must fail");
+        assert!(
+            error.contains("strict descendant"),
+            "error must require a strict descendant: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_slow_durable_reader_client_id_value() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let mut args = lifecycle_base_args(config_base.path(), "lifecycleparse");
+        args.push("--test-slow-durable-reader-client-id".into());
+        let error = parse_args(args).expect_err("missing flag value must fail");
+        assert!(
+            error.contains("missing value for --test-slow-durable-reader-client-id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_slow_durable_reader_client_id() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let mut args = lifecycle_base_args(config_base.path(), "lifecycleparse");
+        args.push("--test-slow-durable-reader-client-id".into());
+        args.push("not-a-uuidv7".into());
+        let error = parse_args(args).expect_err("invalid UUIDv7 must fail");
+        assert!(
+            error.contains("invalid --test-slow-durable-reader-client-id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_duplicate_slow_durable_reader_client_id() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let client_id = "018f60b0-9c1a-7001-8000-0000000000c1";
+        let mut args = lifecycle_base_args(config_base.path(), "lifecycleparse");
+        args.push("--test-slow-durable-reader-client-id".into());
+        args.push(client_id.into());
+        args.push("--test-slow-durable-reader-client-id".into());
+        args.push(client_id.into());
+        let error = parse_args(args).expect_err("duplicate flag must fail");
+        assert!(
+            error.contains("duplicate --test-slow-durable-reader-client-id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_slow_durable_reader_client_id_under_lifecycle_shape() {
+        let config_base = TempDir::new().expect("process-unique config base");
+        let client_id = "018f60b0-9c1a-7001-8000-0000000000c1";
+        let mut args = lifecycle_base_args(config_base.path(), "lifecycleparse");
+        args.push("--test-slow-durable-reader-client-id".into());
+        args.push(client_id.into());
+        let parsed: HostArgs = parse_args(args).expect("valid lifecycle shape must parse");
+        assert_eq!(
+            parsed
+                .test_slow_durable_reader_client_id
+                .expect("flag retained")
+                .to_string(),
+            client_id
+        );
+        assert!(parsed.config_base.is_absolute());
+    }
 }

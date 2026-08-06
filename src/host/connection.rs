@@ -2198,6 +2198,30 @@ impl ConnectionOutputPorts {
             }
         }
     }
+
+    /// Debug-only: drain critical traffic only; never consume durable or ephemeral.
+    #[cfg(debug_assertions)]
+    pub(crate) async fn recv_critical_only(&mut self) -> Option<PrioritizedOutbound> {
+        loop {
+            if self.shutdown_requested() {
+                return None;
+            }
+            if let Ok(outbound) = self.critical_rx.try_recv() {
+                return Some(PrioritizedOutbound::Critical(outbound));
+            }
+            tokio::select! {
+                biased;
+                changed = self.shutdown_rx.changed() => {
+                    if changed.is_err() || self.shutdown_requested() {
+                        return None;
+                    }
+                }
+                critical = self.critical_rx.recv() => {
+                    return critical.map(PrioritizedOutbound::Critical);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2232,6 +2256,75 @@ mod output_tests {
             request_id: RequestId::new(),
             outcome: QueryOutcome::Err(crate::domain::query::QueryError::NotFound),
         })
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn critical_only_receiver_never_consumes_durable_or_ephemeral() {
+        let subscription_id = SubscriptionId::new();
+        let stream = LiveStreamState::new(0);
+        let (handle, mut ports) = ConnectionOutputHandle::new(2, 1, 1);
+
+        assert!(matches!(
+            handle.try_enqueue_durable_event(subscription_id, sample_event(1), &stream, 1),
+            DurableAdmitResult::Admitted
+        ));
+        let ephemeral_stream = sample_stream_key(0x70);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                ephemeral_stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(ephemeral_stream, 1, 1, 7))),
+            ),
+            EphemeralAdmitResult::Queued | EphemeralAdmitResult::Coalesced
+        ));
+        handle
+            .try_enqueue_critical(sample_reply())
+            .expect("critical must admit while durable and ephemeral are held");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), ports.recv_critical_only())
+            .await
+            .expect("critical-only recv stayed bounded")
+            .expect("critical outbound");
+        assert!(matches!(first, PrioritizedOutbound::Critical(_)));
+
+        let still_waiting =
+            tokio::time::timeout(Duration::from_millis(50), ports.recv_critical_only()).await;
+        assert!(
+            still_waiting.is_err(),
+            "critical-only must not surface durable or ephemeral while waiting"
+        );
+        let durable = ports
+            .try_recv_prioritized()
+            .expect("durable must remain queued");
+        assert!(matches!(durable, PrioritizedOutbound::Durable(_)));
+        let ephemeral = ports
+            .try_recv_prioritized()
+            .expect("ephemeral must remain queued");
+        assert!(matches!(ephemeral, PrioritizedOutbound::Ephemeral(_)));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn critical_only_receiver_completes_none_on_shutdown() {
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        let pending = tokio::spawn(async move { ports.recv_critical_only().await });
+        // Yield until the spawned receive is pending on critical/shutdown.
+        for _ in 0..16 {
+            if pending.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.request_shutdown();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("critical-only shutdown wakeup stayed bounded")
+            .expect("critical-only shutdown join");
+        assert!(
+            outcome.is_none(),
+            "shutdown must complete critical-only receive with None"
+        );
     }
 
     #[test]
