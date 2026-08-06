@@ -17,8 +17,8 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use devmanager::client::{
-    connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
-    UnsolicitedServerMessage,
+    connect, perform_client_hello, ClientSubscription, ClientSubscriptionState, HostClient,
+    HostClientConfig, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
@@ -1058,6 +1058,306 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
 
     writer.disconnect();
     reader.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_snapshot_retains_id_across_section_restart_without_cursor() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0xd0)).expect("retain client id");
+    let mut limits = FrameLimits::v1_default();
+    limits.max_page_items = 1;
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested: CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
+        limits,
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+
+    let (first_create, _, first_task_id) =
+        create_task_named(client_id, 0xd1, 0xd2, 0xd3, 0xd4, "Retain first");
+    let (second_create, _, second_task_id) =
+        create_task_named(client_id, 0xd5, 0xd6, 0xd7, 0xd8, "Retain second");
+    assert!(matches!(
+        client
+            .execute_command(first_create)
+            .await
+            .expect("create first retain task"),
+        CommandReceipt::Accepted { .. }
+    ));
+    assert!(matches!(
+        client
+            .execute_command(second_create)
+            .await
+            .expect("create second retain task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let first_page = client
+        .snapshot_page(SnapshotSection::Tasks, None, None)
+        .await
+        .expect("open retained snapshot transport")
+        .expect("open retained snapshot query");
+    assert_eq!(first_page.items.len(), 1);
+    let valid_cursor = first_page
+        .next_cursor
+        .clone()
+        .expect("tasks page must continue under max_page_items=1");
+
+    let second_page = client
+        .snapshot_page(
+            SnapshotSection::Tasks,
+            Some(first_page.snapshot_id),
+            Some(valid_cursor),
+        )
+        .await
+        .expect("finish tasks section transport")
+        .expect("finish tasks section query");
+    assert_eq!(second_page.snapshot_id, first_page.snapshot_id);
+    assert_eq!(second_page.through_sequence, first_page.through_sequence);
+    assert!(second_page.next_cursor.is_none());
+    let SnapshotItem::Task(second_item) = &second_page.items[0] else {
+        panic!("tasks page must contain only task items");
+    };
+    assert_eq!(second_item.task.id, second_task_id);
+    assert_ne!(second_item.task.id, first_task_id);
+
+    let operations_page = client
+        .snapshot_page(
+            SnapshotSection::Operations,
+            Some(first_page.snapshot_id),
+            None,
+        )
+        .await
+        .expect("begin operations section without cursor transport")
+        .expect("begin operations section without cursor query");
+    assert_eq!(operations_page.snapshot_id, first_page.snapshot_id);
+    assert_eq!(
+        operations_page.through_sequence,
+        first_page.through_sequence
+    );
+    assert_eq!(operations_page.section, SnapshotSection::Operations);
+    assert!(!operations_page.items.is_empty());
+
+    client
+        .release_snapshot(first_page.snapshot_id)
+        .await
+        .expect("explicit snapshot release transport")
+        .expect("explicit snapshot release query");
+    let released = client
+        .snapshot_page(
+            SnapshotSection::Operations,
+            Some(first_page.snapshot_id),
+            None,
+        )
+        .await
+        .expect("released snapshot lookup transport");
+    assert_eq!(
+        released,
+        Err(devmanager::domain::query::QueryError::NotFound)
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    client.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_clients_assemble_same_initial_model_and_converge_live() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let writer_id = ClientId::from_bytes(fixed_uuid_v7(0xe0)).expect("writer client id");
+    let reader_a_id = ClientId::from_bytes(fixed_uuid_v7(0xe1)).expect("reader a id");
+    let reader_b_id = ClientId::from_bytes(fixed_uuid_v7(0xe2)).expect("reader b id");
+    let mut limits = FrameLimits::v1_default();
+    limits.max_page_items = 1;
+    let requested =
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay]);
+    let writer_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: writer_id,
+        requested,
+        limits,
+    };
+    let reader_a_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: reader_a_id,
+        requested,
+        limits,
+    };
+    let reader_b_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: reader_b_id,
+        requested,
+        limits,
+    };
+    let mut writer = connect_bounded(&writer_config, &mut host).await;
+    let mut reader_a = connect_bounded(&reader_a_config, &mut host).await;
+    let mut reader_b = connect_bounded(&reader_b_config, &mut host).await;
+
+    for (idx, title) in ["Seed one", "Seed two", "Seed three"]
+        .into_iter()
+        .enumerate()
+    {
+        let tail = 0xe3 + (idx as u8) * 4;
+        let (create, _, _) =
+            create_task_named(writer_id, tail, tail + 1, tail + 2, tail + 3, title);
+        assert!(matches!(
+            writer.execute_command(create).await.expect("seed create"),
+            CommandReceipt::Accepted { .. }
+        ));
+    }
+
+    let mut sub_a = ClientSubscription::new();
+    let mut sub_b = ClientSubscription::new();
+    sub_a
+        .synchronize(&mut reader_a)
+        .await
+        .expect("reader a initial synchronize");
+    sub_b
+        .synchronize(&mut reader_b)
+        .await
+        .expect("reader b initial synchronize");
+    assert_eq!(sub_a.state(), ClientSubscriptionState::Ready);
+    assert_eq!(sub_b.state(), ClientSubscriptionState::Ready);
+    let model_a = sub_a.model().expect("reader a model").clone();
+    let model_b = sub_b.model().expect("reader b model").clone();
+    assert_eq!(model_a, model_b);
+    assert_eq!(
+        model_a.last_applied_sequence(),
+        model_b.last_applied_sequence()
+    );
+    assert_eq!(model_a.tasks().len(), 3);
+    assert_eq!(model_a.operations().len(), 3);
+    let sync_sequence = model_a.last_applied_sequence();
+
+    let (live_create, live_command_id, live_task_id) =
+        create_task_named(writer_id, 0xf0, 0xf1, 0xf2, 0xf3, "Live converge task");
+    assert!(matches!(
+        writer
+            .execute_command(live_create.clone())
+            .await
+            .expect("create live converge task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let probe = writer
+        .open_event_replay(sync_sequence)
+        .await
+        .expect("probe high-water transport")
+        .expect("probe high-water query");
+    let high_water = probe.page.through_sequence;
+    assert!(
+        high_water > sync_sequence,
+        "live create must advance durable high-water"
+    );
+    writer
+        .release_event_replay(probe.subscription_id)
+        .await
+        .expect("release probe transport")
+        .expect("release probe query");
+
+    async fn drain_to_high_water(
+        sub: &mut ClientSubscription,
+        client: &HostClient,
+        high_water: u64,
+    ) {
+        while sub
+            .model()
+            .expect("model while draining")
+            .last_applied_sequence()
+            < high_water
+        {
+            let update = timeout(READY_TIMEOUT, sub.recv_and_apply(client))
+                .await
+                .expect("live apply stayed bounded")
+                .expect("live apply");
+            match update {
+                devmanager::client::SubscriptionUpdate::DurableEvent(event) => {
+                    assert!(event.sequence <= high_water);
+                }
+                other => panic!("expected durable event while draining, got {other:?}"),
+            }
+        }
+    }
+
+    drain_to_high_water(&mut sub_a, &reader_a, high_water).await;
+    drain_to_high_water(&mut sub_b, &reader_b, high_water).await;
+
+    let converged_a = sub_a.model().expect("reader a after live").clone();
+    let converged_b = sub_b.model().expect("reader b after live").clone();
+    assert_eq!(converged_a, converged_b);
+    assert_eq!(converged_a.last_applied_sequence(), high_water);
+    assert!(converged_a.tasks().contains_key(&live_task_id));
+    assert_eq!(converged_a.tasks().len(), 4);
+    assert_eq!(converged_a.operations().len(), 4);
+
+    let retry = writer
+        .execute_command(live_create)
+        .await
+        .expect("exact live command retry");
+    assert!(
+        matches!(
+            retry,
+            CommandReceipt::Accepted {
+                command_id,
+                ..
+            } if command_id == live_command_id
+        ),
+        "exact retry must remain accepted"
+    );
+    let dup_a = timeout(Duration::from_millis(300), sub_a.recv_and_apply(&reader_a)).await;
+    let dup_b = timeout(Duration::from_millis(300), sub_b.recv_and_apply(&reader_b)).await;
+    assert!(dup_a.is_err(), "reader a must not receive a duplicate");
+    assert!(dup_b.is_err(), "reader b must not receive a duplicate");
+
+    sub_a
+        .release(&mut reader_a)
+        .await
+        .expect("release reader a subscription");
+    sub_b
+        .release(&mut reader_b)
+        .await
+        .expect("release reader b subscription");
+    assert_eq!(sub_a.state(), ClientSubscriptionState::Released);
+    assert_eq!(sub_b.state(), ClientSubscriptionState::Released);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    writer.disconnect();
+    reader_a.disconnect();
+    reader_b.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

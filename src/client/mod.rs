@@ -5,6 +5,8 @@ pub mod action;
 pub mod cli;
 mod connection;
 mod host_client;
+pub mod model;
+pub mod subscription;
 
 pub use action::{
     catalog, require_unique_ids, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
@@ -13,3 +15,7 @@ pub use action::{
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
 pub use connection::{connect, perform_client_hello, ClientConnection, UnsolicitedServerMessage};
 pub use host_client::{EventReplayBatch, HostClient, HostClientConfig, TrackedOperation};
+pub use model::{ClientModel, ClientModelBuilder, ClientModelError};
+pub use subscription::{
+    ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,
+};

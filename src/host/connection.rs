@@ -706,10 +706,13 @@ impl HostRequestExecutor {
     ) -> Result<QueryOutcome, IpcError> {
         match (snapshot_id, resume_cursor) {
             (None, None) => self.open_snapshot_page(negotiated, section),
+            (Some(snapshot_id), None) => {
+                self.begin_snapshot_section(negotiated, section, snapshot_id)
+            }
             (Some(snapshot_id), Some(resume_cursor)) => {
                 self.resume_snapshot_page(negotiated, section, snapshot_id, resume_cursor)
             }
-            _ => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
+            (None, Some(_)) => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
         }
     }
 
@@ -729,10 +732,40 @@ impl HostRequestExecutor {
             Ok(page) => page,
             Err(error) => return map_snapshot_error(error),
         };
-        if page.next_cursor.is_some() {
-            self.registry
-                .insert(negotiated.client_id, session, limits, Instant::now());
+        // Retain the pinned session for every valid open page, including empty
+        // or single-page first sections, until explicit release / TTL / eviction.
+        self.registry
+            .insert(negotiated.client_id, session, limits, Instant::now());
+        Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
+    }
+
+    fn begin_snapshot_section(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        section: SnapshotSection,
+        snapshot_id: SnapshotId,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.registry.reap_idle(now);
+        if let Some(entry) = self.registry.entries.get(&snapshot_id) {
+            if now.duration_since(entry.last_touch) >= SNAPSHOT_IDLE_TTL {
+                self.registry.remove(snapshot_id);
+                return Ok(QueryOutcome::Err(QueryError::NotFound));
+            }
         }
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = match self
+            .registry
+            .get(snapshot_id, negotiated.client_id, limits, now)
+        {
+            Ok(session) => session,
+            Err(error) => return Ok(QueryOutcome::Err(error)),
+        };
+        let page = match session.page(section, None) {
+            Ok(page) => page,
+            Err(error) => return map_snapshot_error(error),
+        };
+        self.registry.touch(snapshot_id, Instant::now());
         Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
     }
 
@@ -767,12 +800,8 @@ impl HostRequestExecutor {
                 return map_snapshot_error(error);
             }
         };
-        let finished = page.next_cursor.is_none();
-        if finished {
-            self.registry.remove(snapshot_id);
-        } else {
-            self.registry.touch(snapshot_id, Instant::now());
-        }
+        // Finished sections stay pinned; only release / TTL / eviction drops them.
+        self.registry.touch(snapshot_id, Instant::now());
         Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
     }
 
