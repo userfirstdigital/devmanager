@@ -14,4 +14,4 @@ pub use ipc::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, AcceptHelloConfig,
     AcceptedHello, HelloListener, HostConnection, IpcError,
 };
-pub use lock::{HostIdentity, HostLock, HostLockError};
+pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
