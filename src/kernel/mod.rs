@@ -22,6 +22,7 @@ pub use dispatch::{
 };
 pub(crate) use maintenance::{StoreMaintenanceReport, WalCheckpointOutcome};
 pub use outbox::{DestinationClass, Effect, ReplayPolicy};
+pub(crate) use replay::{EventReplaySession, ReplayError};
 pub use runtime::{
     CompletionDisposition, RecoveringResource, RuntimePresence, RuntimeRegistry,
     RuntimeRegistryError,

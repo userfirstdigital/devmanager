@@ -23,11 +23,11 @@ use super::connection::{dispatch_authenticated_request, HostRequestHandle};
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
-// SnapshotPage::encoded_bytes covers the page body, not the surrounding
+// SnapshotPage/EventPage encoded_bytes cover the page body, not the surrounding
 // QueryResult/QueryReply/ServerResponse named maps. Protocol v1 sends that
 // wrapped response in one physical frame, so reserve bounded headroom for the
-// fixed correlation/envelope fields before granting PagedSnapshots.
-const PAGED_SNAPSHOT_RESPONSE_ENVELOPE_HEADROOM_BYTES: u32 = 1024;
+// fixed correlation/envelope fields before granting PagedSnapshots or EventReplay.
+const PAGE_RESPONSE_ENVELOPE_HEADROOM_BYTES: u32 = 1024;
 
 /// Exact protected two-ACE SDDL form: LocalSystem + one caller-supplied user SID.
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
@@ -182,20 +182,23 @@ fn negotiated_codecs(
 }
 
 fn fence_capabilities_by_transport(mut negotiated: NegotiatedParameters) -> NegotiatedParameters {
-    if negotiated.capabilities.contains(Capability::PagedSnapshots)
-        && !paged_snapshot_response_fits_transport(negotiated.limits)
-    {
-        negotiated.capabilities = CapabilitySet::from_bits(
-            negotiated.capabilities.bits() & !Capability::PagedSnapshots.bit(),
-        );
+    if !page_response_fits_transport(negotiated.limits) {
+        let mut bits = negotiated.capabilities.bits();
+        if negotiated.capabilities.contains(Capability::PagedSnapshots) {
+            bits &= !Capability::PagedSnapshots.bit();
+        }
+        if negotiated.capabilities.contains(Capability::EventReplay) {
+            bits &= !Capability::EventReplay.bit();
+        }
+        negotiated.capabilities = CapabilitySet::from_bits(bits);
     }
     negotiated
 }
 
-fn paged_snapshot_response_fits_transport(limits: FrameLimits) -> bool {
+fn page_response_fits_transport(limits: FrameLimits) -> bool {
     let Some(required_payload_bytes) = limits
         .max_page_encoded_bytes
-        .checked_add(PAGED_SNAPSHOT_RESPONSE_ENVELOPE_HEADROOM_BYTES)
+        .checked_add(PAGE_RESPONSE_ENVELOPE_HEADROOM_BYTES)
     else {
         return false;
     };
@@ -804,6 +807,62 @@ mod tests {
             connection_ensure_live(poisoned),
             Err(IpcError::ConnectionPoisoned)
         ));
+    }
+
+    #[test]
+    fn transport_fence_strips_paged_snapshots_and_event_replay_together() {
+        use super::{fence_capabilities_by_transport, page_response_fits_transport};
+        use crate::domain::ClientId;
+        use crate::protocol::{
+            Capability, CapabilitySet, FrameLimits, NegotiatedParameters, ProtocolVersion,
+        };
+
+        let defaults = FrameLimits::v1_default();
+        assert!(
+            page_response_fits_transport(defaults),
+            "default frame limits must leave headroom for a one-frame page reply"
+        );
+
+        let client_id = ClientId::new();
+        let granted = CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::EventReplay,
+            Capability::OperationSettlement,
+        ]);
+        let default_negotiated = fence_capabilities_by_transport(NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id,
+            capabilities: granted,
+            limits: defaults,
+        });
+        assert!(default_negotiated
+            .capabilities
+            .contains(Capability::PagedSnapshots));
+        assert!(default_negotiated
+            .capabilities
+            .contains(Capability::EventReplay));
+        assert!(default_negotiated
+            .capabilities
+            .contains(Capability::OperationSettlement));
+
+        let tight = FrameLimits {
+            max_physical_frame_bytes: 64 * 1024,
+            max_reassembled_message_bytes: 16 * 1024 * 1024,
+            max_page_items: 250,
+            max_page_encoded_bytes: 512 * 1024,
+        };
+        assert!(!page_response_fits_transport(tight));
+        let fenced = fence_capabilities_by_transport(NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id,
+            capabilities: granted,
+            limits: tight,
+        });
+        assert!(!fenced.capabilities.contains(Capability::PagedSnapshots));
+        assert!(!fenced.capabilities.contains(Capability::EventReplay));
+        assert!(fenced
+            .capabilities
+            .contains(Capability::OperationSettlement));
     }
 
     #[tokio::test(flavor = "current_thread")]

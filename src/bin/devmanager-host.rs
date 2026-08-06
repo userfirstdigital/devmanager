@@ -674,6 +674,7 @@ async fn serve_foreground_host(
         server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
         supported: CapabilitySet::from_capabilities([
             Capability::PagedSnapshots,
+            Capability::EventReplay,
             Capability::OperationSettlement,
         ]),
         local_limits: FrameLimits::v1_default(),

@@ -42,6 +42,7 @@ use crate::kernel::outbox::{
     Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
+use crate::kernel::replay::{EventReplaySession, ReplayError};
 use crate::kernel::snapshot::{SnapshotError, SnapshotSession};
 use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
@@ -91,8 +92,8 @@ impl CommandBus {
 
     /// Serve a side-effect-free query through the owned store projections only.
     ///
-    /// Paged snapshot open/resume/release requires the host executor registry and
-    /// returns [`QueryError::UnsupportedCapability`] here.
+    /// Paged snapshot and event-replay open/resume/release require the host
+    /// executor registry and return [`QueryError::UnsupportedCapability`] here.
     pub fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, StoreError> {
         let outcome = match envelope.query {
             Query::OperationStatus { operation_id } => match self.operation_status(operation_id)? {
@@ -123,7 +124,11 @@ impl CommandBus {
                     None => QueryOutcome::Err(QueryError::NotFound),
                 }
             }
-            Query::SnapshotPage { .. } | Query::ReleaseSnapshot { .. } => {
+            Query::SnapshotPage { .. }
+            | Query::ReleaseSnapshot { .. }
+            | Query::OpenEventReplay { .. }
+            | Query::ContinueEventReplay { .. }
+            | Query::ReleaseEventReplay { .. } => {
                 QueryOutcome::Err(QueryError::UnsupportedCapability)
             }
         };
@@ -139,6 +144,15 @@ impl CommandBus {
         limits: PageLimits,
     ) -> Result<SnapshotSession, SnapshotError> {
         self.store.begin_snapshot(limits)
+    }
+
+    /// Pin an immutable event replay through the store boundary (no SQLite escape).
+    pub(crate) fn begin_event_replay(
+        &self,
+        after_sequence: u64,
+        limits: PageLimits,
+    ) -> Result<EventReplaySession, ReplayError> {
+        self.store.begin_event_replay(after_sequence, limits)
     }
 }
 

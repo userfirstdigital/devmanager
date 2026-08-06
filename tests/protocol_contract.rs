@@ -4,10 +4,11 @@ use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
     CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
-    CreateTaskIntent, EnvironmentId, EventId, OperationErrorCode, OperationId, OperationState,
-    OperationUncertaintyCode, ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome,
-    QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness, TaskActivity,
-    TaskAssignment, TaskAttention, TaskConnectivity, TaskId, WorkspaceRef,
+    CreateTaskIntent, EnvironmentId, EventId, EventPage, OperationErrorCode, OperationId,
+    OperationState, OperationUncertaintyCode, ProjectId, Query, QueryEnvelope, QueryError,
+    QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness,
+    SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskId,
+    WorkspaceRef,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
@@ -551,6 +552,10 @@ fn protocol_event_id(tail: u8) -> EventId {
 
 fn protocol_request_id(tail: u8) -> RequestId {
     RequestId::from_bytes(protocol_uuid_v7(tail)).expect("request id")
+}
+
+fn protocol_subscription_id(tail: u8) -> SubscriptionId {
+    SubscriptionId::from_bytes(protocol_uuid_v7(tail)).expect("subscription id")
 }
 
 #[test]
@@ -2380,5 +2385,196 @@ fn protocol_nested_create_task_snapshot_and_command_reject_unknown_fields() {
         ),
         Err(MessagePackError::Decode),
         "unknown Command struct-variant field must be rejected"
+    );
+}
+
+#[test]
+fn protocol_event_replay_queries_and_results_round_trip_named_maps() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let subscription_id = protocol_subscription_id(0xe1);
+    let page = EventPage {
+        after_sequence: 0,
+        through_sequence: 3,
+        events: Vec::new(),
+        next_cursor: Some(vec![0x01, 0x02]),
+    };
+
+    for query in [
+        Query::OpenEventReplay { after_sequence: 0 },
+        Query::ContinueEventReplay {
+            subscription_id,
+            resume_cursor: vec![0xaa, 0xbb],
+        },
+        Query::ReleaseEventReplay { subscription_id },
+    ] {
+        let encoded = codec.encode(&query).expect("encode replay query");
+        assert_eq!(encoded[0], 0x81, "Query is a one-entry named map");
+        assert_eq!(
+            codec
+                .decode::<Query>(&encoded)
+                .expect("decode replay query"),
+            query
+        );
+    }
+
+    for result in [
+        QueryResult::EventReplayPage {
+            subscription_id,
+            page: page.clone(),
+        },
+        QueryResult::EventReplayReleased { subscription_id },
+    ] {
+        let encoded = codec.encode(&result).expect("encode replay result");
+        assert_eq!(encoded[0], 0x81, "QueryResult is a one-entry named map");
+        assert_eq!(
+            codec
+                .decode::<QueryResult>(&encoded)
+                .expect("decode replay result"),
+            result
+        );
+    }
+
+    let envelope = QueryEnvelope {
+        request_id: protocol_request_id(0xe2),
+        client_id: protocol_client_id(0xe3),
+        task_id: None,
+        query: Query::OpenEventReplay { after_sequence: 0 },
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(&codec.encode(&envelope).expect("encode replay envelope"))
+            .expect("decode replay envelope"),
+        envelope
+    );
+
+    let reply = QueryReply {
+        request_id: protocol_request_id(0xe4),
+        outcome: QueryOutcome::Ok(QueryResult::EventReplayPage {
+            subscription_id,
+            page,
+        }),
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&codec.encode(&reply).expect("encode replay reply"))
+            .expect("decode replay reply"),
+        reply
+    );
+}
+
+#[test]
+fn protocol_query_error_replay_unavailable_is_strict_named_map() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let error = QueryError::ReplayUnavailable {
+        oldest_sequence: 4,
+        newest_sequence: 12,
+    };
+    let encoded = codec.encode(&error).expect("encode replay unavailable");
+    assert_eq!(
+        encoded[0], 0x81,
+        "ReplayUnavailable must be a one-entry named map, not a bare string"
+    );
+    assert_eq!(
+        codec
+            .decode::<QueryError>(&encoded)
+            .expect("decode replay unavailable"),
+        error
+    );
+    assert_eq!(
+        serde_json::from_value::<QueryError>(serde_json::to_value(&error).unwrap()).unwrap(),
+        error
+    );
+
+    let reply = QueryReply {
+        request_id: protocol_request_id(0xe5),
+        outcome: QueryOutcome::Err(error),
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&codec.encode(&reply).expect("encode error reply"))
+            .expect("decode error reply"),
+        reply
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawStringReplayUnavailable {
+        ReplayUnavailable,
+    }
+    assert_eq!(
+        codec.decode::<QueryError>(
+            &rmp_serde::to_vec_named(&RawStringReplayUnavailable::ReplayUnavailable).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "bare replay_unavailable string must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    struct RawOpenReplayUnavailable {
+        oldest_sequence: u64,
+        newest_sequence: u64,
+        future_field: bool,
+    }
+    struct RawOpenReplayUnavailableError;
+    impl serde::Serialize for RawOpenReplayUnavailableError {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "replay_unavailable",
+                &RawOpenReplayUnavailable {
+                    oldest_sequence: 1,
+                    newest_sequence: 2,
+                    future_field: true,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<QueryError>(
+            &rmp_serde::to_vec_named(&RawOpenReplayUnavailableError).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown replay_unavailable field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenEventReplayQuery {
+        OpenEventReplay {
+            after_sequence: u64,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawOpenEventReplayQuery::OpenEventReplay {
+                after_sequence: 0,
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown open_event_replay field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawMissingContinueEventReplay {
+        ContinueEventReplay { subscription_id: SubscriptionId },
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawMissingContinueEventReplay::ContinueEventReplay {
+                subscription_id: protocol_subscription_id(0xe6),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "continue_event_replay missing resume_cursor must be rejected"
     );
 }

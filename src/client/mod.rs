@@ -10,7 +10,7 @@ pub use action::{
     ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
 };
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
-pub use host_client::{HostClient, HostClientConfig, TrackedOperation};
+pub use host_client::{EventReplayBatch, HostClient, HostClientConfig, TrackedOperation};
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::id::CommandId;

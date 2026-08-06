@@ -7,6 +7,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::domain::event::DomainEvent;
+use crate::domain::id::SubscriptionId;
 use crate::domain::snapshot::{EventPage, PageLimits, PageLimitsError};
 use crate::kernel::store::{
     decode_stored_domain_event, load_event_log_bounds, u64_from_nonnegative_i64, u64_to_sqlite_i64,
@@ -118,8 +119,11 @@ struct EventCursorDocument {
 }
 
 /// One immutable, read-only SQLite view of an ordered durable event range.
-#[allow(dead_code)] // consumed by the bounded host registry in a later phase
+///
+/// The owned connection holds a deferred read transaction open. Dropping this
+/// value releases the view; no OS process or other runtime resource is owned.
 pub(crate) struct EventReplaySession {
+    subscription_id: SubscriptionId,
     start_after_sequence: u64,
     through_sequence: u64,
     limits: PageLimits,
@@ -130,6 +134,7 @@ pub(crate) struct EventReplaySession {
 impl fmt::Debug for EventReplaySession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventReplaySession")
+            .field("subscription_id", &self.subscription_id)
             .field("start_after_sequence", &self.start_after_sequence)
             .field("through_sequence", &self.through_sequence)
             .field("limits", &self.limits)
@@ -138,7 +143,7 @@ impl fmt::Debug for EventReplaySession {
 }
 
 impl KernelStore {
-    #[allow(dead_code)]
+    /// Pin a read-only event replay at the current durable high-water mark.
     pub(crate) fn begin_event_replay(
         &self,
         after_sequence: u64,
@@ -164,6 +169,7 @@ impl KernelStore {
             });
         }
         Ok(EventReplaySession {
+            subscription_id: SubscriptionId::new(),
             start_after_sequence: after_sequence,
             through_sequence,
             limits,
@@ -174,7 +180,11 @@ impl KernelStore {
 }
 
 impl EventReplaySession {
-    #[allow(dead_code)]
+    pub(crate) fn subscription_id(&self) -> SubscriptionId {
+        self.subscription_id
+    }
+
+    /// Read one bounded event page from the view pinned by `begin_event_replay`.
     pub(crate) fn page(&self, resume_cursor: Option<&[u8]>) -> Result<EventPage, ReplayError> {
         let after_sequence = match resume_cursor {
             Some(cursor) => self.decode_cursor(cursor)?.last_sequence,

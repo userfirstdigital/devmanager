@@ -2,9 +2,9 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::domain::id::{ClientId, OperationId, RequestId, SnapshotId, TaskId};
+use crate::domain::id::{ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::operation::OperationState;
-use crate::domain::snapshot::{SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryEnvelope {
@@ -150,6 +150,16 @@ pub enum Query {
     ReleaseSnapshot {
         snapshot_id: SnapshotId,
     },
+    OpenEventReplay {
+        after_sequence: u64,
+    },
+    ContinueEventReplay {
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    },
+    ReleaseEventReplay {
+        subscription_id: SubscriptionId,
+    },
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -212,6 +222,53 @@ impl Serialize for ReleaseSnapshotQueryRef<'_> {
     }
 }
 
+struct OpenEventReplayQueryRef {
+    after_sequence: u64,
+}
+
+impl Serialize for OpenEventReplayQueryRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("after_sequence", &self.after_sequence)?;
+        map.end()
+    }
+}
+
+struct ContinueEventReplayQueryRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    resume_cursor: &'a [u8],
+}
+
+impl Serialize for ContinueEventReplayQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("resume_cursor", self.resume_cursor)?;
+        map.end()
+    }
+}
+
+struct ReleaseEventReplayQueryRef<'a> {
+    subscription_id: &'a SubscriptionId,
+}
+
+impl Serialize for ReleaseEventReplayQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for Query {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -239,6 +296,26 @@ impl Serialize for Query {
             Self::ReleaseSnapshot { snapshot_id } => {
                 map.serialize_entry("release_snapshot", &ReleaseSnapshotQueryRef { snapshot_id })?
             }
+            Self::OpenEventReplay { after_sequence } => map.serialize_entry(
+                "open_event_replay",
+                &OpenEventReplayQueryRef {
+                    after_sequence: *after_sequence,
+                },
+            )?,
+            Self::ContinueEventReplay {
+                subscription_id,
+                resume_cursor,
+            } => map.serialize_entry(
+                "continue_event_replay",
+                &ContinueEventReplayQueryRef {
+                    subscription_id,
+                    resume_cursor,
+                },
+            )?,
+            Self::ReleaseEventReplay { subscription_id } => map.serialize_entry(
+                "release_event_replay",
+                &ReleaseEventReplayQueryRef { subscription_id },
+            )?,
         }
         map.end()
     }
@@ -249,6 +326,9 @@ enum QueryVariant {
     TaskSnapshot,
     SnapshotPage,
     ReleaseSnapshot,
+    OpenEventReplay,
+    ContinueEventReplay,
+    ReleaseEventReplay,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -263,7 +343,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, or release_snapshot",
+                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, or release_event_replay",
                 )
             }
 
@@ -276,6 +356,9 @@ impl<'de> Deserialize<'de> for QueryVariant {
                     "task_snapshot" => Ok(QueryVariant::TaskSnapshot),
                     "snapshot_page" => Ok(QueryVariant::SnapshotPage),
                     "release_snapshot" => Ok(QueryVariant::ReleaseSnapshot),
+                    "open_event_replay" => Ok(QueryVariant::OpenEventReplay),
+                    "continue_event_replay" => Ok(QueryVariant::ContinueEventReplay),
+                    "release_event_replay" => Ok(QueryVariant::ReleaseEventReplay),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -283,6 +366,9 @@ impl<'de> Deserialize<'de> for QueryVariant {
                             "task_snapshot",
                             "snapshot_page",
                             "release_snapshot",
+                            "open_event_replay",
+                            "continue_event_replay",
+                            "release_event_replay",
                         ],
                     )),
                 }
@@ -581,6 +667,252 @@ impl<'de> Deserialize<'de> for ReleaseSnapshotQueryPayload {
     }
 }
 
+struct OpenEventReplayQueryPayload {
+    after_sequence: u64,
+}
+
+enum OpenEventReplayQueryField {
+    AfterSequence,
+}
+
+impl<'de> Deserialize<'de> for OpenEventReplayQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = OpenEventReplayQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("after_sequence")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "after_sequence" => Ok(OpenEventReplayQueryField::AfterSequence),
+                    _ => Err(de::Error::unknown_field(value, &["after_sequence"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenEventReplayQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = OpenEventReplayQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named open_event_replay query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut after_sequence = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        OpenEventReplayQueryField::AfterSequence => {
+                            if after_sequence.is_some() {
+                                return Err(de::Error::duplicate_field("after_sequence"));
+                            }
+                            after_sequence = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(OpenEventReplayQueryPayload {
+                    after_sequence: after_sequence
+                        .ok_or_else(|| de::Error::missing_field("after_sequence"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ContinueEventReplayQueryPayload {
+    subscription_id: SubscriptionId,
+    resume_cursor: Vec<u8>,
+}
+
+enum ContinueEventReplayQueryField {
+    SubscriptionId,
+    ResumeCursor,
+}
+
+impl<'de> Deserialize<'de> for ContinueEventReplayQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ContinueEventReplayQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id or resume_cursor")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ContinueEventReplayQueryField::SubscriptionId),
+                    "resume_cursor" => Ok(ContinueEventReplayQueryField::ResumeCursor),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["subscription_id", "resume_cursor"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContinueEventReplayQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ContinueEventReplayQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named continue_event_replay query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut resume_cursor = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ContinueEventReplayQueryField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        ContinueEventReplayQueryField::ResumeCursor => {
+                            if resume_cursor.is_some() {
+                                return Err(de::Error::duplicate_field("resume_cursor"));
+                            }
+                            resume_cursor = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ContinueEventReplayQueryPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    resume_cursor: resume_cursor
+                        .ok_or_else(|| de::Error::missing_field("resume_cursor"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ReleaseEventReplayQueryPayload {
+    subscription_id: SubscriptionId,
+}
+
+enum ReleaseEventReplayQueryField {
+    SubscriptionId,
+}
+
+impl<'de> Deserialize<'de> for ReleaseEventReplayQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ReleaseEventReplayQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ReleaseEventReplayQueryField::SubscriptionId),
+                    _ => Err(de::Error::unknown_field(value, &["subscription_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseEventReplayQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ReleaseEventReplayQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named release_event_replay query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ReleaseEventReplayQueryField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ReleaseEventReplayQueryPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for Query {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -627,6 +959,25 @@ impl<'de> Deserialize<'de> for Query {
                             snapshot_id: payload.snapshot_id,
                         }
                     }
+                    QueryVariant::OpenEventReplay => {
+                        let payload: OpenEventReplayQueryPayload = map.next_value()?;
+                        Query::OpenEventReplay {
+                            after_sequence: payload.after_sequence,
+                        }
+                    }
+                    QueryVariant::ContinueEventReplay => {
+                        let payload: ContinueEventReplayQueryPayload = map.next_value()?;
+                        Query::ContinueEventReplay {
+                            subscription_id: payload.subscription_id,
+                            resume_cursor: payload.resume_cursor,
+                        }
+                    }
+                    QueryVariant::ReleaseEventReplay => {
+                        let payload: ReleaseEventReplayQueryPayload = map.next_value()?;
+                        Query::ReleaseEventReplay {
+                            subscription_id: payload.subscription_id,
+                        }
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -653,6 +1004,13 @@ pub enum QueryResult {
     },
     SnapshotReleased {
         snapshot_id: SnapshotId,
+    },
+    EventReplayPage {
+        subscription_id: SubscriptionId,
+        page: EventPage,
+    },
+    EventReplayReleased {
+        subscription_id: SubscriptionId,
     },
 }
 
@@ -718,6 +1076,38 @@ impl Serialize for SnapshotReleasedResultRef<'_> {
     }
 }
 
+struct EventReplayPageResultRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    page: &'a EventPage,
+}
+
+impl Serialize for EventReplayPageResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("page", self.page)?;
+        map.end()
+    }
+}
+
+struct EventReplayReleasedResultRef<'a> {
+    subscription_id: &'a SubscriptionId,
+}
+
+impl Serialize for EventReplayReleasedResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for QueryResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -745,6 +1135,20 @@ impl Serialize for QueryResult {
                 "snapshot_released",
                 &SnapshotReleasedResultRef { snapshot_id },
             )?,
+            Self::EventReplayPage {
+                subscription_id,
+                page,
+            } => map.serialize_entry(
+                "event_replay_page",
+                &EventReplayPageResultRef {
+                    subscription_id,
+                    page,
+                },
+            )?,
+            Self::EventReplayReleased { subscription_id } => map.serialize_entry(
+                "event_replay_released",
+                &EventReplayReleasedResultRef { subscription_id },
+            )?,
         }
         map.end()
     }
@@ -755,6 +1159,8 @@ enum QueryResultVariant {
     TaskSnapshot,
     SnapshotPage,
     SnapshotReleased,
+    EventReplayPage,
+    EventReplayReleased,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -769,7 +1175,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, or snapshot_released",
+                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, or event_replay_released",
                 )
             }
 
@@ -782,6 +1188,8 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                     "task_snapshot" => Ok(QueryResultVariant::TaskSnapshot),
                     "snapshot_page" => Ok(QueryResultVariant::SnapshotPage),
                     "snapshot_released" => Ok(QueryResultVariant::SnapshotReleased),
+                    "event_replay_page" => Ok(QueryResultVariant::EventReplayPage),
+                    "event_replay_released" => Ok(QueryResultVariant::EventReplayReleased),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -789,6 +1197,8 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                             "task_snapshot",
                             "snapshot_page",
                             "snapshot_released",
+                            "event_replay_page",
+                            "event_replay_released",
                         ],
                     )),
                 }
@@ -1118,6 +1528,174 @@ impl<'de> Deserialize<'de> for SnapshotReleasedResultPayload {
     }
 }
 
+struct EventReplayPageResultPayload {
+    subscription_id: SubscriptionId,
+    page: EventPage,
+}
+
+enum EventReplayPageResultField {
+    SubscriptionId,
+    Page,
+}
+
+impl<'de> Deserialize<'de> for EventReplayPageResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = EventReplayPageResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id or page")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(EventReplayPageResultField::SubscriptionId),
+                    "page" => Ok(EventReplayPageResultField::Page),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["subscription_id", "page"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventReplayPageResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = EventReplayPageResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named event_replay_page result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut page = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        EventReplayPageResultField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        EventReplayPageResultField::Page => {
+                            if page.is_some() {
+                                return Err(de::Error::duplicate_field("page"));
+                            }
+                            page = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(EventReplayPageResultPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    page: page.ok_or_else(|| de::Error::missing_field("page"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct EventReplayReleasedResultPayload {
+    subscription_id: SubscriptionId,
+}
+
+enum EventReplayReleasedResultField {
+    SubscriptionId,
+}
+
+impl<'de> Deserialize<'de> for EventReplayReleasedResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = EventReplayReleasedResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(EventReplayReleasedResultField::SubscriptionId),
+                    _ => Err(de::Error::unknown_field(value, &["subscription_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventReplayReleasedResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = EventReplayReleasedResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named event_replay_released result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        EventReplayReleasedResultField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(EventReplayReleasedResultPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1163,6 +1741,19 @@ impl<'de> Deserialize<'de> for QueryResult {
                             snapshot_id: payload.snapshot_id,
                         }
                     }
+                    QueryResultVariant::EventReplayPage => {
+                        let payload: EventReplayPageResultPayload = map.next_value()?;
+                        QueryResult::EventReplayPage {
+                            subscription_id: payload.subscription_id,
+                            page: payload.page,
+                        }
+                    }
+                    QueryResultVariant::EventReplayReleased => {
+                        let payload: EventReplayReleasedResultPayload = map.next_value()?;
+                        QueryResult::EventReplayReleased {
+                            subscription_id: payload.subscription_id,
+                        }
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
@@ -1183,6 +1774,27 @@ pub enum QueryError {
     Unauthorized,
     InvalidRequest,
     UnsupportedCapability,
+    ReplayUnavailable {
+        oldest_sequence: u64,
+        newest_sequence: u64,
+    },
+}
+
+struct ReplayUnavailableErrorRef {
+    oldest_sequence: u64,
+    newest_sequence: u64,
+}
+
+impl Serialize for ReplayUnavailableErrorRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("oldest_sequence", &self.oldest_sequence)?;
+        map.serialize_entry("newest_sequence", &self.newest_sequence)?;
+        map.end()
+    }
 }
 
 impl Serialize for QueryError {
@@ -1190,12 +1802,160 @@ impl Serialize for QueryError {
     where
         S: Serializer,
     {
-        serializer.serialize_str(match self {
-            Self::NotFound => "not_found",
-            Self::Unauthorized => "unauthorized",
-            Self::InvalidRequest => "invalid_request",
-            Self::UnsupportedCapability => "unsupported_capability",
-        })
+        match self {
+            Self::NotFound => serializer.serialize_str("not_found"),
+            Self::Unauthorized => serializer.serialize_str("unauthorized"),
+            Self::InvalidRequest => serializer.serialize_str("invalid_request"),
+            Self::UnsupportedCapability => serializer.serialize_str("unsupported_capability"),
+            Self::ReplayUnavailable {
+                oldest_sequence,
+                newest_sequence,
+            } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(
+                    "replay_unavailable",
+                    &ReplayUnavailableErrorRef {
+                        oldest_sequence: *oldest_sequence,
+                        newest_sequence: *newest_sequence,
+                    },
+                )?;
+                map.end()
+            }
+        }
+    }
+}
+
+enum QueryErrorMapVariant {
+    ReplayUnavailable,
+}
+
+impl<'de> Deserialize<'de> for QueryErrorMapVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VariantVisitor;
+
+        impl Visitor<'_> for VariantVisitor {
+            type Value = QueryErrorMapVariant;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("replay_unavailable")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "replay_unavailable" => Ok(QueryErrorMapVariant::ReplayUnavailable),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &[
+                            "not_found",
+                            "unauthorized",
+                            "invalid_request",
+                            "unsupported_capability",
+                            "replay_unavailable",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct ReplayUnavailableErrorPayload {
+    oldest_sequence: u64,
+    newest_sequence: u64,
+}
+
+enum ReplayUnavailableErrorField {
+    OldestSequence,
+    NewestSequence,
+}
+
+impl<'de> Deserialize<'de> for ReplayUnavailableErrorField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ReplayUnavailableErrorField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("oldest_sequence or newest_sequence")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "oldest_sequence" => Ok(ReplayUnavailableErrorField::OldestSequence),
+                    "newest_sequence" => Ok(ReplayUnavailableErrorField::NewestSequence),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["oldest_sequence", "newest_sequence"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReplayUnavailableErrorPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ReplayUnavailableErrorPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named replay_unavailable error payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut oldest_sequence = None;
+                let mut newest_sequence = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ReplayUnavailableErrorField::OldestSequence => {
+                            if oldest_sequence.is_some() {
+                                return Err(de::Error::duplicate_field("oldest_sequence"));
+                            }
+                            oldest_sequence = Some(map.next_value()?);
+                        }
+                        ReplayUnavailableErrorField::NewestSequence => {
+                            if newest_sequence.is_some() {
+                                return Err(de::Error::duplicate_field("newest_sequence"));
+                            }
+                            newest_sequence = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ReplayUnavailableErrorPayload {
+                    oldest_sequence: oldest_sequence
+                        .ok_or_else(|| de::Error::missing_field("oldest_sequence"))?,
+                    newest_sequence: newest_sequence
+                        .ok_or_else(|| de::Error::missing_field("newest_sequence"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
     }
 }
 
@@ -1206,11 +1966,11 @@ impl<'de> Deserialize<'de> for QueryError {
     {
         struct QueryErrorVisitor;
 
-        impl Visitor<'_> for QueryErrorVisitor {
+        impl<'de> Visitor<'de> for QueryErrorVisitor {
             type Value = QueryError;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a named QueryError code")
+                formatter.write_str("a named QueryError code or one-entry replay_unavailable map")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -1229,13 +1989,38 @@ impl<'de> Deserialize<'de> for QueryError {
                             "unauthorized",
                             "invalid_request",
                             "unsupported_capability",
+                            "replay_unavailable",
                         ],
                     )),
                 }
             }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let variant = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("QueryError map variant is missing"))?;
+                let error = match variant {
+                    QueryErrorMapVariant::ReplayUnavailable => {
+                        let payload: ReplayUnavailableErrorPayload = map.next_value()?;
+                        QueryError::ReplayUnavailable {
+                            oldest_sequence: payload.oldest_sequence,
+                            newest_sequence: payload.newest_sequence,
+                        }
+                    }
+                };
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "QueryError must contain exactly one variant",
+                    ));
+                }
+                Ok(error)
+            }
         }
 
-        deserializer.deserialize_str(QueryErrorVisitor)
+        deserializer.deserialize_any(QueryErrorVisitor)
     }
 }
 

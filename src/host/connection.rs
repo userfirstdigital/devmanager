@@ -4,7 +4,7 @@
 //! They submit decoded requests through [`HostRequestHandle`]; one
 //! [`HostRequestExecutor`] task exclusively owns [`CommandBus`] and services
 //! them in arrival order. The executor also owns the bounded SnapshotSession
-//! registry for paged snapshot queries.
+//! and EventReplaySession registries for paged snapshot and event-replay queries.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -13,13 +13,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::domain::id::SnapshotId;
+use crate::domain::id::{SnapshotId, SubscriptionId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
 use crate::domain::ClientId;
-use crate::kernel::{CommandBus, SnapshotError, SnapshotSession, StoreError};
+use crate::kernel::{
+    CommandBus, EventReplaySession, ReplayError, SnapshotError, SnapshotSession, StoreError,
+};
 use crate::protocol::{Capability, ClientRequest, NegotiatedParameters, ServerResponse};
 
 use super::ipc::IpcError;
@@ -34,6 +36,10 @@ const MAX_SNAPSHOT_SESSIONS: usize = 32;
 const SNAPSHOT_IDLE_TTL: Duration = Duration::from_secs(30);
 const SNAPSHOT_REAPER_PERIOD: Duration = Duration::from_secs(1);
 
+const MAX_EVENT_REPLAY_SESSIONS: usize = 32;
+const EVENT_REPLAY_IDLE_TTL: Duration = Duration::from_secs(30);
+const EVENT_REPLAY_REAPER_PERIOD: Duration = Duration::from_secs(1);
+
 struct HostRequestJob {
     negotiated: NegotiatedParameters,
     request: ClientRequest,
@@ -43,6 +49,7 @@ struct HostRequestJob {
 struct SnapshotRegistryEntry {
     owner: ClientId,
     session: SnapshotSession,
+    limits: PageLimits,
     last_touch: Instant,
 }
 
@@ -75,7 +82,13 @@ impl SnapshotRegistry {
         }
     }
 
-    fn insert(&mut self, owner: ClientId, session: SnapshotSession, now: Instant) {
+    fn insert(
+        &mut self,
+        owner: ClientId,
+        session: SnapshotSession,
+        limits: PageLimits,
+        now: Instant,
+    ) {
         self.evict_lru_if_at_capacity();
         let snapshot_id = session.snapshot_id();
         self.entries.insert(
@@ -83,6 +96,7 @@ impl SnapshotRegistry {
             SnapshotRegistryEntry {
                 owner,
                 session,
+                limits,
                 last_touch: now,
             },
         );
@@ -102,6 +116,7 @@ impl SnapshotRegistry {
         &self,
         snapshot_id: SnapshotId,
         requester: ClientId,
+        limits: PageLimits,
         now: Instant,
     ) -> Result<&SnapshotSession, QueryError> {
         let Some(entry) = self.entries.get(&snapshot_id) else {
@@ -112,6 +127,98 @@ impl SnapshotRegistry {
         }
         if entry.owner != requester {
             return Err(QueryError::Unauthorized);
+        }
+        if entry.limits != limits {
+            return Err(QueryError::InvalidRequest);
+        }
+        Ok(&entry.session)
+    }
+}
+
+struct EventReplayRegistryEntry {
+    owner: ClientId,
+    session: EventReplaySession,
+    limits: PageLimits,
+    last_touch: Instant,
+}
+
+struct EventReplayRegistry {
+    entries: HashMap<SubscriptionId, EventReplayRegistryEntry>,
+}
+
+impl EventReplayRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn reap_idle(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_touch) < EVENT_REPLAY_IDLE_TTL);
+    }
+
+    fn evict_lru_if_at_capacity(&mut self) {
+        while self.entries.len() >= MAX_EVENT_REPLAY_SESSIONS {
+            let Some((&victim_id, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touch)
+            else {
+                break;
+            };
+            self.entries.remove(&victim_id);
+        }
+    }
+
+    fn insert(
+        &mut self,
+        owner: ClientId,
+        session: EventReplaySession,
+        limits: PageLimits,
+        now: Instant,
+    ) {
+        self.evict_lru_if_at_capacity();
+        let subscription_id = session.subscription_id();
+        self.entries.insert(
+            subscription_id,
+            EventReplayRegistryEntry {
+                owner,
+                session,
+                limits,
+                last_touch: now,
+            },
+        );
+    }
+
+    fn touch(&mut self, subscription_id: SubscriptionId, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&subscription_id) {
+            entry.last_touch = now;
+        }
+    }
+
+    fn remove(&mut self, subscription_id: SubscriptionId) -> Option<EventReplayRegistryEntry> {
+        self.entries.remove(&subscription_id)
+    }
+
+    fn get(
+        &self,
+        subscription_id: SubscriptionId,
+        requester: ClientId,
+        limits: PageLimits,
+        now: Instant,
+    ) -> Result<&EventReplaySession, QueryError> {
+        let Some(entry) = self.entries.get(&subscription_id) else {
+            return Err(QueryError::NotFound);
+        };
+        if now.duration_since(entry.last_touch) >= EVENT_REPLAY_IDLE_TTL {
+            return Err(QueryError::NotFound);
+        }
+        if entry.owner != requester {
+            return Err(QueryError::Unauthorized);
+        }
+        if entry.limits != limits {
+            return Err(QueryError::InvalidRequest);
         }
         Ok(&entry.session)
     }
@@ -151,6 +258,7 @@ pub struct HostRequestExecutor {
     bus: CommandBus,
     rx: mpsc::Receiver<HostRequestJob>,
     registry: SnapshotRegistry,
+    replay_registry: EventReplayRegistry,
 }
 
 impl HostRequestExecutor {
@@ -166,6 +274,7 @@ impl HostRequestExecutor {
             bus,
             rx,
             registry: SnapshotRegistry::new(),
+            replay_registry: EventReplayRegistry::new(),
         };
         let join = tokio::spawn(async move {
             executor.run().await;
@@ -174,7 +283,7 @@ impl HostRequestExecutor {
     }
 
     async fn run(&mut self) {
-        let mut reaper = interval(SNAPSHOT_REAPER_PERIOD);
+        let mut reaper = interval(SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD));
         reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -187,7 +296,9 @@ impl HostRequestExecutor {
                     let _ = job.reply.send(result);
                 }
                 _ = reaper.tick() => {
-                    self.registry.reap_idle(Instant::now());
+                    let now = Instant::now();
+                    self.registry.reap_idle(now);
+                    self.replay_registry.reap_idle(now);
                 }
             }
         }
@@ -221,6 +332,7 @@ impl HostRequestExecutor {
         negotiated: NegotiatedParameters,
         envelope: QueryEnvelope,
     ) -> Result<QueryReply, IpcError> {
+        let task_id = envelope.task_id;
         match envelope.query {
             Query::SnapshotPage {
                 section,
@@ -253,6 +365,68 @@ impl HostRequestExecutor {
                     outcome,
                 })
             }
+            Query::OpenEventReplay { after_sequence } => {
+                if task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
+                if !negotiated.capabilities.contains(Capability::EventReplay) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome = self.serve_open_event_replay(negotiated, after_sequence)?;
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::ContinueEventReplay {
+                subscription_id,
+                resume_cursor,
+            } => {
+                if task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
+                if !negotiated.capabilities.contains(Capability::EventReplay) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome =
+                    self.serve_continue_event_replay(negotiated, subscription_id, resume_cursor)?;
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::ReleaseEventReplay { subscription_id } => {
+                if task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
+                if !negotiated.capabilities.contains(Capability::EventReplay) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome =
+                    self.serve_release_event_replay(negotiated.client_id, subscription_id);
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
             Query::OperationStatus { .. } | Query::TaskSnapshot => {
                 self.bus.query(envelope).map_err(map_store_error)
             }
@@ -269,7 +443,7 @@ impl HostRequestExecutor {
         match (snapshot_id, resume_cursor) {
             (None, None) => self.open_snapshot_page(negotiated, section),
             (Some(snapshot_id), Some(resume_cursor)) => {
-                self.resume_snapshot_page(negotiated.client_id, section, snapshot_id, resume_cursor)
+                self.resume_snapshot_page(negotiated, section, snapshot_id, resume_cursor)
             }
             _ => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
         }
@@ -293,14 +467,14 @@ impl HostRequestExecutor {
         };
         if page.next_cursor.is_some() {
             self.registry
-                .insert(negotiated.client_id, session, Instant::now());
+                .insert(negotiated.client_id, session, limits, Instant::now());
         }
         Ok(QueryOutcome::Ok(QueryResult::SnapshotPage { page }))
     }
 
     fn resume_snapshot_page(
         &mut self,
-        requester: ClientId,
+        negotiated: NegotiatedParameters,
         section: SnapshotSection,
         snapshot_id: SnapshotId,
         resume_cursor: Vec<u8>,
@@ -314,7 +488,11 @@ impl HostRequestExecutor {
                 return Ok(QueryOutcome::Err(QueryError::NotFound));
             }
         }
-        let session = match self.registry.get(snapshot_id, requester, now) {
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = match self
+            .registry
+            .get(snapshot_id, negotiated.client_id, limits, now)
+        {
             Ok(session) => session,
             Err(error) => return Ok(QueryOutcome::Err(error)),
         };
@@ -347,6 +525,92 @@ impl HostRequestExecutor {
             Some(_) => {
                 self.registry.remove(snapshot_id);
                 QueryOutcome::Ok(QueryResult::SnapshotReleased { snapshot_id })
+            }
+        }
+    }
+
+    fn serve_open_event_replay(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        after_sequence: u64,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.replay_registry.reap_idle(now);
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = match self.bus.begin_event_replay(after_sequence, limits) {
+            Ok(session) => session,
+            Err(error) => return map_replay_error(error),
+        };
+        let subscription_id = session.subscription_id();
+        let page = match session.page(None) {
+            Ok(page) => page,
+            Err(error) => return map_replay_error(error),
+        };
+        if page.next_cursor.is_some() {
+            self.replay_registry
+                .insert(negotiated.client_id, session, limits, Instant::now());
+        }
+        Ok(QueryOutcome::Ok(QueryResult::EventReplayPage {
+            subscription_id,
+            page,
+        }))
+    }
+
+    fn serve_continue_event_replay(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.replay_registry.reap_idle(now);
+        if let Some(entry) = self.replay_registry.entries.get(&subscription_id) {
+            if now.duration_since(entry.last_touch) >= EVENT_REPLAY_IDLE_TTL {
+                self.replay_registry.remove(subscription_id);
+                return Ok(QueryOutcome::Err(QueryError::NotFound));
+            }
+        }
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session =
+            match self
+                .replay_registry
+                .get(subscription_id, negotiated.client_id, limits, now)
+            {
+                Ok(session) => session,
+                Err(error) => return Ok(QueryOutcome::Err(error)),
+            };
+        let page = match session.page(Some(resume_cursor.as_slice())) {
+            Ok(page) => page,
+            Err(error) => {
+                // Cursor/shape failures leave a valid retained session intact.
+                return map_replay_error(error);
+            }
+        };
+        let finished = page.next_cursor.is_none();
+        if finished {
+            self.replay_registry.remove(subscription_id);
+        } else {
+            self.replay_registry.touch(subscription_id, Instant::now());
+        }
+        Ok(QueryOutcome::Ok(QueryResult::EventReplayPage {
+            subscription_id,
+            page,
+        }))
+    }
+
+    fn serve_release_event_replay(
+        &mut self,
+        requester: ClientId,
+        subscription_id: SubscriptionId,
+    ) -> QueryOutcome {
+        let now = Instant::now();
+        self.replay_registry.reap_idle(now);
+        match self.replay_registry.entries.get(&subscription_id) {
+            None => QueryOutcome::Ok(QueryResult::EventReplayReleased { subscription_id }),
+            Some(entry) if entry.owner != requester => QueryOutcome::Err(QueryError::Unauthorized),
+            Some(_) => {
+                self.replay_registry.remove(subscription_id);
+                QueryOutcome::Ok(QueryResult::EventReplayReleased { subscription_id })
             }
         }
     }
@@ -392,11 +656,32 @@ fn map_snapshot_error(error: SnapshotError) -> Result<QueryOutcome, IpcError> {
     }
 }
 
+fn map_replay_error(error: ReplayError) -> Result<QueryOutcome, IpcError> {
+    match error {
+        ReplayError::ReplayUnavailable {
+            oldest_sequence,
+            newest_sequence,
+        } => Ok(QueryOutcome::Err(QueryError::ReplayUnavailable {
+            oldest_sequence,
+            newest_sequence,
+        })),
+        ReplayError::InvalidRange { .. }
+        | ReplayError::InvalidCursor
+        | ReplayError::CursorContextMismatch => Ok(QueryOutcome::Err(QueryError::InvalidRequest)),
+        ReplayError::Store(StoreError::Busy) => Err(IpcError::Busy),
+        ReplayError::Store(_)
+        | ReplayError::InvalidLimits(_)
+        | ReplayError::EntropyUnavailable
+        | ReplayError::PageEnvelopeTooLarge { .. }
+        | ReplayError::PageItemTooLarge { .. } => Err(IpcError::Unavailable),
+    }
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
-/// compatibility path. Registry-backed snapshot queries are unsupported here;
-/// the single executor owns that registry.
+/// compatibility path. Registry-backed snapshot and event-replay queries are
+/// unsupported here; the single executor owns those registries.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
     bus: &mut CommandBus,
@@ -415,7 +700,11 @@ pub(crate) fn dispatch_authenticated_request(
                 return Err(IpcError::Unauthorized);
             }
             match &envelope.query {
-                Query::SnapshotPage { .. } | Query::ReleaseSnapshot { .. } => {
+                Query::SnapshotPage { .. }
+                | Query::ReleaseSnapshot { .. }
+                | Query::OpenEventReplay { .. }
+                | Query::ContinueEventReplay { .. }
+                | Query::ReleaseEventReplay { .. } => {
                     return Ok(ServerResponse::QueryReply(QueryReply {
                         request_id: envelope.request_id,
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),

@@ -16,11 +16,14 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use devmanager::client::{perform_client_hello, HostClient, HostClientConfig, TrackedOperation};
+use devmanager::client::{
+    connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
+};
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
-use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
+use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
 use devmanager::domain::operation::OperationState;
+use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
@@ -438,7 +441,7 @@ async fn two_clients_attach_concurrently_and_share_one_command_bus() {
 
     let client_b_id = ClientId::from_bytes(fixed_uuid_v7(0x81)).expect("client B id");
     let client_b_config = HostClientConfig {
-        named_profile: profile,
+        named_profile: profile.clone(),
         client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
         client_id: client_b_id,
         requested,
@@ -514,7 +517,7 @@ async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
     let mut limits = FrameLimits::v1_default();
     limits.max_page_items = 1;
     let config = HostClientConfig {
-        named_profile: profile,
+        named_profile: profile.clone(),
         client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
         client_id,
         requested: CapabilitySet::from_capabilities([Capability::PagedSnapshots]),
@@ -627,6 +630,218 @@ async fn paged_task_snapshot_is_immutable_tamper_evident_and_releasable() {
     assert_eq!(final_identity.boot_id, original_identity.boot_id);
 
     client.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_event_replay_is_ordered_frozen_tamper_evident_and_reconnectable() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let writer_id = ClientId::from_bytes(fixed_uuid_v7(0xa0)).expect("writer client id");
+    let reader_id = ClientId::from_bytes(fixed_uuid_v7(0xa1)).expect("reader client id");
+    let mut limits = FrameLimits::v1_default();
+    limits.max_page_items = 1;
+    let requested = CapabilitySet::from_capabilities([Capability::EventReplay]);
+    let writer_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: writer_id,
+        requested,
+        limits,
+    };
+    let reader_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: reader_id,
+        requested,
+        limits,
+    };
+    let mut writer = connect_bounded(&writer_config, &mut host).await;
+    let mut reader = connect_bounded(&reader_config, &mut host).await;
+    assert!(writer
+        .granted_capabilities()
+        .contains(Capability::EventReplay));
+    assert!(reader
+        .granted_capabilities()
+        .contains(Capability::EventReplay));
+
+    let scoped_client_id = ClientId::from_bytes(fixed_uuid_v7(0xae)).expect("scoped client id");
+    let scoped_hello = ClientHello::new(
+        format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        scoped_client_id,
+        profile_fingerprint_for_named_profile(&profile).expect("profile fingerprint"),
+        requested,
+        limits,
+    )
+    .expect("scoped replay hello");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("profile endpoint");
+    let mut scoped_connection = timeout(CONNECT_ATTEMPT_TIMEOUT, connect(&endpoint, &scoped_hello))
+        .await
+        .expect("scoped replay attach stayed bounded")
+        .expect("scoped replay attach");
+    let scoped_reply = scoped_connection
+        .query(QueryEnvelope {
+            request_id: RequestId::new(),
+            client_id: scoped_client_id,
+            task_id: Some(TaskId::new()),
+            query: Query::OpenEventReplay { after_sequence: 0 },
+        })
+        .await
+        .expect("scoped replay query transport");
+    assert_eq!(
+        scoped_reply.outcome,
+        QueryOutcome::Err(QueryError::InvalidRequest),
+        "global event replay must reject a silently ignored Task scope"
+    );
+    drop(scoped_connection);
+
+    let (first_create, _, _) =
+        create_task_named(writer_id, 0xa2, 0xa3, 0xa4, 0xa5, "First replay task");
+    let (second_create, _, _) =
+        create_task_named(writer_id, 0xa6, 0xa7, 0xa8, 0xa9, "Second replay task");
+    assert!(matches!(
+        writer
+            .execute_command(first_create)
+            .await
+            .expect("create first replay task"),
+        CommandReceipt::Accepted { .. }
+    ));
+    assert!(matches!(
+        writer
+            .execute_command(second_create)
+            .await
+            .expect("create second replay task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let first = reader
+        .open_event_replay(0)
+        .await
+        .expect("open event replay transport")
+        .expect("open event replay query");
+    assert_eq!(first.page.after_sequence, 0);
+    assert_eq!(first.page.events.len(), 1);
+    let replay_id = first.subscription_id;
+    let frozen_through = first.page.through_sequence;
+    let valid_cursor = first
+        .page
+        .next_cursor
+        .clone()
+        .expect("one-item first page must continue");
+
+    let mut tampered_cursor = valid_cursor.clone();
+    tampered_cursor[0] ^= 0x01;
+    let tampered = reader
+        .continue_event_replay(replay_id, tampered_cursor)
+        .await
+        .expect("tampered replay cursor transport");
+    assert_eq!(
+        tampered,
+        Err(devmanager::domain::query::QueryError::InvalidRequest)
+    );
+
+    let foreign = writer
+        .continue_event_replay(replay_id, valid_cursor.clone())
+        .await
+        .expect("foreign replay lookup transport");
+    assert_eq!(
+        foreign,
+        Err(devmanager::domain::query::QueryError::Unauthorized)
+    );
+
+    let (post_open_create, _, _) =
+        create_task_named(writer_id, 0xaa, 0xab, 0xac, 0xad, "Post-replay task");
+    assert!(matches!(
+        writer
+            .execute_command(post_open_create)
+            .await
+            .expect("create task after replay pin"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    reader.disconnect();
+    let mut reduced_limits = limits;
+    reduced_limits.max_page_encoded_bytes /= 2;
+    let reduced_reader_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: reader_id,
+        requested,
+        limits: reduced_limits,
+    };
+    let mut reduced_reader = connect_bounded(&reduced_reader_config, &mut host).await;
+    let mismatched_limits = reduced_reader
+        .continue_event_replay(replay_id, valid_cursor.clone())
+        .await
+        .expect("reduced-limit replay transport");
+    assert_eq!(
+        mismatched_limits,
+        Err(QueryError::InvalidRequest),
+        "a retained replay must not emit under different reconnect page limits"
+    );
+    reduced_reader.disconnect();
+    reconnect_bounded(&mut reader, &mut host).await;
+
+    let mut observed_sequences = vec![first.page.events[0].sequence];
+    let mut cursor = Some(valid_cursor.clone());
+    while let Some(resume_cursor) = cursor {
+        let page = reader
+            .continue_event_replay(replay_id, resume_cursor)
+            .await
+            .expect("resume event replay transport")
+            .expect("resume event replay query");
+        assert_eq!(page.subscription_id, replay_id);
+        assert_eq!(page.page.through_sequence, frozen_through);
+        assert_eq!(page.page.events.len(), 1);
+        observed_sequences.push(page.page.events[0].sequence);
+        cursor = page.page.next_cursor;
+    }
+    assert_eq!(
+        observed_sequences.last().copied(),
+        Some(frozen_through),
+        "the pinned replay must end exactly at its original high-water mark"
+    );
+    assert!(
+        observed_sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "durable replay must be strictly ordered without duplicates"
+    );
+    assert!(
+        observed_sequences
+            .iter()
+            .all(|sequence| *sequence <= frozen_through),
+        "events committed after replay open must not enter the frozen range"
+    );
+
+    reader
+        .release_event_replay(replay_id)
+        .await
+        .expect("idempotent replay release transport")
+        .expect("idempotent replay release query");
+    let released = reader
+        .continue_event_replay(replay_id, valid_cursor)
+        .await
+        .expect("released replay lookup transport");
+    assert_eq!(
+        released,
+        Err(devmanager::domain::query::QueryError::NotFound)
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    writer.disconnect();
+    reader.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
-use crate::domain::id::{CommandId, OperationId, RequestId, SnapshotId, TaskId};
+use crate::domain::id::{CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::operation::OperationState;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
-use crate::domain::snapshot::{SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem};
 use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
@@ -41,6 +41,13 @@ pub enum TrackedOperation {
         command_id: CommandId,
         state: OperationState,
     },
+}
+
+/// One correlated event-replay page batch from open or continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventReplayBatch {
+    pub subscription_id: SubscriptionId,
+    pub page: EventPage,
 }
 
 /// Profile-derived host client with stable ClientId and operation tracking.
@@ -299,6 +306,160 @@ impl HostClient {
         }
     }
 
+    /// Open a durable event replay session. Requires granted EventReplay.
+    pub async fn open_event_replay(
+        &mut self,
+        after_sequence: u64,
+    ) -> Result<Result<EventReplayBatch, QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::EventReplay) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::OpenEventReplay { after_sequence },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::EventReplayPage {
+                subscription_id,
+                page,
+            }) => {
+                if page.after_sequence != after_sequence {
+                    self.retire_connection();
+                    return Err(IpcError::CorrelationMismatch);
+                }
+                Ok(Ok(EventReplayBatch {
+                    subscription_id,
+                    page,
+                }))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Continue a retained event replay. Requires granted EventReplay.
+    pub async fn continue_event_replay(
+        &mut self,
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    ) -> Result<Result<EventReplayBatch, QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::EventReplay) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::ContinueEventReplay {
+                        subscription_id,
+                        resume_cursor,
+                    },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::EventReplayPage {
+                subscription_id: returned,
+                page,
+            }) => {
+                if returned != subscription_id {
+                    self.retire_connection();
+                    return Err(IpcError::CorrelationMismatch);
+                }
+                Ok(Ok(EventReplayBatch {
+                    subscription_id: returned,
+                    page,
+                }))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Release a retained event replay. Requires granted EventReplay.
+    pub async fn release_event_replay(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> Result<Result<(), QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::EventReplay) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::ReleaseEventReplay { subscription_id },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::EventReplayReleased {
+                subscription_id: released,
+            }) if released == subscription_id => Ok(Ok(())),
+            QueryOutcome::Ok(QueryResult::EventReplayReleased { .. }) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Correlate a fresh OperationStatus query and resolve terminal states locally.
     pub async fn refresh_operation(
         &mut self,
@@ -416,7 +577,9 @@ fn correlate_operation_status(
         }
         QueryResult::TaskSnapshot { .. }
         | QueryResult::SnapshotPage { .. }
-        | QueryResult::SnapshotReleased { .. } => Err(IpcError::UnexpectedResponse),
+        | QueryResult::SnapshotReleased { .. }
+        | QueryResult::EventReplayPage { .. }
+        | QueryResult::EventReplayReleased { .. } => Err(IpcError::UnexpectedResponse),
     }
 }
 

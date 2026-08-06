@@ -637,6 +637,9 @@ async fn assemble_task_list(
             Ok(Err(QueryError::UnsupportedCapability)) => {
                 return Err(CliError::new("task.list query capability is unsupported"))
             }
+            Ok(Err(QueryError::ReplayUnavailable { .. })) => {
+                return Err(CliError::new("task.list query replay is unavailable"))
+            }
             Err(error) => return Err(CliError::new(format!("task.list query failed: {error}"))),
         };
 
@@ -741,6 +744,9 @@ async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result
         }
         Ok(Err(QueryError::UnsupportedCapability)) => {
             return Err(CliError::new("task.show query capability is unsupported"))
+        }
+        Ok(Err(QueryError::ReplayUnavailable { .. })) => {
+            return Err(CliError::new("task.show query replay is unavailable"))
         }
         Err(error) => return Err(CliError::new(format!("task.show query failed: {error}"))),
     };
