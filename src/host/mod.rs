@@ -19,4 +19,6 @@ pub use ipc::{
     AcceptedHello, HelloListener, HostConnection, IpcError,
 };
 pub use lock::{HostIdentity, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
-pub use shutdown::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
+pub use shutdown::{
+    HostCleanupProgress, HostCleanupWorker, ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
+};

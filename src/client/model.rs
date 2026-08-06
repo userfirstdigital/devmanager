@@ -399,11 +399,13 @@ impl ClientModel {
                     artifact_summary: Some(summary),
                 })
             }
-            Event::HostCloseBegun { .. } => Ok(StagedEventCommit {
-                task: None,
-                operation: None,
-                artifact_summary: None,
-            }),
+            Event::HostCloseBegun { .. } | Event::HostCleanupBranchCompleted { .. } => {
+                Ok(StagedEventCommit {
+                    task: None,
+                    operation: None,
+                    artifact_summary: None,
+                })
+            }
             _ => {
                 let task_id = event.task_id.ok_or(ClientModelError::ApplyFailed)?;
                 let current = self.tasks.get(&task_id).cloned();

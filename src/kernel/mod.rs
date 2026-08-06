@@ -18,6 +18,7 @@ mod store;
 
 pub(crate) use artifact_content::{ArtifactContentError, ArtifactContentRegistry};
 pub use command_bus::CommandBus;
+pub(crate) use command_bus::HostCleanupUnit;
 pub use dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
     ReconciliationFinding, ReconciliationOrigin,

@@ -4,6 +4,7 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use crate::domain::agent::AgentRole;
 use crate::domain::event::{DomainEvent, Event};
+use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{AgentSessionId, CommandId, EventId, ResourceId, TaskId};
 use crate::domain::operation::{
     CancellationReason, OperationErrorCode, OperationUncertaintyCode, OutcomeFenceError,
@@ -359,6 +360,114 @@ pub(crate) fn apply_event(
                     event.occurred_at_ms,
                 ],
             )?;
+        }
+        Event::HostCleanupBranchCompleted {
+            operation_id,
+            action_epoch,
+            branch,
+            outcome,
+        } => {
+            if event.task_id.is_some() || event.task_revision.is_some() {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed requires NULL task_id and task_revision".into(),
+                ));
+            }
+            let admission: Option<(Vec<u8>, i64)> = tx
+                .query_row(
+                    &format!(
+                        "SELECT operation_id, action_epoch FROM {} WHERE singleton_key = 1",
+                        table_name("host_admission", shadow)
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((admission_op, admission_epoch_i64)) = admission else {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed requires Closing host admission".into(),
+                ));
+            };
+            if admission_op.as_slice() != operation_id.as_bytes().as_slice() {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed operation_id must match Closing admission"
+                        .into(),
+                ));
+            }
+            let admission_epoch =
+                u64_from_nonnegative_i64("host_admission.action_epoch", admission_epoch_i64)?;
+            if admission_epoch != *action_epoch {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed action_epoch must match Closing admission"
+                        .into(),
+                ));
+            }
+            let remaining_count = outcome.remaining_count();
+            match outcome {
+                HostCleanupBranchOutcome::Succeeded if remaining_count != 0 => {
+                    return Err(StoreError::Projection(
+                        "host.cleanup_branch_completed Succeeded requires remaining_count 0".into(),
+                    ));
+                }
+                HostCleanupBranchOutcome::Failed { .. } if remaining_count == 0 => {
+                    return Err(StoreError::Projection(
+                        "host.cleanup_branch_completed Failed requires remaining_count > 0".into(),
+                    ));
+                }
+                _ => {}
+            }
+            let table = table_name("host_cleanup_branches", shadow);
+            let existing: Option<i64> = tx
+                .query_row(
+                    &format!("SELECT 1 FROM {table} WHERE operation_id = ?1 AND branch = ?2"),
+                    rusqlite::params![operation_id.as_bytes().as_slice(), branch.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed duplicate branch is corruption".into(),
+                ));
+            }
+            let expected_index = HostCleanupBranch::ORDER
+                .iter()
+                .position(|ordered| ordered == branch)
+                .ok_or_else(|| {
+                    StoreError::Projection("host.cleanup_branch_completed unknown branch".into())
+                })?;
+            for prior in &HostCleanupBranch::ORDER[..expected_index] {
+                let prior_exists: Option<i64> = tx
+                    .query_row(
+                        &format!("SELECT 1 FROM {table} WHERE operation_id = ?1 AND branch = ?2"),
+                        rusqlite::params![operation_id.as_bytes().as_slice(), prior.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if prior_exists.is_none() {
+                    return Err(StoreError::Projection(
+                        "host.cleanup_branch_completed requires exact ORDER prefix before branch"
+                            .into(),
+                    ));
+                }
+            }
+            let inserted = tx.execute(
+                &format!(
+                    "INSERT INTO {table} (
+                        operation_id, branch, result, remaining_count, completed_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)"
+                ),
+                rusqlite::params![
+                    operation_id.as_bytes().as_slice(),
+                    branch.as_str(),
+                    outcome.result_str(),
+                    u64_to_sqlite_i64("host_cleanup_branches.remaining_count", remaining_count)?,
+                    event.occurred_at_ms,
+                ],
+            )?;
+            if inserted != 1 {
+                return Err(StoreError::Projection(
+                    "host.cleanup_branch_completed insert affected unexpected rows".into(),
+                ));
+            }
         }
         Event::OperationAccepted(fact) => {
             require_valid_operation_fact(fact.validate())?;

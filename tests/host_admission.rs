@@ -1298,3 +1298,925 @@ fn host_admission_duplicate_global_accepted_fact_is_corruption() {
         .expect_err("duplicate global accepted fact must corrupt exact retry lookup");
     assert_eq!(err, StoreError::Corruption);
 }
+
+fn confirm_host_quit(bus: &mut CommandBus) -> OperationId {
+    let inspection = bus.inspect_host_quit().expect("inspect");
+    let receipt = bus
+        .execute(envelope(
+            command_id(0xF0),
+            None,
+            None,
+            Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                inspection_id: inspection.inspection_id,
+                allow_uninspected_worktrees: true,
+            }),
+        ))
+        .expect("confirm quit");
+    match receipt {
+        CommandReceipt::Accepted { operation_id, .. } => operation_id,
+        other => panic!("expected Accepted quit, got {other:?}"),
+    }
+}
+
+fn host_cleanup_branch_rows(path: &Path) -> Vec<(Vec<u8>, String, String, i64, i64)> {
+    let conn = open_raw(path);
+    let mut stmt = conn
+        .prepare(
+            "SELECT operation_id, branch, result, remaining_count, completed_at_ms
+             FROM host_cleanup_branches
+             ORDER BY
+               CASE branch
+                 WHEN 'agent_sessions' THEN 0
+                 WHEN 'resources' THEN 1
+                 WHEN 'outstanding_effects' THEN 2
+                 WHEN 'task_teardowns' THEN 3
+                 ELSE 99
+               END",
+        )
+        .expect("prepare cleanup branches");
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .expect("query cleanup branches")
+    .map(|row| row.expect("cleanup branch row"))
+    .collect()
+}
+
+fn cleanup_event_count(path: &Path) -> i64 {
+    let conn = open_raw(path);
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'host.cleanup_branch_completed'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("cleanup event count")
+}
+
+fn fabricated_cleanup_mutation_count(path: &Path) -> i64 {
+    let conn = open_raw(path);
+    conn.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE event_type IN (
+           'agent_session.registered',
+           'resource.release_begun',
+           'resource.released',
+           'task.close_begun',
+           'task.archived',
+           'operation.settled',
+           'operation.failed',
+           'operation.cancelled',
+           'operation.uncertain'
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .expect("fabricated mutation count")
+}
+
+fn register_open_agent(bus: &mut CommandBus, task: TaskId, cmd: CommandId, rev: u64) {
+    use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+    use devmanager::domain::id::AgentSessionId;
+
+    let receipt = bus
+        .execute(envelope(
+            cmd,
+            Some(task),
+            Some(rev),
+            Command::RegisterAgentSession {
+                agent: AgentSessionFacts {
+                    id: AgentSessionId::from_bytes(fixed_uuid_v7(0xA1)).expect("agent id"),
+                    task_id: task,
+                    role: AgentRole::Primary,
+                    provider_kind: "claude".into(),
+                    provider_session_id: Some("session-sentinel".into()),
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 0,
+                    revision: 0,
+                },
+            },
+        ))
+        .expect("register agent");
+    assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+}
+
+#[test]
+fn host_cleanup_advances_one_durable_branch_per_pass_and_resumes_after_reopen() {
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::operation::OperationState;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::KernelStore;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let quit_op = confirm_host_quit(&mut bus);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("status"),
+        Some(OperationState::Accepted)
+    );
+
+    let expected_order = [
+        HostCleanupBranch::AgentSessions,
+        HostCleanupBranch::Resources,
+        HostCleanupBranch::OutstandingEffects,
+        HostCleanupBranch::TaskTeardowns,
+    ];
+    for (idx, branch) in expected_order.into_iter().enumerate() {
+        let progress = HostCleanupWorker::run_once(&mut bus).expect("advance");
+        assert_eq!(
+            progress,
+            HostCleanupProgress::BranchCompleted {
+                operation_id: quit_op,
+                action_epoch: 1,
+                branch,
+                outcome: HostCleanupBranchOutcome::succeeded(),
+            },
+            "pass {idx} must complete {branch:?}"
+        );
+        let rows = host_cleanup_branch_rows(&path);
+        assert_eq!(rows.len(), idx + 1);
+        assert_eq!(rows[idx].1, branch.as_str());
+        assert_eq!(rows[idx].2, "succeeded");
+        assert_eq!(rows[idx].3, 0);
+        assert_eq!(cleanup_event_count(&path), (idx + 1) as i64);
+        assert_eq!(
+            bus.operation_status(quit_op).expect("status"),
+            Some(OperationState::Accepted)
+        );
+        assert!(host_admission_row(&path).is_some());
+    }
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("idle after four"),
+        HostCleanupProgress::Idle
+    );
+    drop(bus);
+
+    {
+        let mut bus = CommandBus::open(&path).expect("reopen after crash barrier");
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("resume idle"),
+            HostCleanupProgress::Idle
+        );
+    }
+
+    let before = host_cleanup_branch_rows(&path);
+    assert_eq!(before.len(), 4);
+    {
+        let mut store = KernelStore::open(&path).expect("rebuild store");
+        let rebuild = store.rebuild_projections().expect("rebuild");
+        assert!(rebuild.events_replayed > 0);
+    }
+    assert_eq!(host_cleanup_branch_rows(&path), before);
+
+    // Crash after first terminal branch resumes at next absent branch.
+    let dir2 = TempDir::new().expect("tempdir2");
+    let path2 = temp_db_path(&dir2);
+    let quit_op2 = {
+        let mut bus = CommandBus::open(&path2).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        assert!(matches!(
+            HostCleanupWorker::run_once(&mut bus).expect("first"),
+            HostCleanupProgress::BranchCompleted {
+                branch: HostCleanupBranch::AgentSessions,
+                outcome: HostCleanupBranchOutcome::Succeeded,
+                ..
+            }
+        ));
+        quit_op
+    };
+    let mut bus = CommandBus::open(&path2).expect("reopen mid-journal");
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("resume resources"),
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op2,
+            action_epoch: 1,
+            branch: HostCleanupBranch::Resources,
+            outcome: HostCleanupBranchOutcome::succeeded(),
+        }
+    );
+    assert_eq!(host_cleanup_branch_rows(&path2).len(), 2);
+}
+
+#[test]
+fn host_cleanup_reports_agent_resource_and_effect_residue_without_fabricating_cleanup() {
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::operation::OperationState;
+    use devmanager::domain::task::TaskLifecycle;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let task = task_id(0x91);
+    let resource = resource_id(0x92);
+    bus.execute(envelope(
+        command_id(0x93),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create");
+    register_open_agent(&mut bus, task, command_id(0x94), 1);
+    register_active_terminal(&mut bus, task, command_id(0x95), resource, 2);
+    let release_op = {
+        let receipt = bus
+            .execute(envelope(
+                command_id(0x96),
+                Some(task),
+                Some(3),
+                Command::ReleaseResource {
+                    resource_id: resource,
+                },
+            ))
+            .expect("begin release");
+        match receipt {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected release accepted, got {other:?}"),
+        }
+    };
+    let close_op = accept_begin_close(&mut bus, task, command_id(0x97), 4);
+    let fabricated_before = fabricated_cleanup_mutation_count(&path);
+    let quit_op = confirm_host_quit(&mut bus);
+    let outbox_before = count_table(&path, "outbox");
+
+    let agent = HostCleanupWorker::run_once(&mut bus).expect("agent branch");
+    assert_eq!(
+        agent,
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::AgentSessions,
+            outcome: HostCleanupBranchOutcome::failed(1).expect("nonzero"),
+        }
+    );
+
+    let resources = HostCleanupWorker::run_once(&mut bus).expect("resource branch");
+    assert_eq!(
+        resources,
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::Resources,
+            outcome: HostCleanupBranchOutcome::failed(1).expect("nonzero"),
+        }
+    );
+
+    let effects = HostCleanupWorker::run_once(&mut bus).expect("effects branch");
+    assert_eq!(
+        effects,
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::OutstandingEffects,
+            outcome: HostCleanupBranchOutcome::failed(1).expect("nonzero"),
+        }
+    );
+
+    let teardowns = HostCleanupWorker::run_once(&mut bus).expect("teardown branch");
+    assert_eq!(
+        teardowns,
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::TaskTeardowns,
+            outcome: HostCleanupBranchOutcome::failed(1).expect("nonzero"),
+        }
+    );
+
+    let snap = bus.task_snapshot(task).expect("snapshot").expect("present");
+    assert_eq!(snap.task.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(snap.agents.len(), 1);
+    assert_eq!(
+        snap.resources.get(&resource).map(|r| r.lifecycle),
+        Some(devmanager::domain::resource::ResourceLifecycle::Releasing)
+    );
+    assert_eq!(count_table(&path, "outbox"), outbox_before);
+    {
+        let conn = open_raw(&path);
+        assert_eq!(outbox_dispatch_fields(&conn, release_op).0, "pending");
+        assert_eq!(outbox_dispatch_fields(&conn, close_op).0, "pending");
+    }
+    assert_eq!(
+        fabricated_cleanup_mutation_count(&path),
+        fabricated_before,
+        "must not fabricate close/release/archive/host-terminal events"
+    );
+    assert_eq!(
+        bus.operation_status(quit_op).expect("quit"),
+        Some(OperationState::Accepted)
+    );
+    assert!(host_admission_row(&path).is_some());
+    assert_eq!(outbox_count_for_operation(&path, quit_op), 0);
+}
+
+#[test]
+fn host_cleanup_task_branch_reuses_bounded_process_empty_teardown() {
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::operation::OperationState;
+    use devmanager::domain::task::TaskLifecycle;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let task_a = task_id(0xA2);
+    let task_b = task_id(0xA5);
+    bus.execute(envelope(
+        command_id(0xA3),
+        None,
+        None,
+        Command::CreateTask(create_task(task_a)),
+    ))
+    .expect("create A");
+    bus.execute(envelope(
+        command_id(0xA6),
+        None,
+        None,
+        Command::CreateTask(create_task(task_b)),
+    ))
+    .expect("create B");
+    let close_a = accept_begin_close(&mut bus, task_a, command_id(0xA4), 1);
+    let close_b = accept_begin_close(&mut bus, task_b, command_id(0xA7), 1);
+    let quit_op = confirm_host_quit(&mut bus);
+
+    for branch in [
+        HostCleanupBranch::AgentSessions,
+        HostCleanupBranch::Resources,
+        HostCleanupBranch::OutstandingEffects,
+    ] {
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("clean branch"),
+            HostCleanupProgress::BranchCompleted {
+                operation_id: quit_op,
+                action_epoch: 1,
+                branch,
+                outcome: HostCleanupBranchOutcome::succeeded(),
+            }
+        );
+    }
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("progress first teardown only"),
+        HostCleanupProgress::Progressed {
+            task_id: task_a,
+            operation_id: close_a,
+        }
+    );
+    assert_eq!(host_cleanup_branch_rows(&path).len(), 3);
+    assert_eq!(
+        bus.task_snapshot(task_a)
+            .expect("A snap")
+            .expect("A present")
+            .task
+            .lifecycle,
+        TaskLifecycle::Archived
+    );
+    assert_eq!(
+        bus.task_snapshot(task_b)
+            .expect("B snap")
+            .expect("B present")
+            .task
+            .lifecycle,
+        TaskLifecycle::Closing
+    );
+    assert!(matches!(
+        bus.operation_status(close_a).expect("A settled"),
+        Some(OperationState::Settled { .. })
+    ));
+    assert_eq!(
+        bus.operation_status(close_b).expect("B still accepted"),
+        Some(OperationState::Accepted)
+    );
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("progress second teardown"),
+        HostCleanupProgress::Progressed {
+            task_id: task_b,
+            operation_id: close_b,
+        }
+    );
+    assert_eq!(host_cleanup_branch_rows(&path).len(), 3);
+    assert_eq!(
+        bus.task_snapshot(task_b)
+            .expect("B after")
+            .expect("B present")
+            .task
+            .lifecycle,
+        TaskLifecycle::Archived
+    );
+
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("complete teardown branch"),
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::TaskTeardowns,
+            outcome: HostCleanupBranchOutcome::succeeded(),
+        }
+    );
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("idle"),
+        HostCleanupProgress::Idle
+    );
+    assert_eq!(
+        bus.operation_status(quit_op).expect("quit still accepted"),
+        Some(OperationState::Accepted)
+    );
+}
+
+#[test]
+fn host_cleanup_projection_only_forged_row_is_corruption_and_appends_nothing() {
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::host::HostCleanupWorker;
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let quit_op = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        confirm_host_quit(&mut bus)
+    };
+    let events_before = count_table(&path, "events");
+    let admission_before = host_admission_row(&path).expect("closing");
+    {
+        let conn = open_raw(&path);
+        let inserted = conn
+            .execute(
+                "INSERT INTO host_cleanup_branches (
+                    operation_id, branch, result, remaining_count, completed_at_ms
+                 ) VALUES (?1, ?2, 'succeeded', 0, 1)",
+                rusqlite::params![
+                    quit_op.as_bytes().as_slice(),
+                    HostCleanupBranch::AgentSessions.as_str(),
+                ],
+            )
+            .expect("forge projection-only row");
+        assert_eq!(inserted, 1);
+    }
+    assert_eq!(host_cleanup_branch_rows(&path).len(), 1);
+    assert_eq!(cleanup_event_count(&path), 0);
+
+    let mut bus = CommandBus::open(&path).expect("reopen");
+    let err =
+        HostCleanupWorker::run_once(&mut bus).expect_err("projection-only forge must fail closed");
+    assert_eq!(err, StoreError::Corruption);
+    assert_eq!(count_table(&path, "events"), events_before);
+    assert_eq!(cleanup_event_count(&path), 0);
+    assert_eq!(host_cleanup_branch_rows(&path).len(), 1);
+    assert_eq!(
+        host_admission_row(&path).expect("still closing"),
+        admission_before
+    );
+}
+
+#[test]
+fn host_cleanup_out_of_order_durable_event_rebuild_fails_and_preserves_projections() {
+    use devmanager::domain::event::{HostCleanupBranchCompletedPayload, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::id::EventId;
+    use devmanager::kernel::{KernelStore, StoreError};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let quit_op = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        confirm_host_quit(&mut bus)
+    };
+    let before_rows = host_cleanup_branch_rows(&path);
+    let admission_before = host_admission_row(&path).expect("closing");
+    let events_before = count_table(&path, "events");
+    {
+        let conn = open_raw(&path);
+        let payload = HostCleanupBranchCompletedPayload {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::Resources,
+            outcome: HostCleanupBranchOutcome::succeeded(),
+        };
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'host.cleanup_branch_completed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0xC0))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                1_725_000_000_950i64,
+                rmp_serde::to_vec(&payload).expect("pack"),
+            ],
+        )
+        .expect("forge out-of-order Resources without AgentSessions");
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .rebuild_projections()
+        .expect_err("out-of-order branch must fail rebuild");
+    assert!(
+        matches!(
+            &err,
+            StoreError::Projection(detail) if detail.contains("prefix") || detail.contains("order")
+        ),
+        "out-of-order must fail at projection prefix gate, got {err:?}"
+    );
+    drop(store);
+    assert_eq!(host_cleanup_branch_rows(&path), before_rows);
+    assert_eq!(
+        host_admission_row(&path).expect("still closing"),
+        admission_before
+    );
+    assert_eq!(count_table(&path, "events"), events_before + 1);
+}
+
+#[test]
+fn host_cleanup_corrupt_pending_non_teardown_effect_is_corruption_not_failed_outcome() {
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let task = task_id(0xD1);
+    let resource = resource_id(0xD2);
+    bus.execute(envelope(
+        command_id(0xD3),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create");
+    register_active_terminal(&mut bus, task, command_id(0xD4), resource, 1);
+    let release_op = {
+        let receipt = bus
+            .execute(envelope(
+                command_id(0xD5),
+                Some(task),
+                Some(2),
+                Command::ReleaseResource {
+                    resource_id: resource,
+                },
+            ))
+            .expect("begin release");
+        match receipt {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected release accepted, got {other:?}"),
+        }
+    };
+    let quit_op = confirm_host_quit(&mut bus);
+    drop(bus);
+
+    {
+        let conn = open_raw(&path);
+        let changed = conn
+            .execute(
+                "UPDATE outbox SET payload = X'DEADBEEF' WHERE operation_id = ?1",
+                [release_op.as_bytes().as_slice()],
+            )
+            .expect("corrupt pending non-teardown payload");
+        assert_eq!(changed, 1);
+    }
+
+    let mut bus = CommandBus::open(&path).expect("reopen");
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("agents"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::AgentSessions,
+            ..
+        }
+    ));
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("resources"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::Resources,
+            ..
+        }
+    ));
+    let events_before = count_table(&path, "events");
+    let branches_before = host_cleanup_branch_rows(&path).len();
+    let err = HostCleanupWorker::run_once(&mut bus)
+        .expect_err("corrupt pending non-teardown must fail closed");
+    assert_eq!(err, StoreError::Corruption);
+    assert_eq!(count_table(&path, "events"), events_before);
+    assert_eq!(host_cleanup_branch_rows(&path).len(), branches_before);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("quit"),
+        Some(devmanager::domain::operation::OperationState::Accepted)
+    );
+    assert!(!host_cleanup_branch_rows(&path)
+        .iter()
+        .any(|row| row.1 == HostCleanupBranch::OutstandingEffects.as_str()));
+}
+
+#[test]
+fn host_cleanup_wrong_event_sequence_pending_effect_is_corruption_not_residue() {
+    use devmanager::domain::host::HostCleanupBranch;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let task = task_id(0xE1);
+    let resource = resource_id(0xE2);
+    bus.execute(envelope(
+        command_id(0xE3),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create");
+    register_active_terminal(&mut bus, task, command_id(0xE4), resource, 1);
+    let release_op = {
+        let receipt = bus
+            .execute(envelope(
+                command_id(0xE5),
+                Some(task),
+                Some(2),
+                Command::ReleaseResource {
+                    resource_id: resource,
+                },
+            ))
+            .expect("begin release");
+        match receipt {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected release accepted, got {other:?}"),
+        }
+    };
+    let quit_op = confirm_host_quit(&mut bus);
+    drop(bus);
+
+    {
+        let conn = open_raw(&path);
+        let correct: i64 = conn
+            .query_row(
+                "SELECT event_sequence FROM outbox WHERE operation_id = ?1",
+                [release_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read event_sequence");
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT sequence FROM events WHERE sequence != ?1 ORDER BY sequence ASC LIMIT 1",
+                [correct],
+                |row| row.get(0),
+            )
+            .expect("pick existing but incorrect event_sequence");
+        assert_ne!(wrong, correct);
+        let changed = conn
+            .execute(
+                "UPDATE outbox SET event_sequence = ?1 WHERE operation_id = ?2",
+                rusqlite::params![wrong, release_op.as_bytes().as_slice()],
+            )
+            .expect("forge wrong event_sequence on structurally valid pending effect");
+        assert_eq!(changed, 1);
+    }
+
+    let mut bus = CommandBus::open(&path).expect("reopen");
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("agents"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::AgentSessions,
+            ..
+        }
+    ));
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("resources"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::Resources,
+            ..
+        }
+    ));
+    let events_before = count_table(&path, "events");
+    let branches_before = host_cleanup_branch_rows(&path).len();
+    let err = HostCleanupWorker::run_once(&mut bus)
+        .expect_err("wrong event_sequence must fail closed as Corruption");
+    assert_eq!(err, StoreError::Corruption);
+    assert_eq!(count_table(&path, "events"), events_before);
+    assert_eq!(host_cleanup_branch_rows(&path).len(), branches_before);
+    assert_eq!(
+        bus.operation_status(quit_op).expect("quit"),
+        Some(devmanager::domain::operation::OperationState::Accepted)
+    );
+    assert!(!host_cleanup_branch_rows(&path)
+        .iter()
+        .any(|row| row.1 == HostCleanupBranch::OutstandingEffects.as_str()));
+}
+
+#[test]
+fn host_cleanup_task_teardown_revalidates_lineage_after_outstanding_effects_crash_boundary() {
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::StoreError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let mut bus = CommandBus::open(&path).expect("open bus");
+    let task = task_id(0xF1);
+    let resource = resource_id(0xF2);
+    bus.execute(envelope(
+        command_id(0xF3),
+        None,
+        None,
+        Command::CreateTask(create_task(task)),
+    ))
+    .expect("create");
+    register_active_terminal(&mut bus, task, command_id(0xF4), resource, 1);
+    let close_op = accept_begin_close(&mut bus, task, command_id(0xF5), 2);
+    let quit_op = confirm_host_quit(&mut bus);
+
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("agents"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::AgentSessions,
+            outcome: HostCleanupBranchOutcome::Succeeded,
+            ..
+        }
+    ));
+    assert_eq!(
+        HostCleanupWorker::run_once(&mut bus).expect("resources"),
+        HostCleanupProgress::BranchCompleted {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::Resources,
+            outcome: HostCleanupBranchOutcome::failed(1).expect("one live resource"),
+        }
+    );
+    assert!(matches!(
+        HostCleanupWorker::run_once(&mut bus).expect("outstanding effects"),
+        HostCleanupProgress::BranchCompleted {
+            branch: HostCleanupBranch::OutstandingEffects,
+            outcome: HostCleanupBranchOutcome::Succeeded,
+            ..
+        }
+    ));
+    drop(bus);
+
+    // Simulate corruption after the durable OutstandingEffects crash boundary.
+    // The active resource keeps this teardown out of the process-empty candidate query.
+    {
+        let conn = open_raw(&path);
+        let correct: i64 = conn
+            .query_row(
+                "SELECT event_sequence FROM outbox WHERE operation_id = ?1",
+                [close_op.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read teardown event_sequence");
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT sequence FROM events WHERE sequence != ?1 ORDER BY sequence ASC LIMIT 1",
+                [correct],
+                |row| row.get(0),
+            )
+            .expect("pick existing but incorrect event_sequence");
+        assert_ne!(wrong, correct);
+        assert_eq!(
+            conn.execute(
+                "UPDATE outbox SET event_sequence = ?1 WHERE operation_id = ?2",
+                rusqlite::params![wrong, close_op.as_bytes().as_slice()],
+            )
+            .expect("forge blocked teardown lineage"),
+            1
+        );
+    }
+
+    let events_before = count_table(&path, "events");
+    let branches_before = host_cleanup_branch_rows(&path);
+    assert_eq!(branches_before.len(), 3);
+    let mut bus = CommandBus::open(&path).expect("reopen after crash boundary");
+    let err = HostCleanupWorker::run_once(&mut bus)
+        .expect_err("blocked teardown lineage corruption must fail closed");
+    assert_eq!(err, StoreError::Corruption);
+    assert_eq!(count_table(&path, "events"), events_before);
+    assert_eq!(host_cleanup_branch_rows(&path), branches_before);
+    assert!(!host_cleanup_branch_rows(&path)
+        .iter()
+        .any(|row| row.1 == HostCleanupBranch::TaskTeardowns.as_str()));
+}
+
+#[test]
+fn host_cleanup_branch_wrong_operation_epoch_or_duplicate_is_corruption_and_rolls_back() {
+    use devmanager::domain::event::{HostCleanupBranchCompletedPayload, EVENT_SCHEMA_VERSION};
+    use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::domain::id::EventId;
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker};
+    use devmanager::kernel::{KernelStore, StoreError};
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = temp_db_path(&dir);
+    let quit_op = {
+        let mut bus = CommandBus::open(&path).expect("open");
+        let quit_op = confirm_host_quit(&mut bus);
+        assert!(matches!(
+            HostCleanupWorker::run_once(&mut bus).expect("agent"),
+            HostCleanupProgress::BranchCompleted {
+                branch: HostCleanupBranch::AgentSessions,
+                ..
+            }
+        ));
+        quit_op
+    };
+    let before_rows = host_cleanup_branch_rows(&path);
+    let events_before = count_table(&path, "events");
+    let admission_before = host_admission_row(&path).expect("closing");
+
+    {
+        let conn = open_raw(&path);
+        let payload = HostCleanupBranchCompletedPayload {
+            operation_id: quit_op,
+            action_epoch: 99,
+            branch: HostCleanupBranch::Resources,
+            outcome: HostCleanupBranchOutcome::succeeded(),
+        };
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'host.cleanup_branch_completed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0xB0))
+                    .expect("eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                1_725_000_000_900i64,
+                rmp_serde::to_vec(&payload).expect("pack"),
+            ],
+        )
+        .expect("forge wrong-epoch cleanup fact");
+    }
+
+    let mut store = KernelStore::open(&path).expect("reopen");
+    let err = store
+        .rebuild_projections()
+        .expect_err("wrong epoch must fail closed");
+    assert!(
+        matches!(&err, StoreError::Projection(detail) if detail.contains("action_epoch")),
+        "wrong epoch must fail at projection gate, got {err:?}"
+    );
+    drop(store);
+
+    assert_eq!(host_cleanup_branch_rows(&path), before_rows);
+    assert_eq!(
+        host_admission_row(&path).expect("still closing"),
+        admission_before
+    );
+    assert_eq!(count_table(&path, "events"), events_before + 1);
+
+    // Remove the wrong-epoch forged fact so the duplicate case is isolated.
+    {
+        let conn = open_raw(&path);
+        let deleted = conn
+            .execute(
+                "DELETE FROM events WHERE event_type = 'host.cleanup_branch_completed'
+                 AND sequence = (SELECT MAX(sequence) FROM events)",
+                [],
+            )
+            .expect("remove wrong-epoch forge");
+        assert_eq!(deleted, 1);
+    }
+    assert_eq!(count_table(&path, "events"), events_before);
+
+    {
+        let conn = open_raw(&path);
+        let payload = HostCleanupBranchCompletedPayload {
+            operation_id: quit_op,
+            action_epoch: 1,
+            branch: HostCleanupBranch::AgentSessions,
+            outcome: HostCleanupBranchOutcome::succeeded(),
+        };
+        conn.execute(
+            "INSERT INTO events (
+                event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
+             ) VALUES (?1, NULL, NULL, 'host.cleanup_branch_completed', ?2, ?3, ?4)",
+            rusqlite::params![
+                EventId::from_bytes(fixed_uuid_v7(0xB1))
+                    .expect("dup eid")
+                    .as_bytes()
+                    .as_slice(),
+                i64::from(EVENT_SCHEMA_VERSION),
+                1_725_000_000_901i64,
+                rmp_serde::to_vec(&payload).expect("pack dup"),
+            ],
+        )
+        .expect("forge duplicate agent branch");
+    }
+    let mut store = KernelStore::open(&path).expect("reopen dup");
+    let err = store
+        .rebuild_projections()
+        .expect_err("duplicate branch must fail closed");
+    assert!(
+        matches!(&err, StoreError::Projection(detail) if detail.contains("duplicate")),
+        "duplicate must fail at projection gate, got {err:?}"
+    );
+    assert_eq!(host_cleanup_branch_rows(&path), before_rows);
+}

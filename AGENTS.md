@@ -43,3 +43,15 @@
 - Finalize resync fields that claim wire delivery in the single writer after any
   earlier in-flight frame settles. Release, resync, retarget, and output shutdown
   must invalidate queued generations and leave no executor-held connection owner.
+
+## Durable orchestration journals
+
+- Never use a current-state projection row as a resume cursor until it is
+  correlated to its exact durable event lineage in the same transaction. Fixed
+  multi-step journals must be an exact ordered prefix during normal projection,
+  runtime resume, and projection rebuild; duplicates, holes, foreign lineage,
+  and out-of-order facts fail closed.
+- Before a cleanup journal records an outbox residue count or progresses work,
+  validate the complete receipt, event sequence, planned effect, and operation
+  fence lineage. Corrupt storage is an execution error, never a synthetic
+  cleanup-failure outcome.

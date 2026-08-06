@@ -234,7 +234,8 @@ pub(crate) fn plan_effects(
             | Event::OperationFailed(_)
             | Event::OperationCancelled(_)
             | Event::OperationUncertain(_)
-            | Event::HostCloseBegun { .. } => {
+            | Event::HostCloseBegun { .. }
+            | Event::HostCleanupBranchCompleted { .. } => {
                 return Err(StoreError::Projection(
                     "operation outcome facts are not decision inputs for effect planning".into(),
                 ));

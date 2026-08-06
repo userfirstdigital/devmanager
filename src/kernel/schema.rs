@@ -150,6 +150,21 @@ CREATE TABLE host_admission (\n\
 );\n\
 ";
 
+const V6_SQL: &str = "\
+CREATE TABLE host_cleanup_branches (\n\
+  operation_id BLOB NOT NULL CHECK(length(operation_id) = 16),\n\
+  branch TEXT NOT NULL CHECK(branch IN ('agent_sessions', 'resources', 'outstanding_effects', 'task_teardowns')),\n\
+  result TEXT NOT NULL CHECK(result IN ('succeeded', 'failed')),\n\
+  remaining_count INTEGER NOT NULL CHECK(remaining_count >= 0),\n\
+  completed_at_ms INTEGER NOT NULL,\n\
+  PRIMARY KEY (operation_id, branch),\n\
+  CHECK(\n\
+    (result = 'succeeded' AND remaining_count = 0)\n\
+    OR (result = 'failed' AND remaining_count > 0)\n\
+  )\n\
+);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -178,6 +193,12 @@ pub(crate) const V4_SHA256: [u8; 32] = [
 pub(crate) const V5_SHA256: [u8; 32] = [
     0x17, 0x20, 0x21, 0x30, 0x94, 0xca, 0xfb, 0xc8, 0x01, 0x9b, 0x4b, 0x84, 0xb2, 0x58, 0x28, 0xc4,
     0xff, 0xcf, 0x57, 0x33, 0x45, 0x0c, 0x54, 0x58, 0xcb, 0xaa, 0xd0, 0xe8, 0xfc, 0x9c, 0x82, 0x20,
+];
+
+/// Compiled SHA-256 of [`V6_SQL`]. Do not change V6_SQL without updating this literal.
+pub(crate) const V6_SHA256: [u8; 32] = [
+    0x11, 0xce, 0x61, 0x1c, 0xf9, 0xc1, 0x3e, 0xcd, 0xd8, 0x44, 0x21, 0xd5, 0x0d, 0xc7, 0xa7, 0x71,
+    0x0b, 0x27, 0x47, 0x02, 0x05, 0x31, 0xad, 0x6f, 0x68, 0x34, 0x16, 0x4c, 0xa0, 0xe6, 0x2e, 0x67,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -227,6 +248,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V5_SQL),
                 "V5_SHA256 literal must match V5_SQL bytes"
             );
+            assert_eq!(
+                V6_SHA256,
+                sha256_bytes(V6_SQL),
+                "V6_SHA256 literal must match V6_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -257,6 +283,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v5_host_admission",
                     sql: V5_SQL,
                     sha256: V5_SHA256,
+                },
+                Migration {
+                    version: 6,
+                    name: "v6_host_cleanup_branches",
+                    sql: V6_SQL,
+                    sha256: V6_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -310,6 +342,7 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "artifacts",
     "resources",
     "host_admission",
+    "host_cleanup_branches",
 ];
 
 #[cfg(test)]
@@ -465,7 +498,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 5);
+        assert_eq!(history.len(), 6);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -480,6 +513,9 @@ mod tests {
         assert_eq!(history[4].0, 5);
         assert_eq!(history[4].1, "v5_host_admission");
         assert_eq!(history[4].2, V5_SHA256.to_vec());
+        assert_eq!(history[5].0, 6);
+        assert_eq!(history[5].1, "v6_host_cleanup_branches");
+        assert_eq!(history[5].2, V6_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(

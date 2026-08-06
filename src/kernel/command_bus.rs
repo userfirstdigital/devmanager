@@ -23,7 +23,8 @@ use crate::domain::event::{
     OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::host::{
-    HostQuitAgentBlocker, HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection,
+    HostCleanupBranch, HostCleanupBranchOutcome, HostQuitAgentBlocker, HostQuitInspection,
+    HostQuitResourceBlocker, HostQuitWorktreeInspection,
 };
 use crate::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
@@ -55,6 +56,22 @@ use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
     StoreError,
 };
+
+/// One advancement unit from the Closing host-cleanup journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostCleanupUnit {
+    Idle,
+    Progressed {
+        task_id: TaskId,
+        operation_id: OperationId,
+    },
+    BranchCompleted {
+        operation_id: OperationId,
+        action_epoch: u64,
+        branch: HostCleanupBranch,
+        outcome: HostCleanupBranchOutcome,
+    },
+}
 
 /// Host-facing command facade. Owns the durable store; does not expose SQLite.
 pub struct CommandBus {
@@ -119,6 +136,26 @@ impl CommandBus {
         lease: Duration,
     ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
         self.store.settle_next_process_empty_task_teardown(lease)
+    }
+
+    /// Whether the durable host admission singleton is Closing.
+    pub(crate) fn host_admission_is_closing(&self) -> Result<bool, StoreError> {
+        let conn = self.store.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let closing = host_admission_is_closing(&tx)?;
+        tx.commit()?;
+        Ok(closing)
+    }
+
+    /// Advance exactly one host-cleanup unit under Closing admission.
+    ///
+    /// Resumes at the first absent fixed branch. TaskTeardowns may Progress by
+    /// settling one process-empty teardown without terminalizing the branch.
+    pub(crate) fn advance_next_host_cleanup_unit(
+        &mut self,
+        lease: Duration,
+    ) -> Result<HostCleanupUnit, StoreError> {
+        self.store.advance_next_host_cleanup_unit(lease)
     }
 
     /// Serve a side-effect-free query through the owned store projections only.
@@ -948,7 +985,8 @@ fn durable_operation_lineage_exists(
          FROM events
          WHERE event_type IN (
              'operation.accepted', 'operation.settled', 'operation.failed',
-             'operation.cancelled', 'operation.uncertain'
+             'operation.cancelled', 'operation.uncertain',
+             'host.close_begun', 'host.cleanup_branch_completed'
          )",
     )?;
     let mut event_rows = event_stmt.query([])?;
@@ -987,6 +1025,14 @@ fn event_references_operation(event: &Event, operation_id: OperationId) -> bool 
         Event::OperationFailed(fact) => fact.operation_id == operation_id,
         Event::OperationCancelled(fact) => fact.operation_id == operation_id,
         Event::OperationUncertain(fact) => fact.operation_id == operation_id,
+        Event::HostCloseBegun {
+            operation_id: begun_op,
+            ..
+        }
+        | Event::HostCleanupBranchCompleted {
+            operation_id: begun_op,
+            ..
+        } => *begun_op == operation_id,
         _ => false,
     }
 }
@@ -2201,6 +2247,179 @@ pub(crate) fn validate_rebuilt_host_admission(tx: &Transaction<'_>) -> Result<()
         } if operation_id == admission.operation_id && event_ids.len() == 1 => Ok(()),
         _ => Err(StoreError::Corruption),
     }
+}
+
+/// After projection rebuild, each `host_cleanup_branches` row must match exactly one
+/// durable `HostCleanupBranchCompleted` fact for the Closing admission lineage.
+pub(crate) fn validate_rebuilt_host_cleanup_branches(
+    tx: &Transaction<'_>,
+) -> Result<(), StoreError> {
+    let admission = load_host_admission_row(tx)?;
+    let projected = load_host_cleanup_branch_projection_map(tx)?;
+    if admission.is_none() && !projected.is_empty() {
+        return Err(StoreError::Corruption);
+    }
+    let facts = load_host_cleanup_branch_event_map(tx, admission.as_ref())?;
+    if facts != projected {
+        return Err(StoreError::Corruption);
+    }
+    validate_host_cleanup_branch_prefix_map(&projected)?;
+    Ok(())
+}
+
+fn load_host_cleanup_branch_projection_map(
+    tx: &Connection,
+) -> Result<std::collections::BTreeMap<(Vec<u8>, String), (String, i64, i64)>, StoreError> {
+    let mut projected = std::collections::BTreeMap::new();
+    let mut stmt = tx.prepare(
+        "SELECT operation_id, branch, result, remaining_count, completed_at_ms
+         FROM host_cleanup_branches",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (operation_id, branch, result, remaining_count, completed_at_ms) = row?;
+        if HostCleanupBranch::parse(&branch).is_none() {
+            return Err(StoreError::Corruption);
+        }
+        let key = (operation_id, branch);
+        if projected
+            .insert(key, (result, remaining_count, completed_at_ms))
+            .is_some()
+        {
+            return Err(StoreError::Corruption);
+        }
+    }
+    Ok(projected)
+}
+
+fn load_host_cleanup_branch_event_map(
+    tx: &Connection,
+    admission: Option<&HostAdmissionRow>,
+) -> Result<std::collections::BTreeMap<(Vec<u8>, String), (String, i64, i64)>, StoreError> {
+    let mut facts = std::collections::BTreeMap::new();
+    let mut event_stmt = tx.prepare(
+        "SELECT task_id, task_revision, schema_version, payload, occurred_at_ms
+         FROM events
+         WHERE event_type = 'host.cleanup_branch_completed'
+         ORDER BY sequence ASC",
+    )?;
+    let event_rows = event_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<Vec<u8>>>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in event_rows {
+        let (task_id, task_revision, schema_version, payload, occurred_at_ms) = row?;
+        if task_id.is_some() || task_revision.is_some() {
+            return Err(StoreError::Corruption);
+        }
+        let decoded = crate::kernel::store::decode_stored_event(
+            "host.cleanup_branch_completed",
+            schema_version,
+            &payload,
+        )?;
+        let Event::HostCleanupBranchCompleted {
+            operation_id,
+            action_epoch,
+            branch,
+            outcome,
+        } = decoded
+        else {
+            return Err(StoreError::Corruption);
+        };
+        let Some(admission) = admission else {
+            return Err(StoreError::Corruption);
+        };
+        if operation_id != admission.operation_id || action_epoch != admission.action_epoch {
+            return Err(StoreError::Corruption);
+        }
+        let key = (
+            operation_id.as_bytes().to_vec(),
+            branch.as_str().to_string(),
+        );
+        let value = (
+            outcome.result_str().to_string(),
+            i64::try_from(outcome.remaining_count()).map_err(|_| StoreError::Corruption)?,
+            occurred_at_ms,
+        );
+        if facts.insert(key, value).is_some() {
+            return Err(StoreError::Corruption);
+        }
+    }
+    validate_host_cleanup_branch_prefix_map(&facts)?;
+    Ok(facts)
+}
+
+fn validate_host_cleanup_branch_prefix_map(
+    rows: &std::collections::BTreeMap<(Vec<u8>, String), (String, i64, i64)>,
+) -> Result<(), StoreError> {
+    let mut by_operation: std::collections::BTreeMap<Vec<u8>, Vec<HostCleanupBranch>> =
+        std::collections::BTreeMap::new();
+    for (operation_id, branch_name) in rows.keys() {
+        let branch = HostCleanupBranch::parse(branch_name).ok_or(StoreError::Corruption)?;
+        by_operation
+            .entry(operation_id.clone())
+            .or_default()
+            .push(branch);
+    }
+    for branches in by_operation.values_mut() {
+        branches.sort_by_key(|branch| {
+            HostCleanupBranch::ORDER
+                .iter()
+                .position(|ordered| ordered == branch)
+                .unwrap_or(usize::MAX)
+        });
+        for (idx, branch) in branches.iter().enumerate() {
+            if HostCleanupBranch::ORDER.get(idx) != Some(branch) {
+                return Err(StoreError::Corruption);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensure current cleanup projection rows are an exact event-backed ORDER prefix.
+fn validate_current_host_cleanup_journal(
+    tx: &Connection,
+    admission: &HostAdmissionRow,
+) -> Result<(), StoreError> {
+    let projected = load_host_cleanup_branch_projection_map(tx)?;
+    let facts = load_host_cleanup_branch_event_map(tx, Some(admission))?;
+    if projected != facts {
+        return Err(StoreError::Corruption);
+    }
+    let mut present = Vec::new();
+    for branch in HostCleanupBranch::ORDER {
+        let key = (
+            admission.operation_id.as_bytes().to_vec(),
+            branch.as_str().to_string(),
+        );
+        if projected.contains_key(&key) {
+            present.push(branch);
+        }
+    }
+    for (idx, branch) in present.iter().enumerate() {
+        if HostCleanupBranch::ORDER.get(idx) != Some(branch) {
+            return Err(StoreError::Corruption);
+        }
+    }
+    if present.len() != projected.len() {
+        // Foreign operation_id rows under Closing admission are corruption.
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 fn validate_accepted_receipt_correlation(
@@ -5797,6 +6016,207 @@ fn persist_confirm_host_quit(
     )?;
     set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
     Ok(receipt)
+}
+
+pub(crate) fn advance_next_host_cleanup_unit_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<HostCleanupUnit, StoreError> {
+    validate_rebuilt_host_admission(tx)?;
+    let Some(admission) = load_host_admission_row(tx)? else {
+        return Ok(HostCleanupUnit::Idle);
+    };
+    validate_current_host_cleanup_journal(tx, &admission)?;
+    let Some(branch) = next_absent_host_cleanup_branch(tx, admission.operation_id)? else {
+        return Ok(HostCleanupUnit::Idle);
+    };
+
+    match branch {
+        HostCleanupBranch::AgentSessions => {
+            let remaining = count_open_or_closing_agents(tx)?;
+            complete_host_cleanup_branch(
+                tx,
+                admission.operation_id,
+                admission.action_epoch,
+                branch,
+                remaining,
+                now_ms,
+            )
+        }
+        HostCleanupBranch::Resources => {
+            let remaining = count_active_or_releasing_resources(tx)?;
+            complete_host_cleanup_branch(
+                tx,
+                admission.operation_id,
+                admission.action_epoch,
+                branch,
+                remaining,
+                now_ms,
+            )
+        }
+        HostCleanupBranch::OutstandingEffects => {
+            // Nonterminal = pending/claimed/dispatching/reconcile_required/reconciling.
+            // Outbox `uncertain` is terminal under existing dispatch contracts and is
+            // intentionally excluded from outstanding residue counts.
+            // Full receipt-backed outbox correlation (event_sequence / effect fence)
+            // before counting — structurally valid wrong lineage must be Corruption,
+            // not residue. Decode/codec failures fail closed as Corruption so host
+            // cleanup never treats a corrupt pending effect as countable residue.
+            validate_host_cleanup_outbox_lineage(tx)?;
+            let remaining = count_nonterminal_non_teardown_outbox(tx)?;
+            complete_host_cleanup_branch(
+                tx,
+                admission.operation_id,
+                admission.action_epoch,
+                branch,
+                remaining,
+                now_ms,
+            )
+        }
+        HostCleanupBranch::TaskTeardowns => {
+            // Revalidate after the durable OutstandingEffects crash boundary.
+            // A blocked/noncandidate teardown must not be counted as residue when
+            // its receipt, event sequence, payload, or effect fence is corrupt.
+            validate_host_cleanup_outbox_lineage(tx)?;
+            if let Some((task_id, operation_id)) =
+                crate::kernel::store::settle_next_process_empty_task_teardown_in_tx_for_cleanup(
+                    tx, now_ms, lease_ms,
+                )?
+            {
+                return Ok(HostCleanupUnit::Progressed {
+                    task_id,
+                    operation_id,
+                });
+            }
+            let remaining = count_nonterminal_teardown_outbox(tx)?;
+            complete_host_cleanup_branch(
+                tx,
+                admission.operation_id,
+                admission.action_epoch,
+                branch,
+                remaining,
+                now_ms,
+            )
+        }
+    }
+}
+
+fn validate_host_cleanup_outbox_lineage(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    match validate_all_rebuilt_outbox_metadata(tx) {
+        Ok(()) => Ok(()),
+        Err(StoreError::CodecMismatch { .. }) | Err(StoreError::EventDecode(_)) => {
+            Err(StoreError::Corruption)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn next_absent_host_cleanup_branch(
+    tx: &Connection,
+    operation_id: OperationId,
+) -> Result<Option<HostCleanupBranch>, StoreError> {
+    let mut saw_absent = false;
+    let mut next = None;
+    for branch in HostCleanupBranch::ORDER {
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM host_cleanup_branches
+             WHERE operation_id = ?1 AND branch = ?2",
+            rusqlite::params![operation_id.as_bytes().as_slice(), branch.as_str()],
+            |row| row.get(0),
+        )?;
+        match exists {
+            0 => {
+                if next.is_none() {
+                    next = Some(branch);
+                }
+                saw_absent = true;
+            }
+            1 => {
+                if saw_absent {
+                    return Err(StoreError::Corruption);
+                }
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+    Ok(next)
+}
+
+fn complete_host_cleanup_branch(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    action_epoch: u64,
+    branch: HostCleanupBranch,
+    remaining: u64,
+    now_ms: i64,
+) -> Result<HostCleanupUnit, StoreError> {
+    let outcome = if remaining == 0 {
+        HostCleanupBranchOutcome::succeeded()
+    } else {
+        HostCleanupBranchOutcome::failed(remaining).ok_or(StoreError::Corruption)?
+    };
+    append_and_project(
+        tx,
+        EventId::new(),
+        None,
+        None,
+        now_ms,
+        Event::HostCleanupBranchCompleted {
+            operation_id,
+            action_epoch,
+            branch,
+            outcome,
+        },
+    )?;
+    Ok(HostCleanupUnit::BranchCompleted {
+        operation_id,
+        action_epoch,
+        branch,
+        outcome,
+    })
+}
+
+fn count_open_or_closing_agents(tx: &Connection) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_sessions
+         WHERE lifecycle IN ('open', 'closing')",
+        [],
+        |row| row.get(0),
+    )?;
+    u64_from_nonnegative_i64("agent_sessions.open_or_closing", count)
+}
+
+fn count_active_or_releasing_resources(tx: &Connection) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM resources
+         WHERE lifecycle IN ('active', 'releasing')",
+        [],
+        |row| row.get(0),
+    )?;
+    u64_from_nonnegative_i64("resources.active_or_releasing", count)
+}
+
+fn count_nonterminal_non_teardown_outbox(tx: &Connection) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM outbox
+         WHERE state IN ('pending', 'claimed', 'dispatching', 'reconcile_required', 'reconciling')
+           AND destination_class != 'task_teardown'",
+        [],
+        |row| row.get(0),
+    )?;
+    u64_from_nonnegative_i64("outbox.nonterminal_non_teardown", count)
+}
+
+fn count_nonterminal_teardown_outbox(tx: &Connection) -> Result<u64, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM outbox
+         WHERE state IN ('pending', 'claimed', 'dispatching', 'reconcile_required', 'reconciling')
+           AND destination_class = 'task_teardown'",
+        [],
+        |row| row.get(0),
+    )?;
+    u64_from_nonnegative_i64("outbox.nonterminal_teardown", count)
 }
 
 struct ResourceProjectionFields {

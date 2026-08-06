@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
+use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
 use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
 use crate::domain::operation::{
     validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
@@ -582,6 +583,15 @@ pub struct HostCloseBegunPayload {
     pub inspection_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCleanupBranchCompletedPayload {
+    pub operation_id: OperationId,
+    pub action_epoch: u64,
+    pub branch: HostCleanupBranch,
+    pub outcome: HostCleanupBranchOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     TaskCreated {
@@ -627,6 +637,12 @@ pub enum Event {
         action_epoch: u64,
         inspection_id: u64,
     },
+    HostCleanupBranchCompleted {
+        operation_id: OperationId,
+        action_epoch: u64,
+        branch: HostCleanupBranch,
+        outcome: HostCleanupBranchOutcome,
+    },
     OperationAccepted(OperationAcceptedFact),
     OperationSettled(OperationSettledFact),
     OperationFailed(OperationFailedFact),
@@ -650,6 +666,7 @@ impl Event {
             Self::ResourceReleaseBegun { .. } => "resource.release_begun",
             Self::ResourceReleased { .. } => "resource.released",
             Self::HostCloseBegun { .. } => "host.close_begun",
+            Self::HostCleanupBranchCompleted { .. } => "host.cleanup_branch_completed",
             Self::OperationAccepted(_) => "operation.accepted",
             Self::OperationSettled(_) => "operation.settled",
             Self::OperationFailed(_) => "operation.failed",
@@ -662,6 +679,7 @@ impl Event {
         !matches!(
             self,
             Self::HostCloseBegun { .. }
+                | Self::HostCleanupBranchCompleted { .. }
                 | Self::OperationAccepted(_)
                 | Self::OperationSettled(_)
                 | Self::OperationFailed(_)
@@ -700,6 +718,8 @@ enum EventBody {
     ResourceReleased(ResourceReleasedPayload),
     #[serde(rename = "host.close_begun")]
     HostCloseBegun(HostCloseBegunPayload),
+    #[serde(rename = "host.cleanup_branch_completed")]
+    HostCleanupBranchCompleted(HostCleanupBranchCompletedPayload),
     #[serde(rename = "operation.accepted")]
     OperationAccepted(OperationAcceptedFact),
     #[serde(rename = "operation.settled")]
@@ -792,6 +812,17 @@ impl From<&Event> for EventDocument {
                 operation_id: *operation_id,
                 action_epoch: *action_epoch,
                 inspection_id: *inspection_id,
+            }),
+            Event::HostCleanupBranchCompleted {
+                operation_id,
+                action_epoch,
+                branch,
+                outcome,
+            } => EventBody::HostCleanupBranchCompleted(HostCleanupBranchCompletedPayload {
+                operation_id: *operation_id,
+                action_epoch: *action_epoch,
+                branch: *branch,
+                outcome: *outcome,
             }),
             Event::OperationAccepted(fact) => EventBody::OperationAccepted(fact.clone()),
             Event::OperationSettled(fact) => EventBody::OperationSettled(fact.clone()),
@@ -887,6 +918,12 @@ impl TryFrom<EventDocument> for Event {
                 operation_id: p.operation_id,
                 action_epoch: p.action_epoch,
                 inspection_id: p.inspection_id,
+            },
+            EventBody::HostCleanupBranchCompleted(p) => Event::HostCleanupBranchCompleted {
+                operation_id: p.operation_id,
+                action_epoch: p.action_epoch,
+                branch: p.branch,
+                outcome: p.outcome,
             },
             EventBody::OperationAccepted(fact) => Event::OperationAccepted(fact),
             EventBody::OperationSettled(fact) => Event::OperationSettled(fact),
@@ -1003,7 +1040,9 @@ pub fn apply(
             require_matching_task_id(&snap, event)?;
             Ok(snap)
         }
-        Event::HostCloseBegun { .. } => Err(ApplyError::InvalidTransition),
+        Event::HostCloseBegun { .. } | Event::HostCleanupBranchCompleted { .. } => {
+            Err(ApplyError::InvalidTransition)
+        }
         Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
@@ -1192,6 +1231,7 @@ fn apply_into(
         }
         Event::TaskCreated { .. }
         | Event::HostCloseBegun { .. }
+        | Event::HostCleanupBranchCompleted { .. }
         | Event::OperationAccepted(_)
         | Event::OperationSettled(_)
         | Event::OperationFailed(_)

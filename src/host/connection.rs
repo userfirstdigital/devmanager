@@ -34,7 +34,9 @@ use crate::protocol::{
 };
 
 use super::ipc::IpcError;
-use super::shutdown::{ProcessEmptyTeardown, ProcessEmptyTeardownWorker};
+use super::shutdown::{
+    HostCleanupProgress, HostCleanupWorker, ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
+};
 
 /// Fixed capacity for the host request queue.
 ///
@@ -76,6 +78,10 @@ enum ExecutorControl {
     InspectOutput {
         id: ConnectionOutputId,
         ack: oneshot::Sender<OutputInspection>,
+    },
+    #[cfg(test)]
+    RunMaintenanceOnce {
+        ack: oneshot::Sender<Result<(), StoreError>>,
     },
 }
 
@@ -466,6 +472,19 @@ impl HostRequestHandle {
         ack_rx.await.map_err(|_| IpcError::Unavailable)
     }
 
+    /// Test seam: run exactly one maintenance cleanup/teardown unit on the executor.
+    #[cfg(test)]
+    pub(crate) async fn run_maintenance_once(&self) -> Result<(), StoreError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::RunMaintenanceOnce { ack: ack_tx })
+            .await
+            .map_err(|_| StoreError::Io("executor control channel closed".into()))?;
+        ack_rx
+            .await
+            .map_err(|_| StoreError::Io("maintenance ack dropped".into()))?
+    }
+
     /// Enqueue one authenticated request and await its correlated reply.
     ///
     /// Blocks (with bounded queue backpressure) when the executor queue is full.
@@ -508,6 +527,21 @@ impl HostRequestExecutor {
     /// every handle closes the queue; the executor then finishes after draining
     /// any already-queued jobs.
     pub fn start(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
+        Self::spawn(bus, true)
+    }
+
+    /// Test-only: same executor as [`Self::start`], but without the automatic
+    /// maintenance timer so explicit [`HostRequestHandle::run_maintenance_once`]
+    /// calls are the only cleanup/teardown driver.
+    #[cfg(test)]
+    fn start_without_automatic_maintenance(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
+        Self::spawn(bus, false)
+    }
+
+    fn spawn(
+        bus: CommandBus,
+        schedule_automatic_maintenance: bool,
+    ) -> (HostRequestHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let handle = HostRequestHandle {
@@ -526,12 +560,12 @@ impl HostRequestExecutor {
             outputs: HashMap::new(),
         };
         let join = tokio::spawn(async move {
-            executor.run().await;
+            executor.run(schedule_automatic_maintenance).await;
         });
         (handle, join)
     }
 
-    async fn run(&mut self) {
+    async fn run(&mut self, schedule_automatic_maintenance: bool) {
         // `interval` ticks immediately. Delay the first maintenance pass so
         // startup does not race an eager teardown scan.
         let period = SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD);
@@ -580,9 +614,14 @@ impl HostRequestExecutor {
                                 live_bound,
                             });
                         }
+                        #[cfg(test)]
+                        ExecutorControl::RunMaintenanceOnce { ack } => {
+                            let result = self.run_one_cleanup_or_teardown_unit();
+                            let _ = ack.send(result);
+                        }
                     }
                 }
-                _ = reaper.tick() => {
+                _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
@@ -590,18 +629,36 @@ impl HostRequestExecutor {
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
-                    // At most one process-empty teardown per maintenance tick.
+                    // While Open: at most one process-empty teardown per tick.
+                    // While Closing: advance exactly one durable host-cleanup unit.
                     // StoreError fails closed so host supervision sees unexpected exit.
-                    match ProcessEmptyTeardownWorker::run_once(&mut self.bus) {
-                        Ok(ProcessEmptyTeardown::Idle) => {}
-                        Ok(ProcessEmptyTeardown::Settled { .. }) => {
-                            self.fan_out_live_durable_events();
-                        }
-                        Err(_) => break,
+                    if self.run_one_cleanup_or_teardown_unit().is_err() {
+                        break;
                     }
                 }
             }
         }
+    }
+
+    /// Advance exactly one Open teardown or Closing cleanup unit and fan out on progress.
+    fn run_one_cleanup_or_teardown_unit(&mut self) -> Result<(), StoreError> {
+        let closing = self.bus.host_admission_is_closing()?;
+        let fan_out = if closing {
+            match HostCleanupWorker::run_once(&mut self.bus)? {
+                HostCleanupProgress::Idle => false,
+                HostCleanupProgress::Progressed { .. }
+                | HostCleanupProgress::BranchCompleted { .. } => true,
+            }
+        } else {
+            match ProcessEmptyTeardownWorker::run_once(&mut self.bus)? {
+                ProcessEmptyTeardown::Idle => false,
+                ProcessEmptyTeardown::Settled { .. } => true,
+            }
+        };
+        if fan_out {
+            self.fan_out_live_durable_events();
+        }
+        Ok(())
     }
 
     fn detach_output(&mut self, id: ConnectionOutputId) {
@@ -3780,6 +3837,164 @@ mod output_tests {
                 ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
             ),
             "HostRequestExecutor granted ConfirmHostQuit must Accept, got {granted:?}"
+        );
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_cleanup_one_unit_per_maintenance_tick_with_two_registered_outputs() {
+        use super::{ConnectionOutputId, HostRequestExecutor, OutputInspection};
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
+        };
+        use crate::domain::host::HostCleanupBranch;
+        use crate::domain::id::CommandId;
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{
+            Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
+            ProtocolVersion, ServerMessage,
+        };
+        use rusqlite::Connection;
+        use std::time::Duration;
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-tick.db");
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+
+        let id_a = Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ]);
+        let id_b = Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe2,
+        ]);
+        let (out_a, _ports_a) = ConnectionOutputHandle::with_connection_id(id_a, 2, 4, 1);
+        let (out_b, _ports_b) = ConnectionOutputHandle::with_connection_id(id_b, 2, 4, 1);
+        let _reg_a = requests.register_output(out_a).await.expect("register a");
+        let _reg_b = requests.register_output(out_b).await.expect("register b");
+        let output_id_a = ConnectionOutputId::from_uuid(id_a);
+        let output_id_b = ConnectionOutputId::from_uuid(id_b);
+        assert_ne!(output_id_a, output_id_b);
+
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe3,
+        ])
+        .expect("client");
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            limits: FrameLimits::v1_default(),
+        };
+        let confirm = requests
+            .execute(
+                negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xe4,
+                    ])
+                    .expect("cmd"),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_500,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                        inspection_id: 0,
+                        allow_uninspected_worktrees: true,
+                    }),
+                }),
+            )
+            .await
+            .expect("confirm");
+        assert!(matches!(
+            confirm,
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+        ));
+
+        fn cleanup_branches(path: &std::path::Path) -> Vec<String> {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .expect("readonly");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT branch FROM host_cleanup_branches
+                     ORDER BY
+                       CASE branch
+                         WHEN 'agent_sessions' THEN 0
+                         WHEN 'resources' THEN 1
+                         WHEN 'outstanding_effects' THEN 2
+                         WHEN 'task_teardowns' THEN 3
+                         ELSE 99
+                       END",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .map(|row| row.expect("row"))
+                .collect()
+        }
+
+        assert!(cleanup_branches(&db_path).is_empty());
+        requests.run_maintenance_once().await.expect("tick 1");
+        assert_eq!(
+            cleanup_branches(&db_path),
+            vec![HostCleanupBranch::AgentSessions.as_str().to_string()]
+        );
+        requests.run_maintenance_once().await.expect("tick 2");
+        assert_eq!(
+            cleanup_branches(&db_path),
+            vec![
+                HostCleanupBranch::AgentSessions.as_str().to_string(),
+                HostCleanupBranch::Resources.as_str().to_string(),
+            ]
+        );
+        requests.run_maintenance_once().await.expect("tick 3");
+        requests.run_maintenance_once().await.expect("tick 4");
+        assert_eq!(
+            cleanup_branches(&db_path),
+            HostCleanupBranch::ORDER
+                .iter()
+                .map(|branch| branch.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        requests.run_maintenance_once().await.expect("idle tick");
+        assert_eq!(cleanup_branches(&db_path).len(), 4);
+
+        // Wait longer than the production maintenance period without scheduling
+        // automatic ticks; only explicit invocations may advance rows.
+        tokio::time::sleep(super::SNAPSHOT_REAPER_PERIOD + Duration::from_millis(250)).await;
+        assert_eq!(cleanup_branches(&db_path).len(), 4);
+
+        let inspect_a = requests
+            .inspect_output(output_id_a)
+            .await
+            .expect("inspect a");
+        let inspect_b = requests
+            .inspect_output(output_id_b)
+            .await
+            .expect("inspect b");
+        assert_eq!(
+            inspect_a,
+            OutputInspection {
+                registered: true,
+                live_bound: false,
+            }
+        );
+        assert_eq!(
+            inspect_b,
+            OutputInspection {
+                registered: true,
+                live_bound: false,
+            }
         );
 
         drop(requests);

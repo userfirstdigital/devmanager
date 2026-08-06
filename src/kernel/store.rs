@@ -8,11 +8,11 @@ use sha2::{Digest, Sha256};
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
-    HostCloseBegunPayload, OperationAcceptedFact, OperationCancelledFact, OperationFailedFact,
-    OperationSettledFact, OperationUncertainFact, PrimaryAgentSetPayload,
-    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
-    TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload,
-    TaskUnitPayload, EVENT_SCHEMA_VERSION,
+    HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
+    OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
+    PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
+    ResourceReleasedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
+    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -217,6 +217,17 @@ impl KernelStore {
         let lease_ms = validate_dispatch_lease_ms(lease)?;
         self.with_immediate_transaction(|tx| {
             settle_next_process_empty_task_teardown_in_tx(tx, now_ms()?, lease_ms)
+        })
+    }
+
+    /// Advance one Closing host-cleanup journal unit under a bounded teardown lease.
+    pub(crate) fn advance_next_host_cleanup_unit(
+        &mut self,
+        lease: Duration,
+    ) -> Result<command_bus::HostCleanupUnit, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            command_bus::advance_next_host_cleanup_unit_in_tx(tx, now_ms()?, lease_ms)
         })
     }
 
@@ -668,7 +679,7 @@ fn detect_interrupted_partial_schema(
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
                         'agent_sessions', 'artifacts', 'resources', 'event_retention',
-                        'host_admission')",
+                        'host_admission', 'host_cleanup_branches')",
         [],
         |row| row.get(0),
     )?;
@@ -682,6 +693,7 @@ fn rebuild_projections_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, Sto
     let result = rebuild_projection_tables_tx(tx)?;
     command_bus::validate_all_rebuilt_outbox_metadata(tx)?;
     command_bus::validate_rebuilt_host_admission(tx)?;
+    command_bus::validate_rebuilt_host_cleanup_branches(tx)?;
     Ok(result)
 }
 
@@ -750,6 +762,7 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          DELETE FROM resources;\n\
          DELETE FROM operations;\n\
          DELETE FROM tasks;\n\
+         DELETE FROM host_cleanup_branches;\n\
          DELETE FROM host_admission;",
     )?;
     tx.execute_batch(
@@ -758,7 +771,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          INSERT INTO agent_sessions SELECT * FROM shadow_agent_sessions;\n\
          INSERT INTO artifacts SELECT * FROM shadow_artifacts;\n\
          INSERT INTO resources SELECT * FROM shadow_resources;\n\
-         INSERT INTO host_admission SELECT * FROM shadow_host_admission;",
+         INSERT INTO host_admission SELECT * FROM shadow_host_admission;\n\
+         INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;",
     )?;
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DROP TABLE {}", shadow_name(table)), [])?;
@@ -804,6 +818,12 @@ fn canonical_table_dump(
         ("host_admission", false) => "SELECT * FROM host_admission ORDER BY singleton_key ASC",
         ("host_admission", true) => {
             "SELECT * FROM shadow_host_admission ORDER BY singleton_key ASC"
+        }
+        ("host_cleanup_branches", false) => {
+            "SELECT * FROM host_cleanup_branches ORDER BY operation_id ASC, branch ASC"
+        }
+        ("host_cleanup_branches", true) => {
+            "SELECT * FROM shadow_host_cleanup_branches ORDER BY operation_id ASC, branch ASC"
         }
         _ => {
             return Err(StoreError::Projection(format!(
@@ -988,6 +1008,17 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             action_epoch: *action_epoch,
             inspection_id: *inspection_id,
         }),
+        Event::HostCleanupBranchCompleted {
+            operation_id,
+            action_epoch,
+            branch,
+            outcome,
+        } => rmp_serde::to_vec(&HostCleanupBranchCompletedPayload {
+            operation_id: *operation_id,
+            action_epoch: *action_epoch,
+            branch: *branch,
+            outcome: *outcome,
+        }),
         Event::OperationAccepted(fact) => rmp_serde::to_vec(fact),
         Event::OperationSettled(fact) => rmp_serde::to_vec(fact),
         Event::OperationFailed(fact) => rmp_serde::to_vec(fact),
@@ -1100,6 +1131,15 @@ pub(crate) fn decode_stored_event(
                 operation_id: p.operation_id,
                 action_epoch: p.action_epoch,
                 inspection_id: p.inspection_id,
+            }
+        }
+        "host.cleanup_branch_completed" => {
+            let p: HostCleanupBranchCompletedPayload = unpack(payload)?;
+            Event::HostCleanupBranchCompleted {
+                operation_id: p.operation_id,
+                action_epoch: p.action_epoch,
+                branch: p.branch,
+                outcome: p.outcome,
             }
         }
         "operation.accepted" => {
@@ -1676,6 +1716,15 @@ fn claim_next_dispatch_in_tx(
 }
 
 fn settle_next_process_empty_task_teardown_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+    settle_next_process_empty_task_teardown_in_tx_for_cleanup(tx, now_ms, lease_ms)
+}
+
+/// Shared process-empty teardown primitive for ordinary maintenance and host cleanup.
+pub(crate) fn settle_next_process_empty_task_teardown_in_tx_for_cleanup(
     tx: &Transaction<'_>,
     now_ms: i64,
     lease_ms: i64,
@@ -2737,7 +2786,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .expect("migration count"),
-            4,
+            i64::try_from(schema::migration_manifest().len()).expect("migration count fits i64"),
             "maintenance must not delete durable rows"
         );
     }
