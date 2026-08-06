@@ -1017,6 +1017,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             RejectionCode::UnsupportedCapability,
             "unsupported_capability",
         ),
+        (RejectionCode::Closing, "closing"),
     ]
     .into_iter()
     .enumerate()
@@ -1159,7 +1160,7 @@ fn protocol_command_receipt_rejects_alternate_or_open_shapes() {
         Err(MessagePackError::Decode)
     );
 
-    for numeric in 0_u8..=5 {
+    for numeric in 0_u8..=6 {
         let mut numeric_code = vec![0x81];
         push_messagepack(&mut numeric_code, "rejected");
         numeric_code.push(0x83);

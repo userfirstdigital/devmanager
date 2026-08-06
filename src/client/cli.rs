@@ -904,6 +904,7 @@ fn rejection_code_name(code: RejectionCode) -> &'static str {
         RejectionCode::InvalidTransition => "invalid_transition",
         RejectionCode::OwnershipConflict => "ownership_conflict",
         RejectionCode::UnsupportedCapability => "unsupported_capability",
+        RejectionCode::Closing => "closing",
     }
 }
 

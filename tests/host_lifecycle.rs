@@ -21,15 +21,21 @@ use devmanager::client::{
     HostClientConfig, SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
-use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
+};
 use devmanager::domain::id::{
-    ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId, TaskId,
+    ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId, ResourceId, TaskId,
 };
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
+use devmanager::domain::resource::{
+    OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
 use devmanager::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskLifecycle,
+    WorkspaceRef,
 };
 use devmanager::domain::{ArtifactContentRef, ArtifactFacts, ArtifactKind, ClientId, PrivacyClass};
 use devmanager::host::{
@@ -2122,6 +2128,188 @@ async fn slow_durable_reader_does_not_delay_other_client_command_receipt() {
 
     healthy.disconnect();
     slow.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::PagedSnapshots,
+    ]);
+    let client_a_id = ClientId::from_bytes(fixed_uuid_v7(0xe0)).expect("client A id");
+    let client_a_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: client_a_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client_a = connect_bounded(&client_a_config, &mut host).await;
+
+    let client_b_id = ClientId::from_bytes(fixed_uuid_v7(0xe1)).expect("client B id");
+    let client_b_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: client_b_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut client_b = connect_bounded(&client_b_config, &mut host).await;
+
+    assert_eq!(client_a.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client_b.host_boot_id(), original_identity.boot_id);
+
+    let (create, _, task_id) = create_task_named(
+        client_a_id,
+        0xe2,
+        0xe3,
+        0xe4,
+        0xe5,
+        "Closing admission barrier",
+    );
+    assert!(matches!(
+        client_a
+            .execute_command(create)
+            .await
+            .expect("client A creates task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let begin_close = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xe6)).expect("begin close command id"),
+        client_id: client_a_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_200,
+        expected_task_revision: Some(1),
+        command: Command::BeginCloseTask,
+    };
+    let close_receipt = client_a
+        .execute_command(begin_close)
+        .await
+        .expect("client A begin close");
+    let (close_operation_id, close_event_ids) = match close_receipt {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision,
+            event_ids,
+            ..
+        } => {
+            assert_eq!(
+                task_revision,
+                Some(2),
+                "begin close must advance to revision 2"
+            );
+            assert_eq!(
+                event_ids.len(),
+                1,
+                "begin close must emit exactly one decision event"
+            );
+            (operation_id, event_ids)
+        }
+        other => panic!("expected Accepted begin close, got {other:?}"),
+    };
+    assert_eq!(close_event_ids.len(), 1);
+
+    let close_state = client_a
+        .refresh_operation(close_operation_id)
+        .await
+        .expect("refresh close operation transport")
+        .expect("known close operation");
+    assert!(
+        matches!(close_state, OperationState::Accepted),
+        "close must remain Accepted before drain; got {close_state:?}"
+    );
+
+    let resource_id = ResourceId::from_bytes(fixed_uuid_v7(0xe7)).expect("resource id");
+    let register = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xe8)).expect("register command id"),
+        client_id: client_b_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_300,
+        expected_task_revision: Some(2),
+        command: Command::RegisterResource {
+            resource: ResourceFacts {
+                id: resource_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+                updated_at_ms: 1_725_000_000_300,
+            },
+        },
+    };
+    let rejected = client_b
+        .execute_command(register)
+        .await
+        .expect("client B register resource while closing");
+    assert_eq!(
+        rejected,
+        CommandReceipt::Rejected {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xe8)).expect("register command id"),
+            code: RejectionCode::Closing,
+            current_revision: Some(2),
+        }
+    );
+
+    let snapshot = client_b
+        .task_snapshot(task_id)
+        .await
+        .expect("task snapshot transport")
+        .expect("task snapshot query");
+    assert_eq!(snapshot.task.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(snapshot.task.action_epoch, 1);
+    assert_eq!(snapshot.task.revision, 2);
+
+    let resources = client_b
+        .snapshot_page(SnapshotSection::Resources, None, None)
+        .await
+        .expect("resources snapshot transport")
+        .expect("resources snapshot query");
+    assert!(
+        !resources.items.iter().any(|item| matches!(
+            item,
+            SnapshotItem::Resource(facts) if facts.id == resource_id
+        )),
+        "rejected resource must be absent from durable resources"
+    );
+    client_b
+        .release_snapshot(resources.snapshot_id)
+        .await
+        .expect("release resources snapshot transport")
+        .expect("release resources snapshot");
+
+    let close_state_after = client_a
+        .refresh_operation(close_operation_id)
+        .await
+        .expect("refresh close operation after rejection")
+        .expect("known close operation after rejection");
+    assert!(
+        matches!(close_state_after, OperationState::Accepted),
+        "close must remain Accepted after rejected registration; got {close_state_after:?}"
+    );
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    assert!(paths.database.exists());
+
+    client_a.disconnect();
+    client_b.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

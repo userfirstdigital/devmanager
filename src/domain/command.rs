@@ -25,6 +25,7 @@ pub enum RejectionCode {
     InvalidTransition,
     OwnershipConflict,
     UnsupportedCapability,
+    Closing,
 }
 
 impl<'de> Deserialize<'de> for RejectionCode {
@@ -52,6 +53,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                     "invalid_transition" => Ok(RejectionCode::InvalidTransition),
                     "ownership_conflict" => Ok(RejectionCode::OwnershipConflict),
                     "unsupported_capability" => Ok(RejectionCode::UnsupportedCapability),
+                    "closing" => Ok(RejectionCode::Closing),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -61,6 +63,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                             "invalid_transition",
                             "ownership_conflict",
                             "unsupported_capability",
+                            "closing",
                         ],
                     )),
                 }
@@ -909,6 +912,7 @@ fn require_runtime_capable_task<'a>(
     let snap = require_task(snapshot, envelope)?;
     match snap.task.lifecycle {
         TaskLifecycle::Open => Ok(snap),
-        TaskLifecycle::Closing | TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+        TaskLifecycle::Closing => Err(RejectionCode::Closing),
+        TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
     }
 }
