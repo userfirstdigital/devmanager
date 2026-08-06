@@ -23,7 +23,7 @@ use crate::protocol::{
 
 use super::connection::{
     dispatch_authenticated_request, ConnectionOutputHandle, HostRequestHandle,
-    HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
+    HOST_DURABLE_OUTPUT_QUEUE_CAPACITY, HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
 };
 
 const PIPE_PRODUCT_PREFIX: &str = r"\\.\pipe\devmanager-";
@@ -648,8 +648,11 @@ async fn windows_serve_duplex(
         ..
     } = connection;
     let (mut reader, mut writer) = tokio::io::split(pipe);
-    let (output, mut ports) =
-        ConnectionOutputHandle::new(critical_capacity, HOST_DURABLE_OUTPUT_QUEUE_CAPACITY);
+    let (output, mut ports) = ConnectionOutputHandle::new(
+        critical_capacity,
+        HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
+        HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
+    );
     let reader_output = output.clone();
     let mut reader_shutdown = output.subscribe_shutdown();
     let registration = requests.register_output(output).await?;

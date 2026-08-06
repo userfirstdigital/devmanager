@@ -8,6 +8,7 @@ use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::SubscriptionId;
 use crate::domain::query::{QueryEnvelope, QueryReply};
+use crate::protocol::stream::StreamFrame;
 
 /// One client-initiated request on an authenticated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +118,7 @@ pub enum ServerMessage {
         last_delivered_sequence: u64,
         newest_sequence: u64,
     },
+    Stream(StreamFrame),
 }
 
 struct DurableEventPayloadRef<'a> {
@@ -186,6 +188,7 @@ impl Serialize for ServerMessage {
                     newest_sequence: *newest_sequence,
                 },
             )?,
+            Self::Stream(frame) => map.serialize_entry("stream", frame)?,
         }
         map.end()
     }
@@ -196,6 +199,7 @@ enum ServerMessageVariant {
     QueryReply,
     DurableEvent,
     ResyncRequired,
+    Stream,
 }
 
 impl<'de> Deserialize<'de> for ServerMessageVariant {
@@ -209,8 +213,9 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
             type Value = ServerMessageVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter
-                    .write_str("command_receipt, query_reply, durable_event, or resync_required")
+                formatter.write_str(
+                    "command_receipt, query_reply, durable_event, resync_required, or stream",
+                )
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -222,6 +227,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                     "query_reply" => Ok(ServerMessageVariant::QueryReply),
                     "durable_event" => Ok(ServerMessageVariant::DurableEvent),
                     "resync_required" => Ok(ServerMessageVariant::ResyncRequired),
+                    "stream" => Ok(ServerMessageVariant::Stream),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -229,6 +235,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                             "query_reply",
                             "durable_event",
                             "resync_required",
+                            "stream",
                         ],
                     )),
                 }
@@ -481,6 +488,7 @@ impl<'de> Deserialize<'de> for ServerMessage {
                             newest_sequence: payload.newest_sequence,
                         }
                     }
+                    ServerMessageVariant::Stream => ServerMessage::Stream(map.next_value()?),
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(

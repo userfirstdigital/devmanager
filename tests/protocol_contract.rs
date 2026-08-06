@@ -6,17 +6,17 @@ use devmanager::domain::{
     CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
     CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage, OperationErrorCode,
     OperationId, OperationState, OperationUncertaintyCode, ProjectId, Query, QueryEnvelope,
-    QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ReviewReadiness,
-    SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskId,
-    WorkspaceRef,
+    QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ResourceId,
+    ReviewReadiness, SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+    TaskId, WorkspaceRef,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
     FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError,
     MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint,
-    ProtocolVersion, ServerMessage, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
-    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
+    VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
+    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 #[test]
@@ -2202,6 +2202,415 @@ fn protocol_server_message_unsolicited_variants_are_strict_named_maps() {
         ),
         Err(MessagePackError::Decode),
         "ServerMessage must reject multiple top-level variants"
+    );
+}
+
+fn protocol_resource_id(tail: u8) -> ResourceId {
+    ResourceId::from_bytes(protocol_uuid_v7(tail)).expect("resource id")
+}
+
+fn protocol_stream_frame(kind: u16) -> StreamFrame {
+    StreamFrame {
+        subscription_id: protocol_subscription_id(0xe1),
+        stream: StreamKey::from(protocol_resource_id(0xe2)),
+        generation: 3,
+        sequence: 9,
+        payload_kind: StreamPayloadKind::new(kind).expect("nonzero kind"),
+        schema_version: 1,
+        payload: b"ephemeral-state".to_vec(),
+    }
+}
+
+#[test]
+fn stream_frame_and_server_message_stream_round_trip_named_map() {
+    // Catches: StreamFrame / ServerMessage::Stream must be a strict seven-field
+    // named map under outer wire key exactly "stream".
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let frame = protocol_stream_frame(7);
+    let message = ServerMessage::Stream(frame.clone());
+    let encoded = codec.encode(&message).expect("encode stream");
+    assert_eq!(encoded[0], 0x81, "ServerMessage::Stream is a one-entry map");
+    assert_eq!(
+        &codec
+            .decode::<ServerMessage>(&encoded)
+            .expect("decode stream"),
+        &message
+    );
+
+    struct StreamProbe {
+        subscription_id: SubscriptionId,
+        stream: StreamKey,
+        generation: u64,
+        sequence: u64,
+        payload_kind: StreamPayloadKind,
+        schema_version: u16,
+        payload: Vec<u8>,
+    }
+    impl serde::Serialize for StreamProbe {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            struct Bin<'a>(&'a [u8]);
+            impl serde::Serialize for Bin<'_> {
+                fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+                where
+                    Ser: serde::Serializer,
+                {
+                    serializer.serialize_bytes(self.0)
+                }
+            }
+            let mut map = serializer.serialize_map(Some(7))?;
+            map.serialize_entry("subscription_id", &self.subscription_id)?;
+            map.serialize_entry("stream", &self.stream)?;
+            map.serialize_entry("generation", &self.generation)?;
+            map.serialize_entry("sequence", &self.sequence)?;
+            map.serialize_entry("payload_kind", &self.payload_kind)?;
+            map.serialize_entry("schema_version", &self.schema_version)?;
+            map.serialize_entry("payload", &Bin(&self.payload))?;
+            map.end()
+        }
+    }
+    struct OuterStream {
+        inner: StreamProbe,
+    }
+    impl serde::Serialize for OuterStream {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("stream", &self.inner)?;
+            map.end()
+        }
+    }
+    let probe = codec
+        .encode(&OuterStream {
+            inner: StreamProbe {
+                subscription_id: frame.subscription_id,
+                stream: frame.stream,
+                generation: frame.generation,
+                sequence: frame.sequence,
+                payload_kind: frame.payload_kind,
+                schema_version: frame.schema_version,
+                payload: frame.payload.clone(),
+            },
+        })
+        .expect("encode probe");
+    assert_eq!(
+        probe, encoded,
+        "stable outer key must be exactly `stream` with seven named inner fields"
+    );
+}
+
+#[test]
+fn stream_frame_rejects_zero_payload_kind_and_malformed_payloads() {
+    // Catches: zero payload_kind and missing/duplicate/unknown/positional stream
+    // payloads must fail closed at construction/deserialization.
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    assert!(
+        StreamPayloadKind::new(0).is_none(),
+        "zero StreamPayloadKind must be rejected at construction"
+    );
+
+    struct BinPayload(Vec<u8>);
+    impl serde::Serialize for BinPayload {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+
+    struct StreamPayloadRaw {
+        subscription_id: SubscriptionId,
+        stream: StreamKey,
+        generation: u64,
+        sequence: u64,
+        payload_kind: u16,
+        schema_version: u16,
+        payload: BinPayload,
+    }
+    impl serde::Serialize for StreamPayloadRaw {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(7))?;
+            map.serialize_entry("subscription_id", &self.subscription_id)?;
+            map.serialize_entry("stream", &self.stream)?;
+            map.serialize_entry("generation", &self.generation)?;
+            map.serialize_entry("sequence", &self.sequence)?;
+            map.serialize_entry("payload_kind", &self.payload_kind)?;
+            map.serialize_entry("schema_version", &self.schema_version)?;
+            map.serialize_entry("payload", &self.payload)?;
+            map.end()
+        }
+    }
+    struct StreamMessageRaw {
+        inner: StreamPayloadRaw,
+    }
+    impl serde::Serialize for StreamMessageRaw {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("stream", &self.inner)?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(
+            &rmp_serde::to_vec_named(&StreamMessageRaw {
+                inner: StreamPayloadRaw {
+                    subscription_id: protocol_subscription_id(0xe3),
+                    stream: StreamKey::from(protocol_resource_id(0xe4)),
+                    generation: 1,
+                    sequence: 2,
+                    payload_kind: 0,
+                    schema_version: 1,
+                    payload: BinPayload(b"x".to_vec()),
+                }
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "zero payload_kind must be rejected on the wire"
+    );
+
+    #[derive(serde::Serialize)]
+    struct MissingStreamPayload {
+        subscription_id: SubscriptionId,
+        stream: StreamKey,
+        generation: u64,
+        sequence: u64,
+        payload_kind: u16,
+        schema_version: u16,
+    }
+    struct MissingStream;
+    impl serde::Serialize for MissingStream {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "stream",
+                &MissingStreamPayload {
+                    subscription_id: protocol_subscription_id(0xe5),
+                    stream: StreamKey::from(protocol_resource_id(0xe6)),
+                    generation: 1,
+                    sequence: 1,
+                    payload_kind: 1,
+                    schema_version: 1,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(&rmp_serde::to_vec_named(&MissingStream).unwrap()),
+        Err(MessagePackError::Decode),
+        "stream must reject missing payload field"
+    );
+
+    struct OpenStreamPayload {
+        subscription_id: SubscriptionId,
+        stream: StreamKey,
+        generation: u64,
+        sequence: u64,
+        payload_kind: u16,
+        schema_version: u16,
+        payload: BinPayload,
+        future_field: bool,
+    }
+    impl serde::Serialize for OpenStreamPayload {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(8))?;
+            map.serialize_entry("subscription_id", &self.subscription_id)?;
+            map.serialize_entry("stream", &self.stream)?;
+            map.serialize_entry("generation", &self.generation)?;
+            map.serialize_entry("sequence", &self.sequence)?;
+            map.serialize_entry("payload_kind", &self.payload_kind)?;
+            map.serialize_entry("schema_version", &self.schema_version)?;
+            map.serialize_entry("payload", &self.payload)?;
+            map.serialize_entry("future_field", &self.future_field)?;
+            map.end()
+        }
+    }
+    struct OpenStream;
+    impl serde::Serialize for OpenStream {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "stream",
+                &OpenStreamPayload {
+                    subscription_id: protocol_subscription_id(0xe7),
+                    stream: StreamKey::from(protocol_resource_id(0xe8)),
+                    generation: 1,
+                    sequence: 1,
+                    payload_kind: 1,
+                    schema_version: 1,
+                    payload: BinPayload(b"x".to_vec()),
+                    future_field: true,
+                },
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(&rmp_serde::to_vec_named(&OpenStream).unwrap()),
+        Err(MessagePackError::Decode),
+        "stream must reject unknown payload fields"
+    );
+
+    // Explicit array-payload rejection with otherwise-valid fields.
+    {
+        use serde::ser::SerializeMap;
+        struct ArrayPayloadStream;
+        impl serde::Serialize for ArrayPayloadStream {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Inner;
+                impl serde::Serialize for Inner {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        let mut map = serializer.serialize_map(Some(7))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xed))?;
+                        map.serialize_entry(
+                            "stream",
+                            &StreamKey::from(protocol_resource_id(0xee)),
+                        )?;
+                        map.serialize_entry("generation", &1u64)?;
+                        map.serialize_entry("sequence", &1u64)?;
+                        map.serialize_entry("payload_kind", &1u16)?;
+                        map.serialize_entry("schema_version", &1u16)?;
+                        map.serialize_entry("payload", &vec![0x61u8])?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("stream", &Inner)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<ServerMessage>(&rmp_serde::to_vec_named(&ArrayPayloadStream).unwrap()),
+            Err(MessagePackError::Decode),
+            "stream payload must reject MessagePack array bytes"
+        );
+    }
+
+    let valid_stream = protocol_stream_frame(1);
+    let valid_message = ServerMessage::Stream(valid_stream.clone());
+    let mut duplicate = codec.encode(&valid_message).expect("valid stream bytes");
+    // Outer one-entry map, then "stream" key, then seven-field inner map marker.
+    assert_eq!(duplicate[0], 0x81);
+    let stream_key = rmp_serde::to_vec("stream").expect("stream key");
+    assert_eq!(&duplicate[1..1 + stream_key.len()], stream_key.as_slice());
+    let inner_offset = 1 + stream_key.len();
+    assert_eq!(
+        duplicate[inner_offset], 0x87,
+        "StreamFrame inner map must declare seven fields"
+    );
+    duplicate[inner_offset] = 0x88;
+    push_messagepack(&mut duplicate, "generation");
+    push_messagepack(&mut duplicate, &99u64);
+    assert_eq!(
+        codec.decode::<ServerMessage>(&duplicate),
+        Err(MessagePackError::Decode),
+        "stream must reject duplicate fields"
+    );
+
+    #[derive(serde::Serialize)]
+    struct PositionalStream(SubscriptionId, StreamKey, u64, u64, u16, u16, Vec<u8>);
+    struct PositionalStreamMessage;
+    impl serde::Serialize for PositionalStreamMessage {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(
+                "stream",
+                &PositionalStream(
+                    protocol_subscription_id(0xeb),
+                    StreamKey::from(protocol_resource_id(0xec)),
+                    1,
+                    1,
+                    1,
+                    1,
+                    b"x".to_vec(),
+                ),
+            )?;
+            map.end()
+        }
+    }
+    assert_eq!(
+        codec.decode::<ServerMessage>(&rmp_serde::to_vec_named(&PositionalStreamMessage).unwrap()),
+        Err(MessagePackError::Decode),
+        "stream must reject positional payload forms"
+    );
+}
+
+#[test]
+fn stream_frame_large_binary_payload_round_trips_without_collection_ceiling() {
+    // Catches: StreamFrame.payload must be MessagePack binary bytes, not an array,
+    // so the codec collection preflight cannot impose a 1000-byte payload limit.
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let payload = vec![0x5a; 4096];
+    let frame = StreamFrame {
+        subscription_id: protocol_subscription_id(0xf1),
+        stream: StreamKey::from(protocol_resource_id(0xf2)),
+        generation: 1,
+        sequence: 1,
+        payload_kind: StreamPayloadKind::new(1).expect("kind"),
+        schema_version: 1,
+        payload: payload.clone(),
+    };
+    let message = ServerMessage::Stream(frame.clone());
+    let encoded = codec
+        .encode(&message)
+        .expect("4096-byte stream payload must encode");
+    let decoded = codec
+        .decode::<ServerMessage>(&encoded)
+        .expect("4096-byte stream payload must decode");
+    assert_eq!(decoded, message);
+
+    // Locate the payload field value marker after the "payload" key.
+    let payload_key = rmp_serde::to_vec("payload").expect("payload key");
+    let key_at = encoded
+        .windows(payload_key.len())
+        .position(|window| window == payload_key.as_slice())
+        .expect("encoded stream must contain payload key");
+    let marker = encoded[key_at + payload_key.len()];
+    assert!(
+        matches!(marker, 0xc4 | 0xc5 | 0xc6),
+        "payload must be MessagePack binary (bin8/bin16/bin32), got marker 0x{marker:02x}"
+    );
+    assert!(
+        !matches!(marker, 0x90..=0x9f | 0xdc | 0xdd),
+        "payload must not be a MessagePack array"
     );
 }
 

@@ -23,11 +23,12 @@ use crate::host::{
 };
 use crate::protocol::{
     ClientHello, ClientRequest, FrameLimits, MessagePackCodec, PhysicalFrameCodec, ServerHello,
-    ServerMessage, MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
+    ServerMessage, StreamFrame, MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
 
 const WRITE_QUEUE_CAPACITY: usize = 32;
 const UNSOLICITED_QUEUE_CAPACITY: usize = 64;
+const UNSOLICITED_STREAM_CAPACITY: usize = 16;
 
 /// Unsolicited server→client messages (not correlated replies).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,132 @@ pub enum UnsolicitedServerMessage {
         last_delivered_sequence: u64,
         newest_sequence: u64,
     },
+    Stream(StreamFrame),
+}
+
+/// Durable-priority unsolicited inbox with a separate coalescing stream lane.
+struct UnsolicitedInbox {
+    durable_tx: mpsc::Sender<UnsolicitedServerMessage>,
+    durable_rx: tokio::sync::Mutex<mpsc::Receiver<UnsolicitedServerMessage>>,
+    stream_capacity: usize,
+    streams: Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+    notify: tokio::sync::Notify,
+    closed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    close_gap_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl UnsolicitedInbox {
+    fn new(durable_capacity: usize, stream_capacity: usize) -> Self {
+        let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
+        Self {
+            durable_tx,
+            durable_rx: tokio::sync::Mutex::new(durable_rx),
+            stream_capacity: stream_capacity.max(1),
+            streams: Mutex::new(std::collections::HashMap::new()),
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            close_gap_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(durable_capacity: usize, stream_capacity: usize) -> Self {
+        Self::new(durable_capacity, stream_capacity)
+    }
+
+    #[cfg(test)]
+    fn install_close_gap_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.close_gap_hook.lock().expect("close gap hook") = Some(hook);
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake existing waiters and leave a permit for a waiter that races in
+        // after the closed store but before registration.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+
+    fn push_durable(&self, message: UnsolicitedServerMessage) -> Result<(), IpcError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(IpcError::Unavailable);
+        }
+        match message {
+            UnsolicitedServerMessage::DurableEvent { .. }
+            | UnsolicitedServerMessage::ResyncRequired { .. } => {}
+            UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
+        }
+        self.durable_tx
+            .try_send(message)
+            .map_err(|_| IpcError::Unavailable)?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn push_stream(&self, frame: StreamFrame) -> Result<(), IpcError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(IpcError::Unavailable);
+        }
+        let key = frame.stream;
+        let mut streams = self.streams.lock().expect("stream inbox");
+        if streams.contains_key(&key) || streams.len() < self.stream_capacity {
+            streams.insert(key, frame);
+            drop(streams);
+            self.notify.notify_one();
+        }
+        // Saturated for a new key: drop without failing I/O.
+        Ok(())
+    }
+
+    fn try_dequeue(
+        durable: &mut mpsc::Receiver<UnsolicitedServerMessage>,
+        streams: &Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+    ) -> Option<UnsolicitedServerMessage> {
+        if let Ok(message) = durable.try_recv() {
+            return Some(message);
+        }
+        let mut streams = streams.lock().expect("stream inbox");
+        let key = streams.keys().next().copied();
+        key.and_then(|key| streams.remove(&key))
+            .map(UnsolicitedServerMessage::Stream)
+    }
+
+    async fn recv(&self) -> Result<UnsolicitedServerMessage, IpcError> {
+        // Serialize durable-receiver ownership across the whole recv loop so a
+        // concurrent caller cannot miss a queued durable via try_lock and then
+        // sleep on a consumed Notify permit.
+        let mut durable = self.durable_rx.lock().await;
+        loop {
+            if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+                return Ok(message);
+            }
+
+            // Register before rechecking closed/queues so close cannot be lost.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+                return Ok(message);
+            }
+
+            #[cfg(test)]
+            if let Some(hook) = self.close_gap_hook.lock().expect("close gap hook").take() {
+                hook();
+            }
+
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(message) = Self::try_dequeue(&mut durable, &self.streams) {
+                    return Ok(message);
+                }
+                return Err(IpcError::Unavailable);
+            }
+
+            notified.await;
+        }
+    }
 }
 
 enum PendingKind {
@@ -203,7 +330,7 @@ struct SharedConnection {
     server_hello: ServerHello,
     state: Arc<Mutex<SharedState>>,
     write_tx: mpsc::Sender<WriteJob>,
-    unsolicited_rx: tokio::sync::Mutex<mpsc::Receiver<UnsolicitedServerMessage>>,
+    unsolicited: Arc<UnsolicitedInbox>,
     io_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -271,10 +398,9 @@ impl ClientConnection {
         reply_rx.await.map_err(|_| IpcError::Unavailable)?
     }
 
-    /// Receive the next unsolicited durable/resync message.
+    /// Receive the next unsolicited message, preferring durable/resync over streams.
     pub async fn recv_unsolicited(&self) -> Result<UnsolicitedServerMessage, IpcError> {
-        let mut rx = self.shared.unsolicited_rx.lock().await;
-        rx.recv().await.ok_or(IpcError::Unavailable)
+        self.shared.unsolicited.recv().await
     }
 
     fn register_waiter(
@@ -444,12 +570,16 @@ fn spawn_duplex_supervisor(
 ) -> ClientConnection {
     let (mut reader, mut writer) = tokio::io::split(pipe);
     let (write_tx, mut write_rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_CAPACITY);
-    let (unsolicited_tx, unsolicited_rx) =
-        mpsc::channel::<UnsolicitedServerMessage>(UNSOLICITED_QUEUE_CAPACITY);
+    let unsolicited = Arc::new(UnsolicitedInbox::new(
+        UNSOLICITED_QUEUE_CAPACITY,
+        UNSOLICITED_STREAM_CAPACITY,
+    ));
 
     let state = Arc::new(Mutex::new(SharedState::default()));
     let reader_state = Arc::clone(&state);
     let terminal_state = Arc::clone(&state);
+    let reader_unsolicited = Arc::clone(&unsolicited);
+    let terminal_unsolicited = Arc::clone(&unsolicited);
     let io_task = tokio::spawn(async move {
         let writer = async move {
             while let Some(job) = write_rx.recv().await {
@@ -478,11 +608,12 @@ fn spawn_duplex_supervisor(
                 let server_message = message
                     .decode::<ServerMessage>(&payload)
                     .map_err(IpcError::MessagePack)?;
-                dispatch_server_message(&reader_state, &unsolicited_tx, server_message).await?;
+                dispatch_server_message(&reader_state, &reader_unsolicited, server_message).await?;
             }
         };
 
         let _ = supervise_duplex_halves(reader, writer).await;
+        terminal_unsolicited.close();
         poison_mutex(&terminal_state);
     });
 
@@ -492,7 +623,7 @@ fn spawn_duplex_supervisor(
             server_hello,
             state,
             write_tx,
-            unsolicited_rx: tokio::sync::Mutex::new(unsolicited_rx),
+            unsolicited,
             io_task: Mutex::new(Some(io_task)),
         }),
     }
@@ -500,7 +631,7 @@ fn spawn_duplex_supervisor(
 
 async fn dispatch_server_message(
     state: &Arc<Mutex<SharedState>>,
-    unsolicited_tx: &mpsc::Sender<UnsolicitedServerMessage>,
+    unsolicited: &UnsolicitedInbox,
     message: ServerMessage,
 ) -> Result<(), IpcError> {
     match message {
@@ -535,23 +666,20 @@ async fn dispatch_server_message(
         ServerMessage::DurableEvent {
             subscription_id,
             event,
-        } => unsolicited_tx
-            .try_send(UnsolicitedServerMessage::DurableEvent {
-                subscription_id,
-                event,
-            })
-            .map_err(|_| IpcError::Unavailable),
+        } => unsolicited.push_durable(UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event,
+        }),
         ServerMessage::ResyncRequired {
             subscription_id,
             last_delivered_sequence,
             newest_sequence,
-        } => unsolicited_tx
-            .try_send(UnsolicitedServerMessage::ResyncRequired {
-                subscription_id,
-                last_delivered_sequence,
-                newest_sequence,
-            })
-            .map_err(|_| IpcError::Unavailable),
+        } => unsolicited.push_durable(UnsolicitedServerMessage::ResyncRequired {
+            subscription_id,
+            last_delivered_sequence,
+            newest_sequence,
+        }),
+        ServerMessage::Stream(frame) => unsolicited.push_stream(frame),
     }
 }
 
@@ -651,7 +779,9 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use super::{PendingKey, PendingRegistration, PendingReply, SharedState};
+    use super::{
+        PendingKey, PendingRegistration, PendingReply, SharedState, UnsolicitedServerMessage,
+    };
     use crate::domain::command::CommandReceipt;
     use crate::domain::id::CommandId;
     use crate::host::IpcError;
@@ -730,5 +860,184 @@ mod tests {
                 .is_cancelled(),
             "timed-out connection I/O must be cancelled"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_saturated_ephemeral_lane_preserves_durable_dispatch_and_priority() {
+        // Catches: new-key-at-capacity must drop without failing I/O; durable remains
+        // admissible and preferred; retained stream keeps latest coalesced payload.
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, ResourceId, SubscriptionId};
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let inbox = UnsolicitedInbox::new_for_test(2, 1);
+        let key_a = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x71,
+            ])
+            .expect("resource a"),
+        );
+        let key_b = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x75,
+            ])
+            .expect("resource b"),
+        );
+        let sub = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x72,
+        ])
+        .expect("sub");
+        let frame = |stream: StreamKey, marker: u8| StreamFrame {
+            subscription_id: sub,
+            stream,
+            generation: 1,
+            sequence: u64::from(marker),
+            payload_kind: StreamPayloadKind::new(1).expect("kind"),
+            schema_version: 1,
+            payload: vec![marker],
+        };
+
+        inbox
+            .push_stream(frame(key_a, 1))
+            .expect("first stream admits");
+        inbox
+            .push_stream(frame(key_a, 2))
+            .expect("same-key coalesce must not fail closed");
+        inbox
+            .push_stream(frame(key_b, 9))
+            .expect("distinct key at capacity must drop without failing I/O");
+
+        let durable = UnsolicitedServerMessage::DurableEvent {
+            subscription_id: SubscriptionId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x73,
+            ])
+            .expect("sub"),
+            event: DomainEvent {
+                id: EventId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x74,
+                ])
+                .expect("event"),
+                task_id: None,
+                sequence: 9,
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: Event::TaskReopened,
+            },
+        };
+        inbox
+            .push_durable(durable.clone())
+            .expect("durable must still admit after ephemeral capacity drop");
+
+        let first = inbox.recv().await.expect("recv durable first");
+        assert_eq!(first, durable);
+        let second = inbox.recv().await.expect("recv retained stream A");
+        match second {
+            UnsolicitedServerMessage::Stream(got) => {
+                assert_eq!(got.stream, key_a);
+                assert_eq!(got.payload, vec![2], "retained A must keep latest coalesce");
+            }
+            other => panic!("expected stream A after durable, got {other:?}"),
+        }
+        let third = tokio::time::timeout(Duration::from_millis(50), inbox.recv()).await;
+        assert!(
+            third.is_err(),
+            "dropped key B must never appear in the stream lane"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_concurrent_recv_drains_two_queued_durables_without_hang() {
+        // Catches: concurrent recv must serialize on the durable receiver so a
+        // try_lock miss cannot consume the Notify permit and hang while durables
+        // remain queued.
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(4, 1));
+        let durable = |tail: u8| UnsolicitedServerMessage::DurableEvent {
+            subscription_id: SubscriptionId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x80,
+            ])
+            .expect("sub"),
+            event: DomainEvent {
+                id: EventId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, tail,
+                ])
+                .expect("event"),
+                task_id: None,
+                sequence: u64::from(tail),
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: Event::TaskReopened,
+            },
+        };
+        let first = durable(0x81);
+        let second = durable(0x82);
+        inbox
+            .push_durable(first.clone())
+            .expect("queue first durable");
+        inbox
+            .push_durable(second.clone())
+            .expect("queue second durable");
+
+        let left = Arc::clone(&inbox);
+        let right = Arc::clone(&inbox);
+        let left_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), left.recv()).await
+        });
+        let right_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), right.recv()).await
+        });
+
+        let left_result = left_task
+            .await
+            .expect("left join")
+            .expect("left recv timed out / hung despite queued durables")
+            .expect("left recv");
+        let right_result = right_task
+            .await
+            .expect("right join")
+            .expect("right recv timed out / hung despite queued durables")
+            .expect("right recv");
+
+        let mut got = [left_result, right_result];
+        got.sort_by_key(|message| match message {
+            UnsolicitedServerMessage::DurableEvent { event, .. } => event.sequence,
+            _ => u64::MAX,
+        });
+        assert_eq!(got[0], first);
+        assert_eq!(got[1], second);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_close_during_recv_wait_returns_unavailable_without_hang() {
+        // Catches: close between empty-queue check and waiter registration must not
+        // lose the notification and hang recv forever.
+        use super::UnsolicitedInbox;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(2, 1));
+        let closer = Arc::clone(&inbox);
+        inbox.install_close_gap_hook(Box::new(move || closer.close()));
+
+        let recv = tokio::time::timeout(Duration::from_millis(200), inbox.recv()).await;
+        match recv {
+            Ok(Err(IpcError::Unavailable)) => {}
+            Ok(Ok(other)) => panic!("expected Unavailable after close, got {other:?}"),
+            Ok(Err(other)) => panic!("expected Unavailable, got {other:?}"),
+            Err(_) => panic!("recv hung after close in the former check/wait gap"),
+        }
     }
 }

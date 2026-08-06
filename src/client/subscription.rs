@@ -8,7 +8,7 @@ use crate::domain::id::{SnapshotId, SubscriptionId};
 use crate::domain::query::QueryError;
 use crate::domain::snapshot::SnapshotSection;
 use crate::host::IpcError;
-use crate::protocol::Capability;
+use crate::protocol::{Capability, StreamFrame};
 
 const SNAPSHOT_SECTIONS: [SnapshotSection; 5] = [
     SnapshotSection::Tasks,
@@ -35,6 +35,7 @@ pub enum SubscriptionUpdate {
         last_delivered_sequence: u64,
         newest_sequence: u64,
     },
+    Stream(StreamFrame),
 }
 
 #[derive(Debug)]
@@ -341,6 +342,7 @@ impl ClientSubscription {
                     newest_sequence,
                 })
             }
+            UnsolicitedServerMessage::Stream(frame) => Ok(SubscriptionUpdate::Stream(frame)),
         }
     }
 
@@ -499,5 +501,38 @@ mod tests {
             other => panic!("expected ForeignSubscription, got {other:?}"),
         }
         assert_eq!(sub.state(), ClientSubscriptionState::NeedsResync);
+    }
+
+    #[test]
+    fn stream_frame_is_surfaced_without_mutating_durable_model_cursor_or_state() {
+        // Catches: ServerMessage::Stream / UnsolicitedServerMessage::Stream must
+        // surface via SubscriptionUpdate::Stream without durable model/cursor
+        // mutation, durable subscription-id matching, or NeedsResync.
+        use crate::domain::id::ResourceId;
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let mut sub = ready_subscription();
+        let own = sub.subscription_id.expect("own");
+        let cursor_before = sub.model().expect("model").last_applied_sequence();
+        let foreign_sub = SubscriptionId::from_bytes(fixed_uuid_v7(0xc0)).expect("foreign");
+        assert_ne!(own, foreign_sub);
+        let frame = StreamFrame {
+            subscription_id: foreign_sub,
+            stream: StreamKey::from(ResourceId::from_bytes(fixed_uuid_v7(0xc1)).expect("resource")),
+            generation: 2,
+            sequence: 8,
+            payload_kind: StreamPayloadKind::new(3).expect("kind"),
+            schema_version: 1,
+            payload: b"live".to_vec(),
+        };
+        let update = sub
+            .handle_unsolicited_message(UnsolicitedServerMessage::Stream(frame.clone()))
+            .expect("stream must surface without fail-closed durable matching");
+        assert_eq!(update, SubscriptionUpdate::Stream(frame));
+        assert_eq!(sub.state(), ClientSubscriptionState::Ready);
+        assert_eq!(
+            sub.model().expect("model").last_applied_sequence(),
+            cursor_before
+        );
     }
 }

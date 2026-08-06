@@ -4,6 +4,7 @@ mod capabilities;
 mod envelope;
 mod frame;
 mod request;
+mod stream;
 
 pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
@@ -21,3 +22,4 @@ pub use frame::{
     MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
 pub use request::{ClientRequest, ServerMessage};
+pub use stream::{StreamFrame, StreamKey, StreamPayloadKind};

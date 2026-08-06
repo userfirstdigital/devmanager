@@ -6,9 +6,9 @@
 //! them in arrival order. The executor also owns the bounded SnapshotSession
 //! and EventReplaySession registries for paged snapshot and event-replay queries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
@@ -25,7 +25,9 @@ use crate::domain::ClientId;
 use crate::kernel::{
     CommandBus, EventReplaySession, ReplayError, SnapshotError, SnapshotSession, StoreError,
 };
-use crate::protocol::{Capability, ClientRequest, NegotiatedParameters, ServerMessage};
+use crate::protocol::{
+    Capability, ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
+};
 
 use super::ipc::IpcError;
 
@@ -37,6 +39,9 @@ pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
 
 /// Default durable event output lane capacity for one duplex connection.
 pub(crate) const HOST_DURABLE_OUTPUT_QUEUE_CAPACITY: usize = 32;
+
+/// Default ephemeral stream output lane capacity for one duplex connection.
+pub(crate) const HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 const MAX_SNAPSHOT_SESSIONS: usize = 32;
 const SNAPSHOT_IDLE_TTL: Duration = Duration::from_secs(30);
@@ -364,7 +369,7 @@ impl EventReplayRegistry {
 /// a pipe/writer/reader/task alive after connection shutdown.
 pub(crate) struct ConnectionOutputRegistration {
     id: ConnectionOutputId,
-    shutdown: watch::Sender<bool>,
+    output: ConnectionOutputHandle,
     control_tx: mpsc::Sender<ExecutorControl>,
 }
 
@@ -376,7 +381,7 @@ impl ConnectionOutputRegistration {
 
 impl Drop for ConnectionOutputRegistration {
     fn drop(&mut self) {
-        let _ = self.shutdown.send_replace(true);
+        self.output.request_shutdown();
         let _ = self
             .control_tx
             .try_send(ExecutorControl::UnregisterOutput { id: self.id });
@@ -411,12 +416,11 @@ impl HostRequestHandle {
         output: ConnectionOutputHandle,
     ) -> Result<ConnectionOutputRegistration, IpcError> {
         let id = output.id();
-        let shutdown = output.shutdown_sender();
         // Arm before any await: cancel must not leave an inserted output without
-        // a shutdown owner.
+        // a shutdown owner. Shutdown goes through the handle's synchronized path.
         let registration = ConnectionOutputRegistration {
             id,
-            shutdown,
+            output: output.clone(),
             control_tx: self.control_tx.clone(),
         };
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -1292,6 +1296,7 @@ impl DurableOutbound {
 pub(crate) enum PrioritizedOutbound {
     Critical(CriticalOutbound),
     Durable(DurableOutbound),
+    Ephemeral(EphemeralOutbound),
 }
 
 impl PrioritizedOutbound {
@@ -1299,6 +1304,10 @@ impl PrioritizedOutbound {
         match self {
             Self::Critical(outbound) => &outbound.message,
             Self::Durable(outbound) => &outbound.message,
+            Self::Ephemeral(outbound) => outbound
+                .message
+                .as_ref()
+                .expect("message() requires should_write"),
         }
     }
 
@@ -1306,6 +1315,7 @@ impl PrioritizedOutbound {
         match self {
             Self::Critical(_) => true,
             Self::Durable(outbound) => outbound.is_current(),
+            Self::Ephemeral(outbound) => outbound.should_write(),
         }
     }
 
@@ -1313,7 +1323,7 @@ impl PrioritizedOutbound {
     pub(crate) fn prepare_for_write(&mut self) {
         match self {
             Self::Critical(outbound) => outbound.prepare_for_write(),
-            Self::Durable(_) => {}
+            Self::Durable(_) | Self::Ephemeral(_) => {}
         }
     }
 
@@ -1321,6 +1331,215 @@ impl PrioritizedOutbound {
         match self {
             Self::Critical(_) => {}
             Self::Durable(outbound) => outbound.commit_physical_write(),
+            Self::Ephemeral(mut outbound) => outbound.commit_successful_write(),
+        }
+    }
+}
+
+/// Cloneable materializer invoked only when the writer drains an ephemeral token.
+pub(crate) type StreamMaterializer = Arc<dyn Fn() -> Option<StreamFrame> + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EphemeralAdmitResult {
+    Queued,
+    Coalesced,
+    StaleGeneration,
+    CapacityDrop,
+    ShutdownRequested,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EphemeralPhase {
+    Queued,
+    InFlight {
+        taken_generation: u64,
+        taken_dirty_revision: u64,
+    },
+}
+
+struct EphemeralSlot {
+    generation: u64,
+    dirty_revision: u64,
+    materializer: StreamMaterializer,
+    phase: EphemeralPhase,
+}
+
+struct EphemeralLaneInner {
+    capacity: usize,
+    slots: HashMap<StreamKey, EphemeralSlot>,
+    pending: VecDeque<StreamKey>,
+}
+
+struct EphemeralControl {
+    shutdown: bool,
+    lane: EphemeralLaneInner,
+}
+
+impl EphemeralLaneInner {
+    fn occupied(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.pending.clear();
+    }
+
+    fn admit(
+        &mut self,
+        stream: StreamKey,
+        generation: u64,
+        materializer: StreamMaterializer,
+    ) -> (EphemeralAdmitResult, bool) {
+        if let Some(slot) = self.slots.get_mut(&stream) {
+            if generation < slot.generation {
+                return (EphemeralAdmitResult::StaleGeneration, false);
+            }
+            slot.generation = generation;
+            slot.dirty_revision = slot.dirty_revision.saturating_add(1);
+            slot.materializer = materializer;
+            let wake = matches!(slot.phase, EphemeralPhase::Queued)
+                && !self.pending.iter().any(|key| *key == stream);
+            if wake {
+                self.pending.push_back(stream);
+            }
+            return (EphemeralAdmitResult::Coalesced, wake);
+        }
+        if self.slots.len() >= self.capacity {
+            return (EphemeralAdmitResult::CapacityDrop, false);
+        }
+        self.slots.insert(
+            stream,
+            EphemeralSlot {
+                generation,
+                dirty_revision: 1,
+                materializer,
+                phase: EphemeralPhase::Queued,
+            },
+        );
+        self.pending.push_back(stream);
+        (EphemeralAdmitResult::Queued, true)
+    }
+
+    fn take_pending(&mut self) -> Option<(StreamKey, u64, u64, StreamMaterializer)> {
+        while let Some(stream) = self.pending.pop_front() {
+            let Some(slot) = self.slots.get_mut(&stream) else {
+                continue;
+            };
+            if !matches!(slot.phase, EphemeralPhase::Queued) {
+                continue;
+            }
+            let taken_generation = slot.generation;
+            let taken_dirty_revision = slot.dirty_revision;
+            slot.phase = EphemeralPhase::InFlight {
+                taken_generation,
+                taken_dirty_revision,
+            };
+            return Some((
+                stream,
+                taken_generation,
+                taken_dirty_revision,
+                Arc::clone(&slot.materializer),
+            ));
+        }
+        None
+    }
+
+    fn finish(
+        &mut self,
+        stream: StreamKey,
+        taken_generation: u64,
+        taken_dirty_revision: u64,
+    ) -> bool {
+        let Some(slot) = self.slots.get_mut(&stream) else {
+            return false;
+        };
+        let EphemeralPhase::InFlight {
+            taken_generation: phase_generation,
+            taken_dirty_revision: phase_dirty,
+        } = slot.phase
+        else {
+            return false;
+        };
+        if phase_generation != taken_generation || phase_dirty != taken_dirty_revision {
+            return false;
+        }
+        if slot.dirty_revision > taken_dirty_revision {
+            slot.phase = EphemeralPhase::Queued;
+            if !self.pending.iter().any(|key| *key == stream) {
+                self.pending.push_back(stream);
+            }
+            true
+        } else {
+            self.slots.remove(&stream);
+            false
+        }
+    }
+}
+
+fn wake_ephemeral(tx: &mpsc::Sender<()>) -> Result<(), ()> {
+    match tx.try_send(()) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+    }
+}
+
+/// Ephemeral outbound token: materializes at drain time, frees/requeues on completion.
+pub(crate) struct EphemeralOutbound {
+    message: Option<ServerMessage>,
+    stream: StreamKey,
+    taken_generation: u64,
+    taken_dirty_revision: u64,
+    control: Arc<Mutex<EphemeralControl>>,
+    wake_tx: mpsc::Sender<()>,
+    shutdown: watch::Sender<bool>,
+    completed: bool,
+}
+
+impl EphemeralOutbound {
+    pub(crate) fn should_write(&self) -> bool {
+        self.message.is_some()
+    }
+
+    pub(crate) fn message(&self) -> &ServerMessage {
+        self.message
+            .as_ref()
+            .expect("message() requires should_write")
+    }
+
+    fn commit_successful_write(&mut self) {
+        self.completed = true;
+        self.release_or_requeue();
+    }
+
+    fn release_or_requeue(&self) {
+        let requeue = {
+            let mut control = self.control.lock().expect("ephemeral control");
+            if control.shutdown {
+                control.lane.clear();
+                false
+            } else {
+                control.lane.finish(
+                    self.stream,
+                    self.taken_generation,
+                    self.taken_dirty_revision,
+                )
+            }
+        };
+        if requeue && wake_ephemeral(&self.wake_tx).is_err() {
+            let mut control = self.control.lock().expect("ephemeral control");
+            control.shutdown = true;
+            control.lane.clear();
+            let _ = self.shutdown.send_replace(true);
+        }
+    }
+}
+
+impl Drop for EphemeralOutbound {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.release_or_requeue();
         }
     }
 }
@@ -1332,6 +1551,8 @@ pub(crate) struct ConnectionOutputHandle {
     critical_slots: Arc<Semaphore>,
     critical_tx: mpsc::UnboundedSender<CriticalOutbound>,
     durable_tx: mpsc::Sender<DurableOutbound>,
+    ephemeral: Arc<Mutex<EphemeralControl>>,
+    ephemeral_wake_tx: mpsc::Sender<()>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -1339,6 +1560,10 @@ pub(crate) struct ConnectionOutputHandle {
 pub(crate) struct ConnectionOutputPorts {
     critical_rx: mpsc::UnboundedReceiver<CriticalOutbound>,
     durable_rx: mpsc::Receiver<DurableOutbound>,
+    ephemeral: Arc<Mutex<EphemeralControl>>,
+    ephemeral_wake_rx: mpsc::Receiver<()>,
+    ephemeral_wake_tx: mpsc::Sender<()>,
+    shutdown: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -1346,22 +1571,38 @@ impl ConnectionOutputHandle {
     pub(crate) fn new(
         critical_capacity: usize,
         durable_capacity: usize,
+        ephemeral_capacity: usize,
     ) -> (Self, ConnectionOutputPorts) {
         let (critical_tx, critical_rx) = mpsc::unbounded_channel();
         let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
+        let (ephemeral_wake_tx, ephemeral_wake_rx) = mpsc::channel(1);
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let ephemeral = Arc::new(Mutex::new(EphemeralControl {
+            shutdown: false,
+            lane: EphemeralLaneInner {
+                capacity: ephemeral_capacity.max(1),
+                slots: HashMap::new(),
+                pending: VecDeque::new(),
+            },
+        }));
         let handle = Self {
             id: ConnectionOutputId::new(),
             critical_slots: Arc::new(Semaphore::new(critical_capacity.max(1))),
             critical_tx,
             durable_tx,
-            shutdown,
+            ephemeral: Arc::clone(&ephemeral),
+            ephemeral_wake_tx: ephemeral_wake_tx.clone(),
+            shutdown: shutdown.clone(),
         };
         (
             handle,
             ConnectionOutputPorts {
                 critical_rx,
                 durable_rx,
+                ephemeral,
+                ephemeral_wake_rx,
+                ephemeral_wake_tx,
+                shutdown,
                 shutdown_rx,
             },
         )
@@ -1371,25 +1612,59 @@ impl ConnectionOutputHandle {
         self.id
     }
 
-    pub(crate) fn shutdown_sender(&self) -> watch::Sender<bool> {
-        self.shutdown.clone()
-    }
-
     pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
         self.shutdown.subscribe()
     }
 
     pub(crate) fn is_shutdown_requested(&self) -> bool {
-        *self.shutdown.borrow()
+        let control = self.ephemeral.lock().expect("ephemeral control");
+        control.shutdown || *self.shutdown.borrow()
     }
 
     pub(crate) fn request_shutdown(&self) {
+        {
+            let mut control = self.ephemeral.lock().expect("ephemeral control");
+            control.shutdown = true;
+            control.lane.clear();
+        }
         let _ = self.shutdown.send_replace(true);
+        let _ = wake_ephemeral(&self.ephemeral_wake_tx);
     }
 
     #[cfg(test)]
     pub(crate) fn critical_permits_available(&self) -> usize {
         self.critical_slots.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ephemeral_slots_occupied(&self) -> usize {
+        self.ephemeral
+            .lock()
+            .expect("ephemeral control")
+            .lane
+            .occupied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ephemeral_pending_len(&self) -> usize {
+        self.ephemeral
+            .lock()
+            .expect("ephemeral control")
+            .lane
+            .pending
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registration_guard_for_test(&self) -> ConnectionOutputRegistration {
+        ConnectionOutputRegistration {
+            id: self.id,
+            output: self.clone(),
+            control_tx: {
+                let (tx, _rx) = mpsc::channel(1);
+                tx
+            },
+        }
     }
 
     pub(crate) fn try_enqueue_critical(&self, message: ServerMessage) -> Result<(), IpcError> {
@@ -1489,26 +1764,90 @@ impl ConnectionOutputHandle {
             }
         }
     }
+
+    pub(crate) fn try_admit_ephemeral_stream(
+        &self,
+        stream: StreamKey,
+        generation: u64,
+        materializer: StreamMaterializer,
+    ) -> EphemeralAdmitResult {
+        let mut control = self.ephemeral.lock().expect("ephemeral control");
+        if control.shutdown {
+            return EphemeralAdmitResult::ShutdownRequested;
+        }
+        let (result, wake) = control.lane.admit(stream, generation, materializer);
+        if wake {
+            if wake_ephemeral(&self.ephemeral_wake_tx).is_err() {
+                control.shutdown = true;
+                control.lane.clear();
+                drop(control);
+                let _ = self.shutdown.send_replace(true);
+                return EphemeralAdmitResult::ShutdownRequested;
+            }
+        }
+        result
+    }
 }
 
 impl ConnectionOutputPorts {
     fn shutdown_requested(&self) -> bool {
-        *self.shutdown_rx.borrow()
+        let control = self.ephemeral.lock().expect("ephemeral control");
+        control.shutdown || *self.shutdown_rx.borrow()
     }
 
-    /// Prefer critical traffic; never blocks (returns None when both empty).
+    fn take_ephemeral_outbound(&mut self) -> Option<EphemeralOutbound> {
+        let (stream, taken_generation, taken_dirty_revision, materializer) = {
+            let mut control = self.ephemeral.lock().expect("ephemeral control");
+            if control.shutdown {
+                return None;
+            }
+            control.lane.take_pending()?
+        };
+        let frame = materializer();
+        let message = match frame {
+            Some(frame) if frame.stream == stream && frame.generation == taken_generation => {
+                Some(ServerMessage::Stream(frame))
+            }
+            _ => None,
+        };
+        Some(EphemeralOutbound {
+            message,
+            stream,
+            taken_generation,
+            taken_dirty_revision,
+            control: Arc::clone(&self.ephemeral),
+            wake_tx: self.ephemeral_wake_tx.clone(),
+            shutdown: self.shutdown.clone(),
+            completed: false,
+        })
+    }
+
+    /// Prefer critical, then durable, then ephemeral; never blocks.
     #[cfg(test)]
     pub(crate) fn try_recv_prioritized(&mut self) -> Option<PrioritizedOutbound> {
         if let Ok(outbound) = self.critical_rx.try_recv() {
             return Some(PrioritizedOutbound::Critical(outbound));
         }
-        self.durable_rx
-            .try_recv()
-            .ok()
-            .map(PrioritizedOutbound::Durable)
+        if let Ok(outbound) = self.durable_rx.try_recv() {
+            return Some(PrioritizedOutbound::Durable(outbound));
+        }
+        self.take_ephemeral_outbound()
+            .map(PrioritizedOutbound::Ephemeral)
     }
 
-    /// Blocking receive that prefers critical traffic and wakes on shutdown.
+    /// Count coalesced wake tokens without permanently consuming them.
+    #[cfg(test)]
+    pub(crate) fn ephemeral_wake_pending_count(&mut self) -> usize {
+        match self.ephemeral_wake_rx.try_recv() {
+            Ok(()) => {
+                let _ = self.ephemeral_wake_tx.try_send(());
+                1
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Blocking receive that prefers critical then durable then ephemeral.
     pub(crate) async fn recv_prioritized(&mut self) -> Option<PrioritizedOutbound> {
         loop {
             if self.shutdown_requested() {
@@ -1519,6 +1858,9 @@ impl ConnectionOutputPorts {
             }
             if let Ok(outbound) = self.durable_rx.try_recv() {
                 return Some(PrioritizedOutbound::Durable(outbound));
+            }
+            if let Some(outbound) = self.take_ephemeral_outbound() {
+                return Some(PrioritizedOutbound::Ephemeral(outbound));
             }
             tokio::select! {
                 biased;
@@ -1533,6 +1875,11 @@ impl ConnectionOutputPorts {
                 durable = self.durable_rx.recv() => {
                     return durable.map(PrioritizedOutbound::Durable);
                 }
+                wake = self.ephemeral_wake_rx.recv() => {
+                    if wake.is_none() {
+                        return None;
+                    }
+                }
             }
         }
     }
@@ -1542,11 +1889,15 @@ impl ConnectionOutputPorts {
 mod output_tests {
     use std::time::Duration;
 
-    use super::{ConnectionOutputHandle, DurableAdmitResult, LiveStreamState, PrioritizedOutbound};
+    use super::{
+        ConnectionOutputHandle, DurableAdmitResult, EphemeralAdmitResult, LiveStreamState,
+        PrioritizedOutbound, StreamMaterializer,
+    };
     use crate::domain::event::{DomainEvent, Event};
-    use crate::domain::id::{EventId, RequestId, SubscriptionId};
+    use crate::domain::id::{EventId, RequestId, ResourceId, SubscriptionId};
     use crate::domain::query::{QueryOutcome, QueryReply};
-    use crate::protocol::ServerMessage;
+    use crate::protocol::{ServerMessage, StreamFrame, StreamKey, StreamPayloadKind};
+    use std::sync::Arc;
 
     fn sample_event(sequence: u64) -> DomainEvent {
         DomainEvent {
@@ -1574,8 +1925,8 @@ mod output_tests {
         let stream = LiveStreamState::new(0);
         // Two critical slots: one remains held as RAII through a simulated write
         // while overflow resync still admits on the second slot.
-        let (alpha, mut alpha_ports) = ConnectionOutputHandle::new(2, 1);
-        let (beta, mut beta_ports) = ConnectionOutputHandle::new(1, 1);
+        let (alpha, mut alpha_ports) = ConnectionOutputHandle::new(2, 1, 1);
+        let (beta, mut beta_ports) = ConnectionOutputHandle::new(1, 1, 1);
 
         assert!(matches!(
             alpha.try_enqueue_durable_event(subscription_id, sample_event(1), &stream, 2),
@@ -1635,6 +1986,9 @@ mod output_tests {
                     assert!(!durable.is_current());
                     saw_stale_durable = true;
                 }
+                PrioritizedOutbound::Ephemeral(_) => {
+                    panic!("unexpected ephemeral outbound in durable/critical test")
+                }
             }
         }
         assert!(saw_resync);
@@ -1650,7 +2004,7 @@ mod output_tests {
     fn durable_overflow_resync_uses_physical_baseline_and_suppresses_queued_event() {
         let subscription_id = SubscriptionId::new();
         let stream = LiveStreamState::new(10);
-        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
 
         assert!(matches!(
             handle.try_enqueue_durable_event(subscription_id, sample_event(11), &stream, 12),
@@ -1687,6 +2041,9 @@ mod output_tests {
                     }
                     other => panic!("unexpected critical {other:?}"),
                 },
+                PrioritizedOutbound::Ephemeral(_) => {
+                    panic!("unexpected ephemeral outbound in durable resync test")
+                }
             }
         }
         assert!(
@@ -1702,7 +2059,7 @@ mod output_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_wakes_idle_output_receive_without_sleep() {
-        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
         let recv = tokio::spawn(async move { ports.recv_prioritized().await });
         tokio::task::yield_now().await;
         handle.request_shutdown();
@@ -1715,7 +2072,7 @@ mod output_tests {
 
     #[test]
     fn shutdown_send_replace_retains_when_receivers_already_dropped() {
-        let (handle, ports) = ConnectionOutputHandle::new(1, 1);
+        let (handle, ports) = ConnectionOutputHandle::new(1, 1, 1);
         drop(ports);
         handle.request_shutdown();
         assert!(
@@ -1728,7 +2085,7 @@ mod output_tests {
     fn force_live_resync_cancels_queued_frames_and_reports_physical_baseline() {
         let subscription_id = SubscriptionId::new();
         let stream = LiveStreamState::new(3);
-        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
         assert!(matches!(
             handle.try_enqueue_durable_event(subscription_id, sample_event(4), &stream, 9),
             DurableAdmitResult::Admitted
@@ -1761,6 +2118,9 @@ mod output_tests {
                     }
                     other => panic!("unexpected critical {other:?}"),
                 },
+                PrioritizedOutbound::Ephemeral(_) => {
+                    panic!("unexpected ephemeral outbound in force_live_resync test")
+                }
             }
         }
         assert!(saw_resync);
@@ -1771,7 +2131,7 @@ mod output_tests {
     fn in_flight_durable_write_advances_prepared_resync_baseline() {
         let subscription_id = SubscriptionId::new();
         let stream = LiveStreamState::new(3);
-        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
 
         assert!(matches!(
             handle.try_enqueue_durable_event(subscription_id, sample_event(4), &stream, 9),
@@ -1816,6 +2176,426 @@ mod output_tests {
             }
             other => panic!("expected prepared ResyncRequired, got {other:?}"),
         }
+    }
+
+    fn sample_stream_key(tail: u8) -> StreamKey {
+        StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ])
+            .expect("resource"),
+        )
+    }
+
+    fn sample_stream_frame(
+        stream: StreamKey,
+        generation: u64,
+        sequence: u64,
+        marker: u8,
+    ) -> StreamFrame {
+        StreamFrame {
+            subscription_id: SubscriptionId::new(),
+            stream,
+            generation,
+            sequence,
+            payload_kind: StreamPayloadKind::new(1).expect("kind"),
+            schema_version: 1,
+            payload: vec![marker],
+        }
+    }
+
+    #[test]
+    fn ephemeral_many_dirty_notifications_occupy_one_slot_and_first_drain_materializes_latest() {
+        // Catches: repeated dirtiness for one stream must coalesce to a single
+        // queued/in-flight slot and materialize only the latest state on drain.
+        let stream = sample_stream_key(0x01);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        let markers = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        for marker in [1u8, 2, 3, 4, 5] {
+            markers.store(marker, std::sync::atomic::Ordering::SeqCst);
+            let markers = Arc::clone(&markers);
+            let materializer: StreamMaterializer = Arc::new(move || {
+                Some(sample_stream_frame(
+                    stream,
+                    1,
+                    u64::from(markers.load(std::sync::atomic::Ordering::SeqCst)),
+                    markers.load(std::sync::atomic::Ordering::SeqCst),
+                ))
+            });
+            let result = handle.try_admit_ephemeral_stream(stream, 1, materializer);
+            if marker == 1 {
+                assert!(matches!(result, EphemeralAdmitResult::Queued));
+            } else {
+                assert!(matches!(result, EphemeralAdmitResult::Coalesced));
+            }
+        }
+        assert_eq!(handle.ephemeral_slots_occupied(), 1);
+
+        let outbound = ports
+            .try_recv_prioritized()
+            .expect("one coalesced ephemeral token must drain");
+        let PrioritizedOutbound::Ephemeral(ephemeral) = outbound else {
+            panic!("expected ephemeral outbound");
+        };
+        assert!(ephemeral.should_write());
+        match ephemeral.message() {
+            ServerMessage::Stream(frame) => {
+                assert_eq!(frame.stream, stream);
+                assert_eq!(frame.generation, 1);
+                assert_eq!(frame.payload, vec![5]);
+            }
+            other => panic!("expected Stream frame, got {other:?}"),
+        }
+        assert!(ports.try_recv_prioritized().is_none());
+        PrioritizedOutbound::Ephemeral(ephemeral).after_successful_write();
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+    }
+
+    #[test]
+    fn ephemeral_dirty_during_in_flight_write_requeues_exactly_once_for_new_state() {
+        // Catches: dirtiness while a materialized frame is in flight must requeue
+        // exactly one token after successful write so the next drain regenerates.
+        let stream = sample_stream_key(0x02);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        let markers = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
+        let markers_admit = Arc::clone(&markers);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || {
+                    Some(sample_stream_frame(
+                        stream,
+                        1,
+                        1,
+                        markers_admit.load(std::sync::atomic::Ordering::SeqCst),
+                    ))
+                }),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let first = ports.try_recv_prioritized().expect("first ephemeral drain");
+        let PrioritizedOutbound::Ephemeral(first) = first else {
+            panic!("expected ephemeral");
+        };
+        assert!(
+            matches!(first.message(), ServerMessage::Stream(frame) if frame.payload == vec![1])
+        );
+
+        markers.store(9, std::sync::atomic::Ordering::SeqCst);
+        let markers_second = Arc::clone(&markers);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || {
+                    Some(sample_stream_frame(
+                        stream,
+                        1,
+                        2,
+                        markers_second.load(std::sync::atomic::Ordering::SeqCst),
+                    ))
+                }),
+            ),
+            EphemeralAdmitResult::Coalesced
+        ));
+        assert!(
+            ports.try_recv_prioritized().is_none(),
+            "in-flight stream must not queue a second token before write completion"
+        );
+        assert_eq!(handle.ephemeral_slots_occupied(), 1);
+
+        PrioritizedOutbound::Ephemeral(first).after_successful_write();
+        let second = ports
+            .try_recv_prioritized()
+            .expect("exactly one requeue after in-flight dirtiness");
+        let PrioritizedOutbound::Ephemeral(second) = second else {
+            panic!("expected ephemeral requeue");
+        };
+        assert!(
+            matches!(second.message(), ServerMessage::Stream(frame) if frame.payload == vec![9])
+        );
+        assert!(ports.try_recv_prioritized().is_none());
+        PrioritizedOutbound::Ephemeral(second).after_successful_write();
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+    }
+
+    #[test]
+    fn ephemeral_capacity_drops_overflow_without_blocking_critical_or_durable() {
+        // Catches: distinct-stream capacity is hard-bounded; overflow drops only
+        // ephemeral work while critical/durable remain admissible and prioritized.
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        let stream_a = sample_stream_key(0x10);
+        let stream_b = sample_stream_key(0x11);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream_a,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream_a, 1, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream_b,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream_b, 1, 1, 2))),
+            ),
+            EphemeralAdmitResult::CapacityDrop
+        ));
+        assert_eq!(handle.ephemeral_slots_occupied(), 1);
+        assert!(!handle.is_shutdown_requested());
+
+        let stream = LiveStreamState::new(0);
+        let subscription_id = SubscriptionId::new();
+        assert!(matches!(
+            handle.try_enqueue_durable_event(subscription_id, sample_event(1), &stream, 1),
+            DurableAdmitResult::Admitted
+        ));
+        handle
+            .try_enqueue_critical(sample_reply())
+            .expect("ephemeral capacity must not consume critical/durable capacity");
+
+        let first = ports.try_recv_prioritized().expect("critical first");
+        assert!(matches!(first, PrioritizedOutbound::Critical(_)));
+        let second = ports.try_recv_prioritized().expect("durable second");
+        assert!(matches!(second, PrioritizedOutbound::Durable(_)));
+        let third = ports.try_recv_prioritized().expect("ephemeral third");
+        assert!(matches!(third, PrioritizedOutbound::Ephemeral(_)));
+    }
+
+    #[test]
+    fn ephemeral_stale_generation_cannot_replace_newer_source() {
+        // Catches: a lower generation must be rejected as stale and must not
+        // replace a newer materializer/generation already occupying the slot.
+        let stream = sample_stream_key(0x20);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                5,
+                Arc::new(move || Some(sample_stream_frame(stream, 5, 1, 5))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                4,
+                Arc::new(move || Some(sample_stream_frame(stream, 4, 1, 4))),
+            ),
+            EphemeralAdmitResult::StaleGeneration
+        ));
+        let outbound = ports.try_recv_prioritized().expect("drain");
+        let PrioritizedOutbound::Ephemeral(ephemeral) = outbound else {
+            panic!("expected ephemeral");
+        };
+        match ephemeral.message() {
+            ServerMessage::Stream(frame) => {
+                assert_eq!(frame.generation, 5);
+                assert_eq!(frame.payload, vec![5]);
+            }
+            other => panic!("expected stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ephemeral_none_or_mismatched_materialization_emits_nothing_and_frees_capacity() {
+        // Catches: None/mismatched/stale materialization must emit no frame,
+        // must not busy-loop, and must release capacity consistently.
+        let stream = sample_stream_key(0x30);
+        let other = sample_stream_key(0x31);
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 2);
+
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(stream, 1, Arc::new(|| None)),
+            EphemeralAdmitResult::Queued
+        ));
+        let none_out = ports.try_recv_prioritized().expect("drain none token");
+        let PrioritizedOutbound::Ephemeral(none_out) = none_out else {
+            panic!("expected ephemeral");
+        };
+        assert!(!none_out.should_write());
+        drop(none_out);
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+        assert!(ports.try_recv_prioritized().is_none());
+
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                2,
+                Arc::new(move || Some(sample_stream_frame(other, 2, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let mismatch = ports.try_recv_prioritized().expect("drain mismatch");
+        let PrioritizedOutbound::Ephemeral(mismatch) = mismatch else {
+            panic!("expected ephemeral");
+        };
+        assert!(!mismatch.should_write());
+        drop(mismatch);
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                3,
+                Arc::new(move || Some(sample_stream_frame(stream, 99, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let stale = ports.try_recv_prioritized().expect("drain stale frame");
+        let PrioritizedOutbound::Ephemeral(stale) = stale else {
+            panic!("expected ephemeral");
+        };
+        assert!(!stale.should_write());
+        drop(stale);
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+        assert!(ports.try_recv_prioritized().is_none());
+    }
+
+    #[test]
+    fn ephemeral_wake_notification_stays_one_slot_under_repeated_admit_drain() {
+        // Catches: unbounded ephemeral wake tokens must not accumulate across
+        // repeated admissions and eager try_recv drains.
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 8);
+        for tail in 0..8u8 {
+            let stream = sample_stream_key(tail);
+            assert!(matches!(
+                handle.try_admit_ephemeral_stream(
+                    stream,
+                    1,
+                    Arc::new(move || Some(sample_stream_frame(stream, 1, 1, tail))),
+                ),
+                EphemeralAdmitResult::Queued
+            ));
+        }
+        let wake_pending = ports.ephemeral_wake_pending_count();
+        assert!(
+            wake_pending <= 1,
+            "wake notifications must coalesce to at most one pending token, got {wake_pending}"
+        );
+        for _ in 0..8 {
+            let outbound = ports
+                .try_recv_prioritized()
+                .expect("drain queued ephemeral");
+            let PrioritizedOutbound::Ephemeral(ephemeral) = outbound else {
+                panic!("expected ephemeral");
+            };
+            PrioritizedOutbound::Ephemeral(ephemeral).after_successful_write();
+        }
+        for _ in 0..64 {
+            let stream = sample_stream_key(0x40);
+            let _ = handle.try_admit_ephemeral_stream(
+                stream,
+                2,
+                Arc::new(move || Some(sample_stream_frame(stream, 2, 1, 7))),
+            );
+        }
+        assert!(handle.ephemeral_slots_occupied() <= 8);
+        assert!(handle.ephemeral_pending_len() <= 8);
+        let wake_pending = ports.ephemeral_wake_pending_count();
+        assert!(
+            wake_pending <= 1,
+            "repeated coalesce admits must not grow the wake queue, got {wake_pending}"
+        );
+        while let Some(outbound) = ports.try_recv_prioritized() {
+            if let PrioritizedOutbound::Ephemeral(ephemeral) = outbound {
+                PrioritizedOutbound::Ephemeral(ephemeral).after_successful_write();
+            }
+        }
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+        assert_eq!(handle.ephemeral_pending_len(), 0);
+        assert!(ports.ephemeral_wake_pending_count() <= 1);
+    }
+
+    #[test]
+    fn ephemeral_shutdown_linearizes_admission_and_clears_slots() {
+        // Catches: shutdown and ephemeral admission must share one sync point so
+        // post-shutdown admits return ShutdownRequested and leave zero slots.
+        let (handle, _ports) = ConnectionOutputHandle::new(1, 1, 2);
+        let stream = sample_stream_key(0x50);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        assert_eq!(handle.ephemeral_slots_occupied(), 1);
+
+        let registration = handle.registration_guard_for_test();
+        drop(registration);
+
+        assert!(
+            handle.is_shutdown_requested(),
+            "registration drop must request synchronized shutdown"
+        );
+        assert_eq!(
+            handle.ephemeral_slots_occupied(),
+            0,
+            "shutdown must clear ephemeral slots/pending"
+        );
+        assert_eq!(handle.ephemeral_pending_len(), 0);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                sample_stream_key(0x51),
+                1,
+                Arc::new(|| Some(sample_stream_frame(sample_stream_key(0x51), 1, 1, 2))),
+            ),
+            EphemeralAdmitResult::ShutdownRequested
+        ));
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+    }
+
+    #[test]
+    fn ephemeral_closed_wake_on_in_flight_dirty_completion_requests_shutdown() {
+        // Catches: finish-requeue after dirty in-flight must not strand a slot when
+        // the wake receiver is already closed; Closed wake must synchronize shutdown.
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        let stream = sample_stream_key(0x60);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let in_flight = ports
+            .try_recv_prioritized()
+            .expect("drain token into in-flight");
+        let PrioritizedOutbound::Ephemeral(in_flight) = in_flight else {
+            panic!("expected ephemeral");
+        };
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 2, 2))),
+            ),
+            EphemeralAdmitResult::Coalesced
+        ));
+        drop(ports);
+
+        PrioritizedOutbound::Ephemeral(in_flight).after_successful_write();
+
+        assert!(
+            handle.is_shutdown_requested(),
+            "closed wake after requeue must request synchronized shutdown"
+        );
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+        assert_eq!(handle.ephemeral_pending_len(), 0);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                sample_stream_key(0x61),
+                1,
+                Arc::new(|| Some(sample_stream_frame(sample_stream_key(0x61), 1, 1, 3))),
+            ),
+            EphemeralAdmitResult::ShutdownRequested
+        ));
     }
 
     #[test]
@@ -1871,7 +2651,7 @@ mod output_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("reg-cancel.db")).expect("bus");
         let (requests, executor) = HostRequestExecutor::start(bus);
-        let (output, _ports) = ConnectionOutputHandle::new(1, 1);
+        let (output, _ports) = ConnectionOutputHandle::new(1, 1, 1);
         let shutdown_rx = output.subscribe_shutdown();
 
         {
