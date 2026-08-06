@@ -18,7 +18,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use devmanager::client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
+    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_CREATE,
+    ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
@@ -269,12 +270,12 @@ fn wait_for_identity(host: &mut ChildGuard, lock_path: &Path) -> HostIdentity {
 }
 
 #[test]
-fn action_catalog_ids_are_unique_and_read_only() {
+fn action_catalog_ids_are_unique_and_classified() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        3,
-        "slice exposes host.actions, host.status, and task.show"
+        4,
+        "slice exposes host.actions, host.status, task.show, and task.create"
     );
 
     let mut ids = Vec::new();
@@ -286,7 +287,12 @@ fn action_catalog_ids_are_unique_and_read_only() {
             action.id
         );
         ids.push(action.id);
-        assert_eq!(action.risk, ActionRisk::ReadOnly);
+        let expected_risk = if action.id == ACTION_TASK_CREATE {
+            ActionRisk::Mutating
+        } else {
+            ActionRisk::ReadOnly
+        };
+        assert_eq!(action.risk, expected_risk);
         let expected_scope = if action.id == ACTION_TASK_SHOW {
             ActionScope::Task
         } else {
@@ -301,6 +307,7 @@ fn action_catalog_ids_are_unique_and_read_only() {
     assert!(ids.contains(&ACTION_HOST_ACTIONS));
     assert!(ids.contains(&ACTION_HOST_STATUS));
     assert!(ids.contains(&ACTION_TASK_SHOW));
+    assert!(ids.contains(&ACTION_TASK_CREATE));
     assert!(action::require_unique_ids().is_ok());
 }
 
@@ -328,7 +335,12 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         let id = action["id"].as_str().expect("action id string");
         assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
         ids.push(id.to_string());
-        assert_eq!(action["risk"], "read_only");
+        let expected_risk = if id == ACTION_TASK_CREATE {
+            "mutating"
+        } else {
+            "read_only"
+        };
+        assert_eq!(action["risk"], expected_risk);
         let expected_scope = if id == ACTION_TASK_SHOW {
             "task"
         } else {
@@ -339,10 +351,33 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         assert!(action["description"].as_str().unwrap().len() > 0);
         assert!(action["keywords"].as_array().unwrap().len() > 0);
         assert!(action.get("required_capability").is_some());
+        let schema = action["argument_schema"]
+            .as_object()
+            .expect("each action exposes an argument schema");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        if id == ACTION_TASK_CREATE {
+            let required = schema["required"]
+                .as_array()
+                .expect("create required fields");
+            for field in [
+                "task_id",
+                "environment_id",
+                "title",
+                "project_id",
+                "workspace",
+            ] {
+                assert!(
+                    required.iter().any(|value| value == field),
+                    "task.create schema must require {field}"
+                );
+            }
+        }
     }
     assert!(ids.iter().any(|id| id == ACTION_HOST_ACTIONS));
     assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
     assert!(ids.iter().any(|id| id == ACTION_TASK_SHOW));
+    assert!(ids.iter().any(|id| id == ACTION_TASK_CREATE));
     assert!(
         String::from_utf8_lossy(&first.stderr).trim().is_empty(),
         "successful actions JSON must not emit failure diagnostics on stderr"
@@ -494,6 +529,102 @@ fn ctl_task_show_queries_seeded_task_without_taking_host_lock() {
 }
 
 #[test]
+fn ctl_invoke_task_create_uses_shared_mutation_without_taking_host_lock() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    fs::create_dir(&paths.root).expect("create isolated profile root");
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original = wait_for_identity(&mut host, &lock_path);
+
+    let task_id = TaskId::new();
+    let arguments = serde_json::json!({
+        "task_id": task_id,
+        "environment_id": EnvironmentId::new(),
+        "title": "CLI Created Task",
+        "description": "Created through task.create",
+        "project_id": ProjectId::new(),
+        "workspace": "main"
+    })
+    .to_string();
+    let output = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        &profile,
+        "--action",
+        ACTION_TASK_CREATE,
+        "--arguments-json",
+        &arguments,
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "ctl invoke task.create must succeed; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("invoke JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["action_id"], ACTION_TASK_CREATE);
+    assert_eq!(doc["profile"], profile);
+    assert_eq!(doc["task_id"], task_id.to_string());
+    assert_eq!(doc["receipt"]["accepted"]["task_revision"], 1);
+    assert!(doc["receipt"]["accepted"]["command_id"].as_str().is_some());
+    assert!(doc["receipt"]["accepted"]["operation_id"]
+        .as_str()
+        .is_some());
+
+    let after = read_identity(&lock_path).expect("host lock after task.create");
+    assert_eq!(after.pid, original.pid);
+    assert_eq!(after.boot_id, original.boot_id);
+    assert!(host.try_wait().expect("poll host after invoke").is_none());
+
+    let shown = run_ctl_bounded(&[
+        "ctl",
+        "task-show",
+        "--profile",
+        &profile,
+        "--task-id",
+        &task_id.to_string(),
+        "--json",
+    ]);
+    assert!(shown.status.success(), "created task must be queryable");
+    let shown_doc: Value = serde_json::from_slice(&shown.stdout).expect("task-show JSON");
+    assert_eq!(shown_doc["snapshot"]["task"]["title"], "CLI Created Task");
+
+    let duplicate = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        &profile,
+        "--action",
+        ACTION_TASK_CREATE,
+        "--arguments-json",
+        &arguments,
+        "--json",
+    ]);
+    assert!(
+        !duplicate.status.success(),
+        "a new command for the same task id must reject"
+    );
+    assert!(duplicate.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already_exists"));
+    assert!(host
+        .try_wait()
+        .expect("poll host after rejection")
+        .is_none());
+
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[test]
 fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     let unknown = run_ctl_bounded(&["ctl", "not-a-command", "--json"]);
     assert!(!unknown.status.success());
@@ -541,6 +672,54 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     ]);
     assert!(!invalid_task.status.success());
     assert!(invalid_task.stdout.is_empty());
+
+    let unknown_action = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        "validprofile",
+        "--action",
+        "task.not-real",
+        "--arguments-json",
+        "{}",
+        "--json",
+    ]);
+    assert!(!unknown_action.status.success());
+    assert!(unknown_action.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unknown_action.stderr).contains("unsupported action id"));
+
+    let unknown_field = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        "validprofile",
+        "--action",
+        ACTION_TASK_CREATE,
+        "--arguments-json",
+        r#"{"unknown":true}"#,
+        "--json",
+    ]);
+    assert!(!unknown_field.status.success());
+    assert!(unknown_field.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unknown_field.stderr).contains("unknown field"));
+
+    let create_revision = run_ctl_bounded(&[
+        "ctl",
+        "invoke",
+        "--profile",
+        "validprofile",
+        "--action",
+        ACTION_TASK_CREATE,
+        "--arguments-json",
+        "{}",
+        "--expected-task-revision",
+        "0",
+        "--json",
+    ]);
+    assert!(!create_revision.status.success());
+    assert!(create_revision.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&create_revision.stderr)
+        .contains("requires expected-task-revision"));
 
     let junk = run_ctl_bounded(&["ctl", "actions", "--json", "--extra"]);
     assert!(!junk.status.success());
