@@ -350,12 +350,78 @@ function Get-DevManagerProcessInventoryEntry {
         return $null
     }
 
+    $creationText = [string]$creation
+    if ($creation -is [DateTimeOffset]) {
+        $creationText = ([DateTimeOffset]$creation).UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    elseif ($creation -is [DateTime]) {
+        $creationText = ([DateTime]$creation).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+
     return [pscustomobject]@{
         processId       = [uint32]$CimProcess.ProcessId
         executablePath  = [string]$normalized
-        creationDate    = [string]$creation
+        creationDate    = $creationText
         parentProcessId = $parentId
     }
+}
+
+function ConvertTo-DevManagerProcessCreationUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$CreationDate
+    )
+
+    if ($CreationDate -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$CreationDate).UtcDateTime
+    }
+    if ($CreationDate -is [DateTime]) {
+        return ([DateTime]$CreationDate).ToUniversalTime()
+    }
+
+    $text = [string]$CreationDate
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'Process CreationDate is empty.'
+    }
+
+    $dmtf = [regex]::Match(
+        $text,
+        '^(?<timestamp>\d{14}\.\d{6})(?<sign>[+-])(?<offset>\d{3})$'
+    )
+    if ($dmtf.Success) {
+        try {
+            $wallClock = [DateTime]::ParseExact(
+                $dmtf.Groups['timestamp'].Value,
+                'yyyyMMddHHmmss.ffffff',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None
+            )
+            $offsetMinutes = [int]$dmtf.Groups['offset'].Value
+            if ($dmtf.Groups['sign'].Value -eq '-') {
+                $offsetMinutes = -$offsetMinutes
+            }
+            return ([DateTimeOffset]::new(
+                    $wallClock,
+                    [TimeSpan]::FromMinutes($offsetMinutes)
+                )).UtcDateTime
+        }
+        catch {
+            throw "Invalid DMTF process CreationDate '$text'."
+        }
+    }
+
+    $parsed = [DateTimeOffset]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AllowWhiteSpaces -bor [Globalization.DateTimeStyles]::RoundtripKind
+    if ([DateTimeOffset]::TryParse(
+            $text,
+            [Globalization.CultureInfo]::InvariantCulture,
+            $styles,
+            [ref]$parsed
+        )) {
+        return $parsed.UtcDateTime
+    }
+
+    throw "Unparseable process CreationDate '$text'."
 }
 
 function Get-DevManagerDisposableDevelopmentProcesses {
@@ -468,9 +534,15 @@ function Update-DevManagerObservedProcessTree {
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[uint32]]$TrackedPids,
+        [Parameter(Mandatory = $true)]
+        [DateTime]$AttributionFloorUtc,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.Dictionary[uint32, DateTime]]$LineageEndExclusiveByPid,
         [AllowEmptyCollection()]
         [object[]]$CimProcesses
     )
+
+    $AttributionFloorUtc = $AttributionFloorUtc.ToUniversalTime()
 
     if ($null -eq $CimProcesses) {
         $CimProcesses = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
@@ -484,6 +556,37 @@ function Update-DevManagerObservedProcessTree {
     $lineagePids = New-Object 'System.Collections.Generic.HashSet[uint32]'
     foreach ($trackedPid in $TrackedPids) {
         $null = $lineagePids.Add([uint32]$trackedPid)
+    }
+
+    # Windows can reuse a PID while older processes still retain that value as
+    # ParentProcessId. Keep the newest observed generation start per PID so a
+    # candidate must be temporally possible for both this run and its parent.
+    $latestCreationByPid = @{}
+    foreach ($observed in $ObservedByKey.Values) {
+        $observedPid = [string][uint32]$observed.processId
+        $observedCreationUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $observed.creationDate
+        if (-not $latestCreationByPid.ContainsKey($observedPid) -or $observedCreationUtc -gt $latestCreationByPid[$observedPid]) {
+            $latestCreationByPid[$observedPid] = $observedCreationUtc
+        }
+    }
+
+    # A tracked PID can later be reused by a process outside the admitted
+    # lineage. Its start is an exclusive upper bound for children of the old
+    # generation, and the bound must survive later polls after it exits.
+    foreach ($proc in $CimProcesses) {
+        if ($null -eq $proc.ProcessId -or $null -eq $proc.ParentProcessId) { continue }
+        if (-not (Test-DevManagerIntegralNumber -Value $proc.ProcessId) -or -not (Test-DevManagerIntegralNumber -Value $proc.ParentProcessId)) { continue }
+        $reusedPid = [uint32]$proc.ProcessId
+        if (-not $lineagePids.Contains($reusedPid)) { continue }
+        $reusedEntry = Get-DevManagerProcessInventoryEntry -CimProcess $proc
+        if ($null -eq $reusedEntry) { continue }
+        $reusedKey = Get-DevManagerProcessInventoryIdentityKey -Process $reusedEntry
+        if ($ObservedByKey.ContainsKey($reusedKey)) { continue }
+        if ($lineagePids.Contains([uint32]$reusedEntry.parentProcessId)) { continue }
+        $reusedCreationUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $reusedEntry.creationDate
+        if (-not $LineageEndExclusiveByPid.ContainsKey($reusedPid) -or $reusedCreationUtc -lt $LineageEndExclusiveByPid[$reusedPid]) {
+            $LineageEndExclusiveByPid[$reusedPid] = $reusedCreationUtc
+        }
     }
 
     $changed = $true
@@ -515,6 +618,11 @@ function Update-DevManagerObservedProcessTree {
                 if (-not $lineagePids.Contains([uint32]$refreshed.ParentProcessId)) {
                     # PID reuse under a different parent is not live attributable,
                     # but the old snapshot generation may have surviving children.
+                    $reusedEntry = Get-DevManagerProcessInventoryEntry -CimProcess $refreshed -RequireCompleteIdentity
+                    $reusedCreationUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $reusedEntry.creationDate
+                    if (-not $LineageEndExclusiveByPid.ContainsKey($pidValue) -or $reusedCreationUtc -lt $LineageEndExclusiveByPid[$pidValue]) {
+                        $LineageEndExclusiveByPid[$pidValue] = $reusedCreationUtc
+                    }
                     $null = $TrackedPids.Add($pidValue)
                     if ($lineagePids.Add($pidValue)) { $changed = $true }
                     continue
@@ -522,9 +630,33 @@ function Update-DevManagerObservedProcessTree {
                 $entry = Get-DevManagerProcessInventoryEntry -CimProcess $refreshed -RequireCompleteIdentity
             }
 
+            $parentId = [uint32]$entry.parentProcessId
+            $candidateCreationUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $entry.creationDate
+            $minimumCreationUtc = $AttributionFloorUtc
+            $parentGenerationKey = [string]$parentId
+            if ($latestCreationByPid.ContainsKey($parentGenerationKey) -and $latestCreationByPid[$parentGenerationKey] -gt $minimumCreationUtc) {
+                $minimumCreationUtc = $latestCreationByPid[$parentGenerationKey]
+            }
+            if ($candidateCreationUtc -lt $minimumCreationUtc) {
+                continue
+            }
+            if ($LineageEndExclusiveByPid.ContainsKey($parentId) -and $candidateCreationUtc -ge $LineageEndExclusiveByPid[$parentId]) {
+                continue
+            }
+
             $key = Get-DevManagerProcessInventoryIdentityKey -Process $entry
             if ($ObservedByKey.ContainsKey($key)) { continue }
             $ObservedByKey[$key] = $entry
+            $candidatePidKey = [string]$pidValue
+            if ($LineageEndExclusiveByPid.ContainsKey($pidValue) -and $candidateCreationUtc -gt $LineageEndExclusiveByPid[$pidValue]) {
+                # A later generation of this PID has re-entered the admitted
+                # lineage. Its own start becomes the lower bound for children,
+                # so the intervening unrelated generation's upper bound is done.
+                $null = $LineageEndExclusiveByPid.Remove($pidValue)
+            }
+            if (-not $latestCreationByPid.ContainsKey($candidatePidKey) -or $candidateCreationUtc -gt $latestCreationByPid[$candidatePidKey]) {
+                $latestCreationByPid[$candidatePidKey] = $candidateCreationUtc
+            }
             $null = $TrackedPids.Add($pidValue)
             $null = $lineagePids.Add($pidValue)
             $changed = $true
@@ -613,6 +745,10 @@ function Wait-DevManagerPhaseGateQuietWindow {
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[uint32]]$TrackedPids,
+        [Parameter(Mandatory = $true)]
+        [DateTime]$AttributionFloorUtc,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.Dictionary[uint32, DateTime]]$LineageEndExclusiveByPid,
         [AllowEmptyCollection()]
         [object[]]$BeforeProcesses,
         [int]$TimeoutMilliseconds = 20000,
@@ -635,6 +771,8 @@ function Wait-DevManagerPhaseGateQuietWindow {
         Update-DevManagerObservedProcessTree `
             -ObservedByKey $ObservedByKey `
             -TrackedPids $TrackedPids `
+            -AttributionFloorUtc $AttributionFloorUtc `
+            -LineageEndExclusiveByPid $LineageEndExclusiveByPid `
             -CimProcesses $CimProcesses
 
         $lastResidue = @(Get-DevManagerPhaseGateResidueProcesses `

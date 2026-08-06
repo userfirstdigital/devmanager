@@ -69,6 +69,7 @@ $stopwatch = [System.Diagnostics.Stopwatch]::new()
 
 $observedByKey = New-Object 'System.Collections.Generic.Dictionary[string, object]'
 $trackedPids = New-Object 'System.Collections.Generic.HashSet[uint32]'
+$lineageEndExclusiveByPid = New-Object 'System.Collections.Generic.Dictionary[uint32, DateTime]'
 
 function Write-PhaseGateVerification {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -206,14 +207,23 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
             throw "Unable to capture admitted root process identity for PID=$($process.Id)."
         }
         $rootKey = Get-DevManagerProcessInventoryIdentityKey -Process $rootIdentity
+        $attributionFloorUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $rootIdentity.creationDate
         $observedByKey[$rootKey] = $rootIdentity
         $null = $trackedPids.Add([uint32]$rootIdentity.processId)
 
         while (-not $process.HasExited) {
-            Update-DevManagerObservedProcessTree -ObservedByKey $observedByKey -TrackedPids $trackedPids
+            Update-DevManagerObservedProcessTree `
+                -ObservedByKey $observedByKey `
+                -TrackedPids $trackedPids `
+                -AttributionFloorUtc $attributionFloorUtc `
+                -LineageEndExclusiveByPid $lineageEndExclusiveByPid
             $null = $process.WaitForExit(250)
         }
-        Update-DevManagerObservedProcessTree -ObservedByKey $observedByKey -TrackedPids $trackedPids
+        Update-DevManagerObservedProcessTree `
+            -ObservedByKey $observedByKey `
+            -TrackedPids $trackedPids `
+            -AttributionFloorUtc $attributionFloorUtc `
+            -LineageEndExclusiveByPid $lineageEndExclusiveByPid
         $exitCode = [int]$process.ExitCode
     }
     finally {
@@ -227,6 +237,8 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
         -WorktreeRoot $worktreeRoot `
         -ObservedByKey $observedByKey `
         -TrackedPids $trackedPids `
+        -AttributionFloorUtc $attributionFloorUtc `
+        -LineageEndExclusiveByPid $lineageEndExclusiveByPid `
         -BeforeProcesses $beforeInventory.processes `
         -TimeoutMilliseconds 20000 `
         -PollMilliseconds 250 `

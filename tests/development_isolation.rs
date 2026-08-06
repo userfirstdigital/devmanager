@@ -1149,6 +1149,7 @@ try {{
 }}
 $observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
 $tracked = New-Object 'System.Collections.Generic.HashSet[uint32]'
+$lineageEnds = New-Object 'System.Collections.Generic.Dictionary[uint32, DateTime]'
 [void]$tracked.Add([uint32]10)
 $root = [pscustomobject]@{{ processId=[uint32]10; executablePath=(Join-Path $harness 'target\root.exe'); creationDate='20260101120000.000000-000'; parentProcessId=[uint32]1 }}
 $observed[(Get-DevManagerProcessInventoryIdentityKey -Process $root)] = $root
@@ -1156,7 +1157,8 @@ $cim1 = @(
   [pscustomobject]@{{ ProcessId=[uint32]10; ParentProcessId=[uint32]1; ExecutablePath=$root.executablePath; CreationDate=$root.creationDate }},
   [pscustomobject]@{{ ProcessId=[uint32]20; ParentProcessId=[uint32]10; ExecutablePath=(Join-Path $harness 'target\child.exe'); CreationDate='20260101120100.000000-000' }}
 )
-Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -CimProcesses $cim1
+$rootStartUtc = ConvertTo-DevManagerProcessCreationUtc -CreationDate $root.creationDate
+Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -AttributionFloorUtc $rootStartUtc -LineageEndExclusiveByPid $lineageEnds -CimProcesses $cim1
 $outside = Join-Path '{evidence}' 'outside\rustc.exe'
 New-Item -ItemType Directory -Force -Path (Split-Path $outside -Parent) | Out-Null
 Set-Content -LiteralPath $outside -Value 'x' -Encoding utf8
@@ -1164,7 +1166,7 @@ $cim2 = @(
   $cim1[1],
   [pscustomobject]@{{ ProcessId=[uint32]30; ParentProcessId=[uint32]20; ExecutablePath=$outside; CreationDate='20260101120200.000000-000' }}
 )
-Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -CimProcesses $cim2
+Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -AttributionFloorUtc $rootStartUtc -LineageEndExclusiveByPid $lineageEnds -CimProcesses $cim2
 if (-not $tracked.Contains([uint32]30)) {{ throw 'grandchild attribution failed' }}
 $residue = Get-DevManagerPhaseGateResidueProcesses -WorktreeRoot $harness -ObservedByKey $observed -BeforeProcesses @() -CimProcesses $cim2
 if (@($residue | Where-Object {{ $_.processId -eq 30 }}).Count -ne 1) {{ throw 'grandchild residue' }}
@@ -1284,9 +1286,28 @@ function Get-CimInstance {{
   return @($script:RefreshRows)
 }}
 
+$typedCreation = [DateTime]::SpecifyKind(
+  [DateTime]::ParseExact('20260101120000', 'yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture),
+  [DateTimeKind]::Local
+)
+$expectedTypedCreation = $typedCreation.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+$typedEntry = Get-DevManagerProcessInventoryEntry -CimProcess ([pscustomobject]@{{
+  ProcessId = [uint32]9
+  ParentProcessId = [uint32]1
+  ExecutablePath = (Join-Path $harness 'target\typed.exe')
+  CreationDate = $typedCreation
+}})
+if ($typedEntry.creationDate -ne $expectedTypedCreation) {{
+  throw "typed CreationDate must use stable UTC round-trip text: $($typedEntry.creationDate)"
+}}
+if ((ConvertTo-DevManagerProcessCreationUtc -CreationDate $typedEntry.creationDate).ToString('o') -ne $expectedTypedCreation) {{
+  throw 'stable UTC round-trip CreationDate must remain parseable'
+}}
+
 function New-ObservedState {{
   $observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
   $tracked = New-Object 'System.Collections.Generic.HashSet[uint32]'
+  $lineageEnds = New-Object 'System.Collections.Generic.Dictionary[uint32, DateTime]'
   [void]$tracked.Add([uint32]10)
   $root = [pscustomobject]@{{
     processId = [uint32]10
@@ -1295,7 +1316,7 @@ function New-ObservedState {{
     parentProcessId = [uint32]1
   }}
   $observed[(Get-DevManagerProcessInventoryIdentityKey -Process $root)] = $root
-  [pscustomobject]@{{ Observed = $observed; Tracked = $tracked; Root = $root }}
+  [pscustomobject]@{{ Observed = $observed; Tracked = $tracked; LineageEnds = $lineageEnds; Root = $root }}
 }}
 
 $incompleteChild = [pscustomobject]@{{
@@ -1327,6 +1348,8 @@ $script:RefreshRows = @()
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $gone.Observed `
   -TrackedPids $gone.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $gone.Root.creationDate) `
+  -LineageEndExclusiveByPid $gone.LineageEnds `
   -CimProcesses $snapshotWithGrandchild
 if (-not $gone.Tracked.Contains([uint32]40)) {{ throw 'gone incomplete descendant must remain a lineage tombstone' }}
 if (@($gone.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
@@ -1343,6 +1366,8 @@ $script:RefreshRows = @()
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $crossPoll.Observed `
   -TrackedPids $crossPoll.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $crossPoll.Root.creationDate) `
+  -LineageEndExclusiveByPid $crossPoll.LineageEnds `
   -CimProcesses $snapshot
 if (-not $crossPoll.Tracked.Contains([uint32]40)) {{ throw 'poll one must retain vanished intermediate lineage' }}
 if (@($crossPoll.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
@@ -1351,6 +1376,8 @@ if (@($crossPoll.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $crossPoll.Observed `
   -TrackedPids $crossPoll.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $crossPoll.Root.creationDate) `
+  -LineageEndExclusiveByPid $crossPoll.LineageEnds `
   -CimProcesses @($snapshot[0], $grandchild)
 if (-not $crossPoll.Tracked.Contains([uint32]50)) {{ throw 'poll two grandchild must traverse vanished parent lineage' }}
 if (@($crossPoll.Observed.Values | Where-Object {{ $_.processId -eq 50 }}).Count -ne 1) {{
@@ -1365,6 +1392,8 @@ try {{
   Update-DevManagerObservedProcessTree `
     -ObservedByKey $liveIncomplete.Observed `
     -TrackedPids $liveIncomplete.Tracked `
+    -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $liveIncomplete.Root.creationDate) `
+    -LineageEndExclusiveByPid $liveIncomplete.LineageEnds `
     -CimProcesses $snapshot
 }} catch {{
   $failed = $true
@@ -1387,6 +1416,8 @@ $script:RefreshRows = @($completeRefresh)
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $attributed.Observed `
   -TrackedPids $attributed.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $attributed.Root.creationDate) `
+  -LineageEndExclusiveByPid $attributed.LineageEnds `
   -CimProcesses $snapshot
 if (-not $attributed.Tracked.Contains([uint32]40)) {{ throw 'complete refresh with tracked parent must attribute' }}
 $childKey = Get-DevManagerProcessInventoryIdentityKey -Process ([pscustomobject]@{{
@@ -1406,6 +1437,8 @@ $newGeneration = [pscustomobject]@{{
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $attributed.Observed `
   -TrackedPids $attributed.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $attributed.Root.creationDate) `
+  -LineageEndExclusiveByPid $attributed.LineageEnds `
   -CimProcesses @($snapshot[0], $newGeneration)
 $newGenerationKey = Get-DevManagerProcessInventoryIdentityKey -Process ([pscustomobject]@{{
   processId = [uint32]40
@@ -1413,6 +1446,49 @@ $newGenerationKey = Get-DevManagerProcessInventoryIdentityKey -Process ([pscusto
   creationDate = '20260101120115.000000-000'
 }})
 if (-not $attributed.Observed.ContainsKey($newGenerationKey)) {{ throw 'reused tracked PID generation must be observed by full identity' }}
+
+# Even after the root starts, a process cannot be a child of a parent generation
+# that did not exist yet. This is the second half of the reused-PID fence.
+$preParentReuse = [pscustomobject]@{{
+  ProcessId = [uint32]70
+  ParentProcessId = [uint32]40
+  ExecutablePath = (Join-Path $harness 'outside\pre-parent.exe')
+  CreationDate = '20260101120030.000000-000'
+}}
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $attributed.Observed `
+  -TrackedPids $attributed.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $attributed.Root.creationDate) `
+  -LineageEndExclusiveByPid $attributed.LineageEnds `
+  -CimProcesses @($snapshot[0], $newGeneration, $preParentReuse)
+if ($attributed.Tracked.Contains([uint32]70)) {{
+  throw 'process created before its known parent generation must not become a lineage PID'
+}}
+if (@($attributed.Observed.Values | Where-Object {{ $_.processId -eq 70 }}).Count -ne 0) {{
+  throw 'process created before its known parent generation must not become observed residue evidence'
+}}
+
+# A pre-existing process can retain a stale ParentProcessId that Windows later
+# reuses inside this run. Creation ordering must prevent false attribution.
+$preRootReuse = [pscustomobject]@{{
+  ProcessId = [uint32]60
+  ParentProcessId = [uint32]10
+  ExecutablePath = (Join-Path $harness 'outside\vctip.exe')
+  CreationDate = '20260101115900.000000-000'
+}}
+$preRootState = New-ObservedState
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $preRootState.Observed `
+  -TrackedPids $preRootState.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $preRootState.Root.creationDate) `
+  -LineageEndExclusiveByPid $preRootState.LineageEnds `
+  -CimProcesses @($snapshot[0], $preRootReuse)
+if ($preRootState.Tracked.Contains([uint32]60)) {{
+  throw 'process created before admitted root must not become a lineage PID'
+}}
+if (@($preRootState.Observed.Values | Where-Object {{ $_.processId -eq 60 }}).Count -ne 0) {{
+  throw 'process created before admitted root must not become observed residue evidence'
+}}
 
 # PID reuse with a different parent must not be misattributed.
 $reused = [pscustomobject]@{{
@@ -1426,6 +1502,8 @@ $script:RefreshRows = @($reused)
 Update-DevManagerObservedProcessTree `
   -ObservedByKey $reuseState.Observed `
   -TrackedPids $reuseState.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $reuseState.Root.creationDate) `
+  -LineageEndExclusiveByPid $reuseState.LineageEnds `
   -CimProcesses $snapshotWithGrandchild
 if (-not $reuseState.Tracked.Contains([uint32]40)) {{ throw 'old PID generation must remain a lineage tombstone' }}
 if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Count -ne 0) {{
@@ -1434,6 +1512,64 @@ if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 40 }}).Coun
 if (-not $reuseState.Tracked.Contains([uint32]50)) {{ throw 'snapshot grandchild across reused parent PID must be tracked' }}
 if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 50 }}).Count -ne 1) {{
   throw 'snapshot grandchild across reused parent PID must be observed'
+}}
+if (-not $reuseState.LineageEnds.ContainsKey([uint32]40)) {{
+  throw 'reused PID generation must persist an exclusive lineage end'
+}}
+$laterUnrelatedChild = [pscustomobject]@{{
+  ProcessId = [uint32]80
+  ParentProcessId = [uint32]40
+  ExecutablePath = (Join-Path $harness 'outside\later-unrelated-child.exe')
+  CreationDate = '20260101120230.000000-000'
+}}
+$script:RefreshRows = @()
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $reuseState.Observed `
+  -TrackedPids $reuseState.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $reuseState.Root.creationDate) `
+  -LineageEndExclusiveByPid $reuseState.LineageEnds `
+  -CimProcesses @($snapshot[0], $laterUnrelatedChild)
+if ($reuseState.Tracked.Contains([uint32]80)) {{
+  throw 'child created after an unrelated reused parent generation must not become a lineage PID'
+}}
+if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 80 }}).Count -ne 0) {{
+  throw 'child created after an unrelated reused parent generation must not become observed residue evidence'
+}}
+$ownedAgain = [pscustomobject]@{{
+  ProcessId = [uint32]40
+  ParentProcessId = [uint32]10
+  ExecutablePath = (Join-Path $harness 'target\owned-again.exe')
+  CreationDate = '20260101120300.000000-000'
+}}
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $reuseState.Observed `
+  -TrackedPids $reuseState.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $reuseState.Root.creationDate) `
+  -LineageEndExclusiveByPid $reuseState.LineageEnds `
+  -CimProcesses @($snapshot[0], $ownedAgain)
+if ($reuseState.LineageEnds.ContainsKey([uint32]40)) {{
+  throw 'newer owned PID generation must retire the intervening unrelated lineage end'
+}}
+$ownedAgainChild = [pscustomobject]@{{
+  ProcessId = [uint32]90
+  ParentProcessId = [uint32]40
+  ExecutablePath = (Join-Path $harness 'outside\owned-again-child.exe')
+  CreationDate = '20260101120330.000000-000'
+}}
+Update-DevManagerObservedProcessTree `
+  -ObservedByKey $reuseState.Observed `
+  -TrackedPids $reuseState.Tracked `
+  -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $reuseState.Root.creationDate) `
+  -LineageEndExclusiveByPid $reuseState.LineageEnds `
+  -CimProcesses @($snapshot[0], $ownedAgain, $laterUnrelatedChild, $ownedAgainChild)
+if ($reuseState.Tracked.Contains([uint32]80)) {{
+  throw 'new owned generation lower bound must still reject delayed children of the intervening unrelated generation'
+}}
+if (-not $reuseState.Tracked.Contains([uint32]90)) {{
+  throw 'child of newer owned PID generation must be tracked after lineage reopens'
+}}
+if (@($reuseState.Observed.Values | Where-Object {{ $_.processId -eq 90 }}).Count -ne 1) {{
+  throw 'child of newer owned PID generation must become observed residue evidence'
 }}
 
 # A refreshed live row without trustworthy parent identity remains unverifiable.
@@ -1450,6 +1586,8 @@ try {{
   Update-DevManagerObservedProcessTree `
     -ObservedByKey $missingParentState.Observed `
     -TrackedPids $missingParentState.Tracked `
+    -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $missingParentState.Root.creationDate) `
+    -LineageEndExclusiveByPid $missingParentState.LineageEnds `
     -CimProcesses $snapshot
 }} catch {{
   $failed = $true
@@ -1468,6 +1606,8 @@ try {{
   Update-DevManagerObservedProcessTree `
     -ObservedByKey $refreshFailureState.Observed `
     -TrackedPids $refreshFailureState.Tracked `
+    -AttributionFloorUtc (ConvertTo-DevManagerProcessCreationUtc -CreationDate $refreshFailureState.Root.creationDate) `
+    -LineageEndExclusiveByPid $refreshFailureState.LineageEnds `
     -CimProcesses $snapshot
 }} catch {{
   $failed = $true
