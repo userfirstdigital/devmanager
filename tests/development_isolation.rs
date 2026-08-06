@@ -1002,6 +1002,11 @@ $expected = [ordered]@{{
   'cargo-fmt-check' = @('fmt','--all','--','--check')
   'development-isolation-tests' = @('test','--test','development_isolation','--','--test-threads=1')
   'library-tests-serial' = @('test','--lib','--','--test-threads=1')
+  'phase-02-host-lock' = @('test','--test','host_lock','--','--nocapture')
+  'phase-02-cli-client' = @('test','--test','cli_client','--','--nocapture')
+  'phase-02-host-lifecycle' = @('test','--test','host_lifecycle','--','--nocapture')
+  'phase-02-host-recovery' = @('test','--test','host_recovery','--','--nocapture')
+  'phase-02-diagnostics' = @('test','--test','diagnostic_logging','--','--nocapture')
 }}
 $recipes = Get-DevManagerPhaseGateRecipeTable
 foreach ($name in $expected.Keys) {{
@@ -1009,7 +1014,7 @@ foreach ($name in $expected.Keys) {{
   $got = @($recipes[$name]); $want = @($expected[$name])
   if (($got -join '|') -cne ($want -join '|')) {{ throw "args mismatch $name : got=$($got -join ' ') want=$($want -join ' ')" }}
 }}
-if (@($recipes.Keys).Count -ne 4) {{ throw 'exactly four recipes' }}
+if (@($recipes.Keys).Count -ne 9) {{ throw 'exactly nine recipes' }}
 if ($recipes.Contains('phase-00-tests')) {{ throw 'phase-00-tests must be removed' }}
 $originalPath = [string]$env:Path
 $realCargo = @(Get-Command -Name 'cargo' -All -CommandType Application -ErrorAction SilentlyContinue |
@@ -1039,7 +1044,11 @@ $env:Path = (@($pinnedCargoDir) + $filteredPath) -join ';'
 $plan = Resolve-DevManagerPhaseGateRecipe -Recipe 'cargo-version' -WorktreeRoot $harness
 if (([System.IO.Path]::GetFileName($plan.executable)) -ine 'cargo.exe') {{ throw 'cargo.exe required' }}
 if (($plan.arguments -join ',') -ne '--version') {{ throw 'args' }}
-foreach ($bad in @('cargo-build','pwsh-file','../escape','phase-00-tests')) {{
+foreach ($bad in @(
+  'cargo-build','pwsh-file','../escape','phase-00-tests',
+  'phase-02-unknown','phase-02-host-lock;rm','phase-02-host-lock --release',
+  'scripts/native-next/Invoke-PhaseGate.ps1'
+)) {{
   $rej = $false; try {{ $null = Resolve-DevManagerPhaseGateRecipe -Recipe $bad -WorktreeRoot $harness }} catch {{ $rej = $true }}
   if (-not $rej) {{ throw "reject $bad" }}
 }}
@@ -1063,13 +1072,21 @@ if (-not $libPlan.environment.Contains('CARGO_TARGET_DIR')) {{ throw 'library mi
 foreach ($integrationEnv in @('DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','CARGO_TARGET_DIR')) {{
   if (-not $isoPlan.environment.Contains($integrationEnv)) {{ throw "integration missing $integrationEnv" }}
 }}
+$expectedCargoTarget = [System.IO.Path]::GetFullPath((Join-Path $harness 'target-native-next'))
+$expectedWorktree = [System.IO.Path]::GetFullPath($harness)
+$phase02Names = @(
+  'phase-02-host-lock','phase-02-cli-client','phase-02-host-lifecycle',
+  'phase-02-host-recovery','phase-02-diagnostics'
+)
 $priorProfile = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE', 'Process')
 $priorLabel = [Environment]::GetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Process')
 $priorKind = [Environment]::GetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'Process')
+$priorCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 try {{
   [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', 'poison-parent-profile', 'Process')
   [Environment]::SetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Poisoned Label', 'Process')
   [Environment]::SetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'poisoned-runtime', 'Process')
+  [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\poison-cargo-target', 'Process')
   $psiLib = [System.Diagnostics.ProcessStartInfo]::new()
   $psiLib.UseShellExecute = $false
   foreach ($poisoned in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND')) {{
@@ -1085,11 +1102,47 @@ try {{
   if ([string]$psiIso.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw 'integration must force named profile over poison' }}
   if ([string]$psiIso.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw 'integration must force label over poison' }}
   if ([string]$psiIso.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw 'integration must force runtime kind over poison' }}
+  foreach ($name in $phase02Names) {{
+    $p2 = Resolve-DevManagerPhaseGateRecipe -Recipe $name -WorktreeRoot $harness
+    Assert-DevManagerPhaseGateExecutionPlan -Plan $p2
+    $want = @($expected[$name])
+    if (($p2.arguments -join '|') -cne ($want -join '|')) {{
+      throw "phase-02 args mismatch $name : got=$($p2.arguments -join ' ') want=$($want -join ' ')"
+    }}
+    if ([string]$p2.workingDirectory -ne $expectedWorktree) {{ throw "phase-02 cwd mismatch $name" }}
+    if ([string]$p2.cargoTargetDir -ne $expectedCargoTarget) {{ throw "phase-02 target mismatch $name" }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $p2.cargoTargetDir -AncestorPath $harness)) {{
+      throw "phase-02 target escapes worktree $name"
+    }}
+    if ([string]$p2.environment['CARGO_TARGET_DIR'] -ne $expectedCargoTarget) {{
+      throw "phase-02 env CARGO_TARGET_DIR mismatch $name"
+    }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $p2.environment['CARGO_TARGET_DIR'] -AncestorPath $harness)) {{
+      throw "phase-02 env CARGO_TARGET_DIR escapes worktree $name"
+    }}
+    if ([string]$p2.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-02 profile $name" }}
+    if ([string]$p2.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-02 label $name" }}
+    if ([string]$p2.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-02 kind $name" }}
+    if (@($p2.environmentRemovals).Count -ne 0) {{ throw "phase-02 removals must be empty $name" }}
+    $psiP2 = [System.Diagnostics.ProcessStartInfo]::new()
+    $psiP2.UseShellExecute = $false
+    Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiP2 -Plan $p2
+    if ([string]$psiP2.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-02 force profile over poison $name" }}
+    if ([string]$psiP2.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-02 force label over poison $name" }}
+    if ([string]$psiP2.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-02 force kind over poison $name" }}
+    if ([string]$psiP2.Environment['CARGO_TARGET_DIR'] -ne $expectedCargoTarget) {{
+      throw "phase-02 force CARGO_TARGET_DIR over poison $name"
+    }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $psiP2.Environment['CARGO_TARGET_DIR'] -AncestorPath $harness)) {{
+      throw "phase-02 applied CARGO_TARGET_DIR escapes worktree $name"
+    }}
+  }}
 }} finally {{
   foreach ($restore in @(
     @('DEVMANAGER_PROFILE', $priorProfile),
     @('DEVMANAGER_INSTANCE_LABEL', $priorLabel),
-    @('DEVMANAGER_RUNTIME_KIND', $priorKind)
+    @('DEVMANAGER_RUNTIME_KIND', $priorKind),
+    @('CARGO_TARGET_DIR', $priorCargoTarget)
   )) {{
     [Environment]::SetEnvironmentVariable([string]$restore[0], $restore[1], 'Process')
   }}

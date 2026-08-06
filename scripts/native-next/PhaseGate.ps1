@@ -17,6 +17,31 @@ function Get-DevManagerPhaseGateRecipeTable {
             '--', '--test-threads=1'
         )
         'library-tests-serial'          = [string[]]@('test', '--lib', '--', '--test-threads=1')
+        'phase-02-host-lock'            = [string[]]@(
+            'test',
+            '--test', 'host_lock',
+            '--', '--nocapture'
+        )
+        'phase-02-cli-client'           = [string[]]@(
+            'test',
+            '--test', 'cli_client',
+            '--', '--nocapture'
+        )
+        'phase-02-host-lifecycle'       = [string[]]@(
+            'test',
+            '--test', 'host_lifecycle',
+            '--', '--nocapture'
+        )
+        'phase-02-host-recovery'        = [string[]]@(
+            'test',
+            '--test', 'host_recovery',
+            '--', '--nocapture'
+        )
+        'phase-02-diagnostics'          = [string[]]@(
+            'test',
+            '--test', 'diagnostic_logging',
+            '--', '--nocapture'
+        )
     }
 }
 
