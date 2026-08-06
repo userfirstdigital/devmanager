@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::action::{self, ActionRisk, ActionScope, ACTION_HOST_STATUS};
+use super::action::{self, ActionRisk, ActionScope, ACTION_HOST_STATUS, ACTION_TASK_SHOW};
 use super::{HostClient, HostClientConfig};
-use crate::domain::ClientId;
+use crate::domain::query::QueryError;
+use crate::domain::{ClientId, TaskId};
 use crate::host::IpcError;
 use crate::protocol::{CapabilitySet, FrameLimits};
 
@@ -22,6 +23,7 @@ const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
 pub enum CtlCommand {
     Actions,
     Status { profile: String },
+    TaskShow { profile: String, task_id: TaskId },
 }
 
 /// Bounded, human-readable ctl failure.
@@ -67,6 +69,7 @@ where
     match subcommand.as_str() {
         "actions" => parse_actions(args),
         "status" => parse_status(args),
+        "task-show" => parse_task_show(args),
         other => Err(CliError::new(format!("unknown ctl subcommand: {other}"))),
     }
 }
@@ -133,6 +136,57 @@ where
     Ok(CtlCommand::Status { profile })
 }
 
+fn parse_task_show<I>(mut args: I) -> Result<CtlCommand, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut json = false;
+    let mut profile: Option<String> = None;
+    let mut task_id: Option<TaskId> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => {
+                if json {
+                    return Err(CliError::new("duplicate --json"));
+                }
+                json = true;
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    return Err(CliError::new("duplicate --profile"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --profile"))?;
+                profile = Some(value);
+            }
+            "--task-id" => {
+                if task_id.is_some() {
+                    return Err(CliError::new("duplicate --task-id"));
+                }
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::new("missing value for --task-id"))?;
+                task_id = Some(
+                    TaskId::parse(&value)
+                        .map_err(|error| CliError::new(format!("invalid --task-id: {error}")))?,
+                );
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown flag: {other}")));
+            }
+            other => return Err(CliError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    if !json {
+        return Err(CliError::new("missing required --json"));
+    }
+    let profile = profile.ok_or_else(|| CliError::new("missing required --profile"))?;
+    let profile = validate_ctl_profile(&profile)?;
+    let task_id = task_id.ok_or_else(|| CliError::new("missing required --task-id"))?;
+    Ok(CtlCommand::TaskShow { profile, task_id })
+}
+
 fn validate_ctl_profile(raw: &str) -> Result<String, CliError> {
     if raw.is_empty() {
         return Err(CliError::new("profile must be nonempty"));
@@ -169,6 +223,7 @@ pub fn actions_json_document() -> Result<String, CliError> {
                 "keywords": entry.keywords,
                 "scope": match entry.scope {
                     ActionScope::Host => "host",
+                    ActionScope::Task => "task",
                 },
                 "required_capability": entry.required_capability.map(capability_name),
                 "risk": match entry.risk {
@@ -215,6 +270,10 @@ pub fn run_ctl(command: CtlCommand) -> Result<(), CliError> {
             let document = status_json_document(&profile)?;
             write_stdout(&document)
         }
+        CtlCommand::TaskShow { profile, task_id } => {
+            let document = task_show_json_document(&profile, task_id)?;
+            write_stdout(&document)
+        }
     }
 }
 
@@ -237,39 +296,7 @@ fn status_json_document(profile: &str) -> Result<String, CliError> {
 
 #[cfg(windows)]
 async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
-    let config = HostClientConfig {
-        named_profile: profile.to_string(),
-        client_build: format!("devmanager-host-ctl/{}", env!("CARGO_PKG_VERSION")),
-        client_id: ClientId::new(),
-        requested: CapabilitySet::empty(),
-        limits: FrameLimits::v1_default(),
-    };
-
-    let deadline = tokio::time::Instant::now() + STATUS_CONNECT_TIMEOUT;
-    let client = loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(CliError::new(
-                "host status connect timed out; is a foreground host running for this profile?",
-            ));
-        }
-        match tokio::time::timeout(remaining, HostClient::connect(config.clone())).await {
-            Ok(Ok(client)) => break client,
-            Ok(Err(error)) if is_retryable_connect_error(&error) => {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(map_connect_error(error));
-                }
-                tokio::time::sleep(STATUS_CONNECT_POLL.min(remaining)).await;
-            }
-            Ok(Err(error)) => return Err(map_connect_error(error)),
-            Err(_) => {
-                return Err(CliError::new(
-                    "host status connect timed out; is a foreground host running for this profile?",
-                ));
-            }
-        }
-    };
+    let client = connect_profile_client(profile).await?;
 
     let doc = json!({
         "schema_version": SCHEMA_VERSION,
@@ -286,6 +313,92 @@ async fn status_json_document_async(profile: &str) -> Result<String, CliError> {
         .map_err(|error| CliError::new(format!("failed to encode status JSON: {error}")))
 }
 
+fn task_show_json_document(profile: &str, task_id: TaskId) -> Result<String, CliError> {
+    #[cfg(not(windows))]
+    {
+        let _ = profile;
+        let _ = task_id;
+        return Err(CliError::new("ctl task-show requires Windows"));
+    }
+
+    #[cfg(windows)]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CliError::new(format!("failed to build ctl runtime: {error}")))?;
+        runtime.block_on(task_show_json_document_async(profile, task_id))
+    }
+}
+
+#[cfg(windows)]
+async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result<String, CliError> {
+    let mut client = connect_profile_client(profile).await?;
+    let snapshot = match client.task_snapshot(task_id).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(QueryError::NotFound)) => {
+            return Err(CliError::new(format!("task {task_id} not found")))
+        }
+        Ok(Err(QueryError::Unauthorized)) => {
+            return Err(CliError::new("task.show query was unauthorized"))
+        }
+        Ok(Err(QueryError::InvalidRequest)) => {
+            return Err(CliError::new("task.show query was invalid"))
+        }
+        Ok(Err(QueryError::UnsupportedCapability)) => {
+            return Err(CliError::new("task.show query capability is unsupported"))
+        }
+        Err(error) => return Err(CliError::new(format!("task.show query failed: {error}"))),
+    };
+    let doc = json!({
+        "schema_version": SCHEMA_VERSION,
+        "action_id": ACTION_TASK_SHOW,
+        "profile": profile,
+        "task_id": task_id,
+        "snapshot": snapshot,
+    });
+    serde_json::to_string(&doc)
+        .map_err(|error| CliError::new(format!("failed to encode task-show JSON: {error}")))
+}
+
+#[cfg(windows)]
+async fn connect_profile_client(profile: &str) -> Result<HostClient, CliError> {
+    let config = HostClientConfig {
+        named_profile: profile.to_string(),
+        client_build: format!("devmanager-host-ctl/{}", env!("CARGO_PKG_VERSION")),
+        client_id: ClientId::new(),
+        requested: CapabilitySet::empty(),
+        limits: FrameLimits::v1_default(),
+    };
+
+    let deadline = tokio::time::Instant::now() + STATUS_CONNECT_TIMEOUT;
+    let client = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CliError::new(
+                "host connect timed out; is a foreground host running for this profile?",
+            ));
+        }
+        match tokio::time::timeout(remaining, HostClient::connect(config.clone())).await {
+            Ok(Ok(client)) => break client,
+            Ok(Err(error)) if is_retryable_connect_error(&error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(map_connect_error(error));
+                }
+                tokio::time::sleep(STATUS_CONNECT_POLL.min(remaining)).await;
+            }
+            Ok(Err(error)) => return Err(map_connect_error(error)),
+            Err(_) => {
+                return Err(CliError::new(
+                    "host connect timed out; is a foreground host running for this profile?",
+                ));
+            }
+        }
+    };
+    Ok(client)
+}
+
 fn is_retryable_connect_error(error: &IpcError) -> bool {
     matches!(
         error,
@@ -296,10 +409,10 @@ fn is_retryable_connect_error(error: &IpcError) -> bool {
 fn map_connect_error(error: IpcError) -> CliError {
     match error {
         IpcError::Unavailable | IpcError::Io(_) | IpcError::Timeout => {
-            CliError::new(format!("host unavailable for status attach: {error}"))
+            CliError::new(format!("host unavailable for ctl attach: {error}"))
         }
         IpcError::InvalidProfile(name) => CliError::new(format!("invalid named profile: {name:?}")),
-        other => CliError::new(format!("host status attach failed: {other}")),
+        other => CliError::new(format!("host ctl attach failed: {other}")),
     }
 }
 
@@ -328,9 +441,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{parse_ctl_args, CliError, CtlCommand, MAX_DIAGNOSTIC_CHARS};
+    use crate::domain::TaskId;
 
     #[test]
-    fn parses_actions_and_status() {
+    fn parses_actions_status_and_task_show() {
         assert_eq!(
             parse_ctl_args(["actions", "--json"]).expect("actions"),
             CtlCommand::Actions
@@ -339,6 +453,22 @@ mod tests {
             parse_ctl_args(["status", "--profile", "Alpha_1", "--json"]).expect("status"),
             CtlCommand::Status {
                 profile: "alpha_1".to_string()
+            }
+        );
+        let task_id = TaskId::new();
+        assert_eq!(
+            parse_ctl_args([
+                "task-show".to_string(),
+                "--profile".to_string(),
+                "Alpha_1".to_string(),
+                "--task-id".to_string(),
+                task_id.to_string(),
+                "--json".to_string(),
+            ])
+            .expect("task-show"),
+            CtlCommand::TaskShow {
+                profile: "alpha_1".to_string(),
+                task_id,
             }
         );
     }
@@ -351,6 +481,28 @@ mod tests {
         assert!(parse_ctl_args(["status", "--json"]).is_err());
         assert!(parse_ctl_args(["status", "--profile", "production", "--json"]).is_err());
         assert!(parse_ctl_args(["status", "--profile", "a", "--profile", "b", "--json"]).is_err());
+        assert!(parse_ctl_args([
+            "task-show",
+            "--profile",
+            "valid",
+            "--task-id",
+            "not-a-uuid",
+            "--json"
+        ])
+        .is_err());
+        assert!(parse_ctl_args(["task-show", "--profile", "valid", "--json"]).is_err());
+        let task_id = TaskId::new().to_string();
+        assert!(parse_ctl_args([
+            "task-show".to_string(),
+            "--profile".to_string(),
+            "valid".to_string(),
+            "--task-id".to_string(),
+            task_id.clone(),
+            "--task-id".to_string(),
+            task_id,
+            "--json".to_string(),
+        ])
+        .is_err());
     }
 
     #[test]

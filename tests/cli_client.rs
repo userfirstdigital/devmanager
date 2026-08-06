@@ -18,10 +18,17 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use devmanager::client::action::{
-    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS,
+    self, ActionRisk, ActionScope, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, TaskId};
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
+};
+use devmanager::domain::ClientId;
 use devmanager::host::HostIdentity;
+use devmanager::kernel::CommandBus;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CTL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,6 +41,48 @@ fn host_exe() -> PathBuf {
 
 fn unique_profile() -> String {
     format!("cli{}{}", std::process::id(), Uuid::now_v7().simple())
+}
+
+fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+    [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        tail,
+    ]
+}
+
+fn seed_task(paths: &ResolvedAppPaths) -> TaskId {
+    fs::create_dir(&paths.root).expect("create isolated profile root");
+    let mut bus = CommandBus::open(&paths.database).expect("open isolated seed command bus");
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x60)).expect("seed client id");
+    let task_id = TaskId::from_bytes(fixed_uuid_v7(0x61)).expect("seed task id");
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x62)).expect("seed command id");
+    let receipt = bus
+        .execute(CommandEnvelope {
+            command_id,
+            client_id,
+            task_id: None,
+            issued_at_ms: 1_725_000_000_100,
+            expected_task_revision: None,
+            command: Command::CreateTask(CreateTaskIntent {
+                id: task_id,
+                environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x63))
+                    .expect("environment id"),
+                title: "Task Show Target".into(),
+                description: Some("Read through the host query boundary".into()),
+                project_id: ProjectId::from_bytes(fixed_uuid_v7(0x64)).expect("project id"),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_000,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        })
+        .expect("seed task command");
+    assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+    drop(bus);
+    task_id
 }
 
 fn scrub_env(command: &mut ProcessCommand) {
@@ -224,8 +273,8 @@ fn action_catalog_ids_are_unique_and_read_only() {
     let catalog = action::catalog();
     assert_eq!(
         catalog.len(),
-        2,
-        "slice exposes only host.actions and host.status"
+        3,
+        "slice exposes host.actions, host.status, and task.show"
     );
 
     let mut ids = Vec::new();
@@ -238,7 +287,12 @@ fn action_catalog_ids_are_unique_and_read_only() {
         );
         ids.push(action.id);
         assert_eq!(action.risk, ActionRisk::ReadOnly);
-        assert_eq!(action.scope, ActionScope::Host);
+        let expected_scope = if action.id == ACTION_TASK_SHOW {
+            ActionScope::Task
+        } else {
+            ActionScope::Host
+        };
+        assert_eq!(action.scope, expected_scope);
         assert!(!action.title.is_empty());
         assert!(!action.description.is_empty());
         assert!(!action.keywords.is_empty());
@@ -246,6 +300,7 @@ fn action_catalog_ids_are_unique_and_read_only() {
 
     assert!(ids.contains(&ACTION_HOST_ACTIONS));
     assert!(ids.contains(&ACTION_HOST_STATUS));
+    assert!(ids.contains(&ACTION_TASK_SHOW));
     assert!(action::require_unique_ids().is_ok());
 }
 
@@ -274,7 +329,12 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
         assert!(!ids.contains(&id.to_string()), "duplicate id in JSON: {id}");
         ids.push(id.to_string());
         assert_eq!(action["risk"], "read_only");
-        assert_eq!(action["scope"], "host");
+        let expected_scope = if id == ACTION_TASK_SHOW {
+            "task"
+        } else {
+            "host"
+        };
+        assert_eq!(action["scope"], expected_scope);
         assert!(action["title"].as_str().unwrap().len() > 0);
         assert!(action["description"].as_str().unwrap().len() > 0);
         assert!(action["keywords"].as_array().unwrap().len() > 0);
@@ -282,6 +342,7 @@ fn ctl_actions_json_is_stable_unique_and_offline() {
     }
     assert!(ids.iter().any(|id| id == ACTION_HOST_ACTIONS));
     assert!(ids.iter().any(|id| id == ACTION_HOST_STATUS));
+    assert!(ids.iter().any(|id| id == ACTION_TASK_SHOW));
     assert!(
         String::from_utf8_lossy(&first.stderr).trim().is_empty(),
         "successful actions JSON must not emit failure diagnostics on stderr"
@@ -363,6 +424,76 @@ fn ctl_status_exits_nonzero_when_host_absent() {
 }
 
 #[test]
+fn ctl_task_show_queries_seeded_task_without_taking_host_lock() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let task_id = seed_task(&paths);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original = wait_for_identity(&mut host, &lock_path);
+
+    let output = run_ctl_bounded(&[
+        "ctl",
+        "task-show",
+        "--profile",
+        &profile,
+        "--task-id",
+        &task_id.to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "ctl task-show must succeed; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&output.stdout).expect("task-show JSON");
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["action_id"], ACTION_TASK_SHOW);
+    assert_eq!(doc["profile"], profile);
+    assert_eq!(doc["task_id"], task_id.to_string());
+    assert_eq!(doc["snapshot"]["task"]["id"], task_id.to_string());
+    assert_eq!(doc["snapshot"]["task"]["title"], "Task Show Target");
+
+    let after = read_identity(&lock_path).expect("host lock after task-show");
+    assert_eq!(after.pid, original.pid);
+    assert_eq!(after.boot_id, original.boot_id);
+    assert!(host
+        .try_wait()
+        .expect("poll host after task-show")
+        .is_none());
+
+    let missing_id = TaskId::from_bytes(fixed_uuid_v7(0x69)).expect("missing task id");
+    let missing = run_ctl_bounded(&[
+        "ctl",
+        "task-show",
+        "--profile",
+        &profile,
+        "--task-id",
+        &missing_id.to_string(),
+        "--json",
+    ]);
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
+    let after_missing = read_identity(&lock_path).expect("host lock after missing task query");
+    assert_eq!(after_missing.pid, original.pid);
+    assert_eq!(after_missing.boot_id, original.boot_id);
+    assert!(host
+        .try_wait()
+        .expect("poll host after missing task query")
+        .is_none());
+
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[test]
 fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     let unknown = run_ctl_bounded(&["ctl", "not-a-command", "--json"]);
     assert!(!unknown.status.success());
@@ -398,6 +529,18 @@ fn ctl_rejects_unknown_commands_and_invalid_profiles() {
     ]);
     assert!(!duplicate.status.success());
     assert!(duplicate.stdout.is_empty());
+
+    let invalid_task = run_ctl_bounded(&[
+        "ctl",
+        "task-show",
+        "--profile",
+        "validprofile",
+        "--task-id",
+        "not-a-uuid",
+        "--json",
+    ]);
+    assert!(!invalid_task.status.success());
+    assert!(invalid_task.stdout.is_empty());
 
     let junk = run_ctl_bounded(&["ctl", "actions", "--json", "--extra"]);
     assert!(!junk.status.success());

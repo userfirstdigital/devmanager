@@ -6,8 +6,8 @@ pub mod cli;
 mod host_client;
 
 pub use action::{
-    catalog, require_unique_ids, ActionDescriptor, ActionRisk, ActionScope, ACTION_HOST_ACTIONS,
-    ACTION_HOST_STATUS,
+    catalog, require_unique_ids, task_show_query, ActionDescriptor, ActionRisk, ActionScope,
+    ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_TASK_SHOW,
 };
 pub use cli::{dispatch_ctl_from_args, parse_ctl_args, run_ctl, CliError, CtlCommand};
 pub use host_client::{HostClient, HostClientConfig, TrackedOperation};

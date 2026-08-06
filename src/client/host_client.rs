@@ -8,15 +8,17 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
-use crate::domain::id::{CommandId, OperationId, RequestId};
+use crate::domain::id::{CommandId, OperationId, RequestId, TaskId};
 use crate::domain::operation::OperationState;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
+use crate::domain::snapshot::TaskSnapshotItem;
 use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
 };
 use crate::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits, ServerHello};
 
+use super::action::task_show_query;
 use super::{connect, ClientConnection};
 
 /// Caller-owned connection configuration. `client_id` is never rotated here.
@@ -147,6 +149,41 @@ impl HostClient {
             return Err(error);
         }
         Ok(receipt)
+    }
+
+    /// Read one Task snapshot through the shared `task.show` query factory.
+    pub async fn task_snapshot(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<Result<TaskSnapshotItem, QueryError>, IpcError> {
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection_mut()?;
+            connection
+                .query(task_show_query(request_id, client_id, task_id))
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot })
+                if snapshot.task.id == task_id =>
+            {
+                Ok(Ok(snapshot))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+        }
     }
 
     /// Correlate a fresh OperationStatus query and resolve terminal states locally.
