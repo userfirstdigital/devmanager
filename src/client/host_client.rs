@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
+use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
 };
@@ -234,6 +235,47 @@ impl HostClient {
             QueryOutcome::Ok(_) => {
                 self.retire_connection();
                 Err(IpcError::CorrelationMismatch)
+            }
+        }
+    }
+
+    /// Inspect durable host-quit blockers. Requires granted HostShutdown.
+    ///
+    /// Side-effect-free: does not authorize, confirm, begin, or perform quit.
+    pub async fn inspect_host_quit(
+        &mut self,
+    ) -> Result<Result<HostQuitInspection, QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::HostShutdown) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: None,
+                    query: Query::InspectHostQuit,
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::HostQuitInspection { inspection }) => Ok(Ok(inspection)),
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
             }
         }
     }
@@ -831,7 +873,8 @@ fn correlate_operation_status(
         | QueryResult::EventReplayPage { .. }
         | QueryResult::EventReplayReleased { .. }
         | QueryResult::ArtifactContentPage { .. }
-        | QueryResult::ArtifactContentReleased { .. } => Err(IpcError::UnexpectedResponse),
+        | QueryResult::ArtifactContentReleased { .. }
+        | QueryResult::HostQuitInspection { .. } => Err(IpcError::UnexpectedResponse),
     }
 }
 
@@ -1245,6 +1288,64 @@ mod tests {
         let still = client
             .attached_connection()
             .expect("pre-I/O unsupported detach must keep the connection attached");
+        assert!(
+            still.shares_state_with(&stub),
+            "exact same ClientConnection must remain attached"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspect_host_quit_without_capability_keeps_connection_and_tracked_ops() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xc1,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xc2,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xc3);
+        let cmd = command_id(0xc4);
+        let mut tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let before = tracked.clone();
+        let stub = ClientConnection::inert_stub_for_test(
+            client_id,
+            test_server_hello(
+                CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                connection_id,
+            ),
+        );
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "inspect-quit-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(stub.clone()),
+            std::mem::take(&mut tracked),
+        );
+        assert!(matches!(
+            client.inspect_host_quit().await,
+            Err(IpcError::UnsupportedCapability)
+        ));
+        assert!(client.is_connected());
+        assert_eq!(client.tracked(), &before);
+        let still = client
+            .attached_connection()
+            .expect("pre-I/O unsupported inspect must keep the connection attached");
         assert!(
             still.shares_state_with(&stub),
             "exact same ClientConnection must remain attached"

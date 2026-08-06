@@ -3,11 +3,13 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
-    ArtifactContentPage, ArtifactId, CancellationReason, ClientId, Command, CommandEnvelope,
-    CommandId, CommandReceipt, CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId,
-    EventPage, OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode,
-    ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
-    RejectionCode, RequestId, ResourceId, ReviewReadiness, SubscriptionId, TaskActivity,
+    AgentRole, AgentSessionId, AgentSessionLifecycle, ArtifactContentPage, ArtifactId,
+    CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
+    CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage, HostQuitAgentBlocker,
+    HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection, OperationErrorCode,
+    OperationId, OperationState, OperationUncertaintyCode, OwnerKind, ProjectId, Query,
+    QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId,
+    ResourceId, ResourceKind, ResourceLifecycle, ReviewReadiness, SubscriptionId, TaskActivity,
     TaskAssignment, TaskAttention, TaskConnectivity, TaskId, WorkspaceRef,
 };
 use devmanager::protocol::{
@@ -36,6 +38,7 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
         (Capability::Guests, 10),
         (Capability::ManagementMetadata, 11),
         (Capability::ExplicitDetach, 12),
+        (Capability::HostShutdown, 13),
     ];
     for (capability, bit_index) in named {
         assert_eq!(capability.bit(), 1_u64 << bit_index);
@@ -562,6 +565,10 @@ fn protocol_subscription_id(tail: u8) -> SubscriptionId {
 
 fn protocol_artifact_id(tail: u8) -> ArtifactId {
     ArtifactId::from_bytes(protocol_uuid_v7(tail)).expect("artifact id")
+}
+
+fn protocol_agent_session_id(tail: u8) -> AgentSessionId {
+    AgentSessionId::from_bytes(protocol_uuid_v7(tail)).expect("agent session id")
 }
 
 #[test]
@@ -4648,5 +4655,190 @@ fn artifact_content_cursor_is_messagepack_bin_not_array() {
         encoded_query[token_at - 2],
         0xc4,
         "resume_cursor must use MessagePack bin"
+    );
+}
+
+#[test]
+fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
+    const PRIVATE_PROVIDER_SESSION: &str = "private-provider-session-sentinel-2_6c4";
+    const PRIVATE_BROWSER_URL: &str = "https://private.browser.url.sentinel/2_6c4";
+    const PRIVATE_SERVICE_COMMAND: &str = "private-service-command-sentinel-2_6c4";
+
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    assert_eq!(Capability::HostShutdown.bit(), 1_u64 << 13);
+
+    let inspection = HostQuitInspection {
+        agents: vec![HostQuitAgentBlocker {
+            agent_session_id: protocol_agent_session_id(0x10),
+            task_id: protocol_task_id(0x11),
+            task_title: "Quit blockers".into(),
+            role: AgentRole::Primary,
+            provider_kind: "claude".into(),
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 0,
+        }],
+        resources: vec![
+            HostQuitResourceBlocker {
+                resource_id: protocol_resource_id(0x12),
+                task_id: Some(protocol_task_id(0x11)),
+                task_title: Some("Quit blockers".into()),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+            },
+            HostQuitResourceBlocker {
+                resource_id: protocol_resource_id(0x13),
+                task_id: None,
+                task_title: None,
+                owner_kind: OwnerKind::Host,
+                resource_kind: ResourceKind::BrowserContext,
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 1,
+            },
+        ],
+        worktrees: HostQuitWorktreeInspection::NotInspected,
+        confirmable: false,
+    };
+
+    let query = QueryEnvelope {
+        request_id: protocol_request_id(0x14),
+        client_id: protocol_client_id(0x15),
+        task_id: None,
+        query: Query::InspectHostQuit,
+    };
+    let reply = QueryReply {
+        request_id: protocol_request_id(0x14),
+        outcome: QueryOutcome::Ok(QueryResult::HostQuitInspection {
+            inspection: inspection.clone(),
+        }),
+    };
+
+    let encoded_query = codec
+        .encode(&query)
+        .expect("encode inspect_host_quit query");
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(&encoded_query)
+            .expect("decode inspect_host_quit query"),
+        query
+    );
+    assert!(
+        encoded_query
+            .windows(b"inspect_host_quit".len())
+            .any(|window| window == b"inspect_host_quit"),
+        "stable query key must be exactly inspect_host_quit"
+    );
+
+    let encoded_reply = codec
+        .encode(&reply)
+        .expect("encode host_quit_inspection reply");
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&encoded_reply)
+            .expect("decode host_quit_inspection reply"),
+        reply
+    );
+    assert!(
+        encoded_reply
+            .windows(b"host_quit_inspection".len())
+            .any(|window| window == b"host_quit_inspection"),
+        "stable result key must be exactly host_quit_inspection"
+    );
+    assert!(
+        encoded_reply
+            .windows(b"not_inspected".len())
+            .any(|window| window == b"not_inspected"),
+        "worktrees must serialize NotInspected as not_inspected"
+    );
+
+    let encoded_inspection = codec
+        .encode(&inspection)
+        .expect("encode HostQuitInspection body");
+    for sentinel in [
+        PRIVATE_PROVIDER_SESSION.as_bytes(),
+        PRIVATE_BROWSER_URL.as_bytes(),
+        PRIVATE_SERVICE_COMMAND.as_bytes(),
+    ] {
+        assert!(
+            !encoded_inspection
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "inspection wire body must omit private sentinel {:?}",
+            std::str::from_utf8(sentinel)
+        );
+        assert!(
+            !encoded_reply
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "query reply must omit private sentinel {:?}",
+            std::str::from_utf8(sentinel)
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenInspectHostQuit {
+        InspectHostQuit { future_field: bool },
+    }
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(
+            &rmp_serde::to_vec_named(&raw_query_envelope(
+                RawOpenInspectHostQuit::InspectHostQuit { future_field: true },
+            ))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+
+    #[derive(serde::Serialize)]
+    struct RawOpenHostQuitInspection {
+        agents: Vec<HostQuitAgentBlocker>,
+        resources: Vec<HostQuitResourceBlocker>,
+        worktrees: HostQuitWorktreeInspection,
+        confirmable: bool,
+        future_field: bool,
+    }
+    assert_eq!(
+        codec.decode::<HostQuitInspection>(
+            &rmp_serde::to_vec_named(&RawOpenHostQuitInspection {
+                agents: inspection.agents.clone(),
+                resources: inspection.resources.clone(),
+                worktrees: HostQuitWorktreeInspection::NotInspected,
+                confirmable: false,
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut multiple = vec![0x82];
+    push_messagepack(&mut multiple, "inspect_host_quit");
+    multiple.push(0x80);
+    push_messagepack(&mut multiple, "task_snapshot");
+    multiple.push(0x80);
+    assert_eq!(
+        codec.decode::<Query>(&multiple),
+        Err(MessagePackError::Decode)
+    );
+
+    #[derive(serde::Serialize)]
+    struct HostQuitInspectionResultPayload<'a> {
+        inspection: &'a HostQuitInspection,
+    }
+    let mut multiple_result = vec![0x82];
+    push_messagepack(&mut multiple_result, "host_quit_inspection");
+    push_messagepack(
+        &mut multiple_result,
+        &HostQuitInspectionResultPayload {
+            inspection: &inspection,
+        },
+    );
+    push_messagepack(&mut multiple_result, "task_snapshot");
+    multiple_result.push(0x80);
+    assert_eq!(
+        codec.decode::<QueryResult>(&multiple_result),
+        Err(MessagePackError::Decode)
     );
 }

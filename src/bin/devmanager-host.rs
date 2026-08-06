@@ -738,6 +738,7 @@ async fn serve_foreground_host(
             Capability::OperationSettlement,
             Capability::ChunkResume,
             Capability::ExplicitDetach,
+            Capability::HostShutdown,
         ]),
         local_limits: FrameLimits::v1_default(),
     };

@@ -3,6 +3,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
 };
@@ -214,6 +215,8 @@ pub enum Query {
     ReleaseArtifactContent {
         subscription_id: SubscriptionId,
     },
+    /// Global host-quit inspection over durable projections only.
+    InspectHostQuit,
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -435,6 +438,7 @@ impl Serialize for Query {
                 "release_artifact_content",
                 &ReleaseArtifactContentQueryRef { subscription_id },
             )?,
+            Self::InspectHostQuit => map.serialize_entry("inspect_host_quit", &EmptyNamedMap)?,
         }
         map.end()
     }
@@ -451,6 +455,7 @@ enum QueryVariant {
     OpenArtifactContent,
     ContinueArtifactContent,
     ReleaseArtifactContent,
+    InspectHostQuit,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -465,7 +470,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, or release_artifact_content",
+                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, or inspect_host_quit",
                 )
             }
 
@@ -484,6 +489,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                     "open_artifact_content" => Ok(QueryVariant::OpenArtifactContent),
                     "continue_artifact_content" => Ok(QueryVariant::ContinueArtifactContent),
                     "release_artifact_content" => Ok(QueryVariant::ReleaseArtifactContent),
+                    "inspect_host_quit" => Ok(QueryVariant::InspectHostQuit),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -497,6 +503,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                             "open_artifact_content",
                             "continue_artifact_content",
                             "release_artifact_content",
+                            "inspect_host_quit",
                         ],
                     )),
                 }
@@ -1372,6 +1379,10 @@ impl<'de> Deserialize<'de> for Query {
                             subscription_id: payload.subscription_id,
                         }
                     }
+                    QueryVariant::InspectHostQuit => {
+                        let _: EmptyNamedMap = map.next_value()?;
+                        Query::InspectHostQuit
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -1412,6 +1423,9 @@ pub enum QueryResult {
     },
     ArtifactContentReleased {
         subscription_id: SubscriptionId,
+    },
+    HostQuitInspection {
+        inspection: HostQuitInspection,
     },
 }
 
@@ -1541,6 +1555,21 @@ impl Serialize for ArtifactContentReleasedResultRef<'_> {
     }
 }
 
+struct HostQuitInspectionResultRef<'a> {
+    inspection: &'a HostQuitInspection,
+}
+
+impl Serialize for HostQuitInspectionResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("inspection", self.inspection)?;
+        map.end()
+    }
+}
+
 impl Serialize for QueryResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1596,6 +1625,10 @@ impl Serialize for QueryResult {
                 "artifact_content_released",
                 &ArtifactContentReleasedResultRef { subscription_id },
             )?,
+            Self::HostQuitInspection { inspection } => map.serialize_entry(
+                "host_quit_inspection",
+                &HostQuitInspectionResultRef { inspection },
+            )?,
         }
         map.end()
     }
@@ -1610,6 +1643,7 @@ enum QueryResultVariant {
     EventReplayReleased,
     ArtifactContentPage,
     ArtifactContentReleased,
+    HostQuitInspection,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -1624,7 +1658,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, or artifact_content_released",
+                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, or host_quit_inspection",
                 )
             }
 
@@ -1641,6 +1675,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                     "event_replay_released" => Ok(QueryResultVariant::EventReplayReleased),
                     "artifact_content_page" => Ok(QueryResultVariant::ArtifactContentPage),
                     "artifact_content_released" => Ok(QueryResultVariant::ArtifactContentReleased),
+                    "host_quit_inspection" => Ok(QueryResultVariant::HostQuitInspection),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -1652,6 +1687,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                             "event_replay_released",
                             "artifact_content_page",
                             "artifact_content_released",
+                            "host_quit_inspection",
                         ],
                     )),
                 }
@@ -2317,6 +2353,82 @@ impl<'de> Deserialize<'de> for ArtifactContentReleasedResultPayload {
     }
 }
 
+enum HostQuitInspectionResultField {
+    Inspection,
+}
+
+impl<'de> Deserialize<'de> for HostQuitInspectionResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = HostQuitInspectionResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("inspection")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "inspection" => Ok(HostQuitInspectionResultField::Inspection),
+                    _ => Err(de::Error::unknown_field(value, &["inspection"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct HostQuitInspectionResultPayload {
+    inspection: HostQuitInspection,
+}
+
+impl<'de> Deserialize<'de> for HostQuitInspectionResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = HostQuitInspectionResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named host_quit_inspection result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut inspection = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        HostQuitInspectionResultField::Inspection => {
+                            if inspection.is_some() {
+                                return Err(de::Error::duplicate_field("inspection"));
+                            }
+                            inspection = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(HostQuitInspectionResultPayload {
+                    inspection: inspection.ok_or_else(|| de::Error::missing_field("inspection"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -2386,6 +2498,12 @@ impl<'de> Deserialize<'de> for QueryResult {
                         let payload: ArtifactContentReleasedResultPayload = map.next_value()?;
                         QueryResult::ArtifactContentReleased {
                             subscription_id: payload.subscription_id,
+                        }
+                    }
+                    QueryResultVariant::HostQuitInspection => {
+                        let payload: HostQuitInspectionResultPayload = map.next_value()?;
+                        QueryResult::HostQuitInspection {
+                            inspection: payload.inspection,
                         }
                     }
                 };

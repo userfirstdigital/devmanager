@@ -28,8 +28,8 @@ use crate::kernel::{
     SnapshotError, SnapshotSession, StoreError,
 };
 use crate::protocol::{
-    Capability, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters, ServerMessage,
-    StreamFrame, StreamKey,
+    Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters,
+    ServerMessage, StreamFrame, StreamKey,
 };
 
 use super::ipc::IpcError;
@@ -862,6 +862,21 @@ impl HostRequestExecutor {
                     outcome,
                 })
             }
+            Query::InspectHostQuit => {
+                if task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
+                if !negotiated.capabilities.contains(Capability::HostShutdown) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                self.bus.query(envelope).map_err(map_store_error)
+            }
             Query::OperationStatus { .. } | Query::TaskSnapshot => {
                 self.bus.query(envelope).map_err(map_store_error)
             }
@@ -1453,8 +1468,13 @@ fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcom
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
 /// compatibility path. Registry-backed snapshot and event-replay queries are
 /// unsupported here; the single executor owns those registries.
+///
+/// `capabilities` are the negotiated grant set from Hello; capability-gated
+/// bus queries (currently [`Query::InspectHostQuit`]) fail closed here the
+/// same way [`HostRequestExecutor`] does.
 pub(crate) fn dispatch_authenticated_request(
     authenticated_client_id: ClientId,
+    capabilities: CapabilitySet,
     bus: &mut CommandBus,
     request: ClientRequest,
 ) -> Result<ServerMessage, IpcError> {
@@ -1483,6 +1503,20 @@ pub(crate) fn dispatch_authenticated_request(
                         request_id: envelope.request_id,
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
                     }));
+                }
+                Query::InspectHostQuit => {
+                    if envelope.task_id.is_some() {
+                        return Ok(ServerMessage::QueryReply(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                        }));
+                    }
+                    if !capabilities.contains(Capability::HostShutdown) {
+                        return Ok(ServerMessage::QueryReply(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        }));
+                    }
                 }
                 Query::OperationStatus { .. } | Query::TaskSnapshot => {}
             }
@@ -3421,5 +3455,100 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+    }
+
+    #[test]
+    fn dispatch_authenticated_inspect_host_quit_without_host_shutdown_rejects_before_bus_query() {
+        use super::dispatch_authenticated_request;
+        use crate::domain::id::{RequestId, TaskId};
+        use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply};
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, ClientRequest, ServerMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("inspect-auth-gate.db")).expect("bus");
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe0,
+        ])
+        .expect("client");
+        let request_id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("request");
+        let inspect_envelope = || {
+            ClientRequest::Query(QueryEnvelope {
+                request_id,
+                client_id: client,
+                task_id: None,
+                query: Query::InspectHostQuit,
+            })
+        };
+
+        // Control: with HostShutdown the compatibility path reaches bus.query and succeeds.
+        let granted = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            &mut bus,
+            inspect_envelope(),
+        )
+        .expect("granted inspect transport");
+        assert!(
+            matches!(
+                granted,
+                ServerMessage::QueryReply(QueryReply {
+                    request_id: rid,
+                    outcome: QueryOutcome::Ok(_),
+                }) if rid == request_id
+            ),
+            "HostShutdown must still allow InspectHostQuit on the auth path; got {granted:?}"
+        );
+
+        // Regression: missing HostShutdown must fail closed before bus.query.
+        // The same envelope just succeeded above, so UnsupportedCapability here
+        // cannot be a bus-level failure — the capability gate returned first.
+        let denied = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            &mut bus,
+            inspect_envelope(),
+        )
+        .expect("denied inspect transport");
+        assert_eq!(
+            denied,
+            ServerMessage::QueryReply(QueryReply {
+                request_id,
+                outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+            })
+        );
+
+        // Global-only scope still wins before capability when task_id is set.
+        let scoped = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            &mut bus,
+            ClientRequest::Query(QueryEnvelope {
+                request_id,
+                client_id: client,
+                task_id: Some(
+                    TaskId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xe2,
+                    ])
+                    .expect("task"),
+                ),
+                query: Query::InspectHostQuit,
+            }),
+        )
+        .expect("scoped inspect transport");
+        assert_eq!(
+            scoped,
+            ServerMessage::QueryReply(QueryReply {
+                request_id,
+                outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+            })
+        );
     }
 }

@@ -70,6 +70,7 @@ pub enum Capability {
     Guests = 10,
     ManagementMetadata = 11,
     ExplicitDetach = 12,
+    HostShutdown = 13,
 }
 
 impl Capability {

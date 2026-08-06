@@ -25,7 +25,8 @@ use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
 };
 use devmanager::domain::id::{
-    ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId, ResourceId, TaskId,
+    AgentSessionId, ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId,
+    ResourceId, TaskId,
 };
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
@@ -37,11 +38,15 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskLifecycle,
     WorkspaceRef,
 };
-use devmanager::domain::{ArtifactContentRef, ArtifactFacts, ArtifactKind, ClientId, PrivacyClass};
+use devmanager::domain::{
+    AgentRole, AgentSessionFacts, AgentSessionLifecycle, ArtifactContentRef, ArtifactFacts,
+    ArtifactKind, ClientId, HostQuitWorktreeInspection, PrivacyClass,
+};
 use devmanager::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, HostIdentity, IpcError,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2479,6 +2484,331 @@ async fn empty_begin_close_settles_and_archives_via_host_maintenance() {
     assert_eq!(final_identity.pid, original_identity.pid);
     assert_eq!(final_identity.boot_id, original_identity.boot_id);
     assert!(paths.database.exists());
+
+    client.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
+    const PRIVATE_PROVIDER_SESSION: &str = "private-provider-session-sentinel-2_6c4";
+    const PRIVATE_BROWSER_URL: &str = "https://private.browser.url.sentinel/2_6c4";
+    const PRIVATE_SERVICE_COMMAND: &str = "private-service-command-sentinel-2_6c4";
+    const TASK_TITLE: &str = "Inspect host quit blockers";
+
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x20)).expect("client id");
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::HostShutdown,
+    ]);
+    let limits = FrameLimits::v1_default();
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits,
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert!(
+        client
+            .granted_capabilities()
+            .contains(Capability::HostShutdown),
+        "debug foreground host must advertise HostShutdown"
+    );
+    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+
+    let (create, _, task_id) = create_task_named(client_id, 0x21, 0x22, 0x23, 0x24, TASK_TITLE);
+    assert!(matches!(
+        client.execute_command(create).await.expect("create task"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let agent_session_id =
+        AgentSessionId::from_bytes(fixed_uuid_v7(0x25)).expect("agent session id");
+    let register_agent = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x26)).expect("register agent command"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_150,
+        expected_task_revision: Some(1),
+        command: Command::RegisterAgentSession {
+            agent: AgentSessionFacts {
+                id: agent_session_id,
+                task_id,
+                role: AgentRole::Primary,
+                provider_kind: "claude".into(),
+                provider_session_id: Some(PRIVATE_PROVIDER_SESSION.into()),
+                lifecycle: AgentSessionLifecycle::Open,
+                runtime_generation: 0,
+                revision: 0,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register_agent)
+            .await
+            .expect("register open agent"),
+        CommandReceipt::Accepted {
+            task_revision: Some(2),
+            ..
+        }
+    ));
+
+    let terminal_id = ResourceId::from_bytes(fixed_uuid_v7(0x27)).expect("terminal id");
+    let register_terminal = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x28)).expect("register terminal command"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_160,
+        expected_task_revision: Some(2),
+        command: Command::RegisterResource {
+            resource: ResourceFacts {
+                id: terminal_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+                updated_at_ms: 1_725_000_000_160,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register_terminal)
+            .await
+            .expect("register active terminal"),
+        CommandReceipt::Accepted {
+            task_revision: Some(3),
+            ..
+        }
+    ));
+
+    let browser_id = ResourceId::from_bytes(fixed_uuid_v7(0x29)).expect("browser id");
+    let register_browser = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x2a)).expect("register browser command"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_170,
+        expected_task_revision: Some(3),
+        command: Command::RegisterResource {
+            resource: ResourceFacts {
+                id: browser_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::BrowserContext,
+                recipe: ResourceRecipe::browser(PRIVATE_BROWSER_URL).expect("browser recipe"),
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+                updated_at_ms: 1_725_000_000_170,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register_browser)
+            .await
+            .expect("register active browser"),
+        CommandReceipt::Accepted {
+            task_revision: Some(4),
+            ..
+        }
+    ));
+
+    let service_id = ResourceId::from_bytes(fixed_uuid_v7(0x2b)).expect("service id");
+    let register_service = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x2c)).expect("register service command"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_180,
+        expected_task_revision: Some(4),
+        command: Command::RegisterResource {
+            resource: ResourceFacts {
+                id: service_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Service,
+                recipe: ResourceRecipe::service(PRIVATE_SERVICE_COMMAND).expect("service recipe"),
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 0,
+                updated_at_ms: 1_725_000_000_180,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register_service)
+            .await
+            .expect("register active service"),
+        CommandReceipt::Accepted {
+            task_revision: Some(5),
+            ..
+        }
+    ));
+
+    let release_service = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0x2d)).expect("release service command"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_190,
+        expected_task_revision: Some(5),
+        command: Command::ReleaseResource {
+            resource_id: service_id,
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(release_service)
+            .await
+            .expect("begin service release"),
+        CommandReceipt::Accepted {
+            task_revision: Some(6),
+            ..
+        }
+    ));
+
+    let scoped_client_id = ClientId::from_bytes(fixed_uuid_v7(0x2e)).expect("scoped client id");
+    let scoped_hello = ClientHello::new(
+        format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        scoped_client_id,
+        profile_fingerprint_for_named_profile(&profile).expect("profile fingerprint"),
+        requested,
+        limits,
+    )
+    .expect("scoped inspect hello");
+    let endpoint = pipe_endpoint_for_named_profile(&profile).expect("profile endpoint");
+    let scoped_connection = timeout(CONNECT_ATTEMPT_TIMEOUT, connect(&endpoint, &scoped_hello))
+        .await
+        .expect("scoped inspect attach stayed bounded")
+        .expect("scoped inspect attach");
+    let scoped_reply = scoped_connection
+        .query(QueryEnvelope {
+            request_id: RequestId::new(),
+            client_id: scoped_client_id,
+            task_id: Some(task_id),
+            query: Query::InspectHostQuit,
+        })
+        .await
+        .expect("scoped inspect query transport");
+    assert_eq!(
+        scoped_reply.outcome,
+        QueryOutcome::Err(QueryError::InvalidRequest),
+        "InspectHostQuit must reject Task scope"
+    );
+    drop(scoped_connection);
+
+    fn count_table(path: &Path, table: &str) -> i64 {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open sqlite read-only counts");
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count table")
+    }
+    let events_before = count_table(&paths.database, "events");
+    let operations_before = count_table(&paths.database, "operations");
+    let outbox_before = count_table(&paths.database, "outbox");
+
+    let first = client
+        .inspect_host_quit()
+        .await
+        .expect("first inspect transport")
+        .expect("first inspect query");
+    let second = client
+        .inspect_host_quit()
+        .await
+        .expect("second inspect transport")
+        .expect("second inspect query");
+    assert_eq!(first, second, "repeat inspect must be deterministic");
+
+    assert_eq!(first.worktrees, HostQuitWorktreeInspection::NotInspected);
+    assert!(!first.confirmable);
+    assert_eq!(first.agents.len(), 1);
+    assert_eq!(first.resources.len(), 3);
+
+    let agent = &first.agents[0];
+    assert_eq!(agent.agent_session_id, agent_session_id);
+    assert_eq!(agent.task_id, task_id);
+    assert_eq!(agent.task_title, TASK_TITLE);
+    assert_eq!(agent.role, AgentRole::Primary);
+    assert_eq!(agent.provider_kind, "claude");
+    assert_eq!(agent.lifecycle, AgentSessionLifecycle::Open);
+    assert_eq!(agent.runtime_generation, 0);
+
+    let resource_ids: Vec<_> = first.resources.iter().map(|r| r.resource_id).collect();
+    let mut sorted_ids = resource_ids.clone();
+    sorted_ids.sort();
+    assert_eq!(
+        resource_ids, sorted_ids,
+        "resources must be stable-id ordered"
+    );
+
+    let by_id = |id: ResourceId| {
+        first
+            .resources
+            .iter()
+            .find(|r| r.resource_id == id)
+            .unwrap_or_else(|| panic!("missing resource {id:?}"))
+    };
+    let terminal = by_id(terminal_id);
+    assert_eq!(terminal.task_id, Some(task_id));
+    assert_eq!(terminal.task_title.as_deref(), Some(TASK_TITLE));
+    assert_eq!(terminal.owner_kind, OwnerKind::Task);
+    assert_eq!(terminal.resource_kind, ResourceKind::Terminal);
+    assert_eq!(terminal.lifecycle, ResourceLifecycle::Active);
+
+    let browser = by_id(browser_id);
+    assert_eq!(browser.resource_kind, ResourceKind::BrowserContext);
+    assert_eq!(browser.lifecycle, ResourceLifecycle::Active);
+
+    let service = by_id(service_id);
+    assert_eq!(service.resource_kind, ResourceKind::Service);
+    assert_eq!(service.lifecycle, ResourceLifecycle::Releasing);
+
+    let encoded = rmp_serde::to_vec_named(&first).expect("encode inspection");
+    for sentinel in [
+        PRIVATE_PROVIDER_SESSION.as_bytes(),
+        PRIVATE_BROWSER_URL.as_bytes(),
+        PRIVATE_SERVICE_COMMAND.as_bytes(),
+    ] {
+        assert!(
+            !encoded
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "inspection must omit private sentinel {:?}",
+            std::str::from_utf8(sentinel)
+        );
+    }
+
+    assert_eq!(count_table(&paths.database, "events"), events_before);
+    assert_eq!(
+        count_table(&paths.database, "operations"),
+        operations_before
+    );
+    assert_eq!(count_table(&paths.database, "outbox"), outbox_before);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    assert!(
+        host.try_wait().expect("poll host after inspect").is_none(),
+        "inspect must not exit the foreground host"
+    );
 
     client.disconnect();
     let status = host

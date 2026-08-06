@@ -20,6 +20,9 @@ use crate::domain::event::{
     apply as apply_domain_event, DomainEvent, Event, OperationAcceptedFact, OperationCancelledFact,
     OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
 };
+use crate::domain::host::{
+    HostQuitAgentBlocker, HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection,
+};
 use crate::domain::id::{
     AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
     ProjectId, ResourceId, TaskId,
@@ -92,6 +95,19 @@ impl CommandBus {
         Ok(snapshot)
     }
 
+    /// Inspect durable host-quit blockers through one short read-only transaction.
+    ///
+    /// Side-effect-free: no writes, operation allocation, or outbox work. Worktrees
+    /// are always [`HostQuitWorktreeInspection::NotInspected`] and `confirmable` is
+    /// always false in this slice.
+    pub fn inspect_host_quit(&self) -> Result<HostQuitInspection, StoreError> {
+        let conn = self.store.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let inspection = inspect_host_quit_in_tx(&tx)?;
+        tx.commit()?;
+        Ok(inspection)
+    }
+
     /// Settle the next eligible process-empty `BeginTaskTeardown`, if any.
     ///
     /// Claim, begin, exact-effect validation, and settled completion run inside one
@@ -136,6 +152,17 @@ impl CommandBus {
                     }),
                     None => QueryOutcome::Err(QueryError::NotFound),
                 }
+            }
+            Query::InspectHostQuit => {
+                if envelope.task_id.is_some() {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                }
+                QueryOutcome::Ok(QueryResult::HostQuitInspection {
+                    inspection: self.inspect_host_quit()?,
+                })
             }
             Query::SnapshotPage { .. }
             | Query::ReleaseSnapshot { .. }
@@ -5266,6 +5293,83 @@ pub(crate) fn load_all_resources(conn: &Connection) -> Result<Vec<ResourceFacts>
         resources.push(load_resource(conn, resource_id)?.ok_or(StoreError::Corruption)?);
     }
     Ok(resources)
+}
+
+fn load_all_agent_sessions(conn: &Connection) -> Result<Vec<AgentSessionFacts>, StoreError> {
+    let agent_ids = {
+        let mut stmt = conn
+            .prepare("SELECT agent_session_id FROM agent_sessions ORDER BY agent_session_id ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut agent_ids = Vec::new();
+        for row in rows {
+            agent_ids.push(id16::<AgentSessionId>(
+                "agent_sessions.agent_session_id",
+                &row?,
+            )?);
+        }
+        agent_ids
+    };
+
+    let mut agents = Vec::with_capacity(agent_ids.len());
+    for agent_id in agent_ids {
+        agents.push(load_agent_session(conn, agent_id)?.ok_or(StoreError::Corruption)?);
+    }
+    Ok(agents)
+}
+
+fn inspect_host_quit_in_tx(conn: &Connection) -> Result<HostQuitInspection, StoreError> {
+    let mut agents = Vec::new();
+    for agent in load_all_agent_sessions(conn)? {
+        if !matches!(
+            agent.lifecycle,
+            AgentSessionLifecycle::Open | AgentSessionLifecycle::Closing
+        ) {
+            continue;
+        }
+        let task = load_task_row(conn, agent.task_id)?.ok_or(StoreError::Corruption)?;
+        agents.push(HostQuitAgentBlocker {
+            agent_session_id: agent.id,
+            task_id: agent.task_id,
+            task_title: task.task.title,
+            role: agent.role,
+            provider_kind: agent.provider_kind,
+            lifecycle: agent.lifecycle,
+            runtime_generation: agent.runtime_generation,
+        });
+    }
+
+    let mut resources = Vec::new();
+    for resource in load_all_resources(conn)? {
+        if !matches!(
+            resource.lifecycle,
+            ResourceLifecycle::Active | ResourceLifecycle::Releasing
+        ) {
+            continue;
+        }
+        let (task_id, task_title) = match resource.task_id {
+            Some(task_id) => {
+                let task = load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+                (Some(task_id), Some(task.task.title))
+            }
+            None => (None, None),
+        };
+        resources.push(HostQuitResourceBlocker {
+            resource_id: resource.id,
+            task_id,
+            task_title,
+            owner_kind: resource.owner_kind,
+            resource_kind: resource.resource_kind,
+            lifecycle: resource.lifecycle,
+            runtime_generation: resource.runtime_generation,
+        });
+    }
+
+    Ok(HostQuitInspection {
+        agents,
+        resources,
+        worktrees: HostQuitWorktreeInspection::NotInspected,
+        confirmable: false,
+    })
 }
 
 struct ResourceProjectionFields {

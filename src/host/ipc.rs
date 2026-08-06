@@ -604,7 +604,12 @@ async fn windows_serve_request(
             .message
             .decode::<ClientRequest>(&payload)
             .map_err(IpcError::MessagePack)?;
-        let response = dispatch_authenticated_request(connection.client_id, bus, request)?;
+        let response = dispatch_authenticated_request(
+            connection.client_id,
+            connection.negotiated.capabilities,
+            bus,
+            request,
+        )?;
         let encoded = connection
             .message
             .encode(&response)
