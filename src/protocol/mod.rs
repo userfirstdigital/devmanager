@@ -1,6 +1,7 @@
 //! Transport-neutral protocol compatibility and wire framing contracts.
 
 mod capabilities;
+mod control;
 mod envelope;
 mod frame;
 mod request;
@@ -10,6 +11,7 @@ pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
+pub use control::{DetachAck, DetachRequest};
 pub use envelope::{
     ClientBuildError, ClientHello, ClientHelloError, MessagePackCodec, MessagePackError,
     MessagePackLengthKind, NegotiatedParameters, ProfileFingerprint, ServerBuildError, ServerHello,

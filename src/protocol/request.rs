@@ -8,6 +8,7 @@ use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::SubscriptionId;
 use crate::domain::query::{QueryEnvelope, QueryReply};
+use crate::protocol::control::{DetachAck, DetachRequest};
 use crate::protocol::stream::StreamFrame;
 
 /// One client-initiated request on an authenticated connection.
@@ -15,6 +16,7 @@ use crate::protocol::stream::StreamFrame;
 pub enum ClientRequest {
     Command(CommandEnvelope),
     Query(QueryEnvelope),
+    Detach(DetachRequest),
 }
 
 impl Serialize for ClientRequest {
@@ -26,6 +28,7 @@ impl Serialize for ClientRequest {
         match self {
             Self::Command(envelope) => map.serialize_entry("command", envelope)?,
             Self::Query(envelope) => map.serialize_entry("query", envelope)?,
+            Self::Detach(request) => map.serialize_entry("detach", request)?,
         }
         map.end()
     }
@@ -34,6 +37,7 @@ impl Serialize for ClientRequest {
 enum ClientRequestVariant {
     Command,
     Query,
+    Detach,
 }
 
 impl<'de> Deserialize<'de> for ClientRequestVariant {
@@ -47,7 +51,7 @@ impl<'de> Deserialize<'de> for ClientRequestVariant {
             type Value = ClientRequestVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("command or query")
+                formatter.write_str("command, query, or detach")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -57,7 +61,11 @@ impl<'de> Deserialize<'de> for ClientRequestVariant {
                 match value {
                     "command" => Ok(ClientRequestVariant::Command),
                     "query" => Ok(ClientRequestVariant::Query),
-                    _ => Err(de::Error::unknown_variant(value, &["command", "query"])),
+                    "detach" => Ok(ClientRequestVariant::Detach),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &["command", "query", "detach"],
+                    )),
                 }
             }
         }
@@ -90,6 +98,7 @@ impl<'de> Deserialize<'de> for ClientRequest {
                 let request = match variant {
                     ClientRequestVariant::Command => ClientRequest::Command(map.next_value()?),
                     ClientRequestVariant::Query => ClientRequest::Query(map.next_value()?),
+                    ClientRequestVariant::Detach => ClientRequest::Detach(map.next_value()?),
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
@@ -119,6 +128,7 @@ pub enum ServerMessage {
         newest_sequence: u64,
     },
     Stream(StreamFrame),
+    Detached(DetachAck),
 }
 
 struct DurableEventPayloadRef<'a> {
@@ -189,6 +199,7 @@ impl Serialize for ServerMessage {
                 },
             )?,
             Self::Stream(frame) => map.serialize_entry("stream", frame)?,
+            Self::Detached(ack) => map.serialize_entry("detached", ack)?,
         }
         map.end()
     }
@@ -200,6 +211,7 @@ enum ServerMessageVariant {
     DurableEvent,
     ResyncRequired,
     Stream,
+    Detached,
 }
 
 impl<'de> Deserialize<'de> for ServerMessageVariant {
@@ -214,7 +226,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "command_receipt, query_reply, durable_event, resync_required, or stream",
+                    "command_receipt, query_reply, durable_event, resync_required, stream, or detached",
                 )
             }
 
@@ -228,6 +240,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                     "durable_event" => Ok(ServerMessageVariant::DurableEvent),
                     "resync_required" => Ok(ServerMessageVariant::ResyncRequired),
                     "stream" => Ok(ServerMessageVariant::Stream),
+                    "detached" => Ok(ServerMessageVariant::Detached),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -236,6 +249,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                             "durable_event",
                             "resync_required",
                             "stream",
+                            "detached",
                         ],
                     )),
                 }
@@ -489,6 +503,7 @@ impl<'de> Deserialize<'de> for ServerMessage {
                         }
                     }
                     ServerMessageVariant::Stream => ServerMessage::Stream(map.next_value()?),
+                    ServerMessageVariant::Detached => ServerMessage::Detached(map.next_value()?),
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(

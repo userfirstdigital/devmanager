@@ -1656,3 +1656,232 @@ async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte_exact() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0xc0)).expect("artifact retry client id");
+    let mut limits = FrameLimits::v1_default();
+    // Force at least four content pages under a tight negotiated page budget.
+    limits.max_page_encoded_bytes = 1_024;
+    let requested = CapabilitySet::from_capabilities([
+        Capability::PagedSnapshots,
+        Capability::ChunkResume,
+        Capability::EventReplay,
+        Capability::ExplicitDetach,
+    ]);
+    let config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits,
+    };
+    let mut client = connect_bounded(&config, &mut host).await;
+    assert!(client
+        .granted_capabilities()
+        .contains(Capability::ChunkResume));
+    assert!(
+        client
+            .granted_capabilities()
+            .contains(Capability::ExplicitDetach),
+        "lifecycle detach proof requires negotiated ExplicitDetach"
+    );
+    let first_connection_id = client.connection_id();
+    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+
+    let (create, _, task_id) = create_task_named(
+        client_id,
+        0xc1,
+        0xc2,
+        0xc3,
+        0xc4,
+        "Artifact content retry task",
+    );
+    assert!(matches!(
+        client
+            .execute_command(create)
+            .await
+            .expect("create task for artifact content retry"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let body = format!(
+        "ARTIFACT_CONTENT_RETRY_TOKEN_7f3a{}",
+        "αβγδεζηθικλμνξοπρστυφχψω"
+            .repeat(120)
+            .chars()
+            .cycle()
+            .take(3_200)
+            .collect::<String>()
+    );
+    let sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let artifact_id = ArtifactId::from_bytes(fixed_uuid_v7(0xc5)).expect("artifact id");
+    let register = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xc6)).expect("register command id"),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_200,
+        expected_task_revision: Some(1),
+        command: Command::RegisterArtifact {
+            artifact: ArtifactFacts {
+                id: artifact_id,
+                task_id,
+                kind: ArtifactKind::Evidence,
+                label: "Retryable paged evidence".into(),
+                content_ref: ArtifactContentRef::inline_utf8(&body).expect("inline body"),
+                sha256,
+                privacy_class: PrivacyClass::LocalOnly,
+                created_at_ms: 1_725_000_000_200,
+            },
+        },
+    };
+    assert!(matches!(
+        client
+            .execute_command(register)
+            .await
+            .expect("register multi-page artifact for retry"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let open = client
+        .open_artifact_content(task_id, artifact_id)
+        .await
+        .expect("open artifact content transport")
+        .expect("open artifact content query");
+    assert_eq!(open.page.artifact_id, artifact_id);
+    assert_eq!(open.page.sha256, sha256);
+    assert_eq!(open.page.offset, 0);
+    assert_eq!(open.page.total_bytes, body.len() as u64);
+    let subscription_id = open.subscription_id;
+    let cursor_c0 = open
+        .page
+        .next_cursor
+        .clone()
+        .expect("first page must leave a continuation cursor");
+
+    let page_p1 = client
+        .continue_artifact_content(task_id, subscription_id, cursor_c0.clone())
+        .await
+        .expect("first continue with C0 transport")
+        .expect("first continue with C0 query");
+    assert_eq!(page_p1.subscription_id, subscription_id);
+    assert_eq!(page_p1.page.artifact_id, artifact_id);
+    assert_ne!(
+        page_p1.page.offset, 0,
+        "continuation after open must not silently reopen from offset zero"
+    );
+    // Deliberately keep C0 as the last committed client cursor (do not advance).
+
+    let detached_id = client
+        .detach()
+        .await
+        .expect("host-acknowledged detach must complete before replacement");
+    assert_eq!(
+        detached_id, first_connection_id,
+        "detach ack must name the interrupted connection"
+    );
+    assert!(
+        !client.is_connected(),
+        "local connection must drop only after detach ack"
+    );
+    let after_detach = read_identity(&lock_path).expect("host identity after detach");
+    assert_eq!(after_detach.pid, original_identity.pid);
+    assert_eq!(after_detach.boot_id, original_identity.boot_id);
+
+    let mut replacement = connect_bounded(&config, &mut host).await;
+    assert_eq!(replacement.client_id(), client_id);
+    assert_ne!(
+        replacement.connection_id(),
+        first_connection_id,
+        "replacement connection must be distinct from the interrupted one"
+    );
+    assert_eq!(replacement.host_boot_id(), original_identity.boot_id);
+    let mid_identity = read_identity(&lock_path).expect("host identity after replacement");
+    assert_eq!(mid_identity.pid, original_identity.pid);
+    assert_eq!(mid_identity.boot_id, original_identity.boot_id);
+
+    let retried_p1 = replacement
+        .continue_artifact_content(task_id, subscription_id, cursor_c0.clone())
+        .await
+        .expect("retry C0 after connection replacement transport")
+        .expect("retry C0 after connection replacement query");
+    assert_eq!(
+        retried_p1, page_p1,
+        "retried C0 must equal the original P1 at the typed-value level"
+    );
+    assert_eq!(retried_p1.subscription_id, subscription_id);
+    assert_eq!(retried_p1.page.artifact_id, artifact_id);
+    assert_eq!(retried_p1.page.offset, page_p1.page.offset);
+    assert_eq!(retried_p1.page.total_bytes, page_p1.page.total_bytes);
+    assert_eq!(retried_p1.page.sha256, page_p1.page.sha256);
+    assert_eq!(retried_p1.page.payload, page_p1.page.payload);
+    assert_eq!(retried_p1.page.encoded_bytes, page_p1.page.encoded_bytes);
+    assert_eq!(retried_p1.page.next_cursor, page_p1.page.next_cursor);
+    assert_ne!(
+        retried_p1.page.offset, 0,
+        "same-cursor retry must not silently reopen from offset zero"
+    );
+
+    // Commit the retried page once, then continue to completion from its next cursor.
+    let open_payload_len = open.page.payload.len() as u64;
+    let mut reconstructed = open.page.payload;
+    reconstructed.extend_from_slice(&retried_p1.page.payload);
+    let mut expected_offset = open_payload_len;
+    assert_eq!(retried_p1.page.offset, expected_offset);
+    expected_offset += retried_p1.page.payload.len() as u64;
+
+    let mut next = retried_p1.page.next_cursor;
+    let mut pages = 2usize;
+    while let Some(cursor) = next {
+        let continued = replacement
+            .continue_artifact_content(task_id, subscription_id, cursor)
+            .await
+            .expect("continue after committed retry transport")
+            .expect("continue after committed retry query");
+        assert_eq!(continued.subscription_id, subscription_id);
+        assert_eq!(continued.page.artifact_id, artifact_id);
+        assert_eq!(continued.page.sha256, sha256);
+        assert_eq!(continued.page.total_bytes, body.len() as u64);
+        assert_eq!(
+            continued.page.offset, expected_offset,
+            "committed page offsets must be contiguous without duplicated bytes"
+        );
+        reconstructed.extend_from_slice(&continued.page.payload);
+        expected_offset += continued.page.payload.len() as u64;
+        next = continued.page.next_cursor;
+        pages += 1;
+    }
+    assert!(
+        pages >= 4,
+        "tight page budget must require at least four content pages, got {pages}"
+    );
+    assert_eq!(reconstructed.len() as u64, body.len() as u64);
+    assert_eq!(reconstructed, body.as_bytes());
+    let reconstructed_digest: [u8; 32] = Sha256::digest(&reconstructed).into();
+    assert_eq!(reconstructed_digest, sha256);
+
+    replacement
+        .release_artifact_content(task_id, subscription_id)
+        .await
+        .expect("release artifact content transport")
+        .expect("release artifact content");
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    replacement.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}

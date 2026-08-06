@@ -28,7 +28,8 @@ use crate::kernel::{
     SnapshotError, SnapshotSession, StoreError,
 };
 use crate::protocol::{
-    Capability, ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
+    Capability, ClientRequest, DetachAck, DetachRequest, NegotiatedParameters, ServerMessage,
+    StreamFrame, StreamKey,
 };
 
 use super::ipc::IpcError;
@@ -69,6 +70,18 @@ enum ExecutorControl {
     UnregisterOutput {
         id: ConnectionOutputId,
     },
+    #[cfg(test)]
+    InspectOutput {
+        id: ConnectionOutputId,
+        ack: oneshot::Sender<OutputInspection>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputInspection {
+    pub(crate) registered: bool,
+    pub(crate) live_bound: bool,
 }
 
 struct SnapshotRegistryEntry {
@@ -438,6 +451,19 @@ impl HostRequestHandle {
         Ok(registration)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn inspect_output(
+        &self,
+        id: ConnectionOutputId,
+    ) -> Result<OutputInspection, IpcError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::InspectOutput { id, ack: ack_tx })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        ack_rx.await.map_err(|_| IpcError::Unavailable)
+    }
+
     /// Enqueue one authenticated request and await its correlated reply.
     ///
     /// Blocks (with bounded queue backpressure) when the executor queue is full.
@@ -535,6 +561,20 @@ impl HostRequestExecutor {
                         ExecutorControl::UnregisterOutput { id } => {
                             self.detach_output(id);
                         }
+                        #[cfg(test)]
+                        ExecutorControl::InspectOutput { id, ack } => {
+                            let registered = self.outputs.contains_key(&id);
+                            let live_bound = self.replay_registry.entries.values().any(|entry| {
+                                entry
+                                    .live
+                                    .as_ref()
+                                    .is_some_and(|live| live.output_id == id)
+                            });
+                            let _ = ack.send(OutputInspection {
+                                registered,
+                                live_bound,
+                            });
+                        }
                     }
                 }
                 _ = reaper.tick() => {
@@ -555,6 +595,45 @@ impl HostRequestExecutor {
             output.request_shutdown();
         }
         self.replay_registry.remove_for_output(id);
+    }
+
+    /// Remove one output registration for an acknowledged detach without
+    /// requesting shutdown yet (ack must be physically written first).
+    fn release_output_for_detach(
+        &mut self,
+        id: ConnectionOutputId,
+    ) -> Option<ConnectionOutputHandle> {
+        let output = self.outputs.remove(&id);
+        self.replay_registry.remove_for_output(id);
+        output
+    }
+
+    fn serve_detach(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        request: DetachRequest,
+        output_id: Option<ConnectionOutputId>,
+    ) -> Result<ServerMessage, IpcError> {
+        if !negotiated.capabilities.contains(Capability::ExplicitDetach) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+        if request.client_id != negotiated.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        let Some(registered_id) = output_id else {
+            return Err(IpcError::Unauthorized);
+        };
+        let requested_id = ConnectionOutputId::from_uuid(request.connection_id);
+        if requested_id != registered_id {
+            return Err(IpcError::Unauthorized);
+        }
+        if self.release_output_for_detach(registered_id).is_none() {
+            return Err(IpcError::Unauthorized);
+        }
+        Ok(ServerMessage::Detached(DetachAck {
+            request_id: request.request_id,
+            connection_id: request.connection_id,
+        }))
     }
 
     fn reap_shutdown_outputs(&mut self) {
@@ -591,6 +670,7 @@ impl HostRequestExecutor {
                 let reply = self.dispatch_query(negotiated, envelope, output_id)?;
                 Ok(ServerMessage::QueryReply(reply))
             }
+            ClientRequest::Detach(request) => self.serve_detach(negotiated, request, output_id),
         }
     }
 
@@ -1396,16 +1476,31 @@ pub(crate) fn dispatch_authenticated_request(
             let reply = bus.query(envelope).map_err(map_store_error)?;
             Ok(ServerMessage::QueryReply(reply))
         }
+        ClientRequest::Detach(_) => Err(IpcError::Unavailable),
     }
 }
 
 /// Stable id for one duplex connection's executor-facing output handle.
+///
+/// Production registrations use the wire [`ServerHello::connection_id`] so host
+/// and client share one identity. Unit tests may generate ids via [`Self::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectionOutputId(Uuid);
 
 impl ConnectionOutputId {
-    fn new() -> Self {
+    /// Test constructor: allocate a fresh UUIDv7 identity.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self(Uuid::now_v7())
+    }
+
+    pub(crate) fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
@@ -1428,6 +1523,8 @@ pub(crate) struct CriticalOutbound {
     /// Live resync only: finalize `last_delivered_sequence` immediately before
     /// encode/write so an earlier in-flight durable can advance the baseline.
     live_resync: Option<LiveResyncMaterialization>,
+    /// Explicit detach: request connection shutdown only after the ack write.
+    shutdown_after_successful_write: Option<ConnectionOutputHandle>,
 }
 
 struct LiveResyncMaterialization {
@@ -1514,7 +1611,11 @@ impl PrioritizedOutbound {
 
     pub(crate) fn after_successful_write(self) {
         match self {
-            Self::Critical(_) => {}
+            Self::Critical(outbound) => {
+                if let Some(handle) = outbound.shutdown_after_successful_write {
+                    handle.request_shutdown();
+                }
+            }
             Self::Durable(outbound) => outbound.commit_physical_write(),
             Self::Ephemeral(mut outbound) => outbound.commit_successful_write(),
         }
@@ -1753,7 +1854,24 @@ pub(crate) struct ConnectionOutputPorts {
 }
 
 impl ConnectionOutputHandle {
+    /// Allocate an output with a generated connection identity (unit tests).
+    #[cfg(test)]
     pub(crate) fn new(
+        critical_capacity: usize,
+        durable_capacity: usize,
+        ephemeral_capacity: usize,
+    ) -> (Self, ConnectionOutputPorts) {
+        Self::with_connection_id(
+            ConnectionOutputId::new().as_uuid(),
+            critical_capacity,
+            durable_capacity,
+            ephemeral_capacity,
+        )
+    }
+
+    /// Allocate an output whose id is the wire `ServerHello.connection_id`.
+    pub(crate) fn with_connection_id(
+        connection_id: Uuid,
         critical_capacity: usize,
         durable_capacity: usize,
         ephemeral_capacity: usize,
@@ -1771,7 +1889,7 @@ impl ConnectionOutputHandle {
             },
         }));
         let handle = Self {
-            id: ConnectionOutputId::new(),
+            id: ConnectionOutputId::from_uuid(connection_id),
             critical_slots: Arc::new(Semaphore::new(critical_capacity.max(1))),
             critical_tx,
             durable_tx,
@@ -1853,13 +1971,22 @@ impl ConnectionOutputHandle {
     }
 
     pub(crate) fn try_enqueue_critical(&self, message: ServerMessage) -> Result<(), IpcError> {
-        self.try_enqueue_critical_outbound(message, None)
+        self.try_enqueue_critical_outbound(message, None, false)
+    }
+
+    /// Admit a critical message that requests shutdown only after a successful write.
+    pub(crate) fn try_enqueue_critical_shutdown_after_write(
+        &self,
+        message: ServerMessage,
+    ) -> Result<(), IpcError> {
+        self.try_enqueue_critical_outbound(message, None, true)
     }
 
     fn try_enqueue_critical_outbound(
         &self,
         message: ServerMessage,
         live_resync: Option<LiveResyncMaterialization>,
+        shutdown_after_successful_write: bool,
     ) -> Result<(), IpcError> {
         if self.is_shutdown_requested() {
             return Err(IpcError::Unavailable);
@@ -1872,11 +1999,13 @@ impl ConnectionOutputHandle {
                 self.request_shutdown();
                 IpcError::Unavailable
             })?;
+        let shutdown_after_successful_write = shutdown_after_successful_write.then(|| self.clone());
         self.critical_tx
             .send(CriticalOutbound {
                 message,
                 _permit: permit,
                 live_resync,
+                shutdown_after_successful_write,
             })
             .map_err(|_| {
                 self.request_shutdown();
@@ -1912,6 +2041,7 @@ impl ConnectionOutputHandle {
                 stream: Arc::clone(stream),
                 newest_sequence_hint: newest_sequence,
             }),
+            false,
         ) {
             Ok(()) => DurableAdmitResult::ResyncAdmitted {
                 last_delivered_sequence,
@@ -2826,6 +2956,328 @@ mod output_tests {
             newest_sequence_hint_from_replay_error(&ReplayError::InvalidCursor, 5, 8),
             8
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_removes_exact_output_and_live_binding_before_ack_shutdown() {
+        use super::{ConnectionOutputId, HostRequestExecutor, OutputInspection};
+        use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+        use crate::domain::query::{Query, QueryEnvelope};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            WorkspaceRef,
+        };
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{
+            Capability, CapabilitySet, ClientRequest, DetachRequest, FrameLimits,
+            NegotiatedParameters, ProtocolVersion, ServerMessage,
+        };
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("detach.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start(bus);
+
+        let id_a = Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd1,
+        ]);
+        let id_b = Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd2,
+        ]);
+        let (out_a, mut ports_a) = ConnectionOutputHandle::with_connection_id(id_a, 2, 4, 1);
+        let (out_b, _ports_b) = ConnectionOutputHandle::with_connection_id(id_b, 2, 4, 1);
+        let shutdown_a = out_a.subscribe_shutdown();
+        let reg_a = requests
+            .register_output(out_a.clone())
+            .await
+            .expect("register a");
+        let reg_b = requests
+            .register_output(out_b.clone())
+            .await
+            .expect("register b");
+        assert_eq!(reg_a.id().as_uuid(), id_a);
+        assert_eq!(reg_b.id().as_uuid(), id_b);
+
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd3,
+        ])
+        .expect("client");
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+                Capability::OperationSettlement,
+                Capability::ExplicitDetach,
+            ]),
+            limits: FrameLimits::v1_default(),
+        };
+        let handle_a = requests.with_output(reg_a.id());
+        let handle_b = requests.with_output(reg_b.id());
+
+        let task_id = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd4,
+        ])
+        .expect("task");
+        let create = CommandEnvelope {
+            command_id: CommandId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xd5,
+            ])
+            .expect("command"),
+            client_id: client,
+            task_id: None,
+            issued_at_ms: 1,
+            expected_task_revision: None,
+            command: Command::CreateTask(CreateTaskIntent {
+                id: task_id,
+                environment_id: EnvironmentId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xd6,
+                ])
+                .expect("env"),
+                title: "detach live".into(),
+                description: None,
+                project_id: ProjectId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xd7,
+                ])
+                .expect("project"),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        };
+        handle_a
+            .execute(negotiated, ClientRequest::Command(create))
+            .await
+            .expect("create task");
+
+        let open = handle_a
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xd8,
+                    ])
+                    .expect("open req"),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open replay");
+        assert!(matches!(open, ServerMessage::QueryReply(_)));
+
+        let before = requests
+            .inspect_output(ConnectionOutputId::from_uuid(id_a))
+            .await
+            .expect("inspect before");
+        assert_eq!(
+            before,
+            OutputInspection {
+                registered: true,
+                live_bound: true,
+            }
+        );
+
+        let denied = handle_a
+            .execute(
+                NegotiatedParameters {
+                    capabilities: CapabilitySet::from_capabilities([
+                        Capability::PagedSnapshots,
+                        Capability::EventReplay,
+                        Capability::OperationSettlement,
+                    ]),
+                    ..negotiated
+                },
+                ClientRequest::Detach(DetachRequest {
+                    request_id: RequestId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xcf,
+                    ])
+                    .expect("denied req"),
+                    client_id: client,
+                    connection_id: id_a,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(super::super::ipc::IpcError::UnsupportedCapability)
+        ));
+        assert_eq!(
+            requests
+                .inspect_output(ConnectionOutputId::from_uuid(id_a))
+                .await
+                .expect("inspect after deny"),
+            before,
+            "unsupported detach must leave output and live binding intact"
+        );
+
+        let sibling_before = requests
+            .inspect_output(ConnectionOutputId::from_uuid(id_b))
+            .await
+            .expect("inspect b");
+        assert!(sibling_before.registered);
+
+        let request_id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd9,
+        ])
+        .expect("detach req");
+        let ack_message = handle_a
+            .execute(
+                negotiated,
+                ClientRequest::Detach(DetachRequest {
+                    request_id,
+                    client_id: client,
+                    connection_id: id_a,
+                }),
+            )
+            .await
+            .expect("detach");
+        assert_eq!(
+            ack_message,
+            ServerMessage::Detached(crate::protocol::DetachAck {
+                request_id,
+                connection_id: id_a,
+            })
+        );
+
+        let after = requests
+            .inspect_output(ConnectionOutputId::from_uuid(id_a))
+            .await
+            .expect("inspect after");
+        assert_eq!(
+            after,
+            OutputInspection {
+                registered: false,
+                live_bound: false,
+            },
+            "detach must remove output and live binding before ack write"
+        );
+        let sibling_after = requests
+            .inspect_output(ConnectionOutputId::from_uuid(id_b))
+            .await
+            .expect("inspect b after");
+        assert!(
+            sibling_after.registered,
+            "sibling output must remain usable"
+        );
+
+        assert!(
+            !*shutdown_a.borrow(),
+            "shutdown must not run before ack write"
+        );
+        out_a
+            .try_enqueue_critical_shutdown_after_write(ack_message.clone())
+            .expect("admit detach ack");
+        assert!(!*shutdown_a.borrow());
+        let outbound = ports_a
+            .try_recv_prioritized()
+            .expect("detach ack on critical lane");
+        assert_eq!(outbound.message(), &ack_message);
+        outbound.after_successful_write();
+        assert!(
+            *shutdown_a.borrow(),
+            "successful ack write must request shutdown"
+        );
+        assert!(
+            matches!(
+                out_a.try_enqueue_critical(ServerMessage::QueryReply(
+                    crate::domain::query::QueryReply {
+                        request_id: RequestId::new(),
+                        outcome: crate::domain::query::QueryOutcome::Err(
+                            crate::domain::query::QueryError::NotFound
+                        ),
+                    }
+                )),
+                Err(super::super::ipc::IpcError::Unavailable)
+            ),
+            "no later critical traffic after detach shutdown"
+        );
+
+        let stale = handle_b
+            .execute(
+                negotiated,
+                ClientRequest::Detach(DetachRequest {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    connection_id: id_a,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(super::super::ipc::IpcError::Unauthorized)),
+            "stale connection identity must not detach the sibling"
+        );
+        assert!(
+            requests
+                .inspect_output(ConnectionOutputId::from_uuid(id_b))
+                .await
+                .expect("b still registered")
+                .registered
+        );
+
+        let wrong_client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xda,
+        ])
+        .expect("foreign");
+        let wrong = handle_b
+            .execute(
+                negotiated,
+                ClientRequest::Detach(DetachRequest {
+                    request_id: RequestId::new(),
+                    client_id: wrong_client,
+                    connection_id: id_b,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            wrong,
+            Err(super::super::ipc::IpcError::Unauthorized)
+        ));
+        assert!(
+            requests
+                .inspect_output(ConnectionOutputId::from_uuid(id_b))
+                .await
+                .expect("b survives wrong client")
+                .registered
+        );
+
+        handle_b
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    query: Query::TaskSnapshot,
+                }),
+            )
+            .await
+            .expect("sibling remains usable after failed detaches");
+
+        drop(reg_a);
+        drop(reg_b);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -69,6 +69,7 @@ pub enum Capability {
     ConnectEncryption = 9,
     Guests = 10,
     ManagementMetadata = 11,
+    ExplicitDetach = 12,
 }
 
 impl Capability {

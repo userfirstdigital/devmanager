@@ -646,13 +646,15 @@ async fn windows_serve_duplex(
 ) -> Result<(), IpcError> {
     let HostConnection {
         negotiated,
+        server_hello,
         physical,
         message,
         pipe,
         ..
     } = connection;
     let (mut reader, mut writer) = tokio::io::split(pipe);
-    let (output, mut ports) = ConnectionOutputHandle::new(
+    let (output, mut ports) = ConnectionOutputHandle::with_connection_id(
+        server_hello.connection_id,
         critical_capacity,
         HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
         HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
@@ -719,7 +721,22 @@ async fn windows_serve_duplex(
                     let request = message
                         .decode::<ClientRequest>(&payload)
                         .map_err(IpcError::MessagePack)?;
+                    let is_detach = matches!(request, ClientRequest::Detach(_));
                     let response = requests.execute(negotiated, request).await?;
+                    if is_detach {
+                        // Critical detach ack: shutdown only after successful write.
+                        // Admit once, then refuse further requests on this reader.
+                        reader_output.try_enqueue_critical_shutdown_after_write(response)?;
+                        loop {
+                            if *reader_shutdown.borrow() {
+                                return Err(IpcError::Unavailable);
+                            }
+                            reader_shutdown
+                                .changed()
+                                .await
+                                .map_err(|_| IpcError::Unavailable)?;
+                        }
+                    }
                     // Critical traffic must not block the executor/other clients: if the
                     // client is not draining, fail closed for this connection only.
                     reader_output.try_enqueue_critical(response)?;

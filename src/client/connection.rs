@@ -22,13 +22,26 @@ use crate::host::{
     write_physical_frame, write_physical_frame_with_deadline, IpcError,
 };
 use crate::protocol::{
-    ClientHello, ClientRequest, FrameLimits, MessagePackCodec, PhysicalFrameCodec, ServerHello,
-    ServerMessage, StreamFrame, MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
+    ClientHello, ClientRequest, DetachAck, DetachRequest, FrameLimits, MessagePackCodec,
+    PhysicalFrameCodec, ServerHello, ServerMessage, StreamFrame, MAX_PHYSICAL_FRAME_BYTES,
+    MAX_REASSEMBLED_MESSAGE_BYTES,
 };
 
 const WRITE_QUEUE_CAPACITY: usize = 32;
 const UNSOLICITED_QUEUE_CAPACITY: usize = 64;
 const UNSOLICITED_STREAM_CAPACITY: usize = 16;
+
+/// Scripted detach I/O behavior for unit tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScriptedDetachBehavior {
+    /// Echo a Detached ack with the request's connection_id.
+    MatchingAck,
+    /// Echo a Detached ack with a different connection_id (correlation fail-closed).
+    WrongConnectionAck,
+    /// Reject enqueue immediately (closed write queue / transport unavailable).
+    ClosedWriteQueue,
+}
 
 /// Unsolicited server→client messages (not correlated replies).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,12 +186,14 @@ impl UnsolicitedInbox {
 enum PendingKind {
     Command(oneshot::Sender<Result<CommandReceipt, IpcError>>),
     Query(oneshot::Sender<Result<QueryReply, IpcError>>),
+    Detach(oneshot::Sender<Result<DetachAck, IpcError>>),
 }
 
 #[derive(Clone, Copy)]
 enum PendingKey {
     Command(CommandId),
     Query(RequestId),
+    Detach(RequestId),
 }
 
 struct PendingReply<T> {
@@ -212,6 +227,7 @@ impl<T> PendingReply<T> {
 enum ErasedPendingReply {
     Command(PendingReply<CommandReceipt>),
     Query(PendingReply<QueryReply>),
+    Detach(PendingReply<DetachAck>),
 }
 
 impl ErasedPendingReply {
@@ -219,6 +235,7 @@ impl ErasedPendingReply {
         match self {
             Self::Command(pending) => pending.complete_from_deadline(),
             Self::Query(pending) => pending.complete_from_deadline(),
+            Self::Detach(pending) => pending.complete_from_deadline(),
         }
     }
 
@@ -226,6 +243,7 @@ impl ErasedPendingReply {
         match self {
             Self::Command(pending) => pending.cancel(),
             Self::Query(pending) => pending.cancel(),
+            Self::Detach(pending) => pending.cancel(),
         }
     }
 }
@@ -288,6 +306,15 @@ impl PendingRegistration {
                     pending.deadline_task = deadline_task.take();
                 }
             }
+            PendingKey::Detach(id) => {
+                if let Some(pending) = state
+                    .detach_waiters
+                    .get_mut(&id)
+                    .filter(|pending| pending.registration_id == registration_id)
+                {
+                    pending.deadline_task = deadline_task.take();
+                }
+            }
         }
         drop(state);
 
@@ -321,6 +348,7 @@ struct SharedState {
     next_registration_id: u64,
     command_waiters: HashMap<CommandId, PendingReply<CommandReceipt>>,
     query_waiters: HashMap<RequestId, PendingReply<QueryReply>>,
+    detach_waiters: HashMap<RequestId, PendingReply<DetachAck>>,
     poisoned: bool,
     closed: bool,
 }
@@ -347,6 +375,117 @@ impl ClientConnection {
 
     pub fn server_hello(&self) -> ServerHello {
         self.shared.server_hello.clone()
+    }
+
+    /// Inert connected stub for HostClient unit tests (never performs I/O).
+    #[cfg(test)]
+    pub(crate) fn inert_stub_for_test(client_id: ClientId, server_hello: ServerHello) -> Self {
+        Self {
+            shared: Arc::new(SharedConnection {
+                client_id,
+                server_hello,
+                state: Arc::new(Mutex::new(SharedState::default())),
+                write_tx: {
+                    let (tx, _rx) = mpsc::channel(1);
+                    tx
+                },
+                unsolicited: Arc::new(UnsolicitedInbox::new_for_test(1, 1)),
+                io_task: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Deterministic scripted duplex for detach unit tests (no named pipe).
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(
+        client_id: ClientId,
+        server_hello: ServerHello,
+        behavior: ScriptedDetachBehavior,
+    ) -> Self {
+        let (write_tx, write_rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_CAPACITY);
+        let state = Arc::new(Mutex::new(SharedState::default()));
+        let unsolicited = Arc::new(UnsolicitedInbox::new_for_test(1, 1));
+        let io_task = match behavior {
+            ScriptedDetachBehavior::ClosedWriteQueue => {
+                drop(write_rx);
+                None
+            }
+            ScriptedDetachBehavior::MatchingAck | ScriptedDetachBehavior::WrongConnectionAck => {
+                let reader_state = Arc::clone(&state);
+                let terminal_state = Arc::clone(&state);
+                let reader_unsolicited = Arc::clone(&unsolicited);
+                let wrong_connection =
+                    matches!(behavior, ScriptedDetachBehavior::WrongConnectionAck);
+                Some(tokio::spawn(async move {
+                    let mut write_rx = write_rx;
+                    while let Some(job) = write_rx.recv().await {
+                        let ClientRequest::Detach(request) = job.request else {
+                            continue;
+                        };
+                        let connection_id = if wrong_connection {
+                            uuid::Uuid::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0xff,
+                            ])
+                        } else {
+                            request.connection_id
+                        };
+                        if dispatch_server_message(
+                            &reader_state,
+                            &reader_unsolicited,
+                            ServerMessage::Detached(DetachAck {
+                                request_id: request.request_id,
+                                connection_id,
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    reader_unsolicited.close();
+                    poison_mutex(&terminal_state);
+                }))
+            }
+        };
+
+        Self {
+            shared: Arc::new(SharedConnection {
+                client_id,
+                server_hello,
+                state,
+                write_tx,
+                unsolicited,
+                io_task: Mutex::new(io_task),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[cfg(test)]
+    fn detach_waiter_registration_id(&self, request_id: RequestId) -> Option<u64> {
+        self.shared
+            .state
+            .lock()
+            .expect("client connection state")
+            .detach_waiters
+            .get(&request_id)
+            .map(|pending| pending.registration_id)
+    }
+
+    #[cfg(test)]
+    fn detach_waiter_count(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .expect("client connection state")
+            .detach_waiters
+            .len()
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -398,6 +537,33 @@ impl ClientConnection {
         reply_rx.await.map_err(|_| IpcError::Unavailable)?
     }
 
+    /// Request host-acknowledged detach for this connection's wire connection_id.
+    pub async fn detach(&self, request: DetachRequest) -> Result<DetachAck, IpcError> {
+        let request_id = request.request_id;
+        let expected_connection_id = request.connection_id;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut registration = self.register_waiter(
+            PendingKey::Detach(request_id),
+            PendingKind::Detach(reply_tx),
+        )?;
+        if let Err(error) = self.enqueue_write(ClientRequest::Detach(request)).await {
+            self.fail_closed();
+            return Err(error);
+        }
+        if let Err(error) = registration
+            .arm_response_deadline(self.io_abort_handle()?, request_completion_timeout())
+        {
+            self.fail_closed();
+            return Err(error);
+        }
+        let ack = reply_rx.await.map_err(|_| IpcError::Unavailable)??;
+        if ack.request_id != request_id || ack.connection_id != expected_connection_id {
+            self.fail_closed();
+            return Err(IpcError::CorrelationMismatch);
+        }
+        Ok(ack)
+    }
+
     /// Receive the next unsolicited message, preferring durable/resync over streams.
     pub async fn recv_unsolicited(&self) -> Result<UnsolicitedServerMessage, IpcError> {
         self.shared.unsolicited.recv().await
@@ -440,6 +606,19 @@ impl ClientConnection {
                     return Err(IpcError::DuplicateInFlight);
                 }
                 state.query_waiters.insert(
+                    id,
+                    PendingReply {
+                        registration_id,
+                        sender: tx,
+                        deadline_task: None,
+                    },
+                );
+            }
+            (PendingKey::Detach(id), PendingKind::Detach(tx)) => {
+                if state.detach_waiters.contains_key(&id) {
+                    return Err(IpcError::DuplicateInFlight);
+                }
+                state.detach_waiters.insert(
                     id,
                     PendingReply {
                         registration_id,
@@ -680,6 +859,20 @@ async fn dispatch_server_message(
             newest_sequence,
         }),
         ServerMessage::Stream(frame) => unsolicited.push_stream(frame),
+        ServerMessage::Detached(ack) => {
+            let request_id = ack.request_id;
+            let waiter = {
+                let mut guard = state.lock().expect("client connection state");
+                guard.detach_waiters.remove(&request_id)
+            };
+            match waiter {
+                Some(pending) => {
+                    pending.complete(Ok(ack));
+                    Ok(())
+                }
+                None => Err(IpcError::CorrelationMismatch),
+            }
+        }
     }
 }
 
@@ -714,6 +907,17 @@ fn remove_pending_exact(
                 .remove(&id)
                 .map(ErasedPendingReply::Query)
         }
+        PendingKey::Detach(id)
+            if guard
+                .detach_waiters
+                .get(&id)
+                .is_some_and(|pending| pending.registration_id == registration_id) =>
+        {
+            guard
+                .detach_waiters
+                .remove(&id)
+                .map(ErasedPendingReply::Detach)
+        }
         _ => None,
     }
 }
@@ -729,11 +933,15 @@ fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
     guard.closed = true;
     let commands = std::mem::take(&mut guard.command_waiters);
     let queries = std::mem::take(&mut guard.query_waiters);
+    let detaches = std::mem::take(&mut guard.detach_waiters);
     drop(guard);
     for (_, pending) in commands {
         pending.complete(Err(IpcError::Unavailable));
     }
     for (_, pending) in queries {
+        pending.complete(Err(IpcError::Unavailable));
+    }
+    for (_, pending) in detaches {
         pending.complete(Err(IpcError::Unavailable));
     }
 }
@@ -793,6 +1001,302 @@ mod tests {
         bytes[8] = 0x80;
         bytes[15] = tail;
         CommandId::from_bytes(bytes).expect("command id")
+    }
+
+    #[test]
+    fn detach_cancelled_pre_enqueue_registration_removes_the_unsent_waiter() {
+        use super::{ClientConnection, PendingKind, ScriptedDetachBehavior};
+        use crate::domain::id::RequestId;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, DetachAck, FrameLimits, ServerHello};
+        use crate::protocol::{ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd0,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd1,
+        ]);
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "test".into(),
+            host_boot_id: connection_id,
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            limits: FrameLimits::v1_default(),
+        };
+        let conn = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::ClosedWriteQueue,
+        );
+        let id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd2,
+        ])
+        .expect("request id");
+        let (reply_tx, _reply_rx) = oneshot::channel::<Result<DetachAck, IpcError>>();
+        let registration = conn
+            .register_waiter(PendingKey::Detach(id), PendingKind::Detach(reply_tx))
+            .expect("register");
+        assert_eq!(conn.detach_waiter_count(), 1);
+        drop(registration);
+        assert_eq!(
+            conn.detach_waiter_count(),
+            0,
+            "cancelling before enqueue must release the unsent detach correlation id"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_cancelled_post_enqueue_retains_deadline_then_poisons_at_expiry() {
+        use super::{ClientConnection, PendingKind, ScriptedDetachBehavior};
+        use crate::domain::id::RequestId;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, DetachAck, FrameLimits, ServerHello};
+        use crate::protocol::{ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd3,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd4,
+        ]);
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "test".into(),
+            host_boot_id: connection_id,
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            limits: FrameLimits::v1_default(),
+        };
+        // MatchingAck keeps a live write consumer; we only exercise the deadline path.
+        let conn = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::MatchingAck,
+        );
+        let id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd5,
+        ])
+        .expect("request id");
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<DetachAck, IpcError>>();
+        let mut registration = conn
+            .register_waiter(PendingKey::Detach(id), PendingKind::Detach(reply_tx))
+            .expect("register");
+        let io_abort = conn.io_abort_handle().expect("scripted I/O");
+        registration
+            .arm_response_deadline(io_abort, Duration::from_millis(20))
+            .expect("arm detach deadline");
+        drop(registration);
+        drop(reply_rx);
+
+        assert_eq!(
+            conn.detach_waiter_count(),
+            1,
+            "post-enqueue cancel must leave the connection-owned detach deadline armed"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(conn.detach_waiter_count(), 0);
+        assert!(
+            conn.is_poisoned(),
+            "deadline must poison and close the connection"
+        );
+        let guard = conn.shared.state.lock().expect("state");
+        assert!(guard.closed);
+        drop(guard);
+        let task = conn
+            .shared
+            .io_task
+            .lock()
+            .expect("io task")
+            .take()
+            .expect("io task");
+        assert!(
+            task.await
+                .expect_err("deadline must abort I/O")
+                .is_cancelled(),
+            "timed-out connection I/O must be cancelled"
+        );
+    }
+
+    #[test]
+    fn detach_duplicate_request_id_is_rejected_without_replacing_waiter() {
+        use super::{ClientConnection, PendingKind, ScriptedDetachBehavior};
+        use crate::domain::id::RequestId;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, DetachAck, FrameLimits, ServerHello};
+        use crate::protocol::{ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd6,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd7,
+        ]);
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "test".into(),
+            host_boot_id: connection_id,
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            limits: FrameLimits::v1_default(),
+        };
+        let conn = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::ClosedWriteQueue,
+        );
+        let id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd8,
+        ])
+        .expect("request id");
+        let (first_tx, _first_rx) = oneshot::channel::<Result<DetachAck, IpcError>>();
+        let first = conn
+            .register_waiter(PendingKey::Detach(id), PendingKind::Detach(first_tx))
+            .expect("first register");
+        let before = conn
+            .detach_waiter_registration_id(id)
+            .expect("first generation");
+
+        let (second_tx, _second_rx) = oneshot::channel::<Result<DetachAck, IpcError>>();
+        assert!(matches!(
+            conn.register_waiter(PendingKey::Detach(id), PendingKind::Detach(second_tx)),
+            Err(IpcError::DuplicateInFlight)
+        ));
+        assert_eq!(
+            conn.detach_waiter_registration_id(id),
+            Some(before),
+            "duplicate detach RequestId must not replace the original waiter"
+        );
+        drop(first);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_wrong_connection_ack_fail_closes_without_reusable_pending() {
+        use super::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::id::RequestId;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, DetachRequest, FrameLimits, ServerHello};
+        use crate::protocol::{ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd9,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xda,
+        ]);
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "test".into(),
+            host_boot_id: connection_id,
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            limits: FrameLimits::v1_default(),
+        };
+        let conn = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::WrongConnectionAck,
+        );
+        let request_id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xdb,
+        ])
+        .expect("request id");
+        assert!(matches!(
+            conn.detach(DetachRequest {
+                request_id,
+                client_id,
+                connection_id,
+            })
+            .await,
+            Err(IpcError::CorrelationMismatch)
+        ));
+        assert_eq!(
+            conn.detach_waiter_count(),
+            0,
+            "fail-closed detach must leave no reusable pending entry"
+        );
+        assert!(conn.is_poisoned());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_transport_failure_fail_closes_without_reusable_pending() {
+        use super::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::id::RequestId;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, DetachRequest, FrameLimits, ServerHello};
+        use crate::protocol::{ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xdc,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xdd,
+        ]);
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "test".into(),
+            host_boot_id: connection_id,
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            limits: FrameLimits::v1_default(),
+        };
+        let conn = ClientConnection::scripted_for_test(
+            client_id,
+            hello,
+            ScriptedDetachBehavior::ClosedWriteQueue,
+        );
+        let request_id = RequestId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xde,
+        ])
+        .expect("request id");
+        assert!(matches!(
+            conn.detach(DetachRequest {
+                request_id,
+                client_id,
+                connection_id,
+            })
+            .await,
+            Err(IpcError::Unavailable)
+        ));
+        assert_eq!(
+            conn.detach_waiter_count(),
+            0,
+            "transport failure must leave no reusable detach waiter"
+        );
+        assert!(conn.is_poisoned());
     }
 
     #[test]

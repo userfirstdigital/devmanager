@@ -671,6 +671,7 @@ async fn serve_foreground_host(
             Capability::EventReplay,
             Capability::OperationSettlement,
             Capability::ChunkResume,
+            Capability::ExplicitDetach,
         ]),
         local_limits: FrameLimits::v1_default(),
     };

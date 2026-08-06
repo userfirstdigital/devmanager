@@ -12,12 +12,13 @@ use devmanager::domain::{
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
-    FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError,
-    MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint,
-    ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
+    DetachAck, DetachRequest, FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec,
+    MessagePackError, MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError,
+    ProfileFingerprint, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
     VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
     MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use uuid::Uuid;
 
 #[test]
 fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
@@ -34,6 +35,7 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
         (Capability::ConnectEncryption, 9),
         (Capability::Guests, 10),
         (Capability::ManagementMetadata, 11),
+        (Capability::ExplicitDetach, 12),
     ];
     for (capability, bit_index) in named {
         assert_eq!(capability.bit(), 1_u64 << bit_index);
@@ -1956,6 +1958,589 @@ fn protocol_task_snapshot_query_is_strict_empty_named_payload() {
             .unwrap()
         ),
         Err(MessagePackError::Decode)
+    );
+}
+
+#[test]
+fn protocol_detach_request_and_detached_ack_are_strict_named_control_maps() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let connection_id = Uuid::from_bytes(protocol_uuid_v7(0xe1));
+    let request = DetachRequest {
+        request_id: protocol_request_id(0xe2),
+        client_id: protocol_client_id(0xe3),
+        connection_id,
+    };
+    let ack = DetachAck {
+        request_id: protocol_request_id(0xe2),
+        connection_id,
+    };
+    let client = ClientRequest::Detach(request.clone());
+    let server = ServerMessage::Detached(ack.clone());
+
+    let encoded_request = codec.encode(&client).expect("encode detach");
+    assert_eq!(
+        encoded_request[0], 0x81,
+        "ClientRequest::Detach is one-entry"
+    );
+    assert_eq!(
+        codec
+            .decode::<ClientRequest>(&encoded_request)
+            .expect("decode detach"),
+        client
+    );
+    assert!(
+        encoded_request
+            .windows(b"detach".len())
+            .any(|w| w == b"detach"),
+        "stable outer key must be exactly `detach`"
+    );
+
+    let encoded_ack = codec.encode(&server).expect("encode detached");
+    assert_eq!(encoded_ack[0], 0x81, "ServerMessage::Detached is one-entry");
+    assert_eq!(
+        codec
+            .decode::<ServerMessage>(&encoded_ack)
+            .expect("decode detached"),
+        server
+    );
+    assert!(
+        encoded_ack
+            .windows(b"detached".len())
+            .any(|w| w == b"detached"),
+        "stable outer key must be exactly `detached`"
+    );
+
+    let direct_request = codec.encode(&request).expect("direct request");
+    let direct_ack = codec.encode(&ack).expect("direct ack");
+
+    let wrap_detach = |inner: &[u8]| -> Vec<u8> {
+        let mut out = vec![0x81];
+        push_messagepack(&mut out, "detach");
+        out.extend_from_slice(inner);
+        out
+    };
+    let wrap_detached = |inner: &[u8]| -> Vec<u8> {
+        let mut out = vec![0x81];
+        push_messagepack(&mut out, "detached");
+        out.extend_from_slice(inner);
+        out
+    };
+
+    let reject = |label: &str,
+                  bytes: &[u8],
+                  decode_request: bool,
+                  decode_ack: bool,
+                  decode_client: bool,
+                  decode_server: bool| {
+        let is_err = |result: Result<(), MessagePackError>| -> bool {
+            matches!(
+                result,
+                Err(MessagePackError::Decode) | Err(MessagePackError::TrailingBytes { .. })
+            )
+        };
+        if decode_request {
+            assert!(
+                is_err(codec.decode::<DetachRequest>(bytes).map(|_| ())),
+                "{label}: DetachRequest got {:?}",
+                codec.decode::<DetachRequest>(bytes)
+            );
+        }
+        if decode_ack {
+            assert!(
+                is_err(codec.decode::<DetachAck>(bytes).map(|_| ())),
+                "{label}: DetachAck got {:?}",
+                codec.decode::<DetachAck>(bytes)
+            );
+        }
+        if decode_client {
+            assert!(
+                is_err(codec.decode::<ClientRequest>(bytes).map(|_| ())),
+                "{label}: ClientRequest got {:?}",
+                codec.decode::<ClientRequest>(bytes)
+            );
+        }
+        if decode_server {
+            assert!(
+                is_err(codec.decode::<ServerMessage>(bytes).map(|_| ())),
+                "{label}: ServerMessage got {:?}",
+                codec.decode::<ServerMessage>(bytes)
+            );
+        }
+    };
+
+    // Rebuild fixtures for assertions (avoid lifetime issues with the table).
+    #[derive(serde::Serialize)]
+    struct MissingRequestId {
+        client_id: ClientId,
+        connection_id: Uuid,
+    }
+    let missing_request_id = rmp_serde::to_vec_named(&MissingRequestId {
+        client_id: protocol_client_id(0xe4),
+        connection_id,
+    })
+    .unwrap();
+    reject(
+        "missing request_id",
+        &missing_request_id,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer missing request_id",
+        &wrap_detach(&missing_request_id),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct MissingClientId {
+        request_id: RequestId,
+        connection_id: Uuid,
+    }
+    let missing_client_id = rmp_serde::to_vec_named(&MissingClientId {
+        request_id: protocol_request_id(0xe5),
+        connection_id,
+    })
+    .unwrap();
+    reject(
+        "missing client_id",
+        &missing_client_id,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer missing client_id",
+        &wrap_detach(&missing_client_id),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct MissingConnection {
+        request_id: RequestId,
+        client_id: ClientId,
+    }
+    let missing_connection = rmp_serde::to_vec_named(&MissingConnection {
+        request_id: protocol_request_id(0xe6),
+        client_id: protocol_client_id(0xe7),
+    })
+    .unwrap();
+    reject(
+        "missing connection_id",
+        &missing_connection,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer missing connection_id",
+        &wrap_detach(&missing_connection),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct MissingAckConnection {
+        request_id: RequestId,
+    }
+    let missing_ack_connection = rmp_serde::to_vec_named(&MissingAckConnection {
+        request_id: protocol_request_id(0xe8),
+    })
+    .unwrap();
+    reject(
+        "missing ack connection_id",
+        &missing_ack_connection,
+        false,
+        true,
+        false,
+        false,
+    );
+    reject(
+        "outer missing ack connection_id",
+        &wrap_detached(&missing_ack_connection),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    struct MissingAckRequest {
+        connection_id: Uuid,
+    }
+    let missing_ack_request =
+        rmp_serde::to_vec_named(&MissingAckRequest { connection_id }).unwrap();
+    reject(
+        "missing ack request_id",
+        &missing_ack_request,
+        false,
+        true,
+        false,
+        false,
+    );
+    reject(
+        "outer missing ack request_id",
+        &wrap_detached(&missing_ack_request),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    struct OpenDetach {
+        request_id: RequestId,
+        client_id: ClientId,
+        connection_id: Uuid,
+        future_field: bool,
+    }
+    let unknown_request = rmp_serde::to_vec_named(&OpenDetach {
+        request_id: protocol_request_id(0xe9),
+        client_id: protocol_client_id(0xea),
+        connection_id,
+        future_field: true,
+    })
+    .unwrap();
+    reject(
+        "unknown request field",
+        &unknown_request,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer unknown request field",
+        &wrap_detach(&unknown_request),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct OpenAck {
+        request_id: RequestId,
+        connection_id: Uuid,
+        future_field: bool,
+    }
+    let unknown_ack = rmp_serde::to_vec_named(&OpenAck {
+        request_id: protocol_request_id(0xeb),
+        connection_id,
+        future_field: true,
+    })
+    .unwrap();
+    reject("unknown ack field", &unknown_ack, false, true, false, false);
+    reject(
+        "outer unknown ack field",
+        &wrap_detached(&unknown_ack),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    struct PositionalDetach(RequestId, ClientId, Uuid);
+    let positional_request = rmp_serde::to_vec(&PositionalDetach(
+        protocol_request_id(0xec),
+        protocol_client_id(0xed),
+        connection_id,
+    ))
+    .unwrap();
+    reject(
+        "positional request",
+        &positional_request,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer positional request",
+        &wrap_detach(&positional_request),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct PositionalAck(RequestId, Uuid);
+    let positional_ack =
+        rmp_serde::to_vec(&PositionalAck(protocol_request_id(0xee), connection_id)).unwrap();
+    reject("positional ack", &positional_ack, false, true, false, false);
+    reject(
+        "outer positional ack",
+        &wrap_detached(&positional_ack),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawUnknownRequest {
+        FutureRequest,
+    }
+    reject(
+        "unknown ClientRequest variant",
+        &rmp_serde::to_vec_named(&RawUnknownRequest::FutureRequest).unwrap(),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawUnknownResponse {
+        FutureResponse,
+    }
+    reject(
+        "unknown ServerMessage variant",
+        &rmp_serde::to_vec_named(&RawUnknownResponse::FutureResponse).unwrap(),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    struct MultiOuterRequest {
+        detach: DetachRequest,
+        query: bool,
+    }
+    reject(
+        "multi ClientRequest variants",
+        &rmp_serde::to_vec_named(&MultiOuterRequest {
+            detach: request.clone(),
+            query: true,
+        })
+        .unwrap(),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct MultiOuterResponse {
+        detached: DetachAck,
+        query_reply: bool,
+    }
+    reject(
+        "multi ServerMessage variants",
+        &rmp_serde::to_vec_named(&MultiOuterResponse {
+            detached: ack.clone(),
+            query_reply: true,
+        })
+        .unwrap(),
+        false,
+        false,
+        false,
+        true,
+    );
+    #[derive(serde::Serialize)]
+    struct RawDetach {
+        request_id: [u8; 16],
+        client_id: [u8; 16],
+        connection_id: Uuid,
+    }
+    reject(
+        "malformed request_id",
+        &rmp_serde::to_vec_named(&RawDetach {
+            request_id: [0; 16],
+            client_id: *protocol_client_id(0xef).as_bytes(),
+            connection_id,
+        })
+        .unwrap(),
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "malformed client_id",
+        &rmp_serde::to_vec_named(&RawDetach {
+            request_id: *protocol_request_id(0xf0).as_bytes(),
+            client_id: [0; 16],
+            connection_id,
+        })
+        .unwrap(),
+        true,
+        false,
+        false,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct RawDetachBadConnection {
+        request_id: RequestId,
+        client_id: ClientId,
+        connection_id: [u8; 8],
+    }
+    let malformed_connection = rmp_serde::to_vec_named(&RawDetachBadConnection {
+        request_id: protocol_request_id(0xf5),
+        client_id: protocol_client_id(0xf6),
+        connection_id: [0; 8],
+    })
+    .unwrap();
+    reject(
+        "malformed connection_id",
+        &malformed_connection,
+        true,
+        false,
+        false,
+        false,
+    );
+    reject(
+        "outer malformed connection_id",
+        &wrap_detach(&malformed_connection),
+        false,
+        false,
+        true,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct RawAck {
+        request_id: [u8; 16],
+        connection_id: Uuid,
+    }
+    reject(
+        "malformed ack request_id",
+        &rmp_serde::to_vec_named(&RawAck {
+            request_id: [0; 16],
+            connection_id,
+        })
+        .unwrap(),
+        false,
+        true,
+        false,
+        false,
+    );
+    #[derive(serde::Serialize)]
+    struct RawAckBadConnection {
+        request_id: RequestId,
+        connection_id: [u8; 8],
+    }
+    let malformed_ack_connection = rmp_serde::to_vec_named(&RawAckBadConnection {
+        request_id: protocol_request_id(0xf7),
+        connection_id: [0; 8],
+    })
+    .unwrap();
+    reject(
+        "malformed ack connection_id",
+        &malformed_ack_connection,
+        false,
+        true,
+        false,
+        false,
+    );
+    reject(
+        "outer malformed ack connection_id",
+        &wrap_detached(&malformed_ack_connection),
+        false,
+        false,
+        false,
+        true,
+    );
+
+    let mut duplicate_request = direct_request.clone();
+    duplicate_request[0] = 0x84;
+    push_messagepack(&mut duplicate_request, "request_id");
+    push_messagepack(&mut duplicate_request, &protocol_request_id(0xf1));
+    reject(
+        "duplicate request field",
+        &duplicate_request,
+        true,
+        false,
+        false,
+        false,
+    );
+
+    let mut duplicate_ack = direct_ack.clone();
+    duplicate_ack[0] = 0x83;
+    push_messagepack(&mut duplicate_ack, "request_id");
+    push_messagepack(&mut duplicate_ack, &protocol_request_id(0xf2));
+    reject(
+        "duplicate ack field",
+        &duplicate_ack,
+        false,
+        true,
+        false,
+        false,
+    );
+
+    let mut duplicate_outer_request = encoded_request.clone();
+    let request_inner = 1 + rmp_serde::to_vec("detach").unwrap().len();
+    duplicate_outer_request[request_inner] = 0x84;
+    push_messagepack(&mut duplicate_outer_request, "client_id");
+    push_messagepack(&mut duplicate_outer_request, &protocol_client_id(0xf3));
+    reject(
+        "duplicate outer request field",
+        &duplicate_outer_request,
+        false,
+        false,
+        true,
+        false,
+    );
+
+    let mut duplicate_outer_ack = encoded_ack.clone();
+    let ack_inner = 1 + rmp_serde::to_vec("detached").unwrap().len();
+    duplicate_outer_ack[ack_inner] = 0x83;
+    push_messagepack(&mut duplicate_outer_ack, "connection_id");
+    push_messagepack(
+        &mut duplicate_outer_ack,
+        &Uuid::from_bytes(protocol_uuid_v7(0xf4)),
+    );
+    reject(
+        "duplicate outer ack field",
+        &duplicate_outer_ack,
+        false,
+        false,
+        false,
+        true,
+    );
+
+    let mut trailing_direct_request = direct_request;
+    trailing_direct_request.push(0xc0);
+    reject(
+        "trailing direct request",
+        &trailing_direct_request,
+        true,
+        false,
+        false,
+        false,
+    );
+    let mut trailing_direct_ack = direct_ack;
+    trailing_direct_ack.push(0xc0);
+    reject(
+        "trailing direct ack",
+        &trailing_direct_ack,
+        false,
+        true,
+        false,
+        false,
+    );
+    let mut trailing_outer_request = encoded_request;
+    trailing_outer_request.push(0xc0);
+    reject(
+        "trailing outer request",
+        &trailing_outer_request,
+        false,
+        false,
+        true,
+        false,
+    );
+    let mut trailing_outer_ack = encoded_ack;
+    trailing_outer_ack.push(0xc0);
+    reject(
+        "trailing outer ack",
+        &trailing_outer_ack,
+        false,
+        false,
+        false,
+        true,
     );
 }
 

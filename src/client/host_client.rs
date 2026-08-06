@@ -20,7 +20,9 @@ use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
 };
-use crate::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits, ServerHello};
+use crate::protocol::{
+    Capability, CapabilitySet, ClientHello, DetachAck, DetachRequest, FrameLimits, ServerHello,
+};
 
 use super::action::task_show_query;
 use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
@@ -101,6 +103,37 @@ impl HostClient {
     /// Drop the live connection without clearing tracked operations.
     pub fn disconnect(&mut self) {
         self.connection = None;
+    }
+
+    /// Host-acknowledged detach: wait for Detached ack, then drop the local connection.
+    ///
+    /// Returns the acknowledged wire `connection_id`. Does not clear tracked operations.
+    /// Without granted [`Capability::ExplicitDetach`], returns
+    /// [`IpcError::UnsupportedCapability`] and leaves the connection live.
+    pub async fn detach(&mut self) -> Result<Uuid, IpcError> {
+        if !self
+            .server_hello
+            .granted
+            .contains(Capability::ExplicitDetach)
+        {
+            return Err(IpcError::UnsupportedCapability);
+        }
+        let Some(connection) = self.connection.as_ref() else {
+            return Err(IpcError::Unavailable);
+        };
+        let request = DetachRequest {
+            request_id: RequestId::new(),
+            client_id: self.config.client_id,
+            connection_id: self.server_hello.connection_id,
+        };
+        let ack = match connection.detach(request).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+        finish_detach_after_matching_ack(&mut self.connection, self.server_hello.connection_id, ack)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -699,6 +732,46 @@ impl HostClient {
     fn retire_connection(&mut self) {
         self.connection = None;
     }
+
+    #[cfg(test)]
+    fn from_parts_for_test(
+        config: HostClientConfig,
+        server_hello: ServerHello,
+        connection: Option<ClientConnection>,
+        tracked: BTreeMap<OperationId, TrackedOperation>,
+    ) -> Self {
+        Self {
+            config,
+            endpoint: String::new(),
+            connection,
+            server_hello,
+            tracked,
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> &BTreeMap<OperationId, TrackedOperation> {
+        &self.tracked
+    }
+
+    #[cfg(test)]
+    fn attached_connection(&self) -> Option<&ClientConnection> {
+        self.connection.as_ref()
+    }
+}
+
+fn finish_detach_after_matching_ack(
+    connection: &mut Option<ClientConnection>,
+    expected_connection_id: Uuid,
+    ack: DetachAck,
+) -> Result<Uuid, IpcError> {
+    if ack.connection_id != expected_connection_id {
+        *connection = None;
+        return Err(IpcError::CorrelationMismatch);
+    }
+    let connection_id = ack.connection_id;
+    *connection = None;
+    Ok(connection_id)
 }
 
 /// Record an Accepted receipt. Collision with a different CommandId leaves the map unchanged.
@@ -1098,5 +1171,218 @@ mod tests {
             .expect("matched")
                 == settled()
         );
+    }
+
+    fn test_server_hello(
+        granted: crate::protocol::CapabilitySet,
+        connection_id: uuid::Uuid,
+    ) -> crate::protocol::ServerHello {
+        use crate::protocol::{FrameLimits, ProfileFingerprint, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+        crate::protocol::ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "devmanager-host/test".into(),
+            host_boot_id: uuid::Uuid::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xb0,
+            ]),
+            connection_id,
+            profile_fingerprint: ProfileFingerprint::hash_normalized("detach-unit"),
+            granted,
+            limits: FrameLimits::v1_default(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_without_capability_keeps_connection_and_tracked_ops() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xb1,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xb2,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xb3);
+        let cmd = command_id(0xb4);
+        let mut tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let before = tracked.clone();
+        let stub = ClientConnection::inert_stub_for_test(
+            client_id,
+            test_server_hello(
+                CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                connection_id,
+            ),
+        );
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "detach-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(stub.clone()),
+            std::mem::take(&mut tracked),
+        );
+        assert!(matches!(
+            client.detach().await,
+            Err(IpcError::UnsupportedCapability)
+        ));
+        assert!(client.is_connected());
+        assert_eq!(client.tracked(), &before);
+        let still = client
+            .attached_connection()
+            .expect("pre-I/O unsupported detach must keep the connection attached");
+        assert!(
+            still.shares_state_with(&stub),
+            "exact same ClientConnection must remain attached"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_matching_ack_drops_only_connection_keeps_tracked() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xb5,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xb6,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            connection_id,
+        );
+        let op = operation_id(0xb7);
+        let cmd = command_id(0xb8);
+        let tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "detach-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::scripted_for_test(
+                client_id,
+                hello,
+                ScriptedDetachBehavior::MatchingAck,
+            )),
+            tracked.clone(),
+        );
+        assert_eq!(client.detach().await.expect("detach"), connection_id);
+        assert!(!client.is_connected());
+        assert_eq!(client.tracked(), &tracked);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_correlation_mismatch_retires_connection_keeps_tracked() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xba,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbb,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            connection_id,
+        );
+        let op = operation_id(0xbc);
+        let cmd = command_id(0xbd);
+        let tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "detach-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::scripted_for_test(
+                client_id,
+                hello,
+                ScriptedDetachBehavior::WrongConnectionAck,
+            )),
+            tracked.clone(),
+        );
+        assert!(matches!(
+            client.detach().await,
+            Err(IpcError::CorrelationMismatch)
+        ));
+        assert!(!client.is_connected());
+        assert_eq!(client.tracked(), &tracked);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detach_transport_failure_retires_connection_keeps_tracked() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbe,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbf,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+            connection_id,
+        );
+        let op = operation_id(0xc0);
+        let cmd = command_id(0xc1);
+        let tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "detach-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ExplicitDetach]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::scripted_for_test(
+                client_id,
+                hello,
+                ScriptedDetachBehavior::ClosedWriteQueue,
+            )),
+            tracked.clone(),
+        );
+        assert!(matches!(client.detach().await, Err(IpcError::Unavailable)));
+        assert!(!client.is_connected());
+        assert_eq!(client.tracked(), &tracked);
     }
 }

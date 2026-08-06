@@ -485,6 +485,7 @@ fn capability_name(capability: crate::protocol::Capability) -> &'static str {
         ConnectEncryption => "connect_encryption",
         Guests => "guests",
         ManagementMetadata => "management_metadata",
+        ExplicitDetach => "explicit_detach",
     }
 }
 
