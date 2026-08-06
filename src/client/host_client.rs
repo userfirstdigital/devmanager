@@ -103,6 +103,10 @@ impl HostClient {
         self.server_hello.connection_id
     }
 
+    pub fn host_boot_id(&self) -> Uuid {
+        self.server_hello.host_boot_id
+    }
+
     pub fn tracked_operation(&self, operation_id: OperationId) -> Option<&TrackedOperation> {
         self.tracked.get(&operation_id)
     }

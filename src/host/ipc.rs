@@ -212,7 +212,7 @@ impl HelloListener {
         }
         #[cfg(windows)]
         {
-            windows_bind(endpoint, expected_fingerprint, config)
+            windows_bind(endpoint, expected_fingerprint, config, true)
         }
         #[cfg(not(windows))]
         {
@@ -228,6 +228,25 @@ impl HelloListener {
         #[cfg(windows)]
         {
             windows_accept(self).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(IpcError::Unsupported)
+        }
+    }
+
+    /// Accept one connection while preserving a same-config successor pipe.
+    ///
+    /// The outer error means the listener chain could not be preserved and is
+    /// fatal to the host. The inner error is scoped to the attempted handshake;
+    /// the returned successor remains ready for another client.
+    pub async fn accept_with_successor(
+        self,
+    ) -> Result<(Result<HostConnection, IpcError>, Self), IpcError> {
+        #[cfg(windows)]
+        {
+            windows_accept_with_successor(self).await
         }
         #[cfg(not(windows))]
         {
@@ -301,13 +320,14 @@ fn windows_bind(
     endpoint: String,
     expected_fingerprint: ProfileFingerprint,
     config: AcceptHelloConfig,
+    first_pipe_instance: bool,
 ) -> Result<HelloListener, IpcError> {
     use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 
     let mut security = windows_security::PipeSecurity::current_user_and_system()?;
     let server = security.with_attributes(|attrs| unsafe {
         ServerOptions::new()
-            .first_pipe_instance(true)
+            .first_pipe_instance(first_pipe_instance)
             .reject_remote_clients(true)
             .pipe_mode(PipeMode::Byte)
             .create_with_security_attributes_raw(&endpoint, attrs)
@@ -323,12 +343,37 @@ fn windows_bind(
 }
 
 #[cfg(windows)]
-async fn windows_accept(mut listener: HelloListener) -> Result<HostConnection, IpcError> {
+async fn windows_accept(listener: HelloListener) -> Result<HostConnection, IpcError> {
+    // Idle accept waits for a client indefinitely; host shutdown cancels this later.
+    listener.server.connect().await.map_err(IpcError::Io)?;
+    windows_finish_handshake(listener).await
+}
+
+#[cfg(windows)]
+async fn windows_accept_with_successor(
+    listener: HelloListener,
+) -> Result<(Result<HostConnection, IpcError>, HelloListener), IpcError> {
+    // Keep the connected instance alive while creating its successor. Even a
+    // rejected or malformed Hello therefore cannot leave the pipe name vacant.
+    let connected = listener.server.connect().await.map_err(IpcError::Io);
+    let successor = windows_bind(
+        listener.endpoint.clone(),
+        listener.expected_fingerprint,
+        listener.config.clone(),
+        false,
+    )?;
+    let connection = match connected {
+        Ok(()) => windows_finish_handshake(listener).await,
+        Err(error) => Err(error),
+    };
+    Ok((connection, successor))
+}
+
+#[cfg(windows)]
+async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostConnection, IpcError> {
     use tokio::io::AsyncWriteExt;
 
     let (hello_physical, hello_message) = handshake_codecs()?;
-    // Idle accept waits for a client indefinitely; host shutdown cancels this later.
-    listener.server.connect().await.map_err(IpcError::Io)?;
 
     let (client_id, negotiated, server_hello) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let payload = read_physical_frame(&mut listener.server, &hello_physical).await?;

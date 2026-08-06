@@ -1,18 +1,25 @@
-//! Development foreground `devmanager-host` entry for Phase 2.1 ownership.
+//! Development foreground `devmanager-host` entry for Phase 2 ownership.
 //!
-//! This binary proves real host-process identity, HostLock ownership, and
-//! parent-process lifetime binding. It does not bind IPC, open the kernel
-//! database, or own Phase 3 resources.
+//! This binary owns one profile lock and one writable command bus, accepts
+//! authenticated clients sequentially, and remains bound to its exact parent
+//! process. It does not yet own Phase 3 supervised resources.
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
-use devmanager::host::{HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING};
+use devmanager::host::{
+    AcceptHelloConfig, HelloListener, HostLock, HostLockError, HOST_EXIT_ALREADY_RUNNING,
+};
+use devmanager::kernel::CommandBus;
+use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
+use uuid::Uuid;
 
 const MAX_INSTANCE_LABEL_CHARS: usize = 64;
+const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct HostArgs {
@@ -21,6 +28,12 @@ struct HostArgs {
     instance_label: String,
     parent_pid: u32,
     config_base: PathBuf,
+}
+
+#[derive(Debug)]
+struct PreparedDebugPaths {
+    profile_root: PathBuf,
+    database: PathBuf,
 }
 
 enum HostRunError {
@@ -66,12 +79,24 @@ fn run() -> Result<(), HostRunError> {
     #[cfg(all(windows, debug_assertions))]
     {
         let args = parse_args(std::env::args().skip(1))?;
-        let profile_root = prepare_debug_profile_root(&args)?;
+        let paths = prepare_debug_paths(&args)?;
         let parent = open_and_validate_parent(args.parent_pid)?;
-        let _lock = acquire_lock(&profile_root, &args.profile)?;
-        // Readiness for this ownership-only slice is the valid lock identity.
+        let host_lock = acquire_lock(&paths.profile_root, &args.profile)?;
+        let host_boot_id = host_lock.identity().boot_id;
+        let bus = CommandBus::open(&paths.database)
+            .map_err(|error| format!("failed to open host command bus: {error}"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to build host async runtime: {error}"))?;
         let _ = &args.instance_label;
-        wait_for_parent(parent)?;
+        runtime.block_on(serve_foreground_host(
+            &args.profile,
+            parent,
+            host_boot_id,
+            bus,
+        ))?;
+        drop(host_lock);
         Ok(())
     }
 }
@@ -292,11 +317,11 @@ fn is_reparse_point(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(all(windows, debug_assertions))]
-fn prepare_debug_profile_root(args: &HostArgs) -> Result<PathBuf, String> {
+fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
     let profile = AppProfile::named(&args.profile).map_err(|error| error.to_string())?;
     let paths = resolve_app_paths(&args.config_base, profile, BuildKind::Debug)
         .map_err(|error| error.to_string())?;
-    let root = paths.root;
+    let root = paths.root.clone();
 
     if root
         .parent()
@@ -364,7 +389,10 @@ fn prepare_debug_profile_root(args: &HostArgs) -> Result<PathBuf, String> {
         ));
     }
 
-    Ok(canonical_root)
+    Ok(PreparedDebugPaths {
+        profile_root: canonical_root,
+        database: paths.database,
+    })
 }
 
 #[cfg(all(windows, debug_assertions))]
@@ -486,18 +514,81 @@ fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
 }
 
 #[cfg(all(windows, debug_assertions))]
-fn wait_for_parent(parent: ParentProcess) -> Result<(), String> {
-    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
 
-    let result = unsafe { WaitForSingleObject(parent.handle, INFINITE) };
+    let result = unsafe { WaitForSingleObject(parent.handle, 0) };
     if result == WAIT_OBJECT_0 {
-        Ok(())
+        Ok(true)
+    } else if result == WAIT_TIMEOUT {
+        Ok(false)
     } else if result == WAIT_FAILED {
         Err("WaitForSingleObject on parent process failed".to_string())
     } else {
         Err(format!(
             "unexpected WaitForSingleObject result for parent process: {result:?}"
         ))
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
+    loop {
+        if parent_has_exited(parent)? {
+            return Ok(());
+        }
+        tokio::time::sleep(PARENT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+async fn serve_foreground_host(
+    profile: &str,
+    parent: ParentProcess,
+    host_boot_id: Uuid,
+    mut bus: CommandBus,
+) -> Result<(), String> {
+    let hello_config = AcceptHelloConfig {
+        host_boot_id,
+        server_build: format!("devmanager-host/{}", env!("CARGO_PKG_VERSION")),
+        supported: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+        local_limits: FrameLimits::v1_default(),
+    };
+
+    // The first instance proves no pre-existing pipe server is present. Each
+    // later instance is created by this same lock owner before the connected
+    // instance is served, so clients never depend on a close/rebind gap.
+    let mut listener = HelloListener::bind(profile, hello_config)
+        .map_err(|error| format!("failed to bind host pipe: {error}"))?;
+
+    loop {
+        let (accepted, next_listener) = tokio::select! {
+            parent_result = wait_for_parent_exit(&parent) => return parent_result,
+            accepted = listener.accept_with_successor() => accepted.map_err(|error| {
+                format!("failed to preserve host pipe listener: {error}")
+            })?,
+        };
+        listener = next_listener;
+
+        let mut connection = match accepted {
+            Ok(connection) => connection,
+            // Handshake failures belong only to the attempted connection. The
+            // successor was secured before the untrusted Hello was decoded.
+            Err(_) => continue,
+        };
+
+        loop {
+            let served = tokio::select! {
+                parent_result = wait_for_parent_exit(&parent) => return parent_result,
+                served = connection.serve_request(&mut bus) => served,
+            };
+            match served {
+                Ok(()) => {}
+                // EOF, malformed input, timeout, and request errors poison only
+                // this connection. Dropping it returns the host to accept.
+                Err(_) => break,
+            }
+        }
     }
 }
