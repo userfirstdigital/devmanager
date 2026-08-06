@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
+use crate::domain::command::Command;
 use crate::domain::id::{ArtifactId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
@@ -671,6 +672,11 @@ impl HostRequestExecutor {
             ClientRequest::Command(envelope) => {
                 if envelope.client_id != negotiated.client_id {
                     return Err(IpcError::Unauthorized);
+                }
+                if matches!(envelope.command, Command::ConfirmHostQuit(_))
+                    && !negotiated.capabilities.contains(Capability::HostShutdown)
+                {
+                    return Err(IpcError::UnsupportedCapability);
                 }
                 let receipt = self.bus.execute(envelope).map_err(map_store_error)?;
                 self.fan_out_live_durable_events();
@@ -1482,6 +1488,11 @@ pub(crate) fn dispatch_authenticated_request(
         ClientRequest::Command(envelope) => {
             if envelope.client_id != authenticated_client_id {
                 return Err(IpcError::Unauthorized);
+            }
+            if matches!(envelope.command, Command::ConfirmHostQuit(_))
+                && !capabilities.contains(Capability::HostShutdown)
+            {
+                return Err(IpcError::UnsupportedCapability);
             }
             let receipt = bus.execute(envelope).map_err(map_store_error)?;
             Ok(ServerMessage::CommandReceipt(receipt))
@@ -3550,5 +3561,229 @@ mod output_tests {
                 outcome: QueryOutcome::Err(QueryError::InvalidRequest),
             })
         );
+    }
+
+    #[test]
+    fn dispatch_authenticated_confirm_host_quit_capability_and_scope_gates() {
+        use super::dispatch_authenticated_request;
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
+        };
+        use crate::domain::id::{CommandId, TaskId};
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, ClientRequest, ServerMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("confirm-auth-gate.db")).expect("bus");
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf0,
+        ])
+        .expect("client");
+        let events_before: i64 = {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("confirm-auth-gate.db")).expect("raw");
+            conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+                .expect("count")
+        };
+
+        let denied = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            &mut bus,
+            ClientRequest::Command(CommandEnvelope {
+                command_id: CommandId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xf1,
+                ])
+                .expect("cmd"),
+                client_id: client,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_400,
+                expected_task_revision: None,
+                command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                    inspection_id: 0,
+                    allow_uninspected_worktrees: true,
+                }),
+            }),
+        );
+        assert!(matches!(
+            denied,
+            Err(crate::host::IpcError::UnsupportedCapability)
+        ));
+        let events_after_deny: i64 = {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("confirm-auth-gate.db")).expect("raw");
+            conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+                .expect("count")
+        };
+        assert_eq!(events_after_deny, events_before, "denied must not mutate");
+
+        let inspection = bus.inspect_host_quit().expect("inspect");
+        let granted = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            &mut bus,
+            ClientRequest::Command(CommandEnvelope {
+                command_id: CommandId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xf2,
+                ])
+                .expect("cmd"),
+                client_id: client,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_401,
+                expected_task_revision: None,
+                command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                    inspection_id: inspection.inspection_id,
+                    allow_uninspected_worktrees: true,
+                }),
+            }),
+        )
+        .expect("granted confirm");
+        assert!(
+            matches!(
+                granted,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "granted ConfirmHostQuit must Accept, got {granted:?}"
+        );
+
+        // Fresh Open store for task-scope invalidation without Closing interference.
+        let mut scoped_bus =
+            CommandBus::open(&dir.path().join("confirm-scope-gate.db")).expect("scoped bus");
+        let scoped_inspection = scoped_bus.inspect_host_quit().expect("scoped inspect");
+        let scoped = dispatch_authenticated_request(
+            client,
+            CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            &mut scoped_bus,
+            ClientRequest::Command(CommandEnvelope {
+                command_id: CommandId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xf3,
+                ])
+                .expect("cmd"),
+                client_id: client,
+                task_id: Some(
+                    TaskId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf4,
+                    ])
+                    .expect("task"),
+                ),
+                issued_at_ms: 1_725_000_000_402,
+                expected_task_revision: None,
+                command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                    inspection_id: scoped_inspection.inspection_id,
+                    allow_uninspected_worktrees: true,
+                }),
+            }),
+        )
+        .expect("scoped confirm transport");
+        assert!(
+            matches!(
+                scoped,
+                ServerMessage::CommandReceipt(CommandReceipt::Rejected {
+                    code: RejectionCode::InvalidTransition,
+                    ..
+                })
+            ),
+            "task scope must InvalidTransition via CommandBus, got {scoped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_request_executor_confirm_host_quit_capability_gate() {
+        use super::HostRequestExecutor;
+        use crate::domain::command::{
+            Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
+        };
+        use crate::domain::id::CommandId;
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{
+            Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
+            ProtocolVersion, ServerMessage,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("confirm-exec-gate.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start(bus);
+        let client = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf5,
+        ])
+        .expect("client");
+        let denied_negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+            limits: FrameLimits::v1_default(),
+        };
+        let denied = requests
+            .execute(
+                denied_negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf6,
+                    ])
+                    .expect("cmd"),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_410,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                        inspection_id: 0,
+                        allow_uninspected_worktrees: true,
+                    }),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(crate::host::IpcError::UnsupportedCapability)
+        ));
+
+        let granted_negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([Capability::HostShutdown]),
+            limits: FrameLimits::v1_default(),
+        };
+        // Empty host: COALESCE(MAX(sequence),0) == 0 matches inspection_id 0.
+        let granted = requests
+            .execute(
+                granted_negotiated,
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0xf7,
+                    ])
+                    .expect("cmd"),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_411,
+                    expected_task_revision: None,
+                    command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                        inspection_id: 0,
+                        allow_uninspected_worktrees: true,
+                    }),
+                }),
+            )
+            .await
+            .expect("granted confirm");
+        assert!(
+            matches!(
+                granted,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "HostRequestExecutor granted ConfirmHostQuit must Accept, got {granted:?}"
+        );
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
     }
 }

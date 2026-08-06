@@ -658,6 +658,89 @@ pub struct SetTaskAttentionIntent {
     pub attention: TaskAttention,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfirmHostQuitIntent {
+    pub inspection_id: u64,
+    pub allow_uninspected_worktrees: bool,
+}
+
+enum ConfirmHostQuitField {
+    InspectionId,
+    AllowUninspectedWorktrees,
+}
+
+impl<'de> Deserialize<'de> for ConfirmHostQuitField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ConfirmHostQuitField;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("confirm_host_quit field")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "inspection_id" => Ok(ConfirmHostQuitField::InspectionId),
+                    "allow_uninspected_worktrees" => {
+                        Ok(ConfirmHostQuitField::AllowUninspectedWorktrees)
+                    }
+                    other => Err(E::unknown_field(
+                        other,
+                        &["inspection_id", "allow_uninspected_worktrees"],
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfirmHostQuitIntent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct IntentVisitor;
+        impl<'de> Visitor<'de> for IntentVisitor {
+            type Value = ConfirmHostQuitIntent;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("confirm_host_quit named map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut inspection_id = None;
+                let mut allow_uninspected_worktrees = None;
+                while let Some(key) = map.next_key::<ConfirmHostQuitField>()? {
+                    match key {
+                        ConfirmHostQuitField::InspectionId => {
+                            if inspection_id.is_some() {
+                                return Err(de::Error::duplicate_field("inspection_id"));
+                            }
+                            inspection_id = Some(map.next_value()?);
+                        }
+                        ConfirmHostQuitField::AllowUninspectedWorktrees => {
+                            if allow_uninspected_worktrees.is_some() {
+                                return Err(de::Error::duplicate_field(
+                                    "allow_uninspected_worktrees",
+                                ));
+                            }
+                            allow_uninspected_worktrees = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ConfirmHostQuitIntent {
+                    inspection_id: inspection_id
+                        .ok_or_else(|| de::Error::missing_field("inspection_id"))?,
+                    allow_uninspected_worktrees: allow_uninspected_worktrees
+                        .ok_or_else(|| de::Error::missing_field("allow_uninspected_worktrees"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(IntentVisitor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
@@ -671,6 +754,7 @@ pub enum Command {
     RegisterArtifact { artifact: ArtifactFacts },
     RegisterResource { resource: ResourceFacts },
     ReleaseResource { resource_id: ResourceId },
+    ConfirmHostQuit(ConfirmHostQuitIntent),
 }
 
 pub fn decide(
@@ -797,6 +881,7 @@ pub fn decide(
                 }
             }
         }
+        Command::ConfirmHostQuit(_) => Err(RejectionCode::InvalidTransition),
     }
 }
 

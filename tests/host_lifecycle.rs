@@ -2817,3 +2817,126 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_host_quit_closes_admission_but_keeps_foreground_host_running() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id_a = ClientId::from_bytes(fixed_uuid_v7(0x30)).expect("client a");
+    let client_id_b = ClientId::from_bytes(fixed_uuid_v7(0x31)).expect("client b");
+    let requested = CapabilitySet::from_capabilities([
+        Capability::OperationSettlement,
+        Capability::HostShutdown,
+    ]);
+    let limits = FrameLimits::v1_default();
+    let mut client_a = connect_bounded(
+        &HostClientConfig {
+            named_profile: profile.clone(),
+            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+            client_id: client_id_a,
+            requested,
+            limits,
+        },
+        &mut host,
+    )
+    .await;
+    let mut client_b = connect_bounded(
+        &HostClientConfig {
+            named_profile: profile.clone(),
+            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+            client_id: client_id_b,
+            requested,
+            limits,
+        },
+        &mut host,
+    )
+    .await;
+
+    let inspection = client_a
+        .inspect_host_quit()
+        .await
+        .expect("inspect transport")
+        .expect("inspect query");
+    assert_eq!(
+        inspection.worktrees,
+        HostQuitWorktreeInspection::NotInspected
+    );
+    assert!(!inspection.confirmable);
+
+    let confirm_command_id =
+        CommandId::from_bytes(fixed_uuid_v7(0x36)).expect("confirm command id");
+    let confirm = client_a
+        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
+        .await
+        .expect("confirm transport");
+    let operation_id = match &confirm {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision: None,
+            ..
+        } => *operation_id,
+        other => panic!("expected taskless Accepted, got {other:?}"),
+    };
+
+    let retry = client_a
+        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
+        .await
+        .expect("exact CommandId retry transport");
+    assert_eq!(
+        retry, confirm,
+        "caller-retained CommandId retry must return struct-identical Accepted"
+    );
+
+    let (create, _, _) = create_task_named(client_id_b, 0x32, 0x33, 0x34, 0x35, "after close");
+    let closing = client_b
+        .execute_command(create)
+        .await
+        .expect("second client mutation transport");
+    assert!(
+        matches!(
+            closing,
+            CommandReceipt::Rejected {
+                code: RejectionCode::Closing,
+                ..
+            }
+        ),
+        "second client mutation must Closing, got {closing:?}"
+    );
+
+    let status = client_b
+        .refresh_operation(operation_id)
+        .await
+        .expect("status transport")
+        .expect("status query");
+    assert_eq!(status, OperationState::Accepted);
+
+    let after = client_a
+        .inspect_host_quit()
+        .await
+        .expect("post-confirm inspect transport")
+        .expect("post-confirm inspect");
+    assert_eq!(after.worktrees, HostQuitWorktreeInspection::NotInspected);
+    assert!(!after.confirmable);
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    assert!(
+        host.try_wait().expect("poll host after confirm").is_none(),
+        "confirm must keep the foreground host running"
+    );
+
+    client_a.disconnect();
+    client_b.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact ChildGuard");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}

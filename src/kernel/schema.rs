@@ -140,6 +140,16 @@ CREATE INDEX idx_outbox_cleanup_ready ON outbox(event_sequence, effect_index, ou
 WHERE state IN ('settled', 'failed', 'cancelled') AND compacted_payload_sha256 IS NULL AND length(payload) > 0;\n\
 ";
 
+const V5_SQL: &str = "\
+CREATE TABLE host_admission (\n\
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),\n\
+  operation_id BLOB NOT NULL CHECK(length(operation_id) = 16),\n\
+  action_epoch INTEGER NOT NULL CHECK(action_epoch >= 0),\n\
+  inspection_id INTEGER NOT NULL CHECK(inspection_id >= 0),\n\
+  updated_at_ms INTEGER NOT NULL\n\
+);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -162,6 +172,12 @@ pub(crate) const V3_SHA256: [u8; 32] = [
 pub(crate) const V4_SHA256: [u8; 32] = [
     0xb4, 0x38, 0x36, 0x29, 0x1f, 0xac, 0x5e, 0xd0, 0x21, 0x19, 0x92, 0x39, 0xa4, 0x73, 0x76, 0x87,
     0xf4, 0x9b, 0x55, 0xeb, 0x20, 0x05, 0x08, 0x85, 0xb4, 0x44, 0xa2, 0xa6, 0xc0, 0x89, 0x18, 0xf3,
+];
+
+/// Compiled SHA-256 of [`V5_SQL`]. Do not change V5_SQL without updating this literal.
+pub(crate) const V5_SHA256: [u8; 32] = [
+    0x17, 0x20, 0x21, 0x30, 0x94, 0xca, 0xfb, 0xc8, 0x01, 0x9b, 0x4b, 0x84, 0xb2, 0x58, 0x28, 0xc4,
+    0xff, 0xcf, 0x57, 0x33, 0x45, 0x0c, 0x54, 0x58, 0xcb, 0xaa, 0xd0, 0xe8, 0xfc, 0x9c, 0x82, 0x20,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -206,6 +222,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V4_SQL),
                 "V4_SHA256 literal must match V4_SQL bytes"
             );
+            assert_eq!(
+                V5_SHA256,
+                sha256_bytes(V5_SQL),
+                "V5_SHA256 literal must match V5_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -230,6 +251,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v4_terminal_outbox_payload_compaction",
                     sql: V4_SQL,
                     sha256: V4_SHA256,
+                },
+                Migration {
+                    version: 5,
+                    name: "v5_host_admission",
+                    sql: V5_SQL,
+                    sha256: V5_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -282,6 +309,7 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "agent_sessions",
     "artifacts",
     "resources",
+    "host_admission",
 ];
 
 #[cfg(test)]
@@ -437,7 +465,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 4);
+        assert_eq!(history.len(), 5);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -449,6 +477,9 @@ mod tests {
         assert_eq!(history[3].0, 4);
         assert_eq!(history[3].1, "v4_terminal_outbox_payload_compaction");
         assert_eq!(history[3].2, V4_SHA256.to_vec());
+        assert_eq!(history[4].0, 5);
+        assert_eq!(history[4].1, "v5_host_admission");
+        assert_eq!(history[4].2, V5_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(

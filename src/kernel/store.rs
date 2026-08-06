@@ -8,11 +8,11 @@ use sha2::{Digest, Sha256};
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
-    OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
-    OperationUncertainFact, PrimaryAgentSetPayload, ResourceRegisteredPayload,
-    ResourceReleaseBegunPayload, ResourceReleasedPayload, TaskAttentionSetPayload,
-    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
-    EVENT_SCHEMA_VERSION,
+    HostCloseBegunPayload, OperationAcceptedFact, OperationCancelledFact, OperationFailedFact,
+    OperationSettledFact, OperationUncertainFact, PrimaryAgentSetPayload,
+    ResourceRegisteredPayload, ResourceReleaseBegunPayload, ResourceReleasedPayload,
+    TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload,
+    TaskUnitPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -667,7 +667,8 @@ fn detect_interrupted_partial_schema(
         "SELECT COUNT(*) FROM sqlite_schema
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
-                        'agent_sessions', 'artifacts', 'resources', 'event_retention')",
+                        'agent_sessions', 'artifacts', 'resources', 'event_retention',
+                        'host_admission')",
         [],
         |row| row.get(0),
     )?;
@@ -680,6 +681,7 @@ fn detect_interrupted_partial_schema(
 fn rebuild_projections_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuild, StoreError> {
     let result = rebuild_projection_tables_tx(tx)?;
     command_bus::validate_all_rebuilt_outbox_metadata(tx)?;
+    command_bus::validate_rebuilt_host_admission(tx)?;
     Ok(result)
 }
 
@@ -747,14 +749,16 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          DELETE FROM artifacts;\n\
          DELETE FROM resources;\n\
          DELETE FROM operations;\n\
-         DELETE FROM tasks;",
+         DELETE FROM tasks;\n\
+         DELETE FROM host_admission;",
     )?;
     tx.execute_batch(
         "INSERT INTO tasks SELECT * FROM shadow_tasks;\n\
          INSERT INTO operations SELECT * FROM shadow_operations;\n\
          INSERT INTO agent_sessions SELECT * FROM shadow_agent_sessions;\n\
          INSERT INTO artifacts SELECT * FROM shadow_artifacts;\n\
-         INSERT INTO resources SELECT * FROM shadow_resources;",
+         INSERT INTO resources SELECT * FROM shadow_resources;\n\
+         INSERT INTO host_admission SELECT * FROM shadow_host_admission;",
     )?;
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DROP TABLE {}", shadow_name(table)), [])?;
@@ -797,6 +801,10 @@ fn canonical_table_dump(
         ("artifacts", true) => "SELECT * FROM shadow_artifacts ORDER BY artifact_id ASC",
         ("resources", false) => "SELECT * FROM resources ORDER BY resource_id ASC",
         ("resources", true) => "SELECT * FROM shadow_resources ORDER BY resource_id ASC",
+        ("host_admission", false) => "SELECT * FROM host_admission ORDER BY singleton_key ASC",
+        ("host_admission", true) => {
+            "SELECT * FROM shadow_host_admission ORDER BY singleton_key ASC"
+        }
         _ => {
             return Err(StoreError::Projection(format!(
                 "unsupported projection table for canonical compare: {table}"
@@ -971,6 +979,15 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             resource_id: *resource_id,
             runtime_generation: *runtime_generation,
         }),
+        Event::HostCloseBegun {
+            operation_id,
+            action_epoch,
+            inspection_id,
+        } => rmp_serde::to_vec(&HostCloseBegunPayload {
+            operation_id: *operation_id,
+            action_epoch: *action_epoch,
+            inspection_id: *inspection_id,
+        }),
         Event::OperationAccepted(fact) => rmp_serde::to_vec(fact),
         Event::OperationSettled(fact) => rmp_serde::to_vec(fact),
         Event::OperationFailed(fact) => rmp_serde::to_vec(fact),
@@ -1075,6 +1092,14 @@ pub(crate) fn decode_stored_event(
             Event::ResourceReleased {
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
+            }
+        }
+        "host.close_begun" => {
+            let p: HostCloseBegunPayload = unpack(payload)?;
+            Event::HostCloseBegun {
+                operation_id: p.operation_id,
+                action_epoch: p.action_epoch,
+                inspection_id: p.inspection_id,
             }
         }
         "operation.accepted" => {

@@ -574,6 +574,14 @@ pub struct ResourceReleasedPayload {
     pub runtime_generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCloseBegunPayload {
+    pub operation_id: OperationId,
+    pub action_epoch: u64,
+    pub inspection_id: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     TaskCreated {
@@ -614,6 +622,11 @@ pub enum Event {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
+    HostCloseBegun {
+        operation_id: OperationId,
+        action_epoch: u64,
+        inspection_id: u64,
+    },
     OperationAccepted(OperationAcceptedFact),
     OperationSettled(OperationSettledFact),
     OperationFailed(OperationFailedFact),
@@ -636,6 +649,7 @@ impl Event {
             Self::ResourceRegistered { .. } => "resource.registered",
             Self::ResourceReleaseBegun { .. } => "resource.release_begun",
             Self::ResourceReleased { .. } => "resource.released",
+            Self::HostCloseBegun { .. } => "host.close_begun",
             Self::OperationAccepted(_) => "operation.accepted",
             Self::OperationSettled(_) => "operation.settled",
             Self::OperationFailed(_) => "operation.failed",
@@ -647,7 +661,8 @@ impl Event {
     pub fn is_task_mutation(&self) -> bool {
         !matches!(
             self,
-            Self::OperationAccepted(_)
+            Self::HostCloseBegun { .. }
+                | Self::OperationAccepted(_)
                 | Self::OperationSettled(_)
                 | Self::OperationFailed(_)
                 | Self::OperationCancelled(_)
@@ -683,6 +698,8 @@ enum EventBody {
     ResourceReleaseBegun(ResourceReleaseBegunPayload),
     #[serde(rename = "resource.released")]
     ResourceReleased(ResourceReleasedPayload),
+    #[serde(rename = "host.close_begun")]
+    HostCloseBegun(HostCloseBegunPayload),
     #[serde(rename = "operation.accepted")]
     OperationAccepted(OperationAcceptedFact),
     #[serde(rename = "operation.settled")]
@@ -766,6 +783,15 @@ impl From<&Event> for EventDocument {
             } => EventBody::ResourceReleased(ResourceReleasedPayload {
                 resource_id: *resource_id,
                 runtime_generation: *runtime_generation,
+            }),
+            Event::HostCloseBegun {
+                operation_id,
+                action_epoch,
+                inspection_id,
+            } => EventBody::HostCloseBegun(HostCloseBegunPayload {
+                operation_id: *operation_id,
+                action_epoch: *action_epoch,
+                inspection_id: *inspection_id,
             }),
             Event::OperationAccepted(fact) => EventBody::OperationAccepted(fact.clone()),
             Event::OperationSettled(fact) => EventBody::OperationSettled(fact.clone()),
@@ -856,6 +882,11 @@ impl TryFrom<EventDocument> for Event {
             EventBody::ResourceReleased(p) => Event::ResourceReleased {
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
+            },
+            EventBody::HostCloseBegun(p) => Event::HostCloseBegun {
+                operation_id: p.operation_id,
+                action_epoch: p.action_epoch,
+                inspection_id: p.inspection_id,
             },
             EventBody::OperationAccepted(fact) => Event::OperationAccepted(fact),
             EventBody::OperationSettled(fact) => Event::OperationSettled(fact),
@@ -972,6 +1003,7 @@ pub fn apply(
             require_matching_task_id(&snap, event)?;
             Ok(snap)
         }
+        Event::HostCloseBegun { .. } => Err(ApplyError::InvalidTransition),
         Event::OperationSettled(_)
         | Event::OperationFailed(_)
         | Event::OperationCancelled(_)
@@ -1159,6 +1191,7 @@ fn apply_into(
             resource.updated_at_ms = occurred_at_ms;
         }
         Event::TaskCreated { .. }
+        | Event::HostCloseBegun { .. }
         | Event::OperationAccepted(_)
         | Event::OperationSettled(_)
         | Event::OperationFailed(_)

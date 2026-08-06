@@ -5,12 +5,13 @@ use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use devmanager::domain::{
     AgentRole, AgentSessionId, AgentSessionLifecycle, ArtifactContentPage, ArtifactId,
     CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
-    CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage, HostQuitAgentBlocker,
-    HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection, OperationErrorCode,
-    OperationId, OperationState, OperationUncertaintyCode, OwnerKind, ProjectId, Query,
-    QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId,
-    ResourceId, ResourceKind, ResourceLifecycle, ReviewReadiness, SubscriptionId, TaskActivity,
-    TaskAssignment, TaskAttention, TaskConnectivity, TaskId, WorkspaceRef,
+    ConfirmHostQuitIntent, CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage,
+    HostQuitAgentBlocker, HostQuitInspection, HostQuitResourceBlocker, HostQuitWorktreeInspection,
+    OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode, OwnerKind,
+    ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+    RejectionCode, RequestId, ResourceId, ResourceKind, ResourceLifecycle, ReviewReadiness,
+    SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskId,
+    WorkspaceRef,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
@@ -4668,6 +4669,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
     assert_eq!(Capability::HostShutdown.bit(), 1_u64 << 13);
 
     let inspection = HostQuitInspection {
+        inspection_id: 42,
         agents: vec![HostQuitAgentBlocker {
             agent_session_id: protocol_agent_session_id(0x10),
             task_id: protocol_task_id(0x11),
@@ -4793,6 +4795,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
 
     #[derive(serde::Serialize)]
     struct RawOpenHostQuitInspection {
+        inspection_id: u64,
         agents: Vec<HostQuitAgentBlocker>,
         resources: Vec<HostQuitResourceBlocker>,
         worktrees: HostQuitWorktreeInspection,
@@ -4802,6 +4805,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
     assert_eq!(
         codec.decode::<HostQuitInspection>(
             &rmp_serde::to_vec_named(&RawOpenHostQuitInspection {
+                inspection_id: 42,
                 agents: inspection.agents.clone(),
                 resources: inspection.resources.clone(),
                 worktrees: HostQuitWorktreeInspection::NotInspected,
@@ -4841,4 +4845,180 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
         codec.decode::<QueryResult>(&multiple_result),
         Err(MessagePackError::Decode)
     );
+}
+
+#[test]
+fn protocol_confirm_host_quit_is_strict_global_command() {
+    const PRIVATE_PROVIDER_SESSION: &str = "private-provider-session-sentinel-2_6c5";
+    const PRIVATE_BROWSER_URL: &str = "https://private.browser.url.sentinel/2_6c5";
+    const PRIVATE_SERVICE_COMMAND: &str = "private-service-command-sentinel-2_6c5";
+    const PRIVATE_TERMINAL_PATH: &str = "C:\\private\\terminal\\path\\sentinel-2_6c5";
+    const PRIVATE_RECIPE: &str = "private-recipe-sentinel-2_6c5";
+
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let command = Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+        inspection_id: 7,
+        allow_uninspected_worktrees: true,
+    });
+    let envelope = CommandEnvelope {
+        command_id: protocol_command_id(0x70),
+        client_id: protocol_client_id(0x71),
+        task_id: None,
+        issued_at_ms: 1_725_000_000_300,
+        expected_task_revision: None,
+        command: command.clone(),
+    };
+
+    let encoded = codec
+        .encode(&envelope)
+        .expect("encode confirm_host_quit envelope");
+    assert_eq!(
+        codec
+            .decode::<CommandEnvelope>(&encoded)
+            .expect("decode confirm_host_quit envelope"),
+        envelope
+    );
+    assert!(
+        encoded
+            .windows(b"confirm_host_quit".len())
+            .any(|window| window == b"confirm_host_quit"),
+        "stable command key must be exactly confirm_host_quit"
+    );
+    assert!(
+        encoded
+            .windows(b"inspection_id".len())
+            .any(|window| window == b"inspection_id"),
+        "confirm_host_quit must carry named inspection_id"
+    );
+    assert!(
+        encoded
+            .windows(b"allow_uninspected_worktrees".len())
+            .any(|window| window == b"allow_uninspected_worktrees"),
+        "confirm_host_quit must carry named allow_uninspected_worktrees"
+    );
+    for sentinel in [
+        PRIVATE_PROVIDER_SESSION.as_bytes(),
+        PRIVATE_BROWSER_URL.as_bytes(),
+        PRIVATE_SERVICE_COMMAND.as_bytes(),
+        PRIVATE_TERMINAL_PATH.as_bytes(),
+        PRIVATE_RECIPE.as_bytes(),
+        b"blocker",
+    ] {
+        assert!(
+            !encoded
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "confirm_host_quit body must omit private/blocker sentinel {:?}",
+            std::str::from_utf8(sentinel)
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenConfirmHostQuit {
+        ConfirmHostQuit {
+            inspection_id: u64,
+            allow_uninspected_worktrees: bool,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(
+            &rmp_serde::to_vec_named(&RawCommandEnvelope {
+                command_id: protocol_command_id(0x72),
+                client_id: protocol_client_id(0x73),
+                task_id: None,
+                issued_at_ms: 1_725_000_000_301,
+                expected_task_revision: None,
+                command: RawOpenConfirmHostQuit::ConfirmHostQuit {
+                    inspection_id: 7,
+                    allow_uninspected_worktrees: true,
+                    future_field: true,
+                },
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+
+    #[derive(serde::Serialize)]
+    struct MissingAllow {
+        inspection_id: u64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawMissingAllow {
+        ConfirmHostQuit(MissingAllow),
+    }
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(
+            &rmp_serde::to_vec_named(&RawCommandEnvelope {
+                command_id: protocol_command_id(0x74),
+                client_id: protocol_client_id(0x75),
+                task_id: None,
+                issued_at_ms: 1_725_000_000_302,
+                expected_task_revision: None,
+                command: RawMissingAllow::ConfirmHostQuit(MissingAllow { inspection_id: 7 }),
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+
+    #[derive(serde::Serialize)]
+    struct DuplicateFields {
+        inspection_id: u64,
+        allow_uninspected_worktrees: bool,
+    }
+    let mut duplicate = vec![0x81];
+    push_messagepack(&mut duplicate, "confirm_host_quit");
+    let mut body = rmp_serde::to_vec_named(&DuplicateFields {
+        inspection_id: 7,
+        allow_uninspected_worktrees: true,
+    })
+    .unwrap();
+    assert_eq!(body[0], 0x82);
+    body[0] = 0x83;
+    push_messagepack(&mut body, "inspection_id");
+    push_messagepack(&mut body, &7u64);
+    duplicate.extend(body);
+    assert_eq!(
+        codec.decode::<Command>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let positional = rmp_serde::to_vec(&(7u64, true)).unwrap();
+    let mut positional_command = vec![0x81];
+    push_messagepack(&mut positional_command, "confirm_host_quit");
+    positional_command.extend(positional);
+    assert_eq!(
+        codec.decode::<Command>(&positional_command),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut multiple = vec![0x82];
+    push_messagepack(&mut multiple, "confirm_host_quit");
+    push_messagepack(
+        &mut multiple,
+        &DuplicateFields {
+            inspection_id: 7,
+            allow_uninspected_worktrees: true,
+        },
+    );
+    push_messagepack(&mut multiple, "begin_close_task");
+    multiple.push(0x80);
+    assert_eq!(
+        codec.decode::<Command>(&multiple),
+        Err(MessagePackError::Decode)
+    );
+
+    assert_eq!(
+        codec.decode::<CommandEnvelope>(
+            &rmp_serde::to_vec_named(&raw_command_envelope(RawUnknownCommand::FutureCommand))
+                .unwrap()
+        ),
+        Err(MessagePackError::Decode)
+    );
+
+    let _ = command;
 }

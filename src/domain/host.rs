@@ -13,6 +13,8 @@ use crate::domain::resource::{OwnerKind, ResourceKind, ResourceLifecycle};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostQuitInspection {
+    /// Durable event high-water from the same read snapshot as the blockers.
+    pub inspection_id: u64,
     pub agents: Vec<HostQuitAgentBlocker>,
     pub resources: Vec<HostQuitResourceBlocker>,
     pub worktrees: HostQuitWorktreeInspection,

@@ -323,12 +323,50 @@ pub(crate) fn apply_event(
             )?;
             bump_task_revision(tx, shadow, task_id, event)?;
         }
+        Event::HostCloseBegun {
+            operation_id,
+            action_epoch,
+            inspection_id,
+        } => {
+            if event.task_id.is_some() || event.task_revision.is_some() {
+                return Err(StoreError::Projection(
+                    "host.close_begun requires NULL task_id and task_revision".into(),
+                ));
+            }
+            let table = table_name("host_admission", shadow);
+            let existing: Option<i64> = tx
+                .query_row(
+                    &format!("SELECT singleton_key FROM {table} WHERE singleton_key = 1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(StoreError::Projection(
+                    "host.close_begun requires Open host admission (no existing row)".into(),
+                ));
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (
+                        singleton_key, operation_id, action_epoch, inspection_id, updated_at_ms
+                     ) VALUES (1, ?1, ?2, ?3, ?4)"
+                ),
+                rusqlite::params![
+                    operation_id.as_bytes().as_slice(),
+                    u64_to_sqlite_i64("host_admission.action_epoch", *action_epoch)?,
+                    u64_to_sqlite_i64("host_admission.inspection_id", *inspection_id)?,
+                    event.occurred_at_ms,
+                ],
+            )?;
+        }
         Event::OperationAccepted(fact) => {
             require_valid_operation_fact(fact.validate())?;
             classify_settled_lineage_fence(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                event.task_id,
                 true,
             )?;
             if event.occurred_at_ms != fact.accepted_at_ms {
@@ -364,8 +402,15 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                event.task_id,
                 true,
             )?;
+            if matches!(kind, SettledLineageKind::HostAdmission) {
+                return Err(StoreError::Projection(
+                    "host-admission settlement is not permitted until branch-aware settlement"
+                        .into(),
+                ));
+            }
             if event.occurred_at_ms != fact.settled_at_ms {
                 return Err(StoreError::Projection(
                     "operation.settled envelope occurred_at_ms must equal fact.settled_at_ms"
@@ -397,6 +442,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                event.task_id,
                 true,
             )?;
             reject_pure_non_settled_terminal(kind, true)?;
@@ -427,6 +473,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                event.task_id,
                 true,
             )?;
             reject_pure_non_settled_terminal(kind, true)?;
@@ -458,6 +505,7 @@ pub(crate) fn apply_event(
                 fact.action_epoch,
                 fact.resource_id,
                 fact.runtime_generation,
+                event.task_id,
                 true,
             )?;
             reject_pure_non_settled_terminal(kind, true)?;
@@ -1157,7 +1205,7 @@ fn enforce_derived_result_lineage(
     let prior = load_prior_event_row(tx, event.sequence)?;
     match &event.payload {
         Event::OperationSettled(fact) => {
-            let kind = classify_operation_settled_fact(fact, true)?;
+            let kind = classify_operation_settled_fact(fact, event.task_id, true)?;
             let prior_arg = prior
                 .as_ref()
                 .map(|(id, payload, rev, at, task)| (*id, payload, *rev, *at, *task));

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::domain::command::{CommandEnvelope, CommandReceipt};
+use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
@@ -237,6 +237,44 @@ impl HostClient {
                 Err(IpcError::CorrelationMismatch)
             }
         }
+    }
+
+    /// Confirm host quit admission. Requires granted HostShutdown.
+    ///
+    /// `command_id` is caller-owned and must be retained for exact retries: if the
+    /// Accepted response is lost, resubmit the same ID to recover the original
+    /// receipt. A fresh ID after Closing is Rejected.
+    ///
+    /// Accepts a durable drain-intent operation and enters global Closing; does
+    /// not drain, settle, release the lock, or exit the host in this slice.
+    pub async fn confirm_host_quit(
+        &mut self,
+        command_id: CommandId,
+        inspection_id: u64,
+        allow_uninspected_worktrees: bool,
+    ) -> Result<CommandReceipt, IpcError> {
+        if !self.server_hello.granted.contains(Capability::HostShutdown) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let envelope = CommandEnvelope {
+            command_id,
+            client_id: self.config.client_id,
+            task_id: None,
+            issued_at_ms: {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or(0)
+            },
+            expected_task_revision: None,
+            command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                inspection_id,
+                allow_uninspected_worktrees,
+            }),
+        };
+        self.execute_command(envelope).await
     }
 
     /// Inspect durable host-quit blockers. Requires granted HostShutdown.
@@ -1346,6 +1384,64 @@ mod tests {
         let still = client
             .attached_connection()
             .expect("pre-I/O unsupported inspect must keep the connection attached");
+        assert!(
+            still.shares_state_with(&stub),
+            "exact same ClientConnection must remain attached"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirm_host_quit_without_capability_keeps_connection_and_tracked_ops() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd1,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd2,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xd3);
+        let cmd = command_id(0xd4);
+        let mut tracked = BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]);
+        let before = tracked.clone();
+        let stub = ClientConnection::inert_stub_for_test(
+            client_id,
+            test_server_hello(
+                CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                connection_id,
+            ),
+        );
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "confirm-quit-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(stub.clone()),
+            std::mem::take(&mut tracked),
+        );
+        assert!(matches!(
+            client.confirm_host_quit(command_id(0xd5), 0, true).await,
+            Err(IpcError::UnsupportedCapability)
+        ));
+        assert!(client.is_connected());
+        assert_eq!(client.tracked(), &before);
+        let still = client
+            .attached_connection()
+            .expect("pre-I/O unsupported confirm must keep the connection attached");
         assert!(
             still.shares_state_with(&stub),
             "exact same ClientConnection must remain attached"

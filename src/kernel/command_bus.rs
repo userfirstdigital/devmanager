@@ -15,7 +15,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use crate::domain::artifact::{ArtifactFacts, ArtifactKind, PrivacyClass};
-use crate::domain::command::{decide, Command, CommandEnvelope, CommandReceipt, RejectionCode};
+use crate::domain::command::{
+    decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, RejectionCode,
+};
 use crate::domain::event::{
     apply as apply_domain_event, DomainEvent, Event, OperationAcceptedFact, OperationCancelledFact,
     OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
@@ -1946,6 +1948,28 @@ fn execute_in_tx(
         return Ok(existing);
     }
 
+    if host_admission_is_closing(tx)? {
+        let accepted_at_ms = now_ms()?;
+        let effective_task_id = effective_task_scope(&envelope);
+        let snapshot = match effective_task_id {
+            Some(task_id) => load_task_snapshot(tx, task_id)?,
+            None => None,
+        };
+        let current_revision = snapshot.as_ref().map(|snap| snap.task.revision);
+        return persist_rejection(
+            tx,
+            &envelope,
+            effective_task_id,
+            RejectionCode::Closing,
+            current_revision,
+            accepted_at_ms,
+        );
+    }
+
+    if matches!(envelope.command, Command::ConfirmHostQuit(_)) {
+        return persist_confirm_host_quit(tx, envelope);
+    }
+
     let accepted_at_ms = now_ms()?;
     let effective_task_id = effective_task_scope(&envelope);
     let snapshot = match effective_task_id {
@@ -2131,6 +2155,54 @@ pub(crate) fn validate_all_rebuilt_outbox_metadata(tx: &Transaction<'_>) -> Resu
     Ok(())
 }
 
+/// After projection rebuild, Closing host_admission must resolve to the exact global
+/// Accepted operation and receipt. Orphan HostCloseBegun (Closing without roots) fails closed.
+pub(crate) fn validate_rebuilt_host_admission(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    let Some(admission) = load_host_admission_row(tx)? else {
+        return Ok(());
+    };
+    let operation = load_operation_projection_by_id(tx, admission.operation_id)?.ok_or(
+        StoreError::Projection(
+            "host_admission Closing requires exact global Accepted operation".into(),
+        ),
+    )?;
+    if operation.task_id.is_some()
+        || operation.resource_id.is_some()
+        || operation.runtime_generation.is_some()
+        || operation.state != "accepted"
+        || operation.result.is_some()
+        || operation.outcome_code.is_some()
+        || operation.outcome_at_ms.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    let Some(action_epoch_i64) = operation.action_epoch else {
+        return Err(StoreError::Corruption);
+    };
+    let action_epoch = u64_from_nonnegative_i64("operations.action_epoch", action_epoch_i64)?;
+    if admission.action_epoch != action_epoch || admission.updated_at_ms != operation.accepted_at_ms
+    {
+        return Err(StoreError::Corruption);
+    }
+
+    let command_bytes: Vec<u8> = tx.query_row(
+        "SELECT command_id FROM operations WHERE operation_id = ?1",
+        [admission.operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let command_id = id16::<CommandId>("operations.command_id", &command_bytes)?;
+    let receipt = lookup_receipt(tx, command_id)?.ok_or(StoreError::Corruption)?;
+    match receipt {
+        CommandReceipt::Accepted {
+            operation_id,
+            task_revision: None,
+            event_ids,
+            ..
+        } if operation_id == admission.operation_id && event_ids.len() == 1 => Ok(()),
+        _ => Err(StoreError::Corruption),
+    }
+}
+
 fn validate_accepted_receipt_correlation(
     tx: &Connection,
     command_id: CommandId,
@@ -2151,6 +2223,26 @@ fn validate_accepted_receipt_correlation(
     if event_ids.is_empty() {
         return Err(StoreError::Corruption);
     }
+
+    let operation = load_operation_projection(tx, command_id)?;
+    if operation.operation_id != expected_operation_id {
+        return Err(StoreError::Corruption);
+    }
+    if receipt_created_at_ms != operation.accepted_at_ms {
+        return Err(StoreError::Corruption);
+    }
+
+    if receipt_task_id.is_none() && receipt_task_revision.is_none() {
+        return validate_host_admission_accepted_receipt(
+            tx,
+            command_id,
+            expected_operation_id,
+            event_ids,
+            committed_sequence,
+            &operation,
+        );
+    }
+
     let Some(scope) = receipt_task_id else {
         return Err(StoreError::Corruption);
     };
@@ -2158,14 +2250,7 @@ fn validate_accepted_receipt_correlation(
         return Err(StoreError::Corruption);
     };
 
-    let operation = load_operation_projection(tx, command_id)?;
-    if operation.operation_id != expected_operation_id {
-        return Err(StoreError::Corruption);
-    }
     if operation.task_id != Some(scope) {
-        return Err(StoreError::Corruption);
-    }
-    if receipt_created_at_ms != operation.accepted_at_ms {
         return Err(StoreError::Corruption);
     }
 
@@ -2197,6 +2282,115 @@ fn validate_accepted_receipt_correlation(
         committed_sequence,
         &operation,
     )
+}
+
+fn validate_host_admission_accepted_receipt(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    if event_ids.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    if operation.task_id.is_some()
+        || operation.resource_id.is_some()
+        || operation.runtime_generation.is_some()
+        || operation.state != "accepted"
+        || operation.result.is_some()
+        || operation.outcome_code.is_some()
+        || operation.outcome_at_ms.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    let Some(action_epoch) = operation.action_epoch else {
+        return Err(StoreError::Corruption);
+    };
+    let action_epoch = u64_from_nonnegative_i64("operations.action_epoch", action_epoch)?;
+
+    let outbox_rows = load_outbox_rows(tx, expected_operation_id)?;
+    if !outbox_rows.is_empty() {
+        return Err(StoreError::Corruption);
+    }
+
+    let accepted_sequence = committed_sequence;
+    let decision_sequence = accepted_sequence
+        .checked_sub(1)
+        .ok_or(StoreError::Corruption)?;
+
+    let decision_row = load_event_row_at_sequence(tx, decision_sequence)?;
+    if decision_row.task_id.is_some()
+        || decision_row.task_revision.is_some()
+        || decision_row.occurred_at_ms != operation.accepted_at_ms
+        || decision_row.event_id != event_ids[0]
+    {
+        return Err(StoreError::Corruption);
+    }
+    let decision_event = crate::kernel::store::decode_stored_event(
+        &decision_row.event_type,
+        decision_row.schema_version,
+        &decision_row.payload,
+    )?;
+    let Event::HostCloseBegun {
+        operation_id,
+        action_epoch: begun_epoch,
+        inspection_id,
+    } = decision_event
+    else {
+        return Err(StoreError::Corruption);
+    };
+    if operation_id != expected_operation_id || begun_epoch != action_epoch {
+        return Err(StoreError::Corruption);
+    }
+
+    let accepted_row = load_event_row_at_sequence(tx, accepted_sequence)?;
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        None,
+        operation.accepted_at_ms,
+        OperationFence {
+            action_epoch: Some(action_epoch),
+            resource_id: None,
+            runtime_generation: None,
+        },
+    )?;
+    ensure_unique_host_close_begun_fact(
+        tx,
+        expected_operation_id,
+        action_epoch,
+        inspection_id,
+        decision_sequence,
+        &decision_row,
+        operation.accepted_at_ms,
+    )?;
+    ensure_unique_operation_accepted_fact(
+        tx,
+        command_id,
+        expected_operation_id,
+        None,
+        operation.accepted_at_ms,
+        accepted_sequence,
+        &accepted_row,
+        OperationFence {
+            action_epoch: Some(action_epoch),
+            resource_id: None,
+            runtime_generation: None,
+        },
+    )?;
+
+    let admission = load_host_admission_row(tx)?.ok_or(StoreError::Corruption)?;
+    if admission.operation_id != expected_operation_id
+        || admission.action_epoch != action_epoch
+        || admission.inspection_id != inspection_id
+        || admission.updated_at_ms != operation.accepted_at_ms
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 fn validate_pure_accepted_receipt(
@@ -2249,7 +2443,7 @@ fn validate_pure_accepted_receipt(
         &accepted_row,
         command_id,
         expected_operation_id,
-        scope,
+        Some(scope),
         operation.accepted_at_ms,
         OperationFence {
             action_epoch: None,
@@ -2261,7 +2455,7 @@ fn validate_pure_accepted_receipt(
         tx,
         command_id,
         expected_operation_id,
-        scope,
+        Some(scope),
         operation.accepted_at_ms,
         accepted_sequence,
         &accepted_row,
@@ -2366,7 +2560,7 @@ fn validate_side_effect_accepted_receipt(
         &accepted_row,
         command_id,
         expected_operation_id,
-        scope,
+        Some(scope),
         operation.accepted_at_ms,
         fence,
     )?;
@@ -2374,7 +2568,7 @@ fn validate_side_effect_accepted_receipt(
         tx,
         command_id,
         expected_operation_id,
-        scope,
+        Some(scope),
         operation.accepted_at_ms,
         committed_sequence,
         &accepted_row,
@@ -3741,11 +3935,11 @@ fn validate_accepted_fact_row(
     accepted_row: &EventRow,
     command_id: CommandId,
     expected_operation_id: OperationId,
-    scope: TaskId,
+    scope: Option<TaskId>,
     accepted_at_ms: i64,
     fence: OperationFence,
 ) -> Result<(), StoreError> {
-    if accepted_row.task_id != Some(scope) || accepted_row.task_revision.is_some() {
+    if accepted_row.task_id != scope || accepted_row.task_revision.is_some() {
         return Err(StoreError::Corruption);
     }
     let accepted_event = crate::kernel::store::decode_stored_event(
@@ -3775,11 +3969,12 @@ fn validate_accepted_fact_row(
 /// V1 stores `operation_id` only in the accepted payload. Scan every
 /// `operation.accepted` row and require exactly one matching fact for this
 /// operation; extras in any task scope/sequence are Corruption.
+/// `scope` is `Some(task)` for task operations and `None` for global host admission.
 fn ensure_unique_operation_accepted_fact(
     tx: &Connection,
     command_id: CommandId,
     expected_operation_id: OperationId,
-    scope: TaskId,
+    scope: Option<TaskId>,
     accepted_at_ms: i64,
     expected_sequence: u64,
     expected_row: &EventRow,
@@ -3865,6 +4060,94 @@ fn ensure_unique_operation_accepted_fact(
             accepted_at_ms,
             fence,
         )?;
+    }
+    if match_count != 1 {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
+}
+
+/// Require exactly one global `host.close_begun` for this singleton admission,
+/// at the exact expected sequence, event id, scope, time, payload, fence, and inspection.
+fn ensure_unique_host_close_begun_fact(
+    tx: &Connection,
+    expected_operation_id: OperationId,
+    expected_action_epoch: u64,
+    expected_inspection_id: u64,
+    expected_sequence: u64,
+    expected_row: &EventRow,
+    expected_occurred_at_ms: i64,
+) -> Result<(), StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT sequence, event_id, task_id, task_revision, schema_version, payload, occurred_at_ms
+         FROM events
+         WHERE event_type = 'host.close_begun'
+         ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+
+    let mut match_count = 0u64;
+    for row in rows {
+        let (
+            sequence_i64,
+            event_id_bytes,
+            task_bytes,
+            task_revision,
+            schema_version,
+            payload,
+            occurred_at_ms,
+        ) = row?;
+        let sequence = u64_from_nonnegative_i64("events.sequence", sequence_i64)?;
+        let event_id = id16::<EventId>("events.event_id", &event_id_bytes)?;
+        let task_id = parse_optional_task_scope("events.task_id", task_bytes)?;
+        let task_revision = match task_revision {
+            Some(v) => Some(u64_from_nonnegative_i64("events.task_revision", v)?),
+            None => None,
+        };
+        let decoded = crate::kernel::store::decode_stored_event(
+            "host.close_begun",
+            schema_version,
+            &payload,
+        )?;
+        let Event::HostCloseBegun {
+            operation_id,
+            action_epoch,
+            inspection_id,
+        } = decoded
+        else {
+            return Err(StoreError::Corruption);
+        };
+        if operation_id != expected_operation_id {
+            // A second close_begun for a different operation is still a singleton violation
+            // once Closing exists; treat any extra host.close_begun as Corruption.
+            return Err(StoreError::Corruption);
+        }
+        match_count = match_count.checked_add(1).ok_or(StoreError::Corruption)?;
+        if sequence != expected_sequence
+            || event_id != expected_row.event_id
+            || task_id != expected_row.task_id
+            || task_revision != expected_row.task_revision
+            || occurred_at_ms != expected_row.occurred_at_ms
+            || schema_version != expected_row.schema_version
+            || payload != expected_row.payload
+            || action_epoch != expected_action_epoch
+            || inspection_id != expected_inspection_id
+            || occurred_at_ms != expected_occurred_at_ms
+            || task_id.is_some()
+            || task_revision.is_some()
+        {
+            return Err(StoreError::Corruption);
+        }
     }
     if match_count != 1 {
         return Err(StoreError::Corruption);
@@ -5365,11 +5648,155 @@ fn inspect_host_quit_in_tx(conn: &Connection) -> Result<HostQuitInspection, Stor
     }
 
     Ok(HostQuitInspection {
+        inspection_id: durable_event_high_water(conn)?,
         agents,
         resources,
         worktrees: HostQuitWorktreeInspection::NotInspected,
         confirmable: false,
     })
+}
+
+fn durable_event_high_water(conn: &Connection) -> Result<u64, StoreError> {
+    let max_sequence: i64 =
+        conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+    u64_from_nonnegative_i64("events.sequence", max_sequence)
+}
+
+fn host_admission_is_closing(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(load_host_admission_row(conn)?.is_some())
+}
+
+struct HostAdmissionRow {
+    operation_id: OperationId,
+    action_epoch: u64,
+    inspection_id: u64,
+    updated_at_ms: i64,
+}
+
+fn load_host_admission_row(conn: &Connection) -> Result<Option<HostAdmissionRow>, StoreError> {
+    let row: Option<(Vec<u8>, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT operation_id, action_epoch, inspection_id, updated_at_ms
+             FROM host_admission WHERE singleton_key = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((operation_id, action_epoch, inspection_id, updated_at_ms)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(HostAdmissionRow {
+        operation_id: id16::<OperationId>("host_admission.operation_id", &operation_id)?,
+        action_epoch: u64_from_nonnegative_i64("host_admission.action_epoch", action_epoch)?,
+        inspection_id: u64_from_nonnegative_i64("host_admission.inspection_id", inspection_id)?,
+        updated_at_ms,
+    }))
+}
+
+fn persist_confirm_host_quit(
+    tx: &Transaction<'_>,
+    envelope: CommandEnvelope,
+) -> Result<CommandReceipt, StoreError> {
+    let accepted_at_ms = now_ms()?;
+    let Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+        inspection_id,
+        allow_uninspected_worktrees,
+    }) = &envelope.command
+    else {
+        return Err(StoreError::Projection(
+            "persist_confirm_host_quit requires ConfirmHostQuit".into(),
+        ));
+    };
+
+    if envelope.task_id.is_some() || envelope.expected_task_revision.is_some() {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::InvalidTransition,
+            None,
+            accepted_at_ms,
+        );
+    }
+    if host_admission_is_closing(tx)? {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::Closing,
+            None,
+            accepted_at_ms,
+        );
+    }
+    let current_high_water = durable_event_high_water(tx)?;
+    if *inspection_id != current_high_water {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::RevisionConflict,
+            None,
+            accepted_at_ms,
+        );
+    }
+    if !*allow_uninspected_worktrees {
+        return persist_rejection(
+            tx,
+            &envelope,
+            None,
+            RejectionCode::InvalidTransition,
+            None,
+            accepted_at_ms,
+        );
+    }
+
+    let operation_id = OperationId::new();
+    let begun_event_id = EventId::new();
+    let accepted_event_id = EventId::new();
+    const HOST_CLOSE_ACTION_EPOCH: u64 = 1;
+
+    let receipt = CommandReceipt::Accepted {
+        command_id: envelope.command_id,
+        operation_id,
+        task_revision: None,
+        event_ids: vec![begun_event_id],
+    };
+    insert_receipt_row(tx, &envelope, None, &receipt, None, accepted_at_ms)?;
+
+    append_and_project(
+        tx,
+        begun_event_id,
+        None,
+        None,
+        accepted_at_ms,
+        Event::HostCloseBegun {
+            operation_id,
+            action_epoch: HOST_CLOSE_ACTION_EPOCH,
+            inspection_id: *inspection_id,
+        },
+    )?;
+
+    let accepted = OperationAcceptedFact::new(
+        envelope.command_id,
+        operation_id,
+        accepted_at_ms,
+        Some(HOST_CLOSE_ACTION_EPOCH),
+        None,
+        None,
+    )
+    .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let committed_sequence = append_and_project(
+        tx,
+        accepted_event_id,
+        None,
+        None,
+        accepted_at_ms,
+        Event::OperationAccepted(accepted),
+    )?;
+    set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
+    Ok(receipt)
 }
 
 struct ResourceProjectionFields {

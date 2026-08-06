@@ -19,27 +19,32 @@ fn mismatch(as_projection: bool, detail: &str) -> StoreError {
 pub(crate) enum SettledLineageKind {
     Pure,
     TaskTeardown,
+    HostAdmission,
     Release {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
 }
 
-/// Pure = all-none; teardown = action only; release = action + both resource fields.
-/// Any other combination (including resource fence without action_epoch) fails closed.
+/// Pure = all-none; teardown = action + task scope; host admission = action + global scope;
+/// release = action + both resource fields. Any other combination fails closed.
 pub(crate) fn classify_settled_lineage_fence(
     action_epoch: Option<u64>,
     resource_id: Option<ResourceId>,
     runtime_generation: Option<u64>,
+    task_id: Option<TaskId>,
     as_projection: bool,
 ) -> Result<SettledLineageKind, StoreError> {
-    match (action_epoch, resource_id, runtime_generation) {
-        (None, None, None) => Ok(SettledLineageKind::Pure),
-        (Some(_), None, None) => Ok(SettledLineageKind::TaskTeardown),
-        (Some(_), Some(resource_id), Some(runtime_generation)) => Ok(SettledLineageKind::Release {
-            resource_id,
-            runtime_generation,
-        }),
+    match (action_epoch, resource_id, runtime_generation, task_id) {
+        (None, None, None, _) => Ok(SettledLineageKind::Pure),
+        (Some(_), None, None, Some(_)) => Ok(SettledLineageKind::TaskTeardown),
+        (Some(_), None, None, None) => Ok(SettledLineageKind::HostAdmission),
+        (Some(_), Some(resource_id), Some(runtime_generation), Some(_)) => {
+            Ok(SettledLineageKind::Release {
+                resource_id,
+                runtime_generation,
+            })
+        }
         _ => Err(mismatch(
             as_projection,
             "unsupported operation fence shape for lineage",
@@ -49,12 +54,14 @@ pub(crate) fn classify_settled_lineage_fence(
 
 pub(crate) fn classify_operation_settled_fact(
     fact: &OperationSettledFact,
+    task_id: Option<TaskId>,
     as_projection: bool,
 ) -> Result<SettledLineageKind, StoreError> {
     classify_settled_lineage_fence(
         fact.action_epoch,
         fact.resource_id,
         fact.runtime_generation,
+        task_id,
         as_projection,
     )
 }
@@ -87,8 +94,11 @@ pub(crate) fn validate_derived_settled_adjacency(
             "derived lifecycle result must be followed immediately by operation.settled",
         ));
     };
-    let kind = classify_operation_settled_fact(fact, as_projection)?;
-    if matches!(kind, SettledLineageKind::Pure) {
+    let kind = classify_operation_settled_fact(fact, next_task_id, as_projection)?;
+    if matches!(
+        kind,
+        SettledLineageKind::Pure | SettledLineageKind::HostAdmission
+    ) {
         return Err(mismatch(
             as_projection,
             "derived lifecycle result must be followed by a side-effect operation.settled",
@@ -126,9 +136,15 @@ pub(crate) fn validate_side_effect_settled_against_derived(
     derived_task_id: Option<TaskId>,
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    let kind = classify_operation_settled_fact(fact, as_projection)?;
+    let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
     if matches!(kind, SettledLineageKind::Pure) {
         return Ok(());
+    }
+    if matches!(kind, SettledLineageKind::HostAdmission) {
+        return Err(mismatch(
+            as_projection,
+            "host-admission settlement is not permitted until branch-aware settlement",
+        ));
     }
     if fact.result_event_ids.len() != 1 || fact.result_event_ids[0] != derived_id {
         return Err(mismatch(
@@ -178,7 +194,9 @@ pub(crate) fn validate_side_effect_settled_against_derived(
             as_projection,
             "resource release settle requires matching immediately preceding resource.released",
         )),
-        (SettledLineageKind::Pure, _) => unreachable!("pure returned early"),
+        (SettledLineageKind::Pure | SettledLineageKind::HostAdmission, _) => {
+            unreachable!("pure returned early; host admission rejected above")
+        }
     }
 }
 
@@ -191,9 +209,15 @@ pub(crate) fn validate_side_effect_settled_has_prior_derived(
     prior: Option<(EventId, &Event, Option<u64>, i64, Option<TaskId>)>,
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    let kind = classify_operation_settled_fact(fact, as_projection)?;
+    let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
     if matches!(kind, SettledLineageKind::Pure) {
         return Ok(());
+    }
+    if matches!(kind, SettledLineageKind::HostAdmission) {
+        return Err(mismatch(
+            as_projection,
+            "host-admission settlement is not permitted until branch-aware settlement",
+        ));
     }
     let Some((derived_id, derived, derived_revision, derived_occurred, derived_task)) = prior
     else {
@@ -226,10 +250,13 @@ pub(crate) fn reject_pure_non_settled_terminal(
     kind: SettledLineageKind,
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    if matches!(kind, SettledLineageKind::Pure) {
+    if matches!(
+        kind,
+        SettledLineageKind::Pure | SettledLineageKind::HostAdmission
+    ) {
         return Err(mismatch(
             as_projection,
-            "pure all-none operation cannot become failed, cancelled, or uncertain",
+            "pure/host-admission operation cannot become failed, cancelled, or uncertain",
         ));
     }
     Ok(())
@@ -260,7 +287,7 @@ pub(crate) fn validate_pure_settled_lineage(
     decisions: &[(EventId, Event, Option<u64>, i64, Option<TaskId>)],
     as_projection: bool,
 ) -> Result<(), StoreError> {
-    let kind = classify_operation_settled_fact(fact, as_projection)?;
+    let kind = classify_operation_settled_fact(fact, settled_task_id, as_projection)?;
     if !matches!(kind, SettledLineageKind::Pure) {
         return Ok(());
     }
