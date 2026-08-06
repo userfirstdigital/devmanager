@@ -20,7 +20,7 @@ use crate::domain::event::{
     OperationFailedFact, OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{
-    AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId, OutboxId,
     ProjectId, ResourceId, TaskId,
 };
 use crate::domain::operation::{
@@ -35,6 +35,7 @@ use crate::domain::snapshot::{PageLimits, TaskSnapshot, TaskSnapshotItem};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
 };
+use crate::kernel::artifact_content::{ArtifactContentError, ArtifactContentSession};
 use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, DispatchPermit};
 use crate::kernel::outbox::{
     decode_effect_document, decode_receipt_document, effect_document_sha256,
@@ -92,8 +93,8 @@ impl CommandBus {
 
     /// Serve a side-effect-free query through the owned store projections only.
     ///
-    /// Paged snapshot and event-replay open/resume/release require the host
-    /// executor registry and return [`QueryError::UnsupportedCapability`] here.
+    /// Paged snapshot, event-replay, and artifact-content open/resume/release require
+    /// the host executor registry and return [`QueryError::UnsupportedCapability`] here.
     pub fn query(&self, envelope: QueryEnvelope) -> Result<QueryReply, StoreError> {
         let outcome = match envelope.query {
             Query::OperationStatus { operation_id } => match self.operation_status(operation_id)? {
@@ -128,7 +129,10 @@ impl CommandBus {
             | Query::ReleaseSnapshot { .. }
             | Query::OpenEventReplay { .. }
             | Query::ContinueEventReplay { .. }
-            | Query::ReleaseEventReplay { .. } => {
+            | Query::ReleaseEventReplay { .. }
+            | Query::OpenArtifactContent { .. }
+            | Query::ContinueArtifactContent { .. }
+            | Query::ReleaseArtifactContent { .. } => {
                 QueryOutcome::Err(QueryError::UnsupportedCapability)
             }
         };
@@ -153,6 +157,26 @@ impl CommandBus {
         limits: PageLimits,
     ) -> Result<EventReplaySession, ReplayError> {
         self.store.begin_event_replay(after_sequence, limits)
+    }
+
+    /// Load InlineUtf8 artifact content into a paged session (no SQLite escape).
+    pub(crate) fn begin_artifact_content(
+        &self,
+        client_id: ClientId,
+        task_id: TaskId,
+        artifact_id: ArtifactId,
+        limits: PageLimits,
+        max_reassembled_message_bytes: u32,
+        max_physical_frame_bytes: u32,
+    ) -> Result<ArtifactContentSession, ArtifactContentError> {
+        self.store.begin_artifact_content(
+            client_id,
+            task_id,
+            artifact_id,
+            limits,
+            max_reassembled_message_bytes,
+            max_physical_frame_bytes,
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::canonical;
 use crate::domain::id::{ArtifactId, TaskId};
@@ -8,6 +9,7 @@ use crate::domain::id::{ArtifactId, TaskId};
 pub enum ArtifactValidationError {
     EmptyLabel,
     EmptyContent,
+    ContentDigestMismatch,
 }
 
 impl std::fmt::Display for ArtifactValidationError {
@@ -15,6 +17,12 @@ impl std::fmt::Display for ArtifactValidationError {
         match self {
             Self::EmptyLabel => write!(f, "artifact label must be non-empty"),
             Self::EmptyContent => write!(f, "artifact content must be non-empty"),
+            Self::ContentDigestMismatch => {
+                write!(
+                    f,
+                    "artifact inline content SHA-256 does not match declared digest"
+                )
+            }
         }
     }
 }
@@ -183,5 +191,79 @@ impl<'de> Deserialize<'de> for ArtifactFacts {
         };
         facts.validate().map_err(de::Error::custom)?;
         Ok(facts)
+    }
+}
+
+/// Client snapshot metadata for one artifact. Never carries body bytes or a
+/// content-ref; SHA-256 is the content identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactSummary {
+    pub id: ArtifactId,
+    pub task_id: TaskId,
+    pub kind: ArtifactKind,
+    pub label: String,
+    pub sha256: [u8; 32],
+    pub privacy_class: PrivacyClass,
+    pub created_at_ms: i64,
+}
+
+impl ArtifactSummary {
+    pub fn from_facts(facts: &ArtifactFacts) -> Result<Self, ArtifactValidationError> {
+        facts.validate()?;
+        verify_inline_content_digest(facts)?;
+        Ok(Self {
+            id: facts.id,
+            task_id: facts.task_id,
+            kind: facts.kind,
+            label: facts.label.clone(),
+            sha256: facts.sha256,
+            privacy_class: facts.privacy_class,
+            created_at_ms: facts.created_at_ms,
+        })
+    }
+}
+
+/// Recompute SHA-256 for locally available InlineUtf8 bodies. ContentAddressed
+/// bytes are not required here and are left unchecked.
+pub fn verify_inline_content_digest(facts: &ArtifactFacts) -> Result<(), ArtifactValidationError> {
+    match &facts.content_ref {
+        ArtifactContentRef::InlineUtf8(body) => {
+            let mut hasher = Sha256::new();
+            hasher.update(body.as_bytes());
+            let computed: [u8; 32] = hasher.finalize().into();
+            if computed != facts.sha256 {
+                return Err(ArtifactValidationError::ContentDigestMismatch);
+            }
+            Ok(())
+        }
+        ArtifactContentRef::ContentAddressed { .. } => Ok(()),
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactSummary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ArtifactSummaryWire {
+            id: ArtifactId,
+            task_id: TaskId,
+            kind: ArtifactKind,
+            label: String,
+            sha256: [u8; 32],
+            privacy_class: PrivacyClass,
+            created_at_ms: i64,
+        }
+
+        let wire = ArtifactSummaryWire::deserialize(deserializer)?;
+        let label = ArtifactFacts::canonicalize_label(wire.label).map_err(de::Error::custom)?;
+        Ok(Self {
+            id: wire.id,
+            task_id: wire.task_id,
+            kind: wire.kind,
+            label,
+            sha256: wire.sha256,
+            privacy_class: wire.privacy_class,
+            created_at_ms: wire.created_at_ms,
+        })
     }
 }

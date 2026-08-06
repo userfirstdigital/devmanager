@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+use crate::domain::artifact::ArtifactSummary;
 use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
 use crate::domain::snapshot::{
     PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
@@ -249,7 +250,9 @@ impl SnapshotSession {
                     command_bus::load_artifact(&self.conn, artifact_id)?.ok_or_else(|| {
                         StoreError::Projection("artifact disappeared from pinned snapshot".into())
                     })?;
-                Ok(SnapshotItem::Artifact(artifact))
+                let summary = ArtifactSummary::from_facts(&artifact)
+                    .map_err(|err| StoreError::Projection(err.to_string()))?;
+                Ok(SnapshotItem::Artifact(summary))
             },
         )
     }
@@ -729,6 +732,7 @@ impl Drop for SnapshotSession {
 mod tests {
     use std::time::Duration;
 
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::*;
@@ -867,13 +871,18 @@ mod tests {
         label: &str,
         body: String,
     ) -> ArtifactFacts {
+        let sha256 = {
+            let mut hasher = Sha256::new();
+            hasher.update(body.as_bytes());
+            hasher.finalize().into()
+        };
         ArtifactFacts {
             id: artifact_id,
             task_id,
             kind: ArtifactKind::Finding,
             label: label.into(),
             content_ref: ArtifactContentRef::inline_utf8(body).expect("artifact content"),
-            sha256: [artifact_id.as_bytes()[15]; 32],
+            sha256,
             privacy_class: PrivacyClass::LocalOnly,
             created_at_ms: 1_725_000_000_200,
         }
@@ -1314,10 +1323,11 @@ mod tests {
             1,
         );
         let huge_artifact = artifact_id(0xA4);
+        let huge_body = "x".repeat(8_192);
         register_artifact(
             &mut store,
             task,
-            artifact_facts(task, huge_artifact, "Huge", "x".repeat(8_192)),
+            artifact_facts(task, huge_artifact, "Huge", huge_body.clone()),
             command_id(0xA5),
             2,
         );
@@ -1326,24 +1336,92 @@ mod tests {
             .expect("begin snapshot");
         let page = snapshot
             .page(SnapshotSection::Artifacts, None)
-            .expect("artifact page");
-        assert_eq!(page.items.len(), 1);
+            .expect("metadata-only summaries fit both artifacts");
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next_cursor, None);
         assert_eq!(
             usize::try_from(page.encoded_bytes).expect("page length fits"),
             rmp_serde::to_vec_named(&page)
                 .expect("encode final page")
                 .len(),
         );
-        let cursor = page
-            .next_cursor
-            .expect("byte cutoff must preserve a resume cursor");
+        let encoded = rmp_serde::to_vec_named(&page).expect("encode page");
+        assert!(
+            !encoded
+                .windows(huge_body.len())
+                .any(|window| window == huge_body.as_bytes()),
+            "snapshot encoding must omit huge inline body"
+        );
+        let conn = store.open_query_connection().expect("query conn");
+        let durable = command_bus::load_artifact(&conn, huge_artifact)
+            .expect("load")
+            .expect("huge artifact");
         assert!(matches!(
-            snapshot.page(SnapshotSection::Artifacts, Some(&cursor)),
-            Err(SnapshotError::PageItemTooLarge {
-                item: SnapshotItemKey::Artifact(id),
-                ..
-            }) if id == huge_artifact
+            durable.content_ref,
+            ArtifactContentRef::InlineUtf8(body) if body == huge_body
         ));
+    }
+
+    #[test]
+    fn artifact_snapshot_omits_inline_body_until_requested() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let task = task_id(0xC0);
+        let artifact = artifact_id(0xC1);
+        create_task(&mut store, task, command_id(0xC2));
+        const BODY: &str = "DISTINCTIVE_ARTIFACT_BODY_TOKEN_2_5E";
+        const LABEL: &str = "DistinctiveLabelToken";
+        register_artifact(
+            &mut store,
+            task,
+            artifact_facts(task, artifact, LABEL, BODY.into()),
+            command_id(0xC3),
+            1,
+        );
+
+        let snapshot = store
+            .begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits"))
+            .expect("begin snapshot");
+        let page = snapshot
+            .page(SnapshotSection::Artifacts, None)
+            .expect("artifacts page");
+        let encoded = rmp_serde::to_vec_named(&page).expect("encode artifacts page");
+        assert!(
+            !encoded
+                .windows(BODY.len())
+                .any(|window| window == BODY.as_bytes()),
+            "snapshot must not inline artifact body bytes"
+        );
+        assert!(
+            encoded
+                .windows(LABEL.len())
+                .any(|window| window == LABEL.as_bytes()),
+            "snapshot must retain artifact label"
+        );
+        let summary = match &page.items[..] {
+            [SnapshotItem::Artifact(summary)] => summary,
+            other => panic!("expected one artifact summary, got {other:?}"),
+        };
+        assert_eq!(summary.id, artifact);
+        assert_eq!(summary.label, LABEL);
+        let mut expected_digest = Sha256::new();
+        expected_digest.update(BODY.as_bytes());
+        let expected_digest: [u8; 32] = expected_digest.finalize().into();
+        assert_eq!(
+            summary.sha256, expected_digest,
+            "decoded summary hash must equal the real content SHA-256"
+        );
+
+        let conn = store.open_query_connection().expect("query conn");
+        let durable = command_bus::load_artifact(&conn, artifact)
+            .expect("load")
+            .expect("artifact");
+        assert!(matches!(
+            durable.content_ref,
+            ArtifactContentRef::InlineUtf8(body) if body == BODY
+        ));
+        assert_eq!(durable.sha256, expected_digest);
     }
 
     #[test]

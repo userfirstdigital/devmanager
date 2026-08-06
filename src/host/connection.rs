@@ -3,8 +3,9 @@
 //! Transport connection tasks never mutate the bus or projections directly.
 //! They submit decoded requests through [`HostRequestHandle`]; one
 //! [`HostRequestExecutor`] task exclusively owns [`CommandBus`] and services
-//! them in arrival order. The executor also owns the bounded SnapshotSession
-//! and EventReplaySession registries for paged snapshot and event-replay queries.
+//! them in arrival order. The executor also owns the bounded SnapshotSession,
+//! EventReplaySession, and ArtifactContentSession registries for paged snapshot,
+//! event-replay, and artifact-content queries.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,14 +17,15 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::domain::id::{SnapshotId, SubscriptionId};
+use crate::domain::id::{ArtifactId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
 use crate::domain::ClientId;
 use crate::kernel::{
-    CommandBus, EventReplaySession, ReplayError, SnapshotError, SnapshotSession, StoreError,
+    ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
+    SnapshotError, SnapshotSession, StoreError,
 };
 use crate::protocol::{
     Capability, ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
@@ -467,6 +469,7 @@ pub struct HostRequestExecutor {
     control_closed: bool,
     registry: SnapshotRegistry,
     replay_registry: EventReplayRegistry,
+    artifact_content_registry: ArtifactContentRegistry,
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
 }
 
@@ -491,6 +494,7 @@ impl HostRequestExecutor {
             control_closed: false,
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
+            artifact_content_registry: ArtifactContentRegistry::new(),
             outputs: HashMap::new(),
         };
         let join = tokio::spawn(async move {
@@ -537,6 +541,7 @@ impl HostRequestExecutor {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
+                    self.artifact_content_registry.reap(now);
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
@@ -690,6 +695,75 @@ impl HostRequestExecutor {
                 }
                 let outcome =
                     self.serve_release_event_replay(negotiated.client_id, subscription_id);
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::OpenArtifactContent { artifact_id } => {
+                let Some(task_id) = task_id else {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                };
+                if !negotiated.capabilities.contains(Capability::ChunkResume) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome = self.serve_open_artifact_content(negotiated, task_id, artifact_id)?;
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::ContinueArtifactContent {
+                subscription_id,
+                resume_cursor,
+            } => {
+                let Some(task_id) = task_id else {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                };
+                if !negotiated.capabilities.contains(Capability::ChunkResume) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome = self.serve_continue_artifact_content(
+                    negotiated,
+                    task_id,
+                    subscription_id,
+                    resume_cursor,
+                )?;
+                Ok(QueryReply {
+                    request_id: envelope.request_id,
+                    outcome,
+                })
+            }
+            Query::ReleaseArtifactContent { subscription_id } => {
+                let Some(task_id) = task_id else {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+                    });
+                };
+                if !negotiated.capabilities.contains(Capability::ChunkResume) {
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                    });
+                }
+                let outcome = self.serve_release_artifact_content(
+                    negotiated.client_id,
+                    task_id,
+                    subscription_id,
+                )?;
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -977,6 +1051,95 @@ impl HostRequestExecutor {
         }
     }
 
+    fn serve_open_artifact_content(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        task_id: TaskId,
+        artifact_id: ArtifactId,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.artifact_content_registry.reap(now);
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = match self.bus.begin_artifact_content(
+            negotiated.client_id,
+            task_id,
+            artifact_id,
+            limits,
+            negotiated.limits.max_reassembled_message_bytes,
+            negotiated.limits.max_physical_frame_bytes,
+        ) {
+            Ok(session) => session,
+            Err(error) => return map_artifact_content_error(error),
+        };
+        let subscription_id = session.subscription_id();
+        let page = match session.page(None) {
+            Ok(page) => page,
+            Err(error) => return map_artifact_content_error(error),
+        };
+        self.artifact_content_registry
+            .insert(session, Instant::now());
+        Ok(QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+            subscription_id,
+            page,
+        }))
+    }
+
+    fn serve_continue_artifact_content(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        task_id: TaskId,
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.artifact_content_registry.reap(now);
+        let limits = page_limits_from_negotiated(negotiated)?;
+        let session = match self.artifact_content_registry.get(
+            subscription_id,
+            negotiated.client_id,
+            task_id,
+            limits,
+            negotiated.limits.max_reassembled_message_bytes,
+            negotiated.limits.max_physical_frame_bytes,
+            now,
+        ) {
+            Ok(session) => session,
+            Err(error) => return map_artifact_content_error(error),
+        };
+        let page = match session.page(Some(resume_cursor.as_slice())) {
+            Ok(page) => page,
+            Err(error) => {
+                // Cursor/shape failures leave a valid retained session intact.
+                return map_artifact_content_error(error);
+            }
+        };
+        self.artifact_content_registry
+            .touch(subscription_id, Instant::now());
+        Ok(QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+            subscription_id,
+            page,
+        }))
+    }
+
+    fn serve_release_artifact_content(
+        &mut self,
+        requester: ClientId,
+        task_id: TaskId,
+        subscription_id: SubscriptionId,
+    ) -> Result<QueryOutcome, IpcError> {
+        let now = Instant::now();
+        self.artifact_content_registry.reap(now);
+        match self
+            .artifact_content_registry
+            .release(subscription_id, requester, task_id)
+        {
+            Ok(()) => Ok(QueryOutcome::Ok(QueryResult::ArtifactContentReleased {
+                subscription_id,
+            })),
+            Err(error) => map_artifact_content_error(error),
+        }
+    }
+
     fn fan_out_live_durable_events(&mut self) {
         let subscription_ids = self
             .replay_registry
@@ -1173,6 +1336,25 @@ fn map_replay_error(error: ReplayError) -> Result<QueryOutcome, IpcError> {
     }
 }
 
+fn map_artifact_content_error(error: ArtifactContentError) -> Result<QueryOutcome, IpcError> {
+    match error {
+        ArtifactContentError::NotFound => Ok(QueryOutcome::Err(QueryError::NotFound)),
+        ArtifactContentError::Unauthorized => Ok(QueryOutcome::Err(QueryError::Unauthorized)),
+        ArtifactContentError::InvalidRequest
+        | ArtifactContentError::InvalidCursor
+        | ArtifactContentError::CursorContextMismatch
+        | ArtifactContentError::ContentDigestMismatch
+        | ArtifactContentError::BodyTooLarge { .. } => {
+            Ok(QueryOutcome::Err(QueryError::InvalidRequest))
+        }
+        ArtifactContentError::Store(StoreError::Busy) => Err(IpcError::Busy),
+        ArtifactContentError::Store(_)
+        | ArtifactContentError::InvalidLimits(_)
+        | ArtifactContentError::EntropyUnavailable
+        | ArtifactContentError::PageEnvelopeTooLarge { .. } => Err(IpcError::Unavailable),
+    }
+}
+
 /// Authenticated client_id check plus CommandBus execute/query dispatch.
 ///
 /// Used by the exclusive [`super::ipc::HostConnection::serve_request`]
@@ -1200,7 +1382,10 @@ pub(crate) fn dispatch_authenticated_request(
                 | Query::ReleaseSnapshot { .. }
                 | Query::OpenEventReplay { .. }
                 | Query::ContinueEventReplay { .. }
-                | Query::ReleaseEventReplay { .. } => {
+                | Query::ReleaseEventReplay { .. }
+                | Query::OpenArtifactContent { .. }
+                | Query::ContinueArtifactContent { .. }
+                | Query::ReleaseArtifactContent { .. } => {
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
                         outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),

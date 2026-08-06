@@ -670,6 +670,7 @@ async fn serve_foreground_host(
             Capability::PagedSnapshots,
             Capability::EventReplay,
             Capability::OperationSettlement,
+            Capability::ChunkResume,
         ]),
         local_limits: FrameLimits::v1_default(),
     };

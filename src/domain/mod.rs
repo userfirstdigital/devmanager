@@ -12,7 +12,8 @@ pub mod task;
 
 pub use agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle, AgentValidationError};
 pub use artifact::{
-    ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactValidationError, PrivacyClass,
+    ArtifactContentRef, ArtifactFacts, ArtifactKind, ArtifactSummary, ArtifactValidationError,
+    PrivacyClass,
 };
 pub use command::{
     decide, Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
@@ -40,8 +41,8 @@ pub use resource::{
     ResourceValidationError,
 };
 pub use snapshot::{
-    EventPage, PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey, SnapshotPage,
-    SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+    ArtifactContentPage, EventPage, PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey,
+    SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
     MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{

@@ -22,18 +22,19 @@ use devmanager::client::{
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
-use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+use devmanager::domain::id::{ArtifactId, CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotSection};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef,
 };
-use devmanager::domain::ClientId;
+use devmanager::domain::{ArtifactContentRef, ArtifactFacts, ArtifactKind, ClientId, PrivacyClass};
 use devmanager::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, HostIdentity, IpcError,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
+use sha2::{Digest, Sha256};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1358,6 +1359,297 @@ async fn two_clients_assemble_same_initial_model_and_converge_live() {
     writer.disconnect();
     reader_a.disconnect();
     reader_b.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+    assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_content_pages_are_scoped_resumable_and_side_effect_free() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let original_identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let owner_id = ClientId::from_bytes(fixed_uuid_v7(0xa0)).expect("owner client id");
+    let foreign_id = ClientId::from_bytes(fixed_uuid_v7(0xa1)).expect("foreign client id");
+    let mut limits = FrameLimits::v1_default();
+    // Force multi-page artifact content under a tight page budget.
+    limits.max_page_encoded_bytes = 1_024;
+    let requested = CapabilitySet::from_capabilities([
+        Capability::PagedSnapshots,
+        Capability::ChunkResume,
+        Capability::EventReplay,
+    ]);
+    let owner_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: owner_id,
+        requested,
+        limits,
+    };
+    let foreign_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: foreign_id,
+        requested,
+        limits,
+    };
+    let mut owner = connect_bounded(&owner_config, &mut host).await;
+    let mut foreign = connect_bounded(&foreign_config, &mut host).await;
+    assert!(owner
+        .granted_capabilities()
+        .contains(Capability::ChunkResume));
+    assert!(foreign
+        .granted_capabilities()
+        .contains(Capability::ChunkResume));
+
+    let (create, _, task_id) =
+        create_task_named(owner_id, 0xa2, 0xa3, 0xa4, 0xa5, "Artifact content task");
+    assert!(matches!(
+        owner
+            .execute_command(create)
+            .await
+            .expect("create task for artifact content"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let distinctive = "ARTIFACT_CONTENT_BODY_TOKEN_9c2e";
+    let body = format!(
+        "{}{}",
+        distinctive,
+        "αβγδεζηθικλμνξοπρστυφχψω"
+            .repeat(80)
+            .chars()
+            .cycle()
+            .take(2_000)
+            .collect::<String>()
+    );
+    let sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let artifact_id = ArtifactId::from_bytes(fixed_uuid_v7(0xa6)).expect("artifact id");
+    let register = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xa7)).expect("register command id"),
+        client_id: owner_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_200,
+        expected_task_revision: Some(1),
+        command: Command::RegisterArtifact {
+            artifact: ArtifactFacts {
+                id: artifact_id,
+                task_id,
+                kind: ArtifactKind::Evidence,
+                label: "Paged evidence".into(),
+                content_ref: ArtifactContentRef::inline_utf8(&body).expect("inline body"),
+                sha256,
+                privacy_class: PrivacyClass::LocalOnly,
+                created_at_ms: 1_725_000_000_200,
+            },
+        },
+    };
+    assert!(matches!(
+        owner
+            .execute_command(register)
+            .await
+            .expect("register multi-page artifact"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    for client in [&mut owner, &mut foreign] {
+        let page = client
+            .snapshot_page(SnapshotSection::Artifacts, None, None)
+            .await
+            .expect("artifacts snapshot transport")
+            .expect("artifacts snapshot query");
+        assert_eq!(page.section, SnapshotSection::Artifacts);
+        assert_eq!(page.items.len(), 1);
+        let SnapshotItem::Artifact(summary) = &page.items[0] else {
+            panic!("artifacts page must contain ArtifactSummary items");
+        };
+        assert_eq!(summary.id, artifact_id);
+        assert_eq!(summary.sha256, sha256);
+        let encoded = rmp_serde::to_vec_named(&page).expect("encode snapshot page");
+        assert!(
+            !encoded
+                .windows(distinctive.as_bytes().len())
+                .any(|window| window == distinctive.as_bytes()),
+            "snapshot page encoding must omit artifact body token"
+        );
+        client
+            .release_snapshot(page.snapshot_id)
+            .await
+            .expect("release artifacts snapshot transport")
+            .expect("release artifacts snapshot");
+    }
+
+    let baseline = owner
+        .open_event_replay(0)
+        .await
+        .expect("baseline replay transport")
+        .expect("baseline replay query");
+    let baseline_through = baseline.page.through_sequence;
+    let baseline_events = baseline.page.events.len();
+    owner
+        .release_event_replay(baseline.subscription_id)
+        .await
+        .expect("release baseline replay transport")
+        .expect("release baseline replay");
+
+    let open = owner
+        .open_artifact_content(task_id, artifact_id)
+        .await
+        .expect("open artifact content transport")
+        .expect("open artifact content query");
+    assert_eq!(open.page.artifact_id, artifact_id);
+    assert_eq!(open.page.sha256, sha256);
+    assert_eq!(open.page.offset, 0);
+    let subscription_id = open.subscription_id;
+    let mut reconstructed = open.page.payload;
+    let mut next = open.page.next_cursor;
+    let mut pages = 1usize;
+    while let Some(cursor) = next {
+        let continued = owner
+            .continue_artifact_content(task_id, subscription_id, cursor)
+            .await
+            .expect("continue artifact content transport")
+            .expect("continue artifact content query");
+        assert_eq!(continued.subscription_id, subscription_id);
+        assert_eq!(continued.page.artifact_id, artifact_id);
+        reconstructed.extend_from_slice(&continued.page.payload);
+        next = continued.page.next_cursor;
+        pages += 1;
+    }
+    assert!(
+        pages > 1,
+        "tight page budget must require multiple content pages"
+    );
+    assert_eq!(reconstructed, body.as_bytes());
+    let reconstructed_digest: [u8; 32] = Sha256::digest(&reconstructed).into();
+    assert_eq!(reconstructed_digest, sha256);
+
+    let foreign_continue = foreign
+        .continue_artifact_content(task_id, subscription_id, vec![0x01, 0x02])
+        .await
+        .expect("foreign continue transport");
+    assert_eq!(foreign_continue, Err(QueryError::Unauthorized));
+
+    let wrong_task = TaskId::from_bytes(fixed_uuid_v7(0xa8)).expect("wrong task id");
+    let wrong_task_continue = owner
+        .continue_artifact_content(wrong_task, subscription_id, vec![0x01, 0x02])
+        .await
+        .expect("wrong-task continue transport");
+    assert_eq!(wrong_task_continue, Err(QueryError::Unauthorized));
+
+    owner
+        .release_artifact_content(task_id, subscription_id)
+        .await
+        .expect("release artifact content transport")
+        .expect("release artifact content");
+    owner
+        .release_artifact_content(task_id, subscription_id)
+        .await
+        .expect("idempotent release transport")
+        .expect("idempotent release");
+
+    let after = owner
+        .open_event_replay(0)
+        .await
+        .expect("post-read replay transport")
+        .expect("post-read replay query");
+    assert_eq!(after.page.through_sequence, baseline_through);
+    assert_eq!(after.page.events.len(), baseline_events);
+    owner
+        .release_event_replay(after.subscription_id)
+        .await
+        .expect("release post-read replay transport")
+        .expect("release post-read replay");
+
+    // Correction 4: V1-oversized body must return InvalidRequest without poisoning.
+    let oversized_body = "O".repeat(6_000);
+    let oversized_sha: [u8; 32] = Sha256::digest(oversized_body.as_bytes()).into();
+    let oversized_id = ArtifactId::from_bytes(fixed_uuid_v7(0xa9)).expect("oversized artifact id");
+    let register_oversized = CommandEnvelope {
+        command_id: CommandId::from_bytes(fixed_uuid_v7(0xaa)).expect("oversized command id"),
+        client_id: owner_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_000_300,
+        expected_task_revision: Some(2),
+        command: Command::RegisterArtifact {
+            artifact: ArtifactFacts {
+                id: oversized_id,
+                task_id,
+                kind: ArtifactKind::Evidence,
+                label: "Oversized evidence".into(),
+                content_ref: ArtifactContentRef::inline_utf8(&oversized_body).expect("body"),
+                sha256: oversized_sha,
+                privacy_class: PrivacyClass::LocalOnly,
+                created_at_ms: 1_725_000_000_300,
+            },
+        },
+    };
+    assert!(matches!(
+        owner
+            .execute_command(register_oversized)
+            .await
+            .expect("register oversized artifact"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let tight_id = ClientId::from_bytes(fixed_uuid_v7(0xab)).expect("tight client id");
+    let mut tight_limits = FrameLimits::v1_default();
+    tight_limits.max_page_encoded_bytes = 1_024;
+    tight_limits.max_reassembled_message_bytes = 4_096;
+    let tight_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id: tight_id,
+        requested: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::ChunkResume,
+            Capability::EventReplay,
+        ]),
+        limits: tight_limits,
+    };
+    let mut tight = connect_bounded(&tight_config, &mut host).await;
+    assert!(
+        tight
+            .granted_capabilities()
+            .contains(Capability::ChunkResume),
+        "tight client must still receive ChunkResume"
+    );
+    let oversized_open = tight
+        .open_artifact_content(task_id, oversized_id)
+        .await
+        .expect("oversized open transport");
+    assert_eq!(
+        oversized_open,
+        Err(QueryError::InvalidRequest),
+        "BodyTooLarge must map to InvalidRequest, not poison transport"
+    );
+    let still_alive = tight
+        .snapshot_page(SnapshotSection::Artifacts, None, None)
+        .await
+        .expect("post-InvalidRequest snapshot transport")
+        .expect("post-InvalidRequest snapshot query");
+    assert_eq!(still_alive.section, SnapshotSection::Artifacts);
+    assert!(still_alive.items.len() >= 2);
+    tight
+        .release_snapshot(still_alive.snapshot_id)
+        .await
+        .expect("release tight snapshot transport")
+        .expect("release tight snapshot");
+    tight.disconnect();
+
+    let final_identity = read_identity(&lock_path).expect("final host identity");
+    assert_eq!(final_identity.pid, original_identity.pid);
+    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+
+    owner.disconnect();
+    foreign.disconnect();
     let status = host
         .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
         .expect("terminate exact foreground host");

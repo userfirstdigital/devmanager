@@ -1,10 +1,54 @@
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
-use crate::domain::id::{ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
+use crate::domain::id::{
+    ArtifactId, ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
+};
 use crate::domain::operation::OperationState;
-use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use crate::domain::snapshot::{
+    ArtifactContentPage as ArtifactContentPageBody, EventPage, SnapshotPage, SnapshotSection,
+    TaskSnapshotItem,
+};
+
+struct QueryBinaryRef<'a>(&'a [u8]);
+
+impl Serialize for QueryBinaryRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct QueryBinary(Vec<u8>);
+
+impl<'de> Deserialize<'de> for QueryBinary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BinaryVisitor;
+
+        impl<'de> Visitor<'de> for BinaryVisitor {
+            type Value = QueryBinary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("MessagePack binary bytes")
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(QueryBinary(value.to_vec()))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(QueryBinary(value))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_bytes(BinaryVisitor)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryEnvelope {
@@ -160,6 +204,16 @@ pub enum Query {
     ReleaseEventReplay {
         subscription_id: SubscriptionId,
     },
+    OpenArtifactContent {
+        artifact_id: ArtifactId,
+    },
+    ContinueArtifactContent {
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    },
+    ReleaseArtifactContent {
+        subscription_id: SubscriptionId,
+    },
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -269,6 +323,53 @@ impl Serialize for ReleaseEventReplayQueryRef<'_> {
     }
 }
 
+struct OpenArtifactContentQueryRef<'a> {
+    artifact_id: &'a ArtifactId,
+}
+
+impl Serialize for OpenArtifactContentQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("artifact_id", self.artifact_id)?;
+        map.end()
+    }
+}
+
+struct ContinueArtifactContentQueryRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    resume_cursor: &'a [u8],
+}
+
+impl Serialize for ContinueArtifactContentQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("resume_cursor", &QueryBinaryRef(self.resume_cursor))?;
+        map.end()
+    }
+}
+
+struct ReleaseArtifactContentQueryRef<'a> {
+    subscription_id: &'a SubscriptionId,
+}
+
+impl Serialize for ReleaseArtifactContentQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for Query {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -316,6 +417,24 @@ impl Serialize for Query {
                 "release_event_replay",
                 &ReleaseEventReplayQueryRef { subscription_id },
             )?,
+            Self::OpenArtifactContent { artifact_id } => map.serialize_entry(
+                "open_artifact_content",
+                &OpenArtifactContentQueryRef { artifact_id },
+            )?,
+            Self::ContinueArtifactContent {
+                subscription_id,
+                resume_cursor,
+            } => map.serialize_entry(
+                "continue_artifact_content",
+                &ContinueArtifactContentQueryRef {
+                    subscription_id,
+                    resume_cursor,
+                },
+            )?,
+            Self::ReleaseArtifactContent { subscription_id } => map.serialize_entry(
+                "release_artifact_content",
+                &ReleaseArtifactContentQueryRef { subscription_id },
+            )?,
         }
         map.end()
     }
@@ -329,6 +448,9 @@ enum QueryVariant {
     OpenEventReplay,
     ContinueEventReplay,
     ReleaseEventReplay,
+    OpenArtifactContent,
+    ContinueArtifactContent,
+    ReleaseArtifactContent,
 }
 
 impl<'de> Deserialize<'de> for QueryVariant {
@@ -343,7 +465,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, or release_event_replay",
+                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, or release_artifact_content",
                 )
             }
 
@@ -359,6 +481,9 @@ impl<'de> Deserialize<'de> for QueryVariant {
                     "open_event_replay" => Ok(QueryVariant::OpenEventReplay),
                     "continue_event_replay" => Ok(QueryVariant::ContinueEventReplay),
                     "release_event_replay" => Ok(QueryVariant::ReleaseEventReplay),
+                    "open_artifact_content" => Ok(QueryVariant::OpenArtifactContent),
+                    "continue_artifact_content" => Ok(QueryVariant::ContinueArtifactContent),
+                    "release_artifact_content" => Ok(QueryVariant::ReleaseArtifactContent),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -369,6 +494,9 @@ impl<'de> Deserialize<'de> for QueryVariant {
                             "open_event_replay",
                             "continue_event_replay",
                             "release_event_replay",
+                            "open_artifact_content",
+                            "continue_artifact_content",
+                            "release_artifact_content",
                         ],
                     )),
                 }
@@ -913,6 +1041,253 @@ impl<'de> Deserialize<'de> for ReleaseEventReplayQueryPayload {
     }
 }
 
+struct OpenArtifactContentQueryPayload {
+    artifact_id: ArtifactId,
+}
+
+enum OpenArtifactContentQueryField {
+    ArtifactId,
+}
+
+impl<'de> Deserialize<'de> for OpenArtifactContentQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = OpenArtifactContentQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("artifact_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "artifact_id" => Ok(OpenArtifactContentQueryField::ArtifactId),
+                    _ => Err(de::Error::unknown_field(value, &["artifact_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenArtifactContentQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = OpenArtifactContentQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named open_artifact_content query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut artifact_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        OpenArtifactContentQueryField::ArtifactId => {
+                            if artifact_id.is_some() {
+                                return Err(de::Error::duplicate_field("artifact_id"));
+                            }
+                            artifact_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(OpenArtifactContentQueryPayload {
+                    artifact_id: artifact_id
+                        .ok_or_else(|| de::Error::missing_field("artifact_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ContinueArtifactContentQueryPayload {
+    subscription_id: SubscriptionId,
+    resume_cursor: Vec<u8>,
+}
+
+enum ContinueArtifactContentQueryField {
+    SubscriptionId,
+    ResumeCursor,
+}
+
+impl<'de> Deserialize<'de> for ContinueArtifactContentQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ContinueArtifactContentQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id or resume_cursor")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ContinueArtifactContentQueryField::SubscriptionId),
+                    "resume_cursor" => Ok(ContinueArtifactContentQueryField::ResumeCursor),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["subscription_id", "resume_cursor"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContinueArtifactContentQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ContinueArtifactContentQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named continue_artifact_content query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut resume_cursor = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ContinueArtifactContentQueryField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        ContinueArtifactContentQueryField::ResumeCursor => {
+                            if resume_cursor.is_some() {
+                                return Err(de::Error::duplicate_field("resume_cursor"));
+                            }
+                            let QueryBinary(bytes) = map.next_value()?;
+                            resume_cursor = Some(bytes);
+                        }
+                    }
+                }
+                Ok(ContinueArtifactContentQueryPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    resume_cursor: resume_cursor
+                        .ok_or_else(|| de::Error::missing_field("resume_cursor"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ReleaseArtifactContentQueryPayload {
+    subscription_id: SubscriptionId,
+}
+
+enum ReleaseArtifactContentQueryField {
+    SubscriptionId,
+}
+
+impl<'de> Deserialize<'de> for ReleaseArtifactContentQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ReleaseArtifactContentQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ReleaseArtifactContentQueryField::SubscriptionId),
+                    _ => Err(de::Error::unknown_field(value, &["subscription_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseArtifactContentQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ReleaseArtifactContentQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named release_artifact_content query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ReleaseArtifactContentQueryField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ReleaseArtifactContentQueryPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for Query {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -978,6 +1353,25 @@ impl<'de> Deserialize<'de> for Query {
                             subscription_id: payload.subscription_id,
                         }
                     }
+                    QueryVariant::OpenArtifactContent => {
+                        let payload: OpenArtifactContentQueryPayload = map.next_value()?;
+                        Query::OpenArtifactContent {
+                            artifact_id: payload.artifact_id,
+                        }
+                    }
+                    QueryVariant::ContinueArtifactContent => {
+                        let payload: ContinueArtifactContentQueryPayload = map.next_value()?;
+                        Query::ContinueArtifactContent {
+                            subscription_id: payload.subscription_id,
+                            resume_cursor: payload.resume_cursor,
+                        }
+                    }
+                    QueryVariant::ReleaseArtifactContent => {
+                        let payload: ReleaseArtifactContentQueryPayload = map.next_value()?;
+                        Query::ReleaseArtifactContent {
+                            subscription_id: payload.subscription_id,
+                        }
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom("Query must contain exactly one variant"));
@@ -1010,6 +1404,13 @@ pub enum QueryResult {
         page: EventPage,
     },
     EventReplayReleased {
+        subscription_id: SubscriptionId,
+    },
+    ArtifactContentPage {
+        subscription_id: SubscriptionId,
+        page: ArtifactContentPageBody,
+    },
+    ArtifactContentReleased {
         subscription_id: SubscriptionId,
     },
 }
@@ -1108,6 +1509,38 @@ impl Serialize for EventReplayReleasedResultRef<'_> {
     }
 }
 
+struct ArtifactContentPageResultRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    page: &'a ArtifactContentPageBody,
+}
+
+impl Serialize for ArtifactContentPageResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("page", self.page)?;
+        map.end()
+    }
+}
+
+struct ArtifactContentReleasedResultRef<'a> {
+    subscription_id: &'a SubscriptionId,
+}
+
+impl Serialize for ArtifactContentReleasedResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.end()
+    }
+}
+
 impl Serialize for QueryResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1149,6 +1582,20 @@ impl Serialize for QueryResult {
                 "event_replay_released",
                 &EventReplayReleasedResultRef { subscription_id },
             )?,
+            Self::ArtifactContentPage {
+                subscription_id,
+                page,
+            } => map.serialize_entry(
+                "artifact_content_page",
+                &ArtifactContentPageResultRef {
+                    subscription_id,
+                    page,
+                },
+            )?,
+            Self::ArtifactContentReleased { subscription_id } => map.serialize_entry(
+                "artifact_content_released",
+                &ArtifactContentReleasedResultRef { subscription_id },
+            )?,
         }
         map.end()
     }
@@ -1161,6 +1608,8 @@ enum QueryResultVariant {
     SnapshotReleased,
     EventReplayPage,
     EventReplayReleased,
+    ArtifactContentPage,
+    ArtifactContentReleased,
 }
 
 impl<'de> Deserialize<'de> for QueryResultVariant {
@@ -1175,7 +1624,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, or event_replay_released",
+                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, or artifact_content_released",
                 )
             }
 
@@ -1190,6 +1639,8 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                     "snapshot_released" => Ok(QueryResultVariant::SnapshotReleased),
                     "event_replay_page" => Ok(QueryResultVariant::EventReplayPage),
                     "event_replay_released" => Ok(QueryResultVariant::EventReplayReleased),
+                    "artifact_content_page" => Ok(QueryResultVariant::ArtifactContentPage),
+                    "artifact_content_released" => Ok(QueryResultVariant::ArtifactContentReleased),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -1199,6 +1650,8 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                             "snapshot_released",
                             "event_replay_page",
                             "event_replay_released",
+                            "artifact_content_page",
+                            "artifact_content_released",
                         ],
                     )),
                 }
@@ -1696,6 +2149,174 @@ impl<'de> Deserialize<'de> for EventReplayReleasedResultPayload {
     }
 }
 
+struct ArtifactContentPageResultPayload {
+    subscription_id: SubscriptionId,
+    page: ArtifactContentPageBody,
+}
+
+enum ArtifactContentPageResultField {
+    SubscriptionId,
+    Page,
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentPageResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ArtifactContentPageResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id or page")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ArtifactContentPageResultField::SubscriptionId),
+                    "page" => Ok(ArtifactContentPageResultField::Page),
+                    _ => Err(de::Error::unknown_field(
+                        value,
+                        &["subscription_id", "page"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentPageResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ArtifactContentPageResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named artifact_content_page result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                let mut page = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ArtifactContentPageResultField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                        ArtifactContentPageResultField::Page => {
+                            if page.is_some() {
+                                return Err(de::Error::duplicate_field("page"));
+                            }
+                            page = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ArtifactContentPageResultPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                    page: page.ok_or_else(|| de::Error::missing_field("page"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
+struct ArtifactContentReleasedResultPayload {
+    subscription_id: SubscriptionId,
+}
+
+enum ArtifactContentReleasedResultField {
+    SubscriptionId,
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentReleasedResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = ArtifactContentReleasedResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("subscription_id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "subscription_id" => Ok(ArtifactContentReleasedResultField::SubscriptionId),
+                    _ => Err(de::Error::unknown_field(value, &["subscription_id"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentReleasedResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = ArtifactContentReleasedResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named artifact_content_released result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut subscription_id = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ArtifactContentReleasedResultField::SubscriptionId => {
+                            if subscription_id.is_some() {
+                                return Err(de::Error::duplicate_field("subscription_id"));
+                            }
+                            subscription_id = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(ArtifactContentReleasedResultPayload {
+                    subscription_id: subscription_id
+                        .ok_or_else(|| de::Error::missing_field("subscription_id"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1751,6 +2372,19 @@ impl<'de> Deserialize<'de> for QueryResult {
                     QueryResultVariant::EventReplayReleased => {
                         let payload: EventReplayReleasedResultPayload = map.next_value()?;
                         QueryResult::EventReplayReleased {
+                            subscription_id: payload.subscription_id,
+                        }
+                    }
+                    QueryResultVariant::ArtifactContentPage => {
+                        let payload: ArtifactContentPageResultPayload = map.next_value()?;
+                        QueryResult::ArtifactContentPage {
+                            subscription_id: payload.subscription_id,
+                            page: payload.page,
+                        }
+                    }
+                    QueryResultVariant::ArtifactContentReleased => {
+                        let payload: ArtifactContentReleasedResultPayload = map.next_value()?;
+                        QueryResult::ArtifactContentReleased {
                             subscription_id: payload.subscription_id,
                         }
                     }

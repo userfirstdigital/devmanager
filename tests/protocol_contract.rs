@@ -3,12 +3,12 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
-    CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt,
-    CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId, EventPage, OperationErrorCode,
-    OperationId, OperationState, OperationUncertaintyCode, ProjectId, Query, QueryEnvelope,
-    QueryError, QueryOutcome, QueryReply, QueryResult, RejectionCode, RequestId, ResourceId,
-    ReviewReadiness, SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-    TaskId, WorkspaceRef,
+    ArtifactContentPage, ArtifactId, CancellationReason, ClientId, Command, CommandEnvelope,
+    CommandId, CommandReceipt, CreateTaskIntent, DomainEvent, EnvironmentId, Event, EventId,
+    EventPage, OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode,
+    ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+    RejectionCode, RequestId, ResourceId, ReviewReadiness, SubscriptionId, TaskActivity,
+    TaskAssignment, TaskAttention, TaskConnectivity, TaskId, WorkspaceRef,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
@@ -556,6 +556,10 @@ fn protocol_request_id(tail: u8) -> RequestId {
 
 fn protocol_subscription_id(tail: u8) -> SubscriptionId {
     SubscriptionId::from_bytes(protocol_uuid_v7(tail)).expect("subscription id")
+}
+
+fn protocol_artifact_id(tail: u8) -> ArtifactId {
+    ArtifactId::from_bytes(protocol_uuid_v7(tail)).expect("artifact id")
 }
 
 #[test]
@@ -3161,5 +3165,902 @@ fn protocol_query_error_replay_unavailable_is_strict_named_map() {
         ),
         Err(MessagePackError::Decode),
         "continue_event_replay missing resume_cursor must be rejected"
+    );
+}
+
+#[test]
+fn artifact_content_queries_and_results_round_trip_named_maps() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let subscription_id = protocol_subscription_id(0xf1);
+    let artifact_id = protocol_artifact_id(0xf2);
+    let page = ArtifactContentPage {
+        artifact_id,
+        offset: 0,
+        total_bytes: 4,
+        sha256: [0x11; 32],
+        payload: b"ping".to_vec(),
+        encoded_bytes: 128,
+        next_cursor: Some(vec![0x01, 0x02]),
+    };
+
+    for query in [
+        Query::OpenArtifactContent { artifact_id },
+        Query::ContinueArtifactContent {
+            subscription_id,
+            resume_cursor: vec![0xaa, 0xbb],
+        },
+        Query::ReleaseArtifactContent { subscription_id },
+    ] {
+        let encoded = codec.encode(&query).expect("encode artifact content query");
+        assert_eq!(encoded[0], 0x81, "Query is a one-entry named map");
+        assert_eq!(
+            codec
+                .decode::<Query>(&encoded)
+                .expect("decode artifact content query"),
+            query
+        );
+    }
+
+    for result in [
+        QueryResult::ArtifactContentPage {
+            subscription_id,
+            page: page.clone(),
+        },
+        QueryResult::ArtifactContentReleased { subscription_id },
+    ] {
+        let encoded = codec
+            .encode(&result)
+            .expect("encode artifact content result");
+        assert_eq!(encoded[0], 0x81, "QueryResult is a one-entry named map");
+        assert_eq!(
+            codec
+                .decode::<QueryResult>(&encoded)
+                .expect("decode artifact content result"),
+            result
+        );
+    }
+
+    let envelope = QueryEnvelope {
+        request_id: protocol_request_id(0xf3),
+        client_id: protocol_client_id(0xf4),
+        task_id: Some(protocol_task_id(0xf5)),
+        query: Query::OpenArtifactContent { artifact_id },
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(
+                &codec
+                    .encode(&envelope)
+                    .expect("encode artifact content envelope")
+            )
+            .expect("decode artifact content envelope"),
+        envelope
+    );
+
+    let reply = QueryReply {
+        request_id: protocol_request_id(0xf6),
+        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+            subscription_id,
+            page,
+        }),
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryReply>(&codec.encode(&reply).expect("encode artifact content reply"))
+            .expect("decode artifact content reply"),
+        reply
+    );
+}
+
+#[test]
+fn artifact_content_page_payload_is_messagepack_bin_not_array() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let distinctive = b"ARTIFACT_CONTENT_BIN_TOKEN_7f3a";
+    let page = ArtifactContentPage {
+        artifact_id: protocol_artifact_id(0xf7),
+        offset: 0,
+        total_bytes: distinctive.len() as u64,
+        sha256: [0x22; 32],
+        payload: distinctive.to_vec(),
+        encoded_bytes: 256,
+        next_cursor: None,
+    };
+    let encoded = codec.encode(&page).expect("encode artifact content page");
+    assert_eq!(
+        codec
+            .decode::<ArtifactContentPage>(&encoded)
+            .expect("decode artifact content page"),
+        page
+    );
+
+    let token_at = encoded
+        .windows(distinctive.len())
+        .position(|window| window == distinctive)
+        .expect("distinctive payload bytes must appear in encoding");
+    assert!(
+        token_at >= 2,
+        "payload marker must precede distinctive bytes"
+    );
+    // MessagePack bin8: 0xc4 <len> <bytes>
+    assert_eq!(
+        encoded[token_at - 2],
+        0xc4,
+        "payload must use MessagePack bin, not an array"
+    );
+    assert_eq!(encoded[token_at - 1], distinctive.len() as u8);
+
+    #[derive(serde::Serialize)]
+    struct ArrayPayloadPage {
+        artifact_id: ArtifactId,
+        offset: u64,
+        total_bytes: u64,
+        sha256: [u8; 32],
+        payload: Vec<u8>,
+        encoded_bytes: u32,
+        next_cursor: Option<Vec<u8>>,
+    }
+    let array_encoded = rmp_serde::to_vec_named(&ArrayPayloadPage {
+        artifact_id: protocol_artifact_id(0xf7),
+        offset: 0,
+        total_bytes: distinctive.len() as u64,
+        sha256: [0x22; 32],
+        payload: distinctive.to_vec(),
+        encoded_bytes: 256,
+        next_cursor: None,
+    })
+    .expect("encode array payload page");
+    assert_eq!(
+        codec.decode::<ArtifactContentPage>(&array_encoded),
+        Err(MessagePackError::Decode),
+        "array-encoded payload must be rejected"
+    );
+}
+
+#[test]
+fn artifact_content_queries_reject_malformed_and_positional_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let artifact_id = protocol_artifact_id(0xf8);
+    let subscription_id = protocol_subscription_id(0xf9);
+
+    // --- open_artifact_content ---
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenUnknown {
+        OpenArtifactContent {
+            artifact_id: ArtifactId,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawOpenUnknown::OpenArtifactContent {
+                artifact_id,
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown open_artifact_content field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenMissing {
+        OpenArtifactContent {},
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawOpenMissing::OpenArtifactContent {}).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "open_artifact_content missing artifact_id must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawOpenPositional {
+        OpenArtifactContent((ArtifactId,)),
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawOpenPositional::OpenArtifactContent((artifact_id,)))
+                .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "positional open_artifact_content must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct DupOpen;
+        impl serde::Serialize for DupOpen {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(2))?;
+                        map.serialize_entry("artifact_id", &protocol_artifact_id(0xf8))?;
+                        map.serialize_entry("artifact_id", &protocol_artifact_id(0xf8))?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("open_artifact_content", &Payload)?;
+                outer.end()
+            }
+        }
+        let open_duplicate = rmp_serde::to_vec_named(&DupOpen).unwrap();
+        assert_eq!(
+            codec.decode::<Query>(&open_duplicate),
+            Err(MessagePackError::Decode),
+            "duplicate open_artifact_content field must be rejected"
+        );
+    }
+
+    // --- continue_artifact_content ---
+    // Valid continue fixtures must encode resume_cursor as MessagePack binary;
+    // plain Vec<u8>/&[u8] serialize as arrays and reject before the intended check.
+    struct BinCursor<'a>(&'a [u8]);
+    impl serde::Serialize for BinCursor<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+    let continue_cursor = [0x01u8, 0x02];
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawMissingContinue {
+        ContinueArtifactContent { subscription_id: SubscriptionId },
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawMissingContinue::ContinueArtifactContent {
+                subscription_id,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "continue_artifact_content missing resume_cursor must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct ContinueUnknown;
+        impl serde::Serialize for ContinueUnknown {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(3))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.serialize_entry("resume_cursor", &BinCursor(&[0x01, 0x02]))?;
+                        map.serialize_entry("future_field", &true)?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("continue_artifact_content", &Payload)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<Query>(&rmp_serde::to_vec_named(&ContinueUnknown).unwrap()),
+            Err(MessagePackError::Decode),
+            "unknown continue_artifact_content field must be rejected"
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawContinuePositional {
+        ContinueArtifactContent((SubscriptionId, Vec<u8>)),
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawContinuePositional::ContinueArtifactContent((
+                subscription_id,
+                vec![1, 2],
+            )))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "positional continue_artifact_content must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct DupContinue;
+        impl serde::Serialize for DupContinue {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(3))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.serialize_entry("resume_cursor", &BinCursor(&[0x01, 0x02]))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("continue_artifact_content", &Payload)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<Query>(&rmp_serde::to_vec_named(&DupContinue).unwrap()),
+            Err(MessagePackError::Decode),
+            "duplicate continue_artifact_content field must be rejected"
+        );
+    }
+
+    // Array-encoded resume_cursor must be rejected (binary only).
+    {
+        #[derive(serde::Serialize)]
+        struct ArrayCursorPayload {
+            subscription_id: SubscriptionId,
+            resume_cursor: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "snake_case")]
+        enum RawArrayCursor {
+            ContinueArtifactContent(ArrayCursorPayload),
+        }
+        assert_eq!(
+            codec.decode::<Query>(
+                &rmp_serde::to_vec_named(&RawArrayCursor::ContinueArtifactContent(
+                    ArrayCursorPayload {
+                        subscription_id,
+                        resume_cursor: continue_cursor.to_vec(),
+                    }
+                ))
+                .unwrap()
+            ),
+            Err(MessagePackError::Decode),
+            "array-encoded resume_cursor must be rejected"
+        );
+    }
+
+    // --- release_artifact_content ---
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleaseUnknown {
+        ReleaseArtifactContent {
+            subscription_id: SubscriptionId,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawReleaseUnknown::ReleaseArtifactContent {
+                subscription_id,
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown release_artifact_content field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleaseMissing {
+        ReleaseArtifactContent {},
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawReleaseMissing::ReleaseArtifactContent {}).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "release_artifact_content missing subscription_id must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleasePositional {
+        ReleaseArtifactContent((SubscriptionId,)),
+    }
+    assert_eq!(
+        codec.decode::<Query>(
+            &rmp_serde::to_vec_named(&RawReleasePositional::ReleaseArtifactContent((
+                subscription_id,
+            )))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "positional release_artifact_content must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct DupRelease;
+        impl serde::Serialize for DupRelease {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(2))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("release_artifact_content", &Payload)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<Query>(&rmp_serde::to_vec_named(&DupRelease).unwrap()),
+            Err(MessagePackError::Decode),
+            "duplicate release_artifact_content field must be rejected"
+        );
+    }
+
+    // Multi-variant Query map.
+    {
+        struct MultiQuery;
+        impl serde::Serialize for MultiQuery {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("open_artifact_content", &{
+                    #[derive(serde::Serialize)]
+                    struct P {
+                        artifact_id: ArtifactId,
+                    }
+                    P {
+                        artifact_id: protocol_artifact_id(0xf8),
+                    }
+                })?;
+                map.serialize_entry("release_artifact_content", &{
+                    #[derive(serde::Serialize)]
+                    struct P {
+                        subscription_id: SubscriptionId,
+                    }
+                    P {
+                        subscription_id: protocol_subscription_id(0xf9),
+                    }
+                })?;
+                map.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<Query>(&rmp_serde::to_vec_named(&MultiQuery).unwrap()),
+            Err(MessagePackError::Decode),
+            "multi-variant artifact content query must be rejected"
+        );
+    }
+
+    // --- ArtifactContentPage / release results ---
+    let page = ArtifactContentPage {
+        artifact_id,
+        offset: 0,
+        total_bytes: 2,
+        sha256: [0x33; 32],
+        payload: b"ok".to_vec(),
+        encoded_bytes: 64,
+        next_cursor: Some(vec![0x01, 0x02]),
+    };
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawPageUnknown {
+        ArtifactContentPage {
+            subscription_id: SubscriptionId,
+            page: ArtifactContentPage,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawPageUnknown::ArtifactContentPage {
+                subscription_id,
+                page: page.clone(),
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown artifact_content_page field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawPageMissing {
+        ArtifactContentPage { subscription_id: SubscriptionId },
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawPageMissing::ArtifactContentPage { subscription_id })
+                .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "artifact_content_page missing page must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawPagePositional {
+        ArtifactContentPage((SubscriptionId, ArtifactContentPage)),
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawPagePositional::ArtifactContentPage((
+                subscription_id,
+                page.clone(),
+            )))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "positional artifact_content_page must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct DupPageResult;
+        impl serde::Serialize for DupPageResult {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(3))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.serialize_entry(
+                            "page",
+                            &ArtifactContentPage {
+                                artifact_id: protocol_artifact_id(0xf8),
+                                offset: 0,
+                                total_bytes: 2,
+                                sha256: [0x33; 32],
+                                payload: b"ok".to_vec(),
+                                encoded_bytes: 64,
+                                next_cursor: None,
+                            },
+                        )?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("artifact_content_page", &Payload)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<QueryResult>(&rmp_serde::to_vec_named(&DupPageResult).unwrap()),
+            Err(MessagePackError::Decode),
+            "duplicate artifact_content_page field must be rejected"
+        );
+    }
+
+    // Inner ArtifactContentPage named-map strictness.
+    {
+        use serde::ser::SerializeMap;
+        let valid_page = page.clone();
+        assert_eq!(
+            codec
+                .decode::<ArtifactContentPage>(&codec.encode(&valid_page).expect("encode page"))
+                .expect("decode page"),
+            valid_page
+        );
+
+        #[derive(serde::Serialize)]
+        struct MissingOffsetPage {
+            artifact_id: ArtifactId,
+            total_bytes: u64,
+            sha256: [u8; 32],
+            payload: BinCursor<'static>,
+            encoded_bytes: u32,
+            next_cursor: Option<()>,
+        }
+        assert_eq!(
+            codec.decode::<ArtifactContentPage>(
+                &rmp_serde::to_vec_named(&MissingOffsetPage {
+                    artifact_id,
+                    total_bytes: 2,
+                    sha256: [0x33; 32],
+                    payload: BinCursor(b"ok"),
+                    encoded_bytes: 64,
+                    next_cursor: None,
+                })
+                .unwrap()
+            ),
+            Err(MessagePackError::Decode),
+            "ArtifactContentPage missing offset must be rejected"
+        );
+
+        struct DupFieldPage;
+        impl serde::Serialize for DupFieldPage {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(Some(8))?;
+                map.serialize_entry("artifact_id", &protocol_artifact_id(0xf8))?;
+                map.serialize_entry("offset", &0u64)?;
+                map.serialize_entry("total_bytes", &2u64)?;
+                map.serialize_entry("sha256", &[0x33u8; 32])?;
+                map.serialize_entry("payload", &BinCursor(b"ok"))?;
+                map.serialize_entry("encoded_bytes", &64u32)?;
+                map.serialize_entry("next_cursor", &Option::<()>::None)?;
+                map.serialize_entry("offset", &0u64)?;
+                map.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<ArtifactContentPage>(&rmp_serde::to_vec_named(&DupFieldPage).unwrap()),
+            Err(MessagePackError::Decode),
+            "ArtifactContentPage duplicate field must be rejected"
+        );
+
+        #[derive(serde::Serialize)]
+        struct UnknownFieldPage {
+            artifact_id: ArtifactId,
+            offset: u64,
+            total_bytes: u64,
+            sha256: [u8; 32],
+            payload: BinCursor<'static>,
+            encoded_bytes: u32,
+            next_cursor: Option<()>,
+            future_field: bool,
+        }
+        assert_eq!(
+            codec.decode::<ArtifactContentPage>(
+                &rmp_serde::to_vec_named(&UnknownFieldPage {
+                    artifact_id,
+                    offset: 0,
+                    total_bytes: 2,
+                    sha256: [0x33; 32],
+                    payload: BinCursor(b"ok"),
+                    encoded_bytes: 64,
+                    next_cursor: None,
+                    future_field: true,
+                })
+                .unwrap()
+            ),
+            Err(MessagePackError::Decode),
+            "ArtifactContentPage unknown field must be rejected"
+        );
+
+        let positional_page = (
+            artifact_id,
+            0u64,
+            2u64,
+            [0x33u8; 32],
+            BinCursor(b"ok"),
+            64u32,
+            Option::<()>::None,
+        );
+        assert_eq!(
+            codec.decode::<ArtifactContentPage>(&rmp_serde::to_vec(&positional_page).unwrap()),
+            Err(MessagePackError::Decode),
+            "positional ArtifactContentPage must be rejected"
+        );
+    }
+
+    // Array-encoded next_cursor on the page body must be rejected.
+    {
+        struct ArrayCursorPage {
+            artifact_id: ArtifactId,
+            offset: u64,
+            total_bytes: u64,
+            sha256: [u8; 32],
+            payload: Vec<u8>,
+            encoded_bytes: u32,
+            next_cursor: Option<Vec<u8>>,
+        }
+        impl serde::Serialize for ArrayCursorPage {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(7))?;
+                map.serialize_entry("artifact_id", &self.artifact_id)?;
+                map.serialize_entry("offset", &self.offset)?;
+                map.serialize_entry("total_bytes", &self.total_bytes)?;
+                map.serialize_entry("sha256", &self.sha256)?;
+                map.serialize_entry("payload", &QueryBinaryHack(&self.payload))?;
+                map.serialize_entry("encoded_bytes", &self.encoded_bytes)?;
+                map.serialize_entry("next_cursor", &self.next_cursor)?;
+                map.end()
+            }
+        }
+        struct QueryBinaryHack<'a>(&'a [u8]);
+        impl serde::Serialize for QueryBinaryHack<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        let array_cursor_page = ArrayCursorPage {
+            artifact_id,
+            offset: 0,
+            total_bytes: 2,
+            sha256: [0x33; 32],
+            payload: b"ok".to_vec(),
+            encoded_bytes: 64,
+            next_cursor: Some(vec![0x01, 0x02]),
+        };
+        assert_eq!(
+            codec.decode::<ArtifactContentPage>(
+                &rmp_serde::to_vec_named(&array_cursor_page).unwrap()
+            ),
+            Err(MessagePackError::Decode),
+            "array-encoded next_cursor must be rejected"
+        );
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleasedUnknown {
+        ArtifactContentReleased {
+            subscription_id: SubscriptionId,
+            future_field: bool,
+        },
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawReleasedUnknown::ArtifactContentReleased {
+                subscription_id,
+                future_field: true,
+            })
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "unknown artifact_content_released field must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleasedMissing {
+        ArtifactContentReleased {},
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawReleasedMissing::ArtifactContentReleased {}).unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "artifact_content_released missing subscription_id must be rejected"
+    );
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RawReleasedPositional {
+        ArtifactContentReleased((SubscriptionId,)),
+    }
+    assert_eq!(
+        codec.decode::<QueryResult>(
+            &rmp_serde::to_vec_named(&RawReleasedPositional::ArtifactContentReleased((
+                subscription_id,
+            )))
+            .unwrap()
+        ),
+        Err(MessagePackError::Decode),
+        "positional artifact_content_released must be rejected"
+    );
+
+    {
+        use serde::ser::SerializeMap;
+        struct DupReleased;
+        impl serde::Serialize for DupReleased {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut outer = serializer.serialize_map(Some(1))?;
+                struct Payload;
+                impl serde::Serialize for Payload {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut map = serializer.serialize_map(Some(2))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.serialize_entry("subscription_id", &protocol_subscription_id(0xf9))?;
+                        map.end()
+                    }
+                }
+                outer.serialize_entry("artifact_content_released", &Payload)?;
+                outer.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<QueryResult>(&rmp_serde::to_vec_named(&DupReleased).unwrap()),
+            Err(MessagePackError::Decode),
+            "duplicate artifact_content_released field must be rejected"
+        );
+    }
+
+    {
+        struct MultiResult;
+        impl serde::Serialize for MultiResult {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("artifact_content_released", &{
+                    #[derive(serde::Serialize)]
+                    struct P {
+                        subscription_id: SubscriptionId,
+                    }
+                    P {
+                        subscription_id: protocol_subscription_id(0xf9),
+                    }
+                })?;
+                map.serialize_entry("artifact_content_page", &{
+                    #[derive(serde::Serialize)]
+                    struct P {
+                        subscription_id: SubscriptionId,
+                        page: ArtifactContentPage,
+                    }
+                    P {
+                        subscription_id: protocol_subscription_id(0xf9),
+                        page: ArtifactContentPage {
+                            artifact_id: protocol_artifact_id(0xf8),
+                            offset: 0,
+                            total_bytes: 0,
+                            sha256: [0; 32],
+                            payload: Vec::new(),
+                            encoded_bytes: 0,
+                            next_cursor: None,
+                        },
+                    }
+                })?;
+                map.end()
+            }
+        }
+        assert_eq!(
+            codec.decode::<QueryResult>(&rmp_serde::to_vec_named(&MultiResult).unwrap()),
+            Err(MessagePackError::Decode),
+            "multi-variant artifact content result must be rejected"
+        );
+    }
+}
+
+#[test]
+fn artifact_content_cursor_is_messagepack_bin_not_array() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let cursor = b"ARTIFACT_CONTENT_CURSOR_BIN_9d1c";
+    let page = ArtifactContentPage {
+        artifact_id: protocol_artifact_id(0xfb),
+        offset: 10,
+        total_bytes: 100,
+        sha256: [0x44; 32],
+        payload: b"x".to_vec(),
+        encoded_bytes: 128,
+        next_cursor: Some(cursor.to_vec()),
+    };
+    let encoded = codec.encode(&page).expect("encode page with cursor");
+    let token_at = encoded
+        .windows(cursor.len())
+        .position(|window| window == cursor)
+        .expect("cursor bytes must appear");
+    assert_eq!(
+        encoded[token_at - 2],
+        0xc4,
+        "next_cursor must use MessagePack bin"
+    );
+    assert_eq!(encoded[token_at - 1], cursor.len() as u8);
+
+    let query = Query::ContinueArtifactContent {
+        subscription_id: protocol_subscription_id(0xfc),
+        resume_cursor: cursor.to_vec(),
+    };
+    let encoded_query = codec.encode(&query).expect("encode continue");
+    let token_at = encoded_query
+        .windows(cursor.len())
+        .position(|window| window == cursor)
+        .expect("resume_cursor bytes must appear");
+    assert_eq!(
+        encoded_query[token_at - 2],
+        0xc4,
+        "resume_cursor must use MessagePack bin"
     );
 }

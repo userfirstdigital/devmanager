@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::de::{self, Deserializer};
-use serde::ser::{self, Serializer};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{self, SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
-use crate::domain::artifact::ArtifactFacts;
+use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
 use crate::domain::operation::OperationFacts;
@@ -171,7 +172,7 @@ pub struct TaskSnapshotItem {
 pub enum SnapshotItem {
     Task(TaskSnapshotItem),
     AgentSession(AgentSessionFacts),
-    Artifact(ArtifactFacts),
+    Artifact(ArtifactSummary),
     Resource(ResourceFacts),
     Operation(OperationFacts),
 }
@@ -202,4 +203,240 @@ pub struct EventPage {
     pub through_sequence: u64,
     pub events: Vec<DomainEvent>,
     pub next_cursor: Option<Vec<u8>>,
+}
+
+/// One bounded on-demand artifact content page. `payload` is MessagePack binary
+/// bytes (never a byte array). `offset` is the first byte included in this page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactContentPage {
+    pub artifact_id: ArtifactId,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub sha256: [u8; 32],
+    pub payload: Vec<u8>,
+    pub encoded_bytes: u32,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+struct ArtifactContentBinaryRef<'a>(&'a [u8]);
+
+impl Serialize for ArtifactContentBinaryRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct OptionalArtifactContentBinaryRef<'a>(Option<&'a [u8]>);
+
+impl Serialize for OptionalArtifactContentBinaryRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(bytes) => serializer.serialize_some(&ArtifactContentBinaryRef(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+struct ArtifactContentBinary(Vec<u8>);
+
+impl<'de> Deserialize<'de> for ArtifactContentBinary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BinaryVisitor;
+
+        impl<'de> Visitor<'de> for BinaryVisitor {
+            type Value = ArtifactContentBinary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("MessagePack binary bytes")
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(ArtifactContentBinary(value.to_vec()))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(ArtifactContentBinary(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_bytes(BinaryVisitor)
+    }
+}
+
+struct OptionalArtifactContentBinary(Option<Vec<u8>>);
+
+impl<'de> Deserialize<'de> for OptionalArtifactContentBinary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OptionalBinaryVisitor;
+
+        impl<'de> Visitor<'de> for OptionalBinaryVisitor {
+            type Value = OptionalArtifactContentBinary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("optional MessagePack binary bytes")
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(None))
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                let ArtifactContentBinary(bytes) =
+                    ArtifactContentBinary::deserialize(deserializer)?;
+                Ok(OptionalArtifactContentBinary(Some(bytes)))
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(Some(value.to_vec())))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(OptionalArtifactContentBinary(Some(value)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
+        }
+
+        deserializer.deserialize_option(OptionalBinaryVisitor)
+    }
+}
+
+impl Serialize for ArtifactContentPage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(7))?;
+        map.serialize_entry("artifact_id", &self.artifact_id)?;
+        map.serialize_entry("offset", &self.offset)?;
+        map.serialize_entry("total_bytes", &self.total_bytes)?;
+        map.serialize_entry("sha256", &self.sha256)?;
+        map.serialize_entry("payload", &ArtifactContentBinaryRef(&self.payload))?;
+        map.serialize_entry("encoded_bytes", &self.encoded_bytes)?;
+        map.serialize_entry(
+            "next_cursor",
+            &OptionalArtifactContentBinaryRef(self.next_cursor.as_deref()),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentPage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            ArtifactId,
+            Offset,
+            TotalBytes,
+            Sha256,
+            Payload,
+            EncodedBytes,
+            NextCursor,
+        }
+
+        struct PageVisitor;
+
+        impl<'de> Visitor<'de> for PageVisitor {
+            type Value = ArtifactContentPage;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a named ArtifactContentPage map")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut artifact_id = None;
+                let mut offset = None;
+                let mut total_bytes = None;
+                let mut sha256 = None;
+                let mut payload = None;
+                let mut encoded_bytes = None;
+                let mut next_cursor = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::ArtifactId => {
+                            if artifact_id.is_some() {
+                                return Err(de::Error::duplicate_field("artifact_id"));
+                            }
+                            artifact_id = Some(map.next_value()?);
+                        }
+                        Field::Offset => {
+                            if offset.is_some() {
+                                return Err(de::Error::duplicate_field("offset"));
+                            }
+                            offset = Some(map.next_value()?);
+                        }
+                        Field::TotalBytes => {
+                            if total_bytes.is_some() {
+                                return Err(de::Error::duplicate_field("total_bytes"));
+                            }
+                            total_bytes = Some(map.next_value()?);
+                        }
+                        Field::Sha256 => {
+                            if sha256.is_some() {
+                                return Err(de::Error::duplicate_field("sha256"));
+                            }
+                            sha256 = Some(map.next_value()?);
+                        }
+                        Field::Payload => {
+                            if payload.is_some() {
+                                return Err(de::Error::duplicate_field("payload"));
+                            }
+                            let ArtifactContentBinary(bytes) = map.next_value()?;
+                            payload = Some(bytes);
+                        }
+                        Field::EncodedBytes => {
+                            if encoded_bytes.is_some() {
+                                return Err(de::Error::duplicate_field("encoded_bytes"));
+                            }
+                            encoded_bytes = Some(map.next_value()?);
+                        }
+                        Field::NextCursor => {
+                            if next_cursor.is_some() {
+                                return Err(de::Error::duplicate_field("next_cursor"));
+                            }
+                            let OptionalArtifactContentBinary(bytes) = map.next_value()?;
+                            next_cursor = Some(bytes);
+                        }
+                    }
+                }
+
+                Ok(ArtifactContentPage {
+                    artifact_id: artifact_id
+                        .ok_or_else(|| de::Error::missing_field("artifact_id"))?,
+                    offset: offset.ok_or_else(|| de::Error::missing_field("offset"))?,
+                    total_bytes: total_bytes
+                        .ok_or_else(|| de::Error::missing_field("total_bytes"))?,
+                    sha256: sha256.ok_or_else(|| de::Error::missing_field("sha256"))?,
+                    payload: payload.ok_or_else(|| de::Error::missing_field("payload"))?,
+                    encoded_bytes: encoded_bytes
+                        .ok_or_else(|| de::Error::missing_field("encoded_bytes"))?,
+                    next_cursor: next_cursor
+                        .ok_or_else(|| de::Error::missing_field("next_cursor"))?,
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "artifact_id",
+            "offset",
+            "total_bytes",
+            "sha256",
+            "payload",
+            "encoded_bytes",
+            "next_cursor",
+        ];
+        deserializer.deserialize_struct("ArtifactContentPage", FIELDS, PageVisitor)
+    }
 }

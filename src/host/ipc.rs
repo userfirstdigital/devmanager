@@ -31,10 +31,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounded post-Hello host→client critical output queue capacity.
 const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
-// SnapshotPage/EventPage encoded_bytes cover the page body, not the surrounding
-// QueryResult/QueryReply/ServerMessage named maps. Protocol v1 sends that
-// wrapped response in one physical frame, so reserve bounded headroom for the
-// fixed correlation/envelope fields before granting PagedSnapshots or EventReplay.
+// SnapshotPage/EventPage/ArtifactContentPage encoded_bytes cover the page body,
+// not the surrounding QueryResult/QueryReply/ServerMessage named maps. Protocol
+// v1 sends that wrapped response in one physical frame, so reserve bounded
+// headroom for the fixed correlation/envelope fields before granting
+// PagedSnapshots, EventReplay, or ChunkResume.
 const PAGE_RESPONSE_ENVELOPE_HEADROOM_BYTES: u32 = 1024;
 
 pub(crate) async fn supervise_duplex_halves<R, W>(reader: R, writer: W) -> Result<(), IpcError>
@@ -218,6 +219,9 @@ fn fence_capabilities_by_transport(mut negotiated: NegotiatedParameters) -> Nego
         }
         if negotiated.capabilities.contains(Capability::EventReplay) {
             bits &= !Capability::EventReplay.bit();
+        }
+        if negotiated.capabilities.contains(Capability::ChunkResume) {
+            bits &= !Capability::ChunkResume.bit();
         }
         negotiated.capabilities = CapabilitySet::from_bits(bits);
     }
@@ -1045,6 +1049,7 @@ mod tests {
         let granted = CapabilitySet::from_capabilities([
             Capability::PagedSnapshots,
             Capability::EventReplay,
+            Capability::ChunkResume,
             Capability::OperationSettlement,
         ]);
         let default_negotiated = fence_capabilities_by_transport(NegotiatedParameters {
@@ -1059,6 +1064,9 @@ mod tests {
         assert!(default_negotiated
             .capabilities
             .contains(Capability::EventReplay));
+        assert!(default_negotiated
+            .capabilities
+            .contains(Capability::ChunkResume));
         assert!(default_negotiated
             .capabilities
             .contains(Capability::OperationSettlement));
@@ -1078,6 +1086,7 @@ mod tests {
         });
         assert!(!fenced.capabilities.contains(Capability::PagedSnapshots));
         assert!(!fenced.capabilities.contains(Capability::EventReplay));
+        assert!(!fenced.capabilities.contains(Capability::ChunkResume));
         assert!(fenced
             .capabilities
             .contains(Capability::OperationSettlement));

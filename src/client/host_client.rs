@@ -8,10 +8,14 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
-use crate::domain::id::{CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId};
+use crate::domain::id::{
+    ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
+};
 use crate::domain::operation::OperationState;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryResult};
-use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use crate::domain::snapshot::{
+    ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+};
 use crate::domain::ClientId;
 use crate::host::{
     pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
@@ -48,6 +52,13 @@ pub enum TrackedOperation {
 pub struct EventReplayBatch {
     pub subscription_id: SubscriptionId,
     pub page: EventPage,
+}
+
+/// One correlated artifact-content page batch from open or continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactContentBatch {
+    pub subscription_id: SubscriptionId,
+    pub page: ArtifactContentPage,
 }
 
 /// Profile-derived host client with stable ClientId and operation tracking.
@@ -461,6 +472,163 @@ impl HostClient {
         }
     }
 
+    /// Open an artifact content session. Requires granted ChunkResume.
+    pub async fn open_artifact_content(
+        &mut self,
+        task_id: TaskId,
+        artifact_id: ArtifactId,
+    ) -> Result<Result<ArtifactContentBatch, QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: Some(task_id),
+                    query: Query::OpenArtifactContent { artifact_id },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+                subscription_id,
+                page,
+            }) => {
+                if page.artifact_id != artifact_id {
+                    self.retire_connection();
+                    return Err(IpcError::CorrelationMismatch);
+                }
+                Ok(Ok(ArtifactContentBatch {
+                    subscription_id,
+                    page,
+                }))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Continue a retained artifact content session. Requires granted ChunkResume.
+    pub async fn continue_artifact_content(
+        &mut self,
+        task_id: TaskId,
+        subscription_id: SubscriptionId,
+        resume_cursor: Vec<u8>,
+    ) -> Result<Result<ArtifactContentBatch, QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: Some(task_id),
+                    query: Query::ContinueArtifactContent {
+                        subscription_id,
+                        resume_cursor,
+                    },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+                subscription_id: returned,
+                page,
+            }) => {
+                if returned != subscription_id {
+                    self.retire_connection();
+                    return Err(IpcError::CorrelationMismatch);
+                }
+                Ok(Ok(ArtifactContentBatch {
+                    subscription_id: returned,
+                    page,
+                }))
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Release a retained artifact content session. Requires granted ChunkResume.
+    pub async fn release_artifact_content(
+        &mut self,
+        task_id: TaskId,
+        subscription_id: SubscriptionId,
+    ) -> Result<Result<(), QueryError>, IpcError> {
+        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query(QueryEnvelope {
+                    request_id,
+                    client_id,
+                    task_id: Some(task_id),
+                    query: Query::ReleaseArtifactContent { subscription_id },
+                })
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::ArtifactContentReleased {
+                subscription_id: released,
+            }) if released == subscription_id => Ok(Ok(())),
+            QueryOutcome::Ok(QueryResult::ArtifactContentReleased { .. }) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Correlate a fresh OperationStatus query and resolve terminal states locally.
     pub async fn refresh_operation(
         &mut self,
@@ -588,7 +756,9 @@ fn correlate_operation_status(
         | QueryResult::SnapshotPage { .. }
         | QueryResult::SnapshotReleased { .. }
         | QueryResult::EventReplayPage { .. }
-        | QueryResult::EventReplayReleased { .. } => Err(IpcError::UnexpectedResponse),
+        | QueryResult::EventReplayReleased { .. }
+        | QueryResult::ArtifactContentPage { .. }
+        | QueryResult::ArtifactContentReleased { .. } => Err(IpcError::UnexpectedResponse),
     }
 }
 

@@ -3,6 +3,7 @@
 //! Schema and projector internals stay crate-private. Callers only see
 //! domain-safe store APIs — never rusqlite types or a connection accessor.
 
+mod artifact_content;
 mod command_bus;
 mod dispatch;
 mod lineage;
@@ -15,6 +16,7 @@ mod schema;
 mod snapshot;
 mod store;
 
+pub(crate) use artifact_content::{ArtifactContentError, ArtifactContentRegistry};
 pub use command_bus::CommandBus;
 pub use dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::domain::agent::AgentSessionFacts;
-use crate::domain::artifact::ArtifactFacts;
+use crate::domain::artifact::ArtifactSummary;
 use crate::domain::event::{apply, DomainEvent, Event};
 use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
 use crate::domain::operation::{OperationFacts, OperationState};
@@ -122,6 +122,10 @@ pub struct ClientModel {
     tasks: BTreeMap<TaskId, TaskSnapshot>,
     host_resources: BTreeMap<ResourceId, ResourceFacts>,
     operations: BTreeMap<OperationId, OperationFacts>,
+    /// Metadata-only artifact index from snapshot pages / durable events.
+    /// TaskSnapshot.artifacts is cleared after ArtifactRegistered staging so the
+    /// public client model never retains inline bodies or content refs.
+    artifact_summaries: BTreeMap<ArtifactId, ArtifactSummary>,
     last_applied_sequence: u64,
     replay_through: Option<u64>,
     replay_page_count: usize,
@@ -139,6 +143,10 @@ impl ClientModel {
 
     pub fn operations(&self) -> &BTreeMap<OperationId, OperationFacts> {
         &self.operations
+    }
+
+    pub fn artifact_summaries(&self) -> &BTreeMap<ArtifactId, ArtifactSummary> {
+        &self.artifact_summaries
     }
 
     pub fn last_applied_sequence(&self) -> u64 {
@@ -250,6 +258,9 @@ impl ClientModel {
         if let Some((operation_id, facts)) = staged.operation {
             self.operations.insert(operation_id, facts);
         }
+        if let Some(summary) = staged.artifact_summary {
+            self.artifact_summaries.insert(summary.id, summary);
+        }
         self.last_applied_sequence = event.sequence;
         Ok(())
     }
@@ -280,6 +291,7 @@ impl ClientModel {
                             accepted_at_ms: fact.accepted_at_ms,
                         },
                     )),
+                    artifact_summary: None,
                 })
             }
             Event::OperationSettled(fact) => {
@@ -298,6 +310,7 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task,
                     operation: Some(operation),
+                    artifact_summary: None,
                 })
             }
             Event::OperationFailed(fact) => {
@@ -316,6 +329,7 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task,
                     operation: Some(operation),
+                    artifact_summary: None,
                 })
             }
             Event::OperationCancelled(fact) => {
@@ -334,6 +348,7 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task,
                     operation: Some(operation),
+                    artifact_summary: None,
                 })
             }
             Event::OperationUncertain(fact) => {
@@ -352,6 +367,7 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task,
                     operation: Some(operation),
+                    artifact_summary: None,
                 })
             }
             Event::TaskCreated { task, .. } => {
@@ -362,6 +378,25 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task: Some((task.id, next)),
                     operation: None,
+                    artifact_summary: None,
+                })
+            }
+            Event::ArtifactRegistered { artifact } => {
+                if self.artifact_summaries.contains_key(&artifact.id) {
+                    return Err(ClientModelError::DuplicateItem);
+                }
+                let task_id = event.task_id.ok_or(ClientModelError::ApplyFailed)?;
+                let current = self.tasks.get(&task_id).cloned();
+                let mut next = apply(current, event).map_err(|_| ClientModelError::ApplyFailed)?;
+                // Domain apply inserts full ArtifactFacts for revision correctness;
+                // the public client model retains metadata-only summaries.
+                let summary = ArtifactSummary::from_facts(artifact)
+                    .map_err(|_| ClientModelError::ApplyFailed)?;
+                next.artifacts.remove(&artifact.id);
+                Ok(StagedEventCommit {
+                    task: Some((task_id, next)),
+                    operation: None,
+                    artifact_summary: Some(summary),
                 })
             }
             _ => {
@@ -371,6 +406,7 @@ impl ClientModel {
                 Ok(StagedEventCommit {
                     task: Some((task_id, next)),
                     operation: None,
+                    artifact_summary: None,
                 })
             }
         }
@@ -477,6 +513,7 @@ impl ClientModel {
 struct StagedEventCommit {
     task: Option<(TaskId, TaskSnapshot)>,
     operation: Option<(OperationId, OperationFacts)>,
+    artifact_summary: Option<ArtifactSummary>,
 }
 
 #[derive(Debug, Default)]
@@ -525,7 +562,7 @@ pub struct ClientModelBuilder {
     sections: [SectionAssembly; 5],
     tasks: BTreeMap<TaskId, TaskSnapshotItem>,
     agents: BTreeMap<AgentSessionId, AgentSessionFacts>,
-    artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
+    artifacts: BTreeMap<ArtifactId, ArtifactSummary>,
     resources: BTreeMap<ResourceId, ResourceFacts>,
     operations: BTreeMap<OperationId, OperationFacts>,
 }
@@ -662,12 +699,10 @@ impl ClientModelBuilder {
             }
         }
 
-        for (artifact_id, artifact) in self.artifacts {
-            let task = tasks
-                .get_mut(&artifact.task_id)
-                .ok_or(ClientModelError::MissingParentTask)?;
-            if task.artifacts.insert(artifact_id, artifact).is_some() {
-                return Err(ClientModelError::DuplicateItem);
+        // Snapshot ArtifactSummary items never invent content_ref into TaskSnapshot.
+        for summary in self.artifacts.values() {
+            if !tasks.contains_key(&summary.task_id) {
+                return Err(ClientModelError::MissingParentTask);
             }
         }
 
@@ -717,6 +752,7 @@ impl ClientModelBuilder {
             tasks,
             host_resources,
             operations: self.operations,
+            artifact_summaries: self.artifacts,
             last_applied_sequence: through_sequence,
             replay_through: None,
             replay_page_count: 0,
@@ -784,7 +820,7 @@ impl ClientModelBuilder {
 mod tests {
     use super::*;
     use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
-    use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass};
+    use crate::domain::artifact::{ArtifactKind, ArtifactSummary, PrivacyClass};
     use crate::domain::event::{
         OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
         OperationUncertainFact,
@@ -976,12 +1012,11 @@ mod tests {
                 through,
                 SnapshotSection::Artifacts,
                 None,
-                vec![SnapshotItem::Artifact(ArtifactFacts {
+                vec![SnapshotItem::Artifact(ArtifactSummary {
                     id: artifact,
                     task_id: task,
                     kind: ArtifactKind::Finding,
                     label: "note".into(),
-                    content_ref: ArtifactContentRef::InlineUtf8("body".into()),
                     sha256: [1u8; 32],
                     privacy_class: PrivacyClass::LocalOnly,
                     created_at_ms: 1,
@@ -1044,7 +1079,8 @@ mod tests {
         let nested = model.tasks().get(&task).expect("task present");
         assert_eq!(nested.agents.len(), 1);
         assert_eq!(nested.primary_agent_id, Some(agent));
-        assert!(nested.artifacts.contains_key(&artifact));
+        assert!(nested.artifacts.is_empty());
+        assert!(model.artifact_summaries().contains_key(&artifact));
         assert!(nested.resources.contains_key(&task_resource));
         assert!(!nested.resources.contains_key(&host_resource));
         assert!(model.host_resources().contains_key(&host_resource));
@@ -1052,6 +1088,255 @@ mod tests {
             model.operations().get(&operation).map(|op| &op.state),
             Some(&OperationState::Accepted)
         );
+    }
+
+    #[test]
+    fn artifact_registered_event_retains_summary_only_without_inline_body() {
+        // Catches: apply_event keeping full ArtifactFacts (inline body) in TaskSnapshot.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xA0);
+        let task = task_id(0xA1);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Live", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert!(model.tasks().get(&task).expect("task").artifacts.is_empty());
+
+        const BODY: &str = "CLIENT_MODEL_INLINE_BODY_TOKEN_2_5E";
+        let artifact = artifact_id(0xA2);
+        let mut hasher = Sha256::new();
+        hasher.update(BODY.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let facts = ArtifactFacts {
+            id: artifact,
+            task_id: task,
+            kind: ArtifactKind::Evidence,
+            label: "LiveEvidence".into(),
+            content_ref: ArtifactContentRef::inline_utf8(BODY).expect("body"),
+            sha256: digest,
+            privacy_class: PrivacyClass::LocalOnly,
+            created_at_ms: 2,
+        };
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xA3),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::ArtifactRegistered {
+                    artifact: facts.clone(),
+                },
+            })
+            .expect("artifact registration applies");
+
+        assert_eq!(model.last_applied_sequence(), 2);
+        let nested = model.tasks().get(&task).expect("task present");
+        assert_eq!(nested.task.revision, 2);
+        assert!(
+            nested.artifacts.is_empty(),
+            "task snapshot must not retain full artifact facts"
+        );
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("summary retained");
+        assert_eq!(summary.id, artifact);
+        assert_eq!(summary.sha256, digest);
+        assert_eq!(summary.label, "LiveEvidence");
+        let model_debug = format!("{model:?}");
+        assert!(
+            !model_debug.contains(BODY),
+            "public client model must not retain distinctive inline body"
+        );
+        let encoded = rmp_serde::to_vec_named(summary).expect("encode summary");
+        assert!(
+            !encoded
+                .windows(BODY.len())
+                .any(|window| window == BODY.as_bytes()),
+            "summary encoding must omit body"
+        );
+    }
+
+    #[test]
+    fn artifact_registered_rejects_snapshot_duplicate_id_without_mutation() {
+        // Catches: live ArtifactRegistered overwriting a snapshot-held summary ID.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xB0);
+        let task = task_id(0xB1);
+        let artifact = artifact_id(0xB2);
+        const ORIGINAL_LABEL: &str = "SnapshotHeld";
+        let original_digest = [0x11u8; 32];
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Dup", None))],
+                None,
+            )],
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Artifacts,
+                None,
+                vec![SnapshotItem::Artifact(ArtifactSummary {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Finding,
+                    label: ORIGINAL_LABEL.into(),
+                    sha256: original_digest,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 1,
+                })],
+                None,
+            )],
+        );
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 1);
+        assert_eq!(
+            model
+                .artifact_summaries()
+                .get(&artifact)
+                .expect("summary")
+                .label,
+            ORIGINAL_LABEL
+        );
+
+        const BODY: &str = "SNAPSHOT_DUP_BODY_TOKEN";
+        let mut hasher = Sha256::new();
+        hasher.update(BODY.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let err = model.apply_event(&DomainEvent {
+            id: event_id(0xB3),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 2,
+            payload: Event::ArtifactRegistered {
+                artifact: ArtifactFacts {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Evidence,
+                    label: "Overwritten".into(),
+                    content_ref: ArtifactContentRef::inline_utf8(BODY).expect("body"),
+                    sha256: digest,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 2,
+                },
+            },
+        });
+        assert_eq!(err, Err(ClientModelError::DuplicateItem));
+        assert_eq!(model.last_applied_sequence(), 1);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 1);
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("original summary retained");
+        assert_eq!(summary.label, ORIGINAL_LABEL);
+        assert_eq!(summary.sha256, original_digest);
+    }
+
+    #[test]
+    fn artifact_registered_rejects_live_duplicate_id_without_mutation() {
+        // Catches: second live ArtifactRegistered silently overwriting the first summary.
+        use crate::domain::artifact::{ArtifactContentRef, ArtifactFacts};
+        use sha2::{Digest, Sha256};
+
+        let snap = snapshot_id(0xC0);
+        let task = task_id(0xC1);
+        let artifact = artifact_id(0xC2);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "LiveDup", None))],
+                None,
+            )],
+            Vec::new(),
+        );
+
+        let body_a = "LIVE_DUP_BODY_A";
+        let mut hasher = Sha256::new();
+        hasher.update(body_a.as_bytes());
+        let digest_a: [u8; 32] = hasher.finalize().into();
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xC3),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::ArtifactRegistered {
+                    artifact: ArtifactFacts {
+                        id: artifact,
+                        task_id: task,
+                        kind: ArtifactKind::Evidence,
+                        label: "First".into(),
+                        content_ref: ArtifactContentRef::inline_utf8(body_a).expect("body"),
+                        sha256: digest_a,
+                        privacy_class: PrivacyClass::LocalOnly,
+                        created_at_ms: 2,
+                    },
+                },
+            })
+            .expect("first registration");
+        assert_eq!(model.last_applied_sequence(), 2);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 2);
+
+        let body_b = "LIVE_DUP_BODY_B";
+        let mut hasher = Sha256::new();
+        hasher.update(body_b.as_bytes());
+        let digest_b: [u8; 32] = hasher.finalize().into();
+        let err = model.apply_event(&DomainEvent {
+            id: event_id(0xC4),
+            task_id: Some(task),
+            sequence: 3,
+            task_revision: Some(3),
+            occurred_at_ms: 3,
+            payload: Event::ArtifactRegistered {
+                artifact: ArtifactFacts {
+                    id: artifact,
+                    task_id: task,
+                    kind: ArtifactKind::Evidence,
+                    label: "Second".into(),
+                    content_ref: ArtifactContentRef::inline_utf8(body_b).expect("body"),
+                    sha256: digest_b,
+                    privacy_class: PrivacyClass::LocalOnly,
+                    created_at_ms: 3,
+                },
+            },
+        });
+        assert_eq!(err, Err(ClientModelError::DuplicateItem));
+        assert_eq!(model.last_applied_sequence(), 2);
+        assert_eq!(model.tasks().get(&task).expect("task").task.revision, 2);
+        let summary = model
+            .artifact_summaries()
+            .get(&artifact)
+            .expect("first summary retained");
+        assert_eq!(summary.label, "First");
+        assert_eq!(summary.sha256, digest_a);
     }
 
     #[test]
