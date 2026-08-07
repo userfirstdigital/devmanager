@@ -837,6 +837,8 @@ fn phase_gate_wraps_commands_with_baseline_and_cleanup_checks() {
         "runId",
         "runDirectory",
         "CARGO_TARGET_DIR",
+        "DEVMANAGER_CONFIG_DIR",
+        "DEVMANAGER_APP_IDENTITY",
         "WorkingDirectory",
         "native-next-dev",
         "PhaseGate.ps1",
@@ -1007,6 +1009,11 @@ $expected = [ordered]@{{
   'phase-02-host-lifecycle' = @('test','--test','host_lifecycle','--','--nocapture')
   'phase-02-host-recovery' = @('test','--test','host_recovery','--','--nocapture')
   'phase-02-diagnostics' = @('test','--test','diagnostic_logging','--','--nocapture')
+  'phase-03-process-identity' = @('test','--test','process_supervisor','identity::','--','--nocapture')
+  'phase-03-process-job' = @('test','--test','process_supervisor','job::','--','--nocapture')
+  'phase-03-process-registry' = @('test','--test','process_supervisor','registry::','--','--nocapture')
+  'phase-03-process-launcher' = @('test','--test','process_supervisor','launcher::','--','--nocapture')
+  'phase-03-process-supervisor' = @('test','--test','process_supervisor','supervisor::','--','--nocapture')
 }}
 $recipes = Get-DevManagerPhaseGateRecipeTable
 foreach ($name in $expected.Keys) {{
@@ -1014,7 +1021,7 @@ foreach ($name in $expected.Keys) {{
   $got = @($recipes[$name]); $want = @($expected[$name])
   if (($got -join '|') -cne ($want -join '|')) {{ throw "args mismatch $name : got=$($got -join ' ') want=$($want -join ' ')" }}
 }}
-if (@($recipes.Keys).Count -ne 9) {{ throw 'exactly nine recipes' }}
+if (@($recipes.Keys).Count -ne 14) {{ throw 'exactly fourteen recipes' }}
 if ($recipes.Contains('phase-00-tests')) {{ throw 'phase-00-tests must be removed' }}
 $originalPath = [string]$env:Path
 $realCargo = @(Get-Command -Name 'cargo' -All -CommandType Application -ErrorAction SilentlyContinue |
@@ -1047,10 +1054,22 @@ if (($plan.arguments -join ',') -ne '--version') {{ throw 'args' }}
 foreach ($bad in @(
   'cargo-build','pwsh-file','../escape','phase-00-tests',
   'phase-02-unknown','phase-02-host-lock;rm','phase-02-host-lock --release',
+  'phase-03-unknown','phase-03-process-identity;rm','phase-03-process-identity --release',
+  'phase-03-process-identity-extra','phase-03-process-job;rm','phase-03-process-supervisor --release',
   'scripts/native-next/Invoke-PhaseGate.ps1'
 )) {{
   $rej = $false; try {{ $null = Resolve-DevManagerPhaseGateRecipe -Recipe $bad -WorktreeRoot $harness }} catch {{ $rej = $true }}
   if (-not $rej) {{ throw "reject $bad" }}
+}}
+$resolveParams = @(
+  (Get-Command Resolve-DevManagerPhaseGateRecipe).Parameters.Keys |
+    Where-Object {{ $_ -notin @('Verbose','Debug','ErrorAction','WarningAction','InformationAction','ErrorVariable','WarningVariable','InformationVariable','OutVariable','OutBuffer','PipelineVariable','ProgressAction') }}
+)
+if ($resolveParams -contains 'Filter' -or $resolveParams -contains 'Arguments' -or $resolveParams -contains 'TestFilter') {{
+  throw 'Resolve-DevManagerPhaseGateRecipe must not accept caller-provided filters'
+}}
+if ((@($resolveParams | Sort-Object) -join ',') -cne 'Recipe,WorktreeRoot') {{
+  throw ("Resolve-DevManagerPhaseGateRecipe public params must be Recipe,WorktreeRoot; got: {{0}}" -f ($resolveParams -join ','))
 }}
 $libPlan = Resolve-DevManagerPhaseGateRecipe -Recipe 'library-tests-serial' -WorktreeRoot $harness
 $isoPlan = Resolve-DevManagerPhaseGateRecipe -Recipe 'development-isolation-tests' -WorktreeRoot $harness
@@ -1058,7 +1077,7 @@ Assert-DevManagerPhaseGateExecutionPlan -Plan $libPlan
 Assert-DevManagerPhaseGateExecutionPlan -Plan $isoPlan
 if ($libPlan.environment.Contains('DEVMANAGER_PROFILE')) {{ throw 'library plan must omit DEVMANAGER_PROFILE override' }}
 $libRemovals = @($libPlan.environmentRemovals)
-if (($libRemovals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND') {{
+if (($libRemovals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND,DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {{
   throw ("library removals must clear all DevManager runtime identity; got: {{0}}" -f ($libRemovals -join ','))
 }}
 foreach ($removed in $libRemovals) {{
@@ -1067,7 +1086,10 @@ foreach ($removed in $libRemovals) {{
 if (-not $isoPlan.environment.Contains('DEVMANAGER_PROFILE') -or [string]$isoPlan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{
   throw 'integration plan must force DEVMANAGER_PROFILE=native-next-dev'
 }}
-if (@($isoPlan.environmentRemovals).Count -ne 0) {{ throw 'integration plan must not remove DEVMANAGER_PROFILE' }}
+$isoRemovals = @($isoPlan.environmentRemovals)
+if (($isoRemovals -join ',') -cne 'DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {{
+  throw ("integration removals must clear inherited config/app identity; got: {{0}}" -f ($isoRemovals -join ','))
+}}
 if (-not $libPlan.environment.Contains('CARGO_TARGET_DIR')) {{ throw 'library missing isolated CARGO_TARGET_DIR' }}
 foreach ($integrationEnv in @('DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','CARGO_TARGET_DIR')) {{
   if (-not $isoPlan.environment.Contains($integrationEnv)) {{ throw "integration missing $integrationEnv" }}
@@ -1078,22 +1100,30 @@ $phase02Names = @(
   'phase-02-host-lock','phase-02-cli-client','phase-02-host-lifecycle',
   'phase-02-host-recovery','phase-02-diagnostics'
 )
+$phase03Names = @(
+  'phase-03-process-identity','phase-03-process-job','phase-03-process-registry',
+  'phase-03-process-launcher','phase-03-process-supervisor'
+)
 $priorProfile = [Environment]::GetEnvironmentVariable('DEVMANAGER_PROFILE', 'Process')
 $priorLabel = [Environment]::GetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Process')
 $priorKind = [Environment]::GetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'Process')
+$priorConfigDir = [Environment]::GetEnvironmentVariable('DEVMANAGER_CONFIG_DIR', 'Process')
+$priorAppIdentity = [Environment]::GetEnvironmentVariable('DEVMANAGER_APP_IDENTITY', 'Process')
 $priorCargoTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
 try {{
   [Environment]::SetEnvironmentVariable('DEVMANAGER_PROFILE', 'poison-parent-profile', 'Process')
   [Environment]::SetEnvironmentVariable('DEVMANAGER_INSTANCE_LABEL', 'Poisoned Label', 'Process')
   [Environment]::SetEnvironmentVariable('DEVMANAGER_RUNTIME_KIND', 'poisoned-runtime', 'Process')
+  [Environment]::SetEnvironmentVariable('DEVMANAGER_CONFIG_DIR', 'C:\poison-devmanager-config', 'Process')
+  [Environment]::SetEnvironmentVariable('DEVMANAGER_APP_IDENTITY', 'poisoned-app-identity', 'Process')
   [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\poison-cargo-target', 'Process')
   $psiLib = [System.Diagnostics.ProcessStartInfo]::new()
   $psiLib.UseShellExecute = $false
-  foreach ($poisoned in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND')) {{
+  foreach ($poisoned in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','DEVMANAGER_CONFIG_DIR','DEVMANAGER_APP_IDENTITY','CARGO_TARGET_DIR')) {{
     if (-not $psiLib.Environment.ContainsKey($poisoned)) {{ throw "expected poisoned parent $poisoned to be inherited into StartInfo" }}
   }}
   Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiLib -Plan $libPlan
-  foreach ($removed in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND')) {{
+  foreach ($removed in @('DEVMANAGER_PROFILE','DEVMANAGER_INSTANCE_LABEL','DEVMANAGER_RUNTIME_KIND','DEVMANAGER_CONFIG_DIR','DEVMANAGER_APP_IDENTITY')) {{
     if ($psiLib.Environment.ContainsKey($removed)) {{ throw "library plan must remove poisoned $removed" }}
   }}
   $psiIso = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1102,6 +1132,9 @@ try {{
   if ([string]$psiIso.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw 'integration must force named profile over poison' }}
   if ([string]$psiIso.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw 'integration must force label over poison' }}
   if ([string]$psiIso.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw 'integration must force runtime kind over poison' }}
+  foreach ($removed in @('DEVMANAGER_CONFIG_DIR','DEVMANAGER_APP_IDENTITY')) {{
+    if ($psiIso.Environment.ContainsKey($removed)) {{ throw "integration plan must remove poisoned $removed" }}
+  }}
   foreach ($name in $phase02Names) {{
     $p2 = Resolve-DevManagerPhaseGateRecipe -Recipe $name -WorktreeRoot $harness
     Assert-DevManagerPhaseGateExecutionPlan -Plan $p2
@@ -1123,13 +1156,18 @@ try {{
     if ([string]$p2.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-02 profile $name" }}
     if ([string]$p2.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-02 label $name" }}
     if ([string]$p2.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-02 kind $name" }}
-    if (@($p2.environmentRemovals).Count -ne 0) {{ throw "phase-02 removals must be empty $name" }}
+    if ((@($p2.environmentRemovals) -join ',') -cne 'DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {{
+      throw "phase-02 removals must clear config/app identity $name"
+    }}
     $psiP2 = [System.Diagnostics.ProcessStartInfo]::new()
     $psiP2.UseShellExecute = $false
     Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiP2 -Plan $p2
     if ([string]$psiP2.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-02 force profile over poison $name" }}
     if ([string]$psiP2.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-02 force label over poison $name" }}
     if ([string]$psiP2.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-02 force kind over poison $name" }}
+    foreach ($removed in @('DEVMANAGER_CONFIG_DIR','DEVMANAGER_APP_IDENTITY')) {{
+      if ($psiP2.Environment.ContainsKey($removed)) {{ throw "phase-02 plan must remove poisoned $removed $name" }}
+    }}
     if ([string]$psiP2.Environment['CARGO_TARGET_DIR'] -ne $expectedCargoTarget) {{
       throw "phase-02 force CARGO_TARGET_DIR over poison $name"
     }}
@@ -1137,11 +1175,57 @@ try {{
       throw "phase-02 applied CARGO_TARGET_DIR escapes worktree $name"
     }}
   }}
+  foreach ($name in $phase03Names) {{
+    $p3 = Resolve-DevManagerPhaseGateRecipe -Recipe $name -WorktreeRoot $harness
+    Assert-DevManagerPhaseGateExecutionPlan -Plan $p3
+    $want = @($expected[$name])
+    if (($p3.arguments -join '|') -cne ($want -join '|')) {{
+      throw "phase-03 args mismatch $name : got=$($p3.arguments -join ' ') want=$($want -join ' ')"
+    }}
+    if ($p3.arguments -contains '--exact') {{ throw "phase-03 must not accept caller-provided filters via --exact $name" }}
+    if (@($p3.arguments | Where-Object {{ $_ -like '*::*' }}).Count -ne 1) {{
+      throw "phase-03 must bake exactly one fixed module filter $name"
+    }}
+    if ([string]$p3.workingDirectory -ne $expectedWorktree) {{ throw "phase-03 cwd mismatch $name" }}
+    if ([string]$p3.cargoTargetDir -ne $expectedCargoTarget) {{ throw "phase-03 target mismatch $name" }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $p3.cargoTargetDir -AncestorPath $harness)) {{
+      throw "phase-03 target escapes worktree $name"
+    }}
+    if ([string]$p3.environment['CARGO_TARGET_DIR'] -ne $expectedCargoTarget) {{
+      throw "phase-03 env CARGO_TARGET_DIR mismatch $name"
+    }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $p3.environment['CARGO_TARGET_DIR'] -AncestorPath $harness)) {{
+      throw "phase-03 env CARGO_TARGET_DIR escapes worktree $name"
+    }}
+    if ([string]$p3.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-03 profile $name" }}
+    if ([string]$p3.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-03 label $name" }}
+    if ([string]$p3.environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-03 kind $name" }}
+    if ((@($p3.environmentRemovals) -join ',') -cne 'DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {{
+      throw "phase-03 removals must clear config/app identity $name"
+    }}
+    $psiP3 = [System.Diagnostics.ProcessStartInfo]::new()
+    $psiP3.UseShellExecute = $false
+    Set-DevManagerPhaseGateProcessEnvironment -StartInfo $psiP3 -Plan $p3
+    if ([string]$psiP3.Environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {{ throw "phase-03 force profile over poison $name" }}
+    if ([string]$psiP3.Environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {{ throw "phase-03 force label over poison $name" }}
+    if ([string]$psiP3.Environment['DEVMANAGER_RUNTIME_KIND'] -ne 'native-next') {{ throw "phase-03 force kind over poison $name" }}
+    foreach ($removed in @('DEVMANAGER_CONFIG_DIR','DEVMANAGER_APP_IDENTITY')) {{
+      if ($psiP3.Environment.ContainsKey($removed)) {{ throw "phase-03 plan must remove poisoned $removed $name" }}
+    }}
+    if ([string]$psiP3.Environment['CARGO_TARGET_DIR'] -ne $expectedCargoTarget) {{
+      throw "phase-03 force CARGO_TARGET_DIR over poison $name"
+    }}
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $psiP3.Environment['CARGO_TARGET_DIR'] -AncestorPath $harness)) {{
+      throw "phase-03 applied CARGO_TARGET_DIR escapes worktree $name"
+    }}
+  }}
 }} finally {{
   foreach ($restore in @(
     @('DEVMANAGER_PROFILE', $priorProfile),
     @('DEVMANAGER_INSTANCE_LABEL', $priorLabel),
     @('DEVMANAGER_RUNTIME_KIND', $priorKind),
+    @('DEVMANAGER_CONFIG_DIR', $priorConfigDir),
+    @('DEVMANAGER_APP_IDENTITY', $priorAppIdentity),
     @('CARGO_TARGET_DIR', $priorCargoTarget)
   )) {{
     [Environment]::SetEnvironmentVariable([string]$restore[0], $restore[1], 'Process')
@@ -1222,7 +1306,9 @@ if ($v.recipe -ne 'cargo-version' -or -not [bool]$v.longRustRun -or $v.cleanupRe
 if ($null -ne $v.PSObject.Properties['verificationWriteFailure']) {{ throw 'verificationWriteFailure must stay local-only' }}
 if ($null -ne $v.PSObject.Properties['allowDevelopmentProcesses']) {{ throw 'allowDevelopmentProcesses must be removed' }}
 if ($null -eq $v.PSObject.Properties['environmentRemovals']) {{ throw 'verification must record environmentRemovals names' }}
-if (@($v.environmentRemovals).Count -ne 0) {{ throw 'cargo-version must not remove profile' }}
+if ((@($v.environmentRemovals) -join ',') -cne 'DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {{
+  throw 'cargo-version must remove inherited config/app identity only'
+}}
 if (-not (Test-Path -LiteralPath (Join-Path $runDir 'processes-after.json'))) {{ throw 'after artifact required' }}
 $pub = Join-Path $evidenceRoot 'phase-00\runs\pub\verification.json'
 New-Item -ItemType Directory -Force -Path (Split-Path $pub -Parent) | Out-Null

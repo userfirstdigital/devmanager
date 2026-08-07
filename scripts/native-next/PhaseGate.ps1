@@ -42,6 +42,36 @@ function Get-DevManagerPhaseGateRecipeTable {
             '--test', 'diagnostic_logging',
             '--', '--nocapture'
         )
+        'phase-03-process-identity'     = [string[]]@(
+            'test',
+            '--test', 'process_supervisor',
+            'identity::',
+            '--', '--nocapture'
+        )
+        'phase-03-process-job'          = [string[]]@(
+            'test',
+            '--test', 'process_supervisor',
+            'job::',
+            '--', '--nocapture'
+        )
+        'phase-03-process-registry'     = [string[]]@(
+            'test',
+            '--test', 'process_supervisor',
+            'registry::',
+            '--', '--nocapture'
+        )
+        'phase-03-process-launcher'     = [string[]]@(
+            'test',
+            '--test', 'process_supervisor',
+            'launcher::',
+            '--', '--nocapture'
+        )
+        'phase-03-process-supervisor'   = [string[]]@(
+            'test',
+            '--test', 'process_supervisor',
+            'supervisor::',
+            '--', '--nocapture'
+        )
     }
 }
 
@@ -138,13 +168,18 @@ function Resolve-DevManagerPhaseGateRecipe {
     $environment = [ordered]@{
         CARGO_TARGET_DIR = $cargoTargetDir
     }
-    $environmentRemovals = [string[]]@()
+    $environmentRemovals = [string[]]@(
+        'DEVMANAGER_CONFIG_DIR',
+        'DEVMANAGER_APP_IDENTITY'
+    )
     if ($name -eq 'library-tests-serial') {
         # The complete lib suite owns its test identity and profile environment.
         $environmentRemovals = [string[]]@(
             'DEVMANAGER_PROFILE',
             'DEVMANAGER_INSTANCE_LABEL',
-            'DEVMANAGER_RUNTIME_KIND'
+            'DEVMANAGER_RUNTIME_KIND',
+            'DEVMANAGER_CONFIG_DIR',
+            'DEVMANAGER_APP_IDENTITY'
         )
     }
     else {
@@ -189,7 +224,13 @@ function Assert-DevManagerPhaseGateExecutionPlan {
 
     $removals = [string[]]@($Plan.environmentRemovals)
     if ([string]$Plan.recipe -eq 'library-tests-serial') {
-        foreach ($removed in @('DEVMANAGER_PROFILE', 'DEVMANAGER_INSTANCE_LABEL', 'DEVMANAGER_RUNTIME_KIND')) {
+        foreach ($removed in @(
+            'DEVMANAGER_PROFILE',
+            'DEVMANAGER_INSTANCE_LABEL',
+            'DEVMANAGER_RUNTIME_KIND',
+            'DEVMANAGER_CONFIG_DIR',
+            'DEVMANAGER_APP_IDENTITY'
+        )) {
             if ($Plan.environment.Contains($removed)) {
                 throw "library-tests-serial must not include a $removed override."
             }
@@ -197,7 +238,7 @@ function Assert-DevManagerPhaseGateExecutionPlan {
         if (@($Plan.environment.Keys).Count -ne 1) {
             throw "library-tests-serial must override only CARGO_TARGET_DIR."
         }
-        if (($removals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND') {
+        if (($removals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND,DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {
             throw "library-tests-serial environmentRemovals must clear all DevManager runtime identity (got: $($removals -join ', '))."
         }
     }
@@ -219,11 +260,8 @@ function Assert-DevManagerPhaseGateExecutionPlan {
         if ([string]$Plan.environment['DEVMANAGER_PROFILE'] -ne 'native-next-dev') {
             throw "Execution plan must force DEVMANAGER_PROFILE=native-next-dev."
         }
-        if ($removals -contains 'DEVMANAGER_PROFILE') {
-            throw "Non-library Phase 0 recipes must not remove DEVMANAGER_PROFILE."
-        }
-        if ($removals.Count -ne 0) {
-            throw "Non-library Phase 0 recipes must not declare environmentRemovals (got: $($removals -join ', '))."
+        if (($removals -join ',') -cne 'DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {
+            throw "Non-library Phase 0 recipes must remove only inherited config/app identity (got: $($removals -join ', '))."
         }
     }
 }
