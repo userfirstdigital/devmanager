@@ -14,8 +14,9 @@ use std::time::Duration;
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use devmanager::domain::ClientId;
 use devmanager::host::{
-    AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostLock, HostLockError,
-    HostRequestExecutor, HostRequestHandle, HostRestartDisposition, HOST_EXIT_ALREADY_RUNNING,
+    AcceptHelloConfig, HelloListener, HostCleanupWorker, HostConnection, HostExecutorOutcome,
+    HostLock, HostLockError, HostRequestExecutor, HostRequestHandle, HostRestartDisposition,
+    PhysicalExitArmRequest, SupervisedHostExecutor, HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -23,6 +24,8 @@ use uuid::Uuid;
 
 const MAX_INSTANCE_LABEL_CHARS: usize = 64;
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Short bounded normal drain for connection tasks after intentional quit.
+const INTENTIONAL_CONNECTION_DRAIN: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 struct HostArgs {
@@ -664,14 +667,35 @@ async fn abort_and_drain_connection_tasks(
 }
 
 #[cfg(all(windows, debug_assertions))]
-async fn stop_request_executor(executor_task: tokio::task::JoinHandle<()>) -> Result<(), String> {
-    // Cancel the executor at its next await point, then reap it before the host
-    // releases ownership. Synchronous dispatch remains atomic on this runtime.
-    executor_task.abort();
-    match executor_task.await {
-        Ok(()) => Ok(()),
-        Err(error) if error.is_cancelled() => Ok(()),
-        Err(error) => Err(join_error_message("command-bus executor", error)),
+async fn drain_then_abort_connection_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    drain: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + drain;
+    let mut first_error = None;
+    while !tasks.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, tasks.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) if error.is_cancelled() => {}
+            Ok(Some(Err(error))) => {
+                if first_error.is_none() {
+                    first_error = Some(join_error_message("connection task", error));
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let abort_result = abort_and_drain_connection_tasks(tasks).await;
+    match (first_error, abort_result) {
+        (None, Ok(())) => Ok(()),
+        (Some(error), Ok(())) => Err(error),
+        (None, Err(error)) => Err(error),
+        (Some(first), Err(second)) => Err(format!("{first}; {second}")),
     }
 }
 
@@ -679,7 +703,9 @@ async fn stop_request_executor(executor_task: tokio::task::JoinHandle<()>) -> Re
 enum HostLoopExit {
     Parent(Result<(), String>),
     Listener(String),
-    Executor(Result<(), tokio::task::JoinError>),
+    Executor(
+        Result<Result<HostExecutorOutcome, devmanager::kernel::StoreError>, tokio::task::JoinError>,
+    ),
     Connection(tokio::task::JoinError),
 }
 
@@ -688,37 +714,71 @@ async fn finish_supervised_host(
     exit: HostLoopExit,
     connection_tasks: &mut tokio::task::JoinSet<()>,
     request_handle: HostRequestHandle,
-    executor_task: tokio::task::JoinHandle<()>,
+    executor_task: tokio::task::JoinHandle<
+        Result<HostExecutorOutcome, devmanager::kernel::StoreError>,
+    >,
+    armed: Option<(devmanager::domain::id::OperationId, u64)>,
 ) -> Result<(), String> {
     let executor_already_joined = matches!(&exit, HostLoopExit::Executor(_));
     let mut errors = Vec::new();
+    let mut intentional_match = None;
+
     match exit {
         HostLoopExit::Parent(Ok(())) => {}
         HostLoopExit::Parent(Err(error)) | HostLoopExit::Listener(error) => errors.push(error),
-        HostLoopExit::Executor(Ok(())) => {
-            errors.push("command-bus executor exited unexpectedly".to_string())
+        HostLoopExit::Executor(Ok(Ok(HostExecutorOutcome::Intentional {
+            operation_id,
+            action_epoch,
+        }))) => match armed {
+            Some((armed_op, armed_epoch))
+                if armed_op == operation_id && armed_epoch == action_epoch =>
+            {
+                intentional_match = Some((operation_id, action_epoch));
+            }
+            Some(_) => {
+                errors.push(
+                    "intentional executor exit did not match armed operation/epoch".to_string(),
+                );
+            }
+            None => {
+                errors.push("intentional executor exit without prior arm".to_string());
+            }
+        },
+        HostLoopExit::Executor(Ok(Err(error))) => {
+            errors.push(format!("command-bus executor fault: {error}"));
         }
         HostLoopExit::Executor(Err(error)) => {
-            errors.push(join_error_message("command-bus executor", error))
+            errors.push(join_error_message("command-bus executor", error));
         }
         HostLoopExit::Connection(error) => {
-            errors.push(join_error_message("connection task", error))
+            errors.push(join_error_message("connection task", error));
         }
     }
 
-    if let Err(error) = abort_and_drain_connection_tasks(connection_tasks).await {
+    if intentional_match.is_some() {
+        if let Err(error) =
+            drain_then_abort_connection_tasks(connection_tasks, INTENTIONAL_CONNECTION_DRAIN).await
+        {
+            errors.push(error);
+        }
+    } else if let Err(error) = abort_and_drain_connection_tasks(connection_tasks).await {
         errors.push(error);
     }
-    // Connection tasks are now gone, so dropping the root handle closes the
-    // request queue without leaving any sender clone alive.
+
     drop(request_handle);
     if executor_already_joined {
         drop(executor_task);
-    } else if let Err(error) = stop_request_executor(executor_task).await {
-        errors.push(error);
+    } else {
+        executor_task.abort();
+        match executor_task.await {
+            Ok(_) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => errors.push(join_error_message("command-bus executor", error)),
+        }
     }
 
     if errors.is_empty() {
+        let _ = intentional_match;
         Ok(())
     } else {
         Err(errors.join("; "))
@@ -775,22 +835,50 @@ async fn serve_foreground_host(
     let listener = HelloListener::bind(profile, hello_config)
         .map_err(|error| format!("failed to bind host pipe: {error}"))?;
 
-    // One CommandBus executor owns all mutate/query dispatch. Transport tasks
-    // only submit through HostRequestHandle.
-    let (request_handle, mut executor_task) = HostRequestExecutor::start(bus);
+    // Supervised executor owns CommandBus and may arm physical exit on ReadyToExit.
+    let (
+        request_handle,
+        SupervisedHostExecutor {
+            mut arm_rx,
+            mut join,
+        },
+    ) = HostRequestExecutor::start_supervised(bus);
     let mut connection_tasks = tokio::task::JoinSet::new();
     // `accept_with_successor` owns its listener. Keep the future pinned across
     // unrelated task-completion branches so a normal client disconnect never
-    // cancels and drops the sole pending listener.
-    let mut accept_task = Box::pin(listener.accept_with_successor());
+    // cancels and drops the sole pending listener. On arm, take/drop before ack.
+    let mut accept_task = Some(Box::pin(listener.accept_with_successor()));
+    let mut armed: Option<(devmanager::domain::id::OperationId, u64)> = None;
 
     let exit = loop {
         tokio::select! {
+            biased;
             parent_result = wait_for_parent_exit(&parent) => {
                 break HostLoopExit::Parent(parent_result);
             }
-            executor_result = &mut executor_task => {
+            executor_result = &mut join => {
                 break HostLoopExit::Executor(executor_result);
+            }
+            arm_request = arm_rx.recv(), if armed.is_none() => {
+                let Some(PhysicalExitArmRequest {
+                    operation_id,
+                    action_epoch,
+                    ack,
+                }) = arm_request
+                else {
+                    break HostLoopExit::Listener(
+                        "physical-exit arm channel closed unexpectedly".to_string(),
+                    );
+                };
+                // Drop the pending accept future (and its successor listener) BEFORE ack.
+                let _ = accept_task.take();
+                if ack.send(()).is_err() {
+                    break HostLoopExit::Listener(
+                        "physical-exit arm acknowledgement receiver dropped".to_string(),
+                    );
+                }
+                armed = Some((operation_id, action_epoch));
+                // Continue selecting until the executor returns Intentional.
             }
             connection_result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 match connection_result {
@@ -799,7 +887,13 @@ async fn serve_foreground_host(
                     None => {}
                 }
             }
-            accepted_result = &mut accept_task => {
+            accepted_result = async {
+                accept_task
+                    .as_mut()
+                    .expect("accept branch gated on Some")
+                    .as_mut()
+                    .await
+            }, if accept_task.is_some() => {
                 let (accepted, next_listener) = match accepted_result {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -808,7 +902,7 @@ async fn serve_foreground_host(
                         ));
                     }
                 };
-                accept_task = Box::pin(next_listener.accept_with_successor());
+                accept_task = Some(Box::pin(next_listener.accept_with_successor()));
                 // Handshake failures belong only to the attempted connection.
                 // The secured successor remains pending for another client.
                 if let Ok(connection) = accepted {
@@ -823,13 +917,14 @@ async fn serve_foreground_host(
         }
     };
 
-    finish_supervised_host(exit, &mut connection_tasks, request_handle, executor_task).await
+    finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await
 }
 
 #[cfg(all(windows, debug_assertions, test))]
 mod tests {
     use super::{
-        parse_args, path_strictly_beneath, validate_slow_durable_reader_isolation, HostArgs,
+        drain_then_abort_connection_tasks, parse_args, path_strictly_beneath,
+        validate_slow_durable_reader_isolation, HostArgs, INTENTIONAL_CONNECTION_DRAIN,
     };
     use tempfile::TempDir;
 
@@ -849,6 +944,29 @@ mod tests {
             "--config-base".into(),
             config_base.display().to_string(),
         ]
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_then_abort_reaps_pending_sibling_after_panicking_connection_task() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {
+            panic!("intentional connection-task panic for drain test");
+        });
+        tasks.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(tasks.len(), 2);
+
+        let result =
+            drain_then_abort_connection_tasks(&mut tasks, INTENTIONAL_CONNECTION_DRAIN).await;
+        assert!(
+            tasks.is_empty(),
+            "JoinSet must be empty after drain_then_abort"
+        );
+        assert!(
+            result.is_err(),
+            "panicking connection task must surface as drain error"
+        );
     }
 
     #[test]

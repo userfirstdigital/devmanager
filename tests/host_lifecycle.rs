@@ -22,11 +22,12 @@ use devmanager::client::{
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, RejectionCode,
+    Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
+    RejectionCode,
 };
 use devmanager::domain::id::{
-    AgentSessionId, ArtifactId, CommandId, EnvironmentId, OperationId, ProjectId, RequestId,
-    ResourceId, TaskId,
+    AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
+    RequestId, ResourceId, TaskId,
 };
 use devmanager::domain::operation::OperationState;
 use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome};
@@ -2831,132 +2832,11 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn confirmed_host_quit_closes_admission_but_keeps_foreground_host_running() {
-    let config_base = TempDir::new().expect("process-unique config base");
-    let profile = unique_profile();
-    let paths = isolated_paths(&config_base, &profile);
-    let lock_path = paths.root.join("host.lock");
-
-    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
-    let original_identity = wait_for_identity(&mut host, &lock_path).await;
-
-    let client_id_a = ClientId::from_bytes(fixed_uuid_v7(0x30)).expect("client a");
-    let client_id_b = ClientId::from_bytes(fixed_uuid_v7(0x31)).expect("client b");
-    let requested = CapabilitySet::from_capabilities([
-        Capability::OperationSettlement,
-        Capability::HostShutdown,
-    ]);
-    let limits = FrameLimits::v1_default();
-    let mut client_a = connect_bounded(
-        &HostClientConfig {
-            named_profile: profile.clone(),
-            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
-            client_id: client_id_a,
-            requested,
-            limits,
-        },
-        &mut host,
-    )
-    .await;
-    let mut client_b = connect_bounded(
-        &HostClientConfig {
-            named_profile: profile.clone(),
-            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
-            client_id: client_id_b,
-            requested,
-            limits,
-        },
-        &mut host,
-    )
-    .await;
-
-    let inspection = client_a
-        .inspect_host_quit()
-        .await
-        .expect("inspect transport")
-        .expect("inspect query");
-    assert_eq!(
-        inspection.worktrees,
-        HostQuitWorktreeInspection::NotInspected
-    );
-    assert!(!inspection.confirmable);
-
-    let confirm_command_id =
-        CommandId::from_bytes(fixed_uuid_v7(0x36)).expect("confirm command id");
-    let confirm = client_a
-        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
-        .await
-        .expect("confirm transport");
-    let operation_id = match &confirm {
-        CommandReceipt::Accepted {
-            operation_id,
-            task_revision: None,
-            ..
-        } => *operation_id,
-        other => panic!("expected taskless Accepted, got {other:?}"),
-    };
-
-    let retry = client_a
-        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
-        .await
-        .expect("exact CommandId retry transport");
-    assert_eq!(
-        retry, confirm,
-        "caller-retained CommandId retry must return struct-identical Accepted"
-    );
-
-    let (create, _, _) = create_task_named(client_id_b, 0x32, 0x33, 0x34, 0x35, "after close");
-    let closing = client_b
-        .execute_command(create)
-        .await
-        .expect("second client mutation transport");
-    assert!(
-        matches!(
-            closing,
-            CommandReceipt::Rejected {
-                code: RejectionCode::Closing,
-                ..
-            }
-        ),
-        "second client mutation must Closing, got {closing:?}"
-    );
-
-    let status = client_b
-        .refresh_operation(operation_id)
-        .await
-        .expect("status transport")
-        .expect("status query");
-    assert_eq!(status, OperationState::Accepted);
-
-    let after = client_a
-        .inspect_host_quit()
-        .await
-        .expect("post-confirm inspect transport")
-        .expect("post-confirm inspect");
-    assert_eq!(after.worktrees, HostQuitWorktreeInspection::NotInspected);
-    assert!(!after.confirmable);
-
-    let final_identity = read_identity(&lock_path).expect("final host identity");
-    assert_eq!(final_identity.pid, original_identity.pid);
-    assert_eq!(final_identity.boot_id, original_identity.boot_id);
-    assert!(
-        host.try_wait().expect("poll host after confirm").is_none(),
-        "confirm must keep the foreground host running"
-    );
-
-    client_a.disconnect();
-    client_b.disconnect();
-    let status = host
-        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
-        .expect("terminate exact ChildGuard");
-    assert!(!status.success(), "test termination should stop the host");
-    assert!(host.try_wait().expect("final host poll").is_some());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn confirmed_quit_runs_cleanup_on_single_executor_but_keeps_foreground_host_running() {
+async fn confirmed_quit_settles_live_and_exits_foreground_host_successfully() {
     use devmanager::domain::event::Event;
     use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
+    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+    use devmanager::kernel::CommandBus;
 
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
@@ -2988,7 +2868,6 @@ async fn confirmed_quit_runs_cleanup_on_single_executor_but_keeps_foreground_hos
         .await
         .expect("pre-confirm synchronize");
     assert_eq!(sub.state(), ClientSubscriptionState::Ready);
-    let pre_close_cursor = sub.model().expect("model").last_applied_sequence();
 
     let inspection = client
         .inspect_host_quit()
@@ -3012,179 +2891,132 @@ async fn confirmed_quit_runs_cleanup_on_single_executor_but_keeps_foreground_hos
 
     let expected_order = HostCleanupBranch::ORDER;
     let mut observed = Vec::new();
-    let mut live_cleanup_sequences = Vec::new();
+    let mut branch_event_ids = Vec::new();
+    let mut final_branch_sequence = None;
+    let mut settled_live = None;
+    let mut host_exit = None;
     let started = Instant::now();
-    while observed.len() < expected_order.len() {
-        if let Some(status) = host.try_wait().expect("poll host while waiting cleanup") {
-            let diagnostics = host.exited_diagnostics(status);
-            panic!("foreground host exited during cleanup journal: {diagnostics}");
+    while settled_live.is_none() {
+        // Host physical exit can precede client application of already-written
+        // buffered frames — store exit status and keep applying until complete.
+        if host_exit.is_none() {
+            if let Some(status) = host.try_wait().expect("poll host while waiting quit path") {
+                host_exit = Some(status);
+            }
         }
-        let update = timeout(READY_TIMEOUT, sub.recv_and_apply(&client))
-            .await
-            .expect("live cleanup apply stayed bounded")
-            .expect("live cleanup apply");
+        let update = match timeout(READY_TIMEOUT, sub.recv_and_apply(&client)).await {
+            Ok(Ok(update)) => update,
+            Ok(Err(error)) => panic!("live quit apply failed: {error}"),
+            Err(_) => panic!(
+                "timed out waiting for cleanup + OperationSettled; observed={observed:?} host_exit={host_exit:?}"
+            ),
+        };
         match update {
-            SubscriptionUpdate::DurableEvent(event) => {
-                if let Event::HostCleanupBranchCompleted {
+            SubscriptionUpdate::DurableEvent(event) => match &event.payload {
+                Event::HostCleanupBranchCompleted {
                     operation_id: event_op,
                     action_epoch,
                     branch,
                     outcome,
-                } = event.payload
-                {
-                    assert_eq!(event_op, operation_id);
-                    assert_eq!(action_epoch, 1);
-                    assert_eq!(outcome, HostCleanupBranchOutcome::succeeded());
-                    live_cleanup_sequences.push(event.sequence);
-                    observed.push(branch);
+                } => {
+                    assert_eq!(*event_op, operation_id);
+                    assert_eq!(*action_epoch, 1);
+                    assert_eq!(*outcome, HostCleanupBranchOutcome::succeeded());
+                    branch_event_ids.push(event.id);
+                    observed.push(*branch);
+                    final_branch_sequence = Some(event.sequence);
                 }
-            }
-            other => panic!("unexpected subscription update while waiting cleanup: {other:?}"),
+                Event::OperationSettled(fact) => {
+                    assert_eq!(fact.operation_id, operation_id);
+                    assert_eq!(fact.action_epoch, Some(1));
+                    assert_eq!(fact.command_id, confirm_command_id);
+                    assert_eq!(fact.result_event_ids, branch_event_ids);
+                    settled_live = Some(event);
+                }
+                Event::HostCloseBegun { .. } | Event::OperationAccepted(_) => {
+                    // ConfirmHostQuit Accepted fan-out; continue waiting for cleanup.
+                }
+                other => panic!("unexpected durable payload during quit path: {other:?}"),
+            },
+            other => panic!("unexpected subscription update while waiting quit path: {other:?}"),
         }
         assert!(
             started.elapsed() < READY_TIMEOUT,
-            "timed out waiting for four HostCleanupBranchCompleted events; observed={observed:?}"
+            "timed out waiting for cleanup + OperationSettled; observed={observed:?}"
         );
     }
     assert_eq!(observed.as_slice(), &expected_order);
-    assert_eq!(live_cleanup_sequences.len(), 4);
-    assert!(
-        live_cleanup_sequences
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "live cleanup sequences must be strictly increasing: {live_cleanup_sequences:?}"
-    );
-    let unique: std::collections::BTreeSet<_> = live_cleanup_sequences.iter().copied().collect();
+    assert_eq!(branch_event_ids.len(), expected_order.len());
+    let final_branch_sequence =
+        final_branch_sequence.expect("fourth HostCleanupBranchCompleted sequence");
+    let settled_event = settled_live.expect("live OperationSettled");
     assert_eq!(
-        unique.len(),
-        4,
-        "live cleanup sequences must be four unique values: {live_cleanup_sequences:?}"
+        settled_event.sequence,
+        final_branch_sequence + 1,
+        "OperationSettled must be the immediate successor of branch four"
     );
 
-    // Longer than one host maintenance period; a duplicate fourth/fifth cleanup
-    // (or any extra live durable) must fail the test.
-    let quiet_period = Duration::from_millis(1_250);
-    let quiet_deadline = Instant::now() + quiet_period;
-    while Instant::now() < quiet_deadline {
-        let remaining = quiet_deadline.saturating_duration_since(Instant::now());
-        match timeout(
-            remaining.min(Duration::from_millis(250)),
-            sub.recv_and_apply(&client),
-        )
-        .await
-        {
-            Err(_) => continue,
-            Ok(Ok(SubscriptionUpdate::DurableEvent(event))) => {
-                panic!(
-                    "no additional live durable event after four cleanup completions; got sequence={} payload={:?}",
-                    event.sequence, event.payload
-                );
+    // Successful bounded host exit: pipe gone, PID dead.
+    let exit_deadline = Instant::now() + READY_TIMEOUT;
+    let exit_status = match host_exit {
+        Some(status) => status,
+        None => loop {
+            if let Some(status) = host.try_wait().expect("poll host exit after settled") {
+                break status;
             }
-            Ok(Ok(other)) => {
-                panic!("unexpected subscription update after cleanup quiet window: {other:?}");
-            }
-            Ok(Err(err)) => panic!("subscription apply failed after cleanup: {err}"),
-        }
-    }
-
-    let status = client
-        .refresh_operation(operation_id)
-        .await
-        .expect("status transport")
-        .expect("status query");
-    assert_eq!(status, OperationState::Accepted);
-
-    let mid_identity = read_identity(&lock_path).expect("mid host identity");
-    assert_eq!(mid_identity.pid, original_identity.pid);
-    assert_eq!(mid_identity.boot_id, original_identity.boot_id);
-    assert!(
-        host.try_wait().expect("poll host after cleanup").is_none(),
-        "cleanup journal must keep the foreground host running"
-    );
-
-    client.disconnect();
-
-    let fresh_id = ClientId::from_bytes(fixed_uuid_v7(0x42)).expect("fresh client");
-    let mut fresh = connect_bounded(
-        &HostClientConfig {
-            named_profile: profile.clone(),
-            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
-            client_id: fresh_id,
-            requested,
-            limits: FrameLimits::v1_default(),
+            assert!(
+                Instant::now() < exit_deadline,
+                "timed out waiting for intentional foreground host exit"
+            );
+            sleep(POLL).await;
         },
-        &mut host,
-    )
-    .await;
-    assert_eq!(
-        fresh.host_boot_id(),
-        original_identity.boot_id,
-        "fresh client must attach to the same host boot"
-    );
-
-    let mut replayed = Vec::new();
-    let mut batch = fresh
-        .open_event_replay(pre_close_cursor)
-        .await
-        .expect("replay open transport")
-        .expect("replay open query");
-    loop {
-        for event in &batch.page.events {
-            if let Event::HostCleanupBranchCompleted {
-                operation_id: event_op,
-                branch,
-                outcome,
-                ..
-            } = &event.payload
-            {
-                assert_eq!(*event_op, operation_id);
-                assert_eq!(*outcome, HostCleanupBranchOutcome::succeeded());
-                replayed.push(*branch);
-            }
-        }
-        let Some(cursor) = batch.page.next_cursor.clone() else {
-            break;
-        };
-        batch = fresh
-            .continue_event_replay(batch.subscription_id, cursor)
-            .await
-            .expect("replay continue transport")
-            .expect("replay continue query");
-    }
-    fresh
-        .release_event_replay(batch.subscription_id)
-        .await
-        .expect("release replay transport")
-        .expect("release replay query");
-    assert_eq!(
-        replayed.as_slice(),
-        &expected_order,
-        "reconnect replay from pre-close cursor must yield the same four cleanup events"
-    );
-
-    let status = fresh
-        .refresh_operation(operation_id)
-        .await
-        .expect("fresh status transport")
-        .expect("fresh status query");
-    assert_eq!(status, OperationState::Accepted);
-
-    let final_identity = read_identity(&lock_path).expect("final host identity");
-    assert_eq!(final_identity.pid, original_identity.pid);
-    assert_eq!(final_identity.boot_id, original_identity.boot_id);
+    };
     assert!(
-        host.try_wait()
-            .expect("poll host after fresh attach")
-            .is_none(),
-        "listener must still accept connections while quit stays Accepted"
+        exit_status.success(),
+        "healthy-client full quit must exit successfully: {}",
+        host.exited_diagnostics(exit_status)
     );
-
-    fresh.disconnect();
-    let status = host
-        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
-        .expect("terminate exact ChildGuard");
-    assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
+    host.release_exited_process_handle();
+
+    // Pipe must be absent: only ERROR_FILE_NOT_FOUND proves absence.
+    assert_named_pipe_absent(&profile, Instant::now() + READY_TIMEOUT).await;
+
+    assert_eq!(count_operation_settled(&paths.database), 1);
+    let (settled_sequence, settled_fact) = read_latest_operation_settled_fact(&paths.database);
+    assert_eq!(settled_sequence as u64, settled_event.sequence);
+    assert_eq!(settled_fact.operation_id, operation_id);
+    assert_eq!(settled_fact.action_epoch, Some(1));
+    assert_eq!(settled_fact.result_event_ids, branch_event_ids);
+    assert_eq!(
+        settled_sequence as u64,
+        final_branch_sequence + 1,
+        "SQLite terminal sequence must immediately follow branch four"
+    );
+    {
+        let bus = CommandBus::open(&paths.database).expect("open bus after quit");
+        assert_eq!(
+            bus.operation_status(operation_id)
+                .expect("operation status")
+                .expect("quit operation present"),
+            OperationState::Settled {
+                settled_at_ms: settled_fact.settled_at_ms,
+                result_event_ids: settled_fact.result_event_ids.clone(),
+            }
+        );
+        assert_eq!(
+            HostCleanupWorker::restart_disposition(&bus).expect("closed disposition"),
+            HostRestartDisposition::Closed {
+                operation_id,
+                action_epoch: 1,
+                settled_at_ms: settled_fact.settled_at_ms,
+            }
+        );
+    }
+
+    // Same-profile lock must be re-acquirable via the existing pre-bind Closed helper.
+    spawn_and_require_prebind_exit(config_base.path(), &profile).await;
+    assert_eq!(count_operation_settled(&paths.database), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3417,6 +3249,56 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
         "CleanupFailed must keep the foreground host running"
     );
 
+    let retry = client
+        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
+        .await
+        .expect("exact CommandId retry transport");
+    assert_eq!(
+        retry, confirm,
+        "caller-retained CommandId retry must return struct-identical Accepted"
+    );
+
+    let client_id_b = ClientId::from_bytes(fixed_uuid_v7(0x59)).expect("client b");
+    let mut client_b = connect_bounded(
+        &HostClientConfig {
+            named_profile: profile.clone(),
+            client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+            client_id: client_id_b,
+            requested: CapabilitySet::from_capabilities([
+                Capability::OperationSettlement,
+                Capability::HostShutdown,
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+            ]),
+            limits: FrameLimits::v1_default(),
+        },
+        &mut host,
+    )
+    .await;
+    let (create_b, _, _) =
+        create_task_named(client_id_b, 0x5a, 0x5b, 0x5c, 0x5d, "after cleanup failed");
+    let closing = client_b
+        .execute_command(create_b)
+        .await
+        .expect("second client mutation transport");
+    assert!(
+        matches!(
+            closing,
+            CommandReceipt::Rejected {
+                code: RejectionCode::Closing,
+                ..
+            }
+        ),
+        "second client mutation must Closing, got {closing:?}"
+    );
+    let after = client
+        .inspect_host_quit()
+        .await
+        .expect("post-failed inspect transport")
+        .expect("post-failed inspect");
+    assert!(!after.confirmable);
+    client_b.disconnect();
+
     client.disconnect();
 
     let fresh_id = ClientId::from_bytes(fixed_uuid_v7(0x58)).expect("fresh client");
@@ -3517,6 +3399,112 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
     assert!(host.try_wait().expect("final host poll").is_some());
 }
 
+fn read_ordered_cleanup_branch_events(path: &Path) -> (Vec<EventId>, u64) {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open sqlite read-only cleanup branch events");
+    let mut stmt = conn
+        .prepare(
+            "SELECT sequence, event_id FROM events
+             WHERE event_type = 'host.cleanup_branch_completed'
+             ORDER BY sequence ASC",
+        )
+        .expect("prepare cleanup branch events");
+    let rows = stmt
+        .query_map([], |row| {
+            let sequence: i64 = row.get(0)?;
+            let event_id: Vec<u8> = row.get(1)?;
+            Ok((sequence, event_id))
+        })
+        .expect("query cleanup branch events")
+        .map(|row| row.expect("cleanup branch event row"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        4,
+        "seeded Ready DB must have exactly four cleanup branch events"
+    );
+    let final_sequence = rows[3].0 as u64;
+    let ids = rows
+        .into_iter()
+        .map(|(_, bytes)| {
+            let arr: [u8; 16] = bytes.try_into().expect("event_id bytes");
+            EventId::from_bytes(arr).expect("event_id uuidv7")
+        })
+        .collect();
+    (ids, final_sequence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedPipePresence {
+    Absent,
+    Present,
+}
+
+/// One-shot raw Windows named-pipe probe for the profile endpoint.
+///
+/// Successful `CreateFileW` (handle closed immediately) and `ERROR_PIPE_BUSY`
+/// both mean Present. Only `ERROR_FILE_NOT_FOUND` means Absent. Any other
+/// error is a hard test failure.
+fn probe_named_pipe(profile: &str) -> NamedPipePresence {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let endpoint = pipe_endpoint_for_named_profile(profile).expect("profile endpoint");
+    let wide: Vec<u16> = endpoint.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_NORMAL.0),
+            None,
+        )
+    };
+    match result {
+        Ok(handle) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            NamedPipePresence::Present
+        }
+        Err(error) => {
+            // CreateFileW surfaces Win32 codes as HRESULT_FROM_WIN32 (0x8007xxxx).
+            let win32 = (error.code().0 as u32) & 0xFFFF;
+            if win32 == ERROR_FILE_NOT_FOUND.0 {
+                NamedPipePresence::Absent
+            } else if win32 == ERROR_PIPE_BUSY.0 {
+                NamedPipePresence::Present
+            } else {
+                panic!(
+                    "unexpected named-pipe probe error for {endpoint}: {error:?} (win32={win32})"
+                );
+            }
+        }
+    }
+}
+
+/// Poll until the named pipe is Absent, or fail at `deadline`.
+async fn assert_named_pipe_absent(profile: &str, deadline: Instant) {
+    let endpoint = pipe_endpoint_for_named_profile(profile).expect("profile endpoint");
+    loop {
+        match probe_named_pipe(profile) {
+            NamedPipePresence::Absent => return,
+            NamedPipePresence::Present => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for named pipe absence: {endpoint}"
+        );
+        sleep(POLL).await;
+    }
+}
+
 fn count_events(path: &Path) -> i64 {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open sqlite read-only event count");
@@ -3556,35 +3544,31 @@ fn read_latest_operation_settled_fact(
     (sequence, fact)
 }
 
-async fn wait_for_exit_before_pipe_accept(
+/// Poll the launched host until it exits without ever binding the named pipe.
+///
+/// While the child is alive, each loop samples the raw CreateFileW probe and
+/// fails immediately if the pipe is Present. This is a sampled watch (POLL
+/// cadence), not a continuous proof — HostClient Io/Unavailable/timeout is
+/// never treated as evidence. On child exit, require the probe to be Absent.
+async fn wait_for_exit_before_pipe_bind(
     host: &mut ChildGuard,
     profile: &str,
     overall_deadline: Instant,
 ) -> ExitStatus {
-    let connect_config = HostClientConfig {
-        named_profile: profile.to_string(),
-        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
-        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7f)).expect("probe client"),
-        requested: CapabilitySet::from_capabilities([Capability::HostShutdown]),
-        limits: FrameLimits::v1_default(),
-    };
+    let endpoint = pipe_endpoint_for_named_profile(profile).expect("profile endpoint");
     loop {
+        assert_eq!(
+            probe_named_pipe(profile),
+            NamedPipePresence::Absent,
+            "named pipe became Present during pre-bind host launch: {endpoint}"
+        );
         if let Some(status) = host.try_wait().expect("poll host for pre-bind exit") {
+            assert_eq!(
+                probe_named_pipe(profile),
+                NamedPipePresence::Absent,
+                "pre-bind exit must leave named pipe absent: {endpoint}"
+            );
             return status;
-        }
-        match timeout(
-            CONNECT_ATTEMPT_TIMEOUT.min(overall_deadline.saturating_duration_since(Instant::now())),
-            HostClient::connect(connect_config.clone()),
-        )
-        .await
-        {
-            Ok(Ok(_client)) => {
-                panic!("host accepted a pipe connection before pre-bind disposition exit");
-            }
-            Ok(Err(IpcError::Io(_) | IpcError::Unavailable | IpcError::Timeout)) | Err(_) => {}
-            Ok(Err(error)) => {
-                panic!("unexpected connect error while waiting for pre-bind exit: {error}")
-            }
         }
         assert!(
             Instant::now() < overall_deadline,
@@ -3607,7 +3591,8 @@ fn is_retryable_host_lock_contention(status: ExitStatus, stderr: &str) -> bool {
 /// Spawn isolated hosts until one completes the real HostLock acquire → pre-bind
 /// disposition path successfully. Retries only narrow HostLock contention/stale-prior
 /// shapes after releasing each exited child handle. Never edits host.lock and never
-/// HostLock::acquire from the test process.
+/// HostLock::acquire from the test process. While waiting, the raw named-pipe probe
+/// must stay Absent (sampled at POLL); a Present pipe fails the launch immediately.
 async fn spawn_and_require_prebind_exit(config_base: &Path, profile: &str) {
     let overall_deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -3616,7 +3601,7 @@ async fn spawn_and_require_prebind_exit(config_base: &Path, profile: &str) {
             "timed out retrying real host relaunch for pre-bind disposition exit"
         );
         let mut host = ChildGuard::spawn(host_command(config_base, profile));
-        let status = wait_for_exit_before_pipe_accept(&mut host, profile, overall_deadline).await;
+        let status = wait_for_exit_before_pipe_bind(&mut host, profile, overall_deadline).await;
         if status.success() {
             assert!(host.try_wait().expect("pre-bind success poll").is_some());
             host.release_exited_process_handle();
@@ -3634,135 +3619,70 @@ async fn spawn_and_require_prebind_exit(config_base: &Path, profile: &str) {
     }
 }
 
-/// Crash at all-success Accepted/Ready, then prove Ready settle and Closed no-op
-/// both exit successfully before HelloListener::bind / pipe accept.
+/// Seed all-success Accepted/Ready offline, then prove Ready settle and Closed
+/// no-op both exit successfully before HelloListener::bind (raw pipe stays Absent).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ready_restart_settles_before_bind_then_closed_exits_without_event() {
-    use devmanager::domain::event::Event;
     use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
-    use devmanager::host::{HostCleanupWorker, HostRestartDisposition};
+    use devmanager::host::{HostCleanupProgress, HostCleanupWorker, HostRestartDisposition};
     use devmanager::kernel::CommandBus;
 
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
     let paths = isolated_paths(&config_base, &profile);
-    let lock_path = paths.root.join("host.lock");
 
-    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
-    let original_identity = wait_for_identity(&mut host, &lock_path).await;
-
-    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x60)).expect("client");
-    let requested = CapabilitySet::from_capabilities([
-        Capability::OperationSettlement,
-        Capability::HostShutdown,
-        Capability::PagedSnapshots,
-        Capability::EventReplay,
-    ]);
-    let config = HostClientConfig {
-        named_profile: profile.clone(),
-        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
-        client_id,
-        requested,
-        limits: FrameLimits::v1_default(),
-    };
-    let mut client = connect_bounded(&config, &mut host).await;
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
-
-    let mut sub = ClientSubscription::new();
-    sub.synchronize(&mut client)
-        .await
-        .expect("pre-confirm synchronize");
-    assert_eq!(sub.state(), ClientSubscriptionState::Ready);
-
-    let inspection = client
-        .inspect_host_quit()
-        .await
-        .expect("inspect transport")
-        .expect("inspect query");
+    // Seed the exact all-success Accepted/Ready database in-process (no live-host race).
     let confirm_command_id =
         CommandId::from_bytes(fixed_uuid_v7(0x61)).expect("confirm command id");
-    let confirm = client
-        .confirm_host_quit(confirm_command_id, inspection.inspection_id, true)
-        .await
-        .expect("confirm transport");
-    let operation_id = match &confirm {
-        CommandReceipt::Accepted {
-            operation_id,
-            task_revision: None,
-            ..
-        } => *operation_id,
-        other => panic!("expected taskless Accepted, got {other:?}"),
-    };
-
-    let expected_order = HostCleanupBranch::ORDER;
-    let mut observed = Vec::new();
-    let mut branch_event_ids = Vec::new();
-    let mut final_branch_sequence = None;
-    let started = Instant::now();
-    while observed.len() < expected_order.len() {
-        if let Some(status) = host.try_wait().expect("poll host while waiting cleanup") {
-            let diagnostics = host.exited_diagnostics(status);
-            panic!("foreground host exited during cleanup journal: {diagnostics}");
-        }
-        let update = timeout(READY_TIMEOUT, sub.recv_and_apply(&client))
-            .await
-            .expect("live cleanup apply stayed bounded")
-            .expect("live cleanup apply");
-        match update {
-            SubscriptionUpdate::DurableEvent(event) => {
-                if let Event::HostCleanupBranchCompleted {
-                    operation_id: event_op,
-                    action_epoch,
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x60)).expect("client");
+    let operation_id = {
+        fs::create_dir_all(&paths.root).expect("create profile root for seed");
+        let mut bus = CommandBus::open(&paths.database).expect("open seed bus");
+        let inspection = bus.inspect_host_quit().expect("inspect");
+        let confirm = bus
+            .execute(CommandEnvelope {
+                command_id: confirm_command_id,
+                client_id,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_200,
+                expected_task_revision: None,
+                command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
+                    inspection_id: inspection.inspection_id,
+                    allow_uninspected_worktrees: true,
+                }),
+            })
+            .expect("confirm quit");
+        let operation_id = match confirm {
+            CommandReceipt::Accepted {
+                operation_id,
+                task_revision: None,
+                ..
+            } => operation_id,
+            other => panic!("expected taskless Accepted, got {other:?}"),
+        };
+        for branch in HostCleanupBranch::ORDER {
+            assert_eq!(
+                HostCleanupWorker::run_once(&mut bus).expect("cleanup branch"),
+                HostCleanupProgress::BranchCompleted {
+                    operation_id,
+                    action_epoch: 1,
                     branch,
-                    outcome,
-                } = event.payload
-                {
-                    assert_eq!(event_op, operation_id);
-                    assert_eq!(action_epoch, 1);
-                    assert_eq!(outcome, HostCleanupBranchOutcome::succeeded());
-                    branch_event_ids.push(event.id);
-                    observed.push(branch);
-                    final_branch_sequence = Some(event.sequence);
+                    outcome: HostCleanupBranchOutcome::succeeded(),
                 }
-            }
-            other => panic!("unexpected subscription update while waiting cleanup: {other:?}"),
+            );
         }
-        assert!(
-            started.elapsed() < READY_TIMEOUT,
-            "timed out waiting for four HostCleanupBranchCompleted events; observed={observed:?}"
+        assert_eq!(
+            HostCleanupWorker::run_once(&mut bus).expect("ready"),
+            HostCleanupProgress::ReadyToExit {
+                operation_id,
+                action_epoch: 1,
+            }
         );
-    }
-    assert_eq!(observed.as_slice(), &expected_order);
-    assert_eq!(branch_event_ids.len(), expected_order.len());
-    let final_branch_sequence =
-        final_branch_sequence.expect("fourth HostCleanupBranchCompleted sequence");
-
-    let status = client
-        .refresh_operation(operation_id)
-        .await
-        .expect("status transport")
-        .expect("status query");
-    assert_eq!(status, OperationState::Accepted);
-
-    client.disconnect();
-    let crash_status = host
-        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
-        .expect("terminate Ready host as crash boundary");
-    assert!(
-        !crash_status.success(),
-        "simulated crash termination should be non-success"
-    );
-    assert!(host.try_wait().expect("crash exit poll").is_some());
-    host.release_exited_process_handle();
-
-    let events_at_ready = count_events(&paths.database);
-    assert_eq!(
-        count_operation_settled(&paths.database),
-        0,
-        "Ready crash boundary must not yet have OperationSettled"
-    );
-    {
-        let bus = CommandBus::open(&paths.database).expect("open bus at Ready crash boundary");
+        assert_eq!(
+            count_operation_settled(&paths.database),
+            0,
+            "Ready seed must not yet have OperationSettled"
+        );
         assert_eq!(
             HostCleanupWorker::restart_disposition(&bus).expect("ready disposition"),
             HostRestartDisposition::ReadyToArmAndSettle {
@@ -3770,7 +3690,12 @@ async fn ready_restart_settles_before_bind_then_closed_exits_without_event() {
                 action_epoch: 1,
             }
         );
-    }
+        drop(bus);
+        operation_id
+    };
+    let (branch_event_ids, final_branch_sequence) =
+        read_ordered_cleanup_branch_events(&paths.database);
+    let events_at_ready = count_events(&paths.database);
 
     // Ready relaunch: settle exactly once, exit before bind, release HostLock.
     spawn_and_require_prebind_exit(config_base.path(), &profile).await;

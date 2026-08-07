@@ -3256,9 +3256,21 @@ fn host_cleanup_all_success_settle_once_idempotent_reopen_and_rebuild() {
             action_epoch: 1,
             settled_at_ms: first.settled_at_ms,
             result_event_ids: expected_ids.clone(),
+            terminal_event: first.terminal_event.clone(),
         }
     );
     assert!(first.settled_at_ms > 0);
+    assert!(first.terminal_event.sequence > 0);
+    assert_eq!(first.terminal_event.occurred_at_ms, first.settled_at_ms);
+    match &first.terminal_event.payload {
+        Event::OperationSettled(fact) => {
+            assert_eq!(fact.operation_id, quit_op);
+            assert_eq!(fact.action_epoch, Some(1));
+            assert_eq!(fact.result_event_ids, expected_ids);
+            assert_eq!(fact.settled_at_ms, first.settled_at_ms);
+        }
+        other => panic!("expected OperationSettled terminal payload, got {other:?}"),
+    }
     assert_eq!(count_table(&path, "events"), events_before + 1);
     assert_eq!(
         bus.operation_status(quit_op).expect("settled"),
@@ -3282,6 +3294,11 @@ fn host_cleanup_all_success_settle_once_idempotent_reopen_and_rebuild() {
 
     let second = HostCleanupWorker::settle_success(&mut bus).expect("idempotent");
     assert_eq!(second, first);
+    assert_eq!(second.terminal_event.id, first.terminal_event.id);
+    assert_eq!(
+        second.terminal_event.sequence,
+        first.terminal_event.sequence
+    );
     assert_eq!(count_table(&path, "events"), events_before + 1);
 
     drop(bus);

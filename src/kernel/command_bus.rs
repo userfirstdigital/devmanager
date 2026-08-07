@@ -189,10 +189,9 @@ impl CommandBus {
 
     /// Explicit all-success host-cleanup settle for c8b after physical exit is armed.
     ///
-    /// Maintenance must not call this. Exact retry is idempotent.
-    pub(crate) fn settle_host_cleanup_success(
-        &mut self,
-    ) -> Result<(OperationId, u64, i64, Vec<EventId>), StoreError> {
+    /// Maintenance must not call this. Exact retry is idempotent and returns the
+    /// same persisted terminal [`DomainEvent`] (event id + sequence).
+    pub(crate) fn settle_host_cleanup_success(&mut self) -> Result<DomainEvent, StoreError> {
         self.store.settle_host_cleanup_success()
     }
 
@@ -2837,6 +2836,7 @@ enum HostOperationTerminalKind {
 }
 
 struct HostOperationTerminalMatch {
+    event_id: EventId,
     sequence: u64,
     occurred_at_ms: i64,
     task_id: Option<TaskId>,
@@ -2888,7 +2888,7 @@ fn scan_host_operation_terminals(
         ) = row?;
         let sequence = u64_from_nonnegative_i64("events.sequence", sequence_i64)?;
         // Fail closed on any selected terminal row with invalid event_id bytes.
-        let _event_id = id16::<EventId>("events.event_id", &event_id_bytes)
+        let event_id = id16::<EventId>("events.event_id", &event_id_bytes)
             .map_err(|_| StoreError::Corruption)?;
         let event =
             crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
@@ -2926,6 +2926,7 @@ fn scan_host_operation_terminals(
                     None => None,
                 };
                 matches.push(HostOperationTerminalMatch {
+                    event_id,
                     sequence,
                     occurred_at_ms,
                     task_id,
@@ -2976,6 +2977,7 @@ fn require_exact_host_cleanup_failed_terminal(
 }
 
 struct HostCleanupSettledTerminal {
+    event_id: EventId,
     sequence: u64,
     occurred_at_ms: i64,
     task_id: Option<TaskId>,
@@ -2998,6 +3000,7 @@ fn require_exact_host_cleanup_settled_terminal(
         return Err(StoreError::Corruption);
     };
     Ok(HostCleanupSettledTerminal {
+        event_id: matched.event_id,
         sequence: matched.sequence,
         occurred_at_ms: matched.occurred_at_ms,
         task_id: matched.task_id,
@@ -6693,11 +6696,12 @@ fn finalize_complete_host_cleanup_journal_in_tx(
 
 /// Explicit all-success host-cleanup settle for c8b after physical exit is armed.
 ///
-/// Exact retry is idempotent. Maintenance must never call this.
+/// Exact retry is idempotent and returns the same persisted terminal
+/// [`DomainEvent`] (event id + sequence). Maintenance must never call this.
 pub(crate) fn settle_host_cleanup_success_in_tx(
     tx: &Transaction<'_>,
     now_ms: i64,
-) -> Result<(OperationId, u64, i64, Vec<EventId>), StoreError> {
+) -> Result<DomainEvent, StoreError> {
     let admission = load_host_admission_row(tx)?.ok_or(StoreError::Corruption)?;
     let operation = load_operation_projection_by_id(tx, admission.operation_id)?
         .ok_or(StoreError::Corruption)?;
@@ -6778,12 +6782,14 @@ pub(crate) fn settle_host_cleanup_success_in_tx(
                 action_epoch,
                 false,
             )?;
-            Ok((
-                admission.operation_id,
-                action_epoch,
-                settled_at_ms,
-                ordered_branch_ids,
-            ))
+            Ok(DomainEvent {
+                id: terminal.event_id,
+                task_id: None,
+                sequence: terminal.sequence,
+                task_revision: None,
+                occurred_at_ms: settled_at_ms,
+                payload: Event::OperationSettled(terminal.fact),
+            })
         }
         "accepted" => {
             if operation.result.is_some()
@@ -6837,20 +6843,23 @@ pub(crate) fn settle_host_cleanup_success_in_tx(
                 action_epoch,
                 false,
             )?;
-            append_and_project(
+            let event_id = EventId::new();
+            let sequence = append_and_project(
                 tx,
-                EventId::new(),
+                event_id,
                 None,
                 None,
                 now_ms,
-                Event::OperationSettled(settled),
+                Event::OperationSettled(settled.clone()),
             )?;
-            Ok((
-                admission.operation_id,
-                action_epoch,
-                now_ms,
-                ordered_branch_ids,
-            ))
+            Ok(DomainEvent {
+                id: event_id,
+                task_id: None,
+                sequence,
+                task_revision: None,
+                occurred_at_ms: now_ms,
+                payload: Event::OperationSettled(settled),
+            })
         }
         _ => Err(StoreError::Corruption),
     }

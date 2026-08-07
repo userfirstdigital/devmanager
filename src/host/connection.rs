@@ -7,17 +7,20 @@
 //! EventReplaySession, and ArtifactContentSession registries for paged snapshot,
 //! event-replay, and artifact-content queries.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::domain::command::{Command, CommandReceipt};
+use crate::domain::event::DomainEvent;
 use crate::domain::id::{ArtifactId, OperationId, SnapshotId, SubscriptionId, TaskId};
 use crate::domain::query::{
     Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
@@ -57,6 +60,32 @@ const SNAPSHOT_REAPER_PERIOD: Duration = Duration::from_secs(1);
 const MAX_EVENT_REPLAY_SESSIONS: usize = 32;
 const EVENT_REPLAY_IDLE_TTL: Duration = Duration::from_secs(30);
 const EVENT_REPLAY_REAPER_PERIOD: Duration = Duration::from_secs(1);
+
+/// One absolute deadline for all quit-terminal high-water ack waits.
+const QUIT_TERMINAL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Capacity-one supervisor arm request: drop the pending listener before ack.
+#[derive(Debug)]
+pub struct PhysicalExitArmRequest {
+    pub operation_id: OperationId,
+    pub action_epoch: u64,
+    pub ack: oneshot::Sender<()>,
+}
+
+/// Typed intentional exit from a supervised [`HostRequestExecutor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostExecutorOutcome {
+    Intentional {
+        operation_id: OperationId,
+        action_epoch: u64,
+    },
+}
+
+/// Supervised foreground executor: arm channel + join handle with typed outcome.
+pub struct SupervisedHostExecutor {
+    pub arm_rx: mpsc::Receiver<PhysicalExitArmRequest>,
+    pub join: JoinHandle<Result<HostExecutorOutcome, StoreError>>,
+}
 
 /// Internal completion routing for one host request job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +245,8 @@ pub(crate) struct LiveStreamState {
     generation: AtomicU64,
     /// Conservative last sequence successfully written on the durable pipe.
     last_physically_written: AtomicU64,
+    /// Persistent progress wakeups for quit durable high-water waits.
+    progress: Notify,
 }
 
 impl LiveStreamState {
@@ -223,6 +254,7 @@ impl LiveStreamState {
         Arc::new(Self {
             generation: AtomicU64::new(1),
             last_physically_written: AtomicU64::new(baseline),
+            progress: Notify::new(),
         })
     }
 
@@ -238,7 +270,7 @@ impl LiveStreamState {
         self.last_physically_written.load(Ordering::SeqCst)
     }
 
-    fn record_physical_write(&self, sequence: u64) {
+    pub(crate) fn record_physical_write(&self, sequence: u64) {
         let mut current = self.last_physically_written.load(Ordering::SeqCst);
         while sequence > current {
             match self.last_physically_written.compare_exchange_weak(
@@ -247,9 +279,31 @@ impl LiveStreamState {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    // Notify only when the atomic high-water actually advances.
+                    self.progress.notify_waiters();
+                    return;
+                }
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    /// Wait until [`Self::last_physically_written`] is at least `target`.
+    ///
+    /// Uses `Notified::enable` plus a recheck so a notify between the atomic
+    /// load and the await cannot be lost.
+    pub(crate) async fn wait_until_physically_written(&self, target: u64) {
+        loop {
+            if self.last_physically_written() >= target {
+                return;
+            }
+            let mut notified = pin!(self.progress.notified());
+            notified.as_mut().enable();
+            if self.last_physically_written() >= target {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -598,6 +652,8 @@ pub struct HostRequestExecutor {
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
     /// Latest accepted ConfirmHostQuit receipt ack per output (for terminal drain).
     pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
+    /// Supervised foreground only: capacity-one arm sender to the host supervisor.
+    arm_tx: Option<mpsc::Sender<PhysicalExitArmRequest>>,
 }
 
 impl HostRequestExecutor {
@@ -610,12 +666,66 @@ impl HostRequestExecutor {
         Self::spawn(bus, true)
     }
 
+    /// Supervised foreground start: arm channel + typed intentional exit outcome.
+    ///
+    /// Ordinary [`Self::start`] callers are unchanged. The supervisor must drop the
+    /// pending accept listener before acknowledging [`PhysicalExitArmRequest`].
+    pub fn start_supervised(bus: CommandBus) -> (HostRequestHandle, SupervisedHostExecutor) {
+        let (handle, join, arm_rx) = Self::spawn_supervised(bus, true);
+        (handle, SupervisedHostExecutor { arm_rx, join })
+    }
+
     /// Test-only: same executor as [`Self::start`], but without the automatic
     /// maintenance timer so explicit [`HostRequestHandle::run_maintenance_once`]
     /// calls are the only cleanup/teardown driver.
     #[cfg(test)]
     fn start_without_automatic_maintenance(bus: CommandBus) -> (HostRequestHandle, JoinHandle<()>) {
         Self::spawn(bus, false)
+    }
+
+    /// Test-only supervised start without the automatic maintenance timer.
+    #[cfg(test)]
+    fn start_supervised_without_automatic_maintenance(
+        bus: CommandBus,
+    ) -> (HostRequestHandle, SupervisedHostExecutor) {
+        let (handle, join, arm_rx) = Self::spawn_supervised(bus, false);
+        (handle, SupervisedHostExecutor { arm_rx, join })
+    }
+
+    fn spawn_supervised(
+        bus: CommandBus,
+        schedule_automatic_maintenance: bool,
+    ) -> (
+        HostRequestHandle,
+        JoinHandle<Result<HostExecutorOutcome, StoreError>>,
+        mpsc::Receiver<PhysicalExitArmRequest>,
+    ) {
+        let (tx, rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
+        let (arm_tx, arm_rx) = mpsc::channel(1);
+        let handle = HostRequestHandle {
+            tx,
+            control_tx,
+            output_id: None,
+        };
+        let mut executor = Self {
+            bus,
+            rx,
+            control_rx,
+            control_closed: false,
+            registry: SnapshotRegistry::new(),
+            replay_registry: EventReplayRegistry::new(),
+            artifact_content_registry: ArtifactContentRegistry::new(),
+            outputs: HashMap::new(),
+            pending_quit_receipt_acks: HashMap::new(),
+            arm_tx: Some(arm_tx),
+        };
+        let join = tokio::spawn(async move {
+            executor
+                .run_supervised(schedule_automatic_maintenance)
+                .await
+        });
+        (handle, join, arm_rx)
     }
 
     fn spawn(
@@ -639,6 +749,7 @@ impl HostRequestExecutor {
             artifact_content_registry: ArtifactContentRegistry::new(),
             outputs: HashMap::new(),
             pending_quit_receipt_acks: HashMap::new(),
+            arm_tx: None,
         };
         let join = tokio::spawn(async move {
             executor.run(schedule_automatic_maintenance).await;
@@ -668,47 +779,7 @@ impl HostRequestExecutor {
                         self.control_closed = true;
                         continue;
                     };
-                    match control {
-                        ExecutorControl::RegisterOutput { id, output, ack } => {
-                            self.outputs.insert(id, output);
-                            if ack.send(()).is_err() {
-                                // Caller canceled (or dropped) before observing
-                                // the ack; detach immediately so outputs cannot
-                                // leak until the next reaper tick.
-                                self.detach_output(id);
-                            }
-                        }
-                        ExecutorControl::UnregisterOutput { id } => {
-                            self.detach_output(id);
-                        }
-                        #[cfg(test)]
-                        ExecutorControl::InspectOutput { id, ack } => {
-                            let registered = self.outputs.contains_key(&id);
-                            let live_bound = self.replay_registry.entries.values().any(|entry| {
-                                entry
-                                    .live
-                                    .as_ref()
-                                    .is_some_and(|live| live.output_id == id)
-                            });
-                            let _ = ack.send(OutputInspection {
-                                registered,
-                                live_bound,
-                            });
-                        }
-                        #[cfg(test)]
-                        ExecutorControl::RunMaintenanceOnce { ack } => {
-                            let result = self.run_one_cleanup_or_teardown_unit();
-                            let _ = ack.send(result);
-                        }
-                        #[cfg(test)]
-                        ExecutorControl::TakePendingQuitReceiptAck { id, ack } => {
-                            let taken = self
-                                .pending_quit_receipt_acks
-                                .remove(&id)
-                                .map(|pending| (pending.operation_id, pending.ack));
-                            let _ = ack.send(taken);
-                        }
-                    }
+                    self.handle_control(control);
                 }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
@@ -727,6 +798,388 @@ impl HostRequestExecutor {
                 }
             }
         }
+    }
+
+    async fn run_supervised(
+        &mut self,
+        schedule_automatic_maintenance: bool,
+    ) -> Result<HostExecutorOutcome, StoreError> {
+        let period = SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD);
+        let mut reaper = interval_at(tokio::time::Instant::now() + period, period);
+        reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                job = self.rx.recv() => {
+                    let Some(job) = job else {
+                        return Err(StoreError::Io(
+                            "supervised executor request queue closed unexpectedly".into(),
+                        ));
+                    };
+                    let result = self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing);
+                    let _ = job.reply.send(result);
+                }
+                control = self.control_rx.recv(), if !self.control_closed => {
+                    let Some(control) = control else {
+                        self.control_closed = true;
+                        continue;
+                    };
+                    if let Some(outcome) = self.handle_control_supervised(control).await? {
+                        return Ok(outcome);
+                    }
+                }
+                _ = reaper.tick(), if schedule_automatic_maintenance => {
+                    let now = Instant::now();
+                    self.registry.reap_idle(now);
+                    self.replay_registry.reap_idle(now);
+                    self.artifact_content_registry.reap(now);
+                    self.reap_shutdown_outputs();
+                    if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
+                        return Ok(outcome);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_control(&mut self, control: ExecutorControl) {
+        match control {
+            ExecutorControl::RegisterOutput { id, output, ack } => {
+                self.outputs.insert(id, output);
+                if ack.send(()).is_err() {
+                    self.detach_output(id);
+                }
+            }
+            ExecutorControl::UnregisterOutput { id } => {
+                self.detach_output(id);
+            }
+            #[cfg(test)]
+            ExecutorControl::InspectOutput { id, ack } => {
+                let registered = self.outputs.contains_key(&id);
+                let live_bound = self
+                    .replay_registry
+                    .entries
+                    .values()
+                    .any(|entry| entry.live.as_ref().is_some_and(|live| live.output_id == id));
+                let _ = ack.send(OutputInspection {
+                    registered,
+                    live_bound,
+                });
+            }
+            #[cfg(test)]
+            ExecutorControl::RunMaintenanceOnce { ack } => {
+                let result = self.run_one_cleanup_or_teardown_unit();
+                let _ = ack.send(result);
+            }
+            #[cfg(test)]
+            ExecutorControl::TakePendingQuitReceiptAck { id, ack } => {
+                let taken = self
+                    .pending_quit_receipt_acks
+                    .remove(&id)
+                    .map(|pending| (pending.operation_id, pending.ack));
+                let _ = ack.send(taken);
+            }
+        }
+    }
+
+    async fn handle_control_supervised(
+        &mut self,
+        control: ExecutorControl,
+    ) -> Result<Option<HostExecutorOutcome>, StoreError> {
+        match control {
+            #[cfg(test)]
+            ExecutorControl::RunMaintenanceOnce { ack } => {
+                match self.drive_supervised_maintenance_unit().await {
+                    Ok(Some(outcome)) => {
+                        let _ = ack.send(Ok(()));
+                        Ok(Some(outcome))
+                    }
+                    Ok(None) => {
+                        let _ = ack.send(Ok(()));
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        let _ = ack.send(Err(error.clone()));
+                        Err(error)
+                    }
+                }
+            }
+            other => {
+                self.handle_control(other);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Advance one Open/Closing unit; on supervised ReadyToExit, arm+settle+exit.
+    async fn drive_supervised_maintenance_unit(
+        &mut self,
+    ) -> Result<Option<HostExecutorOutcome>, StoreError> {
+        let closing = self.bus.host_admission_is_closing()?;
+        if !closing {
+            match ProcessEmptyTeardownWorker::run_once(&mut self.bus)? {
+                ProcessEmptyTeardown::Idle => Ok(None),
+                ProcessEmptyTeardown::Settled { .. } => {
+                    self.fan_out_live_durable_events();
+                    Ok(None)
+                }
+            }
+        } else {
+            match HostCleanupWorker::run_once(&mut self.bus)? {
+                HostCleanupProgress::Idle => Ok(None),
+                HostCleanupProgress::ReadyToExit {
+                    operation_id,
+                    action_epoch,
+                } => self
+                    .arm_and_complete_intentional_quit(operation_id, action_epoch)
+                    .await
+                    .map(Some),
+                HostCleanupProgress::Progressed { .. }
+                | HostCleanupProgress::BranchCompleted { .. }
+                | HostCleanupProgress::Failed { .. } => {
+                    self.fan_out_live_durable_events();
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    async fn arm_and_complete_intentional_quit(
+        &mut self,
+        operation_id: OperationId,
+        action_epoch: u64,
+    ) -> Result<HostExecutorOutcome, StoreError> {
+        let arm_tx = self.arm_tx.as_ref().ok_or_else(|| {
+            StoreError::Io("supervised executor missing physical-exit arm sender".into())
+        })?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        arm_tx
+            .send(PhysicalExitArmRequest {
+                operation_id,
+                action_epoch,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                StoreError::Io("physical-exit arm request rejected by supervisor".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            StoreError::Io("physical-exit arm acknowledgement dropped by supervisor".into())
+        })?;
+
+        self.quiesce_intake();
+        // Fail closed on receipt lineage before any durable settle can persist Closed.
+        self.reap_shutdown_outputs();
+        let high_water = std::mem::take(&mut self.pending_quit_receipt_acks);
+        for pending in high_water.values() {
+            if pending.operation_id != operation_id {
+                return Err(StoreError::Corruption);
+            }
+        }
+
+        let settlement = HostCleanupWorker::settle_success(&mut self.bus)?;
+        if settlement.operation_id != operation_id || settlement.action_epoch != action_epoch {
+            return Err(StoreError::Corruption);
+        }
+
+        self.deliver_terminal_and_await_high_water(
+            settlement.terminal_event,
+            operation_id,
+            high_water,
+        )
+        .await?;
+
+        for output in self.outputs.values() {
+            output.request_shutdown();
+        }
+
+        Ok(HostExecutorOutcome::Intentional {
+            operation_id,
+            action_epoch,
+        })
+    }
+
+    fn quiesce_intake(&mut self) {
+        self.rx.close();
+        self.control_rx.close();
+        self.control_closed = true;
+        while let Ok(job) = self.rx.try_recv() {
+            let _ = job.reply.send(Err(IpcError::Unavailable));
+        }
+        while let Ok(control) = self.control_rx.try_recv() {
+            match control {
+                ExecutorControl::RegisterOutput { output, ack, .. } => {
+                    output.request_shutdown();
+                    drop(ack);
+                }
+                ExecutorControl::UnregisterOutput { id } => {
+                    self.detach_output(id);
+                }
+                #[cfg(test)]
+                ExecutorControl::InspectOutput { ack, .. } => {
+                    drop(ack);
+                }
+                #[cfg(test)]
+                ExecutorControl::RunMaintenanceOnce { ack } => {
+                    let _ = ack.send(Err(StoreError::Io(
+                        "maintenance rejected after quit intake quiesce".into(),
+                    )));
+                }
+                #[cfg(test)]
+                ExecutorControl::TakePendingQuitReceiptAck { ack, .. } => {
+                    let _ = ack.send(None);
+                }
+            }
+        }
+    }
+
+    async fn deliver_terminal_and_await_high_water(
+        &mut self,
+        terminal_event: DomainEvent,
+        quit_operation_id: OperationId,
+        mut high_water: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
+    ) -> Result<(), StoreError> {
+        self.reap_shutdown_outputs();
+        let deadline = Instant::now() + QUIT_TERMINAL_ACK_TIMEOUT;
+
+        // Snapshot each live tail's stream + last admitted sequence, grouped by
+        // output. Subscription IDs are sorted for deterministic terminal order.
+        let mut live_bindings: Vec<(ConnectionOutputId, SubscriptionId)> = self
+            .replay_registry
+            .entries
+            .iter()
+            .filter_map(|(subscription_id, entry)| {
+                entry
+                    .live
+                    .as_ref()
+                    .map(|live| (live.output_id, *subscription_id))
+            })
+            .collect();
+        live_bindings.sort_unstable();
+
+        let mut by_output: BTreeMap<
+            ConnectionOutputId,
+            Vec<(SubscriptionId, Arc<LiveStreamState>, u64)>,
+        > = BTreeMap::new();
+        for (output_id, subscription_id) in live_bindings {
+            let Some(live) = self
+                .replay_registry
+                .entries
+                .get(&subscription_id)
+                .and_then(|entry| entry.live.as_ref())
+            else {
+                continue;
+            };
+            by_output.entry(output_id).or_default().push((
+                subscription_id,
+                Arc::clone(&live.stream),
+                live.last_admitted_sequence,
+            ));
+        }
+
+        let mut pending_outputs: HashMap<ConnectionOutputId, Vec<SubscriptionId>> = HashMap::new();
+        let mut fences = FuturesUnordered::new();
+        for (output_id, tails) in by_output {
+            let subscription_ids: Vec<SubscriptionId> = tails
+                .iter()
+                .map(|(subscription_id, _, _)| *subscription_id)
+                .collect();
+            pending_outputs.insert(output_id, subscription_ids.clone());
+            fences.push(async move {
+                for (_, stream, target) in tails {
+                    stream.wait_until_physically_written(target).await;
+                }
+                (output_id, subscription_ids)
+            });
+        }
+
+        while !fences.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, fences.next()).await {
+                Ok(Some((output_id, subscription_ids))) => {
+                    pending_outputs.remove(&output_id);
+                    // Durable high-water reached: cancel only these live tails, then
+                    // admit ordered terminal CRITICAL (never after skipped history).
+                    for subscription_id in &subscription_ids {
+                        self.replay_registry.remove(*subscription_id);
+                    }
+                    let Some(output) = self.outputs.get(&output_id).cloned() else {
+                        high_water.remove(&output_id);
+                        continue;
+                    };
+                    let mut last_terminal_ack = None;
+                    let mut admit_ok = true;
+                    for subscription_id in &subscription_ids {
+                        match output.try_enqueue_critical_tracked(ServerMessage::DurableEvent {
+                            subscription_id: *subscription_id,
+                            event: terminal_event.clone(),
+                        }) {
+                            Ok(ack) => last_terminal_ack = Some(ack),
+                            Err(_) => {
+                                admit_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !admit_ok {
+                        if let Some(output) = self.outputs.get(&output_id) {
+                            output.request_shutdown();
+                        }
+                        high_water.remove(&output_id);
+                        continue;
+                    }
+                    if let Some(ack) = last_terminal_ack {
+                        high_water.insert(
+                            output_id,
+                            PendingQuitReceiptAck {
+                                operation_id: quit_operation_id,
+                                ack,
+                            },
+                        );
+                    } else {
+                        high_water.remove(&output_id);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        // Shared deadline expired or fences dropped: never settle after skipped history.
+        for (output_id, subscription_ids) in pending_outputs.drain() {
+            self.abort_quit_output_chain(output_id, &subscription_ids, &mut high_water);
+        }
+        drop(fences);
+
+        // Receipt-only / final-terminal high-waters use only the remainder of the
+        // same absolute deadline — no per-client fresh timeout.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = tokio::time::timeout(remaining, async {
+                for (_, pending) in high_water {
+                    let _ = pending.ack.wait().await;
+                }
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    fn abort_quit_output_chain(
+        &mut self,
+        output_id: ConnectionOutputId,
+        subscription_ids: &[SubscriptionId],
+        high_water: &mut HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
+    ) {
+        for subscription_id in subscription_ids {
+            self.replay_registry.remove(*subscription_id);
+        }
+        if let Some(output) = self.outputs.get(&output_id) {
+            output.request_shutdown();
+        }
+        high_water.remove(&output_id);
     }
 
     /// Advance exactly one Open teardown or Closing cleanup unit and fan out on progress.
@@ -1737,7 +2190,7 @@ pub(crate) fn dispatch_authenticated_request(
 ///
 /// Production registrations use the wire [`ServerHello::connection_id`] so host
 /// and client share one identity. Unit tests may generate ids via [`Self::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ConnectionOutputId(Uuid);
 
 impl ConnectionOutputId {
@@ -2918,6 +3371,61 @@ mod output_tests {
             }
             other => panic!("expected prepared ResyncRequired, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_stream_wait_until_physically_written_returns_immediately_when_already_advanced() {
+        let stream = LiveStreamState::new(10);
+        assert_eq!(stream.last_physically_written(), 10);
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            stream.wait_until_physically_written(10),
+        )
+        .await
+        .expect("already-advanced wait must complete without blocking");
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            stream.wait_until_physically_written(7),
+        )
+        .await
+        .expect("lower target must also complete immediately");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_stream_wait_until_physically_written_observes_progress_without_lost_wakeup() {
+        let stream = LiveStreamState::new(1);
+        let waiter_stream = Arc::clone(&stream);
+        let waiter = tokio::spawn(async move {
+            waiter_stream.wait_until_physically_written(5).await;
+        });
+        // Yield so the waiter can register Notified::enable before progress.
+        tokio::task::yield_now().await;
+        stream.record_physical_write(3);
+        assert_eq!(stream.last_physically_written(), 3);
+        assert!(
+            !waiter.is_finished(),
+            "waiter must remain pending below target"
+        );
+        stream.record_physical_write(5);
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("progress notify must wake waiter promptly")
+            .expect("join");
+        assert_eq!(stream.last_physically_written(), 5);
+
+        // Stale / equal sequences must not notify (high-water does not advance).
+        let stalled = Arc::clone(&stream);
+        let stalled_waiter = tokio::spawn(async move {
+            stalled.wait_until_physically_written(6).await;
+        });
+        tokio::task::yield_now().await;
+        stream.record_physical_write(4);
+        stream.record_physical_write(5);
+        assert!(
+            !stalled_waiter.is_finished(),
+            "non-advancing writes must not wake a higher target waiter"
+        );
+        stalled_waiter.abort();
     }
 
     fn sample_stream_key(tail: u8) -> StreamKey {
@@ -4926,5 +5434,539 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+    }
+
+    fn event_replay_negotiated(client: ClientId) -> NegotiatedParameters {
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::HostShutdown,
+                Capability::EventReplay,
+                Capability::OperationSettlement,
+            ]),
+            limits: FrameLimits::v1_default(),
+        }
+    }
+
+    fn count_settled(path: &std::path::Path) -> i64 {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("ro");
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'operation.settled'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_ready_does_not_settle_until_arm_ack_then_exits_intentional() {
+        use crate::domain::host::HostCleanupBranch;
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::ServerMessage;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("arm-before-settle.db");
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, mut supervised) =
+            HostRequestExecutor::start_supervised_without_automatic_maintenance(bus);
+        let (out, mut ports) = ConnectionOutputHandle::new(8, 8, 1);
+        let reg = requests.register_output(out).await.expect("register");
+        let client = ClientId::new();
+        let negotiated = event_replay_negotiated(client);
+        let handle = requests.with_output(reg.id());
+        let inspection_id = inspection_id_for(&handle, negotiated.clone(), client).await;
+
+        let completion = handle
+            .execute_for_duplex(
+                negotiated.clone(),
+                confirm_quit_request(client, CommandId::new(), inspection_id),
+            )
+            .await
+            .expect("duplex quit");
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = completion
+        else {
+            panic!("expected admitted quit receipt");
+        };
+        // Complete receipt write so high-water can succeed.
+        ports
+            .try_recv_prioritized()
+            .expect("receipt critical")
+            .after_successful_write();
+
+        // Open a live subscription so terminal CRITICAL fanout has a target.
+        let open = handle
+            .execute(
+                negotiated,
+                ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: None,
+                    query: crate::domain::query::Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open replay");
+        let subscription_id = match open {
+            ServerMessage::QueryReply(reply) => match reply.outcome {
+                crate::domain::query::QueryOutcome::Ok(
+                    crate::domain::query::QueryResult::EventReplayPage {
+                        subscription_id, ..
+                    },
+                ) => subscription_id,
+                other => panic!("expected EventReplayPage, got {other:?}"),
+            },
+            other => panic!("expected QueryReply, got {other:?}"),
+        };
+        // Drain any catch-up durables from open.
+        while let Some(outbound) = ports.try_recv_prioritized() {
+            outbound.after_successful_write();
+        }
+
+        for _ in HostCleanupBranch::ORDER {
+            requests.run_maintenance_once().await.expect("branch");
+            while let Some(outbound) = ports.try_recv_prioritized() {
+                outbound.after_successful_write();
+            }
+        }
+        assert_eq!(count_settled(&db_path), 0);
+
+        // Kick ReadyToExit → arm without acking yet.
+        let maintenance = tokio::spawn({
+            let requests = requests.clone();
+            async move { requests.run_maintenance_once().await }
+        });
+        let arm = supervised
+            .arm_rx
+            .recv()
+            .await
+            .expect("arm request before settle");
+        assert_eq!(arm.operation_id, operation_id);
+        assert_eq!(arm.action_epoch, 1);
+        assert_eq!(
+            count_settled(&db_path),
+            0,
+            "must not settle before arm acknowledgement"
+        );
+
+        // Writer drain task so terminal high-water can complete after settle.
+        let drain = tokio::spawn(async move {
+            while let Some(outbound) = ports.recv_prioritized().await {
+                outbound.after_successful_write();
+            }
+        });
+
+        arm.ack.send(()).expect("ack arm");
+        maintenance
+            .await
+            .expect("maintenance join")
+            .expect("maintenance ok");
+        let outcome = supervised.join.await.expect("join").expect("intentional");
+        assert_eq!(
+            outcome,
+            super::HostExecutorOutcome::Intentional {
+                operation_id,
+                action_epoch: 1,
+            }
+        );
+        assert_eq!(count_settled(&db_path), 1);
+        let _ = drain.await;
+        let _ = subscription_id;
+        drop(reg);
+        drop(requests);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_terminal_critical_fanout_high_water_receipt_only_and_live_watcher() {
+        use crate::domain::command::CommandReceipt;
+        use crate::domain::event::Event;
+        use crate::domain::host::HostCleanupBranch;
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::ServerMessage;
+        use std::collections::BTreeSet;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("terminal-fanout.db");
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, mut supervised) =
+            HostRequestExecutor::start_supervised_without_automatic_maintenance(bus);
+
+        // Receipt-only initiator: dequeue but do not physically complete until after arm.
+        let (receipt_out, mut receipt_ports) = ConnectionOutputHandle::new(8, 8, 1);
+        let receipt_reg = requests
+            .register_output(receipt_out)
+            .await
+            .expect("register receipt");
+        let receipt_client = ClientId::new();
+        let receipt_neg = host_shutdown_negotiated(receipt_client);
+        let receipt_handle = requests.with_output(receipt_reg.id());
+        let inspection_id =
+            inspection_id_for(&receipt_handle, receipt_neg.clone(), receipt_client).await;
+        let completion = receipt_handle
+            .execute_for_duplex(
+                receipt_neg,
+                confirm_quit_request(receipt_client, CommandId::new(), inspection_id),
+            )
+            .await
+            .expect("quit");
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = completion
+        else {
+            panic!("expected admitted quit");
+        };
+        let receipt_frame = receipt_ports
+            .try_recv_prioritized()
+            .expect("receipt critical");
+        assert!(matches!(
+            receipt_frame.message(),
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+        ));
+        // Hold receipt_frame until after arm (pending high-water).
+
+        // Live-only watcher with TWO subscriptions on one output.
+        let (live_out, mut live_ports) = ConnectionOutputHandle::new(8, 8, 1);
+        let live_reg = requests
+            .register_output(live_out)
+            .await
+            .expect("register live");
+        let live_client = ClientId::new();
+        let live_neg = event_replay_negotiated(live_client);
+        let live_handle = requests.with_output(live_reg.id());
+        let mut live_subs = Vec::new();
+        for _ in 0..2 {
+            let open = live_handle
+                .execute(
+                    live_neg.clone(),
+                    ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                        request_id: RequestId::new(),
+                        client_id: live_client,
+                        task_id: None,
+                        query: crate::domain::query::Query::OpenEventReplay { after_sequence: 0 },
+                    }),
+                )
+                .await
+                .expect("open");
+            let sub = match open {
+                ServerMessage::QueryReply(reply) => match reply.outcome {
+                    crate::domain::query::QueryOutcome::Ok(
+                        crate::domain::query::QueryResult::EventReplayPage {
+                            subscription_id, ..
+                        },
+                    ) => subscription_id,
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            };
+            live_subs.push(sub);
+            while let Some(outbound) = live_ports.try_recv_prioritized() {
+                outbound.after_successful_write();
+            }
+        }
+        assert_eq!(live_subs.len(), 2);
+        assert_ne!(live_subs[0], live_subs[1]);
+
+        for _ in HostCleanupBranch::ORDER {
+            requests.run_maintenance_once().await.expect("branch");
+            while let Some(outbound) = live_ports.try_recv_prioritized() {
+                outbound.after_successful_write();
+            }
+        }
+        assert!(receipt_ports.try_recv_prioritized().is_none());
+
+        let maintenance = tokio::spawn({
+            let requests = requests.clone();
+            async move { requests.run_maintenance_once().await }
+        });
+        let arm = supervised.arm_rx.recv().await.expect("arm");
+        assert_eq!(arm.operation_id, operation_id);
+
+        let expected_subs: BTreeSet<_> = live_subs.iter().copied().collect();
+        let receipt_drain = tokio::spawn(async move {
+            let mut saw_terminal = false;
+            // Complete the held receipt after arm (receipt-only high-water).
+            receipt_frame.after_successful_write();
+            while let Some(outbound) = receipt_ports.recv_prioritized().await {
+                if matches!(
+                    outbound.message(),
+                    ServerMessage::DurableEvent {
+                        event: DomainEvent {
+                            payload: Event::OperationSettled(_),
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    saw_terminal = true;
+                }
+                outbound.after_successful_write();
+            }
+            saw_terminal
+        });
+        let live_drain = tokio::spawn(async move {
+            let mut terminal_subs = BTreeSet::new();
+            while let Some(outbound) = live_ports.recv_prioritized().await {
+                if let ServerMessage::DurableEvent {
+                    subscription_id,
+                    event:
+                        DomainEvent {
+                            payload: Event::OperationSettled(fact),
+                            ..
+                        },
+                } = outbound.message()
+                {
+                    assert_eq!(fact.operation_id, operation_id);
+                    assert_eq!(fact.action_epoch, Some(1));
+                    terminal_subs.insert(*subscription_id);
+                }
+                outbound.after_successful_write();
+            }
+            terminal_subs
+        });
+
+        arm.ack.send(()).expect("ack");
+        maintenance.await.expect("join").expect("ok");
+        let outcome = supervised.join.await.expect("exec").expect("intentional");
+        assert_eq!(
+            outcome,
+            super::HostExecutorOutcome::Intentional {
+                operation_id,
+                action_epoch: 1,
+            }
+        );
+        assert!(
+            !receipt_drain.await.expect("receipt drain"),
+            "receipt-only output must not receive a terminal CRITICAL"
+        );
+        assert_eq!(
+            live_drain.await.expect("live drain"),
+            expected_subs,
+            "two live subscriptions require two distinct terminal CRITICAL frames"
+        );
+        drop(receipt_reg);
+        drop(live_reg);
+        drop(requests);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_terminal_flushes_ordered_durables_before_settlement_with_slow_output_isolation(
+    ) {
+        use crate::domain::event::Event;
+        use crate::domain::host::HostCleanupBranch;
+        use crate::domain::id::CommandId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::ServerMessage;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ordered-durable-fence.db");
+        let bus = CommandBus::open(&db_path).expect("bus");
+        let (requests, mut supervised) =
+            HostRequestExecutor::start_supervised_without_automatic_maintenance(bus);
+
+        let (healthy_out, mut healthy_ports) = ConnectionOutputHandle::new(8, 8, 1);
+        let healthy_reg = requests
+            .register_output(healthy_out)
+            .await
+            .expect("register healthy");
+        let healthy_client = ClientId::new();
+        let healthy_neg = event_replay_negotiated(healthy_client);
+        let healthy_handle = requests.with_output(healthy_reg.id());
+        let inspection_id =
+            inspection_id_for(&healthy_handle, healthy_neg.clone(), healthy_client).await;
+        let completion = healthy_handle
+            .execute_for_duplex(
+                healthy_neg.clone(),
+                confirm_quit_request(healthy_client, CommandId::new(), inspection_id),
+            )
+            .await
+            .expect("quit");
+        let DuplexExecuteCompletion::ExecutorAdmittedQuitReceipt { operation_id } = completion
+        else {
+            panic!("expected admitted quit");
+        };
+        healthy_ports
+            .try_recv_prioritized()
+            .expect("receipt")
+            .after_successful_write();
+
+        let (slow_out, mut slow_ports) = ConnectionOutputHandle::new(8, 8, 1);
+        let slow_probe = slow_out.clone();
+        let slow_reg = requests
+            .register_output(slow_out)
+            .await
+            .expect("register slow");
+        let slow_client = ClientId::new();
+        let slow_neg = event_replay_negotiated(slow_client);
+        let slow_handle = requests.with_output(slow_reg.id());
+
+        let open_healthy = healthy_handle
+            .execute(
+                healthy_neg,
+                ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: healthy_client,
+                    task_id: None,
+                    query: crate::domain::query::Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open healthy");
+        assert!(matches!(open_healthy, ServerMessage::QueryReply(_)));
+        while let Some(outbound) = healthy_ports.try_recv_prioritized() {
+            outbound.after_successful_write();
+        }
+
+        let open_slow = slow_handle
+            .execute(
+                slow_neg,
+                ClientRequest::Query(crate::domain::query::QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: slow_client,
+                    task_id: None,
+                    query: crate::domain::query::Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open slow");
+        assert!(matches!(open_slow, ServerMessage::QueryReply(_)));
+        while let Some(outbound) = slow_ports.try_recv_prioritized() {
+            outbound.after_successful_write();
+        }
+
+        // Admit four HostCleanupBranchCompleted durables; leave them queued (unacked).
+        for _ in HostCleanupBranch::ORDER {
+            requests.run_maintenance_once().await.expect("branch");
+        }
+
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let healthy_drain = tokio::spawn(async move {
+            let mut branch_sequences = Vec::new();
+            let mut saw_settled = false;
+            let mut settled_signal = Some(settled_tx);
+            while let Some(outbound) = healthy_ports.recv_prioritized().await {
+                match outbound.message() {
+                    ServerMessage::DurableEvent {
+                        event:
+                            DomainEvent {
+                                sequence,
+                                payload: Event::HostCleanupBranchCompleted { .. },
+                                ..
+                            },
+                        ..
+                    } => {
+                        assert!(
+                            !saw_settled,
+                            "HostCleanupBranchCompleted must precede OperationSettled"
+                        );
+                        branch_sequences.push(*sequence);
+                    }
+                    ServerMessage::DurableEvent {
+                        event:
+                            DomainEvent {
+                                payload: Event::OperationSettled(fact),
+                                ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(fact.operation_id, operation_id);
+                        assert_eq!(fact.action_epoch, Some(1));
+                        saw_settled = true;
+                        if let Some(tx) = settled_signal.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ => {}
+                }
+                outbound.after_successful_write();
+            }
+            (branch_sequences, saw_settled)
+        });
+
+        let started = std::time::Instant::now();
+        let maintenance = tokio::spawn({
+            let requests = requests.clone();
+            async move { requests.run_maintenance_once().await }
+        });
+        let arm = supervised.arm_rx.recv().await.expect("arm");
+        assert_eq!(arm.operation_id, operation_id);
+        arm.ack.send(()).expect("ack");
+
+        // Healthy output must settle promptly; slow output must still be fencing.
+        tokio::time::timeout(Duration::from_secs(2), settled_rx)
+            .await
+            .expect("healthy OperationSettled must arrive well before the 5s slow-output deadline")
+            .expect("settled signal");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "healthy settlement must not wait on the stalled output"
+        );
+        assert!(
+            !maintenance.is_finished(),
+            "executor/maintenance path must still be pending while slow output fences"
+        );
+        assert!(
+            !supervised.join.is_finished(),
+            "supervised executor must still be pending while slow output fences"
+        );
+
+        maintenance.await.expect("join").expect("ok");
+        let outcome = supervised.join.await.expect("exec").expect("intentional");
+        assert_eq!(
+            outcome,
+            super::HostExecutorOutcome::Intentional {
+                operation_id,
+                action_epoch: 1,
+            }
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "host/executor must exit within the one global terminal bound"
+        );
+
+        let (branch_sequences, saw_settled) = healthy_drain.await.expect("healthy drain");
+        assert_eq!(
+            branch_sequences.len(),
+            HostCleanupBranch::ORDER.len(),
+            "healthy output must physically write all admitted branch durables"
+        );
+        assert!(
+            branch_sequences.windows(2).all(|w| w[0] < w[1]),
+            "branch durables must be written in increasing sequence: {branch_sequences:?}"
+        );
+        assert!(
+            saw_settled,
+            "healthy output must receive OperationSettled CRITICAL after ordered durables"
+        );
+
+        assert!(
+            slow_probe.is_shutdown_requested(),
+            "slow output must be shut down after durable fence deadline"
+        );
+        let mut slow_saw_settled = false;
+        while let Some(outbound) = slow_ports.try_recv_prioritized() {
+            if matches!(
+                outbound.message(),
+                ServerMessage::DurableEvent {
+                    event: DomainEvent {
+                        payload: Event::OperationSettled(_),
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                slow_saw_settled = true;
+            }
+        }
+        assert!(
+            !slow_saw_settled,
+            "slow output must never receive OperationSettled after skipped durable history"
+        );
+
+        drop(healthy_reg);
+        drop(slow_reg);
+        drop(requests);
     }
 }

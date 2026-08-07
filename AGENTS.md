@@ -43,6 +43,12 @@
 - Finalize resync fields that claim wire delivery in the single writer after any
   earlier in-flight frame settles. Release, resync, retarget, and output shutdown
   must invalidate queued generations and leave no executor-held connection owner.
+- A terminal durable fact sent on the critical lane must never cancel, leapfrog,
+  or imply delivery of earlier admitted durable facts. Fence each output at its
+  captured admitted/physical high-water, let healthy outputs finish independently
+  under one absolute deadline, and disconnect a lagging output without sending it
+  a sequence-skipping terminal. Use persistent per-stream progress notification;
+  do not add a channel allocation to every ordinary durable event.
 
 ## Durable orchestration journals
 
