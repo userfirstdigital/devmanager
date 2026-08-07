@@ -64,7 +64,7 @@
 **Contracts:**
 
 ```rust
-pub enum ProcessOwner { Task(TaskId), Host(HostServiceKind) }
+pub enum ProcessOwner { Task(TaskId), Host }
 pub enum ProcessClassification {
     Managed(ProcessOwner),
     External,
@@ -100,13 +100,20 @@ pub struct LaunchIntent {
 
 **Files:** `src/process/{job,launcher}.rs`, `src/services/platform_service.rs`, `Cargo.toml`, `tests/process_supervisor.rs`
 
+**Settled PTY boundary:** stock `portable-pty` 0.9.0 and current upstream do not expose the
+Windows primary-thread handle or a pre-resume handoff. Carry one exact-revision,
+upstreamable dependency patch that adds a typed, non-cloneable pending child. Keep the
+ordinary API unchanged; do not build a parallel ConPTY adapter or a permanent terminal
+harness fork. Remove the patch when the capability ships upstream.
+
 - [ ] **Step 1: Add Windows integration tests** `child_is_suspended_until_job_assignment`, `assignment_failure_never_executes_child`, `nested_children_join_job`, `breakaway_is_disabled`, and `closing_job_terminates_entire_tree`. Use a purpose-built test helper binary that writes markers only after resumption and spawns a grandchild.
 - [ ] **Step 2: Run** `cargo test --test process_supervisor launch_ -- --nocapture` and save the red result.
 - [ ] **Step 3: Enable only required `windows` crate features** for Foundation, Threading, JobObjects, IO completion, process status, and security. Keep platform code behind `cfg(windows)` with a typed unsupported error elsewhere.
-- [ ] **Step 4: Implement launch order:** create Job with `KILL_ON_JOB_CLOSE`, create process/ConPTY root with `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT`, assign to Job, register handles/identity, then resume the primary thread.
-- [ ] **Step 5: On any pre-resume failure**, terminate the still-suspended root, close handles, remove the provisional registry entry, and emit a failed launch fact. Never fall back to an uncontained launch.
-- [ ] **Step 6: Preserve provider/terminal command lines** and add `DEVMANAGER_TASK_ID`, `DEVMANAGER_RESOURCE_ID`, and a concise display label as environment/arguments only where the child contract permits it.
-- [ ] **Step 7: Run** launch tests and inspect marker files/PIDs; commit as `feat(process): assign jobs before managed code executes`.
+- [ ] **Step 4: Implement launch order:** create Job with `KILL_ON_JOB_CLOSE`; pass it through `PROC_THREAD_ATTRIBUTE_JOB_LIST`; create the ConPTY root with `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT`; register the process handle plus PID/creation-time/canonical-executable identity; then consume the pending child with exactly one `resume()`. Creation-time Job membership prevents an uncontained child even if the host fails before registration.
+- [ ] **Step 5: Keep the dependency patch narrow:** expose only `spawn_command_suspended_in_job`, process ID/handle access, consuming `resume`, and fail-safe `abort_and_wait`; pin its upstream base commit and retain the MIT notice.
+- [ ] **Step 6: On any pre-resume failure**, terminate the still-suspended root, close handles, remove the provisional registry entry, and emit a failed launch fact. Never fall back to an uncontained launch.
+- [ ] **Step 7: Preserve provider/terminal command lines** and add `DEVMANAGER_TASK_ID`, `DEVMANAGER_RESOURCE_ID`, and a concise display label as environment/arguments only where the child contract permits it.
+- [ ] **Step 8: Run** launch tests and inspect marker files/PIDs; include credential-free Claude, Codex, and Cursor `--version` PTY smoke checks; commit as `feat(process): assign jobs before managed code executes`.
 
 ### Task 3.3: Track complete Job membership with completion notifications
 
