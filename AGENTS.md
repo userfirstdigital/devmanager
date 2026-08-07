@@ -6,6 +6,10 @@
   are expected test processes, not installed DevManager instances. Tell the
   user before a long Rust verification run and confirm no harness, Cargo, or
   Rust compiler process remains afterward.
+- The first Rust test in a new worktree may cold-build for several minutes.
+  Give it at least a 600-second command timeout. If its wrapper times out, track
+  the exact Cargo process tree until it exits before rerunning; a wrapper timeout
+  is not proof that Cargo or rustc stopped, and duplicate builds are forbidden.
 - Keep `persistence::app_config_dir()` fail-closed under `cfg(test)`. Unit tests
   must resolve beneath the process-unique test root and must never fall back to
   `%APPDATA%\com.userfirst.devmanager`.
