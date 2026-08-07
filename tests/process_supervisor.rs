@@ -8,5 +8,8 @@ mod identity;
 #[path = "process_supervisor/job.rs"]
 mod job;
 
+#[path = "process_supervisor/launcher.rs"]
+mod launcher;
+
 #[path = "process_supervisor/registry.rs"]
 mod registry;

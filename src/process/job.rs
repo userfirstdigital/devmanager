@@ -3,7 +3,7 @@
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -98,6 +98,20 @@ pub struct ManagedProcessJob {
 }
 
 impl ManagedProcessJob {
+    /// Creates an empty, non-inheritable Job Object whose final handle closes
+    /// every process in the tree.
+    pub fn create() -> Result<Option<Self>, String> {
+        #[cfg(windows)]
+        {
+            create_windows_job().map(Some)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Returns the active process IDs currently assigned to this Job Object.
     ///
     /// On non-Windows platforms this always returns an empty list.
@@ -111,6 +125,11 @@ impl ManagedProcessJob {
         {
             Ok(Vec::new())
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn borrowed_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
     }
 }
 
@@ -237,7 +256,7 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(windows)]
-fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> {
+fn create_windows_job() -> Result<ManagedProcessJob, String> {
     unsafe {
         let raw_job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
         if raw_job.is_null() {
@@ -265,6 +284,15 @@ fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> 
             ));
         }
 
+        Ok(ManagedProcessJob { handle: job })
+    }
+}
+
+#[cfg(windows)]
+fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> {
+    unsafe {
+        let job = create_windows_job()?;
+
         let raw_process = OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, 0, pid);
         if raw_process.is_null() {
             return Err(format!(
@@ -276,13 +304,13 @@ fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> 
         // non-inheritable as well.
         let process = OwnedHandle::from_raw_handle(raw_process);
 
-        if AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) == 0 {
+        if AssignProcessToJobObject(job.handle.as_raw_handle(), process.as_raw_handle()) == 0 {
             return Err(format!(
                 "AssignProcessToJobObject({pid}) failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
 
-        Ok(ManagedProcessJob { handle: job })
+        Ok(job)
     }
 }
