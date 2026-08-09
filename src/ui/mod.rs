@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::{App, Global};
 
+pub mod components;
 pub mod preview;
 pub mod tokens;
 
