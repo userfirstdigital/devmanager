@@ -271,7 +271,7 @@ pub struct ManagementGrant {
 }
 
 impl ManagementGrant {
-    pub fn try_new(
+    fn try_new(
         task_id: TaskId,
         role: ManagementRole,
         issued_at_ms: u64,
@@ -311,6 +311,29 @@ impl ManagementGrant {
 
     pub const fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+}
+
+/// Non-forgeable capability for issuing grants through the management policy.
+///
+/// The issuer is intentionally neither cloneable nor copyable. Crate-owned
+/// authenticated host boundaries may obtain one from a [`ManagementPolicy`],
+/// while grant construction stays private to this module.
+#[derive(Debug)]
+pub(crate) struct ManagementGrantIssuer<'policy> {
+    policy: &'policy ManagementPolicy,
+}
+
+impl ManagementGrantIssuer<'_> {
+    pub(crate) fn issue(
+        &mut self,
+        task_id: TaskId,
+        role: ManagementRole,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<ManagementGrant, GrantError> {
+        let _ = self.policy;
+        ManagementGrant::try_new(task_id, role, issued_at_ms, expires_at_ms)
     }
 }
 
@@ -440,6 +463,10 @@ pub struct ManagementPolicy;
 impl ManagementPolicy {
     pub const fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn grant_issuer(&self) -> ManagementGrantIssuer<'_> {
+        ManagementGrantIssuer { policy: self }
     }
 
     pub fn decide(
@@ -616,3 +643,241 @@ pub type PolicyPrivacyClass = ManagementPrivacyClass;
 
 /// Alias for the policy authority's role-neutral name.
 pub type PolicyAuthority = ManagementPolicy;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_not_impl_any;
+    use uuid::Uuid;
+
+    assert_not_impl_any!(ManagementGrant: Clone);
+    assert_not_impl_any!(ManagementGrant: Copy);
+    assert_not_impl_any!(ManagementGrantIssuer: Clone);
+    assert_not_impl_any!(ManagementGrantIssuer: Copy);
+
+    fn task_id(tail: u8) -> TaskId {
+        let mut bytes = [0_u8; 16];
+        bytes[0] = 0x01;
+        bytes[1] = 0x23;
+        bytes[2] = 0x45;
+        bytes[3] = 0x67;
+        bytes[4] = 0x89;
+        bytes[5] = 0xab;
+        bytes[6] = 0x70;
+        bytes[7] = 0xcd;
+        bytes[8] = 0x80;
+        bytes[9] = 0xef;
+        bytes[15] = tail;
+        TaskId::from_bytes(Uuid::from_bytes(bytes).into_bytes()).expect("task id")
+    }
+
+    fn enrolled_task(tail: u8) -> TaskContext {
+        TaskContext::enrolled(
+            task_id(tail),
+            ManagementPrivacyClass::ManagedMetadata,
+            false,
+        )
+    }
+
+    fn grant(tail: u8, role: ManagementRole) -> ManagementGrant {
+        ManagementGrant::try_new(task_id(tail), role, 10, 100).expect("valid grant")
+    }
+
+    fn read(field: ManagedField) -> PolicyOperation {
+        PolicyOperation::ReadMetadata(field)
+    }
+
+    #[test]
+    fn issuer_issues_valid_grants_and_preserves_live_revocation() {
+        let policy = ManagementPolicy::default();
+        let mut issuer = policy.grant_issuer();
+        let mut grant = issuer
+            .issue(task_id(1), ManagementRole::TaskCollaborator, 10, 100)
+            .expect("valid grant");
+
+        grant.revoke();
+
+        assert!(grant.is_revoked());
+        assert_eq!(
+            issuer.issue(task_id(1), ManagementRole::TaskCollaborator, 100, 100),
+            Err(GrantError::ExpiryNotAfterIssue)
+        );
+    }
+
+    #[test]
+    fn missing_stale_revoked_and_wrong_task_grants_have_fixed_denials() {
+        let policy = ManagementPolicy::default();
+        let task = enrolled_task(5);
+        let operation = read(ManagedField::TaskState);
+
+        let not_yet_valid =
+            ManagementGrant::try_new(task_id(5), ManagementRole::ManagerWatcher, 60, 100)
+                .expect("grant");
+        let stale = grant(5, ManagementRole::ManagerWatcher);
+        let mut revoked = grant(5, ManagementRole::ManagerWatcher);
+        revoked.revoke();
+        let wrong_scope = grant(6, ManagementRole::ManagerWatcher);
+
+        assert_eq!(
+            policy
+                .decide(&task, PolicyPrincipal::NoGrant, operation, 50)
+                .reason_code(),
+            PolicyReasonCode::GrantMissing
+        );
+        assert_eq!(
+            policy
+                .decide(&task, PolicyPrincipal::Grant(&not_yet_valid), operation, 50,)
+                .reason_code(),
+            PolicyReasonCode::GrantNotYetValid
+        );
+        assert_eq!(
+            policy
+                .decide(&task, PolicyPrincipal::Grant(&stale), operation, 100,)
+                .reason_code(),
+            PolicyReasonCode::GrantStale
+        );
+        assert_eq!(
+            policy
+                .decide(&task, PolicyPrincipal::Grant(&revoked), operation, 50,)
+                .reason_code(),
+            PolicyReasonCode::GrantRevoked
+        );
+        assert_eq!(
+            policy
+                .decide(&task, PolicyPrincipal::Grant(&wrong_scope), operation, 50,)
+                .reason_code(),
+            PolicyReasonCode::GrantTaskMismatch
+        );
+    }
+
+    #[test]
+    fn watcher_is_read_only_and_collaborator_mutation_is_task_scoped() {
+        let policy = ManagementPolicy::default();
+        let task = enrolled_task(7);
+        let watcher_grant = grant(7, ManagementRole::ManagerWatcher);
+        let collaborator_grant = grant(7, ManagementRole::TaskCollaborator);
+        let wrong_scope_grant = grant(7, ManagementRole::TaskCollaborator);
+
+        let watcher = policy.decide(
+            &task,
+            PolicyPrincipal::Grant(&watcher_grant),
+            PolicyOperation::MutateTask,
+            50,
+        );
+        assert_eq!(watcher.reason_code(), PolicyReasonCode::WatcherReadOnly);
+        assert!(!watcher.is_allowed());
+
+        let collaborator = policy.decide(
+            &task,
+            PolicyPrincipal::Grant(&collaborator_grant),
+            PolicyOperation::MutateTask,
+            50,
+        );
+        assert!(collaborator.is_allowed());
+        assert_eq!(collaborator.reason_code(), PolicyReasonCode::Allowed);
+
+        let wrong_scope = policy.decide(
+            &TaskContext::enrolled(task_id(8), ManagementPrivacyClass::ManagedMetadata, false),
+            PolicyPrincipal::Grant(&wrong_scope_grant),
+            PolicyOperation::MutateTask,
+            50,
+        );
+        assert_eq!(
+            wrong_scope.reason_code(),
+            PolicyReasonCode::GrantTaskMismatch
+        );
+        assert!(!wrong_scope.is_allowed());
+    }
+
+    #[test]
+    fn dangerous_approval_is_owner_only() {
+        let policy = ManagementPolicy::default();
+        let task = enrolled_task(9);
+
+        let owner_decision = policy.decide(
+            &task,
+            PolicyPrincipal::Owner,
+            PolicyOperation::ApproveDangerous,
+            50,
+        );
+        assert!(owner_decision.is_allowed());
+        assert_eq!(owner_decision.reason_code(), PolicyReasonCode::Allowed);
+        for role in [
+            ManagementRole::ManagerWatcher,
+            ManagementRole::TaskCollaborator,
+        ] {
+            let grant = grant(9, role);
+            let decision = policy.decide(
+                &task,
+                PolicyPrincipal::Grant(&grant),
+                PolicyOperation::ApproveDangerous,
+                50,
+            );
+            assert_eq!(
+                decision.reason_code(),
+                PolicyReasonCode::OwnerOnlyDangerousApproval
+            );
+            assert!(!decision.is_allowed());
+        }
+    }
+
+    #[test]
+    fn provider_usage_is_not_quota_cost_or_estimate() {
+        let policy = ManagementPolicy::default();
+        let task = enrolled_task(10);
+        let watcher_grant = grant(10, ManagementRole::ManagerWatcher);
+
+        assert!(policy
+            .decide(
+                &task,
+                PolicyPrincipal::Grant(&watcher_grant),
+                read(ManagedField::ProviderReportedUsage),
+                50
+            )
+            .is_allowed());
+        for field in [
+            ManagedField::ProviderQuota,
+            ManagedField::ProviderCost,
+            ManagedField::ProviderEstimate,
+        ] {
+            assert_eq!(
+                policy
+                    .decide(
+                        &task,
+                        PolicyPrincipal::Grant(&watcher_grant),
+                        read(field),
+                        50
+                    )
+                    .reason_code(),
+                PolicyReasonCode::DeniedMetadataField
+            );
+        }
+    }
+
+    #[test]
+    fn revoking_the_same_grant_denies_the_borrowed_principal_immediately() {
+        let policy = ManagementPolicy::default();
+        let task = enrolled_task(11);
+        let mut grant = grant(11, ManagementRole::TaskCollaborator);
+
+        assert!(policy
+            .decide(
+                &task,
+                PolicyPrincipal::Grant(&grant),
+                PolicyOperation::MutateTask,
+                50,
+            )
+            .is_allowed());
+
+        grant.revoke();
+
+        let decision = policy.decide(
+            &task,
+            PolicyPrincipal::Grant(&grant),
+            PolicyOperation::MutateTask,
+            50,
+        );
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.reason_code(), PolicyReasonCode::GrantRevoked);
+    }
+}
