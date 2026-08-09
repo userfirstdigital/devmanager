@@ -7,6 +7,7 @@ pub mod assets;
 pub mod browser;
 pub mod client;
 pub mod config;
+pub mod connect;
 pub mod diagnostics;
 pub mod domain;
 pub mod git;

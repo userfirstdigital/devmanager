@@ -1,0 +1,27 @@
+//! Contract-first Connect core. Network, identity, crypto, relay, and UI
+//! implementations are intentionally later phase gates.
+
+mod envelope;
+mod permission;
+mod presence;
+mod transport;
+
+pub use envelope::{
+    ChannelId, ChannelKind, Compression, ConnectEnvelope, ConnectLimitError, ConnectLimitField,
+    ConnectLimits, ConnectPrivacyClass, ConnectionId, EnvelopeError, KnownPayloadKind,
+    NegotiatedLimits, PayloadKind, PrivacyClass, SessionId, CONNECT_PROTOCOL_MAJOR,
+    CONNECT_PROTOCOL_MINOR, MAX_CONNECT_CHUNK_BYTES, MAX_CONNECT_CUMULATIVE_BYTES,
+    MAX_CONNECT_PAGE_ENCODED_BYTES, MAX_CONNECT_PAGE_ITEMS, MAX_CONNECT_PHYSICAL_FRAME_BYTES,
+    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+};
+pub use permission::{
+    ActionId, ConnectRole, KnownAction, PermissionDecision, PermissionDenyReason,
+    PermissionEvaluator, PermissionRequest,
+};
+pub use presence::{EphemeralPresence, LastSenderHint, PresenceSink};
+pub use transport::{
+    decode_inner, encode_inner, validate_event_page, validate_snapshot_page,
+    BrowserExtensionDescriptor, ConnectRoute, ConnectTransport, ProjectionError,
+    ProjectionExtensions, ProjectionResponse, ProjectionSource, PromptExtensionDescriptor,
+    ReplayRequest, SnapshotRequest, MAX_CONNECT_RESUME_CURSOR_BYTES,
+};
