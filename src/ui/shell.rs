@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::client::ClientModel;
 use crate::domain::id::TaskId;
-use crate::ui::task_cockpit::TaskList;
+use crate::ui::task_cockpit::{TaskHeaderModel, TaskList};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerButton {
@@ -161,6 +162,13 @@ impl Shell {
 
     pub fn transient_priority(&self) -> Option<TransientPriority> {
         self.transient_priority
+    }
+
+    /// Project the selected task from the current client snapshot. The shell
+    /// captures only the selected TaskId; all task facts remain in ClientModel.
+    pub fn task_header(&self, model: &ClientModel) -> Option<TaskHeaderModel> {
+        self.selected_task
+            .and_then(|task_id| TaskHeaderModel::from_model(model, task_id))
     }
 
     pub fn set_transient_priority(&mut self, priority: Option<TransientPriority>) {
