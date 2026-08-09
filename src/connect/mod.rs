@@ -6,6 +6,7 @@ mod identity;
 mod identity_codec;
 mod identity_store;
 mod permission;
+mod policy;
 mod presence;
 mod schema;
 mod transport;
@@ -43,6 +44,13 @@ pub use identity_store::{
 pub use permission::{
     ActionId, AuthoritativePermissionContext, ConnectRole, KnownAction, PermissionDecision,
     PermissionDenyReason, PermissionEvaluator, PermissionRequest, ScopedPermissionGrant,
+};
+pub use policy::{
+    ActiveSessionInterval, ActiveSessionIntervalError, ContentClass, DeniedContentClass,
+    GrantError, ManagedField, ManagementGrant, ManagementPolicy, ManagementPrivacyClass,
+    ManagementRole, MetadataField, PolicyAuthority, PolicyDecision, PolicyOperation,
+    PolicyPrincipal, PolicyPrivacyClass, PolicyReasonCode, TaskContext, TaskEnrollment,
+    ACTIVE_SESSION_IDLE_LIMIT_MS,
 };
 pub use presence::{EphemeralPresence, LastSenderHint, PresenceSink};
 pub use schema::{
