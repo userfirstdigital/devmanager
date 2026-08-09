@@ -170,6 +170,129 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
         .expect("spawn cutover audit")
 }
 
+fn real_rg_path() -> PathBuf {
+    let output = Command::new("where.exe")
+        .arg("rg")
+        .output()
+        .expect("locate real rg");
+    assert!(
+        output.status.success(),
+        "where.exe rg failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    PathBuf::from(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .expect("real rg path")
+            .trim(),
+    )
+}
+
+fn write_rg_shim(shim_root: &Path) -> PathBuf {
+    fs::create_dir_all(shim_root).expect("rg shim directory");
+    let source_path = shim_root.join("rg-shim.cs");
+    let executable_path = shim_root.join("rg.exe");
+    fs::write(
+        &source_path,
+        r#"using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+public static class Program
+{
+    private static string Escape(string value)
+    {
+        var builder = new StringBuilder();
+        foreach (var character in value)
+        {
+            switch (character)
+            {
+                case '\\': builder.Append("\\\\"); break;
+                case '"': builder.Append("\\\""); break;
+                case '\r': builder.Append("\\r"); break;
+                case '\n': builder.Append("\\n"); break;
+                case '\t': builder.Append("\\t"); break;
+                default:
+                    if (character < 0x20) builder.AppendFormat("\\u{0:X4}", (int)character);
+                    else builder.Append(character);
+                    break;
+            }
+        }
+        return builder.ToString();
+    }
+
+    public static int Main(string[] args)
+    {
+        var rawArgs = string.Join(" ", Array.ConvertAll(args, value => "\"" + Escape(value) + "\""));
+        var usedStdin = false;
+        var rewriteAttempted = false;
+        var rewriteSucceeded = false;
+        var rewriteSameLength = false;
+        string path = null;
+        foreach (var argument in args)
+        {
+            if (argument == "-") usedStdin = true;
+            if (Path.IsPathFullyQualified(argument) && File.Exists(argument)) path = argument;
+        }
+        if (path != null)
+        {
+            rewriteAttempted = true;
+            try
+            {
+                var encoding = new UTF8Encoding(false, true);
+                var before = encoding.GetString(File.ReadAllBytes(path));
+                var after = before.Replace("original-only", "replaced-only");
+                rewriteSameLength = before.Length == after.Length;
+                File.WriteAllBytes(path, encoding.GetBytes(after));
+                rewriteSucceeded = true;
+            }
+            catch
+            {
+                rewriteSucceeded = false;
+            }
+        }
+        var logLine = "{\"rawArgs\":\"" + Escape(rawArgs) + "\",\"usedStdin\":"
+            + (usedStdin ? "true" : "false") + ",\"rewriteAttempted\":"
+            + (rewriteAttempted ? "true" : "false") + ",\"rewriteSucceeded\":"
+            + (rewriteSucceeded ? "true" : "false") + ",\"rewriteSameLength\":"
+            + (rewriteSameLength ? "true" : "false") + "}" + Environment.NewLine;
+        File.AppendAllText(Environment.GetEnvironmentVariable("RG_SHIM_LOG"), logLine, new UTF8Encoding(false));
+
+        var startInfo = new ProcessStartInfo(Environment.GetEnvironmentVariable("RG_REAL"));
+        startInfo.UseShellExecute = false;
+        foreach (var argument in args) startInfo.ArgumentList.Add(argument);
+        using (var process = Process.Start(startInfo))
+        {
+            process.WaitForExit();
+            return process.ExitCode;
+        }
+    }
+}
+"#,
+    )
+    .expect("rg shim source");
+    let compile = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$source = Get-Content -Raw -LiteralPath $env:RG_SHIM_SOURCE; Add-Type -TypeDefinition $source -OutputAssembly $env:RG_SHIM_EXE -OutputType ConsoleApplication",
+        ])
+        .env("RG_SHIM_SOURCE", &source_path)
+        .env("RG_SHIM_EXE", &executable_path)
+        .output()
+        .expect("compile rg shim");
+    assert!(
+        compile.status.success(),
+        "compile rg shim failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    executable_path
+}
+
 fn force_track(root: &Path, paths: &[&str]) {
     let mut args = vec!["add", "--force", "--"];
     args.extend(paths.iter().copied());
@@ -1282,4 +1405,99 @@ fn current_repository_produces_deterministic_hold_report() {
     assert!(first_report["blockers"]
         .as_array()
         .is_some_and(|items| !items.is_empty()));
+}
+
+#[test]
+fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "handle-bytes",
+                "src/legacy.rs",
+                &["original-only"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("src/race.txt", b"original-only\n")],
+    );
+    let shim_root = fixture._temp.path().join("rg-shim");
+    let shim = write_rg_shim(&shim_root);
+    assert!(shim.is_file(), "rg shim must be executable through PATH");
+    let log_path = shim_root.join("rg-shim.jsonl");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let mut path_entries = vec![shim_root.clone()];
+    path_entries.extend(std::env::split_paths(&original_path));
+    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            fixture.root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env("RG_REAL", real_rg_path())
+        .env("RG_SHIM_LOG", &log_path)
+        .env("PATH", isolated_path)
+        .output()
+        .expect("spawn audit through rg shim");
+    assert!(
+        output_path.is_file(),
+        "audit must publish JSON through the shim\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+        .expect("valid audit JSON");
+    let references = strings_at(&row(&report, "handle-bytes"), &["references", "symbol"]);
+    assert!(
+        references.contains(&"src/race.txt"),
+        "the original-only match must survive the shim rewrite attempt: {report}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!(
+            "rg shim log: {error:?}\nstdout={}\nstderr={}\nshim={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            shim.display()
+        )
+    });
+    let records = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("rg shim JSON record"))
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty(), "rg shim must have been invoked");
+    let root_text = fixture.root.to_string_lossy().to_ascii_lowercase();
+    assert!(
+        records.iter().all(|record| record["usedStdin"] == true),
+        "every rg invocation must use stdin: {records:?}"
+    );
+    assert!(
+        records.iter().all(|record| {
+            !record["rawArgs"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(&root_text)
+        }),
+        "rg must not receive an absolute/raw fixture path: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["rewriteAttempted"] == false),
+        "the shim's equal-length rewrite path must remain unreachable: {records:?}"
+    );
 }

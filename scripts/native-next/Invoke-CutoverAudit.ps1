@@ -337,7 +337,8 @@ function Get-CutoverHandleIdentity {
 function Open-CutoverConfinedFile {
     param(
         [Parameter(Mandatory = $true)][string]$LiteralPath,
-        [switch]$AllowDirectory
+        [switch]$AllowDirectory,
+        [switch]$ReadOnlyShare
     )
 
     if ([System.IO.Path]::GetFileName($LiteralPath).Equals('session.json', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -352,11 +353,12 @@ function Open-CutoverConfinedFile {
     if ($item -is [System.IO.DirectoryInfo]) {
         $options = [System.IO.FileOptions]0x02000000
     }
+    $share = if ($ReadOnlyShare) { [System.IO.FileShare]::Read } else { [System.IO.FileShare]::ReadWrite }
     $stream = [System.IO.FileStream]::new(
         $full,
         [System.IO.FileMode]::Open,
         [System.IO.FileAccess]::Read,
-        [System.IO.FileShare]::ReadWrite,
+        $share,
         8192,
         $options)
     try {
@@ -429,6 +431,43 @@ function Read-CutoverConfinedUtf8 {
     finally {
         $opened.stream.Dispose()
     }
+}
+
+function Read-CutoverScanBytes {
+    param(
+        [Parameter(Mandatory = $true)][object]$Opened,
+        [Parameter(Mandatory = $true)][int64]$MaxBytes
+    )
+
+    $length = [int64]$Opened.identity.length
+    if ($length -lt 0) {
+        throw 'Unable to determine the bounded scan file length.'
+    }
+    if ($length -gt $MaxBytes) {
+        Add-SafetyBound
+        throw 'tracked scanner input exceeds the bounded input byte limit.'
+    }
+    if ($length -gt [int32]::MaxValue) {
+        Add-SafetyBound
+        throw 'tracked scanner input cannot be represented in memory.'
+    }
+
+    $bytes = [byte[]]::new([int]$length)
+    $bytesRead = 0
+    while ($bytesRead -lt $bytes.Length) {
+        $read = $Opened.stream.Read($bytes, $bytesRead, $bytes.Length - $bytesRead)
+        if ($read -le 0) { break }
+        $bytesRead += $read
+    }
+    if ($bytesRead -eq $bytes.Length) {
+        return ,$bytes
+    }
+
+    $shortBytes = [byte[]]::new($bytesRead)
+    if ($bytesRead -gt 0) {
+        [System.Array]::Copy($bytes, $shortBytes, $bytesRead)
+    }
+    return ,$shortBytes
 }
 
 function Ensure-CutoverAuditDirectory {
@@ -832,11 +871,13 @@ function Invoke-ReferenceScan {
         $opened = $null
         try {
             $absolutePath = Assert-CutoverConfinedPath -LiteralPath $absolutePath -AncestorPath $RepositoryRoot
-            $opened = Open-CutoverConfinedFile -LiteralPath $absolutePath
+            $opened = Open-CutoverConfinedFile -LiteralPath $absolutePath -ReadOnlyShare
             if ($opened.identity.length -gt $maxScanBytesPerFile) {
                 Add-SafetyBound
                 continue
             }
+
+            $scanBytes = Read-CutoverScanBytes -Opened $opened -MaxBytes $maxScanBytesPerFile
 
             $arguments = @(
                 '--json', '--fixed-strings', '--line-number', '--no-heading', '--color', 'never',
@@ -848,8 +889,12 @@ function Invoke-ReferenceScan {
                 $arguments += [string]$needle.needle
             }
             $arguments += '--'
-            $arguments += $absolutePath
-            $scan = Invoke-CutoverProcessLines -FileName 'rg' -Arguments $arguments -MaxBytes ([int64]262144)
+            $arguments += '-'
+            $scan = Invoke-CutoverProcessLines `
+                -FileName 'rg' `
+                -Arguments $arguments `
+                -InputBytes $scanBytes `
+                -MaxBytes ([int64]262144)
             if ($scan.exitCode -gt 1) {
                 Add-GlobalBlocker 'rg reference scan failed for a validated tracked file.'
                 continue
@@ -922,34 +967,36 @@ function Invoke-CutoverProcessLines {
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][byte[]]$InputBytes,
         [Parameter(Mandatory = $true)][int64]$MaxBytes
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $FileName
     $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $false
+    $startInfo.RedirectStandardError = $true
     foreach ($argument in $Arguments) { $null = $startInfo.ArgumentList.Add($argument) }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     if (-not $process.Start()) { throw "Unable to start bounded $FileName process." }
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    $bytesRead = [int64]0
-    $boundHit = $false
     try {
-        while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
-            $lineBytes = [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
-            if ($bytesRead + $lineBytes -gt $MaxBytes) {
-                $boundHit = $true
-                try { $process.Kill($true) } catch { $process.Kill() }
-                break
-            }
-            $bytesRead += $lineBytes
-            $lines.Add($line)
+        # Start both readers before writing stdin so a noisy rg stderr stream
+        # cannot block the scan while stdout is being consumed.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($InputBytes.Length -gt 0) {
+            $process.StandardInput.BaseStream.Write($InputBytes, 0, $InputBytes.Length)
+            $process.StandardInput.BaseStream.Flush()
         }
+        $process.StandardInput.Close()
         $process.WaitForExit()
-        return [pscustomobject]@{ lines = $lines.ToArray(); exitCode = $process.ExitCode; boundHit = $boundHit }
+        [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask))
+        $stdout = $stdoutTask.Result
+        $boundHit = [System.Text.Encoding]::UTF8.GetByteCount($stdout) -gt $MaxBytes
+        $lines = if ($boundHit) { @() } else { @($stdout -split "`r?`n" | Where-Object { $_ -ne '' }) }
+        return [pscustomobject]@{ lines = $lines; exitCode = $process.ExitCode; boundHit = $boundHit }
     }
     finally {
         $process.Dispose()
