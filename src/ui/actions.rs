@@ -191,8 +191,8 @@ impl KeyboardModel {
 
     /// Resolve a local shortcut through the shared interaction policy.
     /// Escape remains available to dismiss a transient layer even when the
-    /// active control is disabled; every other shortcut requires the same
-    /// current focus epoch and activation state as a component control.
+    /// active control is disabled; every action still requires the current
+    /// focus epoch, and every other shortcut also requires activation state.
     pub fn activate(
         &self,
         shortcut: KeyboardShortcut,
@@ -200,9 +200,10 @@ impl KeyboardModel {
         focus_epoch: u64,
     ) -> Option<KeyboardAction> {
         let action = self.resolve(shortcut)?;
-        if action == KeyboardAction::DismissTransient
-            || (interaction.focus_epoch() == focus_epoch && interaction.state().can_activate())
-        {
+        if interaction.focus_epoch() != focus_epoch {
+            return None;
+        }
+        if action == KeyboardAction::DismissTransient || interaction.state().can_activate() {
             Some(action)
         } else {
             None
@@ -308,8 +309,13 @@ pub fn catalog(selected_task: Option<TaskId>) -> Vec<ActionPresentation> {
                     let mut metadata =
                         AccessibilityMetadata::new(AccessibleRole::Button, descriptor.title)
                             .expect("catalog action title is valid accessibility text");
+                    metadata.disabled = unavailable;
                     metadata
-                        .set_description(descriptor.description)
+                        .set_description(if unavailable {
+                            NO_SELECTED_TASK
+                        } else {
+                            descriptor.description
+                        })
                         .expect("catalog action description is valid accessibility text");
                     metadata
                 },

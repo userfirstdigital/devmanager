@@ -65,17 +65,25 @@ fn foreign_task_and_projected_selection_cannot_capture_terminal_pointer() {
 }
 
 #[test]
-fn stale_terminal_down_after_focus_loss_view_switch_or_resync_is_rejected() {
+fn lifecycle_boundaries_reject_stale_release_and_input_after_invalidating_active_owner() {
     let task = task_id(6);
     for reason in [
         InvalidationReason::FocusLoss,
         InvalidationReason::ViewSwitch,
         InvalidationReason::Resync,
+        InvalidationReason::Deactivate,
     ] {
         let mut shell = Shell::new(Some(task));
         let captured_epoch = shell.navigation_epoch();
+        let owner = shell
+            .terminal_mouse_down(9, task, PointerButton::Primary, captured_epoch, Some(task))
+            .expect("lifecycle test must start with a real active terminal owner");
         assert!(shell.invalidate(reason));
         assert!(shell.navigation_epoch() > captured_epoch);
+        assert_eq!(
+            shell.terminal_mouse_up(Some(owner)),
+            TerminalRelease::Rejected(ReleaseRejection::NoOwner)
+        );
         assert_eq!(
             shell.terminal_mouse_down(9, task, PointerButton::Primary, captured_epoch, Some(task)),
             Err(TerminalPressRejection::StaleEpoch)

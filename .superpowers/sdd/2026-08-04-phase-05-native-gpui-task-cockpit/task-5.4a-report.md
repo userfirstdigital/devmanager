@@ -26,11 +26,14 @@ Status: complete for the pure correction slice; no GPUI/live-host integration is
 - Public interaction state that owns a pointer press is non-`Clone` and
   non-`Copy`; task navigation and focus epochs invalidate active ownership.
 - Action accessibility uses the shared component `AccessibilityMetadata` and
-  `AccessibleRole`; no action-specific public accessibility types remain.
+  `AccessibleRole`; disabled actions set its shared `disabled` flag and expose
+  their disabled reason through its description. No action-specific public
+  accessibility types remain.
 - `KeyboardModel` contains only the Task 5.4 shortcuts from the plan and
-  resolves them through the shared interaction state/focus gate. The
-  Ctrl+Shift+P alias is admitted only when its chord is conflict-free, and
-  Escape remains the transient-dismissal priority path.
+  resolves them through the shared interaction state/focus gate before every
+  action. The Ctrl+Shift+P alias is admitted only when its chord is
+  conflict-free, and Escape bypasses only disabled/loading state, never a
+  stale focus epoch.
 - `src/ui/mod.rs` adds only the narrow module exports. No 5.3 component or
   callback API is used.
 
@@ -47,7 +50,7 @@ GREEN focused coverage:
 
 ```text
 cargo test --locked --test ui_actions --test ui_focus --test ui_task_list --test ui_accessibility -- --nocapture
-22 passed; 0 failed
+23 passed; 0 failed
 ```
 
 The tests cover shared action identity and accessibility, the exact planned
@@ -56,19 +59,21 @@ navigation epoch commit/rejection and consumption, archived-task exclusion,
 pointer invalidation across navigation/focus epochs, exact pointer ownership,
 lifecycle invalidation, local priority, deterministic 5,000-task projection,
 explicit 5,001-task overflow, fixed overscan, viewport clamping, and
-invalid-viewport zero effects.
+invalid-viewport zero effects. Lifecycle coverage starts with a real active
+terminal owner for FocusLoss, ViewSwitch, Resync, and Deactivate, and stale
+navigation is verified to invalidate that owner.
 
 ## Verification
 
 All Rust commands used:
 
 ```text
-CARGO_TARGET_DIR=C:\Temp\devmanager-phase54-correction-final
+CARGO_TARGET_DIR=C:\Temp\devmanager-phase54-final
 ```
 
 - `cargo check --locked --lib` — passed.
 - `cargo fmt --all -- --check` — passed.
-- Focused tests — 22 passed, 0 failed.
+- Focused tests — 23 passed, 0 failed.
 - The existing seven library warnings remain outside the owned paths; the new
   modules add no warnings.
 - No full suite, GPUI window, live host, terminal, installed app, production
