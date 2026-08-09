@@ -388,6 +388,33 @@ fn prerequisite_graph_rejects_unknown_and_circular_nodes() {
 }
 
 #[test]
+fn prerequisite_graph_visits_case_distinct_ids_with_ordinal_state() {
+    let distinct = {
+        let mut node = base_node("GATE-A", "gate", "HOLD");
+        node["dependsOn"] = json!(["gate-missing"]);
+        node
+    };
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "case-distinct-graph",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-a"],
+                "HOLD",
+            )],
+            vec![base_node("gate-a", "gate", "HOLD"), distinct],
+        ),
+        &[],
+    );
+
+    assert!(strings_at(&run.report, &["contractErrors"])
+        .iter()
+        .any(|error| error.contains("unknown prerequisite node 'gate-missing'")));
+}
+
+#[test]
 fn ready_row_requires_all_prerequisites_and_evidence() {
     let run = run_audit(
         contract(
@@ -554,6 +581,39 @@ fn tracked_path_presence_requires_the_exact_requested_path() {
 }
 
 #[test]
+fn ledger_paths_reject_trailing_separators_without_trimming() {
+    let rows = [
+        ("trailing-slash", "src/legacy.rs/"),
+        ("trailing-backslash", r"src\legacy.rs"),
+    ]
+    .into_iter()
+    .map(|(id, path)| {
+        base_row(
+            id,
+            path,
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )
+    })
+    .collect();
+    let run = run_audit(
+        contract(rows, vec![base_node("gate-parity", "gate", "HOLD")]),
+        &[],
+    );
+
+    let errors = strings_at(&run.report, &["contractErrors"]);
+    assert!(errors.iter().any(|error| error.contains("trailing-slash")
+        && error.contains("exact repository-relative spelling")));
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("trailing-backslash")
+            && error.contains("exact repository-relative spelling")));
+    assert!(row(&run.report, "trailing-slash")["legacy"]["path"].is_null());
+}
+
+#[test]
 fn bounded_report_fallback_keeps_the_complete_typed_shape() {
     let long_symbols = (0..64)
         .map(|index| format!("symbol-{index}-{}", "x".repeat(500)))
@@ -612,6 +672,66 @@ fn bounded_report_fallback_keeps_the_complete_typed_shape() {
     }
     assert!(run.human.contains("Phase 11.1 cutover audit"));
     assert!(run.human.contains("status: HOLD"));
+}
+
+#[test]
+fn oversized_contract_id_keeps_bounded_sanitized_fallback_json() {
+    let mut document = contract(
+        vec![base_row(
+            "oversized-contract-id",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    document["contractId"] = Value::String(format!("contract-\u{1}{}", "x".repeat(300_000)));
+
+    let run = run_audit(document, &[]);
+    let output_path = run
+        .fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let bytes = fs::read(output_path).expect("bounded fallback JSON");
+    assert!(
+        bytes.len() <= 262_144,
+        "fallback JSON was {} bytes",
+        bytes.len()
+    );
+    let contract_id = run.report["contractId"]
+        .as_str()
+        .expect("fallback contractId");
+    assert!(contract_id.len() <= 256);
+    assert!(!contract_id.chars().any(char::is_control));
+}
+
+#[test]
+fn oversized_ready_report_propagates_fallback_hold_to_exit() {
+    let mut document = contract(
+        vec![base_row(
+            "oversized-ready",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "READY",
+        )],
+        vec![base_node("gate-parity", "gate", "READY")],
+    );
+    document["contractId"] = Value::String(format!("ready-{}", "y".repeat(300_000)));
+
+    let run = run_audit(
+        document,
+        &[
+            ("evidence/gate-parity.json", br#"{"ok":true}"#),
+            ("evidence/oversized-ready.json", br#"{"ok":true}"#),
+        ],
+    );
+
+    assert!(!run.output.status.success());
+    assert_eq!(run.report["contractStatus"], "HOLD");
 }
 
 #[test]

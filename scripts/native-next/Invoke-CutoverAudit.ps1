@@ -163,7 +163,7 @@ function Assert-CutoverRelativePath {
     }
 
     $raw = [string]$Value
-    if ($raw -ne $raw.Trim() -or $raw.Contains('\')) {
+    if ($raw -ne $raw.Trim() -or $raw.Contains('\') -or $raw.EndsWith('/')) {
         Add-ContractError "${Label} must use its exact repository-relative spelling."
         return $null
     }
@@ -184,9 +184,6 @@ function Assert-CutoverRelativePath {
     for ($partIndex = 0; $partIndex -lt $parts.Count; $partIndex++) {
         $part = [string]$parts[$partIndex]
         if ([string]::IsNullOrEmpty($part)) {
-            if ($partIndex -eq ($parts.Count - 1) -and $raw.EndsWith('/')) {
-                continue
-            }
             Add-ContractError "${Label} contains an empty path component."
             return $null
         }
@@ -195,12 +192,11 @@ function Assert-CutoverRelativePath {
             return $null
         }
     }
-    $normalized = $raw.TrimEnd('/')
-    if ([string]::IsNullOrEmpty($normalized) -or $normalized -eq '.') {
+    if ([string]::IsNullOrEmpty($raw) -or $raw -eq '.') {
         Add-ContractError "${Label} must be a normalized repository-relative path."
         return $null
     }
-    return $normalized
+    return $raw
 }
 
 function Normalize-CutoverAbsolutePath {
@@ -741,7 +737,7 @@ function Assert-NodeGraph {
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$NodeById
     )
 
-    $visitState = @{}
+    $visitState = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
     function Visit-Node {
         param([Parameter(Mandatory = $true)][string]$NodeId)
 
@@ -1115,7 +1111,7 @@ function New-BoundedAuditReport {
 
     return [pscustomobject]([ordered]@{
             schemaVersion = 1
-            contractId = [string](Get-ContractProperty -Object $Report -Name 'contractId')
+            contractId = ConvertTo-SafeDiagnosticText -Message ([string](Get-ContractProperty -Object $Report -Name 'contractId'))
             mode = [string](Get-ContractProperty -Object $Report -Name 'mode')
             contractStatus = 'HOLD'
             ledgerPath = 'docs/replacement-deletion-ledger.md'
@@ -1159,13 +1155,15 @@ function Write-AuditReports {
         [Parameter(Mandatory = $true)][object]$Report,
         [Parameter(Mandatory = $true)][string]$JsonPath,
         [Parameter(Mandatory = $true)][string]$TextPath,
-        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][ref]$ContractStatus
     )
 
     $json = $Report | ConvertTo-Json -Depth 50
     $jsonBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($json)
     if ($jsonBytes -gt $maxReportJsonBytes) {
         $Report = New-BoundedAuditReport -Report $Report
+        $ContractStatus.Value = 'HOLD'
         $json = $Report | ConvertTo-Json -Depth 50
     }
 
@@ -1202,6 +1200,13 @@ function Write-AuditReports {
     foreach ($finding in @($Report.entrypointFindings)) { if (-not (& $addLine "- $finding")) { break } }
     $human = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
     if ([System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
+        $Report.contractStatus = 'HOLD'
+        $ContractStatus.Value = 'HOLD'
+        $json = $Report | ConvertTo-Json -Depth 50
+        if ([System.Text.UTF8Encoding]::new($false).GetByteCount($json) -gt $maxReportJsonBytes) {
+            $Report = New-BoundedAuditReport -Report $Report
+            $json = $Report | ConvertTo-Json -Depth 50
+        }
         $human = "Phase 11.1 cutover audit`nstatus: HOLD`n- $safetyDiagnostic`n"
     }
     Write-CutoverAtomicUtf8 -LiteralPath $JsonPath -Text $json -EvidenceRoot $EvidenceRoot -MaxBytes $maxReportJsonBytes
@@ -1682,7 +1687,7 @@ $report = [pscustomobject]([ordered]@{
 
 try {
     Assert-CutoverRootStable
-    Write-AuditReports -Report $report -JsonPath $reportPath -TextPath $humanPath -EvidenceRoot $evidenceRoot
+    Write-AuditReports -Report $report -JsonPath $reportPath -TextPath $humanPath -EvidenceRoot $evidenceRoot -ContractStatus ([ref]$contractStatus)
     Write-Host ("Wrote cutover audit JSON -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $reportPath))
     Write-Host ("Wrote cutover audit report -> {0}" -f (Get-RelativeReportPath -RepositoryRoot $rootPath -Path $humanPath))
 }
