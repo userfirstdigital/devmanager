@@ -1,18 +1,26 @@
-use serde::de::{self, Deserializer};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MAX_PROVIDER_VERSION_BYTES: usize = 128;
 pub const MAX_CAPABILITY_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_EXECUTABLE_ENTRYPOINT_BYTES: usize = 128;
+pub const MAX_PROVIDER_PATH_BYTES: usize = 4096;
 pub const PROVIDER_AUTH_NONCE_BYTES: usize = 32;
 pub const MAX_PROVIDER_SHIM_BYTES: usize = 16 * 1024;
+pub const PROVIDER_CAPABILITY_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_EXECUTABLE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,8 +180,44 @@ impl TryFrom<String> for ProviderVersion {
 
 impl<'de> Deserialize<'de> for ProviderVersion {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(de::Error::custom)
+        struct ProviderVersionVisitor;
+
+        impl<'de> Visitor<'de> for ProviderVersionVisitor {
+            type Value = ProviderVersion;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded provider version string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_PROVIDER_VERSION_BYTES {
+                    return Err(E::custom(ProviderVersionError::TooLong));
+                }
+                ProviderVersion::new(value.to_owned()).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_PROVIDER_VERSION_BYTES {
+                    return Err(E::custom(ProviderVersionError::TooLong));
+                }
+                ProviderVersion::new(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_string(ProviderVersionVisitor)
     }
 }
 
@@ -221,6 +265,47 @@ pub enum EvidenceStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EvidenceConfidence {
+    High,
+    Medium,
+    Low,
+    Unknown,
+}
+
+impl Default for EvidenceConfidence {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthEvidenceSource {
+    ClaudeCodeSubscriptionLogin,
+    CodexSubscriptionLogin,
+    CursorSubscriptionLogin,
+}
+
+impl ProviderAuthEvidenceSource {
+    pub const fn for_kind(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::ClaudeCode => Self::ClaudeCodeSubscriptionLogin,
+            ProviderKind::Codex => Self::CodexSubscriptionLogin,
+            ProviderKind::Cursor => Self::CursorSubscriptionLogin,
+        }
+    }
+
+    pub const fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::ClaudeCodeSubscriptionLogin => ProviderKind::ClaudeCode,
+            Self::CodexSubscriptionLogin => ProviderKind::Codex,
+            Self::CursorSubscriptionLogin => ProviderKind::Cursor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EvidenceDiagnosticCode {
     AuthenticationRequired,
     ExecutableMissing,
@@ -254,25 +339,38 @@ impl EvidenceDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityEvidenceError {
     ObservedAtZero,
+    ExpiryNotAfterObserved,
+    UnsupportedSchemaVersion(u16),
 }
 
 impl fmt::Display for CapabilityEvidenceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ObservedAtZero => write!(f, "capability evidence observed_at must be non-zero"),
+            Self::ExpiryNotAfterObserved => {
+                write!(f, "capability evidence expiry must follow observed_at")
+            }
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(
+                    f,
+                    "unsupported capability evidence schema version {version}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for CapabilityEvidenceError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityEvidence {
     source: EvidenceSourceId,
     observed_at: u64,
     status: EvidenceStatus,
     diagnostic: Option<EvidenceDiagnostic>,
+    auth_source: Option<ProviderAuthEvidenceSource>,
+    expires_at: Option<u64>,
+    confidence: EvidenceConfidence,
 }
 
 impl CapabilityEvidence {
@@ -287,9 +385,53 @@ impl CapabilityEvidence {
             observed_at,
             status,
             diagnostic,
+            auth_source: None,
+            expires_at: None,
+            confidence: EvidenceConfidence::Unknown,
         };
         evidence.validate()?;
         Ok(evidence)
+    }
+
+    pub fn new_with_lifecycle(
+        source: EvidenceSourceId,
+        observed_at: u64,
+        expires_at: Option<u64>,
+        confidence: EvidenceConfidence,
+        auth_source: Option<ProviderAuthEvidenceSource>,
+        status: EvidenceStatus,
+        diagnostic: Option<EvidenceDiagnostic>,
+    ) -> Result<Self, CapabilityEvidenceError> {
+        let evidence = Self {
+            source,
+            observed_at,
+            status,
+            diagnostic,
+            auth_source,
+            expires_at,
+            confidence,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn new_auth_status(
+        kind: ProviderKind,
+        observed_at: u64,
+        expires_at: u64,
+        confidence: EvidenceConfidence,
+        status: EvidenceStatus,
+        diagnostic: Option<EvidenceDiagnostic>,
+    ) -> Result<Self, CapabilityEvidenceError> {
+        Self::new_with_lifecycle(
+            EvidenceSourceId::AuthStatusProbe,
+            observed_at,
+            Some(expires_at),
+            confidence,
+            Some(ProviderAuthEvidenceSource::for_kind(kind)),
+            status,
+            diagnostic,
+        )
     }
 
     pub const fn source(&self) -> EvidenceSourceId {
@@ -308,11 +450,44 @@ impl CapabilityEvidence {
         self.diagnostic.as_ref()
     }
 
+    pub const fn auth_source(&self) -> Option<ProviderAuthEvidenceSource> {
+        self.auth_source
+    }
+
+    pub const fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
+
+    pub const fn confidence(&self) -> EvidenceConfidence {
+        self.confidence
+    }
+
     pub fn validate(&self) -> Result<(), CapabilityEvidenceError> {
         if self.observed_at == 0 {
             return Err(CapabilityEvidenceError::ObservedAtZero);
         }
+        if self
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= self.observed_at)
+        {
+            return Err(CapabilityEvidenceError::ExpiryNotAfterObserved);
+        }
         Ok(())
+    }
+}
+
+impl Serialize for CapabilityEvidence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("CapabilityEvidence", 8)?;
+        state.serialize_field("schema_version", &PROVIDER_EVIDENCE_SCHEMA_VERSION)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("observed_at", &self.observed_at)?;
+        state.serialize_field("expires_at", &self.expires_at)?;
+        state.serialize_field("confidence", &self.confidence)?;
+        state.serialize_field("auth_source", &self.auth_source)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("diagnostic", &self.diagnostic)?;
+        state.end()
     }
 }
 
@@ -321,32 +496,61 @@ impl<'de> Deserialize<'de> for CapabilityEvidence {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default = "default_evidence_schema_version")]
+            schema_version: u16,
             source: EvidenceSourceId,
             observed_at: u64,
+            #[serde(default)]
+            expires_at: Option<u64>,
+            #[serde(default)]
+            confidence: EvidenceConfidence,
+            #[serde(default)]
+            auth_source: Option<ProviderAuthEvidenceSource>,
             status: EvidenceStatus,
             diagnostic: Option<EvidenceDiagnostic>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.source, wire.observed_at, wire.status, wire.diagnostic)
-            .map_err(de::Error::custom)
+        if wire.schema_version != PROVIDER_EVIDENCE_SCHEMA_VERSION {
+            return Err(de::Error::custom(
+                CapabilityEvidenceError::UnsupportedSchemaVersion(wire.schema_version),
+            ));
+        }
+        Self::new_with_lifecycle(
+            wire.source,
+            wire.observed_at,
+            wire.expires_at,
+            wire.confidence,
+            wire.auth_source,
+            wire.status,
+            wire.diagnostic,
+        )
+        .map_err(de::Error::custom)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const fn default_evidence_schema_version() -> u16 {
+    PROVIDER_EVIDENCE_SCHEMA_VERSION
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderExecutableError {
     EmptyPath,
+    PathTooLong,
     Missing(PathBuf),
     NotAFile(PathBuf),
+    NotNativeExecutable(PathBuf),
     SymlinkOrReparse(PathBuf),
     HardlinkAmbiguous(PathBuf),
     ChangedDuringValidation(PathBuf),
     InvalidFileIdentity(PathBuf),
+    UnsupportedPlatform(PathBuf),
     NotCanonical {
         requested: PathBuf,
         canonical: PathBuf,
     },
     HashMismatch(PathBuf),
+    UnsupportedSchemaVersion(u16),
     Io {
         path: PathBuf,
         kind: io::ErrorKind,
@@ -354,56 +558,73 @@ pub enum ProviderExecutableError {
     BackgroundTask,
 }
 
+impl fmt::Debug for ProviderExecutableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::EmptyPath => "empty_path",
+            Self::PathTooLong => "path_too_long",
+            Self::Missing(_) => "missing",
+            Self::NotAFile(_) => "not_a_file",
+            Self::NotNativeExecutable(_) => "not_native_executable",
+            Self::SymlinkOrReparse(_) => "symlink_or_reparse",
+            Self::HardlinkAmbiguous(_) => "hardlink_ambiguous",
+            Self::ChangedDuringValidation(_) => "changed_during_validation",
+            Self::InvalidFileIdentity(_) => "invalid_file_identity",
+            Self::UnsupportedPlatform(_) => "unsupported_platform",
+            Self::NotCanonical { .. } => "not_canonical",
+            Self::HashMismatch(_) => "hash_mismatch",
+            Self::UnsupportedSchemaVersion(_) => "unsupported_schema_version",
+            Self::Io { .. } => "io",
+            Self::BackgroundTask => "background_task",
+        };
+        formatter
+            .debug_struct("ProviderExecutableError")
+            .field("code", &code)
+            .finish()
+    }
+}
+
 impl fmt::Display for ProviderExecutableError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPath => write!(f, "provider executable path must be non-empty"),
-            Self::Missing(path) => {
-                write!(f, "provider executable does not exist: {}", path.display())
+            Self::PathTooLong => write!(f, "provider executable path is too long"),
+            Self::Missing(_) => write!(f, "provider executable is missing"),
+            Self::NotAFile(_) => write!(f, "provider executable is not a file"),
+            Self::NotNativeExecutable(_) => {
+                write!(f, "provider executable is not a runnable native binary")
             }
-            Self::NotAFile(path) => {
-                write!(f, "provider executable is not a file: {}", path.display())
-            }
-            Self::SymlinkOrReparse(path) => write!(
-                f,
-                "provider executable must not be a symlink or reparse point: {}",
-                path.display()
-            ),
-            Self::HardlinkAmbiguous(path) => write!(
-                f,
-                "provider executable must not have hardlink ambiguity: {}",
-                path.display()
-            ),
-            Self::ChangedDuringValidation(path) => write!(
-                f,
-                "provider executable changed during validation: {}",
-                path.display()
-            ),
-            Self::InvalidFileIdentity(path) => write!(
-                f,
-                "provider executable has invalid file identity: {}",
-                path.display()
-            ),
-            Self::NotCanonical {
-                requested,
-                canonical,
-            } => write!(
-                f,
-                "provider executable path is not canonical: {} (canonical {})",
-                requested.display(),
-                canonical.display()
-            ),
-            Self::HashMismatch(path) => write!(
-                f,
-                "provider executable hash does not match: {}",
-                path.display()
-            ),
-            Self::Io { path, kind } => {
+            Self::SymlinkOrReparse(_) => {
                 write!(
                     f,
-                    "could not inspect provider executable {} ({kind:?})",
-                    path.display()
+                    "provider executable must not be a symlink or reparse point"
                 )
+            }
+            Self::HardlinkAmbiguous(_) => {
+                write!(f, "provider executable has ambiguous hardlink identity")
+            }
+            Self::ChangedDuringValidation(_) => {
+                write!(f, "provider executable changed during validation")
+            }
+            Self::InvalidFileIdentity(_) => {
+                write!(f, "provider executable has invalid file identity")
+            }
+            Self::UnsupportedPlatform(_) => {
+                write!(
+                    f,
+                    "provider executable identity cannot be proven on this platform"
+                )
+            }
+            Self::NotCanonical { .. } => write!(f, "provider executable path is not canonical"),
+            Self::HashMismatch(_) => write!(f, "provider executable hash does not match"),
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(
+                    f,
+                    "unsupported provider executable schema version {version}"
+                )
+            }
+            Self::Io { kind, .. } => {
+                write!(f, "could not inspect provider executable ({kind:?})")
             }
             Self::BackgroundTask => write!(f, "provider executable inspection task failed"),
         }
@@ -457,6 +678,11 @@ impl ProviderFileIdentity {
     }
 
     fn validate(self, path: &Path) -> Result<(), ProviderExecutableError> {
+        if matches!(self, Self::Other { .. }) {
+            return Err(ProviderExecutableError::UnsupportedPlatform(
+                path.to_path_buf(),
+            ));
+        }
         if self.link_count() != 1 {
             return Err(ProviderExecutableError::HardlinkAmbiguous(
                 path.to_path_buf(),
@@ -495,6 +721,14 @@ impl ProviderAuthProbeResult {
             Self::Unknown | Self::ApiKeyDetected => Some(ProviderAuthState::Unknown),
         }
     }
+
+    pub const fn default_confidence(self) -> EvidenceConfidence {
+        match self {
+            Self::AuthenticatedSubscription | Self::AuthRequired => EvidenceConfidence::High,
+            Self::ApiKeyDetected => EvidenceConfidence::Low,
+            Self::Unknown => EvidenceConfidence::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +737,7 @@ pub enum ProviderAuthEvidenceError {
     NonceGenerationFailed,
     UnknownInvocation,
     WrongProvider,
+    WrongAuthSource,
     WrongExecutable,
     Expired,
     FutureTimestamp,
@@ -518,6 +753,7 @@ impl fmt::Display for ProviderAuthEvidenceError {
             Self::NonceGenerationFailed => write!(f, "could not issue auth probe nonce"),
             Self::UnknownInvocation => write!(f, "auth evidence invocation was not issued"),
             Self::WrongProvider => write!(f, "auth evidence provider does not match invocation"),
+            Self::WrongAuthSource => write!(f, "auth evidence source does not match provider"),
             Self::WrongExecutable => {
                 write!(f, "auth evidence executable does not match invocation")
             }
@@ -537,16 +773,17 @@ impl fmt::Display for ProviderAuthEvidenceError {
 
 impl std::error::Error for ProviderAuthEvidenceError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ProviderAuthInvocationKey {
     kind: ProviderKind,
     executable: ProviderExecutable,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderAuthProbeInvocation {
     kind: ProviderKind,
+    source: ProviderAuthEvidenceSource,
     executable: ProviderExecutable,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
@@ -554,9 +791,28 @@ pub struct ProviderAuthProbeInvocation {
     deadline: Instant,
 }
 
+impl fmt::Debug for ProviderAuthProbeInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAuthProbeInvocation")
+            .field("kind", &self.kind)
+            .field("source", &self.source)
+            .field("executable", &self.executable)
+            .field("nonce", &"<redacted>")
+            .field("generation", &self.generation)
+            .field("issued_at", &self.issued_at)
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
 impl ProviderAuthProbeInvocation {
     pub const fn provider_kind(&self) -> ProviderKind {
         self.kind
+    }
+
+    pub const fn source(&self) -> ProviderAuthEvidenceSource {
+        self.source
     }
 
     pub const fn nonce(&self) -> &[u8; PROVIDER_AUTH_NONCE_BYTES] {
@@ -588,20 +844,43 @@ impl ProviderAuthProbeInvocation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderAuthEvidenceReceipt {
     kind: ProviderKind,
+    source: ProviderAuthEvidenceSource,
     executable: ProviderExecutable,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
     result: ProviderAuthProbeResult,
     observed_at: Instant,
     deadline: Instant,
+    confidence: EvidenceConfidence,
+}
+
+impl fmt::Debug for ProviderAuthEvidenceReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAuthEvidenceReceipt")
+            .field("kind", &self.kind)
+            .field("source", &self.source)
+            .field("executable", &self.executable)
+            .field("nonce", &"<redacted>")
+            .field("generation", &self.generation)
+            .field("result", &self.result)
+            .field("observed_at", &self.observed_at)
+            .field("deadline", &self.deadline)
+            .field("confidence", &self.confidence)
+            .finish()
+    }
 }
 
 impl ProviderAuthEvidenceReceipt {
     pub const fn provider_kind(&self) -> ProviderKind {
         self.kind
+    }
+
+    pub const fn source(&self) -> ProviderAuthEvidenceSource {
+        self.source
     }
 
     pub const fn executable(&self) -> &ProviderExecutable {
@@ -628,6 +907,14 @@ impl ProviderAuthEvidenceReceipt {
         self.deadline
     }
 
+    pub const fn expires_at(&self) -> Instant {
+        self.deadline
+    }
+
+    pub const fn confidence(&self) -> EvidenceConfidence {
+        self.confidence
+    }
+
     pub const fn is_authenticated_subscription(&self) -> bool {
         self.result.is_authenticated_subscription()
     }
@@ -637,7 +924,7 @@ impl ProviderAuthEvidenceReceipt {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProviderAuthEvidenceRegistry {
     next_generation: u64,
     pending: HashMap<ProviderAuthInvocationKey, ProviderAuthProbeInvocation>,
@@ -655,11 +942,26 @@ impl ProviderAuthEvidenceRegistry {
         executable: ProviderExecutable,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_with_source(
+            kind,
+            ProviderAuthEvidenceSource::for_kind(kind),
+            executable,
+            ttl,
+        )
+    }
+
+    pub fn begin_with_source(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutable,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         let issued_at = Instant::now();
         let deadline = issued_at
             .checked_add(ttl)
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
-        self.begin_at(kind, executable, issued_at, deadline)
+        self.begin_at_with_source(kind, source, executable, issued_at, deadline)
     }
 
     pub fn begin_at(
@@ -669,6 +971,26 @@ impl ProviderAuthEvidenceRegistry {
         issued_at: Instant,
         deadline: Instant,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_at_with_source(
+            kind,
+            ProviderAuthEvidenceSource::for_kind(kind),
+            executable,
+            issued_at,
+            deadline,
+        )
+    }
+
+    pub fn begin_at_with_source(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutable,
+        issued_at: Instant,
+        deadline: Instant,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        if source.provider_kind() != kind {
+            return Err(ProviderAuthEvidenceError::WrongAuthSource);
+        }
         if deadline <= issued_at {
             return Err(ProviderAuthEvidenceError::InvalidDeadline);
         }
@@ -684,6 +1006,7 @@ impl ProviderAuthEvidenceRegistry {
         }
         let invocation = ProviderAuthProbeInvocation {
             kind,
+            source,
             executable,
             nonce,
             generation: self.next_generation,
@@ -702,8 +1025,30 @@ impl ProviderAuthEvidenceRegistry {
         result: ProviderAuthProbeResult,
         observed_at: Instant,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        self.accept_at_for_with_confidence(
+            expected_kind,
+            expected_executable,
+            invocation,
+            result,
+            observed_at,
+            result.default_confidence(),
+        )
+    }
+
+    pub fn accept_at_for_with_confidence(
+        &mut self,
+        expected_kind: ProviderKind,
+        expected_executable: &ProviderExecutable,
+        invocation: ProviderAuthProbeInvocation,
+        result: ProviderAuthProbeResult,
+        observed_at: Instant,
+        confidence: EvidenceConfidence,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         if invocation.kind != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongProvider);
+        }
+        if invocation.source.provider_kind() != expected_kind {
+            return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
         if &invocation.executable != expected_executable {
             return Err(ProviderAuthEvidenceError::WrongExecutable);
@@ -737,12 +1082,14 @@ impl ProviderAuthEvidenceRegistry {
             .insert(identity_key, (invocation.generation, observed_at));
         Ok(ProviderAuthEvidenceReceipt {
             kind: invocation.kind,
+            source: invocation.source,
             executable: invocation.executable,
             nonce: invocation.nonce,
             generation: invocation.generation,
             result,
             observed_at,
             deadline: invocation.deadline,
+            confidence,
         })
     }
 
@@ -766,11 +1113,53 @@ impl ProviderAuthEvidenceRegistry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone)]
 pub struct ProviderExecutable {
     canonical_path: PathBuf,
     file_identity: ProviderFileIdentity,
     sha256: [u8; 32],
+    is_native: bool,
+    handle: Arc<Mutex<File>>,
+}
+
+impl fmt::Debug for ProviderExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderExecutable")
+            .field("canonical_path", &"<redacted>")
+            .field("file_identity", &self.file_identity)
+            .field("sha256", &self.sha256)
+            .field("is_native", &self.is_native)
+            .finish()
+    }
+}
+
+impl PartialEq for ProviderExecutable {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_path == other.canonical_path
+            && self.file_identity == other.file_identity
+            && self.sha256 == other.sha256
+            && self.is_native == other.is_native
+    }
+}
+
+impl Eq for ProviderExecutable {}
+
+impl Hash for ProviderExecutable {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_path.hash(state);
+        self.file_identity.hash(state);
+        self.sha256.hash(state);
+        self.is_native.hash(state);
+    }
+}
+
+/// A launch-time capability bound to the same no-follow handle and file
+/// identity captured by [`ProviderExecutable`]. The later launcher can
+/// consume the handle instead of reopening an attacker-controlled path.
+#[derive(Debug, Clone)]
+pub struct ProviderExecutableHandle {
+    executable: ProviderExecutable,
 }
 
 impl ProviderExecutable {
@@ -781,6 +1170,9 @@ impl ProviderExecutable {
         let canonical_path = canonical_path.into();
         if canonical_path.as_os_str().is_empty() {
             return Err(ProviderExecutableError::EmptyPath);
+        }
+        if path_bytes(&canonical_path) > MAX_PROVIDER_PATH_BYTES {
+            return Err(ProviderExecutableError::PathTooLong);
         }
         let inspected = Self::inspect_blocking(&canonical_path)?;
         if inspected.canonical_path != canonical_path {
@@ -797,28 +1189,55 @@ impl ProviderExecutable {
         Ok(inspected)
     }
 
-    /// Resolve and inspect a candidate path without trusting its basename.
+    /// Resolve and inspect a native candidate path without trusting its
+    /// basename. The resulting identity retains the opened no-follow handle.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ProviderExecutableError> {
         Self::inspect_blocking(path.as_ref())
     }
 
-    /// Re-check the current path and file identity before using a cached fact.
+    /// Prepare a launch handle after revalidating both the current path and
+    /// the originally captured file handle.
+    pub fn open_for_launch(&self) -> Result<ProviderExecutableHandle, ProviderExecutableError> {
+        self.validate_current()?;
+        Ok(ProviderExecutableHandle {
+            executable: self.clone(),
+        })
+    }
+
+    /// Re-check the current path, native format, and captured file identity
+    /// before using a cached fact.
     pub fn validate_current(&self) -> Result<(), ProviderExecutableError> {
-        let current = Self::inspect_blocking(&self.canonical_path)?;
-        if current == *self {
-            Ok(())
-        } else {
+        let current = Self::inspect_blocking_with_mode(&self.canonical_path, self.is_native)?;
+        if current != *self || !self.validate_bound_handle()? {
             Err(ProviderExecutableError::ChangedDuringValidation(
                 self.canonical_path.clone(),
             ))
+        } else {
+            Ok(())
         }
     }
 
     pub(crate) fn inspect_blocking(path: &Path) -> Result<Self, ProviderExecutableError> {
+        Self::inspect_blocking_with_mode(path, true)
+    }
+
+    fn inspect_non_native_blocking(path: &Path) -> Result<Self, ProviderExecutableError> {
+        Self::inspect_blocking_with_mode(path, false)
+    }
+
+    fn inspect_blocking_with_mode(
+        path: &Path,
+        is_native: bool,
+    ) -> Result<Self, ProviderExecutableError> {
         if path.as_os_str().is_empty() {
             return Err(ProviderExecutableError::EmptyPath);
         }
+        if path_bytes(path) > MAX_PROVIDER_PATH_BYTES {
+            return Err(ProviderExecutableError::PathTooLong);
+        }
         reject_reparse_components(path)?;
+        let initial_file = open_nofollow(path)?;
+        let initial_identity = inspect_opened_metadata(&initial_file, path, is_native)?;
         let canonical_path = fs::canonicalize(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 ProviderExecutableError::Missing(path.to_path_buf())
@@ -829,8 +1248,20 @@ impl ProviderExecutable {
                 }
             }
         })?;
+        if !canonical_path.is_absolute() {
+            return Err(ProviderExecutableError::NotCanonical {
+                requested: path.to_path_buf(),
+                canonical: canonical_path,
+            });
+        }
         reject_reparse_components(&canonical_path)?;
-        let first = inspect_snapshot(&canonical_path)?;
+        let first =
+            inspect_opened_file(open_nofollow(&canonical_path)?, &canonical_path, is_native)?;
+        if initial_identity != first.identity {
+            return Err(ProviderExecutableError::ChangedDuringValidation(
+                canonical_path,
+            ));
+        }
         let canonical_after =
             fs::canonicalize(path).map_err(|error| ProviderExecutableError::Io {
                 path: path.to_path_buf(),
@@ -841,18 +1272,76 @@ impl ProviderExecutable {
                 path.to_path_buf(),
             ));
         }
-        let second = inspect_snapshot(&canonical_path)?;
-        if first != second {
+        let second =
+            inspect_opened_file(open_nofollow(&canonical_path)?, &canonical_path, is_native)?;
+        if first.identity != second.identity || first.sha256 != second.sha256 {
             return Err(ProviderExecutableError::ChangedDuringValidation(
-                canonical_path,
+                canonical_path.clone(),
             ));
         }
 
         Ok(Self {
             canonical_path,
-            file_identity: second.0,
-            sha256: second.1,
+            file_identity: second.identity,
+            sha256: second.sha256,
+            is_native,
+            handle: Arc::new(Mutex::new(second.file)),
         })
+    }
+
+    fn validate_bound_handle(&self) -> Result<bool, ProviderExecutableError> {
+        let file = self
+            .handle
+            .lock()
+            .map_err(|_| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: io::ErrorKind::Other,
+            })?;
+        let identity = inspect_opened_metadata(&file, &self.canonical_path, self.is_native)?;
+        Ok(identity == self.file_identity)
+    }
+
+    fn clone_file_handle(&self) -> Result<File, ProviderExecutableError> {
+        self.handle
+            .lock()
+            .map_err(|_| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: io::ErrorKind::Other,
+            })?
+            .try_clone()
+            .map_err(|error| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: error.kind(),
+            })
+    }
+
+    fn read_handle_contents(&self) -> Result<Vec<u8>, ProviderExecutableError> {
+        let mut file = self
+            .handle
+            .lock()
+            .map_err(|_| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: io::ErrorKind::Other,
+            })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: error.kind(),
+            })?;
+        let mut contents = Vec::with_capacity(MAX_PROVIDER_SHIM_BYTES + 1);
+        let mut bounded = (&mut *file).take((MAX_PROVIDER_SHIM_BYTES + 1) as u64);
+        bounded
+            .read_to_end(&mut contents)
+            .map_err(|error| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: error.kind(),
+            })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ProviderExecutableError::Io {
+                path: self.canonical_path.clone(),
+                kind: error.kind(),
+            })?;
+        Ok(contents)
     }
 
     pub fn canonical_path(&self) -> &Path {
@@ -875,32 +1364,209 @@ impl ProviderExecutable {
     }
 }
 
+impl ProviderExecutableHandle {
+    pub fn executable(&self) -> &ProviderExecutable {
+        &self.executable
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        self.executable.canonical_path()
+    }
+
+    pub const fn file_identity(&self) -> &ProviderFileIdentity {
+        self.executable.file_identity()
+    }
+
+    pub fn revalidate(&self) -> Result<(), ProviderExecutableError> {
+        self.executable.validate_current()
+    }
+
+    pub fn try_clone_file(&self) -> Result<File, ProviderExecutableError> {
+        self.executable.clone_file_handle()
+    }
+
+    pub fn into_file(self) -> Result<File, ProviderExecutableError> {
+        self.revalidate()?;
+        self.executable.clone_file_handle()
+    }
+}
+
+impl Serialize for ProviderExecutable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("ProviderExecutable", 4)?;
+        state.serialize_field("schema_version", &PROVIDER_EXECUTABLE_SCHEMA_VERSION)?;
+        state.serialize_field("canonical_path", &self.canonical_path)?;
+        state.serialize_field("file_identity", &self.file_identity)?;
+        state.serialize_field("sha256", &self.sha256)?;
+        state.end()
+    }
+}
+
+struct BoundedPathBuf(PathBuf);
+
+impl<'de> Deserialize<'de> for BoundedPathBuf {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoundedPathVisitor;
+
+        impl<'de> Visitor<'de> for BoundedPathVisitor {
+            type Value = BoundedPathBuf;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded executable path string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_PROVIDER_PATH_BYTES {
+                    return Err(E::custom(ProviderExecutableError::PathTooLong));
+                }
+                Ok(BoundedPathBuf(PathBuf::from(value)))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_PROVIDER_PATH_BYTES {
+                    return Err(E::custom(ProviderExecutableError::PathTooLong));
+                }
+                Ok(BoundedPathBuf(PathBuf::from(value)))
+            }
+        }
+
+        deserializer
+            .deserialize_string(BoundedPathVisitor)
+            .map_err(|error| error)
+    }
+}
+
 impl<'de> Deserialize<'de> for ProviderExecutable {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            canonical_path: PathBuf,
+            #[serde(default = "default_executable_schema_version")]
+            schema_version: u16,
+            canonical_path: BoundedPathBuf,
             file_identity: ProviderFileIdentity,
             sha256: [u8; 32],
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version != PROVIDER_EXECUTABLE_SCHEMA_VERSION {
+            return Err(de::Error::custom(
+                ProviderExecutableError::UnsupportedSchemaVersion(wire.schema_version),
+            ));
+        }
         let inspected =
-            Self::new(wire.canonical_path.clone(), wire.sha256).map_err(de::Error::custom)?;
+            Self::new(wire.canonical_path.0.clone(), wire.sha256).map_err(de::Error::custom)?;
         if inspected.file_identity != wire.file_identity {
             return Err(de::Error::custom(
-                ProviderExecutableError::InvalidFileIdentity(wire.canonical_path),
+                ProviderExecutableError::InvalidFileIdentity(wire.canonical_path.0),
             ));
         }
         Ok(inspected)
     }
 }
 
-fn inspect_snapshot(
+const fn default_executable_schema_version() -> u16 {
+    PROVIDER_EXECUTABLE_SCHEMA_VERSION
+}
+
+struct OpenedExecutable {
+    file: File,
+    identity: ProviderFileIdentity,
+    sha256: [u8; 32],
+}
+
+fn inspect_opened_file(
+    mut file: File,
     path: &Path,
-) -> Result<(ProviderFileIdentity, [u8; 32]), ProviderExecutableError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    is_native: bool,
+) -> Result<OpenedExecutable, ProviderExecutableError> {
+    let identity = inspect_opened_metadata(&file, path, is_native)?;
+    let sha256 = hash_file(&mut file, path)?;
+    let after_identity = file_identity(&file, path)?;
+    after_identity.validate(path)?;
+    if after_identity != identity {
+        return Err(ProviderExecutableError::ChangedDuringValidation(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(OpenedExecutable {
+        file,
+        identity,
+        sha256,
+    })
+}
+
+fn inspect_opened_metadata(
+    file: &File,
+    path: &Path,
+    is_native: bool,
+) -> Result<ProviderFileIdentity, ProviderExecutableError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| ProviderExecutableError::Io {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+    if !metadata.is_file() {
+        return Err(ProviderExecutableError::NotAFile(path.to_path_buf()));
+    }
+    let identity = file_identity(file, path)?;
+    identity.validate(path)?;
+    if is_native {
+        let mut file = file
+            .try_clone()
+            .map_err(|error| ProviderExecutableError::Io {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+            })?;
+        validate_native_format(&mut file, path)?;
+    }
+    Ok(identity)
+}
+
+fn open_nofollow(path: &Path) -> Result<File, ProviderExecutableError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(no_follow) = unix_open_no_follow_flag() else {
+            return Err(ProviderExecutableError::UnsupportedPlatform(
+                path.to_path_buf(),
+            ));
+        };
+        options.custom_flags(no_follow);
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        return Err(ProviderExecutableError::UnsupportedPlatform(
+            path.to_path_buf(),
+        ));
+    }
+
+    options.open(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             ProviderExecutableError::Missing(path.to_path_buf())
         } else {
@@ -909,24 +1575,134 @@ fn inspect_snapshot(
                 kind: error.kind(),
             }
         }
-    })?;
-    if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
-        return Err(ProviderExecutableError::SymlinkOrReparse(
+    })
+}
+
+#[cfg(unix)]
+fn unix_open_no_follow_flag() -> Option<i32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return Some(0x20000);
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    {
+        return Some(0x0100);
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        return Some(0x0200);
+    }
+    None
+}
+
+fn validate_native_format(file: &mut File, path: &Path) -> Result<(), ProviderExecutableError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ProviderExecutableError::Io {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut dos_header = [0_u8; 64];
+        file.read_exact(&mut dos_header)
+            .map_err(|_| ProviderExecutableError::NotNativeExecutable(path.to_path_buf()))?;
+        if &dos_header[..2] != b"MZ" {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                path.to_path_buf(),
+            ));
+        }
+        let pe_offset = u32::from_le_bytes(dos_header[60..64].try_into().unwrap()) as u64;
+        let length = file
+            .metadata()
+            .map_err(|error| ProviderExecutableError::Io {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+            })?
+            .len();
+        if pe_offset > length.saturating_sub(4) {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                path.to_path_buf(),
+            ));
+        }
+        file.seek(SeekFrom::Start(pe_offset))
+            .map_err(|error| ProviderExecutableError::Io {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+            })?;
+        let mut signature = [0_u8; 4];
+        file.read_exact(&mut signature)
+            .map_err(|_| ProviderExecutableError::NotNativeExecutable(path.to_path_buf()))?;
+        if &signature != b"PE\0\0" {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                path.to_path_buf(),
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file
+            .metadata()
+            .map_err(|error| ProviderExecutableError::Io {
+                path: path.to_path_buf(),
+                kind: error.kind(),
+            })?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                path.to_path_buf(),
+            ));
+        }
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)
+            .map_err(|_| ProviderExecutableError::NotNativeExecutable(path.to_path_buf()))?;
+        let valid = matches!(
+            magic,
+            [0x7f, b'E', b'L', b'F']
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        );
+        if !valid {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                path.to_path_buf(),
+            ));
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        return Err(ProviderExecutableError::UnsupportedPlatform(
             path.to_path_buf(),
         ));
     }
-    if !metadata.is_file() {
-        return Err(ProviderExecutableError::NotAFile(path.to_path_buf()));
-    }
 
-    let mut file = File::open(path).map_err(|error| ProviderExecutableError::Io {
-        path: path.to_path_buf(),
-        kind: error.kind(),
-    })?;
-    let file_identity = file_identity(&file, path)?;
-    file_identity.validate(path)?;
-    let sha256 = hash_file(&mut file, path)?;
-    Ok((file_identity, sha256))
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ProviderExecutableError::Io {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        })?;
+    Ok(())
 }
 
 fn hash_file(file: &mut File, path: &Path) -> Result<[u8; 32], ProviderExecutableError> {
@@ -947,6 +1723,25 @@ fn hash_file(file: &mut File, path: &Path) -> Result<[u8; 32], ProviderExecutabl
     Ok(hasher.finalize().into())
 }
 
+fn path_bytes(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return path.as_os_str().as_bytes().len();
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        return path.as_os_str().encode_wide().count().saturating_mul(2);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_string_lossy().len()
+    }
+}
+
 fn reject_reparse_components(path: &Path) -> Result<(), ProviderExecutableError> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -955,7 +1750,16 @@ fn reject_reparse_components(path: &Path) -> Result<(), ProviderExecutableError>
                     ancestor.to_path_buf(),
                 ));
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ProviderExecutableError::Missing(ancestor.to_path_buf()));
+            }
+            Err(error) => {
+                return Err(ProviderExecutableError::Io {
+                    path: ancestor.to_path_buf(),
+                    kind: error.kind(),
+                });
+            }
         }
     }
     Ok(())
@@ -1035,20 +1839,10 @@ fn file_identity(
     file: &File,
     path: &Path,
 ) -> Result<ProviderFileIdentity, ProviderExecutableError> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| ProviderExecutableError::Io {
-            path: path.to_path_buf(),
-            kind: error.kind(),
-        })?;
-    let mut hasher = Sha256::new();
-    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
-    hasher.update(metadata.len().to_le_bytes());
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok(ProviderFileIdentity::Other {
-        stable_id: digest[..16].try_into().unwrap(),
-        link_count: 1,
-    })
+    let _ = file;
+    Err(ProviderExecutableError::UnsupportedPlatform(
+        path.to_path_buf(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1167,11 +1961,99 @@ impl ProviderExecutablePolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One immutable, canonicalized capture of PATH. Resolution uses these
+/// entries in their captured order and constructs candidate paths itself;
+/// callers cannot assert a `PathEntry` origin for an arbitrary path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderPathSnapshot {
+    directories: Vec<ProviderPathSnapshotEntry>,
+}
+
+impl fmt::Debug for ProviderPathSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderPathSnapshot")
+            .field("directory_count", &self.directories.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderPathSnapshotEntry {
+    index: usize,
+    directory: PathBuf,
+}
+
+impl ProviderPathSnapshot {
+    pub fn capture(path: impl AsRef<OsStr>) -> Result<Self, ProviderDiscoveryError> {
+        let mut directories = Vec::new();
+        for (index, directory) in std::env::split_paths(path.as_ref()).enumerate() {
+            if directory.as_os_str().is_empty() {
+                continue;
+            }
+            if path_bytes(&directory) > MAX_PROVIDER_PATH_BYTES {
+                return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
+            }
+            match reject_reparse_components(&directory) {
+                Ok(()) => {}
+                Err(ProviderExecutableError::Missing(_)) => continue,
+                Err(_) => {
+                    return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
+                }
+            }
+            let canonical = match fs::canonicalize(&directory) {
+                Ok(canonical) => canonical,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
+                }
+            };
+            if !canonical.is_dir() {
+                continue;
+            }
+            reject_reparse_components(&canonical)
+                .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(canonical.clone()))?;
+            directories.push(ProviderPathSnapshotEntry {
+                index,
+                directory: canonical,
+            });
+        }
+        Ok(Self { directories })
+    }
+
+    pub fn capture_current() -> Result<Self, ProviderDiscoveryError> {
+        let path = std::env::var_os("PATH")
+            .ok_or_else(|| ProviderDiscoveryError::InvalidPathSnapshot(PathBuf::from("PATH")))?;
+        Self::capture(path)
+    }
+
+    pub fn len(&self) -> usize {
+        self.directories.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.directories.is_empty()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDiscoveryOrigin {
     ConfiguredOverride,
     PathEntry { index: usize, directory: PathBuf },
+}
+
+impl fmt::Debug for ProviderDiscoveryOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfiguredOverride => formatter.write_str("ConfiguredOverride"),
+            Self::PathEntry { index, .. } => formatter
+                .debug_struct("PathEntry")
+                .field("index", index)
+                .field("directory", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1180,12 +2062,24 @@ pub enum ProviderExecutableForm {
     WindowsShim { target: Box<ProviderExecutable> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderDiscoveryCandidate {
     origin: ProviderDiscoveryOrigin,
     requested_path: PathBuf,
     executable: ProviderExecutable,
     form: ProviderExecutableForm,
+}
+
+impl fmt::Debug for ProviderDiscoveryCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderDiscoveryCandidate")
+            .field("origin", &self.origin)
+            .field("requested_path", &"<redacted>")
+            .field("executable", &self.executable)
+            .field("form", &self.form)
+            .finish()
+    }
 }
 
 impl ProviderDiscoveryCandidate {
@@ -1206,7 +2100,7 @@ impl ProviderDiscoveryCandidate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderDiscoveryCandidateInput {
     Native {
         path: PathBuf,
@@ -1219,25 +2113,29 @@ pub enum ProviderDiscoveryCandidateInput {
     },
 }
 
+impl fmt::Debug for ProviderDiscoveryCandidateInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Native { origin, .. } => formatter
+                .debug_struct("Native")
+                .field("path", &"<redacted>")
+                .field("origin", origin)
+                .finish(),
+            Self::WindowsShim { origin, .. } => formatter
+                .debug_struct("WindowsShim")
+                .field("shim_path", &"<redacted>")
+                .field("target_path", &"<redacted>")
+                .field("origin", origin)
+                .finish(),
+        }
+    }
+}
+
 impl ProviderDiscoveryCandidateInput {
     pub fn configured_override(path: impl Into<PathBuf>) -> Self {
         Self::Native {
             path: path.into(),
             origin: ProviderDiscoveryOrigin::ConfiguredOverride,
-        }
-    }
-
-    pub fn path_entry(
-        path: impl Into<PathBuf>,
-        index: usize,
-        directory: impl Into<PathBuf>,
-    ) -> Self {
-        Self::Native {
-            path: path.into(),
-            origin: ProviderDiscoveryOrigin::PathEntry {
-                index,
-                directory: directory.into(),
-            },
         }
     }
 
@@ -1254,9 +2152,11 @@ impl ProviderDiscoveryCandidateInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderDiscoveryError {
     UnsupportedPlatform,
+    NoCandidate(ProviderKind),
+    InvalidPathSnapshot(PathBuf),
     OriginNotAllowed(PathBuf),
     WrongEntrypoint(PathBuf),
     WrongFileType(PathBuf),
@@ -1264,35 +2164,46 @@ pub enum ProviderDiscoveryError {
     Executable(ProviderExecutableError),
 }
 
+impl fmt::Debug for ProviderDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::NoCandidate(_) => "no_candidate",
+            Self::InvalidPathSnapshot(_) => "invalid_path_snapshot",
+            Self::OriginNotAllowed(_) => "origin_not_allowed",
+            Self::WrongEntrypoint(_) => "wrong_entrypoint",
+            Self::WrongFileType(_) => "wrong_file_type",
+            Self::ShimProofInvalid(_) => "shim_proof_invalid",
+            Self::Executable(_) => "executable",
+        };
+        formatter
+            .debug_struct("ProviderDiscoveryError")
+            .field("code", &code)
+            .finish()
+    }
+}
+
 impl fmt::Display for ProviderDiscoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedPlatform => write!(f, "Windows provider shims are unsupported here"),
-            Self::OriginNotAllowed(path) => write!(
-                f,
-                "provider executable origin is not allowlisted: {}",
-                path.display()
-            ),
-            Self::WrongEntrypoint(path) => {
-                write!(
-                    f,
-                    "provider executable is not an allowlisted entrypoint: {}",
-                    path.display()
-                )
+            Self::NoCandidate(kind) => {
+                write!(f, "no trusted provider executable was found for {kind:?}")
             }
-            Self::WrongFileType(path) => {
-                write!(
-                    f,
-                    "provider executable has the wrong file type: {}",
-                    path.display()
-                )
+            Self::InvalidPathSnapshot(_) => {
+                write!(f, "provider PATH snapshot entry is not a trusted directory")
             }
-            Self::ShimProofInvalid(path) => {
-                write!(
-                    f,
-                    "provider Windows shim proof is invalid: {}",
-                    path.display()
-                )
+            Self::OriginNotAllowed(_) => {
+                write!(f, "provider executable origin is not allowlisted")
+            }
+            Self::WrongEntrypoint(_) => {
+                write!(f, "provider executable is not an allowlisted entrypoint")
+            }
+            Self::WrongFileType(_) => {
+                write!(f, "provider executable has the wrong file type")
+            }
+            Self::ShimProofInvalid(_) => {
+                write!(f, "provider Windows shim proof is invalid")
             }
             Self::Executable(error) => error.fmt(f),
         }
@@ -1346,6 +2257,70 @@ impl ProviderDiscoveryContract {
         (!self.shim_entrypoint.is_empty()).then_some(self.shim_entrypoint.as_str())
     }
 
+    /// Resolve provider candidates from one captured PATH snapshot. Candidate
+    /// paths and their `PathEntry` provenance are constructed here, never
+    /// supplied by the caller.
+    pub fn resolve_from_path_snapshot(
+        &self,
+        snapshot: &ProviderPathSnapshot,
+    ) -> Result<ProviderDiscoveryCandidate, ProviderDiscoveryError> {
+        self.resolve_all_from_path_snapshot(snapshot)?
+            .into_iter()
+            .next()
+            .ok_or(ProviderDiscoveryError::NoCandidate(self.kind))
+    }
+
+    pub fn resolve_all_from_path_snapshot(
+        &self,
+        snapshot: &ProviderPathSnapshot,
+    ) -> Result<Vec<ProviderDiscoveryCandidate>, ProviderDiscoveryError> {
+        let mut candidates = Vec::new();
+        for entry in &snapshot.directories {
+            let origin = ProviderDiscoveryOrigin::PathEntry {
+                index: entry.index,
+                directory: entry.directory.clone(),
+            };
+            let native_path = entry.directory.join(&self.native_entrypoint);
+            match ProviderExecutable::from_path(&native_path) {
+                Ok(executable) => {
+                    self.validate_native_path(&executable)?;
+                    candidates.push(ProviderDiscoveryCandidate {
+                        origin: origin.clone(),
+                        requested_path: native_path.clone(),
+                        executable,
+                        form: ProviderExecutableForm::Native,
+                    });
+                }
+                Err(ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_)) => {
+                }
+                Err(error) => return Err(ProviderDiscoveryError::Executable(error)),
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Some(shim_entrypoint) = self.shim_entrypoint() {
+                let shim_path = entry.directory.join(shim_entrypoint);
+                match fs::symlink_metadata(&shim_path) {
+                    Ok(_) => candidates.push(self.validate_windows_shim(
+                        shim_path,
+                        native_path.clone(),
+                        origin,
+                        true,
+                    )?),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ProviderDiscoveryError::Executable(
+                            ProviderExecutableError::Io {
+                                path: shim_path,
+                                kind: error.kind(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     pub fn validate(
         &self,
         candidate: ProviderDiscoveryCandidateInput,
@@ -1366,7 +2341,7 @@ impl ProviderDiscoveryContract {
                 shim_path,
                 target_path,
                 origin,
-            } => self.validate_windows_shim(shim_path, target_path, origin),
+            } => self.validate_windows_shim(shim_path, target_path, origin, false),
         }
     }
 
@@ -1417,20 +2392,16 @@ impl ProviderDiscoveryContract {
         executable: &ProviderExecutable,
         origin: &ProviderDiscoveryOrigin,
     ) -> Result<(), ProviderDiscoveryError> {
-        let ProviderDiscoveryOrigin::PathEntry { directory, .. } = origin else {
-            return Ok(());
-        };
-        let Ok(directory) = fs::canonicalize(directory) else {
-            return Err(ProviderDiscoveryError::OriginNotAllowed(
-                executable.canonical_path().to_path_buf(),
-            ));
-        };
-        if executable.canonical_path().parent() != Some(directory.as_path()) {
-            return Err(ProviderDiscoveryError::OriginNotAllowed(
-                executable.canonical_path().to_path_buf(),
-            ));
+        match origin {
+            ProviderDiscoveryOrigin::ConfiguredOverride => Ok(()),
+            ProviderDiscoveryOrigin::PathEntry { .. } => {
+                // A caller-supplied PathEntry has no captured PATH proof. Only
+                // resolve_all_from_path_snapshot may create trusted provenance.
+                Err(ProviderDiscoveryError::OriginNotAllowed(
+                    executable.canonical_path().to_path_buf(),
+                ))
+            }
         }
-        Ok(())
     }
 
     fn validate_windows_shim(
@@ -1438,10 +2409,11 @@ impl ProviderDiscoveryContract {
         shim_path: PathBuf,
         target_path: PathBuf,
         origin: ProviderDiscoveryOrigin,
+        trusted_origin: bool,
     ) -> Result<ProviderDiscoveryCandidate, ProviderDiscoveryError> {
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (shim_path, target_path, origin);
+            let _ = (shim_path, target_path, origin, trusted_origin);
             return Err(ProviderDiscoveryError::UnsupportedPlatform);
         }
 
@@ -1450,8 +2422,10 @@ impl ProviderDiscoveryContract {
             let Some(shim_entrypoint) = self.shim_entrypoint() else {
                 return Err(ProviderDiscoveryError::UnsupportedPlatform);
             };
-            let shim = ProviderExecutable::from_path(&shim_path)?;
-            self.validate_origin(&shim, &origin)?;
+            let shim = ProviderExecutable::inspect_non_native_blocking(&shim_path)?;
+            if !trusted_origin {
+                self.validate_origin(&shim, &origin)?;
+            }
             let shim_name = shim
                 .canonical_path()
                 .file_name()
@@ -1476,7 +2450,7 @@ impl ProviderDiscoveryContract {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| ProviderDiscoveryError::ShimProofInvalid(shim_path.clone()))?;
-            let contents = fs::read(shim.canonical_path()).map_err(|_| {
+            let contents = shim.read_handle_contents().map_err(|_| {
                 ProviderDiscoveryError::ShimProofInvalid(shim.canonical_path().to_path_buf())
             })?;
             if contents.len() > MAX_PROVIDER_SHIM_BYTES {
@@ -1539,7 +2513,7 @@ fn is_forbidden_runner_name(name: &str) -> bool {
     .any(|forbidden| same_entrypoint(forbidden, name))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub kind: ProviderKind,
     pub version: ProviderVersion,
@@ -1547,13 +2521,9 @@ pub struct ProviderCapabilities {
     pub exact_resume: CapabilitySupport,
     pub semantic_events: CapabilitySupport,
     pub provider_session_id: CapabilitySupport,
-    #[serde(default)]
     pub build_launch: CapabilitySupport,
-    #[serde(default)]
     pub parse_signal: CapabilitySupport,
-    #[serde(default)]
     pub cooperative_stop: CapabilitySupport,
-    #[serde(default)]
     pub observe_quota: CapabilitySupport,
     pub evidence: Vec<CapabilityEvidence>,
 }
@@ -1561,11 +2531,16 @@ pub struct ProviderCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCapabilitiesError {
     TooManyEvidenceItems,
+    UnsupportedSchemaVersion(u16),
     InvalidEvidence(CapabilityEvidenceError),
     MissingAuthStatusEvidence(ProviderAuthState),
     MismatchedAuthStatusEvidence {
         state: ProviderAuthState,
         evidence: EvidenceStatus,
+    },
+    MismatchedAuthEvidenceSource {
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
     },
 }
 
@@ -1576,6 +2551,9 @@ impl fmt::Display for ProviderCapabilitiesError {
                 f,
                 "provider capabilities contain more than {MAX_CAPABILITY_EVIDENCE_ITEMS} evidence items"
             ),
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(f, "unsupported provider capability schema version {version}")
+            }
             Self::InvalidEvidence(error) => error.fmt(f),
             Self::MissingAuthStatusEvidence(state) => write!(
                 f,
@@ -1585,17 +2563,76 @@ impl fmt::Display for ProviderCapabilitiesError {
                 f,
                 "provider auth state {state:?} does not match AuthStatusProbe evidence {evidence:?}"
             ),
+            Self::MismatchedAuthEvidenceSource { kind, source } => write!(
+                f,
+                "provider auth evidence source {source:?} does not belong to {kind:?}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ProviderCapabilitiesError {}
 
+impl Serialize for ProviderCapabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("ProviderCapabilities", 12)?;
+        state.serialize_field("schema_version", &PROVIDER_CAPABILITY_SCHEMA_VERSION)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("auth_state", &self.auth_state)?;
+        state.serialize_field("exact_resume", &self.exact_resume)?;
+        state.serialize_field("semantic_events", &self.semantic_events)?;
+        state.serialize_field("provider_session_id", &self.provider_session_id)?;
+        state.serialize_field("build_launch", &self.build_launch)?;
+        state.serialize_field("parse_signal", &self.parse_signal)?;
+        state.serialize_field("cooperative_stop", &self.cooperative_stop)?;
+        state.serialize_field("observe_quota", &self.observe_quota)?;
+        state.serialize_field("evidence", &self.evidence)?;
+        state.end()
+    }
+}
+
+struct BoundedCapabilityEvidence(Vec<CapabilityEvidence>);
+
+impl<'de> Deserialize<'de> for BoundedCapabilityEvidence {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EvidenceVisitor;
+
+        impl<'de> Visitor<'de> for EvidenceVisitor {
+            type Value = BoundedCapabilityEvidence;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded capability evidence sequence")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut evidence = Vec::with_capacity(MAX_CAPABILITY_EVIDENCE_ITEMS);
+                while let Some(item) = sequence.next_element::<CapabilityEvidence>()? {
+                    if evidence.len() >= MAX_CAPABILITY_EVIDENCE_ITEMS {
+                        return Err(de::Error::custom(
+                            ProviderCapabilitiesError::TooManyEvidenceItems,
+                        ));
+                    }
+                    evidence.push(item);
+                }
+                Ok(BoundedCapabilityEvidence(evidence))
+            }
+        }
+
+        deserializer.deserialize_seq(EvidenceVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for ProviderCapabilities {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default = "default_capability_schema_version")]
+            schema_version: u16,
             kind: ProviderKind,
             version: ProviderVersion,
             auth_state: ProviderAuthState,
@@ -1610,10 +2647,15 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
             cooperative_stop: CapabilitySupport,
             #[serde(default)]
             observe_quota: CapabilitySupport,
-            evidence: Vec<CapabilityEvidence>,
+            evidence: BoundedCapabilityEvidence,
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version != PROVIDER_CAPABILITY_SCHEMA_VERSION {
+            return Err(de::Error::custom(
+                ProviderCapabilitiesError::UnsupportedSchemaVersion(wire.schema_version),
+            ));
+        }
         let capabilities = Self {
             kind: wire.kind,
             version: wire.version,
@@ -1625,11 +2667,15 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
             parse_signal: wire.parse_signal,
             cooperative_stop: wire.cooperative_stop,
             observe_quota: wire.observe_quota,
-            evidence: wire.evidence,
+            evidence: wire.evidence.0,
         };
         capabilities.validate().map_err(de::Error::custom)?;
         Ok(capabilities)
     }
+}
+
+const fn default_capability_schema_version() -> u16 {
+    PROVIDER_CAPABILITY_SCHEMA_VERSION
 }
 
 impl ProviderCapabilities {
@@ -1641,6 +2687,14 @@ impl ProviderCapabilities {
             evidence
                 .validate()
                 .map_err(ProviderCapabilitiesError::InvalidEvidence)?;
+            if let Some(source) = evidence.auth_source() {
+                if source.provider_kind() != self.kind {
+                    return Err(ProviderCapabilitiesError::MismatchedAuthEvidenceSource {
+                        kind: self.kind,
+                        source,
+                    });
+                }
+            }
         }
         let auth_evidence = self
             .evidence

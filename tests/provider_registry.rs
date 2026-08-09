@@ -21,6 +21,7 @@ use devmanager::providers::registry::{
 };
 use serde_json::Value;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -211,7 +212,19 @@ fn auth_evidence(auth_state: ProviderAuthState, observed_at: u64) -> Vec<Capabil
 
 fn executable_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = root.join(name);
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::copy(
+        std::env::current_exe().expect("current test executable"),
+        &path,
+    )
+    .expect("copy controlled native test executable");
+    if !bytes.is_empty() {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open controlled native test executable")
+            .write_all(bytes)
+            .expect("append controlled fixture marker");
+    }
     path
 }
 
@@ -312,10 +325,8 @@ fn capability_cache_key_contains_every_identity_dimension() {
     let temp = tempdir().unwrap();
     let executable = executable_file(temp.path(), "cursor-agent", b"cursor-a");
     let replacement = executable_file(temp.path(), "cursor-agent-replacement", b"cursor-b");
-    let identity =
-        ProviderExecutable::new(std::fs::canonicalize(&executable).unwrap(), [1; 32]).unwrap();
-    let replacement_identity =
-        ProviderExecutable::new(std::fs::canonicalize(&replacement).unwrap(), [2; 32]).unwrap();
+    let identity = ProviderExecutable::from_path(&executable).unwrap();
+    let replacement_identity = ProviderExecutable::from_path(&replacement).unwrap();
     let version = ProviderVersion::new("fixture-1").unwrap();
     let base = CapabilityCacheKey::new(
         ProviderKind::ClaudeCode,
@@ -568,7 +579,12 @@ async fn binary_replacement_at_same_path_invalidates_capability_cache() {
         .observe(ProviderKind::Codex, &config)
         .await
         .unwrap();
-    std::fs::write(&executable, b"binary-replaced").unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&executable)
+        .unwrap()
+        .write_all(b"binary-replaced")
+        .unwrap();
     let second = registry
         .observe(ProviderKind::Codex, &config)
         .await
@@ -799,9 +815,13 @@ fn capability_evidence_has_only_bounded_sanitized_metadata() {
     let encoded: Value = serde_json::to_value(&evidence).unwrap();
     let object = encoded.as_object().unwrap();
 
-    assert_eq!(object.len(), 4);
+    assert_eq!(object.len(), 8);
+    assert_eq!(object.get("schema_version"), Some(&Value::from(1)));
     assert!(object.contains_key("source"));
     assert!(object.contains_key("observed_at"));
+    assert!(object.contains_key("expires_at"));
+    assert!(object.contains_key("confidence"));
+    assert!(object.contains_key("auth_source"));
     assert!(object.contains_key("status"));
     assert!(object.contains_key("diagnostic"));
     assert!(!object.contains_key("detail"));
@@ -1069,7 +1089,9 @@ impl ProviderAdapter for BoundaryAdapter {
 #[tokio::test]
 async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
     let adapter: Arc<dyn ProviderAdapter> = Arc::new(BoundaryAdapter);
-    let executable = ProviderExecutable::new(PathBuf::from("C:/bin/claude"), [0x11; 32]).unwrap();
+    let temp = tempdir().unwrap();
+    let executable_path = executable_file(temp.path(), "claude", b"adapter");
+    let executable = ProviderExecutable::from_path(executable_path).unwrap();
     let launch = adapter.build_launch(LaunchProviderRequest::new(executable, None, None));
     assert!(matches!(
         launch,
@@ -1228,11 +1250,18 @@ impl ProviderAdapter for OrderedAdapter {
 #[tokio::test]
 async fn observe_rejects_identity_replacement_between_capability_probe_and_after_inspection() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let temp = tempdir().unwrap();
+    let identity_path = executable_file(temp.path(), "claude", b"before");
+    let before = ProviderExecutable::from_path(&identity_path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&identity_path)
+        .unwrap()
+        .write_all(b"after")
+        .unwrap();
+    let after = ProviderExecutable::from_path(&identity_path).unwrap();
     let inspector = Arc::new(SequenceInspector {
-        identities: Mutex::new(vec![
-            ProviderExecutable::new(PathBuf::from("C:/bin/claude"), [0x22; 32]).unwrap(),
-            ProviderExecutable::new(PathBuf::from("C:/bin/claude"), [0x33; 32]).unwrap(),
-        ]),
+        identities: Mutex::new(vec![before, after]),
         events: events.clone(),
     });
     let adapter = Arc::new(OrderedAdapter {
