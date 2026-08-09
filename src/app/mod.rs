@@ -11963,15 +11963,11 @@ impl NativeShell {
             }
         }
 
-        let missing_status = tracked_ports
-            .iter()
-            .any(|port| !self.server_port_snapshot.statuses.contains_key(port));
-        let should_refresh = missing_status
-            || self
-                .server_port_snapshot
-                .last_checked_at
-                .map(|checked_at| checked_at.elapsed() >= refresh_interval)
-                .unwrap_or(true);
+        let should_refresh = self
+            .server_port_snapshot
+            .last_checked_at
+            .map(|checked_at| checked_at.elapsed() >= refresh_interval)
+            .unwrap_or(true);
         if !should_refresh || self.server_port_snapshot.refresh_in_flight {
             return;
         }
@@ -11998,19 +11994,13 @@ impl NativeShell {
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         this.server_port_snapshot.refresh_in_flight = false;
                         this.server_port_snapshot.last_checked_at = Some(Instant::now());
-                        match statuses {
-                            Ok(statuses) => {
-                                this.server_port_snapshot.statuses = statuses;
-                                let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
-                                this.server_port_snapshot
-                                    .statuses
-                                    .retain(|port, _| tracked_ports.binary_search(port).is_ok());
-                            }
-                            Err(error) => {
-                                this.terminal_notice = Some(format!(
-                                    "Port status refresh failed; no ownership was assumed: {error}"
-                                ));
-                            }
+                        let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
+                        if let Some(notice) = apply_server_port_refresh(
+                            &mut this.server_port_snapshot.statuses,
+                            &tracked_ports,
+                            statuses,
+                        ) {
+                            this.terminal_notice = Some(notice);
                         }
                         cx.notify();
                     });
@@ -13011,36 +13001,8 @@ impl NativeShell {
                                     Some(format!("Failed to start server: {error}"));
                             }
                             Err(error) => {
-                                let occupied = matches!(
-                                    &error,
-                                    crate::process::ports::PortStartError::OccupiedExternal { .. }
-                                        | crate::process::ports::PortStartError::OccupiedAmbiguous { .. }
-                                );
-                                if occupied {
-                                    let owner = status
-                                        .as_ref()
-                                        .and_then(|status| status.process_name.clone())
-                                        .unwrap_or_else(|| "another process".to_string());
-                                    let owner_label = status
-                                        .as_ref()
-                                        .and_then(|status| status.pid)
-                                        .map(|pid| format!("{owner} ({pid})"))
-                                        .unwrap_or(owner);
-                                    let message = if status
-                                        .as_ref()
-                                        .is_some_and(|status| status.in_use)
-                                    {
-                                        format!("Port {port} is already in use by {owner_label}.")
-                                    } else {
-                                        error.to_string()
-                                    };
-                                    this.terminal_actionable_notice = None;
-                                    this.terminal_notice = Some(message);
-                                } else {
-                                    this.terminal_actionable_notice = None;
-                                    this.terminal_notice =
-                                        Some(format!("Failed to start server: {error}"));
-                                }
+                                this.terminal_actionable_notice = None;
+                                this.terminal_notice = Some(port_start_error_notice(&error));
                             }
                         }
                         cx.notify();
@@ -16764,6 +16726,37 @@ fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
     !refresh_in_flight
 }
 
+fn apply_server_port_refresh(
+    current: &mut HashMap<u16, PortStatus>,
+    tracked_ports: &[u16],
+    result: Result<HashMap<u16, PortStatus>, String>,
+) -> Option<String> {
+    match result {
+        Ok(mut next) => {
+            next.retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            *current = next;
+            None
+        }
+        Err(error) => {
+            // Unknown must replace prior green/blue/gray evidence. An empty
+            // projection renders managed sessions unready and unmanaged ports
+            // stopped until the next bounded background refresh succeeds.
+            current.clear();
+            Some(format!(
+                "Port status refresh failed; no ownership was assumed: {error}"
+            ))
+        }
+    }
+}
+
+fn port_start_error_notice(error: &crate::process::ports::PortStartError) -> String {
+    match error {
+        crate::process::ports::PortStartError::OccupiedExternal { .. }
+        | crate::process::ports::PortStartError::OccupiedAmbiguous { .. } => error.to_string(),
+        _ => format!("Failed to start server: {error}"),
+    }
+}
+
 fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in state.projects() {
@@ -20341,6 +20334,44 @@ mod tests {
         let (ports, interval) = server_port_snapshot_plan(&state, &runtime);
         assert_eq!(ports, vec![4321, 5174]);
         assert_eq!(interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_port_refresh_clears_stale_colors() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(42),
+                process_name: Some("stale-listener".to_string()),
+            },
+        )]);
+
+        let notice = apply_server_port_refresh(
+            &mut statuses,
+            &[5174],
+            Err("listener inventory unavailable".to_string()),
+        );
+
+        assert!(statuses.is_empty());
+        assert!(notice
+            .as_deref()
+            .is_some_and(|message| message.contains("no ownership was assumed")));
+    }
+
+    #[test]
+    fn occupied_start_notice_preserves_exact_listener_identity() {
+        let error = crate::process::ports::PortStartError::OccupiedExternal {
+            port: 5174,
+            listener: crate::process::ports::ListenerIdentity::new(42, 9_876_543)
+                .expect("listener identity"),
+        };
+
+        let notice = port_start_error_notice(&error);
+
+        assert!(notice.contains("PID 42"));
+        assert!(notice.contains("creation 9876543"));
     }
 
     #[test]
