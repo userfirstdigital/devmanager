@@ -2,8 +2,8 @@
 
 use super::interaction::{
     control_presentation, AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest,
-    ActivationSource, ComponentError, ControlPresentation, InteractionState, InteractionStateModel,
-    InteractionTransition, KeyboardKey,
+    ActivationSource, ComponentError, ControlPresentation, FocusEpoch, InteractionState,
+    InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
 
@@ -88,7 +88,7 @@ impl Button {
         self.disabled_reason.as_deref()
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) {
         self.interaction.set_focus_epoch(focus_epoch);
         self.sync_accessibility();
     }
@@ -142,28 +142,30 @@ impl Button {
         Ok(())
     }
 
-    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         self.interaction.pointer_down(pointer_id, focus_epoch)
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         let activated = self.interaction.pointer_up(pointer_id, focus_epoch);
-        activated.then(|| ActionEvent {
-            request: self.action_request.clone(),
-            source: ActivationSource::Pointer { pointer_id },
-            focus_epoch,
+        activated.then(|| {
+            ActionEvent::new(
+                self.action_request.clone(),
+                ActivationSource::Pointer { pointer_id },
+                focus_epoch,
+            )
         })
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         if !self.interaction.key_activate(key.clone(), focus_epoch) {
             return None;
         }
-        Some(ActionEvent {
-            request: self.action_request.clone(),
-            source: ActivationSource::Keyboard { key },
+        Some(ActionEvent::new(
+            self.action_request.clone(),
+            ActivationSource::Keyboard { key },
             focus_epoch,
-        })
+        ))
     }
 
     pub fn presentation(&self, tokens: ThemeTokens) -> ControlPresentation {

@@ -1,7 +1,7 @@
 //! Bounded text-field model with explicit read-only and disabled behavior.
 
 use super::interaction::{
-    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError,
+    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError, FocusEpoch,
     InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use std::fmt::{Display, Formatter};
@@ -169,7 +169,7 @@ impl TextField {
         self.interaction.state().focused
     }
 
-    pub fn focus_epoch(&self) -> u64 {
+    pub fn focus_epoch(&self) -> FocusEpoch {
         self.interaction.focus_epoch()
     }
 
@@ -224,7 +224,7 @@ impl TextField {
         self.accessibility.read_only = read_only;
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) -> bool {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) -> bool {
         let accepted = self.interaction.set_focus_epoch(focus_epoch);
         self.accessibility.focused = self.interaction.state().focused;
         accepted
@@ -252,7 +252,7 @@ impl TextField {
     pub fn handle_key(
         &mut self,
         key: TextFieldKey,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Result<bool, TextFieldError> {
         let state = self.interaction.state();
         if self.interaction.focus_epoch() != focus_epoch || state.disabled || !state.focused {
@@ -300,7 +300,7 @@ impl TextField {
         }
     }
 
-    pub fn paste(&mut self, text: &str, focus_epoch: u64) -> Result<bool, TextFieldError> {
+    pub fn paste(&mut self, text: &str, focus_epoch: FocusEpoch) -> Result<bool, TextFieldError> {
         let state = self.interaction.state();
         if self.interaction.focus_epoch() != focus_epoch
             || !state.focused

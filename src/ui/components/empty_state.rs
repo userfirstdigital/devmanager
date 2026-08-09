@@ -3,8 +3,8 @@
 use super::button::Button;
 use super::interaction::{
     redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest,
-    ComponentError, KeyboardKey, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
-    MAX_RECOVERY_ACTIONS,
+    ComponentError, FocusEpoch, KeyboardKey, MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+    MAX_ACCESSIBLE_NAME_SCALARS, MAX_RECOVERY_ACTIONS,
 };
 
 pub struct RecoveryAction {
@@ -39,7 +39,7 @@ impl RecoveryAction {
         self.button.action_request()
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) {
         self.button.set_focus_epoch(focus_epoch);
     }
 
@@ -55,19 +55,19 @@ impl RecoveryAction {
         self.button.accessibility()
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.button.key_activate(key, focus_epoch)
     }
 
-    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         self.button.pointer_down(pointer_id, focus_epoch)
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.button.pointer_up(pointer_id, focus_epoch)
     }
 
-    pub fn activate(&self, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn activate(&self, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.button.key_activate(KeyboardKey::Enter, focus_epoch)
     }
 }
@@ -139,7 +139,7 @@ impl EmptyState {
         &self.recovery_actions
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) {
         for action in &mut self.recovery_actions {
             action.set_focus_epoch(focus_epoch);
         }
@@ -162,7 +162,7 @@ impl EmptyState {
         &mut self,
         index: usize,
         pointer_id: u64,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> bool {
         self.recovery_actions
             .get_mut(index)
@@ -174,7 +174,7 @@ impl EmptyState {
         &mut self,
         index: usize,
         pointer_id: u64,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Option<ActionEvent> {
         self.recovery_actions
             .get_mut(index)
@@ -185,14 +185,14 @@ impl EmptyState {
         &self,
         index: usize,
         key: KeyboardKey,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Option<ActionEvent> {
         self.recovery_actions
             .get(index)
             .and_then(|action| action.key_activate(key, focus_epoch))
     }
 
-    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn activate_recovery(&self, index: usize, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.key_activate_recovery(index, KeyboardKey::Enter, focus_epoch)
     }
 

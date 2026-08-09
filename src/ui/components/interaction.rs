@@ -7,10 +7,71 @@
 pub use crate::client::action::ActionRequest;
 use crate::ui::tokens::{ActionStateTokens, Color, ThemeTokens};
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_ACCESSIBLE_NAME_SCALARS: usize = 256;
 pub const MAX_ACCESSIBLE_DESCRIPTION_SCALARS: usize = 512;
 pub const MAX_RECOVERY_ACTIONS: usize = 3;
+
+static NEXT_FOCUS_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusEpoch {
+    source_id: u64,
+    sequence: u64,
+}
+
+impl FocusEpoch {
+    const INITIAL: Self = Self {
+        source_id: 0,
+        sequence: 0,
+    };
+
+    const fn initial() -> Self {
+        Self::INITIAL
+    }
+
+    const fn is_initial(self) -> bool {
+        self.source_id == 0 && self.sequence == 0
+    }
+}
+
+#[derive(Debug)]
+pub struct FocusEpochSource {
+    source_id: u64,
+    sequence: u64,
+}
+
+pub type FocusCoordinator = FocusEpochSource;
+
+impl FocusEpochSource {
+    pub fn new() -> Self {
+        let source_id = NEXT_FOCUS_SOURCE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("focus epoch source identity exhausted");
+        Self {
+            source_id,
+            sequence: 0,
+        }
+    }
+
+    pub fn current(&self) -> FocusEpoch {
+        FocusEpoch {
+            source_id: self.source_id,
+            sequence: self.sequence,
+        }
+    }
+
+    pub fn advance(&mut self) -> FocusEpoch {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .expect("focus epoch source exhausted");
+        self.current()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComponentError {
@@ -40,8 +101,8 @@ pub enum ComponentError {
         actual: usize,
     },
     StaleFocusEpoch {
-        current: u64,
-        attempted: u64,
+        current: FocusEpoch,
+        attempted: FocusEpoch,
     },
 }
 
@@ -72,10 +133,9 @@ impl Display for ComponentError {
             Self::LimitTooLarge { field, max, actual } => {
                 write!(formatter, "{field} exceeds safe maximum {max} ({actual})")
             }
-            Self::StaleFocusEpoch { current, attempted } => write!(
-                formatter,
-                "focus epoch {attempted} is stale; current host epoch is {current}"
-            ),
+            Self::StaleFocusEpoch { .. } => {
+                write!(formatter, "focus epoch is stale or belongs to another host")
+            }
         }
     }
 }
@@ -116,55 +176,115 @@ pub(crate) fn redacted_bounded_text(
     max_scalars: usize,
     max_bytes: usize,
 ) -> Result<String, ComponentError> {
-    let value = crate::diagnostics::runner::redact_secrets(&value.into());
+    let value = bounded_text(field, value, max_scalars, max_bytes)?;
+    let value = crate::diagnostics::runner::redact_secrets(&value);
     let value = redact_ui_credential_lines(&value);
     bounded_text(field, value, max_scalars, max_bytes)
 }
 
 fn redact_ui_credential_lines(value: &str) -> String {
-    value
-        .split_inclusive('\n')
-        .map(|line| {
-            let (body, trailing) = line
-                .strip_suffix('\n')
-                .map(|body| (body, "\n"))
-                .unwrap_or((line, ""));
-            let lower = body.to_ascii_lowercase();
-            if contains_ui_credential_marker(&lower) {
-                format!("[redacted]{trailing}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect()
+    let mut redacted = String::with_capacity(value.len());
+    for line in value.split_inclusive('\n') {
+        let (body, trailing) = line
+            .strip_suffix('\n')
+            .map(|body| (body, "\n"))
+            .unwrap_or((line, ""));
+        if contains_ui_credential_marker(body) {
+            redacted.push_str("[redacted]");
+            redacted.push_str(trailing);
+        } else {
+            redacted.push_str(line);
+        }
+    }
+    redacted
 }
 
-fn contains_ui_credential_marker(lower: &str) -> bool {
-    [
-        "api_key",
-        "api-key",
-        "apikey",
-        "aws_access_key",
-        "aws-access-key",
-        "aws_secret_key",
-        "aws-secret-key",
-        "access_key_id",
-        "access-key-id",
-        "secret_access_key",
-        "secret-access-key",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        || [
-            "authorization:",
-            "authorization=",
-            "\"authorization\"",
-            "'authorization'",
-            "authorization bearer ",
-            "authorization basic ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+fn contains_ui_credential_marker(value: &str) -> bool {
+    for (start, _) in value.char_indices() {
+        if start > 0 {
+            let previous = value[..start].chars().next_back().unwrap_or_default();
+            if previous.is_ascii_alphanumeric() || matches!(previous, '_' | '-') {
+                continue;
+            }
+        }
+        for key in [
+            "apikey",
+            "accesskeyid",
+            "secretaccesskey",
+            "awsaccesskeyid",
+            "awssecretaccesskey",
+            "credential",
+            "authorization",
+        ] {
+            if let Some(end) = normalized_key_end(value, start, key) {
+                let remainder = &value[end..];
+                if key == "authorization" {
+                    if has_authorization_value(remainder) {
+                        return true;
+                    }
+                } else if has_assignment_value(remainder) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn normalized_key_end(value: &str, start: usize, key: &str) -> Option<usize> {
+    let mut cursor = start;
+    for expected in key.chars() {
+        loop {
+            let character = value.get(cursor..)?.chars().next()?;
+            cursor += character.len_utf8();
+            if matches!(character, '_' | '-' | ' ' | '\t') {
+                continue;
+            }
+            if !character.eq_ignore_ascii_case(&expected) {
+                return None;
+            }
+            break;
+        }
+    }
+    Some(cursor)
+}
+
+fn has_assignment_value(remainder: &str) -> bool {
+    let remainder = remainder.trim_start();
+    let remainder = remainder
+        .strip_prefix('"')
+        .or_else(|| remainder.strip_prefix('\''))
+        .map(str::trim_start)
+        .unwrap_or(remainder);
+    let Some(remainder) = remainder
+        .strip_prefix(':')
+        .or_else(|| remainder.strip_prefix('='))
+    else {
+        return false;
+    };
+    !remainder.trim().is_empty()
+}
+
+fn has_authorization_value(remainder: &str) -> bool {
+    let remainder = remainder.trim_start();
+    let remainder = remainder
+        .strip_prefix('"')
+        .or_else(|| remainder.strip_prefix('\''))
+        .map(str::trim_start)
+        .unwrap_or(remainder);
+    let Some(remainder) = remainder
+        .strip_prefix(':')
+        .or_else(|| remainder.strip_prefix('='))
+    else {
+        return false;
+    };
+    let remainder = remainder.trim_start();
+    ["basic", "bearer"].iter().any(|scheme| {
+        remainder
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            && !remainder[scheme.len()..].trim().is_empty()
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,7 +305,25 @@ pub enum ActivationSource {
 pub struct ActionEvent {
     pub request: ActionRequest,
     pub source: ActivationSource,
-    pub focus_epoch: u64,
+    focus_epoch: FocusEpoch,
+}
+
+impl ActionEvent {
+    pub fn focus_epoch(&self) -> FocusEpoch {
+        self.focus_epoch
+    }
+
+    pub(crate) fn new(
+        request: ActionRequest,
+        source: ActivationSource,
+        focus_epoch: FocusEpoch,
+    ) -> Self {
+        Self {
+            request,
+            source,
+            focus_epoch,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,13 +586,13 @@ impl InteractionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PressOwner {
     pointer_id: u64,
-    focus_epoch: u64,
+    focus_epoch: FocusEpoch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InteractionStateModel {
     state: InteractionState,
-    focus_epoch: u64,
+    focus_epoch: FocusEpoch,
     press_owner: Option<PressOwner>,
 }
 
@@ -462,7 +600,7 @@ impl Default for InteractionStateModel {
     fn default() -> Self {
         Self {
             state: InteractionState::default(),
-            focus_epoch: 0,
+            focus_epoch: FocusEpoch::initial(),
             press_owner: None,
         }
     }
@@ -473,16 +611,19 @@ impl InteractionStateModel {
         self.state
     }
 
-    pub fn focus_epoch(&self) -> u64 {
+    pub fn focus_epoch(&self) -> FocusEpoch {
         self.focus_epoch
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) -> bool {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) -> bool {
         self.try_set_focus_epoch(focus_epoch).is_ok()
     }
 
-    pub fn try_set_focus_epoch(&mut self, focus_epoch: u64) -> Result<(), ComponentError> {
-        if focus_epoch < self.focus_epoch {
+    pub fn try_set_focus_epoch(&mut self, focus_epoch: FocusEpoch) -> Result<(), ComponentError> {
+        if (!self.focus_epoch.is_initial() && focus_epoch.source_id != self.focus_epoch.source_id)
+            || (focus_epoch.source_id == self.focus_epoch.source_id
+                && focus_epoch.sequence < self.focus_epoch.sequence)
+        {
             return Err(ComponentError::StaleFocusEpoch {
                 current: self.focus_epoch,
                 attempted: focus_epoch,
@@ -551,7 +692,7 @@ impl InteractionStateModel {
         self.transition(InteractionTransition::Destructive(destructive))
     }
 
-    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         if focus_epoch != self.focus_epoch || !self.state.can_activate() {
             return false;
         }
@@ -565,7 +706,7 @@ impl InteractionStateModel {
         true
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         let owner = self.press_owner.take();
         let same_owner = owner
             .map(|owner| owner.pointer_id == pointer_id && owner.focus_epoch == focus_epoch)
@@ -576,7 +717,7 @@ impl InteractionStateModel {
         same_owner && current_epoch && actionable
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> bool {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: FocusEpoch) -> bool {
         focus_epoch == self.focus_epoch
             && self.state.focused
             && self.state.can_activate()

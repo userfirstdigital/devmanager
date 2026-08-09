@@ -3,7 +3,7 @@
 use super::empty_state::RecoveryAction;
 use super::interaction::{
     redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ActionEvent, ComponentError,
-    KeyboardKey, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
+    FocusEpoch, KeyboardKey, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
     MAX_RECOVERY_ACTIONS,
 };
 
@@ -116,7 +116,7 @@ impl ErrorBoundary {
         &self.recovery_actions
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) {
         for action in &mut self.recovery_actions {
             action.set_focus_epoch(focus_epoch);
         }
@@ -139,7 +139,7 @@ impl ErrorBoundary {
         &mut self,
         index: usize,
         pointer_id: u64,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> bool {
         self.recovery_actions
             .get_mut(index)
@@ -151,7 +151,7 @@ impl ErrorBoundary {
         &mut self,
         index: usize,
         pointer_id: u64,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Option<ActionEvent> {
         self.recovery_actions
             .get_mut(index)
@@ -162,14 +162,14 @@ impl ErrorBoundary {
         &self,
         index: usize,
         key: KeyboardKey,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Option<ActionEvent> {
         self.recovery_actions
             .get(index)
             .and_then(|action| action.key_activate(key, focus_epoch))
     }
 
-    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn activate_recovery(&self, index: usize, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.key_activate_recovery(index, KeyboardKey::Enter, focus_epoch)
     }
 

@@ -7,8 +7,8 @@ use devmanager::ui::components::error_boundary::{
 };
 use devmanager::ui::components::icon_button::{IconButton, TooltipContract};
 use devmanager::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActivationSource, ComponentError, InteractionState,
-    InteractionStateModel, InteractionTransition, KeyboardKey,
+    AccessibilityMetadata, AccessibleRole, ActivationSource, ComponentError, FocusEpochSource,
+    InteractionState, InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use devmanager::ui::components::status_light::StatusLight;
 use devmanager::ui::components::text_field::{
@@ -49,20 +49,23 @@ fn interaction_transition_table_rejects_invalid_combinations_and_fails_closed() 
 
 #[test]
 fn pointer_capture_and_keyboard_activation_reject_stale_focus_epochs() {
+    let mut source = FocusEpochSource::new();
+    let first = source.current();
     let mut model = InteractionStateModel::default();
-    model.set_focus_epoch(10);
-    assert!(model.pointer_down(42, 10));
-    model.set_focus_epoch(11);
-    assert!(!model.pointer_up(42, 10));
+    model.set_focus_epoch(first);
+    assert!(model.pointer_down(42, first));
+    let second = source.advance();
+    model.set_focus_epoch(second);
+    assert!(!model.pointer_up(42, first));
     assert!(!model.state().pressed);
 
-    assert!(!model.key_activate(KeyboardKey::Enter, 11));
+    assert!(!model.key_activate(KeyboardKey::Enter, second));
     assert!(model.focus());
-    assert!(model.key_activate(KeyboardKey::Enter, 11));
-    assert!(model.key_activate(KeyboardKey::Space, 11));
-    assert!(!model.key_activate(KeyboardKey::Escape, 11));
+    assert!(model.key_activate(KeyboardKey::Enter, second));
+    assert!(model.key_activate(KeyboardKey::Space, second));
+    assert!(!model.key_activate(KeyboardKey::Escape, second));
     model.set_disabled(true);
-    assert!(!model.key_activate(KeyboardKey::Enter, 11));
+    assert!(!model.key_activate(KeyboardKey::Enter, second));
 }
 
 #[test]
@@ -75,15 +78,19 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
     assert!(!button.accessibility().disabled);
     assert_eq!(button.variant(), ButtonVariant::Primary);
 
-    button.set_focus_epoch(4);
-    assert!(button.pointer_down(7, 4));
-    let event = button.pointer_up(7, 4).expect("pointer activation");
+    let mut source = FocusEpochSource::new();
+    let first = source.current();
+    button.set_focus_epoch(first);
+    assert!(button.pointer_down(7, first));
+    let event = button.pointer_up(7, first).expect("pointer activation");
     assert_eq!(event.request, ActionRequest::TaskList);
 
-    button.set_focus_epoch(5);
-    assert!(button.pointer_down(8, 5));
-    button.set_focus_epoch(6);
-    assert!(button.pointer_up(8, 5).is_none());
+    let second = source.advance();
+    button.set_focus_epoch(second);
+    assert!(button.pointer_down(8, second));
+    let third = source.advance();
+    button.set_focus_epoch(third);
+    assert!(button.pointer_up(8, second).is_none());
 
     button
         .disable("saving is already in progress")
@@ -96,11 +103,11 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
         button.accessibility().description,
         "saving is already in progress"
     );
-    assert!(button.key_activate(KeyboardKey::Enter, 6).is_none());
+    assert!(button.key_activate(KeyboardKey::Enter, third).is_none());
 
     button.enable().expect("button can be enabled");
     button.set_loading(true).expect("button can enter loading");
-    assert!(button.key_activate(KeyboardKey::Space, 6).is_none());
+    assert!(button.key_activate(KeyboardKey::Space, third).is_none());
 }
 
 #[test]
@@ -212,6 +219,8 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
 
 #[test]
 fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
+    let source = FocusEpochSource::new();
+    let epoch = source.current();
     let action = RecoveryAction::new("Retry", ActionRequest::TaskList).expect("action");
     let mut empty = EmptyState::new("No tasks", "Create a task to get started")
         .expect("empty state")
@@ -223,23 +232,23 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
         empty.recovery_actions()[0].action_request(),
         &ActionRequest::TaskList
     );
-    assert!(empty.activate_recovery(0, 0).is_none());
-    empty.set_focus_epoch(30);
+    assert!(empty.activate_recovery(0, epoch).is_none());
+    empty.set_focus_epoch(epoch);
     assert!(empty.focus_recovery(0));
     let keyboard_event = empty
-        .key_activate_recovery(0, KeyboardKey::Enter, 30)
+        .key_activate_recovery(0, KeyboardKey::Enter, epoch)
         .expect("focused recovery action accepts Enter");
     assert_eq!(keyboard_event.request, ActionRequest::TaskList);
-    assert_eq!(keyboard_event.focus_epoch, 30);
+    assert_eq!(keyboard_event.focus_epoch(), epoch);
     assert!(matches!(
         keyboard_event.source,
         ActivationSource::Keyboard {
             key: KeyboardKey::Enter
         }
     ));
-    assert!(empty.pointer_down_recovery(0, 7, 30));
+    assert!(empty.pointer_down_recovery(0, 7, epoch));
     let pointer_event = empty
-        .pointer_up_recovery(0, 7, 30)
+        .pointer_up_recovery(0, 7, epoch)
         .expect("matching recovery pointer release activates");
     assert_eq!(pointer_event.request, ActionRequest::TaskList);
     assert!(matches!(
@@ -264,14 +273,14 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
     assert_eq!(error.accessibility().role, AccessibleRole::Alert);
     assert!(error.accessibility().invalid);
     assert_eq!(error.recovery_actions().len(), 1);
-    error.set_focus_epoch(40);
+    error.set_focus_epoch(epoch);
     assert!(error.focus_recovery(0));
     let delegated = error
-        .key_activate_recovery(0, KeyboardKey::Space, 40)
+        .key_activate_recovery(0, KeyboardKey::Space, epoch)
         .expect("error recovery action delegates keyboard activation");
     assert_eq!(delegated.request, ActionRequest::TaskList);
-    assert!(error.pointer_down_recovery(0, 9, 40));
-    assert!(error.pointer_up_recovery(0, 9, 40).is_some());
+    assert!(error.pointer_down_recovery(0, 9, epoch));
+    assert!(error.pointer_up_recovery(0, 9, epoch).is_some());
     error.blur_recovery(0);
     assert!(!error.rendered_payload().contains("provider"));
 }
@@ -291,11 +300,13 @@ fn accessibility_metadata_is_bounded_and_rejects_blank_names() {
 #[test]
 fn presentational_button_emits_only_a_typed_catalog_request() {
     let mut button = Button::new("List tasks", ActionRequest::TaskList).expect("button");
-    button.set_focus_epoch(7);
+    let source = FocusEpochSource::new();
+    let epoch = source.current();
+    button.set_focus_epoch(epoch);
     button.focus();
 
     let event = button
-        .key_activate(KeyboardKey::Enter, 7)
+        .key_activate(KeyboardKey::Enter, epoch)
         .expect("focused button should emit an event");
     assert_eq!(event.request, ActionRequest::TaskList);
     assert_eq!(event.request.id(), "task.list");
@@ -303,36 +314,35 @@ fn presentational_button_emits_only_a_typed_catalog_request() {
 
 #[test]
 fn keyboard_activation_requires_current_focus_and_epoch_changes_clear_focus() {
+    let mut source = FocusEpochSource::new();
+    let first = source.current();
+    let second = source.advance();
     let mut model = InteractionStateModel::default();
-    model.set_focus_epoch(10);
-    assert!(!model.key_activate(KeyboardKey::Enter, 10));
+    model.set_focus_epoch(first);
+    assert!(!model.key_activate(KeyboardKey::Enter, first));
 
     assert!(model.focus());
-    assert!(model.key_activate(KeyboardKey::Enter, 10));
+    assert!(model.key_activate(KeyboardKey::Enter, first));
 
-    model.set_focus_epoch(11);
+    model.set_focus_epoch(second);
     assert!(!model.state().focused);
-    assert!(!model.key_activate(KeyboardKey::Space, 11));
+    assert!(!model.key_activate(KeyboardKey::Space, second));
 
     assert!(model.focus());
-    model.set_focus_epoch(10);
-    assert!(!model.set_focus_epoch(10));
+    assert!(!model.set_focus_epoch(first));
     assert_eq!(
         model.focus_epoch(),
-        11,
+        second,
         "stale host epochs must be rejected"
     );
     assert!(
         model.state().focused,
         "rejected epochs must not clear focus"
     );
-    assert!(model.key_activate(KeyboardKey::Enter, 11));
+    assert!(model.key_activate(KeyboardKey::Enter, second));
     assert!(matches!(
-        model.try_set_focus_epoch(9),
-        Err(ComponentError::StaleFocusEpoch {
-            current: 11,
-            attempted: 9
-        })
+        model.try_set_focus_epoch(first),
+        Err(ComponentError::StaleFocusEpoch { .. })
     ));
 }
 
@@ -352,36 +362,42 @@ fn text_field_limits_reject_oversized_public_limits() {
 
 #[test]
 fn text_field_keyboard_input_requires_the_current_focus_epoch() {
+    let mut source = FocusEpochSource::new();
+    let stale = source.current();
+    let current = source.advance();
     let mut field = TextField::new("Prompt").expect("field");
-    field.set_focus_epoch(8);
+    field.set_focus_epoch(current);
     assert!(field.focus());
 
     assert!(!field
-        .handle_key(TextFieldKey::Character('x'), 7)
+        .handle_key(TextFieldKey::Character('x'), stale)
         .expect("stale keyboard input is ignored"));
     assert!(field
-        .handle_key(TextFieldKey::Character('x'), 8)
+        .handle_key(TextFieldKey::Character('x'), current)
         .expect("current keyboard input is accepted"));
     assert_eq!(field.value(), "x");
 }
 
 #[test]
 fn paste_requires_current_focus_and_preflights_both_limits() {
+    let mut source = FocusEpochSource::new();
+    let first = source.current();
+    let second = source.advance();
     let limits = TextFieldLimits::new(3, 5).expect("valid limits");
     let mut field = TextField::with_limits("Prompt", limits).expect("field");
 
-    assert!(!field.paste("x", 0).expect("unfocused paste is ignored"));
-    field.set_focus_epoch(20);
+    assert!(!field.paste("x", first).expect("unfocused paste is ignored"));
+    field.set_focus_epoch(first);
     field.focus();
-    assert!(field.paste("界", 20).expect("focused paste is accepted"));
+    assert!(field.paste("界", first).expect("focused paste is accepted"));
 
-    field.set_focus_epoch(21);
-    assert!(!field.paste("x", 20).expect("stale paste is ignored"));
+    field.set_focus_epoch(second);
+    assert!(!field.paste("x", first).expect("stale paste is ignored"));
     assert_eq!(field.value(), "界");
 
     field.focus();
     let scalar_error = field
-        .paste("xyz", 21)
+        .paste("xyz", second)
         .expect_err("scalar bound must be checked before insertion");
     assert!(matches!(
         scalar_error,
@@ -390,7 +406,7 @@ fn paste_requires_current_focus_and_preflights_both_limits() {
     assert_eq!(field.value(), "界");
 
     let byte_error = field
-        .paste("🙂", 21)
+        .paste("🙂", second)
         .expect_err("byte bound must be checked before insertion");
     assert!(matches!(
         byte_error,
@@ -472,4 +488,56 @@ fn every_renderable_error_and_recovery_label_is_bounded_and_redacted() {
         .set_error(Some(format!("api_key={API_KEY}")))
         .expect("metadata error is bounded");
     assert!(!metadata.error.as_deref().unwrap().contains(API_KEY));
+}
+
+#[test]
+fn focus_tokens_are_minted_by_one_monotonic_source_and_stale_tokens_cannot_activate() {
+    let mut source = FocusEpochSource::new();
+    let first = source.current();
+    let mut model = InteractionStateModel::default();
+
+    assert!(model.set_focus_epoch(first));
+    assert!(model.focus());
+    assert!(model.key_activate(KeyboardKey::Enter, first));
+
+    let second = source.advance();
+    assert_ne!(first, second);
+    assert!(model.set_focus_epoch(second));
+    assert!(!model.key_activate(KeyboardKey::Enter, first));
+    assert!(!model.state().focused);
+
+    let mut foreign_source = FocusEpochSource::new();
+    let foreign = foreign_source.advance();
+    assert!(!model.set_focus_epoch(foreign));
+}
+
+#[test]
+fn error_label_redaction_normalizes_key_separators_without_redacting_unrelated_prose() {
+    const ACCESS: &str = "UI_ACCESS_KEY_ID_VARIANT_SENTINEL";
+    const SECRET: &str = "UI_SECRET_ACCESS_KEY_VARIANT_SENTINEL";
+    const CREDENTIAL_EQUALS: &str = "UI_CREDENTIAL_EQUALS_VARIANT_SENTINEL";
+    const CREDENTIAL_COLON: &str = "UI_CREDENTIAL_COLON_VARIANT_SENTINEL";
+    const BASIC: &str = "UI_AUTH_BASIC_VARIANT_SENTINEL";
+    const BEARER: &str = "UI_AUTH_BEARER_VARIANT_SENTINEL";
+
+    let mut metadata =
+        AccessibilityMetadata::new(AccessibleRole::Alert, "Error").expect("metadata");
+    metadata
+        .set_error(Some(format!(
+            "AccessKeyId : {ACCESS}\nsecret-access-key={SECRET}\ncredential= {CREDENTIAL_EQUALS}\ncredential : {CREDENTIAL_COLON}\nAUTHORIZATION : Basic {BASIC}\nauthorization : bearer {BEARER}\nThe AccessKeyId field is documented here."
+        )))
+        .expect("error label is bounded and redacted");
+
+    let rendered = metadata.error.expect("error label");
+    for secret in [
+        ACCESS,
+        SECRET,
+        CREDENTIAL_EQUALS,
+        CREDENTIAL_COLON,
+        BASIC,
+        BEARER,
+    ] {
+        assert!(!rendered.contains(secret), "rendered error leaked {secret}");
+    }
+    assert!(rendered.contains("The AccessKeyId field is documented here."));
 }

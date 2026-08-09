@@ -3,7 +3,7 @@
 use super::button::{Button, ButtonVariant};
 use super::interaction::{
     AccessibilityMetadata, ActionEvent, ActionRequest, ComponentError, ControlPresentation,
-    KeyboardKey,
+    FocusEpoch, KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
 
@@ -116,19 +116,19 @@ impl IconButton {
         self.button.blur();
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+    pub fn set_focus_epoch(&mut self, focus_epoch: FocusEpoch) {
         self.button.set_focus_epoch(focus_epoch);
     }
 
-    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         self.button.pointer_down(pointer_id, focus_epoch)
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.button.pointer_up(pointer_id, focus_epoch)
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: FocusEpoch) -> Option<ActionEvent> {
         self.button.key_activate(key, focus_epoch)
     }
 
