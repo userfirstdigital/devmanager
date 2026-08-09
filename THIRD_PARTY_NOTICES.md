@@ -59,3 +59,12 @@ The lockfile's resolved package metadata was reviewed with `cargo metadata --for
 | `Zlib OR Apache-2.0 OR MIT` | 12 |
 
 The graph does not activate the optional `decimal`, `inspector`, `tree-sitter-languages`, or `webview` feature dependencies. License expressions are the package metadata audit input; each resolved package remains subject to its own license text and notices.
+
+## windows-capture 1.5.0
+
+- Source: `https://github.com/NiiightmareXD/windows-capture/tree/1.5.0`
+- Crates.io package: `https://crates.io/crates/windows-capture/1.5.0`
+- Manifest reviewed: `https://raw.githubusercontent.com/NiiightmareXD/windows-capture/1.5.0/Cargo.toml`
+- License text reviewed: `https://raw.githubusercontent.com/NiiightmareXD/windows-capture/1.5.0/LICENCE`
+- The package declares `MIT`, targets Windows Graphics Capture, and uses the same `windows = 0.61.3` API family already pinned by this workspace. Its 1.5.0 manifest uses Rust edition 2024 and declares no runtime feature flags; the local toolchain and focused Windows build are the compatibility checks.
+- The reviewed API provides direct `Window::from_raw_hwnd`, `ColorFormat::Bgra8`, `CursorCaptureSettings::WithoutCursor`, `DrawBorderSettings::WithoutBorder`, and `CaptureControl` stop/join support. The preview uses the direct HWND path and does not enumerate or match window titles.
