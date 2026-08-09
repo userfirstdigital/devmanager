@@ -151,6 +151,36 @@ pub struct BorderTokens {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionStateTokens {
+    pub foreground: Color,
+    pub background: Color,
+    pub border: Color,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InteractionStateTokens {
+    pub default: ActionStateTokens,
+    pub hover: ActionStateTokens,
+    pub focus: ActionStateTokens,
+    pub selected: ActionStateTokens,
+    pub disabled: ActionStateTokens,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionTokens {
+    /// The primary action is also the semantic accent. It is the only source
+    /// for accent/action colors until the native cockpit cutover.
+    pub primary: InteractionStateTokens,
+    pub destructive: InteractionStateTokens,
+}
+
+impl ActionTokens {
+    pub const fn accent(self) -> InteractionStateTokens {
+        self.primary
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusMeaning {
     External,
     Attention,
@@ -168,6 +198,18 @@ pub struct StatusTokens {
     pub warning: Color,
     pub destructive: Color,
     pub inactive: Color,
+    pub external_surface: Color,
+    pub external_foreground: Color,
+    pub attention_surface: Color,
+    pub attention_foreground: Color,
+    pub success_surface: Color,
+    pub success_foreground: Color,
+    pub warning_surface: Color,
+    pub warning_foreground: Color,
+    pub destructive_surface: Color,
+    pub destructive_foreground: Color,
+    pub inactive_surface: Color,
+    pub inactive_foreground: Color,
 }
 
 impl StatusTokens {
@@ -359,12 +401,21 @@ pub struct ContrastPair {
     pub background: Color,
 }
 
+const fn contrast_pair(name: &'static str, foreground: Color, background: Color) -> ContrastPair {
+    ContrastPair {
+        name,
+        foreground,
+        background,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThemeTokens {
     pub mode: ThemeMode,
     pub text: TextTokens,
     pub surfaces: SurfaceTokens,
     pub borders: BorderTokens,
+    pub actions: ActionTokens,
     pub status: StatusTokens,
     pub terminal: TerminalPalette,
     pub density: DensityMetrics,
@@ -454,6 +505,54 @@ impl ThemeTokens {
                 color: self.borders.disabled,
             },
             SemanticColorToken {
+                name: "action_primary_default",
+                color: self.actions.primary.default.background,
+            },
+            SemanticColorToken {
+                name: "action_primary_hover",
+                color: self.actions.primary.hover.background,
+            },
+            SemanticColorToken {
+                name: "action_primary_focus",
+                color: self.actions.primary.focus.background,
+            },
+            SemanticColorToken {
+                name: "action_primary_selected",
+                color: self.actions.primary.selected.background,
+            },
+            SemanticColorToken {
+                name: "action_primary_disabled",
+                color: self.actions.primary.disabled.background,
+            },
+            SemanticColorToken {
+                name: "action_primary_foreground",
+                color: self.actions.primary.default.foreground,
+            },
+            SemanticColorToken {
+                name: "action_destructive_default",
+                color: self.actions.destructive.default.background,
+            },
+            SemanticColorToken {
+                name: "action_destructive_hover",
+                color: self.actions.destructive.hover.background,
+            },
+            SemanticColorToken {
+                name: "action_destructive_focus",
+                color: self.actions.destructive.focus.background,
+            },
+            SemanticColorToken {
+                name: "action_destructive_selected",
+                color: self.actions.destructive.selected.background,
+            },
+            SemanticColorToken {
+                name: "action_destructive_disabled",
+                color: self.actions.destructive.disabled.background,
+            },
+            SemanticColorToken {
+                name: "action_destructive_foreground",
+                color: self.actions.destructive.default.foreground,
+            },
+            SemanticColorToken {
                 name: "status_external",
                 color: self.status.external,
             },
@@ -476,6 +575,54 @@ impl ThemeTokens {
             SemanticColorToken {
                 name: "status_inactive",
                 color: self.status.inactive,
+            },
+            SemanticColorToken {
+                name: "status_external_surface",
+                color: self.status.external_surface,
+            },
+            SemanticColorToken {
+                name: "status_external_foreground",
+                color: self.status.external_foreground,
+            },
+            SemanticColorToken {
+                name: "status_attention_surface",
+                color: self.status.attention_surface,
+            },
+            SemanticColorToken {
+                name: "status_attention_foreground",
+                color: self.status.attention_foreground,
+            },
+            SemanticColorToken {
+                name: "status_success_surface",
+                color: self.status.success_surface,
+            },
+            SemanticColorToken {
+                name: "status_success_foreground",
+                color: self.status.success_foreground,
+            },
+            SemanticColorToken {
+                name: "status_warning_surface",
+                color: self.status.warning_surface,
+            },
+            SemanticColorToken {
+                name: "status_warning_foreground",
+                color: self.status.warning_foreground,
+            },
+            SemanticColorToken {
+                name: "status_destructive_surface",
+                color: self.status.destructive_surface,
+            },
+            SemanticColorToken {
+                name: "status_destructive_foreground",
+                color: self.status.destructive_foreground,
+            },
+            SemanticColorToken {
+                name: "status_inactive_surface",
+                color: self.status.inactive_surface,
+            },
+            SemanticColorToken {
+                name: "status_inactive_foreground",
+                color: self.status.inactive_foreground,
             },
             SemanticColorToken {
                 name: "terminal_background",
@@ -561,33 +708,116 @@ impl ThemeTokens {
     }
 
     pub fn normal_text_contrast_pairs(self) -> Vec<ContrastPair> {
-        vec![
-            ContrastPair {
-                name: "text_primary_on_canvas",
-                foreground: self.text.primary,
-                background: self.surfaces.canvas,
-            },
-            ContrastPair {
-                name: "text_secondary_on_canvas",
-                foreground: self.text.secondary,
-                background: self.surfaces.canvas,
-            },
-            ContrastPair {
-                name: "text_muted_on_raised",
-                foreground: self.text.muted,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "text_on_selection",
-                foreground: self.text.on_selection,
-                background: self.surfaces.selection,
-            },
-            ContrastPair {
-                name: "terminal_foreground_on_background",
-                foreground: self.terminal.foreground,
-                background: self.terminal.background,
-            },
-        ]
+        let surfaces = [
+            ("canvas", self.surfaces.canvas),
+            ("raised", self.surfaces.raised),
+            ("overlay", self.surfaces.overlay),
+            ("sunken", self.surfaces.sunken),
+            ("hover", self.surfaces.hover),
+            ("selection", self.surfaces.selection),
+            ("disabled", self.surfaces.disabled),
+        ];
+        let mut pairs = Vec::with_capacity(28 + 2 + 9 + 10 + 6);
+        for (surface_name, surface) in surfaces {
+            let names = [
+                ("text_primary", self.text.primary),
+                ("text_secondary", self.text.secondary),
+                ("text_muted", self.text.muted),
+                ("text_disabled", self.text.disabled),
+            ];
+            for (text_name, foreground) in names {
+                let name = match (text_name, surface_name) {
+                    ("text_primary", "canvas") => "text_primary_on_canvas",
+                    ("text_primary", "raised") => "text_primary_on_raised",
+                    ("text_primary", "overlay") => "text_primary_on_overlay",
+                    ("text_primary", "sunken") => "text_primary_on_sunken",
+                    ("text_primary", "hover") => "text_primary_on_hover",
+                    ("text_primary", "selection") => "text_primary_on_selection",
+                    ("text_primary", "disabled") => "text_primary_on_disabled_surface",
+                    ("text_secondary", "canvas") => "text_secondary_on_canvas",
+                    ("text_secondary", "raised") => "text_secondary_on_raised",
+                    ("text_secondary", "overlay") => "text_secondary_on_overlay",
+                    ("text_secondary", "sunken") => "text_secondary_on_sunken",
+                    ("text_secondary", "hover") => "text_secondary_on_hover",
+                    ("text_secondary", "selection") => "text_secondary_on_selection",
+                    ("text_secondary", "disabled") => "text_secondary_on_disabled_surface",
+                    ("text_muted", "canvas") => "text_muted_on_canvas",
+                    ("text_muted", "raised") => "text_muted_on_raised",
+                    ("text_muted", "overlay") => "text_muted_on_overlay",
+                    ("text_muted", "sunken") => "text_muted_on_sunken",
+                    ("text_muted", "hover") => "text_muted_on_hover",
+                    ("text_muted", "selection") => "text_muted_on_selection",
+                    ("text_muted", "disabled") => "text_muted_on_disabled_surface",
+                    ("text_disabled", "canvas") => "text_disabled_on_canvas",
+                    ("text_disabled", "raised") => "text_disabled_on_raised",
+                    ("text_disabled", "overlay") => "text_disabled_on_overlay",
+                    ("text_disabled", "sunken") => "text_disabled_on_sunken",
+                    ("text_disabled", "hover") => "text_disabled_on_hover",
+                    ("text_disabled", "selection") => "text_disabled_on_selection",
+                    ("text_disabled", "disabled") => "text_disabled_on_disabled_surface",
+                    _ => unreachable!("semantic text/surface pair must be declared"),
+                };
+                pairs.push(contrast_pair(name, foreground, surface));
+            }
+        }
+        pairs.push(contrast_pair(
+            "text_on_selection",
+            self.text.on_selection,
+            self.surfaces.selection,
+        ));
+        pairs.push(contrast_pair(
+            "text_inverse_on_terminal_background",
+            self.text.inverse,
+            self.terminal.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_primary_default",
+            self.text.on_accent,
+            self.actions.primary.default.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_primary_hover",
+            self.text.on_accent,
+            self.actions.primary.hover.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_primary_focus",
+            self.text.on_accent,
+            self.actions.primary.focus.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_primary_selected",
+            self.text.on_accent,
+            self.actions.primary.selected.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_destructive_default",
+            self.text.on_accent,
+            self.actions.destructive.default.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_destructive_hover",
+            self.text.on_accent,
+            self.actions.destructive.hover.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_destructive_focus",
+            self.text.on_accent,
+            self.actions.destructive.focus.background,
+        ));
+        pairs.push(contrast_pair(
+            "text_on_accent_on_action_destructive_selected",
+            self.text.on_accent,
+            self.actions.destructive.selected.background,
+        ));
+        pairs.push(contrast_pair(
+            "terminal_foreground_on_background",
+            self.terminal.foreground,
+            self.terminal.background,
+        ));
+        pairs.extend(self.interaction_state_contrast_pairs());
+        pairs.extend(self.status_surface_contrast_pairs());
+        pairs
     }
 
     pub fn large_text_contrast_pairs(self) -> Vec<ContrastPair> {
@@ -599,63 +829,175 @@ impl ThemeTokens {
     }
 
     pub fn ui_indicator_contrast_pairs(self) -> Vec<ContrastPair> {
+        let mut pairs = vec![
+            contrast_pair(
+                "focus_ring_on_canvas",
+                self.borders.focus,
+                self.surfaces.canvas,
+            ),
+            contrast_pair(
+                "selection_border_on_canvas",
+                self.borders.selection,
+                self.surfaces.canvas,
+            ),
+        ];
+        pairs.extend(self.status_indicator_contrast_pairs());
+        pairs
+    }
+
+    pub fn status_indicator_contrast_pairs(self) -> Vec<ContrastPair> {
         vec![
-            ContrastPair {
-                name: "focus_ring_on_canvas",
-                foreground: self.borders.focus,
-                background: self.surfaces.canvas,
-            },
-            ContrastPair {
-                name: "selection_border_on_canvas",
-                foreground: self.borders.selection,
-                background: self.surfaces.canvas,
-            },
-            ContrastPair {
-                name: "status_external_on_raised",
-                foreground: self.status.external,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "status_attention_on_raised",
-                foreground: self.status.attention,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "status_success_on_raised",
-                foreground: self.status.success,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "status_warning_on_raised",
-                foreground: self.status.warning,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "status_destructive_on_raised",
-                foreground: self.status.destructive,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "status_inactive_on_raised",
-                foreground: self.status.inactive,
-                background: self.surfaces.raised,
-            },
+            contrast_pair(
+                "status_external_indicator_on_surface",
+                self.status.external,
+                self.status.external_surface,
+            ),
+            contrast_pair(
+                "status_attention_indicator_on_surface",
+                self.status.attention,
+                self.status.attention_surface,
+            ),
+            contrast_pair(
+                "status_success_indicator_on_surface",
+                self.status.success,
+                self.status.success_surface,
+            ),
+            contrast_pair(
+                "status_warning_indicator_on_surface",
+                self.status.warning,
+                self.status.warning_surface,
+            ),
+            contrast_pair(
+                "status_destructive_indicator_on_surface",
+                self.status.destructive,
+                self.status.destructive_surface,
+            ),
+            contrast_pair(
+                "status_inactive_indicator_on_surface",
+                self.status.inactive,
+                self.status.inactive_surface,
+            ),
+        ]
+    }
+
+    pub fn interaction_state_contrast_pairs(self) -> Vec<ContrastPair> {
+        let primary = self.actions.primary;
+        let destructive = self.actions.destructive;
+        vec![
+            contrast_pair(
+                "action_primary_default_on_surface",
+                primary.default.foreground,
+                primary.default.background,
+            ),
+            contrast_pair(
+                "action_primary_hover_on_surface",
+                primary.hover.foreground,
+                primary.hover.background,
+            ),
+            contrast_pair(
+                "action_primary_focus_on_surface",
+                primary.focus.foreground,
+                primary.focus.background,
+            ),
+            contrast_pair(
+                "action_primary_selected_on_surface",
+                primary.selected.foreground,
+                primary.selected.background,
+            ),
+            contrast_pair(
+                "action_primary_disabled_on_surface",
+                primary.disabled.foreground,
+                primary.disabled.background,
+            ),
+            contrast_pair(
+                "action_destructive_default_on_surface",
+                destructive.default.foreground,
+                destructive.default.background,
+            ),
+            contrast_pair(
+                "action_destructive_hover_on_surface",
+                destructive.hover.foreground,
+                destructive.hover.background,
+            ),
+            contrast_pair(
+                "action_destructive_focus_on_surface",
+                destructive.focus.foreground,
+                destructive.focus.background,
+            ),
+            contrast_pair(
+                "action_destructive_selected_on_surface",
+                destructive.selected.foreground,
+                destructive.selected.background,
+            ),
+            contrast_pair(
+                "action_destructive_disabled_on_surface",
+                destructive.disabled.foreground,
+                destructive.disabled.background,
+            ),
+        ]
+    }
+
+    pub fn status_surface_contrast_pairs(self) -> Vec<ContrastPair> {
+        vec![
+            contrast_pair(
+                "status_external_surface",
+                self.status.external_foreground,
+                self.status.external_surface,
+            ),
+            contrast_pair(
+                "status_attention_surface",
+                self.status.attention_foreground,
+                self.status.attention_surface,
+            ),
+            contrast_pair(
+                "status_success_surface",
+                self.status.success_foreground,
+                self.status.success_surface,
+            ),
+            contrast_pair(
+                "status_warning_surface",
+                self.status.warning_foreground,
+                self.status.warning_surface,
+            ),
+            contrast_pair(
+                "status_destructive_surface",
+                self.status.destructive_foreground,
+                self.status.destructive_surface,
+            ),
+            contrast_pair(
+                "status_inactive_surface",
+                self.status.inactive_foreground,
+                self.status.inactive_surface,
+            ),
         ]
     }
 
     pub fn disabled_text_contrast_pairs(self) -> Vec<ContrastPair> {
-        vec![
-            ContrastPair {
-                name: "text_disabled_on_raised",
-                foreground: self.text.disabled,
-                background: self.surfaces.raised,
-            },
-            ContrastPair {
-                name: "text_disabled_on_disabled_surface",
-                foreground: self.text.disabled,
-                background: self.surfaces.disabled,
-            },
-        ]
+        let surfaces = [
+            ("raised", self.surfaces.raised),
+            ("canvas", self.surfaces.canvas),
+            ("overlay", self.surfaces.overlay),
+            ("sunken", self.surfaces.sunken),
+            ("hover", self.surfaces.hover),
+            ("selection", self.surfaces.selection),
+            ("disabled", self.surfaces.disabled),
+        ];
+        surfaces
+            .into_iter()
+            .map(|(surface, background)| {
+                let name = match surface {
+                    "raised" => "text_disabled_on_raised",
+                    "canvas" => "text_disabled_on_canvas",
+                    "overlay" => "text_disabled_on_overlay",
+                    "sunken" => "text_disabled_on_sunken",
+                    "hover" => "text_disabled_on_hover",
+                    "selection" => "text_disabled_on_selection",
+                    "disabled" => "text_disabled_on_disabled_surface",
+                    _ => unreachable!("disabled text surface must be declared"),
+                };
+                contrast_pair(name, self.text.disabled, background)
+            })
+            .collect()
     }
 }
 
@@ -669,10 +1011,10 @@ const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x27272a);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe4e4e7);
 const DARK_TEXT_SECONDARY: Color = Color::from_u32(0xd4d4d8);
-const DARK_TEXT_MUTED: Color = Color::from_u32(0xa1a1aa);
-const DARK_TEXT_DISABLED: Color = Color::from_u32(0xa1a1aa);
-const DARK_TEXT_INVERSE: Color = Color::from_u32(0x18181b);
-const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0x09090b);
+const DARK_TEXT_MUTED: Color = Color::from_u32(0xc4c4cc);
+const DARK_TEXT_DISABLED: Color = Color::from_u32(0xb8b8c0);
+const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
+const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xf8fafc);
 
 const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x27272a);
@@ -688,6 +1030,32 @@ const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x4ade80);
 const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
 const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xfb7185);
 const DARK_STATUS_INACTIVE: Color = Color::from_u32(0xa1a1aa);
+
+const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x4f46e5);
+const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x4338ca);
+const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x3730a3);
+const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x312e81);
+const DARK_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x27272a);
+const DARK_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xf8fafc);
+const DARK_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xb42318);
+const DARK_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0x991b1b);
+const DARK_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0x7f1d1d);
+const DARK_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0x7f1d1d);
+const DARK_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x27272a);
+const DARK_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
+
+const DARK_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0x172554);
+const DARK_STATUS_EXTERNAL_FOREGROUND: Color = Color::from_u32(0xdbeafe);
+const DARK_STATUS_ATTENTION_SURFACE: Color = Color::from_u32(0x451a03);
+const DARK_STATUS_ATTENTION_FOREGROUND: Color = Color::from_u32(0xffedd5);
+const DARK_STATUS_SUCCESS_SURFACE: Color = Color::from_u32(0x052e16);
+const DARK_STATUS_SUCCESS_FOREGROUND: Color = Color::from_u32(0xdcfce7);
+const DARK_STATUS_WARNING_SURFACE: Color = Color::from_u32(0x422006);
+const DARK_STATUS_WARNING_FOREGROUND: Color = Color::from_u32(0xfef3c7);
+const DARK_STATUS_DESTRUCTIVE_SURFACE: Color = Color::from_u32(0x450a0a);
+const DARK_STATUS_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffe4e6);
+const DARK_STATUS_INACTIVE_SURFACE: Color = Color::from_u32(0x27272a);
+const DARK_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0xd4d4d8);
 
 const DARK_TERMINAL_BLACK: Color = Color::from_u32(0x18181b);
 const DARK_TERMINAL_RED: Color = Color::from_u32(0xef4444);
@@ -716,8 +1084,8 @@ const LIGHT_SURFACE_DISABLED: Color = Color::from_u32(0xf1f5f9);
 
 const LIGHT_TEXT_PRIMARY: Color = Color::from_u32(0x0f172a);
 const LIGHT_TEXT_SECONDARY: Color = Color::from_u32(0x1e293b);
-const LIGHT_TEXT_MUTED: Color = Color::from_u32(0x475569);
-const LIGHT_TEXT_DISABLED: Color = Color::from_u32(0x64748b);
+const LIGHT_TEXT_MUTED: Color = Color::from_u32(0x334155);
+const LIGHT_TEXT_DISABLED: Color = Color::from_u32(0x475569);
 const LIGHT_TEXT_INVERSE: Color = Color::from_u32(0xffffff);
 const LIGHT_TEXT_ON_ACCENT: Color = Color::from_u32(0xffffff);
 const LIGHT_TEXT_ON_SELECTION: Color = Color::from_u32(0x0f172a);
@@ -735,6 +1103,32 @@ const LIGHT_STATUS_SUCCESS: Color = Color::from_u32(0x087a42);
 const LIGHT_STATUS_WARNING: Color = Color::from_u32(0x8f4b00);
 const LIGHT_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xb42318);
 const LIGHT_STATUS_INACTIVE: Color = Color::from_u32(0x64748b);
+
+const LIGHT_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x4f46e5);
+const LIGHT_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x4338ca);
+const LIGHT_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x3730a3);
+const LIGHT_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x312e81);
+const LIGHT_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0xe2e8f0);
+const LIGHT_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xffffff);
+const LIGHT_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xb42318);
+const LIGHT_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0x991b1b);
+const LIGHT_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0x7f1d1d);
+const LIGHT_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0x7f1d1d);
+const LIGHT_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0xe2e8f0);
+const LIGHT_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
+
+const LIGHT_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0xeff6ff);
+const LIGHT_STATUS_EXTERNAL_FOREGROUND: Color = Color::from_u32(0x1e3a8a);
+const LIGHT_STATUS_ATTENTION_SURFACE: Color = Color::from_u32(0xfff7ed);
+const LIGHT_STATUS_ATTENTION_FOREGROUND: Color = Color::from_u32(0x7c2d12);
+const LIGHT_STATUS_SUCCESS_SURFACE: Color = Color::from_u32(0xf0fdf4);
+const LIGHT_STATUS_SUCCESS_FOREGROUND: Color = Color::from_u32(0x14532d);
+const LIGHT_STATUS_WARNING_SURFACE: Color = Color::from_u32(0xfffbeb);
+const LIGHT_STATUS_WARNING_FOREGROUND: Color = Color::from_u32(0x78350f);
+const LIGHT_STATUS_DESTRUCTIVE_SURFACE: Color = Color::from_u32(0xfff1f2);
+const LIGHT_STATUS_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0x881337);
+const LIGHT_STATUS_INACTIVE_SURFACE: Color = Color::from_u32(0xf1f5f9);
+const LIGHT_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0x334155);
 
 const LIGHT_TERMINAL_BACKGROUND: Color = Color::from_u32(0x1e293b);
 const LIGHT_TERMINAL_FOREGROUND: Color = Color::from_u32(0xf8fafc);
@@ -923,6 +1317,62 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
             selection: DARK_BORDER_SELECTION,
             disabled: DARK_BORDER_DISABLED,
         },
+        actions: ActionTokens {
+            primary: InteractionStateTokens {
+                default: ActionStateTokens {
+                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
+                    background: DARK_ACTION_PRIMARY_DEFAULT,
+                    border: DARK_ACTION_PRIMARY_DEFAULT,
+                },
+                hover: ActionStateTokens {
+                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
+                    background: DARK_ACTION_PRIMARY_HOVER,
+                    border: DARK_ACTION_PRIMARY_HOVER,
+                },
+                focus: ActionStateTokens {
+                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
+                    background: DARK_ACTION_PRIMARY_FOCUS,
+                    border: DARK_BORDER_FOCUS,
+                },
+                selected: ActionStateTokens {
+                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
+                    background: DARK_ACTION_PRIMARY_SELECTED,
+                    border: DARK_BORDER_SELECTION,
+                },
+                disabled: ActionStateTokens {
+                    foreground: DARK_TEXT_DISABLED,
+                    background: DARK_ACTION_PRIMARY_DISABLED,
+                    border: DARK_BORDER_DISABLED,
+                },
+            },
+            destructive: InteractionStateTokens {
+                default: ActionStateTokens {
+                    foreground: DARK_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: DARK_ACTION_DESTRUCTIVE_DEFAULT,
+                    border: DARK_ACTION_DESTRUCTIVE_DEFAULT,
+                },
+                hover: ActionStateTokens {
+                    foreground: DARK_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: DARK_ACTION_DESTRUCTIVE_HOVER,
+                    border: DARK_ACTION_DESTRUCTIVE_HOVER,
+                },
+                focus: ActionStateTokens {
+                    foreground: DARK_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: DARK_ACTION_DESTRUCTIVE_FOCUS,
+                    border: DARK_BORDER_FOCUS,
+                },
+                selected: ActionStateTokens {
+                    foreground: DARK_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: DARK_ACTION_DESTRUCTIVE_SELECTED,
+                    border: DARK_BORDER_SELECTION,
+                },
+                disabled: ActionStateTokens {
+                    foreground: DARK_TEXT_DISABLED,
+                    background: DARK_ACTION_DESTRUCTIVE_DISABLED,
+                    border: DARK_BORDER_DISABLED,
+                },
+            },
+        },
         status: StatusTokens {
             external: DARK_STATUS_EXTERNAL,
             attention: DARK_STATUS_ATTENTION,
@@ -930,6 +1380,18 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
             warning: DARK_STATUS_WARNING,
             destructive: DARK_STATUS_DESTRUCTIVE,
             inactive: DARK_STATUS_INACTIVE,
+            external_surface: DARK_STATUS_EXTERNAL_SURFACE,
+            external_foreground: DARK_STATUS_EXTERNAL_FOREGROUND,
+            attention_surface: DARK_STATUS_ATTENTION_SURFACE,
+            attention_foreground: DARK_STATUS_ATTENTION_FOREGROUND,
+            success_surface: DARK_STATUS_SUCCESS_SURFACE,
+            success_foreground: DARK_STATUS_SUCCESS_FOREGROUND,
+            warning_surface: DARK_STATUS_WARNING_SURFACE,
+            warning_foreground: DARK_STATUS_WARNING_FOREGROUND,
+            destructive_surface: DARK_STATUS_DESTRUCTIVE_SURFACE,
+            destructive_foreground: DARK_STATUS_DESTRUCTIVE_FOREGROUND,
+            inactive_surface: DARK_STATUS_INACTIVE_SURFACE,
+            inactive_foreground: DARK_STATUS_INACTIVE_FOREGROUND,
         },
         terminal: TerminalPalette {
             background: DARK_SURFACE_SUNKEN,
@@ -986,6 +1448,62 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
             selection: LIGHT_BORDER_SELECTION,
             disabled: LIGHT_BORDER_DISABLED,
         },
+        actions: ActionTokens {
+            primary: InteractionStateTokens {
+                default: ActionStateTokens {
+                    foreground: LIGHT_ACTION_PRIMARY_FOREGROUND,
+                    background: LIGHT_ACTION_PRIMARY_DEFAULT,
+                    border: LIGHT_ACTION_PRIMARY_DEFAULT,
+                },
+                hover: ActionStateTokens {
+                    foreground: LIGHT_ACTION_PRIMARY_FOREGROUND,
+                    background: LIGHT_ACTION_PRIMARY_HOVER,
+                    border: LIGHT_ACTION_PRIMARY_HOVER,
+                },
+                focus: ActionStateTokens {
+                    foreground: LIGHT_ACTION_PRIMARY_FOREGROUND,
+                    background: LIGHT_ACTION_PRIMARY_FOCUS,
+                    border: LIGHT_BORDER_FOCUS,
+                },
+                selected: ActionStateTokens {
+                    foreground: LIGHT_ACTION_PRIMARY_FOREGROUND,
+                    background: LIGHT_ACTION_PRIMARY_SELECTED,
+                    border: LIGHT_BORDER_SELECTION,
+                },
+                disabled: ActionStateTokens {
+                    foreground: LIGHT_TEXT_DISABLED,
+                    background: LIGHT_ACTION_PRIMARY_DISABLED,
+                    border: LIGHT_BORDER_DISABLED,
+                },
+            },
+            destructive: InteractionStateTokens {
+                default: ActionStateTokens {
+                    foreground: LIGHT_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: LIGHT_ACTION_DESTRUCTIVE_DEFAULT,
+                    border: LIGHT_ACTION_DESTRUCTIVE_DEFAULT,
+                },
+                hover: ActionStateTokens {
+                    foreground: LIGHT_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: LIGHT_ACTION_DESTRUCTIVE_HOVER,
+                    border: LIGHT_ACTION_DESTRUCTIVE_HOVER,
+                },
+                focus: ActionStateTokens {
+                    foreground: LIGHT_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: LIGHT_ACTION_DESTRUCTIVE_FOCUS,
+                    border: LIGHT_BORDER_FOCUS,
+                },
+                selected: ActionStateTokens {
+                    foreground: LIGHT_ACTION_DESTRUCTIVE_FOREGROUND,
+                    background: LIGHT_ACTION_DESTRUCTIVE_SELECTED,
+                    border: LIGHT_BORDER_SELECTION,
+                },
+                disabled: ActionStateTokens {
+                    foreground: LIGHT_TEXT_DISABLED,
+                    background: LIGHT_ACTION_DESTRUCTIVE_DISABLED,
+                    border: LIGHT_BORDER_DISABLED,
+                },
+            },
+        },
         status: StatusTokens {
             external: LIGHT_STATUS_EXTERNAL,
             attention: LIGHT_STATUS_ATTENTION,
@@ -993,6 +1511,18 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
             warning: LIGHT_STATUS_WARNING,
             destructive: LIGHT_STATUS_DESTRUCTIVE,
             inactive: LIGHT_STATUS_INACTIVE,
+            external_surface: LIGHT_STATUS_EXTERNAL_SURFACE,
+            external_foreground: LIGHT_STATUS_EXTERNAL_FOREGROUND,
+            attention_surface: LIGHT_STATUS_ATTENTION_SURFACE,
+            attention_foreground: LIGHT_STATUS_ATTENTION_FOREGROUND,
+            success_surface: LIGHT_STATUS_SUCCESS_SURFACE,
+            success_foreground: LIGHT_STATUS_SUCCESS_FOREGROUND,
+            warning_surface: LIGHT_STATUS_WARNING_SURFACE,
+            warning_foreground: LIGHT_STATUS_WARNING_FOREGROUND,
+            destructive_surface: LIGHT_STATUS_DESTRUCTIVE_SURFACE,
+            destructive_foreground: LIGHT_STATUS_DESTRUCTIVE_FOREGROUND,
+            inactive_surface: LIGHT_STATUS_INACTIVE_SURFACE,
+            inactive_foreground: LIGHT_STATUS_INACTIVE_FOREGROUND,
         },
         terminal: TerminalPalette {
             background: LIGHT_TERMINAL_BACKGROUND,
@@ -1046,55 +1576,4 @@ pub fn parse_hex_color(value: Option<&str>, fallback: u32) -> u32 {
         return fallback;
     }
     u32::from_str_radix(hex, 16).unwrap_or(fallback)
-}
-
-/// Names retained for the legacy GPUI surface. They are aliases into the
-/// dark semantic theme, not a second palette.
-pub mod legacy {
-    use super::*;
-
-    pub const APP_BG: u32 = DARK_SURFACE_CANVAS.to_u32();
-    pub const SIDEBAR_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const PANEL_BG: u32 = DARK_SURFACE_CANVAS.to_u32();
-    pub const PANEL_HEADER_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const PANEL_CARD_BG: u32 = DARK_SURFACE_CANVAS.to_u32();
-    pub const EDITOR_CARD_BG: u32 = DARK_SURFACE_OVERLAY.to_u32();
-    pub const EDITOR_FIELD_BG: u32 = DARK_SURFACE_SUNKEN.to_u32();
-    pub const EDITOR_NOTICE_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const TOPBAR_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const TAB_BAR_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const TAB_ACTIVE_BG: u32 = DARK_SURFACE_CANVAS.to_u32();
-    pub const TAB_HOVER_BG: u32 = DARK_SURFACE_HOVER.to_u32();
-    pub const STATUS_BAR_BG: u32 = DARK_SURFACE_SUNKEN.to_u32();
-    pub const TERMINAL_BG: u32 = DARK_SURFACE_SUNKEN.to_u32();
-
-    pub const PROJECT_ROW_BG: u32 = DARK_SURFACE_SELECTION.to_u32();
-    pub const AGENT_ROW_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-
-    pub const BORDER_PRIMARY: u32 = DARK_BORDER_DEFAULT.to_u32();
-    pub const BORDER_SECONDARY: u32 = DARK_BORDER_SUBTLE.to_u32();
-    pub const BORDER_ACCENT: u32 = DARK_BORDER_SELECTION.to_u32();
-
-    pub const TEXT_PRIMARY: u32 = DARK_TEXT_PRIMARY.to_u32();
-    pub const TEXT_MUTED: u32 = DARK_TEXT_MUTED.to_u32();
-    pub const TEXT_SUBTLE: u32 = DARK_TEXT_MUTED.to_u32();
-    pub const TEXT_DIM: u32 = DARK_BORDER_STRONG.to_u32();
-
-    pub const SELECTION_BG: u32 = DARK_SURFACE_SELECTION.to_u32();
-    pub const SELECTION_TEXT: u32 = DARK_TEXT_ON_SELECTION.to_u32();
-    pub const PROJECT_DOT: u32 = DARK_BORDER_STRONG.to_u32();
-    pub const AI_DOT: u32 = DARK_STATUS_ATTENTION.to_u32();
-    pub const SSH_DOT: u32 = DARK_STATUS_EXTERNAL.to_u32();
-    pub const SUCCESS_BG: u32 = DARK_SURFACE_RAISED.to_u32();
-    pub const SUCCESS_TEXT: u32 = DARK_STATUS_SUCCESS.to_u32();
-    pub const WARNING_TEXT: u32 = DARK_STATUS_WARNING.to_u32();
-    pub const EXTERNAL_TEXT: u32 = DARK_STATUS_EXTERNAL.to_u32();
-    pub const DANGER_TEXT: u32 = DARK_STATUS_DESTRUCTIVE.to_u32();
-    pub const DANGER_BG_SUBTLE: u32 = DARK_SURFACE_SUNKEN.to_u32();
-
-    pub const PRIMARY: u32 = DARK_BORDER_FOCUS.to_u32();
-    pub const PRIMARY_HOVER: u32 = DARK_BORDER_STRONG.to_u32();
-    pub const PRIMARY_MUTED: u32 = DARK_SURFACE_SELECTION.to_u32();
-    pub const ROW_HOVER_BG: u32 = DARK_SURFACE_HOVER.to_u32();
-    pub const BUTTON_HOVER_BG: u32 = DARK_SURFACE_OVERLAY.to_u32();
 }
