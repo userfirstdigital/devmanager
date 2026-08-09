@@ -10,6 +10,12 @@
   Give it at least a 600-second command timeout. If its wrapper times out, track
   the exact Cargo process tree until it exits before rerunning; a wrapper timeout
   is not proof that Cargo or rustc stopped, and duplicate builds are forbidden.
+- Give every concurrently active Rust worktree its own `CARGO_TARGET_DIR`.
+  Sharing one target directory serializes builds behind Cargo locks, obscures
+  which worker owns compiler processes, and can turn a focused task into a false
+  timeout. Cleanup checks and any termination must be scoped to the exact worker
+  descendant tree, worktree, and target directory; never kill unrelated global
+  Cargo or rustc processes.
 - Keep `persistence::app_config_dir()` fail-closed under `cfg(test)`. Unit tests
   must resolve beneath the process-unique test root and must never fall back to
   `%APPDATA%\com.userfirst.devmanager`.
@@ -65,3 +71,11 @@
   validate the complete receipt, event sequence, planned effect, and operation
   fence lineage. Corrupt storage is an execution error, never a synthetic
   cleanup-failure outcome.
+
+## Lean phase execution
+
+- Aim for a focused RED/GREEN/review phase slice in roughly 30 minutes. This is
+  a planning target, not a hard cutoff. If one slice reaches 60 minutes, stop and
+  reassess its ownership, dependencies, test scope, build isolation, and false
+  blockers before continuing. Preserve useful work in its isolated branch, then
+  split or hand off the smallest coherent correction instead of waiting blindly.
