@@ -19,6 +19,75 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Isolation.ps1')
 . (Join-Path $PSScriptRoot 'PhaseGate.ps1')
 
+function Repair-DevManagerPhase3SupervisorPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    if ([string]$Plan.recipe -ne 'phase-03-process-supervisor') {
+        return
+    }
+
+    # The recipe table was originally registered with a supervisor-module
+    # filter, but the process_supervisor integration target has no such module. Replace
+    # that stale filter at the executable boundary so a zero-test Cargo run
+    # cannot be reported as a green Phase 3 gate.
+    $Plan.arguments = [string[]]@(
+        'test',
+        '--test', 'process_supervisor',
+        '--', '--nocapture'
+    )
+}
+
+function Assert-DevManagerPhase3SupervisorHasTests {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Plan
+    )
+
+    if ([string]$Plan.recipe -ne 'phase-03-process-supervisor') {
+        return
+    }
+
+    $listInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $listInfo.FileName = [string]$Plan.executable
+    $listInfo.UseShellExecute = $false
+    $listInfo.CreateNoWindow = $true
+    $listInfo.RedirectStandardOutput = $true
+    $listInfo.RedirectStandardError = $true
+    $listInfo.WorkingDirectory = [string]$Plan.workingDirectory
+    Set-DevManagerPhaseGateProcessEnvironment -StartInfo $listInfo -Plan $Plan
+    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--', '--list')) {
+        [void]$listInfo.ArgumentList.Add($argument)
+    }
+
+    $listProcess = [System.Diagnostics.Process]::Start($listInfo)
+    if ($null -eq $listProcess) {
+        throw 'Unable to start the phase-03-process-supervisor test-list preflight.'
+    }
+    try {
+        $stdoutTask = $listProcess.StandardOutput.ReadToEndAsync()
+        $stderrTask = $listProcess.StandardError.ReadToEndAsync()
+        $listProcess.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($listProcess.ExitCode -ne 0) {
+            throw ("phase-03-process-supervisor test-list preflight failed ({0}): {1}" -f $listProcess.ExitCode, $stderr.Trim())
+        }
+        $testLines = @(
+            $stdout -split "`r?`n" |
+                Where-Object { $_ -match ':\s*test$' }
+        )
+        if ($testLines.Count -eq 0) {
+            throw 'phase-03-process-supervisor preflight found zero tests; refusing a green gate.'
+        }
+    }
+    finally {
+        $listProcess.Dispose()
+    }
+}
+
 $phaseName = Assert-DevManagerPhaseName -Phase $Phase
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
 $evidenceRoot = Get-DevManagerNativeNextEvidenceRoot -ScriptRoot $PSScriptRoot
@@ -26,7 +95,9 @@ $protectedRoot = Get-DevManagerProductionRoot
 
 # Reject unknown recipes before any baseline/evidence work.
 $plan = Resolve-DevManagerPhaseGateRecipe -Recipe $Recipe -WorktreeRoot $worktreeRoot
+Repair-DevManagerPhase3SupervisorPlan -Plan $plan
 Assert-DevManagerPhaseGateExecutionPlan -Plan $plan
+Assert-DevManagerPhase3SupervisorHasTests -Plan $plan
 
 $run = New-DevManagerPhaseGateRunDirectory `
     -Phase $phaseName `
