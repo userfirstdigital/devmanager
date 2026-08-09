@@ -4,6 +4,17 @@
 use std::ffi::c_void;
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::thread::JoinHandle;
+
+use crate::domain::operation::ResourceFence;
+#[cfg(windows)]
+use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
+use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, JobMemberInfo};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -24,6 +35,39 @@ extern "system" {
         job_object_info_length: u32,
         return_length: *mut u32,
     ) -> i32;
+    fn CreateIoCompletionPort(
+        file_handle: *mut c_void,
+        existing_completion_port: *mut c_void,
+        completion_key: usize,
+        number_of_concurrent_threads: u32,
+    ) -> *mut c_void;
+    fn GetQueuedCompletionStatus(
+        completion_port: *mut c_void,
+        number_of_bytes_transferred: *mut u32,
+        completion_key: *mut usize,
+        overlapped: *mut *mut c_void,
+        milliseconds: u32,
+    ) -> i32;
+    fn PostQueuedCompletionStatus(
+        completion_port: *mut c_void,
+        number_of_bytes_transferred: u32,
+        completion_key: usize,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn GetProcessTimes(
+        process: *mut c_void,
+        creation_time: *mut FileTime,
+        exit_time: *mut FileTime,
+        kernel_time: *mut FileTime,
+        user_time: *mut FileTime,
+    ) -> i32;
+    fn QueryFullProcessImageNameW(
+        process: *mut c_void,
+        flags: u32,
+        executable_name: *mut u16,
+        size: *mut u32,
+    ) -> i32;
+    fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
 }
 
 #[cfg(windows)]
@@ -31,7 +75,11 @@ const PROCESS_TERMINATE: u32 = 0x0001;
 #[cfg(windows)]
 const PROCESS_SET_QUOTA: u32 = 0x0100;
 #[cfg(windows)]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+#[cfg(windows)]
 const JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS: u32 = 3;
+#[cfg(windows)]
+const JOB_OBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION_CLASS: u32 = 7;
 #[cfg(windows)]
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
 #[cfg(windows)]
@@ -40,6 +88,73 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 const ERROR_MORE_DATA: i32 = 234;
 #[cfg(windows)]
 const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
+#[cfg(windows)]
+const MAX_COMPLETION_MESSAGES: usize = 4_096;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
+#[cfg(windows)]
+const SHUTDOWN_MESSAGE: u32 = u32::MAX;
+#[cfg(windows)]
+const SHUTDOWN_COMPLETION_KEY: usize = 0;
+#[cfg(windows)]
+static NEXT_COMPLETION_KEY: AtomicUsize = AtomicUsize::new(1);
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct FileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct JobObjectAssociateCompletionPort {
+    completion_key: *mut c_void,
+    completion_port: *mut c_void,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct CompletionMailbox {
+    messages: std::collections::VecDeque<JobCompletionMessage>,
+}
+
+#[cfg(windows)]
+impl CompletionMailbox {
+    fn push(&mut self, message: JobCompletionMessage) {
+        if matches!(message.event(), JobCompletionEvent::ActiveProcessZero)
+            && self
+                .messages
+                .iter()
+                .any(|queued| matches!(queued.event(), JobCompletionEvent::ActiveProcessZero))
+        {
+            return;
+        }
+        if self.messages.len() == MAX_COMPLETION_MESSAGES {
+            if let Some(index) = self
+                .messages
+                .iter()
+                .position(|queued| !matches!(queued.event(), JobCompletionEvent::ActiveProcessZero))
+            {
+                self.messages.remove(index);
+            } else {
+                return;
+            }
+        }
+        self.messages.push_back(message);
+    }
+
+    fn drain(&mut self) -> Vec<JobCompletionMessage> {
+        self.messages.drain(..).collect()
+    }
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -87,7 +202,12 @@ struct JobObjectExtendedLimitInformation {
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct ManagedProcessJob {
-    handle: OwnedHandle,
+    handle: Option<OwnedHandle>,
+    completion_port: Option<OwnedHandle>,
+    completion_key: usize,
+    completion_fence: Option<ResourceFence>,
+    completion_mailbox: Arc<Mutex<CompletionMailbox>>,
+    completion_listener: Option<JoinHandle<()>>,
 }
 
 /// Non-Windows marker type returned only behind `Option::None`.
@@ -118,7 +238,7 @@ impl ManagedProcessJob {
     pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         #[cfg(windows)]
         {
-            query_job_active_process_ids(self.handle.as_raw_handle())
+            query_job_active_process_ids(self.raw_job_handle())
         }
 
         #[cfg(not(windows))]
@@ -127,9 +247,114 @@ impl ManagedProcessJob {
         }
     }
 
+    pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+        #[cfg(windows)]
+        {
+            inspect_windows_process(self.raw_job_handle(), pid)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+            Err("process inspection is unavailable off Windows".to_string())
+        }
+    }
+
+    pub fn bind_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.bind_windows_completion_fence(fence)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = fence;
+            Ok(())
+        }
+    }
+
+    pub fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
+        #[cfg(windows)]
+        {
+            self.completion_mailbox
+                .lock()
+                .expect("managed Job completion mailbox poisoned")
+                .drain()
+        }
+
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
+    }
+
     #[cfg(windows)]
     pub(crate) fn borrowed_handle(&self) -> BorrowedHandle<'_> {
-        self.handle.as_handle()
+        self.handle
+            .as_ref()
+            .expect("managed Job handle exists until drop")
+            .as_handle()
+    }
+
+    #[cfg(windows)]
+    fn raw_job_handle(&self) -> *mut c_void {
+        self.handle
+            .as_ref()
+            .expect("managed Job handle exists until drop")
+            .as_raw_handle()
+    }
+
+    #[cfg(windows)]
+    fn bind_windows_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
+        if let Some(bound) = self.completion_fence {
+            return if bound == fence {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Job completion port is already bound to {:?}, not {:?}",
+                    bound, fence
+                ))
+            };
+        }
+        let port = self
+            .completion_port
+            .as_ref()
+            .ok_or_else(|| "managed Job completion port is closed".to_string())?
+            .as_raw_handle() as usize;
+        let completion_key = self.completion_key;
+        let mailbox = Arc::clone(&self.completion_mailbox);
+        let listener = std::thread::Builder::new()
+            .name(format!(
+                "devmanager-job-{}-{}",
+                fence.resource_id, fence.runtime_generation
+            ))
+            .spawn(move || completion_listener(port, completion_key, fence, mailbox))
+            .map_err(|error| format!("could not spawn Job completion listener: {error}"))?;
+        self.completion_fence = Some(fence);
+        self.completion_listener = Some(listener);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ManagedProcessJob {
+    fn drop(&mut self) {
+        if let Some(listener) = self.completion_listener.take() {
+            let posted = self.completion_port.as_ref().is_some_and(|port| unsafe {
+                PostQueuedCompletionStatus(
+                    port.as_raw_handle(),
+                    SHUTDOWN_MESSAGE,
+                    SHUTDOWN_COMPLETION_KEY,
+                    std::ptr::null_mut(),
+                ) != 0
+            });
+            if !posted {
+                drop(self.completion_port.take());
+            }
+            let _ = listener.join();
+        }
+        drop(self.completion_port.take());
+        drop(self.handle.take());
     }
 }
 
@@ -269,6 +494,33 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
         // closes exactly this sole owner on every subsequent error path.
         let job = OwnedHandle::from_raw_handle(raw_job);
 
+        let raw_completion_port =
+            CreateIoCompletionPort((-1isize) as *mut c_void, std::ptr::null_mut(), 0, 1);
+        if raw_completion_port.is_null() {
+            return Err(format!(
+                "CreateIoCompletionPort failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let completion_port = OwnedHandle::from_raw_handle(raw_completion_port);
+        let completion_key = next_completion_key();
+        let mut association = JobObjectAssociateCompletionPort {
+            completion_key: completion_key as *mut c_void,
+            completion_port: completion_port.as_raw_handle(),
+        };
+        if SetInformationJobObject(
+            job.as_raw_handle(),
+            JOB_OBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION_CLASS,
+            &mut association as *mut _ as *mut c_void,
+            std::mem::size_of::<JobObjectAssociateCompletionPort>() as u32,
+        ) == 0
+        {
+            return Err(format!(
+                "SetInformationJobObject completion port association failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
         let mut limits = JobObjectExtendedLimitInformation::default();
         limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let set_ok = SetInformationJobObject(
@@ -284,7 +536,14 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
             ));
         }
 
-        Ok(ManagedProcessJob { handle: job })
+        Ok(ManagedProcessJob {
+            handle: Some(job),
+            completion_port: Some(completion_port),
+            completion_key,
+            completion_fence: None,
+            completion_mailbox: Arc::new(Mutex::new(CompletionMailbox::default())),
+            completion_listener: None,
+        })
     }
 }
 
@@ -304,7 +563,7 @@ fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> 
         // non-inheritable as well.
         let process = OwnedHandle::from_raw_handle(raw_process);
 
-        if AssignProcessToJobObject(job.handle.as_raw_handle(), process.as_raw_handle()) == 0 {
+        if AssignProcessToJobObject(job.raw_job_handle(), process.as_raw_handle()) == 0 {
             return Err(format!(
                 "AssignProcessToJobObject({pid}) failed: {}",
                 std::io::Error::last_os_error()
@@ -312,5 +571,194 @@ fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> 
         }
 
         Ok(job)
+    }
+}
+
+#[cfg(windows)]
+fn next_completion_key() -> usize {
+    loop {
+        let key = NEXT_COMPLETION_KEY.fetch_add(1, Ordering::Relaxed);
+        if key != SHUTDOWN_COMPLETION_KEY {
+            return key;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn completion_listener(
+    completion_port_value: usize,
+    expected_completion_key: usize,
+    fence: ResourceFence,
+    mailbox: Arc<Mutex<CompletionMailbox>>,
+) {
+    let completion_port = completion_port_value as *mut c_void;
+    loop {
+        let mut message_id = 0u32;
+        let mut completion_key = 0usize;
+        let mut process_value = std::ptr::null_mut();
+        let ok = unsafe {
+            GetQueuedCompletionStatus(
+                completion_port,
+                &mut message_id,
+                &mut completion_key,
+                &mut process_value,
+                u32::MAX,
+            )
+        };
+        if completion_key == SHUTDOWN_COMPLETION_KEY
+            && message_id == SHUTDOWN_MESSAGE
+            && process_value.is_null()
+        {
+            break;
+        }
+        if ok == 0 {
+            let detail = std::io::Error::last_os_error().to_string();
+            mailbox
+                .lock()
+                .expect("managed Job completion mailbox poisoned")
+                .push(JobCompletionMessage::new(
+                    fence,
+                    JobCompletionEvent::MonitorFailed { detail },
+                ));
+            break;
+        }
+        if completion_key != expected_completion_key {
+            continue;
+        }
+
+        // For Job completion packets, lpOverlapped is a PID-shaped value.
+        // It is never an OVERLAPPED pointer and must never be dereferenced.
+        let pid = usize::from_ne_bytes((process_value as usize).to_ne_bytes()) as u32;
+        let event = match message_id {
+            JOB_OBJECT_MSG_NEW_PROCESS => JobCompletionEvent::NewProcess { pid },
+            JOB_OBJECT_MSG_EXIT_PROCESS => JobCompletionEvent::ExitProcess { pid },
+            JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS => JobCompletionEvent::AbnormalExitProcess { pid },
+            JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO => JobCompletionEvent::ActiveProcessZero,
+            _ => JobCompletionEvent::Limit {
+                message_id,
+                pid: (pid != 0).then_some(pid),
+            },
+        };
+        mailbox
+            .lock()
+            .expect("managed Job completion mailbox poisoned")
+            .push(JobCompletionMessage::new(fence, event));
+    }
+}
+
+#[cfg(windows)]
+fn inspect_windows_process(job: *mut c_void, pid: u32) -> Result<JobMemberInfo, String> {
+    unsafe {
+        let raw_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw_process.is_null() {
+            return Err(format!(
+                "OpenProcess({pid}) for identity inspection failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let process = OwnedHandle::from_raw_handle(raw_process);
+        let mut is_member = 0;
+        if IsProcessInJob(process.as_raw_handle(), job, &mut is_member) == 0 {
+            return Err(format!(
+                "IsProcessInJob({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if is_member == 0 {
+            return Err(format!("PID {pid} no longer belongs to the managed Job"));
+        }
+
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        if GetProcessTimes(
+            process.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return Err(format!(
+                "GetProcessTimes({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let creation_time_100ns =
+            ((creation.high_date_time as u64) << 32) | creation.low_date_time as u64;
+        let process_id = ManagedProcessId::new(pid, creation_time_100ns)
+            .map_err(|error| format!("invalid process identity for PID {pid}: {error}"))?;
+
+        let mut executable_buffer = vec![0u16; 32_768];
+        let mut executable_length = executable_buffer.len() as u32;
+        if QueryFullProcessImageNameW(
+            process.as_raw_handle(),
+            0,
+            executable_buffer.as_mut_ptr(),
+            &mut executable_length,
+        ) == 0
+        {
+            return Err(format!(
+                "QueryFullProcessImageNameW({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        executable_buffer.truncate(executable_length as usize);
+        let executable = std::path::PathBuf::from(String::from_utf16_lossy(&executable_buffer));
+        let identity = ManagedProcessIdentity::new(process_id, executable)
+            .map_err(|error| format!("could not canonicalize executable for PID {pid}: {error}"))?;
+
+        let sys_pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sys_pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let candidate_command_line = system.process(sys_pid).and_then(|process| {
+            let parts: Vec<String> = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy().into_owned())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        });
+        let command_line = (current_creation_time_100ns(pid).as_ref() == Ok(&creation_time_100ns))
+            .then_some(candidate_command_line)
+            .flatten();
+        Ok(JobMemberInfo::new(identity, command_line))
+    }
+}
+
+#[cfg(windows)]
+fn current_creation_time_100ns(pid: u32) -> Result<u64, String> {
+    unsafe {
+        let raw_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw_process.is_null() {
+            return Err(format!(
+                "OpenProcess({pid}) for identity recheck failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let process = OwnedHandle::from_raw_handle(raw_process);
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        if GetProcessTimes(
+            process.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return Err(format!(
+                "GetProcessTimes({pid}) identity recheck failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(((creation.high_date_time as u64) << 32) | creation.low_date_time as u64)
     }
 }

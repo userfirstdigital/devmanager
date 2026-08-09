@@ -59,11 +59,98 @@ impl std::error::Error for ProcessDisplayLabelError {}
 /// that a caller successfully assigned a process to the Job.
 pub trait JobMembership {
     fn active_process_ids(&self) -> Result<Vec<u32>, String>;
+
+    fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+        Err(format!("process identity for PID {pid} is inaccessible"))
+    }
+
+    fn bind_completion_fence(&mut self, _fence: ResourceFence) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
+        Vec::new()
+    }
 }
 
 impl JobMembership for crate::process::job::ManagedProcessJob {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         crate::process::job::ManagedProcessJob::active_process_ids(self)
+    }
+
+    fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+        crate::process::job::ManagedProcessJob::inspect_process(self, pid)
+    }
+
+    fn bind_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::bind_completion_fence(self, fence)
+    }
+
+    fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
+        crate::process::job::ManagedProcessJob::drain_completion_messages(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedProcessState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+    Leaked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobMemberInfo {
+    identity: ManagedProcessIdentity,
+    command_line: Option<String>,
+}
+
+impl JobMemberInfo {
+    pub fn new(identity: ManagedProcessIdentity, command_line: Option<String>) -> Self {
+        Self {
+            identity,
+            command_line,
+        }
+    }
+
+    pub fn identity(&self) -> &ManagedProcessIdentity {
+        &self.identity
+    }
+
+    pub fn command_line(&self) -> Option<&str> {
+        self.command_line.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobCompletionEvent {
+    NewProcess { pid: u32 },
+    ExitProcess { pid: u32 },
+    AbnormalExitProcess { pid: u32 },
+    ActiveProcessZero,
+    Limit { message_id: u32, pid: Option<u32> },
+    MonitorFailed { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCompletionMessage {
+    fence: ResourceFence,
+    event: JobCompletionEvent,
+}
+
+impl JobCompletionMessage {
+    pub fn new(fence: ResourceFence, event: JobCompletionEvent) -> Self {
+        Self { fence, event }
+    }
+
+    pub fn fence(&self) -> ResourceFence {
+        self.fence
+    }
+
+    pub fn event(&self) -> &JobCompletionEvent {
+        &self.event
     }
 }
 
@@ -74,6 +161,10 @@ pub struct RegisteredProcess<J> {
     root: ManagedProcessIdentity,
     display_label: ProcessDisplayLabel,
     job: J,
+    state: ManagedProcessState,
+    known_members: Vec<JobMemberInfo>,
+    unknown_member_pids: Vec<u32>,
+    last_limit: Option<(u32, Option<u32>)>,
 }
 
 impl<J> RegisteredProcess<J> {
@@ -90,6 +181,10 @@ impl<J> RegisteredProcess<J> {
             root,
             display_label,
             job,
+            state: ManagedProcessState::Starting,
+            known_members: Vec::new(),
+            unknown_member_pids: Vec::new(),
+            last_limit: None,
         }
     }
 
@@ -111,6 +206,26 @@ impl<J> RegisteredProcess<J> {
 
     pub fn job(&self) -> &J {
         &self.job
+    }
+
+    pub fn state(&self) -> ManagedProcessState {
+        self.state
+    }
+
+    pub fn known_members(&self) -> &[JobMemberInfo] {
+        &self.known_members
+    }
+
+    pub fn unknown_member_pids(&self) -> &[u32] {
+        &self.unknown_member_pids
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.known_members.len() + self.unknown_member_pids.len()
+    }
+
+    pub fn last_limit(&self) -> Option<(u32, Option<u32>)> {
+        self.last_limit
     }
 }
 
@@ -186,6 +301,10 @@ pub enum ProcessRegistryError {
         resource_id: ResourceId,
         detail: String,
     },
+    CompletionNotificationsFailed {
+        resource_id: ResourceId,
+        detail: String,
+    },
     Runtime(RuntimeRegistryError),
 }
 
@@ -216,6 +335,13 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "could not query resource {resource_id}'s Job membership: {detail}"
             ),
+            Self::CompletionNotificationsFailed {
+                resource_id,
+                detail,
+            } => write!(
+                f,
+                "could not start resource {resource_id}'s Job notifications: {detail}"
+            ),
             Self::Runtime(error) => error.fmt(f),
         }
     }
@@ -228,7 +354,8 @@ impl std::error::Error for ProcessRegistryError {
             Self::ActiveGeneration { .. }
             | Self::DuplicateActivePid { .. }
             | Self::NotJobMember { .. }
-            | Self::MembershipQueryFailed { .. } => None,
+            | Self::MembershipQueryFailed { .. }
+            | Self::CompletionNotificationsFailed { .. } => None,
         }
     }
 }
@@ -322,12 +449,31 @@ impl<J> ProcessRegistry<J> {
             .expect("exact current registry entry was checked before removal");
         Ok(UnregisterOutcome::Removed(removed))
     }
+
+    pub fn begin_stopping_exact(&mut self, fence: &ManagedProcessFence) -> bool {
+        let Some(current) = self.current.get_mut(&fence.resource.resource_id) else {
+            return false;
+        };
+        if ManagedProcessFence::from_process(current) != *fence {
+            return false;
+        }
+        match current.state {
+            ManagedProcessState::Starting
+            | ManagedProcessState::Running
+            | ManagedProcessState::Failed => {
+                current.state = ManagedProcessState::Stopping;
+                true
+            }
+            ManagedProcessState::Stopping => true,
+            ManagedProcessState::Stopped | ManagedProcessState::Leaked => false,
+        }
+    }
 }
 
 impl<J: JobMembership> ProcessRegistry<J> {
     pub fn register(
         &mut self,
-        process: RegisteredProcess<J>,
+        mut process: RegisteredProcess<J>,
     ) -> Result<ManagedProcessFence, ProcessRegistrationFailure<J>> {
         let proposed = process.fence;
         if let Some(current) = self.current.get(&proposed.resource_id) {
@@ -378,6 +524,16 @@ impl<J: JobMembership> ProcessRegistry<J> {
             ));
         }
 
+        if let Err(detail) = process.job.bind_completion_fence(proposed) {
+            return Err(ProcessRegistrationFailure::new(
+                ProcessRegistryError::CompletionNotificationsFailed {
+                    resource_id: proposed.resource_id,
+                    detail,
+                },
+                process,
+            ));
+        }
+
         if let Err(error) = self.runtime.install_current(proposed) {
             return Err(ProcessRegistrationFailure::new(
                 ProcessRegistryError::Runtime(error),
@@ -387,6 +543,104 @@ impl<J: JobMembership> ProcessRegistry<J> {
         let fence = ManagedProcessFence::from_process(&process);
         self.current.insert(proposed.resource_id, process);
         Ok(fence)
+    }
+
+    pub fn drain_job_completions(&mut self, resource_id: ResourceId) -> usize {
+        let messages = self
+            .current
+            .get(&resource_id)
+            .map(|process| process.job.drain_completion_messages())
+            .unwrap_or_default();
+        let count = messages.len();
+        for message in messages {
+            self.apply_job_completion(message);
+        }
+        count
+    }
+
+    pub fn apply_job_completion(&mut self, message: JobCompletionMessage) -> bool {
+        let resource_id = message.fence.resource_id;
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return false;
+        };
+        if current.fence != message.fence {
+            return false;
+        }
+
+        match message.event {
+            JobCompletionEvent::NewProcess { .. } => {
+                if current.state == ManagedProcessState::Starting {
+                    current.state = ManagedProcessState::Running;
+                }
+            }
+            JobCompletionEvent::ExitProcess { .. } => {
+                // Completion-packet PIDs are scheduling hints, never stable
+                // identity. The next authoritative Job query updates members.
+            }
+            JobCompletionEvent::AbnormalExitProcess { .. } => {
+                if current.state != ManagedProcessState::Stopped {
+                    current.state = ManagedProcessState::Failed;
+                }
+            }
+            JobCompletionEvent::ActiveProcessZero => {
+                if matches!(current.job.active_process_ids(), Ok(process_ids) if process_ids.is_empty())
+                {
+                    current.known_members.clear();
+                    current.unknown_member_pids.clear();
+                    current.state = ManagedProcessState::Stopped;
+                }
+            }
+            JobCompletionEvent::Limit { message_id, pid } => {
+                current.last_limit = Some((message_id, pid));
+                if current.state != ManagedProcessState::Stopped {
+                    current.state = ManagedProcessState::Failed;
+                }
+            }
+            JobCompletionEvent::MonitorFailed { .. } => {
+                if current.state != ManagedProcessState::Stopped {
+                    current.state = ManagedProcessState::Leaked;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn reconcile_membership(
+        &mut self,
+        resource_id: ResourceId,
+    ) -> Result<(), ProcessRegistryError> {
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Ok(());
+        };
+        let mut active_pids = current.job.active_process_ids().map_err(|detail| {
+            ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail,
+            }
+        })?;
+        active_pids.sort_unstable();
+        active_pids.dedup();
+        if !active_pids.is_empty() && current.state == ManagedProcessState::Starting {
+            current.state = ManagedProcessState::Running;
+        }
+
+        let mut known_members = Vec::with_capacity(active_pids.len());
+        let mut unknown_member_pids = Vec::new();
+        for pid in active_pids {
+            match current.job.inspect_process(pid) {
+                Ok(member) if member.identity.id().pid() == pid => known_members.push(member),
+                Ok(_) | Err(_) => unknown_member_pids.push(pid),
+            }
+        }
+        known_members.sort_by_key(|member| {
+            (
+                member.identity.id().pid(),
+                member.identity.id().creation_time_100ns(),
+            )
+        });
+        current.known_members = known_members;
+        current.unknown_member_pids = unknown_member_pids;
+        Ok(())
     }
 
     pub fn classify_root(&self, observed: &ManagedProcessIdentity) -> ProcessClassification {

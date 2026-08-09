@@ -11,5 +11,8 @@ mod job;
 #[path = "process_supervisor/launcher.rs"]
 mod launcher;
 
+#[path = "process_supervisor/membership.rs"]
+mod membership;
+
 #[path = "process_supervisor/registry.rs"]
 mod registry;
