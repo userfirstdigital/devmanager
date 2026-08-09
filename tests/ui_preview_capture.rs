@@ -5,7 +5,8 @@ use devmanager::ui::preview::{
 use devmanager::ui::preview_capture::{
     active_capture_thread_count, capture_contract, receive_first_frame,
     settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat, CaptureDeadline,
-    CaptureSetting, PreviewCaptureError, FIRST_FRAME_DEADLINE,
+    CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
+    FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
 };
 use image::GenericImageView;
 use std::fs;
@@ -52,6 +53,26 @@ fn valid_request(policy: &PreviewPathPolicy, name: &str) -> PreviewRequest {
         policy,
     )
     .expect("valid preview request")
+}
+
+fn composed_cleanup_error(
+    primary: PreviewCaptureError,
+    secondary: PreviewCaptureError,
+) -> PreviewCaptureError {
+    settle_capture_with_cleanup(
+        Err::<(), _>(primary),
+        CaptureDeadline::from_now(Duration::from_secs(1)),
+        move |_| Err(secondary),
+    )
+    .expect_err("cleanup settlement should compose the supplied failure")
+}
+
+fn deeply_nested_cleanup_error(depth: usize) -> PreviewCaptureError {
+    let mut error = PreviewCaptureError::CaptureFailed("leaf".into());
+    for _ in 0..depth {
+        error = composed_cleanup_error(PreviewCaptureError::DeadlineExceeded, error);
+    }
+    error
 }
 
 #[test]
@@ -142,14 +163,11 @@ fn settle_cleanup_failure_is_bounded_and_keeps_primary_typed() {
     );
     assert!(matches!(
         &error,
-        PreviewCaptureError::CleanupFailed {
-            primary,
-            operation,
-            secondary,
-        } if matches!(primary.as_ref(), PreviewCaptureError::CaptureClosed)
-            && *operation == "stop"
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.primary(), PreviewCaptureError::CaptureClosed)
+            && context.operation() == "stop"
             && matches!(
-                secondary.as_ref(),
+                context.secondary(),
                 PreviewCaptureError::CaptureFailed(message) if message.contains("deadline")
             )
     ));
@@ -162,30 +180,81 @@ fn settle_cleanup_failure_is_bounded_and_keeps_primary_typed() {
 
 #[test]
 fn cleanup_failure_remains_visible_with_the_primary_capture_error() {
-    let error = PreviewCaptureError::DeadlineExceeded.with_cleanup_failure(
-        "stop/join",
+    let error = composed_cleanup_error(
+        PreviewCaptureError::DeadlineExceeded,
         PreviewCaptureError::CaptureFailed("capture thread could not be joined".into()),
     );
 
     assert!(matches!(
         &error,
-        PreviewCaptureError::CleanupFailed {
-            primary,
-            operation,
-            secondary,
-        } if matches!(primary.as_ref(), PreviewCaptureError::DeadlineExceeded)
-            && *operation == "stop/join"
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.primary(), PreviewCaptureError::DeadlineExceeded)
+            && context.operation() == "stop"
             && matches!(
-                secondary.as_ref(),
+                context.secondary(),
                 PreviewCaptureError::CaptureFailed(message)
                     if message == "capture thread could not be joined"
             )
     ));
-    assert!(error
-        .to_string()
-        .contains(
-            "cleanup stop/join failed: Windows Graphics Capture failed: capture thread could not be joined"
-        ));
+    assert!(error.to_string().contains(
+        "cleanup stop failed: Windows Graphics Capture failed: capture thread could not be joined"
+    ));
+}
+
+#[test]
+fn deeply_nested_cleanup_diagnostic_is_depth_bounded_at_the_formatting_boundary() {
+    let error = deeply_nested_cleanup_error(128);
+
+    let rendered = error.to_string();
+    assert!(rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+    assert!(rendered.ends_with(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER));
+
+    let mapped = PreviewError::from_capture_error(error, PathBuf::from("approved.png").as_path());
+    assert!(matches!(
+        mapped,
+        PreviewError::CaptureCleanupFailed { primary, .. }
+            if matches!(
+                primary.as_ref(),
+                PreviewError::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::DeadlineExceeded,
+                    ..
+                }
+            )
+    ));
+}
+
+#[test]
+fn oversized_multibyte_cleanup_diagnostics_are_utf8_and_exactly_bounded() {
+    let fixed_prefix = "Windows Graphics Capture failed: ";
+    let payload_budget = MAX_CLEANUP_DIAGNOSTIC_BYTES
+        .saturating_sub(fixed_prefix.len() + CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER.len());
+    let ascii_prefix = "a".repeat(payload_budget % 2);
+    let multibyte = "é".repeat((payload_budget - ascii_prefix.len()) / 2);
+    let message = format!("{ascii_prefix}{multibyte}overflow");
+    let error = PreviewCaptureError::CaptureFailed(message);
+
+    let rendered = error.to_string();
+    assert_eq!(rendered.len(), MAX_CLEANUP_DIAGNOSTIC_BYTES);
+    assert!(rendered.ends_with(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER));
+    assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+
+    let mapped = PreviewError::from_capture_error(
+        composed_cleanup_error(PreviewCaptureError::DeadlineExceeded, error),
+        PathBuf::from("approved.png").as_path(),
+    );
+    assert!(matches!(
+        mapped,
+        PreviewError::CaptureCleanupFailed { primary, reason, .. }
+            if matches!(
+                primary.as_ref(),
+                PreviewError::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::DeadlineExceeded,
+                    ..
+                }
+            )
+                && reason.len() == MAX_CLEANUP_DIAGNOSTIC_BYTES
+                && reason.ends_with(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER)
+    ));
 }
 
 #[test]
@@ -277,13 +346,10 @@ fn render_error_mapping_preserves_actionable_capture_categories() {
     }
 
     let cleanup = PreviewError::from_capture_error(
-        PreviewCaptureError::CleanupFailed {
-            primary: Box::new(PreviewCaptureError::DeadlineExceeded),
-            operation: "stop",
-            secondary: Box::new(PreviewCaptureError::CaptureFailed(
-                "cleanup deadline exceeded".into(),
-            )),
-        },
+        composed_cleanup_error(
+            PreviewCaptureError::DeadlineExceeded,
+            PreviewCaptureError::CaptureFailed("cleanup deadline exceeded".into()),
+        ),
         &output,
     );
     assert!(matches!(

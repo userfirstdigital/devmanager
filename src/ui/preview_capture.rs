@@ -5,6 +5,7 @@
 //! window, captures its exact HWND, and writes only a first physical frame.
 
 use image::ImageEncoder;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,13 @@ use crate::ui::preview::{PreviewRequest, PreviewRoot};
 pub const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 pub const PREVIEW_WINDOW_WIDTH: i32 = 640;
 pub const PREVIEW_WINDOW_HEIGHT: i32 = 360;
+
+/// Maximum byte length of any capture diagnostic rendered for the UI.
+pub const MAX_CLEANUP_DIAGNOSTIC_BYTES: usize = 4096;
+/// Marker appended when a capture diagnostic reaches its byte or depth limit.
+pub const CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER: &str = "... [truncated]";
+/// Maximum recursive cleanup depth inspected while producing a diagnostic.
+pub const MAX_CLEANUP_DIAGNOSTIC_DEPTH: usize = 16;
 
 /// One absolute capture deadline. Every blocking capture phase consumes the
 /// remaining time from this same instant; callers must not create phase-local
@@ -202,12 +210,19 @@ where
 
     match (primary, cleanup_result) {
         (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(PreviewCaptureError::CaptureFailed(
-            "a valid frame arrived but capture cleanup did not settle".into(),
-        )
-        .with_cleanup_failure(operation.as_str(), error)),
+        (Ok(_), Err(error)) => Err(PreviewCaptureError::CleanupFailed(
+            CleanupFailureContext::from_settlement(
+                PreviewCaptureError::CaptureFailed(
+                    "a valid frame arrived but capture cleanup did not settle".into(),
+                ),
+                operation.as_str(),
+                error,
+            ),
+        )),
         (Err(primary), Ok(())) => Err(primary),
-        (Err(primary), Err(error)) => Err(primary.with_cleanup_failure(operation.as_str(), error)),
+        (Err(primary), Err(error)) => Err(PreviewCaptureError::CleanupFailed(
+            CleanupFailureContext::from_settlement(primary, operation.as_str(), error),
+        )),
     }
 }
 
@@ -234,9 +249,7 @@ pub enum PreviewCaptureError {
     UnsupportedPlatform,
     InvalidHwnd,
     ForeignHwnd,
-    InvalidWindowState {
-        reason: &'static str,
-    },
+    InvalidWindowState { reason: &'static str },
     DeadlineExceeded,
     CaptureClosed,
     CaptureFailed(String),
@@ -244,65 +257,191 @@ pub enum PreviewCaptureError {
     PngFailed(String),
     OutputAlreadyExists,
     OutputFailed(String),
-    ForegroundChanged {
-        before: isize,
-        after: isize,
-    },
-    CleanupFailed {
-        primary: Box<Self>,
-        operation: &'static str,
-        secondary: Box<Self>,
-    },
+    ForegroundChanged { before: isize, after: isize },
+    CleanupFailed(CleanupFailureContext),
 }
 
-impl PreviewCaptureError {
-    pub fn with_cleanup_failure(self, operation: &'static str, secondary: Self) -> Self {
-        Self::CleanupFailed {
-            primary: Box::new(self),
+/// Opaque evidence that a capture failure and its cleanup failure were
+/// observed by the same bounded settlement operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupFailureContext {
+    primary: Box<PreviewCaptureError>,
+    operation: &'static str,
+    secondary: Box<PreviewCaptureError>,
+}
+
+impl CleanupFailureContext {
+    fn from_settlement(
+        primary: PreviewCaptureError,
+        operation: &'static str,
+        secondary: PreviewCaptureError,
+    ) -> Self {
+        Self {
+            primary: Box::new(primary),
             operation,
             secondary: Box::new(secondary),
+        }
+    }
+
+    pub fn primary(&self) -> &PreviewCaptureError {
+        &self.primary
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub fn secondary(&self) -> &PreviewCaptureError {
+        &self.secondary
+    }
+}
+
+struct BoundedDiagnostic {
+    rendered: String,
+    truncated: bool,
+}
+
+impl BoundedDiagnostic {
+    fn new() -> Self {
+        Self {
+            rendered: String::with_capacity(MAX_CLEANUP_DIAGNOSTIC_BYTES),
+            truncated: false,
+        }
+    }
+
+    fn truncate(&mut self) {
+        if self.truncated {
+            return;
+        }
+
+        let payload_limit =
+            MAX_CLEANUP_DIAGNOSTIC_BYTES.saturating_sub(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER.len());
+        let boundary = utf8_prefix_len(&self.rendered, payload_limit);
+        self.rendered.truncate(boundary);
+        self.rendered.push_str(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER);
+        self.truncated = true;
+    }
+
+    fn write_bounded_text(&mut self, value: &str) {
+        if self.truncated {
+            return;
+        }
+
+        let payload_available = MAX_CLEANUP_DIAGNOSTIC_BYTES
+            .saturating_sub(self.rendered.len())
+            .saturating_sub(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER.len());
+        if value.len() > payload_available {
+            let boundary = utf8_prefix_len(value, payload_available);
+            self.rendered.push_str(&value[..boundary]);
+            self.truncate();
+        } else {
+            self.rendered.push_str(value);
+        }
+    }
+}
+
+impl std::fmt::Write for BoundedDiagnostic {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.truncated || value.is_empty() {
+            return Ok(());
+        }
+
+        let available = MAX_CLEANUP_DIAGNOSTIC_BYTES.saturating_sub(self.rendered.len());
+        if value.len() <= available {
+            self.rendered.push_str(value);
+            return Ok(());
+        }
+
+        let payload_available = MAX_CLEANUP_DIAGNOSTIC_BYTES
+            .saturating_sub(self.rendered.len())
+            .saturating_sub(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER.len());
+        let boundary = utf8_prefix_len(value, payload_available);
+        self.rendered.push_str(&value[..boundary]);
+        self.truncate();
+        Ok(())
+    }
+}
+
+fn utf8_prefix_len(value: &str, max_bytes: usize) -> usize {
+    let mut boundary = value.len().min(max_bytes);
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn render_capture_error(
+    error: &PreviewCaptureError,
+    diagnostic: &mut BoundedDiagnostic,
+    depth: usize,
+) {
+    if diagnostic.truncated {
+        return;
+    }
+    if depth >= MAX_CLEANUP_DIAGNOSTIC_DEPTH {
+        diagnostic.truncate();
+        return;
+    }
+
+    match error {
+        PreviewCaptureError::UnsupportedPlatform => {
+            let _ =
+                diagnostic.write_str("a visible Windows desktop is required for native capture");
+        }
+        PreviewCaptureError::InvalidHwnd => {
+            let _ = diagnostic.write_str("the preview HWND is invalid or closed");
+        }
+        PreviewCaptureError::ForeignHwnd => {
+            let _ = diagnostic.write_str("the preview HWND is owned by another process");
+        }
+        PreviewCaptureError::InvalidWindowState { reason } => {
+            let _ = diagnostic.write_str("the preview HWND is unavailable: ");
+            diagnostic.write_bounded_text(reason);
+        }
+        PreviewCaptureError::DeadlineExceeded => {
+            let _ = diagnostic.write_str("no valid frame arrived before the fixed deadline");
+        }
+        PreviewCaptureError::CaptureClosed => {
+            let _ = diagnostic.write_str("the preview capture item closed before a frame arrived");
+        }
+        PreviewCaptureError::CaptureFailed(message) => {
+            let _ = diagnostic.write_str("Windows Graphics Capture failed: ");
+            diagnostic.write_bounded_text(message);
+        }
+        PreviewCaptureError::ApplicationFailed(message) => {
+            let _ = diagnostic.write_str("GPUI preview application failed: ");
+            diagnostic.write_bounded_text(message);
+        }
+        PreviewCaptureError::PngFailed(message) => {
+            let _ = diagnostic.write_str("PNG encoding failed: ");
+            diagnostic.write_bounded_text(message);
+        }
+        PreviewCaptureError::OutputAlreadyExists => {
+            let _ = diagnostic.write_str("refusing to overwrite an existing PNG output");
+        }
+        PreviewCaptureError::OutputFailed(message) => {
+            let _ = diagnostic.write_str("PNG output failed: ");
+            diagnostic.write_bounded_text(message);
+        }
+        PreviewCaptureError::ForegroundChanged { before, after } => {
+            let _ = write!(
+                diagnostic,
+                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
+            );
+        }
+        PreviewCaptureError::CleanupFailed(context) => {
+            render_capture_error(context.primary(), diagnostic, depth + 1);
+            let _ = write!(diagnostic, "; cleanup {} failed: ", context.operation());
+            render_capture_error(context.secondary(), diagnostic, depth + 1);
         }
     }
 }
 
 impl std::fmt::Display for PreviewCaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedPlatform => {
-                f.write_str("a visible Windows desktop is required for native capture")
-            }
-            Self::InvalidHwnd => f.write_str("the preview HWND is invalid or closed"),
-            Self::ForeignHwnd => f.write_str("the preview HWND is owned by another process"),
-            Self::InvalidWindowState { reason } => {
-                write!(f, "the preview HWND is unavailable: {reason}")
-            }
-            Self::DeadlineExceeded => {
-                f.write_str("no valid frame arrived before the fixed deadline")
-            }
-            Self::CaptureClosed => {
-                f.write_str("the preview capture item closed before a frame arrived")
-            }
-            Self::CaptureFailed(message) => {
-                write!(f, "Windows Graphics Capture failed: {message}")
-            }
-            Self::ApplicationFailed(message) => {
-                write!(f, "GPUI preview application failed: {message}")
-            }
-            Self::PngFailed(message) => write!(f, "PNG encoding failed: {message}"),
-            Self::OutputAlreadyExists => {
-                f.write_str("refusing to overwrite an existing PNG output")
-            }
-            Self::OutputFailed(message) => write!(f, "PNG output failed: {message}"),
-            Self::ForegroundChanged { before, after } => write!(
-                f,
-                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
-            ),
-            Self::CleanupFailed {
-                primary,
-                operation,
-                secondary,
-            } => write!(f, "{primary}; cleanup {operation} failed: {secondary}"),
-        }
+        let mut diagnostic = BoundedDiagnostic::new();
+        render_capture_error(self, &mut diagnostic, 0);
+        f.write_str(&diagnostic.rendered)
     }
 }
 
