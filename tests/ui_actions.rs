@@ -1,8 +1,8 @@
 use devmanager::client::action;
 use devmanager::domain::id::TaskId;
 use devmanager::ui::actions::{
-    self, ActionAvailability, DockTool, KeyboardAction, KeyboardModel, KeyboardShortcut,
-    ShortcutKey,
+    self, ActionAvailability, DockTool, KeyboardAction, KeyboardBinding, KeyboardModel,
+    KeyboardShortcut, ShortcutKey,
 };
 use devmanager::ui::components::{AccessibleRole, InteractionStateModel};
 use serde::Deserialize;
@@ -180,5 +180,31 @@ fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
         ),
         None,
         "Escape may bypass disabled state but never a stale focus epoch"
+    );
+}
+
+#[test]
+fn custom_dismiss_shortcut_cannot_bypass_disabled_or_loading() {
+    let shortcut = KeyboardShortcut::ctrl(ShortcutKey::Character('d'));
+    let model = KeyboardModel::new(vec![KeyboardBinding {
+        shortcut,
+        action: KeyboardAction::DismissTransient,
+    }])
+    .expect("custom shortcut is conflict-free");
+
+    let mut disabled = InteractionStateModel::default();
+    disabled.set_disabled(true);
+    assert_eq!(
+        model.activate(shortcut, &disabled, disabled.focus_epoch()),
+        None
+    );
+
+    let mut loading = InteractionStateModel::default();
+    loading
+        .set_loading(true)
+        .expect("control can enter loading");
+    assert_eq!(
+        model.activate(shortcut, &loading, loading.focus_epoch()),
+        None
     );
 }
