@@ -16,3 +16,6 @@ mod membership;
 
 #[path = "process_supervisor/registry.rs"]
 mod registry;
+
+#[path = "process_supervisor/teardown.rs"]
+mod teardown;

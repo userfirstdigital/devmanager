@@ -29,6 +29,7 @@ extern "system" {
         job_object_info_length: u32,
     ) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
     fn QueryInformationJobObject(
         job: *mut c_void,
         job_object_info_class: u32,
@@ -269,6 +270,30 @@ impl ManagedProcessJob {
         #[cfg(not(windows))]
         {
             Ok(Vec::new())
+        }
+    }
+
+    /// Explicitly terminates every current member of this owned Job Object.
+    ///
+    /// This is intentionally Job-scoped rather than PID-scoped. The Job,
+    /// completion port, and listener remain owned by this value until the
+    /// caller has observed the exact completion fence and authoritative empty
+    /// membership before releasing it.
+    pub fn terminate_tree(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if unsafe { TerminateJobObject(self.raw_job_handle(), 1) } == 0 {
+                return Err(format!(
+                    "TerminateJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            Err("Job Object termination is unavailable off Windows".to_string())
         }
     }
 

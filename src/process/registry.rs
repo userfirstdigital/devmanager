@@ -60,6 +60,11 @@ impl std::error::Error for ProcessDisplayLabelError {}
 pub trait JobMembership {
     fn active_process_ids(&self) -> Result<Vec<u32>, String>;
 
+    /// Terminate the owned Job tree, never a PID-selected process.
+    fn terminate_tree(&self) -> Result<(), String> {
+        Err("Job tree termination is unavailable for this membership".to_string())
+    }
+
     fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         Err(format!("process identity for PID {pid} is inaccessible"))
     }
@@ -76,6 +81,10 @@ pub trait JobMembership {
 impl JobMembership for crate::process::job::ManagedProcessJob {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         crate::process::job::ManagedProcessJob::active_process_ids(self)
+    }
+
+    fn terminate_tree(&self) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::terminate_tree(self)
     }
 
     fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
@@ -469,6 +478,14 @@ impl<J> ProcessRegistry<J> {
         self.current.len()
     }
 
+    /// Compare a full generation/owner/root fence against the current entry.
+    /// PID or resource ID alone is never sufficient for teardown authority.
+    pub fn exact_fence_matches(&self, fence: &ManagedProcessFence) -> bool {
+        self.current
+            .get(&fence.resource.resource_id)
+            .is_some_and(|current| ManagedProcessFence::from_process(current) == *fence)
+    }
+
     fn take_exact_in_state(
         &mut self,
         fence: &ManagedProcessFence,
@@ -654,6 +671,49 @@ impl<J: JobMembership> ProcessRegistry<J> {
             self.apply_job_completion(message);
         }
         count
+    }
+
+    /// Settle a previously observed ACTIVE_PROCESS_ZERO only after rechecking
+    /// the exact fence and querying the Job for authoritative empty membership.
+    ///
+    /// Ok(false) means the completion was not enough because the Job still has
+    /// members. The caller must keep the Job/completion handles alive and must
+    /// not call release_stopped_exact in that case.
+    pub fn settle_active_process_zero_exact(
+        &mut self,
+        fence: &ManagedProcessFence,
+    ) -> Result<bool, ProcessRegistryError> {
+        let resource_id = fence.resource.resource_id;
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        if ManagedProcessFence::from_process(current) != *fence {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+
+        let mut active_process_ids = current.job.active_process_ids().map_err(|detail| {
+            ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail,
+            }
+        })?;
+        active_process_ids.sort_unstable();
+        active_process_ids.dedup();
+        if !active_process_ids.is_empty() {
+            return Ok(false);
+        }
+
+        current.pending_zero_prior_state = None;
+        current.known_members.clear();
+        current.unknown_member_pids.clear();
+        current.state = ManagedProcessState::Stopped;
+        Ok(true)
     }
 
     pub fn apply_job_completion(&mut self, message: JobCompletionMessage) -> bool {
