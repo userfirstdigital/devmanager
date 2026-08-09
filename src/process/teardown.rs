@@ -7,12 +7,14 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tokio::runtime::Handle;
-use tokio::sync::{watch, Semaphore};
+use futures_util::FutureExt;
+use tokio::sync::watch;
 
 use crate::domain::id::{OperationId, ResourceId, TaskId};
 use crate::process::identity::ProcessOwner;
@@ -20,6 +22,7 @@ use crate::process::registry::ManagedProcessFence;
 
 pub const DEFAULT_CONFIGURED_CAPACITY: usize = 4;
 pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
+pub const DEFAULT_EXECUTOR_QUEUE_CAPACITY: usize = 256;
 
 /// A boxed asynchronous operation used by the pure runtime seams.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -166,6 +169,15 @@ pub trait TeardownAdmission: Send + Sync + 'static {
         &self,
         ticket: &TeardownTicket,
     ) -> Result<AdmissionReceipt, TeardownAdmissionError>;
+
+    /// Atomically closes a complete scope before any branch is scheduled.
+    ///
+    /// Implementations must validate every ticket and receipt before changing
+    /// any admission state. A failure therefore leaves the whole batch open.
+    fn close_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+    ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -329,6 +341,7 @@ const MAX_RESIDUE_STAGES: usize = 32;
 const UNAVAILABLE_JOB_IDENTITY: &str = "<unavailable: managed Job identity>";
 const UNAVAILABLE_ROOT_EXECUTABLE: &str = "<unavailable: root executable>";
 const UNAVAILABLE_ROOT_COMMAND: &str = "<unavailable: root command>";
+const UNAVAILABLE_LIFECYCLE_EVENT: &str = "<unavailable: lifecycle event>";
 
 fn sanitize_text(value: &str) -> String {
     let normalized: String = value
@@ -341,28 +354,84 @@ fn sanitize_text(value: &str) -> String {
             }
         })
         .collect();
-    let redacted = normalized
-        .split_whitespace()
-        .map(|part| {
-            let Some((key, _)) = part.split_once('=') else {
-                return part.to_string();
-            };
-            let lower = key.trim_start_matches('-').to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "token" | "password" | "passwd" | "secret" | "api_key" | "apikey" | "authorization"
-            ) || lower.ends_with("_token")
-                || lower.ends_with("_password")
-                || lower.ends_with("_secret")
-            {
-                format!("{key}=<redacted>")
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    let mut redacted = Vec::with_capacity(parts.len());
+    let mut index = 0usize;
+    while index < parts.len() {
+        let part = parts[index];
+        if let Some((key, value)) = part.split_once('=') {
+            if is_sensitive_key(key) {
+                redacted.push(format!("{key}=<redacted>"));
+                index += 1;
+                if key
+                    .trim_start_matches('-')
+                    .trim_end_matches(':')
+                    .eq_ignore_ascii_case("authorization")
+                    && value.eq_ignore_ascii_case("bearer")
+                    && index < parts.len()
+                {
+                    index += 1;
+                }
             } else {
-                part.to_string()
+                redacted.push(part.to_string());
+                index += 1;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+            continue;
+        }
+
+        let key = part.trim_start_matches('-');
+        if is_sensitive_key(key) {
+            redacted.push(part.to_string());
+            redacted.push("<redacted>".to_string());
+            index += 1;
+            if index < parts.len()
+                && key
+                    .trim_end_matches(':')
+                    .eq_ignore_ascii_case("authorization")
+            {
+                if parts[index].eq_ignore_ascii_case("bearer") {
+                    index += 1;
+                    if index < parts.len() {
+                        index += 1;
+                    }
+                } else if parts[index] != "<redacted>" {
+                    index += 1;
+                }
+            } else if index < parts.len() && parts[index] != "<redacted>" {
+                index += 1;
+            } else if index < parts.len() {
+                index += 1;
+            }
+            continue;
+        }
+
+        redacted.push(part.to_string());
+        index += 1;
+    }
+    let redacted = redacted.join(" ");
     truncate_utf8(redacted, MAX_EVIDENCE_TEXT_BYTES)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key
+        .trim_start_matches('-')
+        .trim_end_matches(':')
+        .to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "token" | "password" | "passwd" | "secret" | "api_key" | "apikey" | "authorization"
+    ) || lower.ends_with("_token")
+        || lower.ends_with("_password")
+        || lower.ends_with("_secret")
+}
+
+fn sanitized_or_marker(value: &str, marker: &str) -> String {
+    let sanitized = sanitize_text(value);
+    if sanitized.is_empty() {
+        marker.to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
@@ -400,12 +469,15 @@ impl ResidueEvidence {
         attempted_stages: Vec<TeardownStage>,
     ) -> Self {
         Self {
-            job_name: sanitize_text(job_name.as_ref()),
+            job_name: sanitized_or_marker(job_name.as_ref(), UNAVAILABLE_JOB_IDENTITY),
             pid,
             creation_time_100ns,
-            executable: sanitize_text(executable.as_ref()),
-            command_label: sanitize_text(command_label.as_ref()),
-            last_lifecycle_event: sanitize_text(last_lifecycle_event.as_ref()),
+            executable: sanitized_or_marker(executable.as_ref(), UNAVAILABLE_ROOT_EXECUTABLE),
+            command_label: sanitized_or_marker(command_label.as_ref(), UNAVAILABLE_ROOT_COMMAND),
+            last_lifecycle_event: sanitized_or_marker(
+                last_lifecycle_event.as_ref(),
+                UNAVAILABLE_LIFECYCLE_EVENT,
+            ),
             attempted_stages: attempted_stages
                 .into_iter()
                 .take(MAX_RESIDUE_STAGES)
@@ -498,6 +570,14 @@ impl TeardownReport {
     fn with_handoff_error(mut self, detail: String) -> Self {
         self.errors.push(detail);
         self.outcome = TeardownOutcome::CleanupFailed;
+        let residue = self.residue.take();
+        self.residue = required_residue(
+            &self.ticket,
+            &self.attempted_stages,
+            &self.errors,
+            self.outcome,
+            residue,
+        );
         self
     }
 }
@@ -534,7 +614,11 @@ impl TeardownCompletionKey {
 pub trait TeardownCompletionStore: Send + Sync + 'static {
     fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String>;
 
-    fn persist(&self, key: &TeardownCompletionKey, report: &TeardownReport) -> Result<(), String>;
+    fn persist<'a>(
+        &'a self,
+        key: &'a TeardownCompletionKey,
+        report: &'a TeardownReport,
+    ) -> BoxFuture<'a, Result<(), String>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +628,7 @@ pub enum TeardownReject {
     FenceMismatch,
     CompletionJournalFull,
     CompletionLookupFailed { detail: String },
+    ExecutorClosed,
     NoMatchingCleanup,
     Admission(TeardownAdmissionError),
 }
@@ -564,14 +649,16 @@ impl From<TeardownAdmissionError> for TeardownReject {
 struct CleanupCell {
     result: Mutex<Option<TeardownReport>>,
     done: watch::Sender<bool>,
+    fallback: TeardownReport,
 }
 
 impl CleanupCell {
-    fn new() -> Self {
+    fn new(ticket: &TeardownTicket) -> Self {
         let (done, _receiver) = watch::channel(false);
         Self {
             result: Mutex::new(None),
             done,
+            fallback: waiter_failure_report(ticket.clone(), "teardown waiter channel closed"),
         }
     }
 
@@ -594,7 +681,11 @@ impl CleanupCell {
             {
                 return report;
             }
-            let _ = done.changed().await;
+            if done.changed().await.is_err() {
+                let fallback = self.fallback.clone();
+                self.finish(fallback.clone());
+                return fallback;
+            }
         }
     }
 }
@@ -651,7 +742,236 @@ struct CompletedCleanup {
 struct CoordinatorState {
     active: Vec<ActiveCleanup>,
     completed: VecDeque<CompletedCleanup>,
-    handoff_failed: bool,
+}
+
+struct CleanupWork {
+    ticket: TeardownTicket,
+    key: TeardownCompletionKey,
+    cell: Arc<CleanupCell>,
+    effects: Arc<dyn TeardownEffects>,
+    clock: Arc<dyn TeardownClock>,
+    budgets: TeardownBudgets,
+    state: Arc<Mutex<CoordinatorState>>,
+    completion_store: Arc<dyn TeardownCompletionStore>,
+    completed_operation_capacity: usize,
+}
+
+struct ExecutorQueueState {
+    queue: VecDeque<CleanupWork>,
+    occupied: usize,
+    closed: bool,
+}
+
+struct TeardownExecutorInner {
+    state: Mutex<ExecutorQueueState>,
+    changed: Condvar,
+    worker_capacity: usize,
+    queue_capacity: usize,
+}
+
+struct TeardownExecutor {
+    inner: Arc<TeardownExecutorInner>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct ExecutorReservation {
+    inner: Arc<TeardownExecutorInner>,
+    remaining: usize,
+}
+
+impl TeardownExecutor {
+    fn new(worker_capacity: usize, queue_capacity: usize) -> Self {
+        let inner = Arc::new(TeardownExecutorInner {
+            state: Mutex::new(ExecutorQueueState {
+                queue: VecDeque::with_capacity(queue_capacity),
+                occupied: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+            worker_capacity,
+            queue_capacity,
+        });
+        let mut workers = Vec::with_capacity(worker_capacity);
+        for index in 0..worker_capacity {
+            let worker_inner = Arc::clone(&inner);
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("devmanager-teardown-worker-{index}"))
+                    .spawn(move || teardown_worker(worker_inner))
+                    .expect("spawn bounded teardown worker"),
+            );
+        }
+        Self {
+            inner,
+            workers: Mutex::new(workers),
+        }
+    }
+
+    fn reserve_many(&self, count: usize) -> Result<ExecutorReservation, TeardownReject> {
+        if count == 0 {
+            return Ok(ExecutorReservation {
+                inner: Arc::clone(&self.inner),
+                remaining: 0,
+            });
+        }
+        if count > self.inner.queue_capacity {
+            return Err(TeardownReject::CompletionJournalFull);
+        }
+        let capacity = self
+            .inner
+            .worker_capacity
+            .saturating_add(self.inner.queue_capacity);
+        if count > capacity {
+            return Err(TeardownReject::CompletionJournalFull);
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("teardown executor state mutex poisoned");
+        loop {
+            if state.closed {
+                return Err(TeardownReject::ExecutorClosed);
+            }
+            if count <= capacity.saturating_sub(state.occupied) {
+                state.occupied += count;
+                return Ok(ExecutorReservation {
+                    inner: Arc::clone(&self.inner),
+                    remaining: count,
+                });
+            }
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .expect("teardown executor state mutex poisoned");
+        }
+    }
+}
+
+impl Drop for TeardownExecutor {
+    fn drop(&mut self) {
+        let queued = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("teardown executor state mutex poisoned");
+            state.closed = true;
+            let queued: Vec<_> = state.queue.drain(..).collect();
+            state.occupied = state.occupied.saturating_sub(queued.len());
+            self.inner.changed.notify_all();
+            queued
+        };
+        for work in queued {
+            cancel_queued_cleanup(work);
+        }
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("teardown worker handles mutex poisoned");
+        for worker in workers.drain(..) {
+            worker.join().expect("bounded teardown worker panicked");
+        }
+    }
+}
+
+fn cancel_queued_cleanup(work: CleanupWork) {
+    let CleanupWork {
+        ticket,
+        key,
+        cell,
+        state,
+        ..
+    } = work;
+    cell.finish(waiter_failure_report(
+        ticket,
+        "teardown executor shut down before cleanup started",
+    ));
+    state
+        .lock()
+        .expect("teardown coordinator state mutex poisoned")
+        .active
+        .retain(|active| active.key != key);
+}
+
+impl ExecutorReservation {
+    fn submit(&mut self, work: CleanupWork) -> Result<(), CleanupWork> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("teardown executor state mutex poisoned");
+        loop {
+            if state.closed {
+                return Err(work);
+            }
+            if state.queue.len() < self.inner.queue_capacity {
+                state.queue.push_back(work);
+                self.remaining = self.remaining.saturating_sub(1);
+                self.inner.changed.notify_all();
+                return Ok(());
+            }
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .expect("teardown executor state mutex poisoned");
+        }
+    }
+}
+
+impl Drop for ExecutorReservation {
+    fn drop(&mut self) {
+        if self.remaining == 0 {
+            return;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("teardown executor state mutex poisoned");
+        state.occupied = state.occupied.saturating_sub(self.remaining);
+        self.inner.changed.notify_all();
+    }
+}
+
+fn teardown_worker(inner: Arc<TeardownExecutorInner>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("teardown worker runtime");
+    loop {
+        let work = {
+            let mut state = inner
+                .state
+                .lock()
+                .expect("teardown executor state mutex poisoned");
+            loop {
+                if let Some(work) = state.queue.pop_front() {
+                    inner.changed.notify_all();
+                    break Some(work);
+                }
+                if state.closed {
+                    break None;
+                }
+                state = inner
+                    .changed
+                    .wait(state)
+                    .expect("teardown executor state mutex poisoned");
+            }
+        };
+        let Some(work) = work else {
+            return;
+        };
+        runtime.block_on(run_cleanup(work));
+        let mut state = inner
+            .state
+            .lock()
+            .expect("teardown executor state mutex poisoned");
+        state.occupied = state.occupied.saturating_sub(1);
+        inner.changed.notify_all();
+    }
 }
 
 pub struct TeardownCoordinator {
@@ -659,11 +979,12 @@ pub struct TeardownCoordinator {
     effects: Arc<dyn TeardownEffects>,
     clock: Arc<dyn TeardownClock>,
     budgets: TeardownBudgets,
-    semaphore: Arc<Semaphore>,
     configured_capacity: usize,
     completed_operation_capacity: usize,
     completion_store: Arc<dyn TeardownCompletionStore>,
     state: Arc<Mutex<CoordinatorState>>,
+    admission_serial: Mutex<()>,
+    executor: TeardownExecutor,
 }
 
 impl TeardownCoordinator {
@@ -735,11 +1056,12 @@ impl TeardownCoordinator {
             effects,
             clock,
             budgets,
-            semaphore: Arc::new(Semaphore::new(configured_capacity)),
             configured_capacity,
             completed_operation_capacity,
             completion_store,
             state: Arc::new(Mutex::new(CoordinatorState::default())),
+            admission_serial: Mutex::new(()),
+            executor: TeardownExecutor::new(configured_capacity, DEFAULT_EXECUTOR_QUEUE_CAPACITY),
         }
     }
 
@@ -764,58 +1086,50 @@ impl TeardownCoordinator {
     }
 
     pub fn request(&self, ticket: TeardownTicket) -> Result<TeardownWaiter, TeardownReject> {
+        let _admission_serial = self
+            .admission_serial
+            .lock()
+            .expect("teardown admission serial mutex poisoned");
         let key = completion_key(&ticket);
-        let cell = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("teardown coordinator state mutex poisoned");
-            if let Some(existing) = state.active.iter().find(|existing| existing.key == key) {
-                return Ok(TeardownWaiter {
-                    cell: Arc::clone(&existing.cell),
-                });
-            }
-            if let Some(existing) = state.completed.iter().find(|existing| existing.key == key) {
-                return Ok(TeardownWaiter {
-                    cell: Arc::clone(&existing.cell),
-                });
-            }
-            if state.handoff_failed {
-                return Err(TeardownReject::CompletionLookupFailed {
-                    detail: "completed teardown handoff is unavailable".to_string(),
-                });
-            }
-            match self.completion_store.lookup(&key) {
-                Ok(Some(report)) => {
-                    if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
-                        return Err(TeardownReject::CompletionLookupFailed {
-                            detail: "completion store returned a mismatched report".to_string(),
-                        });
-                    }
-                    let cell = Arc::new(CleanupCell::new());
-                    cell.finish(report);
-                    return Ok(TeardownWaiter { cell });
-                }
-                Ok(None) => {}
-                Err(detail) => {
-                    return Err(TeardownReject::CompletionLookupFailed { detail });
-                }
-            }
+        if let Some(waiter) = self.find_existing_waiter(&key) {
+            return Ok(waiter);
+        }
+        if let Some(waiter) = self.lookup_completed(&ticket, &key)? {
+            return Ok(waiter);
+        }
 
-            let receipt = self
-                .admission
-                .close_admission(&ticket)
-                .map_err(TeardownReject::from)?;
-            validate_receipt(&ticket, &receipt)?;
-            let cell = Arc::new(CleanupCell::new());
-            state.active.push(ActiveCleanup {
+        let mut reservation = self.executor.reserve_many(1)?;
+        let receipts = self
+            .admission
+            .close_admission_batch(std::slice::from_ref(&ticket))
+            .map_err(TeardownReject::from)?;
+        if receipts.len() != 1 {
+            return Err(TeardownReject::Admission(TeardownAdmissionError::Other {
+                detail: "admission returned an invalid single-ticket receipt batch".to_string(),
+            }));
+        }
+        let receipt =
+            receipts
+                .first()
+                .ok_or(TeardownReject::Admission(TeardownAdmissionError::Other {
+                    detail: "admission returned no receipt".to_string(),
+                }))?;
+        validate_receipt(&ticket, receipt)?;
+
+        let cell = Arc::new(CleanupCell::new(&ticket));
+        self.state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned")
+            .active
+            .push(ActiveCleanup {
                 key: key.clone(),
                 cell: Arc::clone(&cell),
             });
-            cell
-        };
-
-        self.spawn_owned_cleanup(ticket, key, Arc::clone(&cell));
+        let work = self.cleanup_work(ticket, key.clone(), Arc::clone(&cell));
+        if reservation.submit(work).is_err() {
+            self.remove_active(&key);
+            return Err(TeardownReject::ExecutorClosed);
+        }
         Ok(TeardownWaiter { cell })
     }
 
@@ -829,36 +1143,16 @@ impl TeardownCoordinator {
         action_epoch: u64,
         fence: &ManagedProcessFence,
     ) -> Result<TeardownWaiter, TeardownReject> {
-        let key = TeardownCompletionKey::new(action_epoch, fence.clone());
-        let state = self
-            .state
+        let _admission_serial = self
+            .admission_serial
             .lock()
-            .expect("teardown coordinator state mutex poisoned");
-        if let Some(existing) = state.active.iter().find(|existing| existing.key == key) {
-            return Ok(TeardownWaiter {
-                cell: Arc::clone(&existing.cell),
-            });
+            .expect("teardown admission serial mutex poisoned");
+        let key = TeardownCompletionKey::new(action_epoch, fence.clone());
+        if let Some(waiter) = self.find_existing_waiter(&key) {
+            return Ok(waiter);
         }
-        if let Some(existing) = state.completed.iter().find(|existing| existing.key == key) {
-            return Ok(TeardownWaiter {
-                cell: Arc::clone(&existing.cell),
-            });
-        }
-        match self.completion_store.lookup(&key) {
-            Ok(Some(report)) => {
-                if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
-                    return Err(TeardownReject::CompletionLookupFailed {
-                        detail: "completion store returned a mismatched report".to_string(),
-                    });
-                }
-                let cell = Arc::new(CleanupCell::new());
-                cell.finish(report);
-                return Ok(TeardownWaiter { cell });
-            }
-            Ok(None) => {}
-            Err(detail) => {
-                return Err(TeardownReject::CompletionLookupFailed { detail });
-            }
+        if let Some(waiter) = self.lookup_completed_by_key(&key)? {
+            return Ok(waiter);
         }
         Err(TeardownReject::NoMatchingCleanup)
     }
@@ -867,58 +1161,171 @@ impl TeardownCoordinator {
         &self,
         tickets: Vec<TeardownTicket>,
     ) -> Result<TeardownBatchWaiter, TeardownReject> {
+        let _admission_serial = self
+            .admission_serial
+            .lock()
+            .expect("teardown admission serial mutex poisoned");
         let mut waiters = Vec::with_capacity(tickets.len());
+        let mut fresh = Vec::new();
+        let mut fresh_duplicates = Vec::new();
         for ticket in tickets {
-            waiters.push(self.request(ticket)?);
+            let key = completion_key(&ticket);
+            if let Some(waiter) = self.find_existing_waiter(&key) {
+                waiters.push(waiter);
+            } else if let Some(waiter) = self.lookup_completed(&ticket, &key)? {
+                waiters.push(waiter);
+            } else if fresh.iter().any(|(fresh_key, _)| fresh_key == &key) {
+                fresh_duplicates.push(key);
+            } else {
+                fresh.push((key, ticket));
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(TeardownBatchWaiter { waiters });
+        }
+
+        let mut reservation = self.executor.reserve_many(fresh.len())?;
+        let fresh_tickets: Vec<TeardownTicket> =
+            fresh.iter().map(|(_, ticket)| ticket.clone()).collect();
+        let receipts = self
+            .admission
+            .close_admission_batch(&fresh_tickets)
+            .map_err(TeardownReject::from)?;
+        if receipts.len() != fresh.len() {
+            return Err(TeardownReject::Admission(TeardownAdmissionError::Other {
+                detail: "admission returned an incomplete receipt batch".to_string(),
+            }));
+        }
+        for ((_, ticket), receipt) in fresh.iter().zip(receipts.iter()) {
+            validate_receipt(ticket, receipt)?;
+        }
+
+        let mut works = Vec::with_capacity(fresh.len());
+        let mut created = Vec::with_capacity(fresh.len());
+        for (key, ticket) in fresh {
+            let cell = Arc::new(CleanupCell::new(&ticket));
+            self.state
+                .lock()
+                .expect("teardown coordinator state mutex poisoned")
+                .active
+                .push(ActiveCleanup {
+                    key: key.clone(),
+                    cell: Arc::clone(&cell),
+                });
+            waiters.push(TeardownWaiter {
+                cell: Arc::clone(&cell),
+            });
+            created.push((key.clone(), Arc::clone(&cell)));
+            works.push(self.cleanup_work(ticket, key, cell));
+        }
+        for key in fresh_duplicates {
+            if let Some((_, cell)) = created.iter().find(|(created_key, _)| *created_key == key) {
+                waiters.push(TeardownWaiter {
+                    cell: Arc::clone(cell),
+                });
+            }
+        }
+        for work in works {
+            if reservation.submit(work).is_err() {
+                return Err(TeardownReject::ExecutorClosed);
+            }
         }
         Ok(TeardownBatchWaiter { waiters })
     }
 
-    fn spawn_owned_cleanup(
+    fn cleanup_work(
         &self,
         ticket: TeardownTicket,
         key: TeardownCompletionKey,
         cell: Arc<CleanupCell>,
-    ) {
-        let effects = Arc::clone(&self.effects);
-        let clock = Arc::clone(&self.clock);
-        let semaphore = Arc::clone(&self.semaphore);
-        let state = Arc::clone(&self.state);
-        let completion_store = self.completion_store.clone();
-        let completed_operation_capacity = self.completed_operation_capacity;
-        let budgets = self.budgets;
-        let task = async move {
-            let permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("teardown semaphore remains open for coordinator lifetime");
-            let report = execute_cleanup(ticket, effects, clock, budgets).await;
-            drop(permit);
-            let report = handoff_completed_cleanup(
-                &state,
-                completion_store,
-                completed_operation_capacity,
-                key,
-                Arc::clone(&cell),
-                report,
-            );
-            cell.finish(report);
-        };
-
-        if let Ok(handle) = Handle::try_current() {
-            std::mem::drop(handle.spawn(task));
-        } else {
-            std::thread::Builder::new()
-                .name("devmanager-teardown".to_string())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("teardown worker runtime");
-                    runtime.block_on(task);
-                })
-                .expect("spawn teardown worker");
+    ) -> CleanupWork {
+        CleanupWork {
+            ticket,
+            key,
+            cell,
+            effects: Arc::clone(&self.effects),
+            clock: Arc::clone(&self.clock),
+            budgets: self.budgets,
+            state: Arc::clone(&self.state),
+            completion_store: Arc::clone(&self.completion_store),
+            completed_operation_capacity: self.completed_operation_capacity,
         }
+    }
+
+    fn find_existing_waiter(&self, key: &TeardownCompletionKey) -> Option<TeardownWaiter> {
+        let state = self
+            .state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned");
+        if let Some(existing) = state.active.iter().find(|existing| existing.key == *key) {
+            return Some(TeardownWaiter {
+                cell: Arc::clone(&existing.cell),
+            });
+        }
+        state
+            .completed
+            .iter()
+            .find(|existing| existing.key == *key)
+            .map(|existing| TeardownWaiter {
+                cell: Arc::clone(&existing.cell),
+            })
+    }
+
+    fn lookup_completed(
+        &self,
+        ticket: &TeardownTicket,
+        key: &TeardownCompletionKey,
+    ) -> Result<Option<TeardownWaiter>, TeardownReject> {
+        self.lookup_completed_by_key_with_ticket(key, ticket)
+    }
+
+    fn lookup_completed_by_key(
+        &self,
+        key: &TeardownCompletionKey,
+    ) -> Result<Option<TeardownWaiter>, TeardownReject> {
+        match self.completion_store.lookup(key) {
+            Ok(Some(report)) => {
+                if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
+                    return Err(TeardownReject::CompletionLookupFailed {
+                        detail: "completion store returned a mismatched report".to_string(),
+                    });
+                }
+                let cell = Arc::new(CleanupCell::new(&report.ticket));
+                cell.finish(report);
+                Ok(Some(TeardownWaiter { cell }))
+            }
+            Ok(None) => Ok(None),
+            Err(detail) => Err(TeardownReject::CompletionLookupFailed { detail }),
+        }
+    }
+
+    fn lookup_completed_by_key_with_ticket(
+        &self,
+        key: &TeardownCompletionKey,
+        ticket: &TeardownTicket,
+    ) -> Result<Option<TeardownWaiter>, TeardownReject> {
+        match self.completion_store.lookup(key) {
+            Ok(Some(report)) => {
+                if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
+                    return Err(TeardownReject::CompletionLookupFailed {
+                        detail: "completion store returned a mismatched report".to_string(),
+                    });
+                }
+                let cell = Arc::new(CleanupCell::new(ticket));
+                cell.finish(report);
+                Ok(Some(TeardownWaiter { cell }))
+            }
+            Ok(None) => Ok(None),
+            Err(detail) => Err(TeardownReject::CompletionLookupFailed { detail }),
+        }
+    }
+
+    fn remove_active(&self, key: &TeardownCompletionKey) {
+        self.state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned")
+            .active
+            .retain(|active| active.key != *key);
     }
 }
 
@@ -926,34 +1333,120 @@ fn completion_key(ticket: &TeardownTicket) -> TeardownCompletionKey {
     TeardownCompletionKey::new(ticket.action_epoch(), ticket.fence().clone())
 }
 
-fn handoff_completed_cleanup(
+async fn run_cleanup(work: CleanupWork) {
+    let CleanupWork {
+        ticket,
+        key,
+        cell,
+        effects,
+        clock,
+        budgets,
+        state,
+        completion_store,
+        completed_operation_capacity,
+    } = work;
+    let fallback_ticket = ticket.clone();
+    let report = match AssertUnwindSafe(execute_cleanup(ticket, effects, clock, budgets))
+        .catch_unwind()
+        .await
+    {
+        Ok(report) => report,
+        Err(payload) => panic_report(
+            fallback_ticket,
+            format!("teardown worker panicked: {}", panic_detail(payload),),
+        ),
+    };
+    let original_report = report.clone();
+    let handoff = AssertUnwindSafe(handoff_completed_cleanup(
+        &state,
+        completion_store,
+        completed_operation_capacity,
+        key.clone(),
+        Arc::clone(&cell),
+        report,
+        budgets.termination,
+    ))
+    .catch_unwind()
+    .await;
+    let report = match handoff {
+        Ok(report) => report,
+        Err(payload) => {
+            let report = original_report.with_handoff_error(format!(
+                "completed teardown handoff panicked: {}",
+                panic_detail(payload),
+            ));
+            retain_completed_cleanup(&state, completed_operation_capacity, key, Arc::clone(&cell));
+            report
+        }
+    };
+    cell.finish(report);
+}
+
+async fn persist_completion(
+    completion_store: &Arc<dyn TeardownCompletionStore>,
+    key: &TeardownCompletionKey,
+    report: &TeardownReport,
+    budget: Duration,
+) -> Result<(), String> {
+    let future =
+        std::panic::catch_unwind(AssertUnwindSafe(|| completion_store.persist(key, report)))
+            .map_err(|payload| {
+                format!("completion persistence panicked: {}", panic_detail(payload))
+            })?;
+    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => Err(format!(
+            "completion persistence panicked: {}",
+            panic_detail(payload)
+        )),
+        Err(_) => Err(format!(
+            "completion persistence timed out after {:?}",
+            budget
+        )),
+    }
+}
+
+async fn handoff_completed_cleanup(
     state: &Arc<Mutex<CoordinatorState>>,
     completion_store: Arc<dyn TeardownCompletionStore>,
     completed_operation_capacity: usize,
     key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
     report: TeardownReport,
+    persistence_budget: Duration,
 ) -> TeardownReport {
-    if let Err(detail) = completion_store.persist(&key, &report) {
-        state
-            .lock()
-            .expect("teardown coordinator state mutex poisoned")
-            .handoff_failed = true;
-        return report.with_handoff_error(format!(
+    if let Err(detail) =
+        persist_completion(&completion_store, &key, &report, persistence_budget).await
+    {
+        let report = report.with_handoff_error(format!(
             "completed teardown handoff failed: {}",
             sanitize_text(&detail)
         ));
+        retain_completed_cleanup(state, completed_operation_capacity, key, cell);
+        return report;
     }
 
+    retain_completed_cleanup(state, completed_operation_capacity, key, cell);
+    report
+}
+
+fn retain_completed_cleanup(
+    state: &Arc<Mutex<CoordinatorState>>,
+    completed_operation_capacity: usize,
+    key: TeardownCompletionKey,
+    cell: Arc<CleanupCell>,
+) {
     let mut state = state
         .lock()
         .expect("teardown coordinator state mutex poisoned");
+    state.active.retain(|active| active.key != key);
+    if state.completed.iter().any(|completed| completed.key == key) {
+        return;
+    }
     if state.completed.len() >= completed_operation_capacity {
         state.completed.pop_front();
     }
-    state.active.retain(|active| active.key != key);
     state.completed.push_back(CompletedCleanup { key, cell });
-    report
 }
 
 fn validate_receipt(
@@ -986,105 +1479,200 @@ async fn execute_cleanup(
 
     attempted_stages.push(TeardownStage::Drain);
     collect_stage_result(
-        effects.drain(&ticket).await,
+        bounded_stage(
+            TeardownStage::Drain,
+            budgets.cooperative_grace,
+            effects.drain(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::Drain,
     );
 
     attempted_stages.push(TeardownStage::CooperativeClose);
     collect_stage_result(
-        effects.cooperative_close(&ticket).await,
+        bounded_stage(
+            TeardownStage::CooperativeClose,
+            budgets.cooperative_grace,
+            effects.cooperative_close(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::CooperativeClose,
     );
 
     attempted_stages.push(TeardownStage::CooperativeWait);
-    let cooperative = effects
-        .wait_for_zero(
+    let cooperative = bounded_wait(
+        TeardownStage::CooperativeWait,
+        budgets.cooperative_grace,
+        effects.wait_for_zero(
             &ticket,
             WaitStage::CooperativeGrace,
             clock.deadline(budgets.cooperative_grace),
-        )
-        .await;
+        ),
+    )
+    .await;
     if try_settle_after_wait(
         &ticket,
         cooperative,
         &effects,
+        budgets.termination,
         &mut attempted_stages,
         &mut errors,
     )
     .await
     {
-        return settle_after_zero(ticket, effects, attempted_stages, errors).await;
+        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
     }
 
     attempted_stages.push(TeardownStage::InterruptOrSafeClose);
     collect_stage_result(
-        effects.interrupt_or_safe_close(&ticket).await,
+        bounded_stage(
+            TeardownStage::InterruptOrSafeClose,
+            budgets.interrupt_grace,
+            effects.interrupt_or_safe_close(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::InterruptOrSafeClose,
     );
 
     attempted_stages.push(TeardownStage::InterruptWait);
-    let interrupted = effects
-        .wait_for_zero(
+    let interrupted = bounded_wait(
+        TeardownStage::InterruptWait,
+        budgets.interrupt_grace,
+        effects.wait_for_zero(
             &ticket,
             WaitStage::InterruptGrace,
             clock.deadline(budgets.interrupt_grace),
-        )
-        .await;
+        ),
+    )
+    .await;
     if try_settle_after_wait(
         &ticket,
         interrupted,
         &effects,
+        budgets.termination,
         &mut attempted_stages,
         &mut errors,
     )
     .await
     {
-        return settle_after_zero(ticket, effects, attempted_stages, errors).await;
+        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
     }
 
     attempted_stages.push(TeardownStage::TerminateTree);
     collect_stage_result(
-        effects.terminate_tree(&ticket).await,
+        bounded_stage(
+            TeardownStage::TerminateTree,
+            budgets.termination,
+            effects.terminate_tree(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::TerminateTree,
     );
 
     attempted_stages.push(TeardownStage::TerminationWait);
-    let terminated = effects
-        .wait_for_zero(
+    let terminated = bounded_wait(
+        TeardownStage::TerminationWait,
+        budgets.termination,
+        effects.wait_for_zero(
             &ticket,
             WaitStage::Termination,
             clock.deadline(budgets.termination),
-        )
-        .await;
+        ),
+    )
+    .await;
     if try_settle_after_wait(
         &ticket,
         terminated,
         &effects,
+        budgets.termination,
         &mut attempted_stages,
         &mut errors,
     )
     .await
     {
-        return settle_after_zero(ticket, effects, attempted_stages, errors).await;
+        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
     }
 
+    let adapter_residue =
+        bounded_residue(&effects, &ticket, budgets.termination, &mut errors).await;
+    let outcome = if errors.is_empty() {
+        TeardownOutcome::Leaked
+    } else {
+        TeardownOutcome::CleanupFailed
+    };
     let residue = required_residue(
         &ticket,
         &attempted_stages,
         &errors,
-        TeardownOutcome::Leaked,
-        effects.residue(&ticket).await,
+        outcome,
+        adapter_residue,
     );
     TeardownReport {
         ticket,
-        outcome: TeardownOutcome::Leaked,
+        outcome,
         attempted_stages,
         errors,
         residue,
+    }
+}
+
+async fn bounded_stage(
+    stage: TeardownStage,
+    budget: Duration,
+    future: BoxFuture<'_, StageResult>,
+) -> StageResult {
+    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => StageResult::Failed {
+            detail: format!("{stage:?} panic: {}", panic_detail(payload)),
+        },
+        Err(_) => StageResult::Failed {
+            detail: format!("{stage:?} timeout after {budget:?}"),
+        },
+    }
+}
+
+async fn bounded_wait(
+    stage: TeardownStage,
+    budget: Duration,
+    future: BoxFuture<'_, WaitResult>,
+) -> WaitResult {
+    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => WaitResult::Failed {
+            detail: format!("{stage:?} panic: {}", panic_detail(payload)),
+        },
+        Err(_) => WaitResult::Failed {
+            detail: format!("{stage:?} timeout after {budget:?}"),
+        },
+    }
+}
+
+async fn bounded_residue(
+    effects: &Arc<dyn TeardownEffects>,
+    ticket: &TeardownTicket,
+    budget: Duration,
+    errors: &mut Vec<String>,
+) -> Option<ResidueEvidence> {
+    match tokio::time::timeout(
+        budget,
+        AssertUnwindSafe(effects.residue(ticket)).catch_unwind(),
+    )
+    .await
+    {
+        Ok(Ok(residue)) => residue,
+        Ok(Err(payload)) => {
+            errors.push(format!("Residue: panic: {}", panic_detail(payload)));
+            None
+        }
+        Err(_) => {
+            errors.push(format!("Residue: timeout after {budget:?}"));
+            None
+        }
     }
 }
 
@@ -1098,13 +1686,20 @@ async fn try_settle_after_wait(
     ticket: &TeardownTicket,
     result: WaitResult,
     effects: &Arc<dyn TeardownEffects>,
+    budget: Duration,
     attempted_stages: &mut Vec<TeardownStage>,
     errors: &mut Vec<String>,
 ) -> bool {
     match result {
         WaitResult::Zero => {
             attempted_stages.push(TeardownStage::SettleActiveProcessZero);
-            match effects.settle_active_process_zero(ticket).await {
+            match bounded_stage(
+                TeardownStage::SettleActiveProcessZero,
+                budget,
+                effects.settle_active_process_zero(ticket),
+            )
+            .await
+            {
                 StageResult::Completed => true,
                 StageResult::Failed { detail } => {
                     errors.push(format!(
@@ -1126,30 +1721,51 @@ async fn try_settle_after_wait(
 async fn settle_after_zero(
     ticket: TeardownTicket,
     effects: Arc<dyn TeardownEffects>,
+    budgets: TeardownBudgets,
     mut attempted_stages: Vec<TeardownStage>,
     errors: Vec<String>,
 ) -> TeardownReport {
     let mut errors = errors;
     attempted_stages.push(TeardownStage::DetachAfterZero);
     collect_stage_result(
-        effects.detach_after_zero(&ticket).await,
+        bounded_stage(
+            TeardownStage::DetachAfterZero,
+            budgets.termination,
+            effects.detach_after_zero(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::DetachAfterZero,
     );
     attempted_stages.push(TeardownStage::ReconcilePorts);
     collect_stage_result(
-        effects.reconcile_ports(&ticket).await,
+        bounded_stage(
+            TeardownStage::ReconcilePorts,
+            budgets.termination,
+            effects.reconcile_ports(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::ReconcilePorts,
     );
     attempted_stages.push(TeardownStage::PersistSettlement);
     collect_stage_result(
-        effects.persist_settlement(&ticket).await,
+        bounded_stage(
+            TeardownStage::PersistSettlement,
+            budgets.termination,
+            effects.persist_settlement(&ticket),
+        )
+        .await,
         &mut errors,
         TeardownStage::PersistSettlement,
     );
     attempted_stages.push(TeardownStage::ReleaseStoppedExact);
-    let release = effects.release_stopped_exact(&ticket).await;
+    let release = bounded_stage(
+        TeardownStage::ReleaseStoppedExact,
+        budgets.termination,
+        effects.release_stopped_exact(&ticket),
+    )
+    .await;
     let outcome = match release {
         StageResult::Completed if errors.is_empty() => TeardownOutcome::Closed,
         StageResult::Completed => TeardownOutcome::CleanupFailed,
@@ -1158,13 +1774,18 @@ async fn settle_after_zero(
             TeardownOutcome::CleanupFailed
         }
     };
+    let adapter_residue = if outcome != TeardownOutcome::Closed {
+        bounded_residue(&effects, &ticket, budgets.termination, &mut errors).await
+    } else {
+        None
+    };
     let residue = if outcome != TeardownOutcome::Closed {
         required_residue(
             &ticket,
             &attempted_stages,
             &errors,
             outcome,
-            effects.residue(&ticket).await,
+            adapter_residue,
         )
     } else {
         None
@@ -1199,7 +1820,7 @@ fn required_residue(
             UNAVAILABLE_JOB_IDENTITY,
             root.id().pid(),
             root.id().creation_time_100ns(),
-            UNAVAILABLE_ROOT_EXECUTABLE,
+            root.canonical_executable().to_string_lossy(),
             UNAVAILABLE_ROOT_COMMAND,
             format!(
                 "resource={}; state={outcome:?}; last_lifecycle_stage={last_stage}{detail}",
@@ -1219,7 +1840,7 @@ fn required_residue(
         )
     };
     Some(ResidueEvidence::new(
-        if residue.job_name.is_empty() {
+        if evidence_unavailable(&residue.job_name) {
             &fallback.job_name
         } else {
             &residue.job_name
@@ -1234,7 +1855,7 @@ fn required_residue(
         } else {
             residue.creation_time_100ns
         },
-        if residue.executable.is_empty() {
+        if evidence_unavailable(&residue.executable) {
             &fallback.executable
         } else {
             &residue.executable
@@ -1251,4 +1872,41 @@ fn required_residue(
             residue.attempted_stages
         },
     ))
+}
+
+fn evidence_unavailable(value: &str) -> bool {
+    value.is_empty() || value.starts_with("<unavailable:")
+}
+
+fn waiter_failure_report(ticket: TeardownTicket, detail: &str) -> TeardownReport {
+    let attempted_stages = Vec::new();
+    let errors = vec![sanitize_text(detail)];
+    let residue = required_residue(
+        &ticket,
+        &attempted_stages,
+        &errors,
+        TeardownOutcome::CleanupFailed,
+        None,
+    );
+    TeardownReport {
+        ticket,
+        outcome: TeardownOutcome::CleanupFailed,
+        attempted_stages,
+        errors,
+        residue,
+    }
+}
+
+fn panic_report(ticket: TeardownTicket, detail: String) -> TeardownReport {
+    waiter_failure_report(ticket, &detail)
+}
+
+fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return sanitize_text(message);
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return sanitize_text(message);
+    }
+    "unknown panic payload".to_string()
 }

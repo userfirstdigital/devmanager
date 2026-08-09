@@ -73,6 +73,8 @@ pub trait JobMembership {
         Ok(())
     }
 
+    /// Drains receiver-owned completion messages. External membership
+    /// adapters cannot construct this type and therefore cannot mint proof.
     fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
         Vec::new()
     }
@@ -143,54 +145,19 @@ pub enum JobCompletionEvent {
     MonitorFailed { detail: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobCompletionSource {
-    CompletionReceiver,
-    UntrustedCaller,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCompletionMessage {
     fence: ManagedProcessFence,
     event: JobCompletionEvent,
-    source: JobCompletionSource,
 }
 
 impl JobCompletionMessage {
-    /// Builds an untrusted observation for compatibility with external test
-    /// doubles. It can update diagnostic membership state, but it can never
-    /// issue an `ActiveProcessZeroProof` or authorize release.
-    #[doc(hidden)]
-    pub fn new(fence: ManagedProcessFence, event: JobCompletionEvent) -> Self {
-        Self {
-            fence,
-            event,
-            source: JobCompletionSource::UntrustedCaller,
-        }
-    }
-
     pub(crate) fn from_completion_receiver(
         _receiver: &crate::process::job::CompletionReceiverToken,
         fence: ManagedProcessFence,
         event: JobCompletionEvent,
     ) -> Self {
-        Self {
-            fence,
-            event,
-            source: JobCompletionSource::CompletionReceiver,
-        }
-    }
-
-    #[cfg(test)]
-    fn from_completion_receiver_for_test(
-        fence: ManagedProcessFence,
-        event: JobCompletionEvent,
-    ) -> Self {
-        Self {
-            fence,
-            event,
-            source: JobCompletionSource::CompletionReceiver,
-        }
+        Self { fence, event }
     }
 
     pub fn fence(&self) -> &ManagedProcessFence {
@@ -200,9 +167,28 @@ impl JobCompletionMessage {
     pub fn event(&self) -> &JobCompletionEvent {
         &self.event
     }
+}
 
-    fn from_real_completion_receiver(&self) -> bool {
-        self.source == JobCompletionSource::CompletionReceiver
+/// A caller-visible completion observation. It is intentionally distinct from
+/// `JobCompletionMessage`, which is produced only by the concrete managed Job
+/// completion receiver and is the sole input that can create zero authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCompletionObservation {
+    fence: ManagedProcessFence,
+    event: JobCompletionEvent,
+}
+
+impl JobCompletionObservation {
+    pub fn new(fence: ManagedProcessFence, event: JobCompletionEvent) -> Self {
+        Self { fence, event }
+    }
+
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+
+    pub fn event(&self) -> &JobCompletionEvent {
+        &self.event
     }
 }
 
@@ -240,7 +226,6 @@ pub struct RegisteredProcess<J> {
     last_limit: Option<(u32, Option<u32>)>,
     pending_zero_prior_state: Option<ManagedProcessState>,
     pending_zero_proof: Option<ActiveProcessZeroProof>,
-    pending_untrusted_zero: bool,
     authoritative_zero_settled: bool,
     next_zero_proof_nonce: u64,
 }
@@ -265,7 +250,6 @@ impl<J> RegisteredProcess<J> {
             last_limit: None,
             pending_zero_prior_state: None,
             pending_zero_proof: None,
-            pending_untrusted_zero: false,
             authoritative_zero_settled: false,
             next_zero_proof_nonce: 1,
         }
@@ -399,6 +383,11 @@ pub enum ProcessRegistryError {
         resource_id: ResourceId,
         detail: String,
     },
+    IdentityMismatch {
+        resource_id: ResourceId,
+        expected: ManagedProcessIdentity,
+        observed: ManagedProcessIdentity,
+    },
     ActiveProcessZeroUnproved {
         resource_id: ResourceId,
     },
@@ -448,6 +437,14 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "could not start resource {resource_id}'s Job notifications: {detail}"
             ),
+            Self::IdentityMismatch {
+                resource_id,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "resource {resource_id} expected managed process identity {expected:?}, observed {observed:?}"
+            ),
             Self::ActiveProcessZeroUnproved { resource_id } => write!(
                 f,
                 "resource {resource_id} has no matching ACTIVE_PROCESS_ZERO completion proof"
@@ -481,6 +478,7 @@ impl std::error::Error for ProcessRegistryError {
             | Self::NotJobMember { .. }
             | Self::MembershipQueryFailed { .. }
             | Self::CompletionNotificationsFailed { .. }
+            | Self::IdentityMismatch { .. }
             | Self::ActiveProcessZeroUnproved { .. }
             | Self::InvalidLifecycleState { .. }
             | Self::StaleLifecycleFence { .. } => None,
@@ -731,6 +729,29 @@ impl<J: JobMembership> ProcessRegistry<J> {
             ));
         }
 
+        let observed_root = match process.job.inspect_process(proposed_pid) {
+            Ok(member) => member.identity().clone(),
+            Err(detail) => {
+                return Err(ProcessRegistrationFailure::new(
+                    ProcessRegistryError::MembershipQueryFailed {
+                        resource_id: proposed.resource_id,
+                        detail,
+                    },
+                    process,
+                ));
+            }
+        };
+        if observed_root != *process.root() {
+            return Err(ProcessRegistrationFailure::new(
+                ProcessRegistryError::IdentityMismatch {
+                    resource_id: proposed.resource_id,
+                    expected: process.root().clone(),
+                    observed: observed_root,
+                },
+                process,
+            ));
+        }
+
         let fence = ManagedProcessFence::from_process(&process);
         if let Err(detail) = process.job.bind_completion_fence(fence.clone()) {
             return Err(ProcessRegistrationFailure::new(
@@ -832,7 +853,6 @@ impl<J: JobMembership> ProcessRegistry<J> {
         active_process_ids.dedup();
         if !active_process_ids.is_empty() {
             current.pending_zero_proof = None;
-            current.pending_untrusted_zero = false;
             current.authoritative_zero_settled = false;
             current.state = current
                 .pending_zero_prior_state
@@ -842,7 +862,6 @@ impl<J: JobMembership> ProcessRegistry<J> {
         }
 
         current.pending_zero_proof = None;
-        current.pending_untrusted_zero = false;
         current.pending_zero_prior_state = None;
         current.known_members.clear();
         current.unknown_member_pids.clear();
@@ -851,6 +870,20 @@ impl<J: JobMembership> ProcessRegistry<J> {
         Ok(true)
     }
 
+    /// Applies a public-trait observation for diagnostics only. It validates
+    /// the current generation but never mutates lifecycle state or creates a
+    /// zero proof.
+    pub fn apply_job_observation(&mut self, observation: JobCompletionObservation) -> bool {
+        let resource_id = observation.fence.resource.resource_id;
+        self.current
+            .get(&resource_id)
+            .map(|current| ManagedProcessFence::from_process(current) == observation.fence)
+            .unwrap_or(false)
+    }
+
+    /// Applies one message emitted by the concrete managed Job receiver.
+    /// `JobCompletionMessage` has no public constructor; this boundary is
+    /// therefore unforgeable by caller-owned membership adapters.
     pub fn apply_job_completion(&mut self, message: JobCompletionMessage) -> bool {
         let resource_id = message.fence.resource.resource_id;
         let Some(current) = self.current.get_mut(&resource_id) else {
@@ -877,22 +910,16 @@ impl<J: JobMembership> ProcessRegistry<J> {
             }
             JobCompletionEvent::ActiveProcessZero => {
                 if current.state != ManagedProcessState::Stopped {
-                    let trusted = message.from_real_completion_receiver();
                     if current.pending_zero_prior_state.is_none() {
                         current.pending_zero_prior_state = Some(current.state);
                     }
-                    current.pending_untrusted_zero = !trusted;
                     current.authoritative_zero_settled = false;
                     let fence = ManagedProcessFence::from_process(current);
-                    if trusted {
-                        let nonce = current.next_zero_proof_nonce;
-                        current.next_zero_proof_nonce =
-                            current.next_zero_proof_nonce.wrapping_add(1).max(1);
-                        current.pending_zero_proof =
-                            Some(ActiveProcessZeroProof::from_completion(fence, nonce));
-                    } else {
-                        current.pending_zero_proof = None;
-                    }
+                    let nonce = current.next_zero_proof_nonce;
+                    current.next_zero_proof_nonce =
+                        current.next_zero_proof_nonce.wrapping_add(1).max(1);
+                    current.pending_zero_proof =
+                        Some(ActiveProcessZeroProof::from_completion(fence, nonce));
                     match current.job.active_process_ids() {
                         Ok(process_ids) if process_ids.is_empty() => {
                             current.pending_zero_prior_state = None;
@@ -902,7 +929,6 @@ impl<J: JobMembership> ProcessRegistry<J> {
                         }
                         Ok(_) => {
                             current.pending_zero_proof = None;
-                            current.pending_untrusted_zero = false;
                             if let Some(prior_state) = current.pending_zero_prior_state.take() {
                                 current.state = prior_state;
                             }
@@ -943,20 +969,6 @@ impl<J: JobMembership> ProcessRegistry<J> {
         })?;
         active_pids.sort_unstable();
         active_pids.dedup();
-        if current.pending_untrusted_zero {
-            if active_pids.is_empty() {
-                current.pending_zero_prior_state = None;
-                current.known_members.clear();
-                current.unknown_member_pids.clear();
-                current.state = ManagedProcessState::Stopped;
-                return Ok(());
-            }
-            current.pending_untrusted_zero = false;
-            current.state = current
-                .pending_zero_prior_state
-                .take()
-                .unwrap_or(ManagedProcessState::Leaked);
-        }
         if current.pending_zero_proof.is_some() {
             if active_pids.is_empty() {
                 current.pending_zero_prior_state = None;
@@ -1000,7 +1012,21 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 let expected = ManagedProcessFence::from_process(current);
                 return match current.job.active_process_ids() {
                     Ok(process_ids) if process_ids.contains(&observed.id().pid()) => {
-                        ProcessClassification::Managed(expected)
+                        match current.job.inspect_process(observed.id().pid()) {
+                            Ok(member) if member.identity() == observed => {
+                                ProcessClassification::Managed(expected)
+                            }
+                            Ok(_) => ProcessClassification::ReconciliationFault {
+                                expected,
+                                observed: observed.clone(),
+                                reason: OwnershipFault::IdentityMismatch,
+                            },
+                            Err(detail) => ProcessClassification::ReconciliationFault {
+                                expected,
+                                observed: observed.clone(),
+                                reason: OwnershipFault::MembershipQueryFailed { detail },
+                            },
+                        }
                     }
                     Ok(_) => ProcessClassification::ReconciliationFault {
                         expected,
@@ -1023,94 +1049,5 @@ impl<J: JobMembership> ProcessRegistry<J> {
             }
         }
         ProcessClassification::External
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::process::identity::ManagedProcessId;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Debug, Clone, Default)]
-    struct ReceiverJob {
-        active: Arc<Mutex<Vec<u32>>>,
-        completions: Arc<Mutex<VecDeque<JobCompletionMessage>>>,
-    }
-
-    impl ReceiverJob {
-        fn with_root(pid: u32) -> Self {
-            Self {
-                active: Arc::new(Mutex::new(vec![pid])),
-                completions: Arc::new(Mutex::new(VecDeque::new())),
-            }
-        }
-
-        fn set_active(&self, active: Vec<u32>) {
-            *self.active.lock().expect("receiver membership") = active;
-        }
-
-        fn push_receiver_completion(&self, fence: ManagedProcessFence, event: JobCompletionEvent) {
-            self.completions
-                .lock()
-                .expect("receiver completions")
-                .push_back(JobCompletionMessage::from_completion_receiver_for_test(
-                    fence, event,
-                ));
-        }
-    }
-
-    impl JobMembership for ReceiverJob {
-        fn active_process_ids(&self) -> Result<Vec<u32>, String> {
-            Ok(self.active.lock().expect("receiver membership").clone())
-        }
-
-        fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
-            self.completions
-                .lock()
-                .expect("receiver completions")
-                .drain(..)
-                .collect()
-        }
-    }
-
-    #[test]
-    fn receiver_owned_zero_proof_is_required_before_release() {
-        let resource = ResourceId::from_bytes([
-            0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x21,
-        ])
-        .expect("resource id");
-        let root = ManagedProcessIdentity::new(
-            ManagedProcessId::new(7_301, 73_001).expect("process id"),
-            std::env::current_exe().expect("test executable"),
-        )
-        .expect("process identity");
-        let job = ReceiverJob::with_root(root.id().pid());
-        let mut registry = ProcessRegistry::new();
-        let fence = registry
-            .register(RegisteredProcess::new(
-                ResourceFence::new(resource, 1),
-                ProcessOwner::Host,
-                root.clone(),
-                ProcessDisplayLabel::new("receiver proof").expect("display label"),
-                job.clone(),
-            ))
-            .expect("registration");
-
-        job.set_active(Vec::new());
-        job.push_receiver_completion(fence.clone(), JobCompletionEvent::ActiveProcessZero);
-        assert_eq!(registry.drain_job_completions(resource), 1);
-        let proof = registry
-            .active_process_zero_proof_exact(&fence)
-            .expect("receiver-owned completion proof");
-        assert!(registry
-            .settle_active_process_zero_exact(proof)
-            .expect("authoritative empty membership"));
-        assert!(matches!(
-            registry.release_stopped_exact(&fence),
-            Ok(UnregisterOutcome::Removed(_))
-        ));
     }
 }
