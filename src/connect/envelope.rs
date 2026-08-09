@@ -423,7 +423,13 @@ impl ConnectLimits {
 
     pub const fn frame_limits(self) -> FrameLimits {
         FrameLimits {
-            max_physical_frame_bytes: self.max_physical_frame_bytes,
+            max_physical_frame_bytes: if self.max_physical_frame_bytes
+                < self.max_reassembled_message_bytes
+            {
+                self.max_physical_frame_bytes
+            } else {
+                self.max_reassembled_message_bytes
+            },
             max_reassembled_message_bytes: self.max_reassembled_message_bytes,
             max_page_items: self.max_page_items,
             max_page_encoded_bytes: self.max_page_encoded_bytes,
@@ -939,14 +945,18 @@ impl ConnectEnvelope {
         negotiated.validate_payload_len(bytes.len())?;
         let codec = MessagePackCodec::from_limits(negotiated.frame_limits())
             .map_err(|_| EnvelopeError::Encode)?;
+        let header = codec
+            .decode::<ConnectEnvelopeHeaderWire>(bytes)
+            .map_err(EnvelopeError::MessagePack)?;
+        if header.limits != negotiated {
+            return Err(EnvelopeError::NegotiatedLimitsMismatch);
+        }
+        super::schema::preflight_envelope_wire(bytes, negotiated)
+            .map_err(EnvelopeError::Payload)?;
         let wire = codec
             .decode::<ConnectEnvelopeWire>(bytes)
             .map_err(EnvelopeError::MessagePack)?;
-        let envelope = Self::from_wire(wire)?;
-        if envelope.limits != negotiated {
-            return Err(EnvelopeError::NegotiatedLimitsMismatch);
-        }
-        Ok(envelope)
+        Self::from_wire(wire, negotiated)
     }
 
     pub const fn binding(&self) -> ChannelBinding {
@@ -1025,7 +1035,13 @@ impl ConnectEnvelope {
         }
     }
 
-    fn from_wire(wire: ConnectEnvelopeWire) -> Result<Self, EnvelopeError> {
+    fn from_wire(
+        wire: ConnectEnvelopeWire,
+        negotiated: ConnectLimits,
+    ) -> Result<Self, EnvelopeError> {
+        if wire.limits != negotiated {
+            return Err(EnvelopeError::NegotiatedLimitsMismatch);
+        }
         if !matches!(wire.compression, Compression::None) {
             return Err(EnvelopeError::CompressionUnsupported);
         }
@@ -1036,7 +1052,7 @@ impl ConnectEnvelope {
             sequence: wire.sequence,
             request_id: wire.request_id,
             operation_id: wire.operation_id,
-            limits: wire.limits,
+            limits: negotiated,
             compression: wire.compression,
             privacy_class: wire.privacy_class,
             payload: ConnectPayload::from(wire.payload),
@@ -1050,6 +1066,27 @@ impl ConnectEnvelope {
         envelope.validate()?;
         Ok(envelope)
     }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectEnvelopeHeaderWire {
+    protocol_major: u16,
+    protocol_minor: u16,
+    connection_id: ConnectionId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    channel: ChannelKind,
+    sequence: u64,
+    request_id: Option<RequestId>,
+    operation_id: Option<OperationId>,
+    limits: ConnectLimits,
+    compression: Compression,
+    privacy_class: ConnectPrivacyClass,
+    payload_kind: PayloadKind,
+    payload_version: u16,
+    payload: de::IgnoredAny,
 }
 
 #[derive(Serialize)]

@@ -15,13 +15,18 @@ use crate::domain::snapshot::{
 };
 use crate::protocol::{
     CapabilitySet, ChunkError, ChunkLimits, ClientHello, ClientRequest, MessagePackCodec,
-    MessagePackError, ServerHello, ServerMessage, StreamFrame,
+    MessagePackError, MessagePackLengthKind, ServerHello, ServerMessage, StreamFrame,
+    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
 };
+use rmp::Marker;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
-use super::envelope::{ChannelKind, ConnectLimitError, ConnectLimits, PayloadKind};
+use super::envelope::{
+    ChannelKind, ConnectLimitError, ConnectLimits, PayloadKind,
+    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+};
 use super::presence::LastSenderHint;
 use super::transport::{BrowserExtensionDescriptor, PromptExtensionDescriptor};
 
@@ -336,13 +341,11 @@ impl ErrorPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenericExtensionPayload {
-    pub type_id: u16,
-    pub schema_version: u16,
-    #[serde(with = "binary")]
-    pub payload: Vec<u8>,
+    type_id: u16,
+    schema_version: u16,
+    payload: Vec<u8>,
 }
 
 impl GenericExtensionPayload {
@@ -352,25 +355,41 @@ impl GenericExtensionPayload {
             schema_version,
             payload,
         };
-        if extension.type_id == 0 || extension.schema_version == 0 {
+        if extension.type_id == 0
+            || extension.schema_version == 0
+            || extension.payload.len() > MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize
+        {
             return Err(PayloadError::Bounds);
         }
         Ok(extension)
     }
+
+    pub const fn type_id(&self) -> u16 {
+        self.type_id
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownPayload {
-    pub kind: PayloadKind,
-    pub version: u16,
-    #[serde(with = "binary")]
-    pub payload: Vec<u8>,
+    kind: PayloadKind,
+    version: u16,
+    payload: Vec<u8>,
 }
 
 impl UnknownPayload {
     pub fn new(kind: PayloadKind, version: u16, payload: Vec<u8>) -> Result<Self, PayloadError> {
-        if kind.known().is_some() || version == 0 {
+        if kind.known().is_some()
+            || version == 0
+            || payload.len() > MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize
+        {
             return Err(PayloadError::Bounds);
         }
         Ok(Self {
@@ -378,6 +397,72 @@ impl UnknownPayload {
             version,
             payload,
         })
+    }
+
+    pub const fn kind(&self) -> PayloadKind {
+        self.kind
+    }
+
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenericExtensionPayloadWire {
+    type_id: u16,
+    schema_version: u16,
+    #[serde(with = "binary")]
+    payload: Vec<u8>,
+}
+
+impl From<&GenericExtensionPayload> for GenericExtensionPayloadWire {
+    fn from(value: &GenericExtensionPayload) -> Self {
+        Self {
+            type_id: value.type_id(),
+            schema_version: value.schema_version(),
+            payload: value.payload.clone(),
+        }
+    }
+}
+
+impl TryFrom<GenericExtensionPayloadWire> for GenericExtensionPayload {
+    type Error = PayloadError;
+
+    fn try_from(value: GenericExtensionPayloadWire) -> Result<Self, Self::Error> {
+        Self::new(value.type_id, value.schema_version, value.payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnknownPayloadWire {
+    kind: PayloadKind,
+    version: u16,
+    #[serde(with = "binary")]
+    payload: Vec<u8>,
+}
+
+impl From<&UnknownPayload> for UnknownPayloadWire {
+    fn from(value: &UnknownPayload) -> Self {
+        Self {
+            kind: value.kind(),
+            version: value.version(),
+            payload: value.payload.clone(),
+        }
+    }
+}
+
+impl TryFrom<UnknownPayloadWire> for UnknownPayload {
+    type Error = PayloadError;
+
+    fn try_from(value: UnknownPayloadWire) -> Result<Self, Self::Error> {
+        Self::new(value.kind, value.version, value.payload)
     }
 }
 
@@ -495,7 +580,7 @@ impl ConnectPayload {
             Self::Chunk(_) => PayloadKind::CHUNK,
             Self::Error(_) => PayloadKind::ERROR,
             Self::Extension(_) => PayloadKind::EXTENSION,
-            Self::Unknown(value) => value.kind,
+            Self::Unknown(value) => value.kind(),
         }
     }
 
@@ -507,7 +592,7 @@ impl ConnectPayload {
 
     pub fn version(&self) -> u16 {
         match self {
-            Self::Unknown(value) => value.version,
+            Self::Unknown(value) => value.version(),
             _ => CONNECT_PAYLOAD_SCHEMA_VERSION,
         }
     }
@@ -581,6 +666,7 @@ impl ConnectPayload {
         if descriptor_for(kind).is_none() && version == 0 {
             return Err(PayloadError::UnsupportedVersion { kind, version });
         }
+        preflight_payload_wire(bytes, limits)?;
         let codec = MessagePackCodec::from_limits(limits.frame_limits())
             .map_err(|_| PayloadError::Encode)?;
         let payload = codec
@@ -641,16 +727,16 @@ impl ConnectPayload {
                 .map_err(PayloadError::Chunk)?,
             Self::Error(error) => error.validate(limits)?,
             Self::Extension(extension) => {
-                if extension.type_id == 0 || extension.schema_version == 0 {
+                if extension.type_id() == 0 || extension.schema_version() == 0 {
                     return Err(PayloadError::Bounds);
                 }
-                limits.validate_payload_len(extension.payload.len())?;
+                limits.validate_payload_len(extension.payload().len())?;
             }
             Self::Unknown(value) => {
-                if value.kind.known().is_some() || value.version == 0 {
+                if value.kind().known().is_some() || value.version() == 0 {
                     return Err(PayloadError::MetadataMismatch);
                 }
-                limits.validate_payload_len(value.payload.len())?;
+                limits.validate_payload_len(value.payload().len())?;
             }
         }
         Ok(())
@@ -891,6 +977,446 @@ impl From<OutcomeFenceError> for PayloadError {
     }
 }
 
+pub(super) fn preflight_envelope_wire(
+    bytes: &[u8],
+    limits: ConnectLimits,
+) -> Result<(), PayloadError> {
+    let mut scanner = ConnectWireScanner::new(bytes, limits);
+    scanner
+        .scan(WireScanContext::Envelope)
+        .map_err(|error| scanner.map_error(error))
+}
+
+pub(super) fn preflight_payload_wire(
+    bytes: &[u8],
+    limits: ConnectLimits,
+) -> Result<(), PayloadError> {
+    let mut scanner = ConnectWireScanner::new(bytes, limits);
+    scanner
+        .scan(WireScanContext::PayloadWrapper)
+        .map_err(|error| scanner.map_error(error))
+}
+
+#[derive(Clone, Copy)]
+enum WireScanContext {
+    Generic,
+    Envelope,
+    PayloadWrapper,
+    SnapshotPage,
+    EventPage,
+    ArtifactPage,
+    Chunk,
+    ChunkPayload,
+    Cursor,
+    PageItems,
+    OpaquePayload,
+}
+
+impl WireScanContext {
+    fn child_for_field(self, field: &[u8]) -> Self {
+        match field {
+            b"payload" => match self {
+                Self::Envelope => Self::PayloadWrapper,
+                Self::Chunk => Self::ChunkPayload,
+                _ => Self::OpaquePayload,
+            },
+            b"snapshot_page" => Self::SnapshotPage,
+            b"event_page" => Self::EventPage,
+            b"artifact_content_page" => Self::ArtifactPage,
+            b"chunk" if matches!(self, Self::PayloadWrapper) => Self::Chunk,
+            b"unknown" | b"extension" if matches!(self, Self::PayloadWrapper) => {
+                Self::OpaquePayload
+            }
+            b"items" if matches!(self, Self::SnapshotPage) => Self::PageItems,
+            b"events" if matches!(self, Self::EventPage) => Self::PageItems,
+            b"next_cursor" | b"resume_cursor" => Self::Cursor,
+            _ => Self::Generic,
+        }
+    }
+
+    fn is_page(self) -> bool {
+        matches!(
+            self,
+            Self::SnapshotPage | Self::EventPage | Self::ArtifactPage
+        )
+    }
+}
+
+struct ConnectWireScanner<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    values: u32,
+    limits: ConnectLimits,
+    limit_error: Option<ConnectLimitError>,
+}
+
+impl<'a> ConnectWireScanner<'a> {
+    fn new(bytes: &'a [u8], limits: ConnectLimits) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            values: 0,
+            limits,
+            limit_error: None,
+        }
+    }
+
+    fn scan(&mut self, context: WireScanContext) -> Result<(), MessagePackError> {
+        if self.bytes.is_empty() {
+            return Err(MessagePackError::Empty);
+        }
+        self.scan_value(context, 0)?;
+        if self.offset != self.bytes.len() {
+            return Err(MessagePackError::TrailingBytes {
+                offset: self.offset_u32(),
+            });
+        }
+        Ok(())
+    }
+
+    fn map_error(&self, error: MessagePackError) -> PayloadError {
+        self.limit_error
+            .map(PayloadError::Limits)
+            .unwrap_or(PayloadError::MessagePack(error))
+    }
+
+    fn scan_value(&mut self, context: WireScanContext, depth: u16) -> Result<(), MessagePackError> {
+        self.bump_value()?;
+        let marker_offset = self.offset_u32();
+        let value_start = self.offset;
+        let marker = Marker::from_u8(self.read_u8()?);
+        match marker {
+            Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::False | Marker::True => {
+                Ok(())
+            }
+            Marker::Reserved => Err(MessagePackError::ReservedMarker {
+                offset: marker_offset,
+            }),
+            Marker::FixExt1
+            | Marker::FixExt2
+            | Marker::FixExt4
+            | Marker::FixExt8
+            | Marker::FixExt16
+            | Marker::Ext8
+            | Marker::Ext16
+            | Marker::Ext32 => Err(MessagePackError::UnsupportedExtension {
+                offset: marker_offset,
+            }),
+            Marker::F32 | Marker::U32 | Marker::I32 => self.skip(4),
+            Marker::F64 | Marker::U64 | Marker::I64 => self.skip(8),
+            Marker::U8 | Marker::I8 => self.skip(1),
+            Marker::U16 | Marker::I16 => self.skip(2),
+            Marker::FixStr(length) => {
+                self.scan_scalar(MessagePackLengthKind::String, u32::from(length))
+            }
+            Marker::Str8 => {
+                let length = u32::from(self.read_u8()?);
+                self.scan_scalar(MessagePackLengthKind::String, length)
+            }
+            Marker::Str16 => {
+                let length = u32::from(self.read_u16()?);
+                self.scan_scalar(MessagePackLengthKind::String, length)
+            }
+            Marker::Str32 => {
+                let length = self.read_u32()?;
+                self.scan_scalar(MessagePackLengthKind::String, length)
+            }
+            Marker::Bin8 => {
+                let length = u32::from(self.read_u8()?);
+                self.scan_binary(context, length)
+            }
+            Marker::Bin16 => {
+                let length = u32::from(self.read_u16()?);
+                self.scan_binary(context, length)
+            }
+            Marker::Bin32 => {
+                let length = self.read_u32()?;
+                self.scan_binary(context, length)
+            }
+            Marker::FixArray(length) => self.scan_array(context, u32::from(length), depth),
+            Marker::Array16 => {
+                let length = u32::from(self.read_u16()?);
+                self.scan_array(context, length, depth)
+            }
+            Marker::Array32 => {
+                let length = self.read_u32()?;
+                self.scan_array(context, length, depth)
+            }
+            Marker::FixMap(length) => self.scan_map(context, u32::from(length), depth, value_start),
+            Marker::Map16 => {
+                let length = u32::from(self.read_u16()?);
+                self.scan_map(context, length, depth, value_start)
+            }
+            Marker::Map32 => {
+                let length = self.read_u32()?;
+                self.scan_map(context, length, depth, value_start)
+            }
+        }
+    }
+
+    fn scan_array(
+        &mut self,
+        context: WireScanContext,
+        length: u32,
+        depth: u16,
+    ) -> Result<(), MessagePackError> {
+        self.check_depth(depth)?;
+        if matches!(context, WireScanContext::PageItems) {
+            if length > self.limits.max_page_items {
+                self.limit_error = Some(ConnectLimitError::PageItemsExceeded {
+                    declared: usize::try_from(length).unwrap_or(usize::MAX),
+                    maximum: self.limits.max_page_items,
+                });
+                return Err(MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Array,
+                    declared: length,
+                    maximum: self.limits.max_page_items,
+                });
+            }
+        } else if matches!(context, WireScanContext::Cursor)
+            && length > self.limits.max_cursor_bytes
+        {
+            self.limit_error = Some(ConnectLimitError::CursorExceeded {
+                declared: u64::from(length),
+                maximum: self.limits.max_cursor_bytes,
+            });
+            return Err(MessagePackError::DeclaredLengthExceeded {
+                kind: MessagePackLengthKind::Array,
+                declared: length,
+                maximum: self.limits.max_cursor_bytes,
+            });
+        } else {
+            self.check_collection(MessagePackLengthKind::Array, length)?;
+        }
+        for _ in 0..length {
+            self.scan_value(WireScanContext::Generic, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn scan_map(
+        &mut self,
+        context: WireScanContext,
+        length: u32,
+        depth: u16,
+        value_start: usize,
+    ) -> Result<(), MessagePackError> {
+        self.check_depth(depth)?;
+        self.check_collection(MessagePackLengthKind::Map, length)?;
+        for _ in 0..length {
+            let field_context = {
+                let field = self.read_field_name()?;
+                context.child_for_field(field)
+            };
+            self.scan_value(field_context, depth + 1)?;
+        }
+        if context.is_page() {
+            let declared = u64::try_from(self.offset - value_start).unwrap_or(u64::MAX);
+            if declared > u64::from(self.limits.max_page_encoded_bytes) {
+                self.limit_error = Some(ConnectLimitError::PageBytesExceeded {
+                    declared,
+                    maximum: self.limits.max_page_encoded_bytes,
+                });
+                return Err(MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Map,
+                    declared: u32::try_from(declared).unwrap_or(u32::MAX),
+                    maximum: self.limits.max_page_encoded_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_binary(
+        &mut self,
+        context: WireScanContext,
+        length: u32,
+    ) -> Result<(), MessagePackError> {
+        match context {
+            WireScanContext::ChunkPayload if length > self.limits.max_chunk_bytes => {
+                self.limit_error = Some(ConnectLimitError::ChunkExceeded {
+                    declared: u64::from(length),
+                    maximum: self.limits.max_chunk_bytes,
+                });
+                return Err(MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Binary,
+                    declared: length,
+                    maximum: self.limits.max_chunk_bytes,
+                });
+            }
+            WireScanContext::Cursor if length > self.limits.max_cursor_bytes => {
+                self.limit_error = Some(ConnectLimitError::CursorExceeded {
+                    declared: u64::from(length),
+                    maximum: self.limits.max_cursor_bytes,
+                });
+                return Err(MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Binary,
+                    declared: length,
+                    maximum: self.limits.max_cursor_bytes,
+                });
+            }
+            WireScanContext::OpaquePayload
+                if length > self.limits.max_reassembled_message_bytes =>
+            {
+                self.limit_error = Some(ConnectLimitError::PayloadExceeded {
+                    declared: u64::from(length),
+                    maximum: self.limits.max_reassembled_message_bytes,
+                });
+                return Err(MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Binary,
+                    declared: length,
+                    maximum: self.limits.max_reassembled_message_bytes,
+                });
+            }
+            _ => {}
+        }
+        self.scan_scalar(MessagePackLengthKind::Binary, length)
+    }
+
+    fn scan_scalar(
+        &mut self,
+        kind: MessagePackLengthKind,
+        length: u32,
+    ) -> Result<(), MessagePackError> {
+        let maximum = self.limits.frame_limits().max_physical_frame_bytes;
+        if length > maximum {
+            return Err(MessagePackError::DeclaredLengthExceeded {
+                kind,
+                declared: length,
+                maximum,
+            });
+        }
+        self.skip(
+            usize::try_from(length).map_err(|_| MessagePackError::Truncated {
+                offset: self.offset_u32(),
+            })?,
+        )
+    }
+
+    fn read_field_name(&mut self) -> Result<&[u8], MessagePackError> {
+        self.bump_value()?;
+        let marker_offset = self.offset_u32();
+        let marker = Marker::from_u8(self.read_u8()?);
+        let length = match marker {
+            Marker::FixStr(length) => u32::from(length),
+            Marker::Str8 => u32::from(self.read_u8()?),
+            Marker::Str16 => u32::from(self.read_u16()?),
+            Marker::Str32 => self.read_u32()?,
+            Marker::Reserved => {
+                return Err(MessagePackError::ReservedMarker {
+                    offset: marker_offset,
+                });
+            }
+            Marker::FixExt1
+            | Marker::FixExt2
+            | Marker::FixExt4
+            | Marker::FixExt8
+            | Marker::FixExt16
+            | Marker::Ext8
+            | Marker::Ext16
+            | Marker::Ext32 => {
+                return Err(MessagePackError::UnsupportedExtension {
+                    offset: marker_offset,
+                });
+            }
+            _ => return Err(MessagePackError::Decode),
+        };
+        if length > self.limits.frame_limits().max_physical_frame_bytes {
+            return Err(MessagePackError::DeclaredLengthExceeded {
+                kind: MessagePackLengthKind::String,
+                declared: length,
+                maximum: self.limits.frame_limits().max_physical_frame_bytes,
+            });
+        }
+        let bytes =
+            self.take(
+                usize::try_from(length).map_err(|_| MessagePackError::Truncated {
+                    offset: self.offset_u32(),
+                })?,
+            )?;
+        std::str::from_utf8(bytes).map_err(|_| MessagePackError::Decode)?;
+        Ok(bytes)
+    }
+
+    fn bump_value(&mut self) -> Result<(), MessagePackError> {
+        self.values = self
+            .values
+            .checked_add(1)
+            .ok_or(MessagePackError::ValueCountExceeded {
+                maximum: MAX_MESSAGEPACK_VALUES,
+            })?;
+        if self.values > MAX_MESSAGEPACK_VALUES {
+            return Err(MessagePackError::ValueCountExceeded {
+                maximum: MAX_MESSAGEPACK_VALUES,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_depth(&self, depth: u16) -> Result<(), MessagePackError> {
+        if depth >= MAX_MESSAGEPACK_DEPTH {
+            return Err(MessagePackError::DepthExceeded {
+                maximum: MAX_MESSAGEPACK_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_collection(
+        &self,
+        kind: MessagePackLengthKind,
+        length: u32,
+    ) -> Result<(), MessagePackError> {
+        if length > MAX_MESSAGEPACK_COLLECTION_ITEMS {
+            return Err(MessagePackError::DeclaredLengthExceeded {
+                kind,
+                declared: length,
+                maximum: MAX_MESSAGEPACK_COLLECTION_ITEMS,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_u8(&mut self) -> Result<u8, MessagePackError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, MessagePackError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, MessagePackError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn skip(&mut self, length: usize) -> Result<(), MessagePackError> {
+        self.take(length).map(|_| ())
+    }
+
+    fn take(&mut self, length: usize) -> Result<&[u8], MessagePackError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(MessagePackError::Truncated {
+                offset: self.offset_u32(),
+            })?;
+        if end > self.bytes.len() {
+            return Err(MessagePackError::Truncated {
+                offset: self.offset_u32(),
+            });
+        }
+        let bytes = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn offset_u32(&self) -> u32 {
+        u32::try_from(self.offset).unwrap_or(u32::MAX)
+    }
+}
+
 enum PayloadTag {
     Hello,
     Capabilities,
@@ -997,8 +1523,12 @@ impl Serialize for ConnectPayloadWire {
             Self::BrowserExtension(value) => map.serialize_entry("browser_extension", value)?,
             Self::Chunk(value) => map.serialize_entry("chunk", value)?,
             Self::Error(value) => map.serialize_entry("error", value)?,
-            Self::Extension(value) => map.serialize_entry("extension", value)?,
-            Self::Unknown(value) => map.serialize_entry("unknown", value)?,
+            Self::Extension(value) => {
+                map.serialize_entry("extension", &GenericExtensionPayloadWire::from(value))?
+            }
+            Self::Unknown(value) => {
+                map.serialize_entry("unknown", &UnknownPayloadWire::from(value))?
+            }
         }
         map.end()
     }
@@ -1048,8 +1578,18 @@ impl<'de> Deserialize<'de> for ConnectPayloadWire {
                     }
                     PayloadTag::Chunk => ConnectPayloadWire::Chunk(map.next_value()?),
                     PayloadTag::Error => ConnectPayloadWire::Error(map.next_value()?),
-                    PayloadTag::Extension => ConnectPayloadWire::Extension(map.next_value()?),
-                    PayloadTag::Unknown => ConnectPayloadWire::Unknown(map.next_value()?),
+                    PayloadTag::Extension => {
+                        let value = map.next_value::<GenericExtensionPayloadWire>()?;
+                        ConnectPayloadWire::Extension(
+                            GenericExtensionPayload::try_from(value).map_err(de::Error::custom)?,
+                        )
+                    }
+                    PayloadTag::Unknown => {
+                        let value = map.next_value::<UnknownPayloadWire>()?;
+                        ConnectPayloadWire::Unknown(
+                            UnknownPayload::try_from(value).map_err(de::Error::custom)?,
+                        )
+                    }
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(

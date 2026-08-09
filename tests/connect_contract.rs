@@ -1,13 +1,14 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
     payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkFrame, ConnectEnvelope,
-    ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectTransport, ConnectionId,
-    FramedConnectTransport, GenericExtensionPayload, PayloadKind, SessionId, UnknownPayload,
+    ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectTransport, ConnectTransportError,
+    ConnectionId, EnvelopeError, FramedConnectTransport, GenericExtensionPayload, PayloadError,
+    PayloadKind, SessionId, UnknownPayload,
 };
 use devmanager::domain::command::CommandReceipt;
 use devmanager::domain::event::DomainEvent;
@@ -21,11 +22,11 @@ use devmanager::domain::query::{
 };
 use devmanager::domain::snapshot::{
     canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
-    ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection,
+    ArtifactContentPage, EventPage, SnapshotItemKey, SnapshotPage, SnapshotSection,
 };
 use devmanager::protocol::{
-    ChunkError, ClientRequest, PhysicalFrameCodec, ProtocolVersion, ServerMessage, StreamFrame,
-    StreamKey, StreamPayloadKind,
+    ChunkError, ClientRequest, PhysicalFrameCodec, PhysicalFrameError, ProtocolVersion,
+    ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -563,6 +564,22 @@ struct RawChunkPayload {
     chunk: ChunkFrame,
 }
 
+#[derive(Serialize)]
+struct RawSnapshotPage {
+    snapshot_id: SnapshotId,
+    through_sequence: u64,
+    section: SnapshotSection,
+    after_item: Option<SnapshotItemKey>,
+    items: Vec<()>,
+    encoded_bytes: u32,
+    next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct RawSnapshotPayload {
+    snapshot_page: RawSnapshotPage,
+}
+
 #[derive(Default)]
 struct LoopbackIo {
     bytes: Vec<u8>,
@@ -599,6 +616,61 @@ impl Write for LoopbackIo {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct FailureIo {
+    bytes: Vec<u8>,
+    read_offset: usize,
+    fail_write: bool,
+    fail_flush: bool,
+}
+
+impl FailureIo {
+    fn writer(fail_write: bool, fail_flush: bool) -> Self {
+        Self {
+            bytes: Vec::new(),
+            read_offset: 0,
+            fail_write,
+            fail_flush,
+        }
+    }
+}
+
+impl Read for FailureIo {
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+        if self.read_offset >= self.bytes.len() || destination.is_empty() {
+            return Ok(0);
+        }
+        let available = self.bytes.len() - self.read_offset;
+        let length = available.min(destination.len());
+        destination[..length]
+            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
+        self.read_offset += length;
+        Ok(length)
+    }
+}
+
+impl Write for FailureIo {
+    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
+        if self.fail_write {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "injected write failure",
+            ));
+        }
+        self.bytes.extend_from_slice(source);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.fail_flush {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "injected flush failure",
+            ));
+        }
         Ok(())
     }
 }
@@ -711,16 +783,307 @@ fn production_transport_applies_one_negotiated_limit_set_on_send_and_receive() {
         ConnectPayload::Chunk(chunk.clone()),
     )
     .expect("wide chunk envelope");
-    let oversized_wire = wire_with_payload(&chunk_envelope, RawChunkPayload { chunk });
+    let mut oversized_wire = wire_with_payload(&chunk_envelope, RawChunkPayload { chunk });
+    oversized_wire.limits = oversize_limits;
     let mut receiver = FramedConnectTransport::with_negotiated_limits(
         LoopbackIo::with_bytes(framed_raw(&oversized_wire, oversize_limits)),
         oversize_limits,
     )
     .expect("oversized receiver");
-    assert!(
-        receiver.receive().is_err(),
-        "oversized chunk crossed no boundary"
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
+            PayloadError::Limits(devmanager::connect::ConnectLimitError::ChunkExceeded {
+                declared: 3,
+                maximum: 2,
+            })
+        )))
+    ));
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+}
+
+#[test]
+fn frame_and_partial_io_failures_permanently_close_transport() {
+    let limits = ConnectLimits::v1_default();
+    let envelope = ConnectEnvelope::new(
+        binding(86),
+        1,
+        Some(domain_id::<RequestId>(86)),
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        query_payload(86),
+    )
+    .expect("valid envelope");
+
+    let mut partial_header = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(vec![0, 0, 0]),
+        limits,
+    )
+    .expect("partial header receiver");
+    assert!(matches!(
+        partial_header.receive(),
+        Err(ConnectTransportError::Frame(
+            PhysicalFrameError::ReadHeader { .. }
+        ))
+    ));
+    assert!(matches!(
+        partial_header.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+
+    let mut partial_payload = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(vec![0, 0, 0, 2, 1]),
+        limits,
+    )
+    .expect("partial payload receiver");
+    assert!(matches!(
+        partial_payload.receive(),
+        Err(ConnectTransportError::Frame(
+            PhysicalFrameError::ReadPayload { declared: 2, .. }
+        ))
+    ));
+    assert!(matches!(
+        partial_payload.send(envelope.clone()),
+        Err(ConnectTransportError::Closed)
+    ));
+
+    let mut write_failed =
+        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(true, false), limits)
+            .expect("write-failure transport");
+    assert!(matches!(
+        write_failed.send(envelope.clone()),
+        Err(ConnectTransportError::Frame(
+            PhysicalFrameError::WriteHeader { .. }
+        ))
+    ));
+    assert!(matches!(
+        write_failed.send(envelope.clone()),
+        Err(ConnectTransportError::Closed)
+    ));
+
+    let mut flush_failed =
+        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(false, true), limits)
+            .expect("flush-failure transport");
+    assert!(matches!(
+        flush_failed.send(envelope.clone()),
+        Err(ConnectTransportError::Flush {
+            kind: ErrorKind::BrokenPipe
+        })
+    ));
+    assert!(matches!(
+        flush_failed.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+
+    let mut close_failed =
+        FramedConnectTransport::with_negotiated_limits(FailureIo::writer(false, true), limits)
+            .expect("close-failure transport");
+    assert!(matches!(
+        close_failed.close(),
+        Err(ConnectTransportError::Flush {
+            kind: ErrorKind::BrokenPipe
+        })
+    ));
+    assert!(matches!(
+        close_failed.send(envelope),
+        Err(ConnectTransportError::Closed)
+    ));
+}
+
+#[test]
+fn physical_receive_limit_is_capped_by_reassembled_message_limit_before_allocation() {
+    let limits =
+        ConnectLimits::try_new(4096, 1024, 10, 2048, 512, 1024, 128).expect("bounded limits");
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes((1025_u32).to_be_bytes().to_vec()),
+        limits,
+    )
+    .expect("receiver");
+
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Frame(
+            PhysicalFrameError::Oversized {
+                declared: 1025,
+                maximum: 1024,
+            }
+        ))
+    ));
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+}
+
+#[test]
+fn declared_limits_are_compared_before_semantic_validation() {
+    let negotiated =
+        ConnectLimits::try_new(4096, 8192, 2, 2048, 512, 1024, 128).expect("negotiated limits");
+    let declared =
+        ConnectLimits::try_new(4096, 8192, 1, 2048, 512, 1024, 128).expect("declared limits");
+    let envelope = ConnectEnvelope::new(
+        binding(83),
+        1,
+        None,
+        None,
+        negotiated,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::SnapshotPage(empty_snapshot_page(83)),
+    )
+    .expect("page envelope");
+    let mut wire = wire_with_payload(
+        &envelope,
+        RawSnapshotPayload {
+            snapshot_page: RawSnapshotPage {
+                snapshot_id: domain_id(83),
+                through_sequence: 4,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: vec![(), ()],
+                encoded_bytes: 0,
+                next_cursor: None,
+            },
+        },
     );
+    wire.limits = declared;
+    let result = ConnectEnvelope::decode_with_limits(
+        &rmp_serde::to_vec_named(&wire).expect("wire fixture"),
+        negotiated,
+    );
+    assert!(matches!(
+        result,
+        Err(EnvelopeError::NegotiatedLimitsMismatch)
+    ));
+}
+
+#[test]
+fn nested_chunk_page_and_cursor_sizes_are_rejected_before_payload_decode() {
+    let limits = ConnectLimits::try_new(4096, 8192, 1, 2048, 2, 4, 2).expect("tight limits");
+
+    let chunk_payload = b"bad".to_vec();
+    let chunk = ChunkFrame::new(
+        domain_id::<TransferId>(84),
+        0,
+        true,
+        chunk_payload.clone(),
+        cumulative_sha256(&[&chunk_payload]),
+        None,
+    )
+    .expect("shape-valid chunk");
+    let chunk_bytes =
+        rmp_serde::to_vec_named(&RawChunkPayload { chunk }).expect("chunk wire fixture");
+    let chunk_error = ConnectPayload::decode(PayloadKind::CHUNK, 1, &chunk_bytes, limits)
+        .expect_err("oversized chunk must fail before decode");
+    assert!(matches!(
+        chunk_error,
+        PayloadError::Limits(devmanager::connect::ConnectLimitError::ChunkExceeded {
+            declared: 3,
+            maximum: 2,
+        })
+    ));
+
+    let page_envelope = ConnectEnvelope::new(
+        binding(85),
+        1,
+        None,
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::SnapshotPage(empty_snapshot_page(85)),
+    )
+    .expect("page envelope");
+    let oversized_page = wire_with_payload(
+        &page_envelope,
+        RawSnapshotPayload {
+            snapshot_page: RawSnapshotPage {
+                snapshot_id: domain_id(85),
+                through_sequence: 4,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: vec![(), ()],
+                encoded_bytes: 0,
+                next_cursor: None,
+            },
+        },
+    );
+    let page_bytes = rmp_serde::to_vec_named(&oversized_page).expect("page wire fixture");
+    let page_error = ConnectEnvelope::decode_with_limits(&page_bytes, limits)
+        .expect_err("oversized page must fail before decode");
+    assert!(matches!(
+        page_error,
+        EnvelopeError::Payload(PayloadError::Limits(
+            devmanager::connect::ConnectLimitError::PageItemsExceeded {
+                declared: 2,
+                maximum: 1,
+            }
+        ))
+    ));
+
+    let oversized_cursor = wire_with_payload(
+        &page_envelope,
+        RawSnapshotPayload {
+            snapshot_page: RawSnapshotPage {
+                snapshot_id: domain_id(85),
+                through_sequence: 4,
+                section: SnapshotSection::Tasks,
+                after_item: None,
+                items: Vec::new(),
+                encoded_bytes: 0,
+                next_cursor: Some(vec![0, 1, 2]),
+            },
+        },
+    );
+    let cursor_bytes = rmp_serde::to_vec_named(&oversized_cursor).expect("cursor wire fixture");
+    let cursor_error = ConnectEnvelope::decode_with_limits(&cursor_bytes, limits)
+        .expect_err("oversized cursor must fail before decode");
+    assert!(matches!(
+        cursor_error,
+        EnvelopeError::Payload(PayloadError::Limits(
+            devmanager::connect::ConnectLimitError::CursorExceeded {
+                declared: 3,
+                maximum: 2,
+            }
+        ))
+    ));
+}
+
+#[test]
+fn envelope_errors_permanently_close_transport_for_send_and_receive() {
+    let limits = ConnectLimits::v1_default();
+    let envelope = ConnectEnvelope::new(
+        binding(86),
+        1,
+        Some(domain_id::<RequestId>(86)),
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        query_payload(86),
+    )
+    .expect("query envelope");
+    let mut invalid = wire_for(&envelope);
+    invalid.sequence = 0;
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&invalid, limits)),
+        limits,
+    )
+    .expect("receiver");
+
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Envelope(_))
+    ));
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+    assert!(matches!(
+        receiver.send(envelope),
+        Err(ConnectTransportError::Closed)
+    ));
 }
 
 #[test]
@@ -944,6 +1307,32 @@ fn unknown_payloads_are_bounded_inert_and_generic_extensions_are_typed() {
         ConnectPayload::Extension(GenericExtensionPayload::new(0x33, 1, vec![4, 5]).unwrap());
     extension.validate(limits).expect("generic extension");
     assert!(!extension.is_action());
+}
+
+#[test]
+fn opaque_payloads_expose_checked_getters_and_reject_hard_oversize() {
+    let kind = PayloadKind::new(0x7ffe).expect("unknown kind");
+    let unknown = UnknownPayload::new(kind, 9, vec![1, 2, 3]).expect("unknown payload");
+    assert_eq!(unknown.kind(), kind);
+    assert_eq!(unknown.version(), 9);
+    assert_eq!(unknown.payload(), &[1, 2, 3]);
+    assert!(UnknownPayload::new(
+        kind,
+        9,
+        vec![0; devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize + 1]
+    )
+    .is_err());
+
+    let extension = GenericExtensionPayload::new(0x33, 1, vec![4, 5]).expect("extension");
+    assert_eq!(extension.type_id(), 0x33);
+    assert_eq!(extension.schema_version(), 1);
+    assert_eq!(extension.payload(), &[4, 5]);
+    assert!(GenericExtensionPayload::new(
+        0x33,
+        1,
+        vec![0; devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize + 1]
+    )
+    .is_err());
 }
 
 fn hex_fixture(value: &str) -> Vec<u8> {

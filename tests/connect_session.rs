@@ -3,12 +3,11 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    decode_inner, encode_inner, ActionId, ChannelBinding, ChannelId,
-    ConnectEnvelope, ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectRole,
-    ConnectTransport, EphemeralPresence, LastSenderHint, PermissionDecision,
-    PermissionDenyReason, PermissionEvaluator, PermissionRequest, ProjectionExtensions,
-    ProjectionSource, ReplayRequest, SnapshotRequest, PresenceSink, MAX_CONNECT_RESUME_CURSOR_BYTES,
-    ConnectionId, SessionId,
+    ActionId, ChannelBinding, ChannelId, ConnectEnvelope, ConnectLimits, ConnectPayload,
+    ConnectPrivacyClass, ConnectRole, ConnectTransport, ConnectionId, EphemeralPresence,
+    LastSenderHint, PermissionDecision, PermissionDenyReason, PermissionEvaluator,
+    PermissionRequest, PresenceSink, ProjectionExtensions, ProjectionSource, ReplayRequest,
+    SessionId, SnapshotRequest, MAX_CONNECT_RESUME_CURSOR_BYTES,
 };
 use devmanager::domain::id::{ClientId, RequestId, SnapshotId, TaskId};
 use devmanager::domain::query::{Query, QueryEnvelope, QueryReply};
@@ -74,18 +73,20 @@ fn fixture_envelope() -> ConnectEnvelope {
 #[test]
 fn typed_inner_envelope_is_deterministic_and_round_trips() {
     let envelope = fixture_envelope();
-    let encoded = encode_inner(&envelope).expect("encode inner");
+    let encoded = envelope.encode().expect("encode inner");
     assert!(!encoded.is_empty());
-    assert_eq!(encoded, encode_inner(&envelope).expect("encode again"));
-    assert_eq!(decode_inner(&encoded).expect("decode inner"), envelope);
+    assert_eq!(encoded, envelope.encode().expect("encode again"));
+    assert_eq!(
+        ConnectEnvelope::decode(&encoded).expect("decode inner"),
+        envelope
+    );
 }
 
 #[test]
 fn unknown_payload_remains_inert_without_mutable_envelope_discriminants() {
     let kind = devmanager::connect::PayloadKind::new(0x7fff).expect("unknown nonzero kind");
     let payload = ConnectPayload::Unknown(
-        devmanager::connect::UnknownPayload::new(kind, 9, vec![1, 2, 3])
-            .expect("unknown payload"),
+        devmanager::connect::UnknownPayload::new(kind, 9, vec![1, 2, 3]).expect("unknown payload"),
     );
     let envelope = ConnectEnvelope::new(
         ChannelBinding::new(
@@ -104,15 +105,34 @@ fn unknown_payload_remains_inert_without_mutable_envelope_discriminants() {
 
     assert_eq!(envelope.known_payload_kind(), None);
     assert!(!envelope.is_action_payload());
-    assert_eq!(decode_inner(&encode_inner(&envelope).unwrap()).unwrap(), envelope);
+    assert_eq!(
+        ConnectEnvelope::decode(&envelope.encode().unwrap()).unwrap(),
+        envelope
+    );
 }
 
 #[test]
 fn negotiated_limits_bound_pages_chunks_and_cumulative_transfer() {
-    let local = ConnectLimits::try_new(8 * 1024, 64 * 1024, 100, 32 * 1024, 8 * 1024, 48 * 1024, 1024)
-        .expect("local limits");
-    let peer = ConnectLimits::try_new(16 * 1024, 32 * 1024, 200, 16 * 1024, 4 * 1024, 24 * 1024, 2048)
-        .expect("peer limits");
+    let local = ConnectLimits::try_new(
+        8 * 1024,
+        64 * 1024,
+        100,
+        32 * 1024,
+        8 * 1024,
+        48 * 1024,
+        1024,
+    )
+    .expect("local limits");
+    let peer = ConnectLimits::try_new(
+        16 * 1024,
+        32 * 1024,
+        200,
+        16 * 1024,
+        4 * 1024,
+        24 * 1024,
+        2048,
+    )
+    .expect("peer limits");
     let negotiated = local.negotiate(peer).expect("negotiate limits");
     assert_eq!(negotiated.max_physical_frame_bytes, 8 * 1024);
     assert_eq!(negotiated.max_reassembled_message_bytes, 32 * 1024);
@@ -171,7 +191,9 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
     );
     assert!(matches!(
         evaluator.evaluate(PermissionRequest {
-            role: ConnectRole::Collaborator { task_id: other_task },
+            role: ConnectRole::Collaborator {
+                task_id: other_task
+            },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
         }),
@@ -232,7 +254,7 @@ impl ConnectTransport for MemoryTransport {
 
     fn send(&mut self, envelope: ConnectEnvelope) -> Result<(), Self::Error> {
         self.frames
-            .push_back(encode_inner(&envelope).expect("encode inner envelope"));
+            .push_back(envelope.encode().expect("encode inner envelope"));
         Ok(())
     }
 
@@ -240,7 +262,7 @@ impl ConnectTransport for MemoryTransport {
         Ok(self
             .frames
             .pop_front()
-            .map(|frame| decode_inner(&frame).expect("decode inner")))
+            .map(|frame| ConnectEnvelope::decode(&frame).expect("decode inner")))
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
@@ -252,8 +274,8 @@ impl ConnectTransport for MemoryTransport {
 #[test]
 fn transport_trait_keeps_inner_semantics_identical() {
     let envelope = fixture_envelope();
-    let direct_bytes = encode_inner(&envelope).expect("direct inner bytes");
-    let relay_bytes = encode_inner(&envelope).expect("relay inner bytes");
+    let direct_bytes = envelope.encode().expect("direct inner bytes");
+    let relay_bytes = envelope.encode().expect("relay inner bytes");
     assert_eq!(direct_bytes, relay_bytes);
 
     let mut transport = MemoryTransport {
@@ -329,7 +351,9 @@ fn projection_source_reuses_bounded_domain_pages_and_optional_extensions() {
     assert_eq!(snapshot.items.len(), 0);
     let mut oversized_snapshot = snapshot.clone();
     oversized_snapshot.next_cursor = Some(vec![0; MAX_CONNECT_RESUME_CURSOR_BYTES + 1]);
-    assert!(devmanager::connect::validate_snapshot_page(&oversized_snapshot, page_limits).is_err());
+    assert!(ConnectPayload::SnapshotPage(oversized_snapshot)
+        .validate(ConnectLimits::v1_default())
+        .is_err());
 
     let replay = source
         .event_page(ReplayRequest {
@@ -342,7 +366,9 @@ fn projection_source_reuses_bounded_domain_pages_and_optional_extensions() {
     assert_eq!(replay.after_sequence, 4);
     let mut oversized_replay = replay.clone();
     oversized_replay.next_cursor = Some(vec![0; MAX_CONNECT_RESUME_CURSOR_BYTES + 1]);
-    assert!(devmanager::connect::validate_event_page(&oversized_replay, page_limits).is_err());
+    assert!(ConnectPayload::EventPage(oversized_replay)
+        .validate(ConnectLimits::v1_default())
+        .is_err());
 
     let reply = source
         .query(QueryEnvelope {

@@ -147,15 +147,24 @@ impl<T: Read + Write> ConnectTransport for FramedConnectTransport<T> {
             return Err(ConnectTransportError::Closed);
         }
         if envelope.limits() != self.negotiated {
+            self.closed = true;
             return Err(ConnectTransportError::NegotiatedLimitsMismatch);
         }
-        let encoded = envelope.encode().map_err(ConnectTransportError::Envelope)?;
-        self.frame
-            .write(&mut self.io, &encoded)
-            .map_err(ConnectTransportError::Frame)?;
-        self.io
-            .flush()
-            .map_err(|error| ConnectTransportError::Flush { kind: error.kind() })?;
+        let encoded = match envelope.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.closed = true;
+                return Err(ConnectTransportError::Envelope(error));
+            }
+        };
+        if let Err(error) = self.frame.write(&mut self.io, &encoded) {
+            self.closed = true;
+            return Err(ConnectTransportError::Frame(error));
+        }
+        if let Err(error) = self.io.flush() {
+            self.closed = true;
+            return Err(ConnectTransportError::Flush { kind: error.kind() });
+        }
         Ok(())
     }
 
@@ -163,21 +172,28 @@ impl<T: Read + Write> ConnectTransport for FramedConnectTransport<T> {
         if self.closed {
             return Err(ConnectTransportError::Closed);
         }
-        let encoded = self
-            .frame
-            .read(&mut self.io)
-            .map_err(ConnectTransportError::Frame)?;
-        ConnectEnvelope::decode_with_limits(&encoded, self.negotiated)
-            .map(Some)
-            .map_err(ConnectTransportError::Envelope)
+        let encoded = match self.frame.read(&mut self.io) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.closed = true;
+                return Err(ConnectTransportError::Frame(error));
+            }
+        };
+        match ConnectEnvelope::decode_with_limits(&encoded, self.negotiated) {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(error) => {
+                self.closed = true;
+                Err(ConnectTransportError::Envelope(error))
+            }
+        }
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
         if !self.closed {
-            self.io
-                .flush()
-                .map_err(|error| ConnectTransportError::Flush { kind: error.kind() })?;
             self.closed = true;
+            if let Err(error) = self.io.flush() {
+                return Err(ConnectTransportError::Flush { kind: error.kind() });
+            }
         }
         Ok(())
     }

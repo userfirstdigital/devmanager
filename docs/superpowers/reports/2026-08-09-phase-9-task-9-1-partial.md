@@ -1,11 +1,9 @@
-# Phase 9 Task 9.1 partial report
+# Phase 9 Task 9.1 wire-boundary security report
 
-Status: PARTIAL — Batch1 Rust contract repair is complete in the isolated
-`phase-9-1a-wire-catalog` worktree. Batch2-A canonical page-sizing proof is
-complete in the isolated `phase-9-1b-page-sizing` worktree. Connect Slice C's
-bounded Rust integration is implemented and its focused contracts are green in
-the isolated `phase-9-1d-connect-integration` worktree; cross-language/service
-gates remain deferred.
+Status: COMPLETE for the independent Rust Connect wire-boundary findings owned
+by the clean `622dfcf` baseline in the isolated
+`phase-9-1d-connect-integration` worktree. Cross-language, service, pairing,
+relay, and UI gates remain deferred by scope.
 
 ## Implemented
 
@@ -48,6 +46,25 @@ gates remain deferred.
   constructor, serde, hash, context, poison, and limit algorithms were
   removed; Connect's negotiated chunk/cursor checks delegate to canonical
   `protocol::ChunkLimits` while retaining the envelope limit schema.
+- Receive derives an effective physical limit as the minimum of negotiated
+  physical-frame and reassembled-message budgets. The physical frame codec
+  validates that limit before reserving or resizing payload storage.
+- Envelope receive performs a minimal named outer decode, compares the
+  wire-declared `ConnectLimits` with the negotiated limits, and only then runs
+  a borrowed, allocation-free MessagePack wire preflight. The preflight
+  rejects negotiated chunk bytes, page item counts/page bytes, cursor arrays or
+  binaries, and opaque payload sizes before typed `Vec`/`String` materializes
+  or semantic state is mutated.
+- Frame/header/partial-I/O, envelope, canonical, negotiated-limit, write, and
+  flush failures permanently close `FramedConnectTransport`; subsequent send
+  and receive calls return the typed `Closed` error.
+- `UnknownPayload` and `GenericExtensionPayload` now have private fields and
+  private serde wire DTOs. Checked constructors enforce nonzero kind/version
+  metadata and the hard reassembled payload bound; public access is through
+  checked getters and the Connect codec boundary.
+- `connect_session` now exercises `ConnectEnvelope::encode` and
+  `ConnectEnvelope::decode` directly and validates pages through
+  `ConnectPayload`, with no removed-helper imports or stale compilation path.
 
 ## TDD and verification evidence
 
@@ -60,24 +77,36 @@ gates remain deferred.
   connect_session -- --nocapture`: 11 + 42 + 8 passed.
 - `cargo check --lib`: passed.
 - `rustfmt --edition 2021 --check` passed for the owned Rust files.
-- `cargo fmt --all -- --check` still reports only the preserved salvage
-  formatting in `tests/connect_session.rs`; that file was not rewritten.
+- The historical Batch1 owned-file rustfmt check passed; the final full
+  `cargo fmt --all -- --check` is recorded below.
 - Final `git diff --check` and owned-path audit: passed.
 
-## Connect Slice C focused verification
+## Wire-boundary security verification
 
-- RED was observed first: the new contract tests rejected the old Connect
-  five-argument chunk constructor/signature and the stale outgoing envelope
-  page claim with the expected compile/runtime failures.
-- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-connect'; cargo test --test connect_contract --test connect_session --test protocol_contract -- --nocapture`:
-  13 + 8 + 50 passed, 0 failed, 0 ignored.
-- The focused run emitted only preserved library warnings. No Cargo, rustc,
-  rustdoc, or Rust test-harness process remained for the isolated target after
-  completion.
-- The hard 18-minute cutoff was reached while the focused gate was running;
-  no additional rustfmt, diff-check, full-suite, push, merge, install, tag, or
-  publish gate was started afterward. The Slice C worktree remains uncommitted
-  pending those intentionally skipped final checks.
+- RED was observed first on the clean `622dfcf` baseline: `connect_session`
+  still imported removed `encode_inner`/`decode_inner` helpers, and the new
+  boundary assertions exposed allocation-order, declared-limit-order, and
+  terminal-close gaps.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-security-final'; cargo
+  test --test connect_contract --test connect_session -- --nocapture`:
+  `connect_contract`: 21 passed; `connect_session`: 8 passed; 0 failed,
+  0 ignored. This includes exact oversized chunk/page/cursor errors,
+  pre-physical-allocation reassembled-frame rejection, declared-limit
+  precedence, and partial-I/O/write/flush terminal-closure proofs.
+- The focused run emitted only pre-existing library warnings. The isolated
+  Cargo/rustc/test-harness process tree was checked after the run and no
+  worker-owned Rust processes remained; unrelated global compiler processes
+  were left untouched.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-security-final'; cargo
+  check --lib`: passed with only pre-existing library warnings.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-security-final'; cargo
+  test --lib -- --test-threads=1`: 1,198 passed, 1 ignored, 0 failed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed. The final
+  worktree audit contains only the Connect envelope/schema/transport and
+  contract/session test changes plus this report; no `mod.rs` edit was needed.
+- The target-scoped residue check found no Cargo, rustc, rustdoc, or Rust
+  test-harness process after verification. No installed app, browser,
+  provider, profile, UI, live service, or production persistence was used.
 
 ## Batch2-A page-sizing verification
 
@@ -91,12 +120,13 @@ gates remain deferred.
 - `git diff --check`: passed. The scoped residue check found 0 slice-owned
   Cargo, rustc, or Rust test-harness processes after verification; unrelated
   global compiler processes were left untouched.
-- Connect Slice C is explicitly deferred. Batch2-A makes no claim for
-  cross-language codec, transport, pairing, relay, or live-service coverage.
+- The Batch2-A record makes no claim for cross-language codec, pairing, relay,
+  or live-service coverage; the bounded Rust wire-boundary follow-up is
+  recorded above.
 
 ## Explicit later gates
 
-This partial does not implement and does not claim to prove:
+This report does not implement and does not claim to prove:
 
 - paired Rust/TypeScript codec generation, TypeScript fixture decoding, or
   Portal/web protocol tests;
@@ -109,9 +139,9 @@ This partial does not implement and does not claim to prove:
 - host/kernel command integration, provider/browser/process/prompt behavior,
   UI, `AppData`, or `session.json` changes;
 - migration or porting of legacy `RemoteAction` or `WriterLease` semantics.
-- Connect Slice C cross-language codec, pairing, relay, and live-service work
-  remain explicitly deferred; the bounded Rust page/chunk integration is
-  covered by the focused evidence above.
+- Cross-language codec, pairing, relay, and live-service work remain explicitly
+  deferred; the bounded Rust page/chunk integration is covered by the focused
+  evidence above.
 
 No live service, installed DevManager, browser, or production persistence was
 used or modified.
