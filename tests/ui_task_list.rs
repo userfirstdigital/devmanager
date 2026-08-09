@@ -212,6 +212,32 @@ fn navigation_mouse_down_commits_only_tasks_in_the_current_bounded_inbox() {
 }
 
 #[test]
+fn stale_navigation_invalidates_an_active_terminal_owner() {
+    let first = task_id_from_index(4);
+    let second = task_id_from_index(5);
+    let model = model_from_ids(&[first, second]);
+    let inbox = TaskList::from_model(&model);
+    let mut shell = Shell::new(Some(first));
+    let epoch = shell.navigation_epoch();
+    let owner = shell
+        .terminal_mouse_down(8, first, PointerButton::Primary, epoch, Some(first))
+        .expect("selected task owns the pointer before stale navigation");
+
+    assert_eq!(
+        shell.navigation_mouse_down(second, epoch + 1, &inbox),
+        NavigationResult::Rejected {
+            reason: NavigationRejection::StaleEpoch,
+        }
+    );
+    assert_eq!(
+        shell.terminal_mouse_up(Some(owner)),
+        TerminalRelease::Rejected(ReleaseRejection::NoOwner)
+    );
+    assert_eq!(shell.selected_task(), Some(first));
+    assert_eq!(shell.navigation_epoch(), epoch);
+}
+
+#[test]
 fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
     let open = task_id_from_index(11);
     let archived = task_id_from_index(12);

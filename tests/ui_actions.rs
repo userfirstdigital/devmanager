@@ -82,7 +82,13 @@ fn action_projection_reuses_every_shared_id_and_adds_accessible_presentation() {
                 entry.id()
             );
             if expected_disabled {
-                assert!(entry.disabled_reason().is_some());
+                let reason = entry
+                    .disabled_reason()
+                    .expect("disabled actions expose a reason");
+                assert!(entry.accessibility().disabled);
+                assert_eq!(entry.accessibility().description, reason);
+            } else {
+                assert!(!entry.accessibility().disabled);
             }
         }
     }
@@ -165,5 +171,14 @@ fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
             disabled.focus_epoch()
         ),
         Some(KeyboardAction::DismissTransient)
+    );
+    assert_eq!(
+        model.activate(
+            KeyboardShortcut::escape(),
+            &disabled,
+            disabled.focus_epoch() + 1
+        ),
+        None,
+        "Escape may bypass disabled state but never a stale focus epoch"
     );
 }
