@@ -175,16 +175,18 @@ impl ActionRequest {
     }
 
     pub fn descriptor(&self) -> &'static ActionDescriptor {
-        catalog()
-            .iter()
-            .find(|descriptor| descriptor.id == self.id())
-            .expect("every ActionRequest must have a catalog descriptor")
+        descriptor(self.id()).expect("every ActionRequest must have a catalog descriptor")
     }
 }
 
 /// Return the closed catalog for this slice.
 pub fn catalog() -> &'static [ActionDescriptor] {
     ACTIONS
+}
+
+/// Resolve one stable action id through the single shared catalog.
+pub fn descriptor(id: &str) -> Option<&'static ActionDescriptor> {
+    catalog().iter().find(|action| action.id == id)
 }
 
 /// Fail when two descriptors share a stable id.

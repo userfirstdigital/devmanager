@@ -106,26 +106,33 @@
   "selected_task_id": "018f60b0-9c1a-7001-8000-000000000021",
   "top_bar": {
     "now_ms": 1725000100000,
+    "generation": 7,
     "host": {
       "identity": {
         "host_id": "local-host",
         "revision": 17
       },
-      "health": "healthy"
+      "health": "healthy",
+      "observed_at_ms": 1725000099000,
+      "generation": 7
     },
     "connect": {
       "identity": {
         "host_id": "local-host",
         "connection_epoch": 3
       },
-      "state": "connected"
+      "state": "connected",
+      "observed_at_ms": 1725000099000,
+      "generation": 7
     },
     "update": {
       "identity": {
         "current_version": "0.4.2",
         "target_version": "0.5.0"
       },
-      "state": "available"
+      "state": "available",
+      "observed_at_ms": 1725000099000,
+      "generation": 7
     },
     "quotas": [
       {
@@ -135,7 +142,8 @@
           "observation_id": 8
         },
         "detail": "72% remaining",
-        "observed_at_ms": 1725000095000
+        "observed_at_ms": 1725000095000,
+        "generation": 7
       },
       {
         "identity": {
@@ -144,7 +152,8 @@
           "observation_id": 9
         },
         "detail": "41% remaining",
-        "observed_at_ms": 1724996499000
+        "observed_at_ms": 1724996499000,
+        "generation": 7
       },
       {
         "identity": {
@@ -153,14 +162,18 @@
           "observation_id": 10
         },
         "detail": null,
-        "observed_at_ms": 1725000099000
+        "observed_at_ms": 1725000099000,
+        "generation": 7
       }
     ],
     "resources": {
       "cpu_percent": 125.0,
+      "cpu_input_unit": "legacy_core_total_percent",
       "memory_bytes": 12345678,
       "logical_cpu_count": 64,
-      "observed_at_ms": 1725000099000
+      "cpu_observed_at_ms": 1725000099000,
+      "memory_observed_at_ms": 1725000099000,
+      "generation": 7
     }
   }
 }
