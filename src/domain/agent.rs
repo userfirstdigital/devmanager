@@ -1,8 +1,162 @@
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
+use rusqlite::ToSql;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::canonical;
 use crate::domain::id::{AgentSessionId, TaskId};
+
+/// Maximum UTF-8 byte length accepted for an opaque provider-issued session ID.
+pub const MAX_PROVIDER_SESSION_ID_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSessionIdError {
+    Empty,
+    ContainsControlCharacter,
+    TooLong,
+}
+
+impl std::fmt::Display for ProviderSessionIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "provider session id must be non-empty"),
+            Self::ContainsControlCharacter => {
+                write!(f, "provider session id must not contain control characters")
+            }
+            Self::TooLong => write!(
+                f,
+                "provider session id exceeds {MAX_PROVIDER_SESSION_ID_BYTES} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderSessionIdError {}
+
+/// An exact, provider-issued conversation identity.
+///
+/// This type intentionally does not trim, normalize, parse, or infer the
+/// value. The provider's bytes remain the resume key; only safety bounds are
+/// enforced at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ProviderSessionId(String);
+
+impl ProviderSessionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProviderSessionIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProviderSessionIdError::Empty);
+        }
+        if value.len() > MAX_PROVIDER_SESSION_ID_BYTES {
+            return Err(ProviderSessionIdError::TooLong);
+        }
+        if value.chars().any(is_unsafe_provider_session_character) {
+            return Err(ProviderSessionIdError::ContainsControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl Deref for ProviderSessionId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for ProviderSessionId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for ProviderSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ProviderSessionId {
+    type Err = ProviderSessionIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ProviderSessionId {
+    type Error = ProviderSessionIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for ProviderSessionId {
+    type Error = ProviderSessionIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderSessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+impl ToSql for ProviderSessionId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.validate()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.0.to_sql()
+    }
+}
+
+impl FromSql for ProviderSessionId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = value.as_str()?;
+        Self::new(value.to_owned()).map_err(|error| FromSqlError::Other(Box::new(error)))
+    }
+}
+
+impl ProviderSessionId {
+    fn validate(&self) -> Result<(), ProviderSessionIdError> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+fn is_unsafe_provider_session_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200b}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'
+                | '\u{2061}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentValidationError {

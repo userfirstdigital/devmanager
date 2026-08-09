@@ -21,11 +21,16 @@ pub use adapter::{
 pub use capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilityState,
     CapabilityStatus, CapabilitySupport, EvidenceDiagnostic, EvidenceDiagnosticCode,
-    EvidenceSourceId, EvidenceStatus, ProviderAuthState, ProviderCapabilities,
-    ProviderCapabilitiesError, ProviderCapability, ProviderExecutable, ProviderExecutableError,
-    ProviderExecutablePolicy, ProviderExecutablePolicyError, ProviderExecutablePolicyViolation,
-    ProviderKind, ProviderVersion, ProviderVersionError, SemanticSchemaVersion,
-    MAX_CAPABILITY_EVIDENCE_ITEMS, MAX_EXECUTABLE_ENTRYPOINT_BYTES, MAX_PROVIDER_VERSION_BYTES,
+    EvidenceSourceId, EvidenceStatus, ProviderAuthEvidenceError, ProviderAuthEvidenceReceipt,
+    ProviderAuthEvidenceRegistry, ProviderAuthProbeInvocation, ProviderAuthProbeResult,
+    ProviderAuthState, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
+    ProviderDiscoveryCandidate, ProviderDiscoveryCandidateInput, ProviderDiscoveryContract,
+    ProviderDiscoveryError, ProviderDiscoveryOrigin, ProviderExecutable, ProviderExecutableError,
+    ProviderExecutableForm, ProviderExecutablePolicy, ProviderExecutablePolicyError,
+    ProviderExecutablePolicyViolation, ProviderFileIdentity, ProviderKind, ProviderVersion,
+    ProviderVersionError, SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
+    MAX_EXECUTABLE_ENTRYPOINT_BYTES, MAX_PROVIDER_SHIM_BYTES, MAX_PROVIDER_VERSION_BYTES,
+    PROVIDER_AUTH_NONCE_BYTES,
 };
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
