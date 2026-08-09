@@ -5,22 +5,34 @@
 
 use std::collections::VecDeque;
 
+use devmanager::domain::TaskId;
 use devmanager::services::health::{
     reduce_service, EvidenceProvenance, EvidenceSource, FakeClock, HealthAxis, HealthTracker,
-    LifecycleAxis, OwnershipAxis, PortAxis, ProbeOutcome, ProcessAxis, RedactedServiceSnapshot,
-    ServiceEvidence, ServiceState,
+    LifecycleAxis, OwnershipAxis, PortAxis, ProbeOutcome, ProcessAxis, ServiceEvidence,
+    ServiceState,
 };
 use devmanager::services::model::{
-    ActiveOperation, AdmissionDecision, AdmissionFence, AdmissionRejection, AdmissionRequest,
-    AdmissionSnapshot, CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, LaunchIntent,
-    PortProtocol, RuntimeOwnership, RuntimeRecord, ServiceAction, ServiceCatalog,
+    CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, PortProtocol, ServiceCatalog,
     ServiceDefinition, ServiceId, ServiceScope, StartupPolicy, StopPolicy, ValidationError,
-    MAX_ARGUMENT_COUNT,
+    MAX_ARGUMENT_COUNT, MAX_DEPENDENCY_COUNT, MAX_SERVICE_COUNT,
 };
-use serde::Deserialize;
 
 fn id(value: &str) -> ServiceId {
     ServiceId::new(value).expect("test service id")
+}
+
+fn task_a() -> TaskId {
+    TaskId::parse("0198b6b0-0000-7000-8000-000000000001").expect("test task id")
+}
+
+fn task_scope(task_id: TaskId) -> ServiceScope {
+    ServiceScope::task(task_id)
+}
+
+fn fixture_definition(index: usize) -> serde_json::Value {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/services/valid.json")).unwrap();
+    fixture["services"][index].clone()
 }
 
 fn policy() -> HealthPolicy {
@@ -37,9 +49,13 @@ fn policy() -> HealthPolicy {
 
 fn command() -> CommandSpec {
     CommandSpec::new("node")
+        .expect("valid executable")
         .with_arg("server.js")
+        .expect("valid argument")
         .with_cwd("apps/api")
+        .expect("valid workspace path")
         .with_env_reference("PORT")
+        .expect("valid environment reference")
 }
 
 fn service(
@@ -95,40 +111,28 @@ fn evidence(
     }
 }
 
-fn record(
-    state: ServiceState,
-    fence: AdmissionFence,
-    ownership: RuntimeOwnership,
-    operation: Option<ActiveOperation>,
-) -> RuntimeRecord {
-    RuntimeRecord {
-        state,
-        fence,
-        ownership,
-        operation,
-    }
-}
-
-#[derive(Deserialize)]
-struct ServiceFixture {
-    services: Vec<ServiceDefinition>,
-}
-
 #[test]
 fn configured_launch_fixture_is_validated_and_launch_intent_is_bounded() {
-    let fixture: ServiceFixture =
+    let catalog: ServiceCatalog =
         serde_json::from_str(include_str!("fixtures/services/valid.json")).unwrap();
-    let catalog = ServiceCatalog::new(fixture.services).expect("valid service fixture");
 
     let intent = catalog
         .launch_intent(&id("api"))
         .expect("api launch intent");
-    assert_eq!(intent.service_id, id("api"));
-    assert_eq!(intent.command.program, "node");
-    assert_eq!(intent.command.args, vec!["server.js"]);
-    assert_eq!(intent.command.cwd.as_deref(), Some("apps/api"));
-    assert_eq!(intent.command.env[0].name, "PORT");
-    assert_eq!(intent.expected_port.unwrap().port, 8080);
+    assert_eq!(intent.service_id(), &id("api"));
+    assert_eq!(intent.command().program().as_str(), "node");
+    assert_eq!(intent.command().args()[0].as_str(), "server.js");
+    assert_eq!(
+        intent.command().cwd().map(|path| path.as_str()),
+        Some("apps/api")
+    );
+    assert_eq!(intent.command().env()[0].name(), "PORT");
+    assert_eq!(intent.expected_port().unwrap().port, 8080);
+
+    let encoded = serde_json::to_value(&catalog).unwrap();
+    assert_eq!(encoded["schema_version"], serde_json::json!(1));
+    let decoded: ServiceCatalog = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
 }
 
 #[test]
@@ -138,50 +142,31 @@ fn validation_rejects_unsafe_paths_raw_secrets_unbounded_args_and_duplicate_ids(
         Err(ValidationError::Empty { .. })
     ));
 
-    let mut unsafe_path = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-    unsafe_path.command.cwd = Some("..\\secrets".to_owned());
-    assert!(matches!(
-        ServiceCatalog::new(vec![unsafe_path]),
-        Err(ValidationError::UnsafePath { .. })
-    ));
+    let mut unsafe_path = fixture_definition(0);
+    unsafe_path["command"]["cwd"] = serde_json::json!("..\\secrets");
+    assert!(serde_json::from_value::<ServiceDefinition>(unsafe_path).is_err());
 
-    let mut raw_secret = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-    raw_secret.command.args = vec!["--api-token=secret-value".to_owned()];
-    assert!(matches!(
-        ServiceCatalog::new(vec![raw_secret]),
-        Err(ValidationError::RawSecret { .. })
-    ));
+    let mut raw_secret = fixture_definition(0);
+    raw_secret["command"]["args"] = serde_json::json!(["--api-token=secret-value"]);
+    assert!(serde_json::from_value::<ServiceDefinition>(raw_secret).is_err());
 
-    let mut too_many_args = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-    too_many_args.command.args = vec!["arg".to_owned(); MAX_ARGUMENT_COUNT + 1];
-    assert!(matches!(
-        ServiceCatalog::new(vec![too_many_args]),
-        Err(ValidationError::TooMany { .. })
-    ));
+    let mut too_many_args = fixture_definition(0);
+    too_many_args["command"]["args"] = serde_json::json!(vec!["arg"; MAX_ARGUMENT_COUNT + 1]);
+    assert!(serde_json::from_value::<ServiceDefinition>(too_many_args).is_err());
 
-    let duplicate = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    let duplicate = service("api", task_scope(task_a()), vec![], Some(8080));
     assert!(matches!(
         ServiceCatalog::new(vec![duplicate.clone(), duplicate]),
         Err(ValidationError::DuplicateServiceId { .. })
     ));
 
-    let self_dependency = service(
-        "api",
-        ServiceScope::task("task-a"),
-        vec![id("api")],
-        Some(8080),
-    );
+    let self_dependency = service("api", task_scope(task_a()), vec![id("api")], Some(8080));
     assert!(matches!(
         ServiceCatalog::new(vec![self_dependency]),
         Err(ValidationError::SelfDependency { .. })
     ));
 
-    let unknown_dependency = service(
-        "api",
-        ServiceScope::task("task-a"),
-        vec![id("missing")],
-        Some(8080),
-    );
+    let unknown_dependency = service("api", task_scope(task_a()), vec![id("missing")], Some(8080));
     assert!(matches!(
         ServiceCatalog::new(vec![unknown_dependency]),
         Err(ValidationError::UnknownDependency { .. })
@@ -189,7 +174,7 @@ fn validation_rejects_unsafe_paths_raw_secrets_unbounded_args_and_duplicate_ids(
 }
 
 #[test]
-fn wire_deserializers_validate_ids_definitions_and_launch_intents() {
+fn wire_deserializers_validate_ids_catalog_schema_and_definitions() {
     assert!(serde_json::from_str::<ServiceId>(r#"\"\""#).is_err());
 
     let mut fixture: serde_json::Value =
@@ -198,32 +183,40 @@ fn wire_deserializers_validate_ids_definitions_and_launch_intents() {
     let definition = serde_json::from_value::<ServiceDefinition>(fixture["services"][0].clone());
     assert!(definition.is_err());
 
-    let invalid_intent = serde_json::json!({
-        "service_id": "../escape",
-        "scope": { "Task": { "task_id": "task-a" } },
-        "command": {
-            "program": "node",
-            "args": ["server.js"],
-            "cwd": "apps/api",
-            "env": [{ "name": "PORT" }]
-        },
-        "dependencies": [],
-        "expected_port": { "protocol": "Tcp", "port": 8080 }
+    let mut unknown_field = serde_json::json!({
+        "schema_version": 1,
+        "services": [],
+        "unexpected": true
     });
-    assert!(serde_json::from_value::<LaunchIntent>(invalid_intent).is_err());
+    assert!(serde_json::from_value::<ServiceCatalog>(unknown_field).is_err());
+
+    unknown_field = serde_json::json!({
+        "schema_version": 2,
+        "services": []
+    });
+    assert!(serde_json::from_value::<ServiceCatalog>(unknown_field).is_err());
+
+    let mut unbounded = fixture_definition(0);
+    unbounded["command"]["program"] = serde_json::json!("x".repeat(257));
+    assert!(serde_json::from_value::<ServiceDefinition>(unbounded).is_err());
+
+    let mut unbounded_dependencies = fixture_definition(0);
+    unbounded_dependencies["dependencies"] =
+        serde_json::json!(vec!["api"; MAX_DEPENDENCY_COUNT + 1]);
+    assert!(serde_json::from_value::<ServiceDefinition>(unbounded_dependencies).is_err());
+
+    let services = vec![fixture_definition(0); MAX_SERVICE_COUNT + 1];
+    assert!(serde_json::from_value::<ServiceCatalog>(serde_json::json!({
+        "schema_version": 1,
+        "services": services
+    }))
+    .is_err());
 }
 
 #[test]
 fn nested_contract_types_reject_unknown_fields_invalid_values_and_secret_debug_output() {
-    let invalid_command = CommandSpec {
-        program: "node".to_owned(),
-        args: vec!["--token".to_owned(), "secret-value".to_owned()],
-        cwd: None,
-        env: Vec::new(),
-    };
-    let debug = format!("{invalid_command:?}");
+    let debug = format!("{:?}", command());
     assert!(!debug.contains("secret-value"));
-    assert!(serde_json::to_value(&invalid_command).is_err());
     assert!(serde_json::from_value::<CommandSpec>(serde_json::json!({
         "program": "node",
         "args": [],
@@ -265,12 +258,9 @@ fn nested_contract_types_reject_unknown_fields_invalid_values_and_secret_debug_o
 #[test]
 fn command_cwd_accepts_only_canonical_workspace_relative_paths() {
     for cwd in ["apps\\api", "apps//api", "apps/./api", " apps/api"] {
-        let mut definition = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-        definition.command.cwd = Some(cwd.to_owned());
-        assert!(
-            ServiceCatalog::new(vec![definition]).is_err(),
-            "non-canonical cwd should be rejected: {cwd:?}"
-        );
+        let mut definition = fixture_definition(0);
+        definition["command"]["cwd"] = serde_json::json!(cwd);
+        assert!(serde_json::from_value::<ServiceDefinition>(definition).is_err());
     }
 }
 
@@ -283,45 +273,37 @@ fn secret_flags_and_assignments_are_rejected_structurally_but_name_only_refs_are
         vec!["--password=raw-secret"],
         vec!["--private-key", "raw-secret"],
     ] {
-        let mut definition = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-        definition.command.args = args.into_iter().map(str::to_owned).collect();
-        assert!(matches!(
-            ServiceCatalog::new(vec![definition]),
-            Err(ValidationError::RawSecret { .. })
-        ));
+        let mut definition = fixture_definition(0);
+        definition["command"]["args"] = serde_json::json!(args);
+        assert!(serde_json::from_value::<ServiceDefinition>(definition).is_err());
     }
 
-    let mut assignment = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-    assignment.command.env = vec![devmanager::services::model::EnvReference::new(
-        "API_TOKEN=raw-secret",
-    )];
-    assert!(matches!(
-        ServiceCatalog::new(vec![assignment]),
-        Err(ValidationError::RawSecret { .. })
-    ));
+    let mut assignment = fixture_definition(0);
+    assignment["command"]["env"] = serde_json::json!([{ "name": "API_TOKEN=raw-secret" }]);
+    assert!(serde_json::from_value::<ServiceDefinition>(assignment).is_err());
 
-    let mut reference = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
-    reference.command.env = vec![devmanager::services::model::EnvReference::new("API_TOKEN")];
-    assert!(ServiceCatalog::new(vec![reference]).is_ok());
+    let mut reference = fixture_definition(0);
+    reference["command"]["env"] = serde_json::json!([{ "name": "API_TOKEN" }]);
+    assert!(serde_json::from_value::<ServiceDefinition>(reference).is_ok());
 }
 
 #[test]
 fn expected_port_must_match_health_or_be_derived_from_health() {
-    let mut mismatch = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    let mut mismatch = service("api", task_scope(task_a()), vec![], Some(8080));
     mismatch.expected_port = Some(ExpectedPort {
         protocol: PortProtocol::Tcp,
         port: 9090,
     });
     assert!(ServiceCatalog::new(vec![mismatch]).is_err());
 
-    let mut derived = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    let mut derived = service("api", task_scope(task_a()), vec![], Some(8080));
     derived.expected_port = None;
     let catalog = ServiceCatalog::new(vec![derived]).unwrap();
     assert_eq!(
         catalog
             .launch_intent(&id("api"))
             .unwrap()
-            .expected_port
+            .expected_port()
             .unwrap()
             .port,
         8080
@@ -331,31 +313,16 @@ fn expected_port_must_match_health_or_be_derived_from_health() {
 #[test]
 fn dependency_plan_is_deterministic_and_cycles_are_explicit() {
     let catalog = ServiceCatalog::new(vec![
-        service(
-            "api",
-            ServiceScope::task("task-a"),
-            vec![id("db")],
-            Some(8080),
-        ),
-        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
+        service("api", task_scope(task_a()), vec![id("db")], Some(8080)),
+        service("db", task_scope(task_a()), vec![], Some(5432)),
     ])
     .unwrap();
     let plan = catalog.dependency_plan(&id("api")).unwrap();
-    assert_eq!(plan.ordered, vec![id("db"), id("api")]);
+    assert_eq!(plan.services(), &[id("db"), id("api")]);
 
     let cycle = ServiceCatalog::new(vec![
-        service(
-            "api",
-            ServiceScope::task("task-a"),
-            vec![id("db")],
-            Some(8080),
-        ),
-        service(
-            "db",
-            ServiceScope::task("task-a"),
-            vec![id("api")],
-            Some(5432),
-        ),
+        service("api", task_scope(task_a()), vec![id("db")], Some(8080)),
+        service("db", task_scope(task_a()), vec![id("api")], Some(5432)),
     ]);
     assert!(matches!(
         cycle,
@@ -548,472 +515,49 @@ fn reducer_keeps_lifecycle_process_health_port_and_ownership_separate() {
 }
 
 #[test]
-fn admission_orders_dependencies_coalesces_duplicate_start_and_blocks_failures() {
-    let catalog = ServiceCatalog::new(vec![
-        service(
-            "api",
-            ServiceScope::task("task-a"),
-            vec![id("db")],
-            Some(8080),
-        ),
-        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
-    ])
-    .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_service(
-        id("api"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
-    snapshot.set_service(
-        id("db"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
+fn command_debug_redacts_program_cwd_env_names_and_argument_values() {
+    let command = command();
+    let debug = format!("{command:?}");
+    for secret in ["node", "server.js", "apps/api", "PORT"] {
+        assert!(!debug.contains(secret), "debug leaked {secret:?}: {debug}");
+    }
+}
 
-    let decision = catalog.admit(
-        AdmissionRequest::new(ServiceAction::Start, id("api"), fence),
-        &snapshot,
+#[test]
+fn service_definition_roundtrip_uses_canonical_dependency_order() {
+    let definition = service(
+        "api",
+        task_scope(task_a()),
+        vec![id("worker"), id("db")],
+        Some(8080),
     );
-    let AdmissionDecision::Start(plan) = decision else {
-        panic!("expected start plan");
-    };
+    let encoded = serde_json::to_value(&definition).unwrap();
+    let decoded: ServiceDefinition = serde_json::from_value(encoded).unwrap();
+    let canonical = serde_json::to_value(decoded).unwrap();
     assert_eq!(
-        plan.ordered
-            .iter()
-            .map(|intent| intent.service_id.clone())
-            .collect::<Vec<_>>(),
-        vec![id("db"), id("api")]
+        canonical["dependencies"],
+        serde_json::json!(["db", "worker"])
     );
-
-    snapshot.set_service(
-        id("api"),
-        record(
-            ServiceState::Starting,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-a".to_owned(),
-            },
-            Some(ActiveOperation {
-                id: 55,
-                action: ServiceAction::Start,
-            }),
-        ),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Start, id("api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Coalesced {
-            operation_id: 55,
-            action: ServiceAction::Start,
-            ..
-        }
-    ));
-
-    snapshot.set_service(
-        id("db"),
-        record(ServiceState::Failed, fence, RuntimeOwnership::None, None),
-    );
-    snapshot.set_service(
-        id("api"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Start, id("api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(AdmissionRejection::DependencyNotReady {
-            dependency,
-            state: ServiceState::Failed,
-            ..
-        }) if dependency == id("db")
-    ));
 }
 
 #[test]
-fn admission_rejects_external_stop_stale_fences_and_limits_task_close_to_owned_task() {
-    let catalog = ServiceCatalog::new(vec![
-        service("task-api", ServiceScope::task("task-a"), vec![], Some(8080)),
-        service(
-            "other-task",
-            ServiceScope::task("task-b"),
-            vec![],
-            Some(8081),
-        ),
-        service("host-db", ServiceScope::Host, vec![], Some(5432)),
+fn catalog_wire_is_strict_and_fingerprint_is_order_independent() {
+    let first = ServiceCatalog::new(vec![
+        service("api", task_scope(task_a()), vec![id("db")], Some(8080)),
+        service("db", task_scope(task_a()), vec![], Some(5432)),
     ])
     .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_service(
-        id("task-api"),
-        record(
-            ServiceState::External,
-            fence,
-            RuntimeOwnership::External,
-            None,
-        ),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Stop, id("task-api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(AdmissionRejection::ExternalNotControllable { .. })
-    ));
-
-    snapshot.set_service(
-        id("task-api"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-a".to_owned(),
-            },
-            None,
-        ),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(
-                ServiceAction::Stop,
-                id("task-api"),
-                AdmissionFence::new(3, 9),
-            ),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(AdmissionRejection::StaleFence { .. })
-    ));
-
-    snapshot.set_task_epoch("task-a", 9);
-    snapshot.mark_task_closing("task-a");
-    snapshot.set_service(
-        id("other-task"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-b".to_owned(),
-            },
-            None,
-        ),
-    );
-    snapshot.set_service(
-        id("host-db"),
-        record(ServiceState::Healthy, fence, RuntimeOwnership::Host, None),
-    );
-    let close = catalog.admit_task_close("task-a", 9, &snapshot).unwrap();
-    assert_eq!(
-        close
-            .ordered
-            .iter()
-            .map(|item| item.service_id.clone())
-            .collect::<Vec<_>>(),
-        vec![id("task-api")]
-    );
-    assert!(!close
-        .ordered
-        .iter()
-        .any(|item| item.service_id == id("other-task")));
-    assert!(!close
-        .ordered
-        .iter()
-        .any(|item| item.service_id == id("host-db")));
-}
-
-#[test]
-fn task_close_requires_closing_barrier_and_rejects_member_operations() {
-    let catalog = ServiceCatalog::new(vec![
-        service("api", ServiceScope::task("task-a"), vec![], Some(8080)),
-        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
+    let second = ServiceCatalog::new(vec![
+        service("db", task_scope(task_a()), vec![], Some(5432)),
+        service("api", task_scope(task_a()), vec![id("db")], Some(8080)),
     ])
     .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let owned = RuntimeOwnership::Task {
-        task_id: "task-a".to_owned(),
-    };
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_task_epoch("task-a", 9);
-    snapshot.set_service(
-        id("api"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            owned.clone(),
-            Some(ActiveOperation {
-                id: 91,
-                action: ServiceAction::Start,
-            }),
-        ),
-    );
-    snapshot.set_service(
-        id("db"),
-        record(ServiceState::Healthy, fence, owned.clone(), None),
-    );
+    assert_eq!(first.fingerprint(), second.fingerprint());
 
-    assert!(catalog.admit_task_close("task-a", 9, &snapshot).is_err());
-    snapshot.mark_task_closing("task-a");
-    assert!(catalog.admit_task_close("task-a", 9, &snapshot).is_err());
-
-    snapshot.set_service(id("api"), record(ServiceState::Healthy, fence, owned, None));
-    let close = catalog.admit_task_close("task-a", 9, &snapshot).unwrap();
-    assert_eq!(
-        close
-            .ordered
-            .iter()
-            .map(|item| item.service_id.clone())
-            .collect::<Vec<_>>(),
-        vec![id("db"), id("api")]
-    );
-    assert!(matches!(
-        &close.ordered[0].fence.ownership,
-        RuntimeOwnership::Task { task_id } if task_id == "task-a"
-    ));
-    assert!(close.revalidate(&snapshot).is_ok());
-}
-
-#[test]
-fn operations_require_exact_scope_ownership_and_none_is_only_initial_start_claim() {
-    let catalog = ServiceCatalog::new(vec![
-        service("task-api", ServiceScope::task("task-a"), vec![], Some(8080)),
-        service("host-db", ServiceScope::Host, vec![], Some(5432)),
-    ])
-    .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_service(
-        id("task-api"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-b".to_owned(),
-            },
-            None,
-        ),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Stop, id("task-api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(_)
-    ));
-
-    snapshot.set_service(
-        id("task-api"),
-        record(ServiceState::Healthy, fence, RuntimeOwnership::None, None),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Stop, id("task-api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(_)
-    ));
-
-    snapshot.set_service(
-        id("task-api"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Start, id("task-api"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Start(_)
-    ));
-
-    snapshot.set_service(
-        id("host-db"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-a".to_owned(),
-            },
-            None,
-        ),
-    );
-    assert!(matches!(
-        catalog.admit(
-            AdmissionRequest::new(ServiceAction::Stop, id("host-db"), fence),
-            &snapshot
-        ),
-        AdmissionDecision::Refused(_)
-    ));
-}
-
-#[test]
-fn plan_members_capture_exact_fences_and_support_atomic_revalidation() {
-    let catalog = ServiceCatalog::new(vec![
-        service(
-            "api",
-            ServiceScope::task("task-a"),
-            vec![id("db")],
-            Some(8080),
-        ),
-        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
-    ])
-    .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_service(
-        id("api"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
-    snapshot.set_service(
-        id("db"),
-        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
-    );
-    let AdmissionDecision::Start(plan) = catalog.admit(
-        AdmissionRequest::new(ServiceAction::Start, id("api"), fence),
-        &snapshot,
-    ) else {
-        panic!("expected start plan");
-    };
-    assert_eq!(plan.ordered[0].fence.generation, 4);
-    assert_eq!(plan.ordered[0].fence.epoch, 9);
-    assert_eq!(plan.ordered[0].fence.ownership, RuntimeOwnership::None);
-    assert!(plan.revalidate(&snapshot).is_ok());
-
-    snapshot.set_service(
-        id("db"),
-        record(
-            ServiceState::Stopped,
-            AdmissionFence::new(5, 9),
-            RuntimeOwnership::None,
-            None,
-        ),
-    );
-    assert!(plan.revalidate(&snapshot).is_err());
-}
-
-#[test]
-fn admission_stop_reverses_dependencies_and_restart_returns_typed_plans() {
-    let catalog = ServiceCatalog::new(vec![
-        service(
-            "api",
-            ServiceScope::task("task-a"),
-            vec![id("db")],
-            Some(8080),
-        ),
-        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
-    ])
-    .unwrap();
-    let fence = AdmissionFence::new(4, 9);
-    let owned = RuntimeOwnership::Task {
-        task_id: "task-a".to_owned(),
-    };
-    let mut snapshot = AdmissionSnapshot::default();
-    snapshot.set_service(
-        id("api"),
-        record(ServiceState::Healthy, fence, owned.clone(), None),
-    );
-    snapshot.set_service(id("db"), record(ServiceState::Healthy, fence, owned, None));
-
-    let stop = catalog.admit(
-        AdmissionRequest::new(ServiceAction::Stop, id("db"), fence),
-        &snapshot,
-    );
-    assert!(matches!(
-        stop,
-        AdmissionDecision::Stop(plan)
-            if plan
-                .ordered
-                .iter()
-                .map(|item| item.service_id.clone())
-                .collect::<Vec<_>>() == vec![id("api"), id("db")]
-    ));
-
-    let AdmissionDecision::Stop(stop_plan) = catalog.admit(
-        AdmissionRequest::new(ServiceAction::Stop, id("db"), fence),
-        &snapshot,
-    ) else {
-        panic!("expected stop plan");
-    };
-    assert!(stop_plan.revalidate(&snapshot).is_ok());
-    snapshot.set_service(
-        id("api"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-a".to_owned(),
-            },
-            Some(ActiveOperation {
-                id: 93,
-                action: ServiceAction::Start,
-            }),
-        ),
-    );
-    assert!(stop_plan.revalidate(&snapshot).is_err());
-    snapshot.set_service(
-        id("api"),
-        record(
-            ServiceState::Healthy,
-            fence,
-            RuntimeOwnership::Task {
-                task_id: "task-a".to_owned(),
-            },
-            None,
-        ),
-    );
-
-    let restart = catalog.admit(
-        AdmissionRequest::new(ServiceAction::Restart, id("api"), fence),
-        &snapshot,
-    );
-    let AdmissionDecision::Restart(restart_plan) = restart else {
-        panic!("expected restart plan");
-    };
-    assert!(restart_plan.revalidate(&snapshot).is_ok());
-    assert_eq!(
-        restart_plan
-            .stop
-            .ordered
-            .iter()
-            .map(|item| item.service_id.clone())
-            .collect::<Vec<_>>(),
-        vec![id("api")]
-    );
-    assert_eq!(
-        restart_plan
-            .start
-            .ordered
-            .iter()
-            .map(|item| item.service_id.clone())
-            .collect::<Vec<_>>(),
-        vec![id("db"), id("api")]
-    );
-}
-
-#[test]
-fn snapshots_are_redacted_and_manual_stop_or_crash_has_explicit_evidence() {
-    let stopped = evidence(
-        LifecycleAxis::Stopped,
-        ProcessAxis::Absent,
-        HealthAxis::Cancelled,
-        PortAxis::Free,
-        OwnershipAxis::None,
-    );
-    assert_eq!(reduce_service(&stopped), ServiceState::Stopped);
-
-    let snapshot =
-        RedactedServiceSnapshot::from_evidence(id("api"), ServiceScope::task("task-a"), &stopped);
-    let serialized = serde_json::to_string(&snapshot).unwrap();
-    assert!(!serialized.contains("node"));
-    assert!(!serialized.contains("server.js"));
-    assert!(!serialized.contains("secret-value"));
-    assert!(serialized.contains("observed_at_ms"));
-    assert!(serialized.contains("fake_probe"));
-
-    let mut tracker = HealthTracker::new(policy());
-    tracker.start(0, 7).unwrap();
-    tracker.cancel(100, 7).unwrap();
-    assert_eq!(tracker.axis(), HealthAxis::Cancelled);
-    tracker.process_exit(200, 7).unwrap();
-    assert!(matches!(tracker.axis(), HealthAxis::Crashed));
+    let omitted = serde_json::json!({ "services": [] });
+    assert!(serde_json::from_value::<ServiceCatalog>(omitted).is_err());
+    assert!(serde_json::from_str::<ServiceCatalog>(
+        r#"{"schema_version":1,"schema_version":1,"services":[]}"#
+    )
+    .is_err());
 }

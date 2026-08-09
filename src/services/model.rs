@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::marker::PhantomData;
 
-use serde::de::Error as _;
+use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::ser::Error as _;
 use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+
+use crate::domain::TaskId;
 
 use super::health::ServiceState;
 
@@ -21,6 +25,7 @@ pub const MAX_HEALTH_PATH_LENGTH: usize = 128;
 pub const MAX_STARTUP_DEADLINE_MS: u64 = 3_600_000;
 pub const MAX_PROBE_INTERVAL_MS: u64 = 60_000;
 pub const MAX_STOP_TIMEOUT_MS: u64 = 120_000;
+pub const SERVICE_CATALOG_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ServiceId(String);
@@ -45,7 +50,7 @@ impl fmt::Display for ServiceId {
 
 #[derive(Deserialize)]
 #[serde(transparent)]
-struct ServiceIdWire(String);
+struct ServiceIdWire(#[serde(deserialize_with = "deserialize_service_id_string")] String);
 
 impl<'de> Deserialize<'de> for ServiceId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -71,7 +76,7 @@ impl Serialize for ServiceId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceScope {
     /// Resolve the command in the task's workspace and give that task ownership.
-    Task { task_id: String },
+    Task { task_id: TaskId },
     /// Resolve the command in the host workspace and give the host ownership.
     Host,
 }
@@ -79,18 +84,19 @@ pub enum ServiceScope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum ServiceScopeWire {
-    Task { task_id: String },
+    Task {
+        #[serde(deserialize_with = "deserialize_task_id_string")]
+        task_id: String,
+    },
     Host,
 }
 
 impl ServiceScope {
-    pub fn task(task_id: impl Into<String>) -> Self {
-        Self::Task {
-            task_id: task_id.into(),
-        }
+    pub fn task(task_id: TaskId) -> Self {
+        Self::Task { task_id }
     }
 
-    pub fn task_id(&self) -> Option<&str> {
+    pub fn task_id(&self) -> Option<&TaskId> {
         match self {
             Self::Task { task_id } => Some(task_id),
             Self::Host => None,
@@ -98,9 +104,6 @@ impl ServiceScope {
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
-        if let Self::Task { task_id } = self {
-            validate_identifier(task_id, ValidationField::TaskId, MAX_TASK_ID_LENGTH)?;
-        }
         Ok(())
     }
 }
@@ -112,7 +115,9 @@ impl<'de> Deserialize<'de> for ServiceScope {
     {
         let wire = ServiceScopeWire::deserialize(deserializer)?;
         let scope = match wire {
-            ServiceScopeWire::Task { task_id } => Self::Task { task_id },
+            ServiceScopeWire::Task { task_id } => Self::Task {
+                task_id: TaskId::parse(&task_id).map_err(D::Error::custom)?,
+            },
             ServiceScopeWire::Host => Self::Host,
         };
         scope.validate().map_err(D::Error::custom)?;
@@ -128,7 +133,7 @@ impl Serialize for ServiceScope {
         self.validate().map_err(S::Error::custom)?;
         let wire = match self {
             Self::Task { task_id } => ServiceScopeWire::Task {
-                task_id: task_id.clone(),
+                task_id: task_id.to_string(),
             },
             Self::Host => ServiceScopeWire::Host,
         };
@@ -136,20 +141,162 @@ impl Serialize for ServiceScope {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ValidatedExecutable(String);
+
+impl ValidatedExecutable {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_executable(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ValidatedExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted executable>")
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatedExecutable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = deserialize_bounded_string::<D, MAX_PROGRAM_LENGTH>(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for ValidatedExecutable {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_executable(&self.0).map_err(S::Error::custom)?;
+        serializer.serialize_str(&self.0)
+    }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct WorkspacePath(String);
+
+impl WorkspacePath {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_text(&value, ValidationField::Cwd, MAX_CWD_LENGTH)?;
+        validate_relative_path(&value, ValidationField::Cwd)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkspacePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted workspace path>")
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspacePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = deserialize_bounded_string::<D, MAX_CWD_LENGTH>(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for WorkspacePath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Self::new(self.0.clone()).map_err(S::Error::custom)?;
+        serializer.serialize_str(&self.0)
+    }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CommandArgument(String);
+
+impl CommandArgument {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_text(&value, ValidationField::Argument, MAX_ARGUMENT_LENGTH)?;
+        if is_secret_argument(&value) {
+            return Err(ValidationError::RawSecret {
+                field: ValidationField::Argument,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CommandArgument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted argument>")
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandArgument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = deserialize_bounded_string::<D, MAX_ARGUMENT_LENGTH>(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for CommandArgument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Self::new(self.0.clone()).map_err(S::Error::custom)?;
+        serializer.serialize_str(&self.0)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct EnvReference {
-    pub name: String,
+    name: String,
 }
 
 impl EnvReference {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+    pub fn new(name: impl Into<String>) -> Result<Self, ValidationError> {
+        let name = name.into();
+        validate_env_name(&name)?;
+        Ok(Self { name })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl fmt::Debug for EnvReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted environment name>")
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnvReferenceWire {
+    #[serde(deserialize_with = "deserialize_env_name")]
     name: String,
 }
 
@@ -159,9 +306,7 @@ impl<'de> Deserialize<'de> for EnvReference {
         D: serde::Deserializer<'de>,
     {
         let wire = EnvReferenceWire::deserialize(deserializer)?;
-        let reference = Self::new(wire.name);
-        validate_env_reference(&reference).map_err(D::Error::custom)?;
-        Ok(reference)
+        Self::new(wire.name).map_err(D::Error::custom)
     }
 }
 
@@ -180,31 +325,32 @@ impl Serialize for EnvReference {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CommandSpec {
-    pub program: String,
-    pub args: Vec<String>,
+    program: ValidatedExecutable,
+    args: Vec<CommandArgument>,
     /// Canonical path relative to the workspace selected by [`ServiceScope`].
-    pub cwd: Option<String>,
-    pub env: Vec<EnvReference>,
+    cwd: Option<WorkspacePath>,
+    env: Vec<EnvReference>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandSpecWire {
-    program: String,
-    args: Vec<String>,
-    cwd: Option<String>,
+    program: ValidatedExecutable,
+    #[serde(deserialize_with = "deserialize_command_arguments")]
+    args: Vec<CommandArgument>,
+    cwd: Option<WorkspacePath>,
+    #[serde(deserialize_with = "deserialize_env_references")]
     env: Vec<EnvReference>,
 }
 
 impl fmt::Debug for CommandSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let redacted_args = vec!["<redacted>"; self.args.len()];
         formatter
             .debug_struct("CommandSpec")
-            .field("program", &self.program)
-            .field("args", &redacted_args)
-            .field("cwd", &self.cwd)
-            .field("env", &self.env)
+            .field("program", &"<redacted>")
+            .field("args", &format_args!("<{} redacted>", self.args.len()))
+            .field("cwd", &self.cwd.as_ref().map(|_| "<redacted>"))
+            .field("env", &format_args!("<{} names redacted>", self.env.len()))
             .finish()
     }
 }
@@ -243,37 +389,67 @@ impl Serialize for CommandSpec {
 }
 
 impl CommandSpec {
-    pub fn new(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
+    pub fn new(program: impl Into<String>) -> Result<Self, ValidationError> {
+        Ok(Self {
+            program: ValidatedExecutable::new(program)?,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+        })
+    }
+
+    pub fn program(&self) -> &ValidatedExecutable {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[CommandArgument] {
+        &self.args
+    }
+
+    pub fn cwd(&self) -> Option<&WorkspacePath> {
+        self.cwd.as_ref()
+    }
+
+    pub fn env(&self) -> &[EnvReference] {
+        &self.env
+    }
+
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Result<Self, ValidationError> {
+        if self.args.len() >= MAX_ARGUMENT_COUNT {
+            return Err(ValidationError::TooMany {
+                field: ValidationField::Argument,
+                limit: MAX_ARGUMENT_COUNT,
+            });
         }
+        self.args.push(CommandArgument::new(arg)?);
+        Ok(self)
     }
 
-    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
-    pub fn with_args<I, S>(mut self, args: I) -> Self
+    pub fn with_args<I, S>(mut self, args: I) -> Result<Self, ValidationError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.args.extend(args.into_iter().map(Into::into));
-        self
+        for arg in args {
+            self = self.with_arg(arg)?;
+        }
+        Ok(self)
     }
 
-    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Result<Self, ValidationError> {
+        self.cwd = Some(WorkspacePath::new(cwd)?);
+        Ok(self)
     }
 
-    pub fn with_env_reference(mut self, name: impl Into<String>) -> Self {
-        self.env.push(EnvReference::new(name));
-        self
+    pub fn with_env_reference(mut self, name: impl Into<String>) -> Result<Self, ValidationError> {
+        if self.env.len() >= MAX_ENV_REFERENCE_COUNT {
+            return Err(ValidationError::TooMany {
+                field: ValidationField::EnvReference,
+                limit: MAX_ENV_REFERENCE_COUNT,
+            });
+        }
+        self.env.push(EnvReference::new(name)?);
+        Ok(self)
     }
 }
 
@@ -423,6 +599,7 @@ enum HealthSpecWire {
     },
     Http {
         port: u16,
+        #[serde(deserialize_with = "deserialize_health_path")]
         path: String,
         policy: HealthPolicy,
     },
@@ -606,6 +783,7 @@ struct ServiceDefinitionWire {
     id: ServiceId,
     scope: ServiceScope,
     command: CommandSpec,
+    #[serde(deserialize_with = "deserialize_dependencies")]
     dependencies: Vec<ServiceId>,
     health: HealthSpec,
     startup: StartupPolicy,
@@ -623,7 +801,7 @@ impl<'de> Deserialize<'de> for ServiceDefinition {
             id: wire.id,
             scope: wire.scope,
             command: wire.command,
-            dependencies: wire.dependencies,
+            dependencies: canonical_dependencies(wire.dependencies),
             health: wire.health,
             startup: wire.startup,
             stop: wire.stop,
@@ -640,11 +818,12 @@ impl Serialize for ServiceDefinition {
         S: Serializer,
     {
         self.validate().map_err(S::Error::custom)?;
+        let dependencies = canonical_dependencies(self.dependencies.clone());
         ServiceDefinitionWire {
             id: self.id.clone(),
             scope: self.scope.clone(),
             command: self.command.clone(),
-            dependencies: self.dependencies.clone(),
+            dependencies,
             health: self.health.clone(),
             startup: self.startup,
             stop: self.stop,
@@ -661,9 +840,6 @@ impl ServiceDefinition {
             ValidationField::ServiceId,
             MAX_SERVICE_ID_LENGTH,
         )?;
-        if let ServiceScope::Task { task_id } = &self.scope {
-            validate_identifier(task_id, ValidationField::TaskId, MAX_TASK_ID_LENGTH)?;
-        }
         validate_command(&self.command)?;
         if self.dependencies.len() > MAX_DEPENDENCY_COUNT {
             return Err(ValidationError::TooMany {
@@ -717,18 +893,8 @@ impl ServiceDefinition {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LaunchIntent {
-    pub service_id: ServiceId,
-    pub scope: ServiceScope,
-    pub command: CommandSpec,
-    pub dependencies: Vec<ServiceId>,
-    pub expected_port: Option<ExpectedPort>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchIntentWire {
     service_id: ServiceId,
     scope: ServiceScope,
     command: CommandSpec,
@@ -736,38 +902,16 @@ struct LaunchIntentWire {
     expected_port: Option<ExpectedPort>,
 }
 
-impl<'de> Deserialize<'de> for LaunchIntent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = LaunchIntentWire::deserialize(deserializer)?;
-        let intent = Self {
-            service_id: wire.service_id,
-            scope: wire.scope,
-            command: wire.command,
-            dependencies: wire.dependencies,
-            expected_port: wire.expected_port,
-        };
-        intent.validate().map_err(D::Error::custom)?;
-        Ok(intent)
-    }
-}
-
-impl Serialize for LaunchIntent {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.validate().map_err(S::Error::custom)?;
-        LaunchIntentWire {
-            service_id: self.service_id.clone(),
-            scope: self.scope.clone(),
-            command: self.command.clone(),
-            dependencies: self.dependencies.clone(),
-            expected_port: self.expected_port,
-        }
-        .serialize(serializer)
+impl fmt::Debug for LaunchIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchIntent")
+            .field("service_id", &self.service_id)
+            .field("scope", &self.scope)
+            .field("command", &self.command)
+            .field("dependencies", &self.dependencies)
+            .field("expected_port", &self.expected_port)
+            .finish()
     }
 }
 
@@ -778,9 +922,6 @@ impl LaunchIntent {
             ValidationField::ServiceId,
             MAX_SERVICE_ID_LENGTH,
         )?;
-        if let ServiceScope::Task { task_id } = &self.scope {
-            validate_identifier(task_id, ValidationField::TaskId, MAX_TASK_ID_LENGTH)?;
-        }
         validate_command(&self.command)?;
         if self.dependencies.len() > MAX_DEPENDENCY_COUNT {
             return Err(ValidationError::TooMany {
@@ -812,6 +953,26 @@ impl LaunchIntent {
         }
         Ok(())
     }
+
+    pub fn service_id(&self) -> &ServiceId {
+        &self.service_id
+    }
+
+    pub fn scope(&self) -> &ServiceScope {
+        &self.scope
+    }
+
+    pub fn command(&self) -> &CommandSpec {
+        &self.command
+    }
+
+    pub fn dependencies(&self) -> &[ServiceId] {
+        &self.dependencies
+    }
+
+    pub fn expected_port(&self) -> Option<ExpectedPort> {
+        self.expected_port
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -819,6 +980,43 @@ pub struct ServiceCatalog {
     services: BTreeMap<ServiceId, ServiceDefinition>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceCatalogWire {
+    schema_version: u16,
+    #[serde(deserialize_with = "deserialize_service_definitions")]
+    services: Vec<ServiceDefinition>,
+}
+
+impl<'de> Deserialize<'de> for ServiceCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ServiceCatalogWire::deserialize(deserializer)?;
+        if wire.schema_version != SERVICE_CATALOG_SCHEMA_VERSION {
+            return Err(D::Error::custom(
+                "unsupported service catalog schema version",
+            ));
+        }
+        Self::new(wire.services).map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for ServiceCatalog {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ServiceCatalogWire {
+            schema_version: SERVICE_CATALOG_SCHEMA_VERSION,
+            services: self.services.values().cloned().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[allow(dead_code)]
 impl ServiceCatalog {
     pub fn new(definitions: Vec<ServiceDefinition>) -> Result<Self, ValidationError> {
         if definitions.len() > MAX_SERVICE_COUNT {
@@ -828,7 +1026,8 @@ impl ServiceCatalog {
             });
         }
         let mut services = BTreeMap::new();
-        for definition in definitions {
+        for mut definition in definitions {
+            definition.dependencies = canonical_dependencies(definition.dependencies);
             definition.validate()?;
             if services
                 .insert(definition.id.clone(), definition.clone())
@@ -853,6 +1052,16 @@ impl ServiceCatalog {
 
     pub fn definition(&self, id: &ServiceId) -> Option<&ServiceDefinition> {
         self.services.get(id)
+    }
+
+    pub fn definitions(&self) -> impl Iterator<Item = &ServiceDefinition> {
+        self.services.values()
+    }
+
+    /// Hash the exact versioned canonical wire representation.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let encoded = serde_json::to_vec(self).expect("validated service catalog must serialize");
+        Sha256::digest(encoded).into()
     }
 
     pub fn launch_intent(&self, id: &ServiceId) -> Result<LaunchIntent, PlanningError> {
@@ -882,7 +1091,7 @@ impl ServiceCatalog {
         Ok(DependencyPlan { ordered })
     }
 
-    pub fn admit(
+    pub(crate) fn admit(
         &self,
         request: AdmissionRequest,
         snapshot: &AdmissionSnapshot,
@@ -892,6 +1101,11 @@ impl ServiceCatalog {
                 service: request.service_id,
             });
         };
+        if !requester_matches_scope(&request.requester, &definition.scope) {
+            return AdmissionDecision::Refused(AdmissionRejection::RequesterMismatch {
+                service: request.service_id,
+            });
+        }
         let Some(runtime) = snapshot.services.get(&request.service_id) else {
             return AdmissionDecision::Refused(AdmissionRejection::EvidenceUnknown {
                 service: request.service_id,
@@ -914,34 +1128,35 @@ impl ServiceCatalog {
             });
         }
 
+        let requester = request.requester;
         match request.action {
-            ServiceAction::Start => self.admit_start(request.service_id, snapshot, false),
-            ServiceAction::Stop => self.admit_stop(request.service_id, snapshot),
-            ServiceAction::Restart => self.admit_restart(request.service_id, snapshot),
+            ServiceAction::Start => {
+                self.admit_start(request.service_id, requester, snapshot, false)
+            }
+            ServiceAction::Stop => self.admit_stop(request.service_id, requester, snapshot),
+            ServiceAction::Restart => self.admit_restart(request.service_id, requester, snapshot),
         }
     }
 
-    pub fn admit_task_close(
+    pub(crate) fn admit_task_close(
         &self,
-        task_id: &str,
-        epoch: u64,
+        task_id: TaskId,
+        epoch: ActionEpoch,
         snapshot: &AdmissionSnapshot,
     ) -> Result<TaskClosePlan, AdmissionRejection> {
-        if !snapshot.closing_tasks.contains(task_id) {
-            return Err(AdmissionRejection::TaskCloseNotAdmitted {
-                task_id: task_id.to_owned(),
-            });
+        if !snapshot.closing_tasks.contains(&task_id) {
+            return Err(AdmissionRejection::TaskCloseNotAdmitted { task_id });
         }
-        let current_epoch = snapshot.task_epochs.get(task_id).copied().ok_or_else(|| {
+        let current_epoch = snapshot.task_epochs.get(&task_id).copied().ok_or_else(|| {
             AdmissionRejection::TaskEpochStale {
-                task_id: task_id.to_owned(),
+                task_id,
                 expected: None,
                 received: epoch,
             }
         })?;
         if current_epoch != epoch {
             return Err(AdmissionRejection::TaskEpochStale {
-                task_id: task_id.to_owned(),
+                task_id,
                 expected: Some(current_epoch),
                 received: epoch,
             });
@@ -949,61 +1164,82 @@ impl ServiceCatalog {
 
         let mut selected = BTreeSet::new();
         for definition in self.services.values() {
-            if definition.scope.task_id() != Some(task_id) {
+            if definition.scope.task_id() != Some(&task_id) {
                 continue;
             }
             let Some(runtime) = snapshot.services.get(&definition.id) else {
-                continue;
+                return Err(AdmissionRejection::EvidenceUnknown {
+                    service: definition.id.clone(),
+                });
             };
-            if matches!(
-                &runtime.ownership,
-                RuntimeOwnership::Task { task_id: owner } if owner == task_id
-            ) {
-                if matches!(runtime.state, ServiceState::External) {
-                    continue;
-                }
-                if let Some(operation) = &runtime.operation {
-                    return Err(AdmissionRejection::OperationInProgress {
-                        service: definition.id.clone(),
-                        action: operation.action,
-                    });
-                }
-                if matches!(
-                    runtime.state,
-                    ServiceState::Starting | ServiceState::Stopping
-                ) {
-                    return Err(AdmissionRejection::OperationInProgress {
-                        service: definition.id.clone(),
-                        action: if matches!(runtime.state, ServiceState::Starting) {
-                            ServiceAction::Start
-                        } else {
-                            ServiceAction::Stop
-                        },
-                    });
-                }
-                if !matches!(runtime.state, ServiceState::Stopped) {
-                    selected.insert(definition.id.clone());
-                }
+            if matches!(runtime.state, ServiceState::External)
+                || matches!(runtime.ownership, RuntimeOwnership::External)
+            {
+                return Err(AdmissionRejection::ExternalNotControllable {
+                    service: definition.id.clone(),
+                });
             }
+            if let Some(operation) = &runtime.operation {
+                return Err(AdmissionRejection::OperationInProgress {
+                    service: definition.id.clone(),
+                    action: operation.action,
+                });
+            }
+            if matches!(
+                runtime.state,
+                ServiceState::Starting | ServiceState::Stopping
+            ) {
+                return Err(AdmissionRejection::OperationInProgress {
+                    service: definition.id.clone(),
+                    action: if matches!(runtime.state, ServiceState::Starting) {
+                        ServiceAction::Start
+                    } else {
+                        ServiceAction::Stop
+                    },
+                });
+            }
+            if !matches!(runtime.state, ServiceState::Stopped)
+                && runtime.ownership != (RuntimeOwnership::Task { task_id })
+            {
+                return Err(AdmissionRejection::OwnershipMismatch {
+                    service: definition.id.clone(),
+                    expected: RuntimeOwnership::Task { task_id },
+                    received: runtime.ownership.clone(),
+                });
+            }
+            let stopped_ownership_is_compatible =
+                matches!(&runtime.ownership, RuntimeOwnership::None);
+            if matches!(runtime.state, ServiceState::Stopped) && !stopped_ownership_is_compatible {
+                return Err(AdmissionRejection::OwnershipMismatch {
+                    service: definition.id.clone(),
+                    expected: RuntimeOwnership::Task { task_id },
+                    received: runtime.ownership.clone(),
+                });
+            }
+            selected.insert(definition.id.clone());
         }
         let ordered = self
             .reverse_selected_order(&selected)
             .into_iter()
-            .filter_map(|service_id| {
-                let definition = self.services.get(&service_id)?;
-                snapshot
+            .map(|service_id| {
+                let definition = self
                     .services
                     .get(&service_id)
-                    .map(|runtime| ServicePlanItem {
-                        service_id: service_id.clone(),
-                        fence: ServiceFence::capture(&service_id, runtime),
-                        expected_state: runtime.state.clone(),
-                        scope: definition.scope.clone(),
-                    })
+                    .expect("selected service is validated in catalog");
+                let runtime = snapshot
+                    .services
+                    .get(&service_id)
+                    .expect("task-close evidence was checked above");
+                ServicePlanItem {
+                    service_id: service_id.clone(),
+                    fence: ServiceFence::capture(&service_id, runtime),
+                    expected_state: runtime.state,
+                    scope: definition.scope.clone(),
+                }
             })
             .collect();
         Ok(TaskClosePlan {
-            task_id: task_id.to_owned(),
+            task_id,
             epoch,
             ordered,
         })
@@ -1012,6 +1248,7 @@ impl ServiceCatalog {
     fn admit_start(
         &self,
         root: ServiceId,
+        requester: AdmissionRequester,
         snapshot: &AdmissionSnapshot,
         force_root: bool,
     ) -> AdmissionDecision {
@@ -1020,9 +1257,14 @@ impl ServiceCatalog {
             .get(&root)
             .expect("root definition checked by admit");
         let runtime = snapshot.services.get(&root).expect("root checked by admit");
-        if let Err(rejection) =
-            validate_ownership(&root, definition, runtime, ServiceAction::Start, true)
-        {
+        if let Err(rejection) = validate_ownership(
+            &root,
+            definition,
+            runtime,
+            ServiceAction::Start,
+            &requester,
+            true,
+        ) {
             return AdmissionDecision::Refused(rejection);
         }
         if let Some(operation) = &runtime.operation {
@@ -1085,6 +1327,11 @@ impl ServiceCatalog {
                 .services
                 .get(&service_id)
                 .expect("dependency is validated in catalog");
+            if !requester_matches_scope(&requester, &definition.scope) {
+                return AdmissionDecision::Refused(AdmissionRejection::RequesterMismatch {
+                    service: service_id,
+                });
+            }
             match dependency_runtime.state {
                 ServiceState::Healthy if !is_root => {
                     if let Err(rejection) = validate_ownership(
@@ -1092,6 +1339,7 @@ impl ServiceCatalog {
                         definition,
                         dependency_runtime,
                         ServiceAction::Start,
+                        &requester,
                         false,
                     ) {
                         return AdmissionDecision::Refused(rejection);
@@ -1110,6 +1358,7 @@ impl ServiceCatalog {
                         definition,
                         dependency_runtime,
                         ServiceAction::Start,
+                        &requester,
                         true,
                     ) {
                         return AdmissionDecision::Refused(rejection);
@@ -1138,6 +1387,7 @@ impl ServiceCatalog {
                         definition,
                         dependency_runtime,
                         ServiceAction::Start,
+                        &requester,
                         false,
                     ) {
                         return AdmissionDecision::Refused(rejection);
@@ -1209,6 +1459,7 @@ impl ServiceCatalog {
                             definition,
                             dependency_runtime,
                             ServiceAction::Start,
+                            &requester,
                             false,
                         ) {
                             return AdmissionDecision::Refused(rejection);
@@ -1234,18 +1485,32 @@ impl ServiceCatalog {
                 }
             }
         }
-        AdmissionDecision::Start(StartPlan { root, ordered })
+        AdmissionDecision::Start(StartPlan {
+            root,
+            requester,
+            ordered,
+        })
     }
 
-    fn admit_stop(&self, root: ServiceId, snapshot: &AdmissionSnapshot) -> AdmissionDecision {
+    fn admit_stop(
+        &self,
+        root: ServiceId,
+        requester: AdmissionRequester,
+        snapshot: &AdmissionSnapshot,
+    ) -> AdmissionDecision {
         let definition = self
             .services
             .get(&root)
             .expect("root definition checked by admit");
         let runtime = snapshot.services.get(&root).expect("root checked by admit");
-        if let Err(rejection) =
-            validate_ownership(&root, definition, runtime, ServiceAction::Stop, false)
-        {
+        if let Err(rejection) = validate_ownership(
+            &root,
+            definition,
+            runtime,
+            ServiceAction::Stop,
+            &requester,
+            false,
+        ) {
             return AdmissionDecision::Refused(rejection);
         }
         if let Some(operation) = &runtime.operation {
@@ -1331,9 +1596,15 @@ impl ServiceCatalog {
                 definition,
                 dependent,
                 ServiceAction::Stop,
+                &requester,
                 false,
             ) {
                 return AdmissionDecision::Refused(rejection);
+            }
+            if !requester_matches_scope(&requester, &definition.scope) {
+                return AdmissionDecision::Refused(AdmissionRejection::RequesterMismatch {
+                    service: service_id,
+                });
             }
             ordered.push(ServicePlanItem {
                 service_id: service_id.clone(),
@@ -1342,10 +1613,19 @@ impl ServiceCatalog {
                 scope: definition.scope.clone(),
             });
         }
-        AdmissionDecision::Stop(StopPlan { root, ordered })
+        AdmissionDecision::Stop(StopPlan {
+            root,
+            requester,
+            ordered,
+        })
     }
 
-    fn admit_restart(&self, root: ServiceId, snapshot: &AdmissionSnapshot) -> AdmissionDecision {
+    fn admit_restart(
+        &self,
+        root: ServiceId,
+        requester: AdmissionRequester,
+        snapshot: &AdmissionSnapshot,
+    ) -> AdmissionDecision {
         let Some(runtime) = snapshot.services.get(&root) else {
             return AdmissionDecision::Refused(AdmissionRejection::EvidenceUnknown {
                 service: root,
@@ -1355,9 +1635,14 @@ impl ServiceCatalog {
             .services
             .get(&root)
             .expect("root definition checked by admit");
-        if let Err(rejection) =
-            validate_ownership(&root, definition, runtime, ServiceAction::Restart, false)
-        {
+        if let Err(rejection) = validate_ownership(
+            &root,
+            definition,
+            runtime,
+            ServiceAction::Restart,
+            &requester,
+            false,
+        ) {
             return AdmissionDecision::Refused(rejection);
         }
         if let Some(operation) = &runtime.operation {
@@ -1369,7 +1654,7 @@ impl ServiceCatalog {
                 };
             }
         }
-        let stop = match self.admit_stop(root.clone(), snapshot) {
+        let stop = match self.admit_stop(root.clone(), requester.clone(), snapshot) {
             AdmissionDecision::Stop(plan) => plan,
             AdmissionDecision::Coalesced { .. } => {
                 return AdmissionDecision::Refused(AdmissionRejection::OperationInProgress {
@@ -1380,7 +1665,7 @@ impl ServiceCatalog {
             AdmissionDecision::Refused(reason) => return AdmissionDecision::Refused(reason),
             _ => unreachable!("stop admission returns only stop/coalesced/refused"),
         };
-        match self.admit_start(root.clone(), snapshot, true) {
+        match self.admit_start(root.clone(), requester, snapshot, true) {
             AdmissionDecision::Start(start) => {
                 AdmissionDecision::Restart(RestartPlan { stop, start })
             }
@@ -1428,7 +1713,13 @@ impl ServiceCatalog {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyPlan {
-    pub ordered: Vec<ServiceId>,
+    ordered: Vec<ServiceId>,
+}
+
+impl DependencyPlan {
+    pub fn services(&self) -> &[ServiceId] {
+        &self.ordered
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1437,31 +1728,129 @@ pub enum PlanningError {
     Cycle(Vec<ServiceId>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AdmissionFence {
-    pub generation: u64,
-    pub epoch: u64,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ResourceGeneration(u64);
+
+#[allow(dead_code)]
+impl ResourceGeneration {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ConnectionEpoch(u64);
+
+#[allow(dead_code)]
+impl ConnectionEpoch {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ActionEpoch(u64);
+
+#[allow(dead_code)]
+impl ActionEpoch {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionFence {
+    resource_generation: ResourceGeneration,
+    connection_epoch: ConnectionEpoch,
+    action_epoch: ActionEpoch,
+}
+
+#[allow(dead_code)]
 impl AdmissionFence {
-    pub const fn new(generation: u64, epoch: u64) -> Self {
-        Self { generation, epoch }
+    pub(crate) const fn new(
+        resource_generation: u64,
+        connection_epoch: u64,
+        action_epoch: u64,
+    ) -> Self {
+        Self {
+            resource_generation: ResourceGeneration::new(resource_generation),
+            connection_epoch: ConnectionEpoch::new(connection_epoch),
+            action_epoch: ActionEpoch::new(action_epoch),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HostId(u64);
+
+#[allow(dead_code)]
+impl HostId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+struct HostAuthority {
+    host_id: HostId,
+}
+
+#[allow(dead_code)]
+impl HostAuthority {
+    pub(crate) const fn new(host_id: HostId) -> Self {
+        Self { host_id }
+    }
+}
+
+impl fmt::Debug for HostAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostAuthority(<opaque>)")
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdmissionRequest {
-    pub action: ServiceAction,
-    pub service_id: ServiceId,
-    pub fence: AdmissionFence,
+#[allow(dead_code)]
+enum AdmissionRequester {
+    Task(TaskId),
+    Host(HostAuthority),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionRequest {
+    action: ServiceAction,
+    service_id: ServiceId,
+    fence: AdmissionFence,
+    requester: AdmissionRequester,
+}
+
+#[allow(dead_code)]
 impl AdmissionRequest {
-    pub fn new(action: ServiceAction, service_id: ServiceId, fence: AdmissionFence) -> Self {
+    pub(crate) fn for_task(
+        action: ServiceAction,
+        service_id: ServiceId,
+        fence: AdmissionFence,
+        task_id: TaskId,
+    ) -> Self {
         Self {
             action,
             service_id,
             fence,
+            requester: AdmissionRequester::Task(task_id),
+        }
+    }
+
+    pub(crate) fn for_host(
+        action: ServiceAction,
+        service_id: ServiceId,
+        fence: AdmissionFence,
+        host_id: HostId,
+    ) -> Self {
+        Self {
+            action,
+            service_id,
+            fence,
+            requester: AdmissionRequester::Host(HostAuthority::new(host_id)),
         }
     }
 }
@@ -1474,73 +1863,100 @@ pub enum ServiceAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RuntimeOwnership {
+#[allow(dead_code)]
+pub(crate) enum RuntimeOwnership {
     None,
-    Task { task_id: String },
-    Host,
+    Task { task_id: TaskId },
+    Host { host_id: HostId },
     External,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveOperation {
-    pub id: u64,
-    pub action: ServiceAction,
+pub(crate) struct ActiveOperation {
+    pub(crate) id: u64,
+    pub(crate) action: ServiceAction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeRecord {
-    pub state: ServiceState,
-    pub fence: AdmissionFence,
-    pub ownership: RuntimeOwnership,
-    pub operation: Option<ActiveOperation>,
+pub(crate) struct RuntimeRecord {
+    pub(crate) state: ServiceState,
+    pub(crate) fence: AdmissionFence,
+    pub(crate) ownership: RuntimeOwnership,
+    pub(crate) operation: Option<ActiveOperation>,
 }
 
 /// Immutable compare-and-swap token captured for one service-plan member.
 ///
-/// The runtime generation/epoch pair is not sufficient by itself: ownership
-/// is part of the authority being revalidated and must change the token too.
+/// The complete resource/connection/action fence is not sufficient by itself:
+/// ownership is part of the authority being revalidated and must change the
+/// token too.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceFence {
-    pub service_id: ServiceId,
-    pub generation: u64,
-    pub epoch: u64,
-    pub ownership: RuntimeOwnership,
+pub(crate) struct ServiceFence {
+    service_id: ServiceId,
+    resource_generation: ResourceGeneration,
+    connection_epoch: ConnectionEpoch,
+    action_epoch: ActionEpoch,
+    ownership: RuntimeOwnership,
 }
 
+#[allow(dead_code)]
 impl ServiceFence {
     fn capture(service_id: &ServiceId, runtime: &RuntimeRecord) -> Self {
         Self {
             service_id: service_id.clone(),
-            generation: runtime.fence.generation,
-            epoch: runtime.fence.epoch,
+            resource_generation: runtime.fence.resource_generation,
+            connection_epoch: runtime.fence.connection_epoch,
+            action_epoch: runtime.fence.action_epoch,
             ownership: runtime.ownership.clone(),
         }
+    }
+
+    pub fn service_id(&self) -> &ServiceId {
+        &self.service_id
+    }
+
+    pub(crate) fn resource_generation(&self) -> ResourceGeneration {
+        self.resource_generation
+    }
+
+    pub(crate) fn connection_epoch(&self) -> ConnectionEpoch {
+        self.connection_epoch
+    }
+
+    pub(crate) fn action_epoch(&self) -> ActionEpoch {
+        self.action_epoch
+    }
+
+    pub(crate) fn ownership(&self) -> &RuntimeOwnership {
+        &self.ownership
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AdmissionSnapshot {
-    pub(crate) services: BTreeMap<ServiceId, RuntimeRecord>,
-    pub(crate) task_epochs: BTreeMap<String, u64>,
-    pub(crate) closing_tasks: BTreeSet<String>,
+pub(crate) struct AdmissionSnapshot {
+    services: BTreeMap<ServiceId, RuntimeRecord>,
+    task_epochs: BTreeMap<TaskId, ActionEpoch>,
+    closing_tasks: BTreeSet<TaskId>,
 }
 
+#[allow(dead_code)]
 impl AdmissionSnapshot {
-    pub fn set_service(&mut self, id: ServiceId, runtime: RuntimeRecord) {
+    pub(crate) fn set_service(&mut self, id: ServiceId, runtime: RuntimeRecord) {
         self.services.insert(id, runtime);
     }
 
-    pub fn set_task_epoch(&mut self, task_id: impl Into<String>, epoch: u64) {
-        self.task_epochs.insert(task_id.into(), epoch);
+    pub(crate) fn set_task_epoch(&mut self, task_id: TaskId, epoch: ActionEpoch) {
+        self.task_epochs.insert(task_id, epoch);
     }
 
-    pub fn mark_task_closing(&mut self, task_id: impl Into<String>) {
-        self.closing_tasks.insert(task_id.into());
+    pub(crate) fn mark_task_closing(&mut self, task_id: TaskId) {
+        self.closing_tasks.insert(task_id);
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionDecision {
+#[allow(dead_code)]
+pub(crate) enum AdmissionDecision {
     Start(StartPlan),
     Stop(StopPlan),
     Restart(RestartPlan),
@@ -1553,7 +1969,8 @@ pub enum AdmissionDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionRejection {
+#[allow(dead_code)]
+pub(crate) enum AdmissionRejection {
     UnknownService {
         service: ServiceId,
     },
@@ -1565,13 +1982,16 @@ pub enum AdmissionRejection {
     TaskClosing {
         service: ServiceId,
     },
+    RequesterMismatch {
+        service: ServiceId,
+    },
     TaskCloseNotAdmitted {
-        task_id: String,
+        task_id: TaskId,
     },
     TaskEpochStale {
-        task_id: String,
-        expected: Option<u64>,
-        received: u64,
+        task_id: TaskId,
+        expected: Option<ActionEpoch>,
+        received: ActionEpoch,
     },
     OwnershipMismatch {
         service: ServiceId,
@@ -1609,53 +2029,111 @@ pub enum AdmissionRejection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StartPlan {
-    pub root: ServiceId,
-    pub ordered: Vec<StartPlanItem>,
+pub(crate) struct StartPlan {
+    root: ServiceId,
+    requester: AdmissionRequester,
+    ordered: Vec<StartPlanItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StopPlan {
-    pub root: ServiceId,
-    pub ordered: Vec<StopPlanItem>,
+pub(crate) struct StopPlan {
+    root: ServiceId,
+    requester: AdmissionRequester,
+    ordered: Vec<StopPlanItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RestartPlan {
-    pub stop: StopPlan,
-    pub start: StartPlan,
+pub(crate) struct RestartPlan {
+    stop: StopPlan,
+    start: StartPlan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskClosePlan {
-    pub task_id: String,
-    pub epoch: u64,
-    pub ordered: Vec<ClosePlanItem>,
+pub(crate) struct TaskClosePlan {
+    task_id: TaskId,
+    epoch: ActionEpoch,
+    ordered: Vec<ClosePlanItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StartPlanItem {
-    pub service_id: ServiceId,
-    pub intent: Option<LaunchIntent>,
-    pub fence: ServiceFence,
-    pub expected_state: ServiceState,
-    pub scope: ServiceScope,
+pub(crate) struct StartPlanItem {
+    service_id: ServiceId,
+    intent: Option<LaunchIntent>,
+    fence: ServiceFence,
+    expected_state: ServiceState,
+    scope: ServiceScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServicePlanItem {
-    pub service_id: ServiceId,
-    pub fence: ServiceFence,
-    pub expected_state: ServiceState,
-    pub scope: ServiceScope,
+pub(crate) struct ServicePlanItem {
+    service_id: ServiceId,
+    fence: ServiceFence,
+    expected_state: ServiceState,
+    scope: ServiceScope,
 }
 
-pub type StopPlanItem = ServicePlanItem;
-pub type ClosePlanItem = ServicePlanItem;
+pub(crate) type StopPlanItem = ServicePlanItem;
+pub(crate) type ClosePlanItem = ServicePlanItem;
 
+#[allow(dead_code)]
+impl StartPlanItem {
+    pub(crate) fn service_id(&self) -> &ServiceId {
+        &self.service_id
+    }
+
+    pub(crate) fn intent(&self) -> Option<&LaunchIntent> {
+        self.intent.as_ref()
+    }
+
+    pub(crate) fn fence(&self) -> &ServiceFence {
+        &self.fence
+    }
+
+    pub(crate) fn expected_state(&self) -> &ServiceState {
+        &self.expected_state
+    }
+
+    pub(crate) fn scope(&self) -> &ServiceScope {
+        &self.scope
+    }
+}
+
+#[allow(dead_code)]
+impl ServicePlanItem {
+    pub(crate) fn service_id(&self) -> &ServiceId {
+        &self.service_id
+    }
+
+    pub(crate) fn fence(&self) -> &ServiceFence {
+        &self.fence
+    }
+
+    pub(crate) fn expected_state(&self) -> &ServiceState {
+        &self.expected_state
+    }
+
+    pub(crate) fn scope(&self) -> &ServiceScope {
+        &self.scope
+    }
+}
+
+#[allow(dead_code)]
 impl StartPlan {
+    pub(crate) fn root(&self) -> &ServiceId {
+        &self.root
+    }
+
+    pub(crate) fn members(&self) -> &[StartPlanItem] {
+        &self.ordered
+    }
+
     /// Revalidate every member against one immutable snapshot before effects.
-    pub fn revalidate(&self, snapshot: &AdmissionSnapshot) -> Result<(), AdmissionRejection> {
+    pub(crate) fn revalidate(
+        &self,
+        catalog: &ServiceCatalog,
+        snapshot: &AdmissionSnapshot,
+    ) -> Result<(), AdmissionRejection> {
+        validate_start_plan(self, catalog)?;
         for item in &self.ordered {
             revalidate_start_item(item, snapshot)?;
         }
@@ -1663,9 +2141,23 @@ impl StartPlan {
     }
 }
 
+#[allow(dead_code)]
 impl StopPlan {
+    pub(crate) fn root(&self) -> &ServiceId {
+        &self.root
+    }
+
+    pub(crate) fn members(&self) -> &[StopPlanItem] {
+        &self.ordered
+    }
+
     /// Revalidate every member against one immutable snapshot before effects.
-    pub fn revalidate(&self, snapshot: &AdmissionSnapshot) -> Result<(), AdmissionRejection> {
+    pub(crate) fn revalidate(
+        &self,
+        catalog: &ServiceCatalog,
+        snapshot: &AdmissionSnapshot,
+    ) -> Result<(), AdmissionRejection> {
+        validate_stop_plan(self, catalog, snapshot)?;
         for item in &self.ordered {
             revalidate_service_item(item, snapshot)?;
         }
@@ -1673,25 +2165,56 @@ impl StopPlan {
     }
 }
 
+#[allow(dead_code)]
 impl RestartPlan {
+    pub(crate) fn stop(&self) -> &StopPlan {
+        &self.stop
+    }
+
+    pub(crate) fn start(&self) -> &StartPlan {
+        &self.start
+    }
+
     /// Revalidate the complete stop/start decision against one snapshot.
-    pub fn revalidate(&self, snapshot: &AdmissionSnapshot) -> Result<(), AdmissionRejection> {
-        self.stop.revalidate(snapshot)?;
-        self.start.revalidate(snapshot)
+    pub(crate) fn revalidate(
+        &self,
+        catalog: &ServiceCatalog,
+        snapshot: &AdmissionSnapshot,
+    ) -> Result<(), AdmissionRejection> {
+        self.stop.revalidate(catalog, snapshot)?;
+        self.start.revalidate(catalog, snapshot)
     }
 }
 
+#[allow(dead_code)]
 impl TaskClosePlan {
+    pub(crate) fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub(crate) fn epoch(&self) -> ActionEpoch {
+        self.epoch
+    }
+
+    pub(crate) fn members(&self) -> &[ClosePlanItem] {
+        &self.ordered
+    }
+
     /// Revalidate the close barrier, epoch, and every owned member atomically.
-    pub fn revalidate(&self, snapshot: &AdmissionSnapshot) -> Result<(), AdmissionRejection> {
+    pub(crate) fn revalidate(
+        &self,
+        catalog: &ServiceCatalog,
+        snapshot: &AdmissionSnapshot,
+    ) -> Result<(), AdmissionRejection> {
+        validate_close_plan(self, catalog)?;
         if !snapshot.closing_tasks.contains(&self.task_id) {
             return Err(AdmissionRejection::TaskCloseNotAdmitted {
-                task_id: self.task_id.clone(),
+                task_id: self.task_id,
             });
         }
         if snapshot.task_epochs.get(&self.task_id).copied() != Some(self.epoch) {
             return Err(AdmissionRejection::TaskEpochStale {
-                task_id: self.task_id.clone(),
+                task_id: self.task_id,
                 expected: snapshot.task_epochs.get(&self.task_id).copied(),
                 received: self.epoch,
             });
@@ -1699,17 +2222,22 @@ impl TaskClosePlan {
         for item in &self.ordered {
             if item.scope
                 != (ServiceScope::Task {
-                    task_id: self.task_id.clone(),
+                    task_id: self.task_id,
                 })
             {
                 return Err(AdmissionRejection::PlanStale {
                     service: item.service_id.clone(),
                 });
             }
+            let stopped_ownership_is_compatible =
+                matches!(&item.fence.ownership, RuntimeOwnership::None);
+            let valid_stopped_ownership = matches!(item.expected_state, ServiceState::Stopped)
+                && stopped_ownership_is_compatible;
             if item.fence.ownership
                 != (RuntimeOwnership::Task {
-                    task_id: self.task_id.clone(),
+                    task_id: self.task_id,
                 })
+                && !valid_stopped_ownership
             {
                 return Err(AdmissionRejection::PlanStale {
                     service: item.service_id.clone(),
@@ -1837,16 +2365,7 @@ impl fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
-    validate_text(
-        &command.program,
-        ValidationField::Program,
-        MAX_PROGRAM_LENGTH,
-    )?;
-    if command.program.contains('/') || command.program.contains('\\') {
-        return Err(ValidationError::UnsafePath {
-            field: ValidationField::Program,
-        });
-    }
+    validate_executable(command.program.as_str())?;
     if command.args.len() > MAX_ARGUMENT_COUNT {
         return Err(ValidationError::TooMany {
             field: ValidationField::Argument,
@@ -1854,16 +2373,10 @@ fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
         });
     }
     for argument in &command.args {
-        validate_text(argument, ValidationField::Argument, MAX_ARGUMENT_LENGTH)?;
-        if is_secret_argument(argument) {
-            return Err(ValidationError::RawSecret {
-                field: ValidationField::Argument,
-            });
-        }
+        CommandArgument::new(argument.as_str().to_owned())?;
     }
     if let Some(cwd) = &command.cwd {
-        validate_text(cwd, ValidationField::Cwd, MAX_CWD_LENGTH)?;
-        validate_relative_path(cwd, ValidationField::Cwd)?;
+        WorkspacePath::new(cwd.as_str().to_owned())?;
     }
     if command.env.len() > MAX_ENV_REFERENCE_COUNT {
         return Err(ValidationError::TooMany {
@@ -1877,33 +2390,194 @@ fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_env_reference(reference: &EnvReference) -> Result<(), ValidationError> {
+fn validate_executable(value: &str) -> Result<(), ValidationError> {
+    validate_text(value, ValidationField::Program, MAX_PROGRAM_LENGTH)?;
+    if value.contains('/')
+        || value.contains('\\')
+        || value.contains('=')
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(ValidationError::UnsafePath {
+            field: ValidationField::Program,
+        });
+    }
+    Ok(())
+}
+
+fn validate_env_name(value: &str) -> Result<(), ValidationError> {
     validate_text(
-        &reference.name,
+        value,
         ValidationField::EnvReference,
         MAX_ENV_REFERENCE_LENGTH,
     )?;
-    if reference.name.contains('=') {
+    if value.contains('=') || is_secret_assignment(value) {
         return Err(ValidationError::RawSecret {
             field: ValidationField::EnvReference,
         });
     }
-    if !reference
-        .name
-        .chars()
-        .enumerate()
-        .all(|(index, character)| {
-            character == '_' || character.is_ascii_alphanumeric() && (index > 0 || character != '0')
-        })
-        || reference
-            .name
-            .starts_with(|character: char| character.is_ascii_digit())
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return Err(ValidationError::Empty {
+            field: ValidationField::EnvReference,
+        });
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
     {
         return Err(ValidationError::InvalidIdentifier {
             field: ValidationField::EnvReference,
         });
     }
     Ok(())
+}
+
+fn deserialize_bounded_string<'de, D, const MAX: usize>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_string(BoundedStringVisitor::<MAX>)
+}
+
+struct BoundedStringVisitor<const MAX: usize>;
+
+impl<'de, const MAX: usize> Visitor<'de> for BoundedStringVisitor<MAX> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a string of at most {MAX} bytes")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX {
+            return Err(E::custom(format!("string exceeds {MAX} bytes")));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX {
+            return Err(E::custom(format!("string exceeds {MAX} bytes")));
+        }
+        Ok(value)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a sequence with at most {MAX} items")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while values.len() < MAX {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values.push(value);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(A::Error::custom(format!("sequence exceeds {MAX} items")));
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_service_id_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, MAX_SERVICE_ID_LENGTH>(deserializer)
+}
+
+fn deserialize_task_id_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, MAX_TASK_ID_LENGTH>(deserializer)
+}
+
+fn deserialize_env_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, MAX_ENV_REFERENCE_LENGTH>(deserializer)
+}
+
+fn deserialize_health_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, MAX_HEALTH_PATH_LENGTH>(deserializer)
+}
+
+fn deserialize_command_arguments<'de, D>(deserializer: D) -> Result<Vec<CommandArgument>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, CommandArgument, MAX_ARGUMENT_COUNT>(deserializer)
+}
+
+fn deserialize_env_references<'de, D>(deserializer: D) -> Result<Vec<EnvReference>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, EnvReference, MAX_ENV_REFERENCE_COUNT>(deserializer)
+}
+
+fn deserialize_dependencies<'de, D>(deserializer: D) -> Result<Vec<ServiceId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, ServiceId, MAX_DEPENDENCY_COUNT>(deserializer)
+}
+
+fn deserialize_service_definitions<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ServiceDefinition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, ServiceDefinition, MAX_SERVICE_COUNT>(deserializer)
+}
+
+fn canonical_dependencies(mut dependencies: Vec<ServiceId>) -> Vec<ServiceId> {
+    dependencies.sort();
+    dependencies
+}
+
+fn validate_env_reference(reference: &EnvReference) -> Result<(), ValidationError> {
+    validate_env_name(&reference.name)
 }
 
 fn validate_health(health: &HealthSpec) -> Result<(), ValidationError> {
@@ -2069,20 +2743,13 @@ fn is_secret_assignment(value: &str) -> bool {
     ) || value.starts_with("-----BEGIN ")
 }
 
-fn expected_ownership(scope: &ServiceScope) -> RuntimeOwnership {
-    match scope {
-        ServiceScope::Task { task_id } => RuntimeOwnership::Task {
-            task_id: task_id.clone(),
-        },
-        ServiceScope::Host => RuntimeOwnership::Host,
-    }
-}
-
+#[allow(dead_code)]
 fn validate_ownership(
     service_id: &ServiceId,
     definition: &ServiceDefinition,
     runtime: &RuntimeRecord,
     action: ServiceAction,
+    requester: &AdmissionRequester,
     allow_initial_claim: bool,
 ) -> Result<(), AdmissionRejection> {
     if runtime.ownership == RuntimeOwnership::External
@@ -2101,7 +2768,21 @@ fn validate_ownership(
         return Ok(());
     }
 
-    let expected = expected_ownership(&definition.scope);
+    let expected = match (&definition.scope, requester) {
+        (ServiceScope::Task { task_id }, AdmissionRequester::Task(requester_task))
+            if task_id == requester_task =>
+        {
+            RuntimeOwnership::Task { task_id: *task_id }
+        }
+        (ServiceScope::Host, AdmissionRequester::Host(authority)) => RuntimeOwnership::Host {
+            host_id: authority.host_id,
+        },
+        _ => {
+            return Err(AdmissionRejection::RequesterMismatch {
+                service: service_id.clone(),
+            })
+        }
+    };
     if runtime.ownership == expected {
         Ok(())
     } else {
@@ -2111,6 +2792,191 @@ fn validate_ownership(
             received: runtime.ownership.clone(),
         })
     }
+}
+
+fn requester_matches_scope(requester: &AdmissionRequester, scope: &ServiceScope) -> bool {
+    match (requester, scope) {
+        (AdmissionRequester::Task(requester), ServiceScope::Task { task_id }) => {
+            requester == task_id
+        }
+        (AdmissionRequester::Host(_), ServiceScope::Host) => true,
+        _ => false,
+    }
+}
+
+fn validate_start_plan(
+    plan: &StartPlan,
+    catalog: &ServiceCatalog,
+) -> Result<(), AdmissionRejection> {
+    let Some(root_definition) = catalog.definition(&plan.root) else {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    };
+    if !requester_matches_scope(&plan.requester, &root_definition.scope) {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    }
+    let expected_order =
+        catalog
+            .dependency_plan(&plan.root)
+            .map_err(|_| AdmissionRejection::PlanStale {
+                service: plan.root.clone(),
+            })?;
+    if plan.ordered.len() != expected_order.services().len()
+        || plan
+            .ordered
+            .iter()
+            .map(|item| &item.service_id)
+            .ne(expected_order.services().iter())
+    {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    }
+    for item in &plan.ordered {
+        let Some(definition) = catalog.definition(&item.service_id) else {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        };
+        if item.fence.service_id != item.service_id
+            || item.scope != definition.scope
+            || !requester_matches_scope(&plan.requester, &definition.scope)
+        {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        }
+        let expected_intent =
+            catalog
+                .launch_intent(&item.service_id)
+                .map_err(|_| AdmissionRejection::PlanStale {
+                    service: item.service_id.clone(),
+                })?;
+        let requires_intent = item.service_id == plan.root
+            || matches!(
+                item.expected_state,
+                ServiceState::Stopped | ServiceState::Failed
+            );
+        match (&item.intent, requires_intent) {
+            (Some(intent), true) if intent == &expected_intent => {}
+            (None, false) => {}
+            _ => {
+                return Err(AdmissionRejection::PlanStale {
+                    service: item.service_id.clone(),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_stop_plan(
+    plan: &StopPlan,
+    catalog: &ServiceCatalog,
+    snapshot: &AdmissionSnapshot,
+) -> Result<(), AdmissionRejection> {
+    let Some(root_definition) = catalog.definition(&plan.root) else {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    };
+    if !requester_matches_scope(&plan.requester, &root_definition.scope) {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    }
+    let selected = catalog.stop_closure(&plan.root);
+    for service_id in &selected {
+        if !snapshot.services.contains_key(service_id) {
+            return Err(AdmissionRejection::EvidenceUnknown {
+                service: service_id.clone(),
+            });
+        }
+    }
+    let expected_order: Vec<_> = catalog
+        .reverse_selected_order(&selected)
+        .into_iter()
+        .filter(|service_id| {
+            snapshot
+                .services
+                .get(service_id)
+                .is_some_and(|runtime| !matches!(runtime.state, ServiceState::Stopped))
+        })
+        .collect();
+    if plan.ordered.len() != expected_order.len()
+        || plan
+            .ordered
+            .iter()
+            .map(|item| &item.service_id)
+            .ne(expected_order.iter())
+    {
+        return Err(AdmissionRejection::PlanStale {
+            service: plan.root.clone(),
+        });
+    }
+    for item in &plan.ordered {
+        let Some(definition) = catalog.definition(&item.service_id) else {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        };
+        if item.fence.service_id != item.service_id
+            || item.scope != definition.scope
+            || !requester_matches_scope(&plan.requester, &definition.scope)
+        {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_close_plan(
+    plan: &TaskClosePlan,
+    catalog: &ServiceCatalog,
+) -> Result<(), AdmissionRejection> {
+    let selected: BTreeSet<_> = catalog
+        .services
+        .values()
+        .filter(|definition| definition.scope.task_id() == Some(&plan.task_id))
+        .map(|definition| definition.id.clone())
+        .collect();
+    let expected_order = catalog.reverse_selected_order(&selected);
+    if plan.ordered.len() != expected_order.len()
+        || plan
+            .ordered
+            .iter()
+            .map(|item| &item.service_id)
+            .ne(expected_order.iter())
+    {
+        let service = plan
+            .ordered
+            .first()
+            .map(|item| item.service_id.clone())
+            .or_else(|| expected_order.first().cloned())
+            .unwrap_or_else(|| ServiceId::new("plan").expect("static service id"));
+        return Err(AdmissionRejection::PlanStale { service });
+    }
+    for item in &plan.ordered {
+        let Some(definition) = catalog.definition(&item.service_id) else {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        };
+        if item.fence.service_id != item.service_id
+            || item.scope != definition.scope
+            || definition.scope.task_id() != Some(&plan.task_id)
+        {
+            return Err(AdmissionRejection::PlanStale {
+                service: item.service_id.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn revalidate_start_item(
@@ -2170,8 +3036,10 @@ fn revalidate_service_item_inner(
             service: item.service_id.clone(),
         });
     };
-    if runtime.fence.generation != item.fence.generation
-        || runtime.fence.epoch != item.fence.epoch
+    if item.fence.service_id != item.service_id
+        || runtime.fence.resource_generation != item.fence.resource_generation
+        || runtime.fence.connection_epoch != item.fence.connection_epoch
+        || runtime.fence.action_epoch != item.fence.action_epoch
         || runtime.ownership != item.fence.ownership
         || runtime.state != item.expected_state
     {
@@ -2259,4 +3127,547 @@ fn visit_graph_selected(
         visit_graph_selected(&dependency, services, selected, visited, ordered);
     }
     ordered.push(id.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: &str) -> ServiceId {
+        ServiceId::new(value).expect("test service id")
+    }
+
+    fn task_a() -> TaskId {
+        TaskId::parse("0198b6b0-0000-7000-8000-000000000001").expect("test task id")
+    }
+
+    fn task_b() -> TaskId {
+        TaskId::parse("0198b6b0-0000-7000-8000-000000000002").expect("test task id")
+    }
+
+    fn host_a() -> HostId {
+        HostId::new(1)
+    }
+
+    fn host_b() -> HostId {
+        HostId::new(2)
+    }
+
+    fn command() -> CommandSpec {
+        CommandSpec::new("node")
+            .expect("valid executable")
+            .with_arg("server.js")
+            .expect("valid argument")
+            .with_cwd("apps/api")
+            .expect("valid workspace path")
+            .with_env_reference("PORT")
+            .expect("valid environment reference")
+    }
+
+    fn policy() -> HealthPolicy {
+        HealthPolicy {
+            startup_deadline_ms: 5_000,
+            probe_interval_ms: 1_000,
+            max_probe_interval_ms: 4_000,
+            backoff_multiplier: 2,
+            success_threshold: 2,
+            failure_threshold: 2,
+            stale_after_ms: 2_500,
+        }
+    }
+
+    fn service(
+        name: &str,
+        scope: ServiceScope,
+        dependencies: Vec<ServiceId>,
+        port: u16,
+    ) -> ServiceDefinition {
+        ServiceDefinition {
+            id: id(name),
+            scope,
+            command: command(),
+            dependencies,
+            health: HealthSpec::Tcp {
+                port,
+                policy: policy(),
+            },
+            startup: StartupPolicy::manual(),
+            stop: StopPolicy::default(),
+            expected_port: Some(ExpectedPort {
+                protocol: PortProtocol::Tcp,
+                port,
+            }),
+        }
+    }
+
+    fn record(
+        state: ServiceState,
+        fence: AdmissionFence,
+        ownership: RuntimeOwnership,
+        operation: Option<ActiveOperation>,
+    ) -> RuntimeRecord {
+        RuntimeRecord {
+            state,
+            fence,
+            ownership,
+            operation,
+        }
+    }
+
+    fn request(
+        action: ServiceAction,
+        service_id: ServiceId,
+        fence: AdmissionFence,
+        task_id: TaskId,
+    ) -> AdmissionRequest {
+        AdmissionRequest::for_task(action, service_id, fence, task_id)
+    }
+
+    #[test]
+    fn admission_requires_exact_requester_scope_and_host_capability() {
+        let catalog = ServiceCatalog::new(vec![
+            service("task-api", ServiceScope::task(task_a()), vec![], 8080),
+            service("host-db", ServiceScope::Host, vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("task-api"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        snapshot.set_service(
+            id("host-db"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+
+        assert!(matches!(
+            catalog.admit(request(ServiceAction::Start, id("task-api"), fence, task_b()), &snapshot),
+            AdmissionDecision::Refused(AdmissionRejection::RequesterMismatch { service })
+                if service == id("task-api")
+        ));
+        assert!(matches!(
+            catalog.admit(request(ServiceAction::Start, id("host-db"), fence, task_a()), &snapshot),
+            AdmissionDecision::Refused(AdmissionRejection::RequesterMismatch { service })
+                if service == id("host-db")
+        ));
+        assert!(matches!(
+            catalog.admit(
+                AdmissionRequest::for_host(ServiceAction::Start, id("host-db"), fence, host_a()),
+                &snapshot,
+            ),
+            AdmissionDecision::Start(_)
+        ));
+    }
+
+    #[test]
+    fn host_capability_must_match_the_live_host_owner() {
+        let catalog =
+            ServiceCatalog::new(vec![service("host-db", ServiceScope::Host, vec![], 5432)])
+                .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("host-db"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Host { host_id: host_a() },
+                None,
+            ),
+        );
+
+        assert!(matches!(
+            catalog.admit(
+                AdmissionRequest::for_host(
+                    ServiceAction::Stop,
+                    id("host-db"),
+                    fence,
+                    host_b(),
+                ),
+                &snapshot,
+            ),
+            AdmissionDecision::Refused(AdmissionRejection::OwnershipMismatch {
+                service,
+                expected: RuntimeOwnership::Host { host_id },
+                ..
+            }) if service == id("host-db") && host_id == host_b()
+        ));
+    }
+
+    #[test]
+    fn admission_orders_dependencies_coalesces_duplicate_start_and_blocks_failures() {
+        let catalog = ServiceCatalog::new(vec![
+            service("api", ServiceScope::task(task_a()), vec![id("db")], 8080),
+            service("db", ServiceScope::task(task_a()), vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        snapshot.set_service(
+            id("db"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+
+        let AdmissionDecision::Start(plan) = catalog.admit(
+            request(ServiceAction::Start, id("api"), fence, task_a()),
+            &snapshot,
+        ) else {
+            panic!("expected start plan");
+        };
+        assert_eq!(
+            plan.members()
+                .iter()
+                .map(|item| item.service_id().clone())
+                .collect::<Vec<_>>(),
+            vec![id("db"), id("api")]
+        );
+        assert!(plan.revalidate(&catalog, &snapshot).is_ok());
+
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Starting,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                Some(ActiveOperation {
+                    id: 55,
+                    action: ServiceAction::Start,
+                }),
+            ),
+        );
+        assert!(matches!(
+            catalog.admit(
+                request(ServiceAction::Start, id("api"), fence, task_a()),
+                &snapshot
+            ),
+            AdmissionDecision::Coalesced {
+                operation_id: 55,
+                action: ServiceAction::Start,
+                ..
+            }
+        ));
+
+        snapshot.set_service(
+            id("db"),
+            record(ServiceState::Failed, fence, RuntimeOwnership::None, None),
+        );
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        assert!(matches!(
+            catalog.admit(request(ServiceAction::Start, id("api"), fence, task_a()), &snapshot),
+            AdmissionDecision::Refused(AdmissionRejection::DependencyNotReady {
+                dependency,
+                state: ServiceState::Failed,
+                ..
+            }) if dependency == id("db")
+        ));
+    }
+
+    #[test]
+    fn plan_revalidation_checks_catalog_root_order_scope_intent_and_fence_identity() {
+        let catalog = ServiceCatalog::new(vec![
+            service("api", ServiceScope::task(task_a()), vec![id("db")], 8080),
+            service("db", ServiceScope::task(task_a()), vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        snapshot.set_service(
+            id("db"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        let AdmissionDecision::Start(plan) = catalog.admit(
+            request(ServiceAction::Start, id("api"), fence, task_a()),
+            &snapshot,
+        ) else {
+            panic!("expected start plan");
+        };
+        assert!(plan.revalidate(&catalog, &snapshot).is_ok());
+
+        let mut wrong_root = plan.clone();
+        wrong_root.root = id("db");
+        assert!(wrong_root.revalidate(&catalog, &snapshot).is_err());
+
+        let mut wrong_order = plan.clone();
+        wrong_order.ordered.reverse();
+        assert!(wrong_order.revalidate(&catalog, &snapshot).is_err());
+
+        let mut wrong_scope = plan.clone();
+        wrong_scope.ordered[0].scope = ServiceScope::Host;
+        assert!(wrong_scope.revalidate(&catalog, &snapshot).is_err());
+
+        let mut wrong_intent = plan.clone();
+        wrong_intent.ordered[0].intent = None;
+        assert!(wrong_intent.revalidate(&catalog, &snapshot).is_err());
+
+        let mut wrong_fence_identity = plan;
+        wrong_fence_identity.ordered[0].fence.service_id = id("api");
+        assert!(wrong_fence_identity
+            .revalidate(&catalog, &snapshot)
+            .is_err());
+    }
+
+    #[test]
+    fn plan_revalidation_rejects_a_changed_connection_epoch() {
+        let catalog = ServiceCatalog::new(vec![service(
+            "api",
+            ServiceScope::task(task_a()),
+            vec![],
+            8080,
+        )])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        let AdmissionDecision::Start(plan) = catalog.admit(
+            request(ServiceAction::Start, id("api"), fence, task_a()),
+            &snapshot,
+        ) else {
+            panic!("expected start plan");
+        };
+
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Stopped,
+                AdmissionFence::new(4, 4, 9),
+                RuntimeOwnership::None,
+                None,
+            ),
+        );
+        assert!(plan.revalidate(&catalog, &snapshot).is_err());
+    }
+
+    #[test]
+    fn stop_restart_revalidation_checks_reverse_order_and_snapshot_state() {
+        let catalog = ServiceCatalog::new(vec![
+            service("api", ServiceScope::task(task_a()), vec![id("db")], 8080),
+            service("db", ServiceScope::task(task_a()), vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let owned = RuntimeOwnership::Task { task_id: task_a() };
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Healthy, fence, owned.clone(), None),
+        );
+        snapshot.set_service(
+            id("db"),
+            record(ServiceState::Healthy, fence, owned.clone(), None),
+        );
+
+        let AdmissionDecision::Stop(stop_plan) = catalog.admit(
+            request(ServiceAction::Stop, id("db"), fence, task_a()),
+            &snapshot,
+        ) else {
+            panic!("expected stop plan");
+        };
+        assert_eq!(
+            stop_plan
+                .members()
+                .iter()
+                .map(|item| item.service_id().clone())
+                .collect::<Vec<_>>(),
+            vec![id("api"), id("db")]
+        );
+        assert!(stop_plan.revalidate(&catalog, &snapshot).is_ok());
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                owned.clone(),
+                Some(ActiveOperation {
+                    id: 93,
+                    action: ServiceAction::Start,
+                }),
+            ),
+        );
+        assert!(stop_plan.revalidate(&catalog, &snapshot).is_err());
+        snapshot.set_service(
+            id("api"),
+            record(ServiceState::Healthy, fence, owned.clone(), None),
+        );
+
+        let AdmissionDecision::Restart(restart_plan) = catalog.admit(
+            request(ServiceAction::Restart, id("api"), fence, task_a()),
+            &snapshot,
+        ) else {
+            panic!("expected restart plan");
+        };
+        assert!(restart_plan.revalidate(&catalog, &snapshot).is_ok());
+        assert_eq!(
+            restart_plan
+                .stop()
+                .members()
+                .iter()
+                .map(|item| item.service_id().clone())
+                .collect::<Vec<_>>(),
+            vec![id("api")]
+        );
+        assert_eq!(
+            restart_plan
+                .start()
+                .members()
+                .iter()
+                .map(|item| item.service_id().clone())
+                .collect::<Vec<_>>(),
+            vec![id("db"), id("api")]
+        );
+    }
+
+    #[test]
+    fn task_close_fails_closed_and_accounts_for_every_task_scoped_definition() {
+        let catalog = ServiceCatalog::new(vec![
+            service("api", ServiceScope::task(task_a()), vec![], 8080),
+            service("worker", ServiceScope::task(task_a()), vec![], 8081),
+            service("other", ServiceScope::task(task_b()), vec![], 8082),
+            service("host-db", ServiceScope::Host, vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+
+        let mut missing = AdmissionSnapshot::default();
+        missing.set_task_epoch(task_a(), ActionEpoch::new(9));
+        missing.mark_task_closing(task_a());
+        missing.set_service(
+            id("api"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &missing),
+            Err(AdmissionRejection::EvidenceUnknown { service }) if service == id("worker")
+        ));
+
+        let mut foreign = missing.clone();
+        foreign.set_service(
+            id("worker"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_b() },
+                None,
+            ),
+        );
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &foreign),
+            Err(AdmissionRejection::OwnershipMismatch { service, .. }) if service == id("worker")
+        ));
+
+        let mut host_owned = missing.clone();
+        host_owned.set_service(
+            id("worker"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Host { host_id: host_a() },
+                None,
+            ),
+        );
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &host_owned),
+            Err(AdmissionRejection::OwnershipMismatch { service, .. }) if service == id("worker")
+        ));
+
+        let mut external = missing.clone();
+        external.set_service(
+            id("worker"),
+            record(
+                ServiceState::External,
+                fence,
+                RuntimeOwnership::External,
+                None,
+            ),
+        );
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &external),
+            Err(AdmissionRejection::ExternalNotControllable { service }) if service == id("worker")
+        ));
+
+        let mut complete = missing;
+        complete.set_service(
+            id("worker"),
+            record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+        );
+        complete.set_service(
+            id("other"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_b() },
+                None,
+            ),
+        );
+        complete.set_service(
+            id("host-db"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Host { host_id: host_a() },
+                None,
+            ),
+        );
+        let close = catalog
+            .admit_task_close(task_a(), ActionEpoch::new(9), &complete)
+            .unwrap();
+        assert_eq!(close.members().len(), 2);
+        assert_eq!(
+            close
+                .members()
+                .iter()
+                .map(|item| item.service_id().clone())
+                .collect::<Vec<_>>(),
+            vec![id("worker"), id("api")]
+        );
+        assert!(close.revalidate(&catalog, &complete).is_ok());
+    }
+
+    #[test]
+    fn task_close_rejects_stopped_members_that_still_retain_task_ownership() {
+        let catalog = ServiceCatalog::new(vec![service(
+            "api",
+            ServiceScope::task(task_a()),
+            vec![],
+            8080,
+        )])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_task_epoch(task_a(), ActionEpoch::new(9));
+        snapshot.mark_task_closing(task_a());
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Stopped,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &snapshot),
+            Err(AdmissionRejection::OwnershipMismatch { service, .. }) if service == id("api")
+        ));
+    }
 }

@@ -1,8 +1,9 @@
 {
+  "schema_version": 1,
   "services": [
     {
       "id": "db",
-      "scope": { "Task": { "task_id": "task-a" } },
+      "scope": { "Task": { "task_id": "0198b6b0-0000-7000-8000-000000000001" } },
       "command": {
         "program": "postgres",
         "args": ["-D", "data/db"],
@@ -30,7 +31,7 @@
     },
     {
       "id": "api",
-      "scope": { "Task": { "task_id": "task-a" } },
+      "scope": { "Task": { "task_id": "0198b6b0-0000-7000-8000-000000000001" } },
       "command": {
         "program": "node",
         "args": ["server.js"],
