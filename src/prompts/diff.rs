@@ -31,16 +31,61 @@ const MAX_JSON_BYTE_BYTES: usize = 3;
 /// exact caller-provided bytes; CRLF normalization is comparison-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptDiff<'a> {
-    pub old_body: &'a str,
-    pub new_body: &'a str,
-    pub old_body_sha256: [u8; 32],
-    pub new_body_sha256: [u8; 32],
-    pub cache_key: Option<DiffCacheKey>,
-    pub hunks: Vec<LineHunk>,
-    pub inline_spans: Vec<InlineSpan>,
-    pub estimated_payload_bytes: usize,
-    pub status: DiffStatus,
-    pub truncation: Option<TruncationMarker>,
+    old_body: &'a str,
+    new_body: &'a str,
+    old_body_sha256: [u8; 32],
+    new_body_sha256: [u8; 32],
+    cache_key: Option<DiffCacheKey>,
+    hunks: Vec<LineHunk>,
+    inline_spans: Vec<InlineSpan>,
+    estimated_payload_bytes: usize,
+    status: DiffStatus,
+    truncation: Option<TruncationMarker>,
+}
+
+impl<'a> PromptDiff<'a> {
+    pub fn old_body(&self) -> &'a str {
+        self.old_body
+    }
+
+    pub fn new_body(&self) -> &'a str {
+        self.new_body
+    }
+
+    pub fn old_body_sha256(&self) -> &[u8; 32] {
+        &self.old_body_sha256
+    }
+
+    pub fn new_body_sha256(&self) -> &[u8; 32] {
+        &self.new_body_sha256
+    }
+
+    pub fn cache_key(&self) -> Option<DiffCacheKey> {
+        match self.status {
+            DiffStatus::Cancelled | DiffStatus::InvalidInput { .. } => None,
+            _ => self.cache_key,
+        }
+    }
+
+    pub fn hunks(&self) -> &[LineHunk] {
+        &self.hunks
+    }
+
+    pub fn inline_spans(&self) -> &[InlineSpan] {
+        &self.inline_spans
+    }
+
+    pub fn estimated_payload_bytes(&self) -> usize {
+        self.estimated_payload_bytes
+    }
+
+    pub fn status(&self) -> DiffStatus {
+        self.status
+    }
+
+    pub fn truncation(&self) -> Option<TruncationMarker> {
+        self.truncation
+    }
 }
 
 /// A typed line-level change hunk.
@@ -152,8 +197,18 @@ pub enum DiffStatus {
 /// can use this key without making SQLite a source of diff truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DiffCacheKey {
-    pub old_body_sha256: [u8; 32],
-    pub new_body_sha256: [u8; 32],
+    old_body_sha256: [u8; 32],
+    new_body_sha256: [u8; 32],
+}
+
+impl DiffCacheKey {
+    pub fn old_body_sha256(&self) -> [u8; 32] {
+        self.old_body_sha256
+    }
+
+    pub fn new_body_sha256(&self) -> [u8; 32] {
+        self.new_body_sha256
+    }
 }
 
 /// A failure to encode the canonical public diff projection within its wire
@@ -538,7 +593,7 @@ pub fn encode_public_diff(diff: &PromptDiff<'_>) -> Result<Vec<u8>, PromptDiffEn
             })
         })
         .collect();
-    let cache_key = diff.cache_key.map(|key| {
+    let cache_key = diff.cache_key().map(|key| {
         serde_json::json!({
             "old_body_sha256": key.old_body_sha256,
             "new_body_sha256": key.new_body_sha256,
@@ -1061,6 +1116,7 @@ fn line_hunk_kind(old_count: usize, new_count: usize) -> LineHunkKind {
 fn finish_cancelled<'a>(mut result: PromptDiff<'a>, output: OutputBudget) -> PromptDiff<'a> {
     result.estimated_payload_bytes = output.bytes.min(MAX_PROMPT_DIFF_PAYLOAD_BYTES);
     result.status = DiffStatus::Cancelled;
+    result.cache_key = None;
     result.truncation = None;
     result
 }
