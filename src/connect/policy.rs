@@ -261,6 +261,41 @@ pub enum GrantError {
 }
 
 /// A time-bounded, task-scoped management grant.
+///
+/// Grant construction is private to this policy module until Phase 10.7 binds
+/// signed grants to account/device identity, membership, tenant, task link,
+/// policy revision, expiry, and allowed classes. External callers cannot use
+/// the constructor:
+///
+/// ```compile_fail
+/// use devmanager::connect::{ManagementGrant, ManagementRole};
+/// use devmanager::domain::id::TaskId;
+///
+/// let task_id = TaskId::from_bytes([
+///     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x70, 0xcd,
+///     0x80, 0xef, 0, 0, 0, 0, 0, 1,
+/// ]).expect("valid task id");
+/// let _grant = ManagementGrant::try_new(task_id, ManagementRole::TaskCollaborator, 0, 1);
+/// ```
+///
+/// They also cannot bypass the constructor with a struct literal:
+///
+/// ```compile_fail
+/// use devmanager::connect::{ManagementGrant, ManagementRole};
+/// use devmanager::domain::id::TaskId;
+///
+/// let task_id = TaskId::from_bytes([
+///     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x70, 0xcd,
+///     0x80, 0xef, 0, 0, 0, 0, 0, 1,
+/// ]).expect("valid task id");
+/// let _grant = ManagementGrant {
+///     task_id,
+///     role: ManagementRole::TaskCollaborator,
+///     issued_at_ms: 0,
+///     expires_at_ms: 1,
+///     revoked: false,
+/// };
+/// ```
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ManagementGrant {
     task_id: TaskId,
@@ -271,6 +306,7 @@ pub struct ManagementGrant {
 }
 
 impl ManagementGrant {
+    #[allow(dead_code)]
     fn try_new(
         task_id: TaskId,
         role: ManagementRole,
@@ -311,29 +347,6 @@ impl ManagementGrant {
 
     pub const fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
-    }
-}
-
-/// Non-forgeable capability for issuing grants through the management policy.
-///
-/// The issuer is intentionally neither cloneable nor copyable. Crate-owned
-/// authenticated host boundaries may obtain one from a [`ManagementPolicy`],
-/// while grant construction stays private to this module.
-#[derive(Debug)]
-pub(crate) struct ManagementGrantIssuer<'policy> {
-    policy: &'policy ManagementPolicy,
-}
-
-impl ManagementGrantIssuer<'_> {
-    pub(crate) fn issue(
-        &mut self,
-        task_id: TaskId,
-        role: ManagementRole,
-        issued_at_ms: u64,
-        expires_at_ms: u64,
-    ) -> Result<ManagementGrant, GrantError> {
-        let _ = self.policy;
-        ManagementGrant::try_new(task_id, role, issued_at_ms, expires_at_ms)
     }
 }
 
@@ -463,10 +476,6 @@ pub struct ManagementPolicy;
 impl ManagementPolicy {
     pub const fn new() -> Self {
         Self
-    }
-
-    pub(crate) fn grant_issuer(&self) -> ManagementGrantIssuer<'_> {
-        ManagementGrantIssuer { policy: self }
     }
 
     pub fn decide(
@@ -652,8 +661,6 @@ mod tests {
 
     assert_not_impl_any!(ManagementGrant: Clone);
     assert_not_impl_any!(ManagementGrant: Copy);
-    assert_not_impl_any!(ManagementGrantIssuer: Clone);
-    assert_not_impl_any!(ManagementGrantIssuer: Copy);
 
     fn task_id(tail: u8) -> TaskId {
         let mut bytes = [0_u8; 16];
@@ -688,18 +695,16 @@ mod tests {
     }
 
     #[test]
-    fn issuer_issues_valid_grants_and_preserves_live_revocation() {
-        let policy = ManagementPolicy::default();
-        let mut issuer = policy.grant_issuer();
-        let mut grant = issuer
-            .issue(task_id(1), ManagementRole::TaskCollaborator, 10, 100)
-            .expect("valid grant");
+    fn private_grants_preserve_expiry_and_live_revocation_behavior() {
+        let mut grant =
+            ManagementGrant::try_new(task_id(1), ManagementRole::TaskCollaborator, 10, 100)
+                .expect("valid grant");
 
         grant.revoke();
 
         assert!(grant.is_revoked());
         assert_eq!(
-            issuer.issue(task_id(1), ManagementRole::TaskCollaborator, 100, 100),
+            ManagementGrant::try_new(task_id(1), ManagementRole::TaskCollaborator, 100, 100),
             Err(GrantError::ExpiryNotAfterIssue)
         );
     }

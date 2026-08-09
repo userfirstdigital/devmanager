@@ -214,26 +214,6 @@ fn active_session_interval_accepts_exactly_fifteen_minutes() {
 }
 
 #[test]
-fn management_grant_constructor_and_issuer_are_not_public() {
-    let policy_source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/connect/policy.rs"
-    ));
-    let connect_source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/connect/mod.rs"));
-    let grant_impl = policy_source
-        .split("impl ManagementGrant {")
-        .nth(1)
-        .and_then(|rest| rest.split("/// Non-forgeable capability").next())
-        .expect("ManagementGrant implementation");
-    assert!(grant_impl.contains("    fn try_new("));
-    assert!(!grant_impl.contains("    pub fn try_new("));
-    assert!(!policy_source.contains("pub struct ManagementGrantIssuer"));
-    assert!(!policy_source.contains("pub fn grant_issuer"));
-    assert!(!policy_source.contains("pub fn issue("));
-    assert!(!connect_source.contains("ManagementGrantIssuer"));
-}
-
-#[test]
 fn fixed_reason_codes_are_stable_and_secret_free() {
     let expected = [
         (PolicyReasonCode::Allowed, "allowed"),
