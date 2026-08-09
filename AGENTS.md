@@ -82,6 +82,10 @@
 
 - Aim for a focused RED/GREEN/review phase slice in roughly 30 minutes. This is
   a planning target, not a hard cutoff. If one slice reaches 60 minutes, stop and
-  reassess its ownership, dependencies, test scope, build isolation, and false
-  blockers before continuing. Preserve useful work in its isolated branch, then
-  split or hand off the smallest coherent correction instead of waiting blindly.
+  reassess its ownership, dependencies, test scope, build isolation, recent file
+  writes, and process activity. Sixty minutes is a progress checkpoint, not a
+  termination signal: let a productive single-writer lane continue for 75–90+
+  minutes when it is making verifiable progress. Stop only for a verified stall,
+  unsafe overlap, isolation breach, or an exited process. A wrapper timeout is
+  not proof that its agent exited; inspect the exact child PID and worktree before
+  resuming, and never start a duplicate writer over a live or preserved diff.
