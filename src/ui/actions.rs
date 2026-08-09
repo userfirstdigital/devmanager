@@ -9,6 +9,7 @@ use crate::client::action::{
     ACTION_TASK_CREATE, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use crate::domain::id::TaskId;
+use crate::ui::components::{AccessibilityMetadata, AccessibleRole, InteractionStateModel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionPresentationKind {
@@ -35,19 +36,7 @@ pub enum ActionAvailability {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccessibilityRole {
-    Button,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ActionAccessibility {
-    pub role: AccessibilityRole,
-    pub name: &'static str,
-    pub description: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionPresentation {
     descriptor: &'static ActionDescriptor,
     presentation: ActionPresentationKind,
@@ -55,7 +44,7 @@ pub struct ActionPresentation {
     availability: ActionAvailability,
     disabled: bool,
     disabled_reason: Option<&'static str>,
-    accessibility: ActionAccessibility,
+    accessibility: AccessibilityMetadata,
 }
 
 impl ActionPresentation {
@@ -91,8 +80,183 @@ impl ActionPresentation {
         self.disabled_reason
     }
 
-    pub fn accessibility(&self) -> &ActionAccessibility {
+    pub fn accessibility(&self) -> &AccessibilityMetadata {
         &self.accessibility
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShortcutKey {
+    Character(char),
+    Digit(u8),
+    Backtick,
+    Escape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct KeyboardShortcut {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: ShortcutKey,
+}
+
+impl KeyboardShortcut {
+    pub const fn new(ctrl: bool, shift: bool, alt: bool, key: ShortcutKey) -> Self {
+        Self {
+            ctrl,
+            shift,
+            alt,
+            key,
+        }
+    }
+
+    pub const fn ctrl(key: ShortcutKey) -> Self {
+        Self::new(true, false, false, key)
+    }
+
+    pub const fn ctrl_shift(key: ShortcutKey) -> Self {
+        Self::new(true, true, false, key)
+    }
+
+    pub const fn alt(key: ShortcutKey) -> Self {
+        Self::new(false, false, true, key)
+    }
+
+    pub const fn escape() -> Self {
+        Self::new(false, false, false, ShortcutKey::Escape)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DockTool {
+    Changes,
+    Files,
+    Terminal,
+    Browser,
+    Services,
+    Artifacts,
+    Review,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardAction {
+    OpenPalette,
+    OpenTaskSwitcher,
+    OpenCommandPalette,
+    SelectDock(DockTool),
+    OpenTerminal,
+    DismissTransient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyboardBinding {
+    pub shortcut: KeyboardShortcut,
+    pub action: KeyboardAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardModelError {
+    ShortcutConflict(KeyboardShortcut),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyboardModel {
+    bindings: Vec<KeyboardBinding>,
+}
+
+impl KeyboardModel {
+    pub fn new(bindings: Vec<KeyboardBinding>) -> Result<Self, KeyboardModelError> {
+        for (index, binding) in bindings.iter().enumerate() {
+            if bindings[..index]
+                .iter()
+                .any(|prior| prior.shortcut == binding.shortcut)
+            {
+                return Err(KeyboardModelError::ShortcutConflict(binding.shortcut));
+            }
+        }
+        Ok(Self { bindings })
+    }
+
+    pub fn bindings(&self) -> &[KeyboardBinding] {
+        &self.bindings
+    }
+
+    pub fn resolve(&self, shortcut: KeyboardShortcut) -> Option<KeyboardAction> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.shortcut == shortcut)
+            .map(|binding| binding.action)
+    }
+
+    /// Resolve a local shortcut through the shared interaction policy.
+    /// Escape remains available to dismiss a transient layer even when the
+    /// active control is disabled; every other shortcut requires the same
+    /// current focus epoch and activation state as a component control.
+    pub fn activate(
+        &self,
+        shortcut: KeyboardShortcut,
+        interaction: &InteractionStateModel,
+        focus_epoch: u64,
+    ) -> Option<KeyboardAction> {
+        let action = self.resolve(shortcut)?;
+        if action == KeyboardAction::DismissTransient
+            || (interaction.focus_epoch() == focus_epoch && interaction.state().can_activate())
+        {
+            Some(action)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for KeyboardModel {
+    fn default() -> Self {
+        let mut bindings = vec![
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Character('k')),
+                action: KeyboardAction::OpenPalette,
+            },
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Character('p')),
+                action: KeyboardAction::OpenTaskSwitcher,
+            },
+        ];
+        let command_palette_alias = KeyboardShortcut::ctrl_shift(ShortcutKey::Character('p'));
+        if !bindings
+            .iter()
+            .any(|binding| binding.shortcut == command_palette_alias)
+        {
+            bindings.push(KeyboardBinding {
+                shortcut: command_palette_alias,
+                action: KeyboardAction::OpenCommandPalette,
+            });
+        }
+        for (digit, action) in [
+            (1, DockTool::Changes),
+            (2, DockTool::Files),
+            (3, DockTool::Terminal),
+            (4, DockTool::Browser),
+            (5, DockTool::Services),
+            (6, DockTool::Artifacts),
+            (7, DockTool::Review),
+        ] {
+            bindings.push(KeyboardBinding {
+                shortcut: KeyboardShortcut::alt(ShortcutKey::Digit(digit)),
+                action: KeyboardAction::SelectDock(action),
+            });
+        }
+        bindings.extend([
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Backtick),
+                action: KeyboardAction::OpenTerminal,
+            },
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::escape(),
+                action: KeyboardAction::DismissTransient,
+            },
+        ]);
+        Self::new(bindings).expect("default Task Cockpit shortcuts are conflict-free")
     }
 }
 
@@ -140,10 +304,14 @@ pub fn catalog(selected_task: Option<TaskId>) -> Vec<ActionPresentation> {
                 },
                 disabled: unavailable,
                 disabled_reason: unavailable.then_some(NO_SELECTED_TASK),
-                accessibility: ActionAccessibility {
-                    role: AccessibilityRole::Button,
-                    name: descriptor.title,
-                    description: descriptor.description,
+                accessibility: {
+                    let mut metadata =
+                        AccessibilityMetadata::new(AccessibleRole::Button, descriptor.title)
+                            .expect("catalog action title is valid accessibility text");
+                    metadata
+                        .set_description(descriptor.description)
+                        .expect("catalog action description is valid accessibility text");
+                    metadata
                 },
             }
         })

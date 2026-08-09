@@ -12,7 +12,11 @@ use devmanager::ui::components::text_field::{
     TextField, TextFieldError, TextFieldKey, TextFieldLimits,
 };
 use devmanager::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
+use static_assertions::assert_not_impl_any;
 use std::sync::{Arc, Mutex};
+
+assert_not_impl_any!(InteractionStateModel: Clone);
+assert_not_impl_any!(InteractionStateModel: Copy);
 
 fn action_id(value: &str) -> ActionId {
     ActionId::new(value).expect("test action ids are stable and valid")

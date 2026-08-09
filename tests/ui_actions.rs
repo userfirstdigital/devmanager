@@ -1,6 +1,10 @@
 use devmanager::client::action;
 use devmanager::domain::id::TaskId;
-use devmanager::ui::actions::{self, AccessibilityRole, ActionAvailability};
+use devmanager::ui::actions::{
+    self, ActionAvailability, DockTool, KeyboardAction, KeyboardModel, KeyboardShortcut,
+    ShortcutKey,
+};
+use devmanager::ui::components::{AccessibleRole, InteractionStateModel};
 use serde::Deserialize;
 use std::fs;
 
@@ -61,7 +65,7 @@ fn action_projection_reuses_every_shared_id_and_adds_accessible_presentation() {
             .all(|entry| !entry.accessibility().name.is_empty()));
         assert!(projected
             .iter()
-            .all(|entry| entry.accessibility().role == AccessibilityRole::Button));
+            .all(|entry| entry.accessibility().role == AccessibleRole::Button));
 
         for entry in &projected {
             let expected_disabled = state.disabled_ids.iter().any(|id| id == entry.id());
@@ -96,4 +100,70 @@ fn action_projection_does_not_add_ids_or_factories_to_the_shared_catalog() {
             .iter()
             .any(|descriptor| descriptor.id == entry.id())
     }));
+}
+
+#[test]
+fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
+    let model = KeyboardModel::default();
+    let interaction = InteractionStateModel::default();
+
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Character('k'))),
+        Some(KeyboardAction::OpenPalette)
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Character('p'))),
+        Some(KeyboardAction::OpenTaskSwitcher)
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Character('p'))),
+        Some(KeyboardAction::OpenCommandPalette)
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(1))),
+        Some(KeyboardAction::SelectDock(DockTool::Changes))
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(7))),
+        Some(KeyboardAction::SelectDock(DockTool::Review))
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Backtick)),
+        Some(KeyboardAction::OpenTerminal)
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::escape()),
+        Some(KeyboardAction::DismissTransient)
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::alt(ShortcutKey::Character('1'))),
+        None
+    );
+
+    assert_eq!(
+        model.activate(
+            KeyboardShortcut::ctrl(ShortcutKey::Character('k')),
+            &interaction,
+            interaction.focus_epoch(),
+        ),
+        Some(KeyboardAction::OpenPalette)
+    );
+    let mut disabled = InteractionStateModel::default();
+    disabled.set_disabled(true);
+    assert_eq!(
+        model.activate(
+            KeyboardShortcut::ctrl(ShortcutKey::Character('k')),
+            &disabled,
+            disabled.focus_epoch(),
+        ),
+        None
+    );
+    assert_eq!(
+        model.activate(
+            KeyboardShortcut::escape(),
+            &disabled,
+            disabled.focus_epoch()
+        ),
+        Some(KeyboardAction::DismissTransient)
+    );
 }
