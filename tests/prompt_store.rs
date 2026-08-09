@@ -5,8 +5,9 @@ use devmanager::domain::{
 };
 use devmanager::prompts::{
     ArchivePrompt, CreatePrompt, CreatePromptChain, CreatePromptVersion, InsertPromptChainLink,
-    MovePromptChainLink, PromptChainCommand, PromptCommand, PromptEvent, PromptMutationReceipt,
-    PromptStore, PromptStoreError, PromptVersion, RemovePromptChainLink, RenamePrompt,
+    MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent,
+    PromptChainMutationReceipt, PromptCommand, PromptEvent, PromptMutationReceipt, PromptStore,
+    PromptStoreError, PromptValidationError, PromptVersion, RemovePromptChainLink, RenamePrompt,
     RestorePrompt, SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion,
 };
 use rusqlite::Connection;
@@ -385,10 +386,7 @@ fn expected_revision_prevents_lost_update() {
         .expect_err("stale revision must reject");
     assert!(matches!(
         error,
-        PromptStoreError::RevisionConflict {
-            expected: 0,
-            actual: 1
-        }
+        PromptStoreError::Validation(PromptValidationError::ExpectedRevisionZero)
     ));
     assert_eq!(
         store.get_prompt(prompt).unwrap().unwrap().title,
@@ -1404,10 +1402,7 @@ fn chain_revision_conflict_changes_nothing() {
         .expect_err("stale chain revision");
     assert!(matches!(
         error,
-        PromptStoreError::RevisionConflict {
-            expected: 0,
-            actual: 1
-        }
+        PromptStoreError::Validation(PromptValidationError::ExpectedRevisionZero)
     ));
     assert!(store.list_chain_links(chain).unwrap().is_empty());
     assert_eq!(store.count_chain_events().unwrap(), 1);
@@ -1472,6 +1467,217 @@ fn chain_update_to_current_is_explicit_and_replayable() {
     assert_eq!(
         store.list_chain_links(chain).unwrap()[0].prompt_version_id,
         second
+    );
+}
+
+#[test]
+fn rebuild_repairs_missing_chain_projection_through_ordered_events() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let chain = chain_id(201);
+    let mut store = open_store(&path);
+    store
+        .execute_chain(command_id(202), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(203),
+            PromptChainCommand::RenamePromptChain(devmanager::prompts::RenamePromptChain {
+                chain_id: chain,
+                title: "Replayed workflow".into(),
+                expected_revision: 1,
+            }),
+        )
+        .expect("rename chain");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "DELETE FROM prompt_chains WHERE chain_id = ?1",
+        [chain.as_bytes().as_slice()],
+    )
+    .expect("remove only the chain projection");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    store
+        .rebuild_projection()
+        .expect("valid ordered chain events rebuild the missing projection");
+    let rebuilt = store
+        .get_chain(chain)
+        .expect("query rebuilt chain")
+        .expect("rebuilt chain");
+    assert_eq!(rebuilt.title, "Replayed workflow");
+    assert_eq!(rebuilt.revision, 2);
+}
+
+#[test]
+fn chain_link_create_rejects_stale_prompt_current_pointer() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(204);
+    let first = version_id(205);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(206), create_prompt(prompt, first))
+        .expect("create prompt");
+    drop(store);
+
+    let body = "later version";
+    let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_versions(
+            prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+         ) VALUES (?1, ?2, 2, ?3, ?4, 2)",
+        rusqlite::params![
+            version_id(207).as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            body,
+            body_sha256.as_slice(),
+        ],
+    )
+    .expect("insert later version without advancing pointer");
+    drop(conn);
+
+    let chain = chain_id(208);
+    let mut store = open_store(&path);
+    store
+        .execute_chain(command_id(209), create_chain(chain))
+        .expect("create chain");
+    let error = store
+        .execute_chain(
+            command_id(210),
+            insert_link(chain, link_id(211), prompt, None, None, 1),
+        )
+        .expect_err("chain creation must validate the loaded prompt pointer");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn chain_link_update_rejects_stale_prompt_current_pointer() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(212);
+    let first = version_id(213);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(214), create_prompt(prompt, first))
+        .expect("create prompt");
+    let chain = chain_id(215);
+    store
+        .execute_chain(command_id(216), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(217),
+            insert_link(chain, link_id(218), prompt, Some(first), None, 1),
+        )
+        .expect("create pinned link");
+    drop(store);
+
+    let body = "later version";
+    let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_versions(
+            prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+         ) VALUES (?1, ?2, 2, ?3, ?4, 2)",
+        rusqlite::params![
+            version_id(219).as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            body,
+            body_sha256.as_slice(),
+        ],
+    )
+    .expect("insert later version without advancing pointer");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute_chain(
+            command_id(220),
+            PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+                chain_id: chain,
+                link_id: link_id(218),
+                expected_revision: 2,
+            }),
+        )
+        .expect_err("chain update must validate the loaded prompt pointer");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn replay_rejects_untrimmed_chain_title_and_description() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let chain = chain_id(221);
+    let command = command_id(222);
+    let event = PromptChainEvent::PromptChainCreated {
+        chain: PromptChain {
+            id: chain,
+            title: " Chain ".into(),
+            description: Some(" description ".into()),
+            revision: 1,
+            archived_at_ms: None,
+        },
+    };
+    let receipt = PromptChainMutationReceipt {
+        command_id: command,
+        chain_id: chain,
+        link_id: None,
+        revision: 1,
+    };
+
+    drop(open_store(&path));
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_chains(
+            chain_id, title, description, revision, created_at_ms, updated_at_ms, archived_at_ms
+         ) VALUES (?1, ?2, ?3, 1, 1, 1, NULL)",
+        rusqlite::params![chain.as_bytes().as_slice(), "Chain", "description"],
+    )
+    .expect("seed projection for row validation");
+    conn.execute(
+        "INSERT INTO prompt_chain_command_receipts(
+            command_id, command_sha256, chain_id, chain_link_id, revision,
+            receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            command.as_bytes().as_slice(),
+            [0u8; 32].as_slice(),
+            chain.as_bytes().as_slice(),
+            Option::<Vec<u8>>::None,
+            1_i64,
+            receipt.encode().expect("chain receipt payload"),
+            1_i64,
+        ],
+    )
+    .expect("seed chain receipt");
+    conn.execute(
+        "INSERT INTO prompt_chain_events(
+            prompt_chain_event_id, command_id, chain_id, event_type,
+            occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            command.as_bytes().as_slice(),
+            chain.as_bytes().as_slice(),
+            event.event_type(),
+            1_i64,
+            event.encode().expect("chain event payload"),
+        ],
+    )
+    .expect("seed chain event");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .rebuild_projection()
+        .expect_err("replay must reject untrimmed chain metadata");
+    assert!(
+        matches!(error, PromptStoreError::Corruption(_)),
+        "unexpected replay error: {error:?}"
     );
 }
 
@@ -2060,4 +2266,347 @@ fn chain_projection_rebuild_rejects_row_target_mismatch() {
         .rebuild_projection()
         .expect_err("chain event target must match event and receipt lineage");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn saved_prompt_reads_reject_untrimmed_metadata() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(231);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(232), create_prompt(prompt, version_id(233)))
+        .expect("create prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "UPDATE saved_prompts SET title = ?1, description = ?2 WHERE prompt_id = ?3",
+        rusqlite::params![
+            " Padded title ",
+            " padded description ",
+            prompt.as_bytes().as_slice()
+        ],
+    )
+    .expect("corrupt prompt metadata");
+    drop(conn);
+
+    let store = open_store(&path);
+    assert!(matches!(
+        store.get_prompt(prompt),
+        Err(PromptStoreError::Corruption(_))
+    ));
+    assert!(matches!(
+        store.list_prompts(0, 10),
+        Err(PromptStoreError::Corruption(_))
+    ));
+}
+
+#[test]
+fn chain_link_reads_move_and_remove_reject_stale_prompt_pointer() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(234);
+    let first = version_id(235);
+    let chain = chain_id(236);
+    let link = link_id(237);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(238), create_prompt(prompt, first))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(239), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(240),
+            insert_link(chain, link, prompt, Some(first), None, 1),
+        )
+        .expect("create link");
+    drop(store);
+
+    let body = "later version";
+    let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_versions(
+            prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+         ) VALUES (?1, ?2, 2, ?3, ?4, 2)",
+        rusqlite::params![
+            version_id(241).as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            body,
+            body_sha256.as_slice(),
+        ],
+    )
+    .expect("insert later version without advancing pointer");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    assert!(matches!(
+        store.list_chain_links(chain),
+        Err(PromptStoreError::Corruption(_))
+    ));
+    assert!(matches!(
+        store.execute_chain(
+            command_id(242),
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id: chain,
+                link_id: link,
+                before_link_id: None,
+                expected_revision: 2,
+            }),
+        ),
+        Err(PromptStoreError::Corruption(_))
+    ));
+    assert!(matches!(
+        store.execute_chain(
+            command_id(243),
+            PromptChainCommand::RemovePromptChainLink(RemovePromptChainLink {
+                chain_id: chain,
+                link_id: link,
+                expected_revision: 2,
+            }),
+        ),
+        Err(PromptStoreError::Corruption(_))
+    ));
+}
+
+#[test]
+fn replay_rejects_archived_chain_create_event() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let chain = chain_id(244);
+    let command = command_id(245);
+    let event = PromptChainEvent::PromptChainCreated {
+        chain: PromptChain {
+            id: chain,
+            title: "Archived chain".into(),
+            description: None,
+            revision: 1,
+            archived_at_ms: Some(9),
+        },
+    };
+    let receipt = PromptChainMutationReceipt {
+        command_id: command,
+        chain_id: chain,
+        link_id: None,
+        revision: 1,
+    };
+
+    drop(open_store(&path));
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_chain_command_receipts(
+            command_id, command_sha256, chain_id, chain_link_id, revision,
+            receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            command.as_bytes().as_slice(),
+            [0u8; 32].as_slice(),
+            chain.as_bytes().as_slice(),
+            Option::<Vec<u8>>::None,
+            1_i64,
+            receipt.encode().expect("chain receipt payload"),
+            1_i64,
+        ],
+    )
+    .expect("seed chain receipt");
+    conn.execute(
+        "INSERT INTO prompt_chain_events(
+            prompt_chain_event_id, command_id, chain_id, event_type,
+            occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            command.as_bytes().as_slice(),
+            chain.as_bytes().as_slice(),
+            event.event_type(),
+            1_i64,
+            event.encode().expect("archived chain event payload"),
+        ],
+    )
+    .expect("seed archived chain event");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    assert!(matches!(
+        store.rebuild_projection(),
+        Err(PromptStoreError::Corruption(_))
+    ));
+}
+
+#[test]
+fn replay_rejects_duplicate_chain_link_ids() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let chain = chain_id(246);
+    let create_command = command_id(247);
+    let link_command = command_id(248);
+    let link = link_id(249);
+    let create_event = PromptChainEvent::PromptChainCreated {
+        chain: PromptChain {
+            id: chain,
+            title: "Chain".into(),
+            description: None,
+            revision: 1,
+            archived_at_ms: None,
+        },
+    };
+    let link_event = PromptChainEvent::PromptChainLinksReplaced {
+        chain_id: chain,
+        links: vec![
+            devmanager::prompts::PromptChainLink {
+                id: link,
+                chain_id: chain,
+                position: 0,
+                prompt_id: prompt_id(250),
+                prompt_version_id: version_id(251),
+            },
+            devmanager::prompts::PromptChainLink {
+                id: link,
+                chain_id: chain,
+                position: 1,
+                prompt_id: prompt_id(252),
+                prompt_version_id: version_id(253),
+            },
+        ],
+        revision: 2,
+    };
+    let create_receipt = PromptChainMutationReceipt {
+        command_id: create_command,
+        chain_id: chain,
+        link_id: None,
+        revision: 1,
+    };
+    let link_receipt = PromptChainMutationReceipt {
+        command_id: link_command,
+        chain_id: chain,
+        link_id: Some(link),
+        revision: 2,
+    };
+
+    drop(open_store(&path));
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    for (command, receipt) in [
+        (create_command, create_receipt),
+        (link_command, link_receipt),
+    ] {
+        conn.execute(
+            "INSERT INTO prompt_chain_command_receipts(
+                command_id, command_sha256, chain_id, chain_link_id, revision,
+                receipt, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                command.as_bytes().as_slice(),
+                [0u8; 32].as_slice(),
+                chain.as_bytes().as_slice(),
+                receipt.link_id.map(|id| id.as_bytes().as_slice().to_vec()),
+                i64::try_from(receipt.revision).expect("receipt revision fits SQLite"),
+                receipt.encode().expect("chain receipt payload"),
+                1_i64,
+            ],
+        )
+        .expect("seed chain receipt");
+    }
+    for (command, event) in [(create_command, create_event), (link_command, link_event)] {
+        conn.execute(
+            "INSERT INTO prompt_chain_events(
+                prompt_chain_event_id, command_id, chain_id, event_type,
+                occurred_at_ms, payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                EventId::new().as_bytes().as_slice(),
+                command.as_bytes().as_slice(),
+                chain.as_bytes().as_slice(),
+                event.event_type(),
+                1_i64,
+                event.encode().expect("chain event payload"),
+            ],
+        )
+        .expect("seed chain event");
+    }
+    drop(conn);
+
+    let mut store = open_store(&path);
+    assert!(matches!(
+        store.rebuild_projection(),
+        Err(PromptStoreError::Corruption(_))
+    ));
+}
+
+#[test]
+fn replay_rejects_prompt_created_with_stale_current_pointer() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(254);
+    let version = version_id(255);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(1), create_prompt(prompt, version))
+        .expect("create prompt");
+    let saved_version = store
+        .get_version(version)
+        .expect("query version")
+        .expect("version");
+    drop(store);
+
+    let command = command_id(2);
+    let event = PromptEvent::PromptCreated {
+        prompt: SavedPrompt {
+            id: prompt,
+            title: "Review code".into(),
+            description: Some("A bounded local prompt".into()),
+            tags: vec!["rust".into(), "review".into()],
+            current_version_id: version_id(3),
+            revision: 1,
+            archived_at_ms: None,
+        },
+        version: saved_version,
+    };
+    let receipt = PromptMutationReceipt {
+        command_id: command,
+        prompt_id: prompt,
+        prompt_version_id: version,
+        revision: 1,
+    };
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, prompt_id, prompt_version_id, revision,
+            receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            command.as_bytes().as_slice(),
+            [0u8; 32].as_slice(),
+            prompt.as_bytes().as_slice(),
+            version.as_bytes().as_slice(),
+            1_i64,
+            receipt.encode().expect("prompt receipt payload"),
+            1_i64,
+        ],
+    )
+    .expect("seed prompt receipt");
+    conn.execute(
+        "INSERT INTO prompt_events(
+            prompt_event_id, command_id, prompt_id, event_type,
+            occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            command.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            event.event_type(),
+            1_i64,
+            event.encode().expect("stale prompt event payload"),
+        ],
+    )
+    .expect("seed stale prompt event");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    assert!(matches!(
+        store.rebuild_projection(),
+        Err(PromptStoreError::Corruption(_))
+    ));
 }

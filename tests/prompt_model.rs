@@ -2,8 +2,11 @@ use devmanager::domain::{
     PromptChainId, PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId,
 };
 use devmanager::prompts::{
-    CreatePrompt, CreatePromptChain, PromptChainLink, PromptCommand, PromptValidationError,
-    PromptVersion, SetPromptTags, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS,
+    ArchivePrompt, ArchivePromptChain, CreatePrompt, CreatePromptChain, CreatePromptVersion,
+    InsertPromptChainLink, MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent,
+    PromptChainLink, PromptCommand, PromptValidationError, PromptVersion, RemovePromptChainLink,
+    RenamePrompt, RenamePromptChain, RestorePrompt, RestorePromptChain, SetPromptTags,
+    UpdatePromptChainLinkVersion, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS,
     MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS, MAX_PROMPT_TAGS,
     MAX_PROMPT_TAG_SCALARS, MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES,
     MAX_PROMPT_VARIABLE_NAME_SCALARS,
@@ -240,4 +243,233 @@ fn prompt_models_reject_unknown_future_fields() {
     }))
     .expect_err("unknown chain fields must fail closed");
     assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn public_prompt_serde_rejects_invalid_bounds_and_canonicality() {
+    let prompt = serde_json::json!({
+        "prompt_id": PromptId::new().to_string(),
+        "prompt_version_id": PromptVersionId::new().to_string(),
+        "title": "x".repeat(MAX_PROMPT_TITLE_SCALARS + 1),
+        "description": null,
+        "tags": [],
+        "variables": [],
+        "body": "body",
+        "created_at_ms": 1
+    });
+    assert!(serde_json::from_value::<CreatePrompt>(prompt).is_err());
+
+    let version = serde_json::json!({
+        "id": PromptVersionId::new().to_string(),
+        "prompt_id": PromptId::new().to_string(),
+        "version": 1,
+        "body": "body",
+        "variables": [" reviewer "],
+        "body_sha256": vec![0; 32],
+        "created_at_ms": 1
+    });
+    assert!(serde_json::from_value::<PromptVersion>(version).is_err());
+
+    let saved = serde_json::json!({
+        "id": PromptId::new().to_string(),
+        "title": " Prompt ",
+        "description": Some(" description "),
+        "tags": [" Review "],
+        "current_version_id": PromptVersionId::new().to_string(),
+        "revision": 1,
+        "archived_at_ms": null
+    });
+    assert!(serde_json::from_value::<devmanager::prompts::SavedPrompt>(saved).is_err());
+
+    let chain = serde_json::json!({
+        "id": PromptChainId::new().to_string(),
+        "title": " Chain ",
+        "description": " description ",
+        "revision": 1,
+        "archived_at_ms": null
+    });
+    assert!(serde_json::from_value::<devmanager::prompts::PromptChain>(chain).is_err());
+}
+
+#[test]
+fn prompt_command_decode_rejects_invalid_bounds_and_canonicality() {
+    let oversized = PromptCommand::CreatePrompt(CreatePrompt {
+        prompt_id: PromptId::new(),
+        prompt_version_id: PromptVersionId::new(),
+        title: "x".repeat(MAX_PROMPT_TITLE_SCALARS + 1),
+        description: None,
+        tags: Vec::new(),
+        variables: Vec::new(),
+        body: "body".into(),
+        created_at_ms: 1,
+    });
+    let payload = oversized.encode().expect("encode oversized command");
+    assert!(PromptCommand::decode(&payload).is_err());
+
+    let uncanonical = PromptCommand::CreatePrompt(CreatePrompt {
+        prompt_id: PromptId::new(),
+        prompt_version_id: PromptVersionId::new(),
+        title: " Prompt ".into(),
+        description: Some(" description ".into()),
+        tags: vec![" review ".into()],
+        variables: vec![" reviewer ".into()],
+        body: "body".into(),
+        created_at_ms: 1,
+    });
+    let payload = uncanonical.encode().expect("encode uncanonical command");
+    assert!(PromptCommand::decode(&payload).is_err());
+}
+
+#[test]
+fn prompt_command_decode_rejects_noncanonical_wire_bytes() {
+    let command = PromptCommand::CreatePrompt(CreatePrompt {
+        prompt_id: PromptId::new(),
+        prompt_version_id: PromptVersionId::new(),
+        title: "Prompt".into(),
+        description: None,
+        tags: Vec::new(),
+        variables: Vec::new(),
+        body: "body".into(),
+        created_at_ms: 1,
+    });
+    let command_payload = rmp_serde::to_vec_named(&command).expect("encode command body");
+    let mut payload = Vec::new();
+    rmp::encode::write_map_len(&mut payload, 2).expect("write command wire map");
+    rmp::encode::write_str(&mut payload, "command").expect("write command key");
+    payload.extend_from_slice(&command_payload);
+    rmp::encode::write_str(&mut payload, "schema_version").expect("write schema key");
+    rmp::encode::write_uint(&mut payload, 1).expect("write schema version");
+
+    assert!(PromptCommand::decode(&payload).is_err());
+}
+
+#[test]
+fn public_prompt_and_chain_mutations_reject_zero_expected_revision() {
+    let prompt_id = devmanager::domain::PromptId::new();
+    let version_id = PromptVersionId::new();
+    let chain_id = PromptChainId::new();
+    let link_id = PromptChainLinkId::new();
+
+    let prompt_commands = [
+        PromptCommand::CreatePromptVersion(CreatePromptVersion {
+            prompt_id,
+            prompt_version_id: version_id,
+            variables: Vec::new(),
+            body: "body".into(),
+            created_at_ms: 1,
+            expected_revision: 0,
+        }),
+        PromptCommand::RenamePrompt(RenamePrompt {
+            prompt_id,
+            title: "Prompt".into(),
+            expected_revision: 0,
+        }),
+        PromptCommand::SetPromptTags(SetPromptTags {
+            prompt_id,
+            tags: Vec::new(),
+            expected_revision: 0,
+        }),
+        PromptCommand::ArchivePrompt(ArchivePrompt {
+            prompt_id,
+            archived_at_ms: 1,
+            expected_revision: 0,
+        }),
+        PromptCommand::RestorePrompt(RestorePrompt {
+            prompt_id,
+            expected_revision: 0,
+        }),
+    ];
+    assert!(prompt_commands
+        .iter()
+        .all(|command| command.validate().is_err()));
+
+    let chain_commands = [
+        PromptChainCommand::RenamePromptChain(RenamePromptChain {
+            chain_id,
+            title: "Chain".into(),
+            expected_revision: 0,
+        }),
+        PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
+            chain_id,
+            link_id,
+            prompt_id,
+            prompt_version_id: None,
+            before_link_id: None,
+            expected_revision: 0,
+        }),
+        PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+            chain_id,
+            link_id,
+            before_link_id: None,
+            expected_revision: 0,
+        }),
+        PromptChainCommand::RemovePromptChainLink(RemovePromptChainLink {
+            chain_id,
+            link_id,
+            expected_revision: 0,
+        }),
+        PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+            chain_id,
+            link_id,
+            expected_revision: 0,
+        }),
+        PromptChainCommand::ArchivePromptChain(ArchivePromptChain {
+            chain_id,
+            archived_at_ms: 1,
+            expected_revision: 0,
+        }),
+        PromptChainCommand::RestorePromptChain(RestorePromptChain {
+            chain_id,
+            expected_revision: 0,
+        }),
+    ];
+    assert!(chain_commands
+        .iter()
+        .all(|command| command.validate().is_err()));
+}
+
+#[test]
+fn prompt_chain_event_decode_rejects_duplicate_links_and_noncanonical_bytes() {
+    let chain_id = PromptChainId::new();
+    let duplicate_link_id = PromptChainLinkId::new();
+    let duplicate = PromptChainEvent::PromptChainLinksReplaced {
+        chain_id,
+        links: vec![
+            PromptChainLink {
+                id: duplicate_link_id,
+                chain_id,
+                position: 0,
+                prompt_id: devmanager::domain::PromptId::new(),
+                prompt_version_id: PromptVersionId::new(),
+            },
+            PromptChainLink {
+                id: duplicate_link_id,
+                chain_id,
+                position: 1,
+                prompt_id: devmanager::domain::PromptId::new(),
+                prompt_version_id: PromptVersionId::new(),
+            },
+        ],
+        revision: 2,
+    };
+    let duplicate_payload = duplicate.encode().expect("encode duplicate links");
+    assert!(PromptChainEvent::decode(&duplicate_payload).is_err());
+
+    let event = PromptChainEvent::PromptChainCreated {
+        chain: PromptChain {
+            id: chain_id,
+            title: "Chain".into(),
+            description: None,
+            revision: 1,
+            archived_at_ms: None,
+        },
+    };
+    let event_body = rmp_serde::to_vec_named(&event).expect("encode chain event body");
+    let mut noncanonical = Vec::new();
+    rmp::encode::write_map_len(&mut noncanonical, 2).expect("write event wire map");
+    rmp::encode::write_str(&mut noncanonical, "event").expect("write event key");
+    noncanonical.extend_from_slice(&event_body);
+    rmp::encode::write_str(&mut noncanonical, "schema_version").expect("write schema key");
+    rmp::encode::write_uint(&mut noncanonical, 1).expect("write schema version");
+    assert!(PromptChainEvent::decode(&noncanonical).is_err());
 }

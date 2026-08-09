@@ -109,6 +109,7 @@ impl PromptStore {
         command_id: CommandId,
         command: PromptCommand,
     ) -> Result<PromptMutationReceipt, PromptStoreError> {
+        command.validate()?;
         let command_sha256 = command.fingerprint();
         let tx = self
             .conn
@@ -120,7 +121,6 @@ impl PromptStore {
             return Ok(receipt);
         }
 
-        command.validate()?;
         let (receipt, event, prompt_id, occurred_at_ms) = apply_command(&tx, command_id, &command)?;
         let receipt_payload = receipt
             .encode()
@@ -167,6 +167,7 @@ impl PromptStore {
         command_id: CommandId,
         command: PromptChainCommand,
     ) -> Result<PromptChainMutationReceipt, PromptStoreError> {
+        command.validate()?;
         let command_sha256 = command.fingerprint();
         let tx = self
             .conn
@@ -177,7 +178,6 @@ impl PromptStore {
             return Ok(receipt);
         }
 
-        command.validate()?;
         let (receipt, event, chain_id, occurred_at_ms) =
             apply_chain_command(&tx, command_id, &command)?;
         let receipt_payload = receipt
@@ -1001,6 +1001,7 @@ fn apply_insert_chain_link(
         return Err(PromptStoreError::AlreadyExists);
     }
     let prompt = load_prompt(tx, command.prompt_id)?.ok_or(PromptStoreError::NotFound)?;
+    validate_saved_prompt_record(tx, &prompt)?;
     let prompt_version_id = match command.prompt_version_id {
         Some(version_id) => {
             let version = load_version(tx, version_id)?.ok_or(PromptStoreError::NotFound)?;
@@ -1153,6 +1154,7 @@ fn apply_update_chain_link_version(
     let prompt = load_prompt(tx, links[position].prompt_id)?.ok_or_else(|| {
         PromptStoreError::Corruption("chain link references missing prompt".into())
     })?;
+    validate_saved_prompt_record(tx, &prompt)?;
     if links[position].prompt_version_id == prompt.current_version_id {
         return Ok((
             chain_receipt(command_id, &chain, Some(command.link_id)),
@@ -1309,6 +1311,9 @@ fn validate_chain_links(
             || link.position
                 != u32::try_from(position)
                     .map_err(|_| PromptStoreError::Corruption("prompt chain is too long".into()))?
+            || links[..position]
+                .iter()
+                .any(|previous| previous.id == link.id)
         {
             return Err(PromptStoreError::Corruption(
                 "prompt chain links must be a dense ordered prefix".into(),
@@ -1317,6 +1322,10 @@ fn validate_chain_links(
         let version = load_version(tx, link.prompt_version_id)?.ok_or_else(|| {
             PromptStoreError::Corruption("prompt chain link references missing version".into())
         })?;
+        let prompt = load_prompt(tx, link.prompt_id)?.ok_or_else(|| {
+            PromptStoreError::Corruption("prompt chain link references missing prompt".into())
+        })?;
+        validate_saved_prompt_record(tx, &prompt)?;
         if version.prompt_id != link.prompt_id {
             return Err(PromptStoreError::Corruption(
                 "prompt chain link version ownership mismatch".into(),
@@ -1617,10 +1626,13 @@ fn apply_chain_event(
     match event {
         PromptChainEvent::PromptChainCreated { chain } => {
             if chain.revision != 1
+                || chain.archived_at_ms.is_some()
                 || chain.title.trim().is_empty()
+                || chain.title != chain.title.trim()
                 || chain.title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
                 || chain.description.as_deref().is_some_and(|description| {
                     description.chars().count() > MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS
+                        || description != description.trim()
                 })
             {
                 return Err(PromptStoreError::Corruption(
@@ -1640,6 +1652,7 @@ fn apply_chain_event(
             if chain.archived_at_ms.is_some()
                 || *revision != next_revision(chain.revision)?
                 || title.trim().is_empty()
+                || title != title.trim()
                 || title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
             {
                 return Err(PromptStoreError::Corruption(
@@ -2298,11 +2311,6 @@ fn validate_chain_event_row(
             "prompt chain event row disagrees with its command receipt".into(),
         ));
     }
-    if load_chain(tx, receipt.chain_id)?.is_none() {
-        return Err(PromptStoreError::Corruption(
-            "prompt chain event receipt references a missing chain".into(),
-        ));
-    }
     let event = PromptChainEvent::decode(payload)
         .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
     if event
@@ -2559,6 +2567,23 @@ fn validate_saved_prompt_record(
             "saved prompt revision must be positive".into(),
         ));
     }
+    if prompt.title != prompt.title.trim()
+        || prompt
+            .description
+            .as_deref()
+            .is_some_and(|description| description != description.trim())
+    {
+        return Err(PromptStoreError::Corruption(
+            "saved prompt metadata is not canonical".into(),
+        ));
+    }
+    let normalized_tags = normalized_tags(&prompt.tags)
+        .map_err(|_| PromptStoreError::Corruption("saved prompt tags are invalid".into()))?;
+    if normalized_tags != prompt.tags {
+        return Err(PromptStoreError::Corruption(
+            "saved prompt tags are not canonical".into(),
+        ));
+    }
     CreatePrompt {
         prompt_id: prompt.id,
         prompt_version_id: prompt.current_version_id,
@@ -2668,6 +2693,16 @@ fn load_chain(
     }
     .validate()
     .map_err(|_| PromptStoreError::Corruption("prompt chain metadata is invalid".into()))?;
+    if chain.title != chain.title.trim()
+        || chain
+            .description
+            .as_deref()
+            .is_some_and(|description| description != description.trim())
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain metadata is not canonical".into(),
+        ));
+    }
     Ok(Some(chain))
 }
 
@@ -2710,6 +2745,10 @@ fn load_chain_links(
                 "prompt chain link version ownership mismatch".into(),
             ));
         }
+        let prompt = load_prompt(conn, prompt_id)?.ok_or_else(|| {
+            PromptStoreError::Corruption("prompt chain link references missing prompt".into())
+        })?;
+        validate_saved_prompt_record(conn, &prompt)?;
         links.push(PromptChainLink {
             id: link_id,
             chain_id,
