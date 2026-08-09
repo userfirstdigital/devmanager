@@ -13,7 +13,9 @@ mod windows {
     use devmanager::process::identity::ProcessOwner;
     use devmanager::process::job::ManagedProcessJob;
     use devmanager::process::launcher::{prepare_suspended_pty, LaunchIntent, ManagedPtyChild};
-    use devmanager::process::registry::{ProcessRegistry, ProcessRegistryError, UnregisterOutcome};
+    use devmanager::process::registry::{
+        ManagedProcessState, ProcessRegistry, ProcessRegistryError,
+    };
     use portable_pty::{native_pty_system, PtyPair, PtySize, SlavePty};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -183,17 +185,8 @@ mod windows {
         }
     }
 
-    fn close_registered(
-        registry: &mut ProcessRegistry<ManagedProcessJob>,
-        child: &mut ManagedPtyChild,
-    ) {
-        let removed = registry
-            .unregister_exact(child.fence())
-            .expect("unregister exact managed process");
-        match removed {
-            UnregisterOutcome::Removed(process) => drop(process),
-            UnregisterOutcome::Stale => panic!("current managed process must unregister"),
-        }
+    fn close_registered(registry: ProcessRegistry<ManagedProcessJob>, child: &mut ManagedPtyChild) {
+        drop(registry);
         wait_for_exit(child);
     }
 
@@ -221,8 +214,15 @@ mod windows {
         let mut child = pending
             .register_and_resume(&mut registry)
             .expect("register then resume");
+        assert_eq!(
+            registry
+                .current(resource_id(1))
+                .expect("resumed process")
+                .state(),
+            ManagedProcessState::Running
+        );
         wait_for_file_or_child_exit(&marker, &mut child);
-        close_registered(&mut registry, &mut child);
+        close_registered(registry, &mut child);
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod windows {
         ));
         assert_file_absent_for(&rejected_marker, Duration::from_millis(100));
 
-        close_registered(&mut registry, &mut first);
+        close_registered(registry, &mut first);
     }
 
     #[test]
@@ -302,7 +302,7 @@ mod windows {
         assert!(members.contains(&root.process_id()));
         assert!(members.contains(&child_pid));
 
-        close_registered(&mut registry, &mut root);
+        close_registered(registry, &mut root);
         child_wait.assert_signaled();
     }
 
@@ -332,7 +332,7 @@ mod windows {
             "managed child escaped Job containment: {outcome}"
         );
         assert!(!escaped_marker.exists());
-        close_registered(&mut registry, &mut root);
+        close_registered(registry, &mut root);
     }
 
     #[test]
@@ -366,9 +366,8 @@ mod windows {
             .expect("numeric child PID");
         let child_wait = ProcessWaitHandle::open(child_pid);
 
-        close_registered(&mut registry, &mut root);
+        close_registered(registry, &mut root);
         child_wait.assert_signaled();
-        assert!(registry.current(resource).is_none());
     }
 }
 

@@ -64,7 +64,7 @@ pub trait JobMembership {
         Err(format!("process identity for PID {pid} is inaccessible"))
     }
 
-    fn bind_completion_fence(&mut self, _fence: ResourceFence) -> Result<(), String> {
+    fn bind_completion_fence(&mut self, _fence: ManagedProcessFence) -> Result<(), String> {
         Ok(())
     }
 
@@ -82,7 +82,7 @@ impl JobMembership for crate::process::job::ManagedProcessJob {
         crate::process::job::ManagedProcessJob::inspect_process(self, pid)
     }
 
-    fn bind_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
+    fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
         crate::process::job::ManagedProcessJob::bind_completion_fence(self, fence)
     }
 
@@ -136,17 +136,17 @@ pub enum JobCompletionEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCompletionMessage {
-    fence: ResourceFence,
+    fence: ManagedProcessFence,
     event: JobCompletionEvent,
 }
 
 impl JobCompletionMessage {
-    pub fn new(fence: ResourceFence, event: JobCompletionEvent) -> Self {
+    pub fn new(fence: ManagedProcessFence, event: JobCompletionEvent) -> Self {
         Self { fence, event }
     }
 
-    pub fn fence(&self) -> ResourceFence {
-        self.fence
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
     }
 
     pub fn event(&self) -> &JobCompletionEvent {
@@ -165,6 +165,7 @@ pub struct RegisteredProcess<J> {
     known_members: Vec<JobMemberInfo>,
     unknown_member_pids: Vec<u32>,
     last_limit: Option<(u32, Option<u32>)>,
+    pending_zero_prior_state: Option<ManagedProcessState>,
 }
 
 impl<J> RegisteredProcess<J> {
@@ -185,6 +186,7 @@ impl<J> RegisteredProcess<J> {
             known_members: Vec::new(),
             unknown_member_pids: Vec::new(),
             last_limit: None,
+            pending_zero_prior_state: None,
         }
     }
 
@@ -237,12 +239,16 @@ pub struct ManagedProcessFence {
 }
 
 impl ManagedProcessFence {
-    fn from_process<J>(process: &RegisteredProcess<J>) -> Self {
+    pub fn new(resource: ResourceFence, owner: ProcessOwner, root: ManagedProcessIdentity) -> Self {
         Self {
-            resource: process.fence,
-            owner: process.owner,
-            root: process.root.clone(),
+            resource,
+            owner,
+            root,
         }
+    }
+
+    fn from_process<J>(process: &RegisteredProcess<J>) -> Self {
+        Self::new(process.fence, process.owner, process.root.clone())
     }
 
     pub fn resource(&self) -> ResourceFence {
@@ -282,6 +288,13 @@ pub enum UnregisterOutcome<J> {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLifecycleOperation {
+    CommitResumed,
+    RollbackStarting,
+    ReleaseStopped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessRegistryError {
     ActiveGeneration {
@@ -304,6 +317,15 @@ pub enum ProcessRegistryError {
     CompletionNotificationsFailed {
         resource_id: ResourceId,
         detail: String,
+    },
+    InvalidLifecycleState {
+        resource_id: ResourceId,
+        operation: ProcessLifecycleOperation,
+        state: ManagedProcessState,
+    },
+    StaleLifecycleFence {
+        resource_id: ResourceId,
+        operation: ProcessLifecycleOperation,
     },
     Runtime(RuntimeRegistryError),
 }
@@ -342,6 +364,21 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "could not start resource {resource_id}'s Job notifications: {detail}"
             ),
+            Self::InvalidLifecycleState {
+                resource_id,
+                operation,
+                state,
+            } => write!(
+                f,
+                "cannot perform {operation:?} for managed process {resource_id} while it is {state:?}"
+            ),
+            Self::StaleLifecycleFence {
+                resource_id,
+                operation,
+            } => write!(
+                f,
+                "cannot perform {operation:?} for managed process {resource_id} through a stale fence"
+            ),
             Self::Runtime(error) => error.fmt(f),
         }
     }
@@ -355,7 +392,9 @@ impl std::error::Error for ProcessRegistryError {
             | Self::DuplicateActivePid { .. }
             | Self::NotJobMember { .. }
             | Self::MembershipQueryFailed { .. }
-            | Self::CompletionNotificationsFailed { .. } => None,
+            | Self::CompletionNotificationsFailed { .. }
+            | Self::InvalidLifecycleState { .. }
+            | Self::StaleLifecycleFence { .. } => None,
         }
     }
 }
@@ -430,9 +469,11 @@ impl<J> ProcessRegistry<J> {
         self.current.len()
     }
 
-    pub fn unregister_exact(
+    fn take_exact_in_state(
         &mut self,
         fence: &ManagedProcessFence,
+        required_state: ManagedProcessState,
+        operation: ProcessLifecycleOperation,
     ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
         let resource_id = fence.resource.resource_id;
         let Some(current) = self.current.get(&resource_id) else {
@@ -441,6 +482,13 @@ impl<J> ProcessRegistry<J> {
         if ManagedProcessFence::from_process(current) != *fence {
             return Ok(UnregisterOutcome::Stale);
         }
+        if current.state != required_state {
+            return Err(ProcessRegistryError::InvalidLifecycleState {
+                resource_id,
+                operation,
+                state: current.state,
+            });
+        }
 
         self.runtime.retire(fence.resource)?;
         let removed = self
@@ -448,6 +496,56 @@ impl<J> ProcessRegistry<J> {
             .remove(&resource_id)
             .expect("exact current registry entry was checked before removal");
         Ok(UnregisterOutcome::Removed(removed))
+    }
+
+    pub fn rollback_starting_exact(
+        &mut self,
+        fence: &ManagedProcessFence,
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
+        self.take_exact_in_state(
+            fence,
+            ManagedProcessState::Starting,
+            ProcessLifecycleOperation::RollbackStarting,
+        )
+    }
+
+    pub fn release_stopped_exact(
+        &mut self,
+        fence: &ManagedProcessFence,
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
+        self.take_exact_in_state(
+            fence,
+            ManagedProcessState::Stopped,
+            ProcessLifecycleOperation::ReleaseStopped,
+        )
+    }
+
+    pub fn commit_resumed_exact(
+        &mut self,
+        fence: &ManagedProcessFence,
+    ) -> Result<(), ProcessRegistryError> {
+        let resource_id = fence.resource.resource_id;
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::CommitResumed,
+            });
+        };
+        if ManagedProcessFence::from_process(current) != *fence {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::CommitResumed,
+            });
+        }
+        if current.state != ManagedProcessState::Starting {
+            return Err(ProcessRegistryError::InvalidLifecycleState {
+                resource_id,
+                operation: ProcessLifecycleOperation::CommitResumed,
+                state: current.state,
+            });
+        }
+        current.state = ManagedProcessState::Running;
+        Ok(())
     }
 
     pub fn begin_stopping_exact(&mut self, fence: &ManagedProcessFence) -> bool {
@@ -524,7 +622,8 @@ impl<J: JobMembership> ProcessRegistry<J> {
             ));
         }
 
-        if let Err(detail) = process.job.bind_completion_fence(proposed) {
+        let fence = ManagedProcessFence::from_process(&process);
+        if let Err(detail) = process.job.bind_completion_fence(fence.clone()) {
             return Err(ProcessRegistrationFailure::new(
                 ProcessRegistryError::CompletionNotificationsFailed {
                     resource_id: proposed.resource_id,
@@ -540,7 +639,6 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 process,
             ));
         }
-        let fence = ManagedProcessFence::from_process(&process);
         self.current.insert(proposed.resource_id, process);
         Ok(fence)
     }
@@ -559,11 +657,11 @@ impl<J: JobMembership> ProcessRegistry<J> {
     }
 
     pub fn apply_job_completion(&mut self, message: JobCompletionMessage) -> bool {
-        let resource_id = message.fence.resource_id;
+        let resource_id = message.fence.resource.resource_id;
         let Some(current) = self.current.get_mut(&resource_id) else {
             return false;
         };
-        if current.fence != message.fence {
+        if ManagedProcessFence::from_process(current) != message.fence {
             return false;
         }
 
@@ -583,11 +681,26 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 }
             }
             JobCompletionEvent::ActiveProcessZero => {
-                if matches!(current.job.active_process_ids(), Ok(process_ids) if process_ids.is_empty())
-                {
-                    current.known_members.clear();
-                    current.unknown_member_pids.clear();
-                    current.state = ManagedProcessState::Stopped;
+                if current.state != ManagedProcessState::Stopped {
+                    match current.job.active_process_ids() {
+                        Ok(process_ids) if process_ids.is_empty() => {
+                            current.pending_zero_prior_state = None;
+                            current.known_members.clear();
+                            current.unknown_member_pids.clear();
+                            current.state = ManagedProcessState::Stopped;
+                        }
+                        Ok(_) => {
+                            if let Some(prior_state) = current.pending_zero_prior_state.take() {
+                                current.state = prior_state;
+                            }
+                        }
+                        Err(_) => {
+                            if current.pending_zero_prior_state.is_none() {
+                                current.pending_zero_prior_state = Some(current.state);
+                            }
+                            current.state = ManagedProcessState::Leaked;
+                        }
+                    }
                 }
             }
             JobCompletionEvent::Limit { message_id, pid } => {
@@ -620,6 +733,15 @@ impl<J: JobMembership> ProcessRegistry<J> {
         })?;
         active_pids.sort_unstable();
         active_pids.dedup();
+        if let Some(prior_state) = current.pending_zero_prior_state.take() {
+            if active_pids.is_empty() {
+                current.known_members.clear();
+                current.unknown_member_pids.clear();
+                current.state = ManagedProcessState::Stopped;
+                return Ok(());
+            }
+            current.state = prior_state;
+        }
         if !active_pids.is_empty() && current.state == ManagedProcessState::Starting {
             current.state = ManagedProcessState::Running;
         }

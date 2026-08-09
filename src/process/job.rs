@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::thread::JoinHandle;
 
-use crate::domain::operation::ResourceFence;
 #[cfg(windows)]
 use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
-use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, JobMemberInfo};
+use crate::process::registry::{
+    JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
+};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -91,6 +92,9 @@ const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
 #[cfg(windows)]
 const MAX_COMPLETION_MESSAGES: usize = 4_096;
 #[cfg(windows)]
+const COMPLETION_OVERFLOW_DETAIL: &str =
+    "managed Job completion mailbox overflow; authoritative reconciliation required";
+#[cfg(windows)]
 const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
 #[cfg(windows)]
 const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
@@ -124,34 +128,55 @@ struct JobObjectAssociateCompletionPort {
 #[derive(Debug, Default)]
 struct CompletionMailbox {
     messages: std::collections::VecDeque<JobCompletionMessage>,
+    overflowed: bool,
 }
 
 #[cfg(windows)]
 impl CompletionMailbox {
     fn push(&mut self, message: JobCompletionMessage) {
-        if matches!(message.event(), JobCompletionEvent::ActiveProcessZero)
-            && self
-                .messages
-                .iter()
-                .any(|queued| matches!(queued.event(), JobCompletionEvent::ActiveProcessZero))
-        {
+        let is_active_zero = matches!(message.event(), JobCompletionEvent::ActiveProcessZero);
+        let has_active_zero = self
+            .messages
+            .iter()
+            .any(|queued| matches!(queued.event(), JobCompletionEvent::ActiveProcessZero));
+        if is_active_zero && has_active_zero {
             return;
         }
-        if self.messages.len() == MAX_COMPLETION_MESSAGES {
-            if let Some(index) = self
-                .messages
-                .iter()
-                .position(|queued| !matches!(queued.event(), JobCompletionEvent::ActiveProcessZero))
-            {
-                self.messages.remove(index);
-            } else {
-                return;
+
+        if self.overflowed {
+            if is_active_zero {
+                self.messages.push_back(message);
             }
+            return;
         }
-        self.messages.push_back(message);
+        if self.messages.len() < MAX_COMPLETION_MESSAGES {
+            self.messages.push_back(message);
+            return;
+        }
+
+        let preserved_zero = if is_active_zero {
+            Some(message.clone())
+        } else {
+            self.messages
+                .iter()
+                .find(|queued| matches!(queued.event(), JobCompletionEvent::ActiveProcessZero))
+                .cloned()
+        };
+        self.messages.clear();
+        self.messages.push_back(JobCompletionMessage::new(
+            message.fence().clone(),
+            JobCompletionEvent::MonitorFailed {
+                detail: COMPLETION_OVERFLOW_DETAIL.to_string(),
+            },
+        ));
+        if let Some(active_zero) = preserved_zero {
+            self.messages.push_back(active_zero);
+        }
+        self.overflowed = true;
     }
 
     fn drain(&mut self) -> Vec<JobCompletionMessage> {
+        self.overflowed = false;
         self.messages.drain(..).collect()
     }
 }
@@ -205,7 +230,7 @@ pub struct ManagedProcessJob {
     handle: Option<OwnedHandle>,
     completion_port: Option<OwnedHandle>,
     completion_key: usize,
-    completion_fence: Option<ResourceFence>,
+    completion_fence: Option<ManagedProcessFence>,
     completion_mailbox: Arc<Mutex<CompletionMailbox>>,
     completion_listener: Option<JoinHandle<()>>,
 }
@@ -260,7 +285,7 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn bind_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
+    pub fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
         #[cfg(windows)]
         {
             self.bind_windows_completion_fence(fence)
@@ -305,9 +330,9 @@ impl ManagedProcessJob {
     }
 
     #[cfg(windows)]
-    fn bind_windows_completion_fence(&mut self, fence: ResourceFence) -> Result<(), String> {
-        if let Some(bound) = self.completion_fence {
-            return if bound == fence {
+    fn bind_windows_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
+        if let Some(bound) = self.completion_fence.as_ref() {
+            return if *bound == fence {
                 Ok(())
             } else {
                 Err(format!(
@@ -323,12 +348,14 @@ impl ManagedProcessJob {
             .as_raw_handle() as usize;
         let completion_key = self.completion_key;
         let mailbox = Arc::clone(&self.completion_mailbox);
+        let listener_fence = fence.clone();
         let listener = std::thread::Builder::new()
             .name(format!(
                 "devmanager-job-{}-{}",
-                fence.resource_id, fence.runtime_generation
+                fence.resource().resource_id,
+                fence.resource().runtime_generation
             ))
-            .spawn(move || completion_listener(port, completion_key, fence, mailbox))
+            .spawn(move || completion_listener(port, completion_key, listener_fence, mailbox))
             .map_err(|error| format!("could not spawn Job completion listener: {error}"))?;
         self.completion_fence = Some(fence);
         self.completion_listener = Some(listener);
@@ -588,7 +615,7 @@ fn next_completion_key() -> usize {
 fn completion_listener(
     completion_port_value: usize,
     expected_completion_key: usize,
-    fence: ResourceFence,
+    fence: ManagedProcessFence,
     mailbox: Arc<Mutex<CompletionMailbox>>,
 ) {
     let completion_port = completion_port_value as *mut c_void;
@@ -617,7 +644,7 @@ fn completion_listener(
                 .lock()
                 .expect("managed Job completion mailbox poisoned")
                 .push(JobCompletionMessage::new(
-                    fence,
+                    fence.clone(),
                     JobCompletionEvent::MonitorFailed { detail },
                 ));
             break;
@@ -642,7 +669,7 @@ fn completion_listener(
         mailbox
             .lock()
             .expect("managed Job completion mailbox poisoned")
-            .push(JobCompletionMessage::new(fence, event));
+            .push(JobCompletionMessage::new(fence.clone(), event));
     }
 }
 
@@ -724,15 +751,16 @@ fn inspect_windows_process(job: *mut c_void, pid: u32) -> Result<JobMemberInfo, 
                 .collect();
             (!parts.is_empty()).then(|| parts.join(" "))
         });
-        let command_line = (current_creation_time_100ns(pid).as_ref() == Ok(&creation_time_100ns))
-            .then_some(candidate_command_line)
-            .flatten();
+        let command_line = (current_creation_time_100ns(job, pid).as_ref()
+            == Ok(&creation_time_100ns))
+        .then_some(candidate_command_line)
+        .flatten();
         Ok(JobMemberInfo::new(identity, command_line))
     }
 }
 
 #[cfg(windows)]
-fn current_creation_time_100ns(pid: u32) -> Result<u64, String> {
+fn current_creation_time_100ns(job: *mut c_void, pid: u32) -> Result<u64, String> {
     unsafe {
         let raw_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if raw_process.is_null() {
@@ -742,6 +770,18 @@ fn current_creation_time_100ns(pid: u32) -> Result<u64, String> {
             ));
         }
         let process = OwnedHandle::from_raw_handle(raw_process);
+        let mut is_member = 0;
+        if IsProcessInJob(process.as_raw_handle(), job, &mut is_member) == 0 {
+            return Err(format!(
+                "IsProcessInJob({pid}) identity recheck failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if is_member == 0 {
+            return Err(format!(
+                "PID {pid} left the managed Job before command-line publication"
+            ));
+        }
         let mut creation = FileTime::default();
         let mut exit = FileTime::default();
         let mut kernel = FileTime::default();
@@ -760,5 +800,80 @@ fn current_creation_time_100ns(pid: u32) -> Result<u64, String> {
             ));
         }
         Ok(((creation.high_date_time as u64) << 32) | creation.low_date_time as u64)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{CompletionMailbox, MAX_COMPLETION_MESSAGES};
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, ManagedProcessFence};
+
+    fn authority() -> ManagedProcessFence {
+        let resource_id = ResourceId::from_bytes([
+            0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x71,
+        ])
+        .expect("resource id");
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(71, 7_100).expect("process id"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("process identity");
+        ManagedProcessFence::new(
+            ResourceFence::new(resource_id, 1),
+            ProcessOwner::Host,
+            identity,
+        )
+    }
+
+    fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
+        JobCompletionMessage::new(authority.clone(), event)
+    }
+
+    #[test]
+    fn membership_mailbox_overflow_is_visible_and_preserves_arriving_zero() {
+        let authority = authority();
+        let mut mailbox = CompletionMailbox::default();
+        for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
+            mailbox.push(message(&authority, JobCompletionEvent::ExitProcess { pid }));
+        }
+        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+
+        let messages = mailbox.drain();
+        assert!(messages.len() <= MAX_COMPLETION_MESSAGES);
+        assert!(messages.iter().any(|message| {
+            matches!(
+                message.event(),
+                JobCompletionEvent::MonitorFailed { detail } if detail.contains("overflow")
+            )
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.event(), JobCompletionEvent::ActiveProcessZero)));
+    }
+
+    #[test]
+    fn membership_mailbox_overflow_is_visible_and_preserves_queued_zero() {
+        let authority = authority();
+        let mut mailbox = CompletionMailbox::default();
+        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+        for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
+            mailbox.push(message(&authority, JobCompletionEvent::NewProcess { pid }));
+        }
+
+        let messages = mailbox.drain();
+        assert!(messages.len() <= MAX_COMPLETION_MESSAGES);
+        assert!(messages.iter().any(|message| {
+            matches!(
+                message.event(),
+                JobCompletionEvent::MonitorFailed { detail } if detail.contains("overflow")
+            )
+        }));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.event(), JobCompletionEvent::ActiveProcessZero)));
     }
 }

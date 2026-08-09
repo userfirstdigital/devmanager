@@ -228,7 +228,7 @@ impl PendingManagedLaunch {
         let child = match pending.resume() {
             Ok(child) => child,
             Err(error) => {
-                let cleanup_detail = match registry.unregister_exact(&managed_fence) {
+                let cleanup_detail = match registry.rollback_starting_exact(&managed_fence) {
                     Ok(UnregisterOutcome::Removed(process)) => {
                         drop(process);
                         String::new()
@@ -244,6 +244,9 @@ impl PendingManagedLaunch {
                 ));
             }
         };
+        registry
+            .commit_resumed_exact(&managed_fence)
+            .expect("newly resumed launch retains its exact Starting registry fence");
 
         Ok(ManagedPtyChild {
             child: Box::new(child),

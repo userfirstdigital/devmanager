@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use devmanager::domain::id::ResourceId;
+use devmanager::domain::id::{ResourceId, TaskId};
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
-    JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership, ManagedProcessState,
-    ProcessDisplayLabel, ProcessRegistry, RegisteredProcess, UnregisterOutcome,
+    JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership, ManagedProcessFence,
+    ManagedProcessState, ProcessDisplayLabel, ProcessRegistry, RegisteredProcess,
+    UnregisterOutcome,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -35,11 +36,23 @@ fn identity(pid: u32, creation_time_100ns: u64, executable: &Path) -> ManagedPro
     .expect("managed process identity")
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ScriptedJobState {
-    active_pids: Vec<u32>,
+    active_pids: Result<Vec<u32>, String>,
     observations: BTreeMap<u32, Result<JobMemberInfo, String>>,
     completions: VecDeque<JobCompletionMessage>,
+    bound_fence: Option<ManagedProcessFence>,
+}
+
+impl Default for ScriptedJobState {
+    fn default() -> Self {
+        Self {
+            active_pids: Ok(Vec::new()),
+            observations: BTreeMap::new(),
+            completions: VecDeque::new(),
+            bound_fence: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,7 +61,7 @@ struct ScriptedJob(Arc<Mutex<ScriptedJobState>>);
 impl ScriptedJob {
     fn with_root(pid: u32) -> Self {
         let job = Self::default();
-        job.0.lock().expect("scripted Job").active_pids = vec![pid];
+        job.0.lock().expect("scripted Job").active_pids = Ok(vec![pid]);
         job
     }
 
@@ -58,8 +71,12 @@ impl ScriptedJob {
         observations: Vec<(u32, Result<JobMemberInfo, String>)>,
     ) {
         let mut state = self.0.lock().expect("scripted Job");
-        state.active_pids = pids;
+        state.active_pids = Ok(pids);
         state.observations = observations.into_iter().collect();
+    }
+
+    fn set_membership_error(&self, detail: &str) {
+        self.0.lock().expect("scripted Job").active_pids = Err(detail.to_string());
     }
 
     fn push(&self, message: JobCompletionMessage) {
@@ -73,7 +90,7 @@ impl ScriptedJob {
 
 impl JobMembership for ScriptedJob {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
-        Ok(self.0.lock().expect("scripted Job").active_pids.clone())
+        self.0.lock().expect("scripted Job").active_pids.clone()
     }
 
     fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
@@ -94,6 +111,11 @@ impl JobMembership for ScriptedJob {
             .drain(..)
             .collect()
     }
+
+    fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
+        self.0.lock().expect("scripted Job").bound_fence = Some(fence);
+        Ok(())
+    }
 }
 
 fn registration(
@@ -111,7 +133,7 @@ fn registration(
     )
 }
 
-fn completion(fence: ResourceFence, event: JobCompletionEvent) -> JobCompletionMessage {
+fn completion(fence: ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
     JobCompletionMessage::new(fence, event)
 }
 
@@ -125,12 +147,11 @@ fn member(pid: u32, creation_time_100ns: u64, command_line: &str) -> JobMemberIn
 #[test]
 fn membership_root_exit_does_not_stop_a_live_grandchild() {
     let resource = resource_id(1);
-    let fence = ResourceFence::new(resource, 1);
     let root = identity(1_001, 10_001, &executable());
     let grandchild = member(1_003, 10_003, "grandchild --work");
     let job = ScriptedJob::with_root(root.id().pid());
     let mut registry = ProcessRegistry::new();
-    registry
+    let fence = registry
         .register(registration(resource, 1, root, job.clone()))
         .expect("registration");
 
@@ -139,11 +160,11 @@ fn membership_root_exit_does_not_stop_a_live_grandchild() {
         vec![(grandchild.identity().id().pid(), Ok(grandchild.clone()))],
     );
     job.push(completion(
-        fence,
+        fence.clone(),
         JobCompletionEvent::NewProcess { pid: 1_003 },
     ));
     job.push(completion(
-        fence,
+        fence.clone(),
         JobCompletionEvent::ExitProcess { pid: 1_001 },
     ));
 
@@ -156,7 +177,10 @@ fn membership_root_exit_does_not_stop_a_live_grandchild() {
     assert_eq!(current.known_members(), &[grandchild]);
     assert!(current.unknown_member_pids().is_empty());
 
-    job.push(completion(fence, JobCompletionEvent::ActiveProcessZero));
+    job.push(completion(
+        fence.clone(),
+        JobCompletionEvent::ActiveProcessZero,
+    ));
     assert_eq!(registry.drain_job_completions(resource), 1);
     assert_eq!(
         registry
@@ -267,7 +291,6 @@ fn membership_pid_reuse_replaces_the_full_process_identity() {
 #[test]
 fn membership_stale_completion_cannot_mutate_replacement_generation() {
     let resource = resource_id(4);
-    let stale_resource_fence = ResourceFence::new(resource, 1);
     let replacement_resource_fence = ResourceFence::new(resource, 2);
     let stale_job = ScriptedJob::with_root(4_001);
     let replacement_job = ScriptedJob::with_root(4_002);
@@ -282,11 +305,11 @@ fn membership_stale_completion_cannot_mutate_replacement_generation() {
         ))
         .expect("stale generation registration");
     let removed = registry
-        .unregister_exact(&stale_fence)
-        .expect("retire stale generation");
+        .rollback_starting_exact(&stale_fence)
+        .expect("rollback stale provisional generation");
     assert!(matches!(removed, UnregisterOutcome::Removed(_)));
 
-    registry
+    let replacement_fence = registry
         .register(registration(
             resource,
             2,
@@ -295,27 +318,216 @@ fn membership_stale_completion_cannot_mutate_replacement_generation() {
         ))
         .expect("replacement registration");
     replacement_job.push(completion(
-        replacement_resource_fence,
+        replacement_fence.clone(),
         JobCompletionEvent::NewProcess { pid: 4_002 },
     ));
     assert_eq!(registry.drain_job_completions(resource), 1);
 
+    let wrong_owner = ManagedProcessFence::new(
+        replacement_fence.resource(),
+        ProcessOwner::Task(TaskId::new()),
+        replacement_fence.root().clone(),
+    );
     assert!(!registry.apply_job_completion(completion(
-        stale_resource_fence,
+        wrong_owner,
+        JobCompletionEvent::MonitorFailed {
+            detail: "wrong owner".to_string(),
+        },
+    )));
+    let wrong_root = ManagedProcessFence::new(
+        replacement_fence.resource(),
+        replacement_fence.owner(),
+        identity(4_002, 49_999, &executable()),
+    );
+    assert!(!registry.apply_job_completion(completion(
+        wrong_root,
+        JobCompletionEvent::AbnormalExitProcess { pid: 4_002 },
+    )));
+
+    assert!(!registry.apply_job_completion(completion(
+        stale_fence.clone(),
         JobCompletionEvent::ExitProcess { pid: 4_001 },
     )));
     assert!(!registry.apply_job_completion(completion(
-        stale_resource_fence,
+        stale_fence.clone(),
         JobCompletionEvent::AbnormalExitProcess { pid: 4_001 },
     )));
     assert!(!registry.apply_job_completion(completion(
-        stale_resource_fence,
+        stale_fence,
         JobCompletionEvent::ActiveProcessZero,
     )));
 
     let current = registry.current(resource).expect("replacement generation");
     assert_eq!(current.fence(), replacement_resource_fence);
     assert_eq!(current.state(), ManagedProcessState::Running);
+}
+
+#[test]
+fn membership_unproved_zero_retries_until_empty_then_stops() {
+    let resource = resource_id(9);
+    let job = ScriptedJob::with_root(9_001);
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource,
+            1,
+            identity(9_001, 90_001, &executable()),
+            job.clone(),
+        ))
+        .expect("registration");
+    assert!(registry.apply_job_completion(completion(
+        fence.clone(),
+        JobCompletionEvent::NewProcess { pid: 9_001 },
+    )));
+
+    job.set_membership_error("transient Job query failure");
+    assert!(
+        registry.apply_job_completion(completion(fence, JobCompletionEvent::ActiveProcessZero,))
+    );
+    assert_eq!(
+        registry.current(resource).expect("current process").state(),
+        ManagedProcessState::Leaked
+    );
+    assert!(registry.reconcile_membership(resource).is_err());
+    assert_eq!(
+        registry.current(resource).expect("current process").state(),
+        ManagedProcessState::Leaked,
+        "a repeated query failure must retain the pending zero retry"
+    );
+
+    job.set_snapshot(Vec::new(), Vec::new());
+    registry
+        .reconcile_membership(resource)
+        .expect("retry authoritative empty Job query");
+    assert_eq!(
+        registry.current(resource).expect("current process").state(),
+        ManagedProcessState::Stopped
+    );
+}
+
+#[test]
+fn membership_unproved_zero_restores_prior_state_when_members_remain() {
+    let resource = resource_id(10);
+    let pid = 10_001;
+    let root = identity(pid, 100_001, &executable());
+    let job = ScriptedJob::with_root(pid);
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(resource, 1, root, job.clone()))
+        .expect("registration");
+    assert!(
+        registry.apply_job_completion(completion(fence, JobCompletionEvent::NewProcess { pid },))
+    );
+
+    job.set_membership_error("transient Job query failure");
+    let bound = job
+        .0
+        .lock()
+        .expect("scripted Job")
+        .bound_fence
+        .clone()
+        .expect("full completion authority bound at registration");
+    assert!(
+        registry.apply_job_completion(completion(bound, JobCompletionEvent::ActiveProcessZero,))
+    );
+    assert_eq!(
+        registry.current(resource).expect("current process").state(),
+        ManagedProcessState::Leaked
+    );
+
+    let live_member = member(pid, 100_001, "still-running");
+    job.set_snapshot(vec![pid], vec![(pid, Ok(live_member.clone()))]);
+    registry
+        .reconcile_membership(resource)
+        .expect("retry authoritative non-empty Job query");
+    let current = registry.current(resource).expect("current process");
+    assert_eq!(current.state(), ManagedProcessState::Running);
+    assert_eq!(current.known_members(), &[live_member]);
+
+    job.set_snapshot(Vec::new(), Vec::new());
+    registry
+        .reconcile_membership(resource)
+        .expect("ordinary empty reconciliation");
+    assert_eq!(
+        registry.current(resource).expect("current process").state(),
+        ManagedProcessState::Running,
+        "a resolved non-empty retry consumes the pending zero marker"
+    );
+}
+
+#[test]
+fn membership_live_states_cannot_be_rolled_back_or_released() {
+    fn assert_not_removable(
+        registry: &mut ProcessRegistry<ScriptedJob>,
+        fence: &ManagedProcessFence,
+    ) {
+        assert!(registry.rollback_starting_exact(fence).is_err());
+        assert!(registry.release_stopped_exact(fence).is_err());
+        assert!(registry.current(fence.resource().resource_id).is_some());
+    }
+
+    let mut registry = ProcessRegistry::new();
+
+    let running_resource = resource_id(12);
+    let running_fence = registry
+        .register(registration(
+            running_resource,
+            1,
+            identity(12_001, 120_001, &executable()),
+            ScriptedJob::with_root(12_001),
+        ))
+        .expect("running registration");
+    registry
+        .commit_resumed_exact(&running_fence)
+        .expect("resume commit");
+    assert_not_removable(&mut registry, &running_fence);
+
+    let stopping_resource = resource_id(13);
+    let stopping_fence = registry
+        .register(registration(
+            stopping_resource,
+            1,
+            identity(13_001, 130_001, &executable()),
+            ScriptedJob::with_root(13_001),
+        ))
+        .expect("stopping registration");
+    registry
+        .commit_resumed_exact(&stopping_fence)
+        .expect("resume commit");
+    assert!(registry.begin_stopping_exact(&stopping_fence));
+    assert_not_removable(&mut registry, &stopping_fence);
+
+    let failed_resource = resource_id(14);
+    let failed_fence = registry
+        .register(registration(
+            failed_resource,
+            1,
+            identity(14_001, 140_001, &executable()),
+            ScriptedJob::with_root(14_001),
+        ))
+        .expect("failed registration");
+    assert!(registry.apply_job_completion(completion(
+        failed_fence.clone(),
+        JobCompletionEvent::AbnormalExitProcess { pid: 14_001 },
+    )));
+    assert_not_removable(&mut registry, &failed_fence);
+
+    let leaked_resource = resource_id(15);
+    let leaked_fence = registry
+        .register(registration(
+            leaked_resource,
+            1,
+            identity(15_001, 150_001, &executable()),
+            ScriptedJob::with_root(15_001),
+        ))
+        .expect("leaked registration");
+    assert!(registry.apply_job_completion(completion(
+        leaked_fence.clone(),
+        JobCompletionEvent::MonitorFailed {
+            detail: "listener lost".to_string(),
+        },
+    )));
+    assert_not_removable(&mut registry, &leaked_fence);
 }
 
 #[test]
@@ -341,7 +553,7 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
         ManagedProcessState::Starting
     );
     assert!(registry.apply_job_completion(completion(
-        stopping_fence.resource(),
+        stopping_fence.clone(),
         JobCompletionEvent::NewProcess { pid: 5_001 },
     )));
     assert!(registry.begin_stopping_exact(&stopping_fence));
@@ -354,7 +566,7 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
     );
     stopping_job.set_snapshot(Vec::new(), Vec::new());
     assert!(registry.apply_job_completion(completion(
-        stopping_fence.resource(),
+        stopping_fence.clone(),
         JobCompletionEvent::ActiveProcessZero,
     )));
     assert_eq!(
@@ -376,7 +588,7 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
         ))
         .expect("failed registration");
     assert!(registry.apply_job_completion(completion(
-        failed_fence.resource(),
+        failed_fence,
         JobCompletionEvent::AbnormalExitProcess { pid: 6_001 },
     )));
     assert_eq!(
@@ -398,7 +610,7 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
         ))
         .expect("limited registration");
     assert!(registry.apply_job_completion(completion(
-        limited_fence.resource(),
+        limited_fence,
         JobCompletionEvent::Limit {
             message_id: 10,
             pid: Some(7_001),
@@ -421,7 +633,7 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
         ))
         .expect("leaked registration");
     assert!(registry.apply_job_completion(completion(
-        leaked_fence.resource(),
+        leaked_fence,
         JobCompletionEvent::MonitorFailed {
             detail: "completion port abandoned".to_string(),
         },
@@ -433,4 +645,118 @@ fn membership_states_cover_stop_failure_limit_and_listener_loss() {
             .state(),
         ManagedProcessState::Leaked
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    use devmanager::process::job::ManagedProcessJob;
+    use devmanager::services::platform_service::{
+        claim_suspended_process, MANAGED_PROCESS_CREATION_FLAGS,
+    };
+    use std::os::windows::process::CommandExt;
+
+    struct TestChild(Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let harness = tempfile::tempdir().expect("completion-port harness");
+    let marker = harness.path().join("running.marker");
+    let mut child = TestChild(
+        Command::new(env!("CARGO_BIN_EXE_devmanager-process-test-helper"))
+            .arg("mark-wait")
+            .arg(&marker)
+            .creation_flags(MANAGED_PROCESS_CREATION_FLAGS)
+            .spawn()
+            .expect("spawn suspended completion-port child"),
+    );
+    let pid = child.0.id();
+    let job = claim_suspended_process(pid)
+        .expect("claim suspended child")
+        .expect("Windows managed Job");
+    let root = job
+        .inspect_process(pid)
+        .expect("inspect exact Job root")
+        .identity()
+        .clone();
+    assert!(
+        job.inspect_process(std::process::id()).is_err(),
+        "a PID outside this Job must remain inaccessible"
+    );
+
+    let resource = resource_id(11);
+    let mut registry: ProcessRegistry<ManagedProcessJob> = ProcessRegistry::new();
+    let fence = registry
+        .register(RegisteredProcess::new(
+            ResourceFence::new(resource, 1),
+            ProcessOwner::Host,
+            root,
+            ProcessDisplayLabel::new("real completion port").expect("display label"),
+            job,
+        ))
+        .expect("register real Job");
+
+    let event_deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_new_process = false;
+    while !saw_new_process && Instant::now() < event_deadline {
+        let messages = registry
+            .current(resource)
+            .expect("current Job")
+            .job()
+            .drain_completion_messages();
+        for message in messages {
+            assert_eq!(message.fence(), &fence);
+            saw_new_process |= matches!(
+                message.event(),
+                JobCompletionEvent::NewProcess { pid: observed } if *observed == pid
+            );
+            assert!(registry.apply_job_completion(message));
+        }
+        if !saw_new_process {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(saw_new_process, "real Job did not emit NEW_PROCESS");
+
+    child.0.kill().expect("terminate owned test child");
+    child.0.wait().expect("wait for owned test child");
+    let zero_deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_active_zero = false;
+    while !saw_active_zero && Instant::now() < zero_deadline {
+        let messages = registry
+            .current(resource)
+            .expect("current Job")
+            .job()
+            .drain_completion_messages();
+        for message in messages {
+            assert_eq!(message.fence(), &fence);
+            saw_active_zero |= matches!(message.event(), JobCompletionEvent::ActiveProcessZero);
+            assert!(registry.apply_job_completion(message));
+        }
+        if !saw_active_zero {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(saw_active_zero, "real Job did not emit ACTIVE_PROCESS_ZERO");
+    assert_eq!(
+        registry.current(resource).expect("current Job").state(),
+        ManagedProcessState::Stopped
+    );
+
+    let removed = registry
+        .release_stopped_exact(&fence)
+        .expect("release completed Job");
+    assert!(matches!(&removed, UnregisterOutcome::Removed(_)));
+    drop(removed);
 }

@@ -118,8 +118,8 @@ fn stale_generation_cannot_unregister_new_process() {
         ))
         .expect("first registration");
     let first = match registry
-        .unregister_exact(&stale_fence)
-        .expect("unregister first generation")
+        .rollback_starting_exact(&stale_fence)
+        .expect("rollback first provisional generation")
     {
         UnregisterOutcome::Removed(process) => process,
         UnregisterOutcome::Stale => panic!("current generation must unregister"),
@@ -137,8 +137,8 @@ fn stale_generation_cannot_unregister_new_process() {
 
     assert!(matches!(
         registry
-            .unregister_exact(&stale_fence)
-            .expect("stale unregister is a disposition"),
+            .rollback_starting_exact(&stale_fence)
+            .expect("stale rollback is a disposition"),
         UnregisterOutcome::Stale
     ));
     assert_eq!(
@@ -227,8 +227,8 @@ fn retired_generation_cannot_be_reused() {
         ))
         .expect("registration");
     let removed = registry
-        .unregister_exact(&fence)
-        .expect("unregister current generation");
+        .rollback_starting_exact(&fence)
+        .expect("rollback current provisional generation");
     drop(removed);
     assert_eq!(*dropped.lock().expect("drop ledger"), vec![1]);
 
