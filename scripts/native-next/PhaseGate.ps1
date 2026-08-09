@@ -69,7 +69,6 @@ function Get-DevManagerPhaseGateRecipeTable {
         'phase-03-process-supervisor'   = [string[]]@(
             'test',
             '--test', 'process_supervisor',
-            'supervisor::',
             '--', '--nocapture'
         )
     }

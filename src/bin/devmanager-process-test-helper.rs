@@ -3,8 +3,11 @@ use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use devmanager::process::job::ManagedProcessJob;
 use serde_json::{json, Value};
 
 const NATURAL_EXIT_BOUND: Duration = Duration::from_secs(20);
@@ -37,15 +40,74 @@ fn mark_and_wait(marker: &Path) {
     wait_naturally();
 }
 
-fn spawn_child_and_wait(root_marker: &Path, child_marker: &Path, child_pid: &Path) {
+struct ChildTreeGuard {
+    children: Vec<Child>,
+    jobs: Vec<ManagedProcessJob>,
+}
+
+impl ChildTreeGuard {
+    fn new() -> Self {
+        Self {
+            children: Vec::new(),
+            jobs: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mut child: Child) -> Result<(), String> {
+        let job = match devmanager::process::job::attach_process_to_managed_job(child.id()) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "attach child {} to kill-on-close Job Object: {error}",
+                    child.id()
+                ));
+            }
+        };
+        if let Some(job) = job {
+            self.jobs.push(job);
+        }
+        self.children.push(child);
+        Ok(())
+    }
+}
+
+impl Drop for ChildTreeGuard {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+fn spawn_child_and_wait(
+    root_marker: &Path,
+    child_marker: &Path,
+    child_pid: &Path,
+) -> Result<(), String> {
     write_marker(root_marker, b"started");
-    let mut child = spawn_marker_child(child_marker);
-    write_marker(child_pid, child.id().to_string());
-    let _ = child.wait();
+    let mut guard = ChildTreeGuard::new();
+    let child = spawn_marker_child(child_marker);
+    let child_id = child.id();
+    guard.push(child)?;
+    write_marker(child_pid, child_id.to_string());
+    let child = guard
+        .children
+        .first_mut()
+        .ok_or_else(|| "child guard lost spawned child".to_string())?;
+    child
+        .wait()
+        .map_err(|error| format!("wait marker child: {error}"))?;
+    guard.children.clear();
+    Ok(())
 }
 
 #[cfg(windows)]
-fn attempt_breakaway(result: &Path, escaped_marker: &Path) {
+fn attempt_breakaway(result: &Path, escaped_marker: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -55,19 +117,29 @@ fn attempt_breakaway(result: &Path, escaped_marker: &Path) {
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
         .spawn();
     match spawn {
-        Ok(mut escaped) => {
-            write_marker(result, format!("escaped:{}", escaped.id()));
+        Ok(escaped) => {
+            let escaped_id = escaped.id();
+            let mut guard = ChildTreeGuard::new();
+            guard.push(escaped)?;
+            write_marker(result, format!("escaped:{escaped_id}"));
+            let escaped = guard
+                .children
+                .first_mut()
+                .ok_or_else(|| "child guard lost breakaway child".to_string())?;
             let _ = escaped.kill();
             let _ = escaped.wait();
+            guard.children.clear();
         }
         Err(error) => write_marker(result, format!("blocked:{:?}", error.kind())),
     }
     wait_naturally();
+    Ok(())
 }
 
 #[cfg(not(windows))]
-fn attempt_breakaway(result: &Path, _escaped_marker: &Path) {
+fn attempt_breakaway(result: &Path, _escaped_marker: &Path) -> Result<(), String> {
     write_marker(result, b"unsupported");
+    Ok(())
 }
 
 fn required_path(
@@ -85,6 +157,7 @@ struct BoundedOptions {
     bytes: usize,
     children: u32,
     port: u16,
+    watchdog_ms: Option<u64>,
 }
 
 impl Default for BoundedOptions {
@@ -94,6 +167,7 @@ impl Default for BoundedOptions {
             bytes: DEFAULT_OUTPUT_BYTES,
             children: DEFAULT_FORK_CHILDREN,
             port: 0,
+            watchdog_ms: None,
         }
     }
 }
@@ -143,6 +217,11 @@ fn parse_bounded_options(
                     .and_then(|value| value.into_string().ok())
                     .unwrap_or_default()
             })),
+            "--watchdog-ms" => Some(inline_value.map(str::to_owned).unwrap_or_else(|| {
+                args.next()
+                    .and_then(|value| value.into_string().ok())
+                    .unwrap_or_default()
+            })),
             other => return Err(format!("unknown bounded helper argument '{other}'")),
         };
         let value = value.expect("bounded helper option value");
@@ -154,6 +233,7 @@ fn parse_bounded_options(
             "--bytes" => options.bytes = parse_number(&value, "bytes")?,
             "--children" => options.children = parse_number(&value, "children")?,
             "--port" => options.port = parse_number(&value, "port")?,
+            "--watchdog-ms" => options.watchdog_ms = Some(parse_number(&value, "watchdog-ms")?),
             _ => unreachable!("bounded helper option was validated above"),
         }
     }
@@ -167,6 +247,13 @@ fn parse_bounded_options(
         return Err(format!(
             "children must be between 1 and {MAX_FORK_CHILDREN}"
         ));
+    }
+    if let Some(watchdog_ms) = options.watchdog_ms {
+        if watchdog_ms == 0 || watchdog_ms > MAX_BOUNDED_DURATION_MS {
+            return Err(format!(
+                "watchdog-ms must be between 1 and {MAX_BOUNDED_DURATION_MS}"
+            ));
+        }
     }
     Ok(options)
 }
@@ -216,6 +303,41 @@ fn wait_bounded(duration_ms: u64) {
     std::thread::sleep(Duration::from_millis(duration_ms));
 }
 
+struct OutputWatchdog {
+    cancelled: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OutputWatchdog {
+    fn start(timeout_ms: u64) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            while !thread_cancelled.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    eprintln!("large-output watchdog expired after {timeout_ms}ms");
+                    std::process::exit(124);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        Self {
+            cancelled,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OutputWatchdog {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn run_rapid_fork_exit(options: BoundedOptions) -> Result<(), String> {
     emit_event(
         "rapid-fork-exit",
@@ -227,7 +349,7 @@ fn run_rapid_fork_exit(options: BoundedOptions) -> Result<(), String> {
             ("maxChildren", json!(MAX_FORK_CHILDREN)),
         ],
     );
-    let mut children = Vec::with_capacity(options.children as usize);
+    let mut guard = ChildTreeGuard::new();
     for _ in 0..options.children {
         let child = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
             .arg("rapid-fork-exit-worker")
@@ -238,9 +360,9 @@ fn run_rapid_fork_exit(options: BoundedOptions) -> Result<(), String> {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("spawn rapid-fork worker: {error}"))?;
-        children.push(child);
+        guard.push(child)?;
     }
-    for mut child in children {
+    for child in &mut guard.children {
         let status = child
             .wait()
             .map_err(|error| format!("wait rapid-fork worker: {error}"))?;
@@ -248,6 +370,7 @@ fn run_rapid_fork_exit(options: BoundedOptions) -> Result<(), String> {
             return Err(format!("rapid-fork worker exited as {status}"));
         }
     }
+    guard.children.clear();
     wait_bounded(options.duration_ms);
     emit_event(
         "rapid-fork-exit",
@@ -272,6 +395,7 @@ fn run_large_output(options: BoundedOptions) -> Result<(), String> {
             "bytes must be between 1 and {MAX_OUTPUT_BYTES} for large-output"
         ));
     }
+    let watchdog = options.watchdog_ms.map(OutputWatchdog::start);
     emit_event(
         "large-output",
         "ready",
@@ -309,6 +433,7 @@ fn run_large_output(options: BoundedOptions) -> Result<(), String> {
             ("outputBytes", json!(options.bytes)),
         ],
     );
+    drop(watchdog);
     Ok(())
 }
 
@@ -347,6 +472,8 @@ fn run_grandchild_lifetime(options: BoundedOptions) -> Result<(), String> {
         .map_err(|error| format!("spawn grandchild lifetime worker: {error}"))?;
     let child_pid = child.id();
     let child_identity = helper_identity(child_pid);
+    let mut guard = ChildTreeGuard::new();
+    guard.push(child)?;
     emit_event(
         "grandchild-lifetime",
         "ready",
@@ -357,8 +484,10 @@ fn run_grandchild_lifetime(options: BoundedOptions) -> Result<(), String> {
             ("childIdentity", json!(&child_identity)),
         ],
     );
-    let mut child = child;
-    let status = child
+    let status = guard
+        .children
+        .first_mut()
+        .ok_or_else(|| "child guard lost grandchild worker".to_string())?
         .wait()
         .map_err(|error| format!("wait grandchild lifetime worker: {error}"))?;
     if !status.success() {
@@ -374,6 +503,7 @@ fn run_grandchild_lifetime(options: BoundedOptions) -> Result<(), String> {
             ("childIdentity", json!(&child_identity)),
         ],
     );
+    guard.children.clear();
     Ok(())
 }
 
@@ -503,21 +633,15 @@ fn main() {
             mark_and_wait(&required_path(&mut args, "marker path"));
             Ok(())
         }
-        "spawn-child" => {
-            spawn_child_and_wait(
-                &required_path(&mut args, "root marker path"),
-                &required_path(&mut args, "child marker path"),
-                &required_path(&mut args, "child PID path"),
-            );
-            Ok(())
-        }
-        "attempt-breakaway" => {
-            attempt_breakaway(
-                &required_path(&mut args, "breakaway result path"),
-                &required_path(&mut args, "escaped marker path"),
-            );
-            Ok(())
-        }
+        "spawn-child" => spawn_child_and_wait(
+            &required_path(&mut args, "root marker path"),
+            &required_path(&mut args, "child marker path"),
+            &required_path(&mut args, "child PID path"),
+        ),
+        "attempt-breakaway" => attempt_breakaway(
+            &required_path(&mut args, "breakaway result path"),
+            &required_path(&mut args, "escaped marker path"),
+        ),
         "rapid-fork-exit" | "fork-exit" | "rapid-fork" => {
             parse_bounded_options(args).and_then(run_rapid_fork_exit)
         }
