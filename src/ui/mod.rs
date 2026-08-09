@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui::{App, Global};
 
 pub mod preview;
+pub mod preview_capture;
 
 pub use preview::PreviewInitReport;
 

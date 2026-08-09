@@ -14,6 +14,10 @@ const FIXTURE_JSON: &str = r#"{
   "schema": "devmanager.ui.preview/v1",
   "id": "theme-gallery",
   "title": "Theme Gallery",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
   "root": {
     "kind": "minimal",
     "label": "DevManager native preview"
@@ -91,7 +95,7 @@ fn component_init_registers_devmanager_resources_once() {
 }
 
 #[test]
-fn preview_output_metadata_is_deterministic_and_refuses_fake_png() {
+fn preview_output_metadata_is_deterministic_and_does_not_claim_write() {
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy);
     let output = request.output_path().to_path_buf();
@@ -107,15 +111,14 @@ fn preview_output_metadata_is_deterministic_and_refuses_fake_png() {
     assert_eq!(first.format, "png");
     assert_eq!(
         first.capability,
-        PreviewOutputCapability::HeadlessProjectionOnly
+        if cfg!(windows) {
+            PreviewOutputCapability::VisibleWindowsNativeCapture
+        } else {
+            PreviewOutputCapability::HeadlessProjectionOnly
+        }
     );
     assert!(!first.output_written);
     assert!(!first.host_started);
-
-    let refusal = preview
-        .render_to_output()
-        .expect_err("PNG rendering must remain an explicit capability refusal");
-    assert_eq!(refusal, PreviewError::HeadlessRenderingUnsupported);
     assert!(!output.exists());
 }
 
@@ -272,8 +275,9 @@ fn preview_validation_rejects_existing_sensitive_output() {
     assert!(matches!(error, PreviewError::SensitivePath { .. }));
 }
 
+#[cfg(not(windows))]
 #[test]
-fn preview_execution_returns_explicit_headless_support_error_without_writing_output() {
+fn preview_execution_returns_explicit_visible_windows_unavailable_error_without_writing_output() {
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy);
     let output = request.output_path().to_path_buf();
@@ -281,28 +285,12 @@ fn preview_execution_returns_explicit_headless_support_error_without_writing_out
 
     let error = preview
         .render_to_output()
-        .expect_err("unproven Windows headless PNG rendering must be visible");
-    assert!(matches!(error, PreviewError::HeadlessRenderingUnsupported));
+        .expect_err("non-Windows visual capture must be unavailable");
+    assert!(matches!(
+        error,
+        PreviewError::VisibleWindowsCaptureUnavailable { .. }
+    ));
     assert!(!output.exists());
-}
-
-#[test]
-#[ignore = "GPUI 0.2.2 has no official isolated pixel readback or PNG encoder"]
-fn preview_renders_a_concrete_png_from_the_native_gpui_root() {
-    let (_root, policy) = temporary_policy();
-    let request = valid_request(&policy);
-    let output = request.output_path().to_path_buf();
-    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
-
-    preview
-        .render_to_output()
-        .expect("the native GPUI root must render to the requested PNG");
-
-    let bytes = fs::read(&output).expect("preview PNG should be written");
-    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-    assert_eq!(&bytes[12..16], b"IHDR");
-    assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 320);
-    assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 160);
 }
 
 #[test]

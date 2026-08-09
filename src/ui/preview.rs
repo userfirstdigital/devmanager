@@ -1,8 +1,8 @@
 //! Deterministic, isolated native UI preview contracts.
 
 use gpui::{
-    div, Action, Context, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    Window,
+    div, px, Action, Context, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    Styled, Window,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -16,9 +16,13 @@ use std::rc::Rc;
 use crate::assets::AppAssets;
 use crate::client::action;
 use crate::terminal::terminal_font;
+use crate::ui::preview_capture;
 
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
+pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
+const PREVIEW_SENTINEL_RGB: u32 = 0x912bd4;
+const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
 const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
 
@@ -63,7 +67,21 @@ pub struct PreviewFixture {
     pub schema: String,
     pub id: String,
     pub title: String,
+    pub capture: PreviewCaptureFixture,
     pub root: PreviewRootFixture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewCaptureSetting {
+    Excluded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewCaptureFixture {
+    pub cursor: PreviewCaptureSetting,
+    pub border: PreviewCaptureSetting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +146,15 @@ impl PreviewRequest {
 
     pub fn output_path(&self) -> &Path {
         &self.output_path
+    }
+
+    pub fn write_bgra_png_atomic(
+        &self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<(), preview_capture::PreviewCaptureError> {
+        preview_capture::encode_bgra_png_atomic(&self.output_path, width, height, bgra)
     }
 
     pub fn validate(
@@ -303,6 +330,7 @@ pub struct PreviewInitReport {
 #[serde(rename_all = "snake_case")]
 pub enum PreviewOutputCapability {
     HeadlessProjectionOnly,
+    VisibleWindowsNativeCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +350,7 @@ pub struct PreviewApplication {
     request: PreviewRequest,
     root_snapshot: PreviewRootSnapshot,
     resources: PreviewResources,
+    capture: PreviewCaptureFixture,
     init_report: RefCell<Option<PreviewInitReport>>,
 }
 
@@ -349,6 +378,8 @@ impl PreviewApplication {
             || fixture.id.chars().count() > 128
             || fixture.title.trim().is_empty()
             || fixture.title.chars().count() > 256
+            || fixture.capture.cursor != PreviewCaptureSetting::Excluded
+            || fixture.capture.border != PreviewCaptureSetting::Excluded
             || fixture.root.kind != "minimal"
             || fixture.root.label.trim().is_empty()
             || fixture.root.label.chars().count() > 256
@@ -368,6 +399,7 @@ impl PreviewApplication {
             request,
             root_snapshot,
             resources: PreviewResources::new(),
+            capture: fixture.capture,
             init_report: RefCell::new(None),
         })
     }
@@ -380,13 +412,25 @@ impl PreviewApplication {
         &self.resources
     }
 
+    pub fn capture_cursor(&self) -> PreviewCaptureSetting {
+        self.capture.cursor
+    }
+
+    pub fn capture_border(&self) -> PreviewCaptureSetting {
+        self.capture.border
+    }
+
     pub fn output_metadata(&self) -> PreviewOutputMetadata {
         PreviewOutputMetadata {
             schema: PREVIEW_SCHEMA.to_string(),
             fixture_id: self.root_snapshot.fixture_id.clone(),
             output_path: self.request.output_path.clone(),
             format: "png".to_string(),
-            capability: PreviewOutputCapability::HeadlessProjectionOnly,
+            capability: if cfg!(windows) {
+                PreviewOutputCapability::VisibleWindowsNativeCapture
+            } else {
+                PreviewOutputCapability::HeadlessProjectionOnly
+            },
             output_written: false,
             host_started: false,
         }
@@ -406,8 +450,7 @@ impl PreviewApplication {
         let report_slot = Rc::clone(&report);
         let application = gpui::Application::headless().with_assets(AppAssets::new());
         application.run(move |cx| {
-            crate::ui::init(cx);
-            crate::ui::init(cx);
+            register_preview_environment(cx);
 
             let assets_registered = cx
                 .asset_source()
@@ -419,15 +462,6 @@ impl PreviewApplication {
                 let _ = cx.text_system().resolve_font(&font);
                 true
             };
-            cx.bind_keys([
-                KeyBinding::new("ctrl-alt-1", HostActions, None),
-                KeyBinding::new("ctrl-alt-2", HostStatus, None),
-                KeyBinding::new("ctrl-alt-3", TaskList, None),
-                KeyBinding::new("ctrl-alt-4", TaskShow, None),
-                KeyBinding::new("ctrl-alt-5", TaskCreate, None),
-                KeyBinding::new("ctrl-alt-6", TaskRename, None),
-                KeyBinding::new("escape", PreviewDismiss, None),
-            ]);
             let actions_registered = TASK_COCKPIT_ACTION_NAMES
                 .iter()
                 .all(|name| cx.all_action_names().contains(name))
@@ -460,9 +494,23 @@ impl PreviewApplication {
     }
 
     pub fn render_to_output(&self) -> Result<(), PreviewError> {
-        let _ = &self.request.output_path;
-        Err(PreviewError::HeadlessRenderingUnsupported)
+        preview_capture::capture_preview(self.root(), &self.request)
+            .map(|_| ())
+            .map_err(|error| PreviewError::from_capture_error(error, self.request.output_path()))
     }
+}
+
+pub(crate) fn register_preview_environment(cx: &mut gpui::App) {
+    crate::ui::init(cx);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-alt-1", HostActions, None),
+        KeyBinding::new("ctrl-alt-2", HostStatus, None),
+        KeyBinding::new("ctrl-alt-3", TaskList, None),
+        KeyBinding::new("ctrl-alt-4", TaskShow, None),
+        KeyBinding::new("ctrl-alt-5", TaskCreate, None),
+        KeyBinding::new("ctrl-alt-6", TaskRename, None),
+        KeyBinding::new("escape", PreviewDismiss, None),
+    ]);
 }
 
 #[derive(Debug, Clone)]
@@ -477,7 +525,17 @@ impl PreviewRoot {
 
     pub fn element(&self) -> impl IntoElement {
         div()
+            .size_full()
+            .p(px(16.0))
+            .bg(gpui::rgb(0x202124))
+            .text_color(gpui::rgb(0xf1f3f4))
             .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(PREVIEW_SENTINEL_SIZE))
+                    .bg(gpui::rgb(PREVIEW_SENTINEL_RGB)),
+            )
             .child(self.snapshot.body.clone())
     }
 }
@@ -631,6 +689,16 @@ fn is_sensitive_path(path: &Path) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureUnavailableKind {
+    UnsupportedPlatform,
+    InvalidHwnd,
+    ForeignHwnd,
+    InvalidWindowState { reason: &'static str },
+    DeadlineExceeded,
+    CaptureClosed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewError {
     Usage(String),
@@ -669,7 +737,107 @@ pub enum PreviewError {
         path: PathBuf,
     },
     HeadlessInitializationFailed,
-    HeadlessRenderingUnsupported,
+    VisibleWindowsCaptureUnavailable {
+        kind: CaptureUnavailableKind,
+        reason: String,
+    },
+    PngFailed {
+        reason: String,
+    },
+    OutputFailed {
+        reason: String,
+    },
+    ForegroundChanged {
+        before: isize,
+        after: isize,
+    },
+    ApplicationFailed {
+        reason: String,
+    },
+    WindowsGraphicsCaptureFailed {
+        reason: String,
+    },
+    CaptureCleanupFailed {
+        primary: Box<Self>,
+        operation: &'static str,
+        reason: String,
+    },
+}
+
+impl PreviewError {
+    pub fn from_capture_error(
+        error: preview_capture::PreviewCaptureError,
+        output_path: &Path,
+    ) -> Self {
+        let reason = error.to_string();
+        match error {
+            preview_capture::PreviewCaptureError::UnsupportedPlatform => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::UnsupportedPlatform,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::InvalidHwnd => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::InvalidHwnd,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::ForeignHwnd => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::ForeignHwnd,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::InvalidWindowState {
+                reason: window_reason,
+            } => Self::VisibleWindowsCaptureUnavailable {
+                kind: CaptureUnavailableKind::InvalidWindowState {
+                    reason: window_reason,
+                },
+                reason,
+            },
+            preview_capture::PreviewCaptureError::DeadlineExceeded => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::DeadlineExceeded,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureClosed => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::CaptureClosed,
+                    reason,
+                }
+            }
+            preview_capture::PreviewCaptureError::CaptureFailed(reason) => {
+                Self::WindowsGraphicsCaptureFailed { reason }
+            }
+            preview_capture::PreviewCaptureError::ApplicationFailed(reason) => {
+                Self::ApplicationFailed { reason }
+            }
+            preview_capture::PreviewCaptureError::PngFailed(reason) => Self::PngFailed { reason },
+            preview_capture::PreviewCaptureError::OutputAlreadyExists => {
+                Self::OutputAlreadyExists {
+                    path: output_path.to_path_buf(),
+                }
+            }
+            preview_capture::PreviewCaptureError::OutputFailed(reason) => {
+                Self::OutputFailed { reason }
+            }
+            preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
+                Self::ForegroundChanged { before, after }
+            }
+            preview_capture::PreviewCaptureError::CleanupFailed {
+                primary,
+                operation,
+                secondary,
+            } => Self::CaptureCleanupFailed {
+                primary: Box::new(Self::from_capture_error(*primary, output_path)),
+                operation,
+                reason: secondary.to_string(),
+            },
+        }
+    }
 }
 
 impl Display for PreviewError {
@@ -723,9 +891,31 @@ impl Display for PreviewError {
             Self::HeadlessInitializationFailed => {
                 f.write_str("headless preview initialization did not complete")
             }
-            Self::HeadlessRenderingUnsupported => f.write_str(
-                "GPUI 0.2.2 exposes no isolated offscreen pixel readback or PNG encoder; Windows rendering ends in a private swap chain",
+            Self::VisibleWindowsCaptureUnavailable { kind, reason } => {
+                write!(
+                    f,
+                    "visible Windows preview capture unavailable ({kind:?}): {reason}"
+                )
+            }
+            Self::PngFailed { reason } => write!(f, "PNG encoding failed: {reason}"),
+            Self::OutputFailed { reason } => write!(f, "PNG output failed: {reason}"),
+            Self::ForegroundChanged { before, after } => write!(
+                f,
+                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
             ),
+            Self::ApplicationFailed { reason } => {
+                write!(f, "GPUI preview application failed: {reason}")
+            }
+            Self::WindowsGraphicsCaptureFailed { reason } => {
+                write!(f, "Windows Graphics Capture failed: {reason}")
+            }
+            Self::CaptureCleanupFailed {
+                primary,
+                operation,
+                reason,
+            } => {
+                write!(f, "{primary}; cleanup {operation} failed: {reason}")
+            }
         }
     }
 }
