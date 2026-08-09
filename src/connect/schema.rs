@@ -341,7 +341,7 @@ impl ErrorPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GenericExtensionPayload {
     type_id: u16,
     schema_version: u16,
@@ -377,7 +377,18 @@ impl GenericExtensionPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for GenericExtensionPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericExtensionPayload")
+            .field("type_id", &self.type_id)
+            .field("schema_version", &self.schema_version)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct UnknownPayload {
     kind: PayloadKind,
     version: u16,
@@ -409,6 +420,17 @@ impl UnknownPayload {
 
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+}
+
+impl fmt::Debug for UnknownPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnknownPayload")
+            .field("kind", &self.kind.get())
+            .field("version", &self.version)
+            .field("payload_len", &self.payload.len())
+            .finish()
     }
 }
 
@@ -466,7 +488,7 @@ impl TryFrom<UnknownPayloadWire> for UnknownPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ConnectPayload {
     Hello(HelloPayload),
     Capabilities(CapabilitySet),
@@ -489,7 +511,7 @@ pub enum ConnectPayload {
 /// The serde representation is deliberately kept separate from the semantic
 /// payload. It is only reached through the checked Connect wire boundaries
 /// below, so direct serde cannot bypass canonicalization or validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum ConnectPayloadWire {
     Hello(HelloPayload),
     Capabilities(CapabilitySet),
@@ -555,7 +577,35 @@ impl From<ConnectPayloadWire> for ConnectPayload {
     }
 }
 
+impl fmt::Debug for ConnectPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectPayload")
+            .field("kind", &self.kind().get())
+            .field("version", &self.version())
+            .field("payload_len", &self.debug_payload_len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for ConnectPayloadWire {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        ConnectPayload::from(self.clone()).fmt(formatter)
+    }
+}
+
 impl ConnectPayload {
+    fn debug_payload_len(&self) -> Option<usize> {
+        match self {
+            Self::Chunk(frame) => Some(frame.payload().len()),
+            Self::TerminalDelta(frame) | Self::BrowserFrame(frame) => Some(frame.payload.len()),
+            Self::Error(error) => Some(error.message.len()),
+            Self::Extension(extension) => Some(extension.payload.len()),
+            Self::Unknown(unknown) => Some(unknown.payload.len()),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self) -> PayloadKind {
         match self {
             Self::Hello(_) => PayloadKind::HELLO,
@@ -1022,11 +1072,13 @@ impl WireScanContext {
             },
             b"snapshot_page" => Self::SnapshotPage,
             b"event_page" => Self::EventPage,
+            b"event_replay_page" => Self::EventPage,
             b"artifact_content_page" => Self::ArtifactPage,
             b"chunk" if matches!(self, Self::PayloadWrapper) => Self::Chunk,
             b"unknown" | b"extension" if matches!(self, Self::PayloadWrapper) => {
                 Self::OpaquePayload
             }
+            b"page" if self.is_page() => self,
             b"items" if matches!(self, Self::SnapshotPage) => Self::PageItems,
             b"events" if matches!(self, Self::EventPage) => Self::PageItems,
             b"next_cursor" | b"resume_cursor" => Self::Cursor,

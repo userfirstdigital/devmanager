@@ -25,8 +25,8 @@ use devmanager::domain::snapshot::{
     ArtifactContentPage, EventPage, SnapshotItemKey, SnapshotPage, SnapshotSection,
 };
 use devmanager::protocol::{
-    ChunkError, ClientRequest, PhysicalFrameCodec, PhysicalFrameError, ProtocolVersion,
-    ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
+    ChunkError, ClientRequest, MessagePackError, MessagePackLengthKind, PhysicalFrameCodec,
+    PhysicalFrameError, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -580,6 +580,110 @@ struct RawSnapshotPayload {
     snapshot_page: RawSnapshotPage,
 }
 
+#[derive(Serialize)]
+struct RawEventPage {
+    after_sequence: u64,
+    through_sequence: u64,
+    events: Vec<()>,
+    next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct RawArtifactContentPage {
+    artifact_id: ArtifactId,
+    offset: u64,
+    total_bytes: u64,
+    sha256: [u8; 32],
+    #[serde(with = "test_binary")]
+    payload: Vec<u8>,
+    encoded_bytes: u32,
+    next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct RawPageResult<P> {
+    page: P,
+}
+
+#[derive(Serialize)]
+struct RawSnapshotQueryResult {
+    snapshot_page: RawPageResult<RawSnapshotPage>,
+}
+
+#[derive(Serialize)]
+struct RawEventReplayPageResult {
+    subscription_id: SubscriptionId,
+    page: RawEventPage,
+}
+
+#[derive(Serialize)]
+struct RawEventQueryResult {
+    event_replay_page: RawEventReplayPageResult,
+}
+
+#[derive(Serialize)]
+struct RawArtifactQueryResult {
+    artifact_content_page: RawPageResult<RawArtifactContentPage>,
+}
+
+#[derive(Serialize)]
+struct RawQueryOutcome<R> {
+    ok: R,
+}
+
+#[derive(Serialize)]
+struct RawQueryReply<R> {
+    request_id: RequestId,
+    outcome: RawQueryOutcome<R>,
+}
+
+#[derive(Serialize)]
+struct RawQueryReplyMessage<R> {
+    query_reply: RawQueryReply<R>,
+}
+
+#[derive(Serialize)]
+struct RawMessagePayload<R> {
+    message: RawQueryReplyMessage<R>,
+}
+
+#[derive(Serialize)]
+struct RawUnknownPayload {
+    unknown: RawUnknownPayloadBody,
+}
+
+#[derive(Serialize)]
+struct RawUnknownPayloadBody {
+    kind: PayloadKind,
+    version: u16,
+    #[serde(with = "test_binary")]
+    payload: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct RawExtensionPayload {
+    extension: RawExtensionPayloadBody,
+}
+
+#[derive(Serialize)]
+struct RawExtensionPayloadBody {
+    type_id: u16,
+    schema_version: u16,
+    #[serde(with = "test_binary")]
+    payload: Vec<u8>,
+}
+
+mod test_binary {
+    use serde::Serializer;
+
+    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+}
+
 #[derive(Default)]
 struct LoopbackIo {
     bytes: Vec<u8>,
@@ -675,12 +779,160 @@ impl Write for FailureIo {
     }
 }
 
+struct ShortWriteThenErrorIo {
+    bytes: Vec<u8>,
+    read_offset: usize,
+    short_write_done: bool,
+}
+
+impl ShortWriteThenErrorIo {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            read_offset: 0,
+            short_write_done: false,
+        }
+    }
+}
+
+impl Read for ShortWriteThenErrorIo {
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+        if self.read_offset >= self.bytes.len() || destination.is_empty() {
+            return Ok(0);
+        }
+        let available = self.bytes.len() - self.read_offset;
+        let length = available.min(destination.len());
+        destination[..length]
+            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
+        self.read_offset += length;
+        Ok(length)
+    }
+}
+
+impl Write for ShortWriteThenErrorIo {
+    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
+        if self.short_write_done {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "injected short-write failure",
+            ));
+        }
+        self.short_write_done = true;
+        let length = source.len().min(1);
+        self.bytes.extend_from_slice(&source[..length]);
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn framed_raw<P: Serialize>(wire: &P, limits: ConnectLimits) -> Vec<u8> {
     let payload = rmp_serde::to_vec_named(wire).expect("raw wire fixture");
+    framed_bytes(&payload, limits)
+}
+
+fn framed_bytes(payload: &[u8], limits: ConnectLimits) -> Vec<u8> {
     let codec = PhysicalFrameCodec::from_limits(limits.frame_limits()).expect("frame codec");
     let mut framed = Vec::new();
-    codec.write(&mut framed, &payload).expect("physical frame");
+    codec.write(&mut framed, payload).expect("physical frame");
     framed
+}
+
+fn query_reply_envelope(tail: u8, limits: ConnectLimits) -> ConnectEnvelope {
+    ConnectEnvelope::new(
+        binding(tail),
+        1,
+        Some(domain_id::<RequestId>(tail)),
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
+            request_id: domain_id::<RequestId>(tail),
+            outcome: QueryOutcome::Err(QueryError::NotFound),
+        })),
+    )
+    .expect("query reply envelope")
+}
+
+fn oversized_binary_frame<P: Serialize>(
+    envelope: &ConnectEnvelope,
+    payload: P,
+    limits: ConnectLimits,
+) -> Vec<u8> {
+    let encoded = oversized_binary_bytes(&wire_with_payload(envelope, payload), limits);
+    framed_bytes(&encoded, limits)
+}
+
+fn oversized_binary_bytes<P: Serialize>(value: &P, limits: ConnectLimits) -> Vec<u8> {
+    let mut encoded = rmp_serde::to_vec_named(value).expect("raw opaque fixture");
+    let empty_binary_marker = [0xc4, 0x00];
+    let marker_offset = encoded
+        .windows(empty_binary_marker.len())
+        .rposition(|window| window == empty_binary_marker)
+        .expect("opaque payload must use an empty MessagePack binary");
+    let declared = limits.max_reassembled_message_bytes + 1;
+    let replacement = [
+        0xc6,
+        (declared >> 24) as u8,
+        (declared >> 16) as u8,
+        (declared >> 8) as u8,
+        declared as u8,
+    ];
+    encoded.splice(
+        marker_offset..marker_offset + empty_binary_marker.len(),
+        replacement,
+    );
+    encoded
+}
+
+fn assert_page_items_rejection(frame: Vec<u8>, limits: ConnectLimits) {
+    let mut receiver =
+        FramedConnectTransport::with_negotiated_limits(LoopbackIo::with_bytes(frame), limits)
+            .expect("page-limit receiver");
+    let result = receiver.receive();
+    let result_debug = format!("{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
+                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageItemsExceeded {
+                    declared: 2,
+                    maximum: 1,
+                })
+            )))
+        ),
+        "unexpected page item result: {result_debug}"
+    );
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+}
+
+fn assert_page_bytes_rejection(frame: Vec<u8>, limits: ConnectLimits) {
+    let mut receiver =
+        FramedConnectTransport::with_negotiated_limits(LoopbackIo::with_bytes(frame), limits)
+            .expect("page-byte-limit receiver");
+    let result = receiver.receive();
+    let result_debug = format!("{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
+                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageBytesExceeded {
+                    maximum: 1,
+                    ..
+                })
+            )))
+        ),
+        "unexpected page byte result: {result_debug}"
+    );
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
 }
 
 #[test]
@@ -895,6 +1147,42 @@ fn frame_and_partial_io_failures_permanently_close_transport() {
 }
 
 #[test]
+fn short_write_then_error_permanently_closes_transport() {
+    let limits = ConnectLimits::v1_default();
+    let envelope = ConnectEnvelope::new(
+        binding(87),
+        1,
+        Some(domain_id::<RequestId>(87)),
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        query_payload(87),
+    )
+    .expect("valid envelope");
+    let mut transport =
+        FramedConnectTransport::with_negotiated_limits(ShortWriteThenErrorIo::new(), limits)
+            .expect("short-write transport");
+
+    assert!(matches!(
+        transport.send(envelope.clone()),
+        Err(ConnectTransportError::Frame(
+            PhysicalFrameError::WriteHeader {
+                kind: ErrorKind::BrokenPipe
+            }
+        ))
+    ));
+    assert!(matches!(
+        transport.send(envelope),
+        Err(ConnectTransportError::Closed)
+    ));
+    assert_eq!(
+        transport.into_inner().bytes.len(),
+        1,
+        "the writer must have successfully short-written before failing"
+    );
+}
+
+#[test]
 fn physical_receive_limit_is_capped_by_reassembled_message_limit_before_allocation() {
     let limits =
         ConnectLimits::try_new(4096, 1024, 10, 2048, 512, 1024, 128).expect("bounded limits");
@@ -1048,6 +1336,294 @@ fn nested_chunk_page_and_cursor_sizes_are_rejected_before_payload_decode() {
                 maximum: 2,
             }
         ))
+    ));
+}
+
+#[test]
+fn query_reply_snapshot_and_event_page_item_limits_preflight_through_transport() {
+    let limits =
+        ConnectLimits::try_new(4096, 8192, 1, 2048, 4, 8, 128).expect("query page item limits");
+
+    let snapshot_envelope = query_reply_envelope(88, limits);
+    let snapshot = RawMessagePayload {
+        message: RawQueryReplyMessage {
+            query_reply: RawQueryReply {
+                request_id: domain_id(88),
+                outcome: RawQueryOutcome {
+                    ok: RawSnapshotQueryResult {
+                        snapshot_page: RawPageResult {
+                            page: RawSnapshotPage {
+                                snapshot_id: domain_id(88),
+                                through_sequence: 4,
+                                section: SnapshotSection::Tasks,
+                                after_item: None,
+                                items: vec![(), ()],
+                                encoded_bytes: 0,
+                                next_cursor: None,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+    assert_page_items_rejection(
+        framed_raw(&wire_with_payload(&snapshot_envelope, snapshot), limits),
+        limits,
+    );
+
+    let event_envelope = query_reply_envelope(89, limits);
+    let event = RawMessagePayload {
+        message: RawQueryReplyMessage {
+            query_reply: RawQueryReply {
+                request_id: domain_id(89),
+                outcome: RawQueryOutcome {
+                    ok: RawEventQueryResult {
+                        event_replay_page: RawEventReplayPageResult {
+                            subscription_id: domain_id(90),
+                            page: RawEventPage {
+                                after_sequence: 0,
+                                through_sequence: 4,
+                                events: vec![(), ()],
+                                next_cursor: None,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+    assert_page_items_rejection(
+        framed_raw(&wire_with_payload(&event_envelope, event), limits),
+        limits,
+    );
+}
+
+#[test]
+fn query_reply_snapshot_event_and_artifact_page_bytes_preflight_through_transport() {
+    let limits =
+        ConnectLimits::try_new(4096, 8192, 8, 1, 4, 8, 128).expect("query page byte limits");
+
+    let snapshot_envelope = query_reply_envelope(91, limits);
+    let snapshot = RawMessagePayload {
+        message: RawQueryReplyMessage {
+            query_reply: RawQueryReply {
+                request_id: domain_id(91),
+                outcome: RawQueryOutcome {
+                    ok: RawSnapshotQueryResult {
+                        snapshot_page: RawPageResult {
+                            page: RawSnapshotPage {
+                                snapshot_id: domain_id(91),
+                                through_sequence: 4,
+                                section: SnapshotSection::Tasks,
+                                after_item: None,
+                                items: Vec::new(),
+                                encoded_bytes: 0,
+                                next_cursor: None,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+    assert_page_bytes_rejection(
+        framed_raw(&wire_with_payload(&snapshot_envelope, snapshot), limits),
+        limits,
+    );
+
+    let event_envelope = query_reply_envelope(92, limits);
+    let event = RawMessagePayload {
+        message: RawQueryReplyMessage {
+            query_reply: RawQueryReply {
+                request_id: domain_id(92),
+                outcome: RawQueryOutcome {
+                    ok: RawEventQueryResult {
+                        event_replay_page: RawEventReplayPageResult {
+                            subscription_id: domain_id(93),
+                            page: RawEventPage {
+                                after_sequence: 0,
+                                through_sequence: 4,
+                                events: Vec::new(),
+                                next_cursor: None,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+    assert_page_bytes_rejection(
+        framed_raw(&wire_with_payload(&event_envelope, event), limits),
+        limits,
+    );
+
+    let artifact_envelope = query_reply_envelope(94, limits);
+    let artifact = RawMessagePayload {
+        message: RawQueryReplyMessage {
+            query_reply: RawQueryReply {
+                request_id: domain_id(94),
+                outcome: RawQueryOutcome {
+                    ok: RawArtifactQueryResult {
+                        artifact_content_page: RawPageResult {
+                            page: RawArtifactContentPage {
+                                artifact_id: domain_id(95),
+                                offset: 0,
+                                total_bytes: 1,
+                                sha256: [7; 32],
+                                payload: vec![8],
+                                encoded_bytes: 0,
+                                next_cursor: None,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+    assert_page_bytes_rejection(
+        framed_raw(&wire_with_payload(&artifact_envelope, artifact), limits),
+        limits,
+    );
+}
+
+#[test]
+fn raw_opaque_payload_limits_preflight_through_transport_and_close_permanently() {
+    let limits =
+        ConnectLimits::try_new(4096, 1024, 8, 2048, 4, 8, 128).expect("opaque payload limits");
+    let declared = limits.max_reassembled_message_bytes + 1;
+
+    let kind = PayloadKind::new(0x7ffd).expect("unknown kind");
+    let unknown_envelope = ConnectEnvelope::new(
+        binding(96),
+        1,
+        None,
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::Unknown(UnknownPayload::new(kind, 9, Vec::new()).expect("unknown payload")),
+    )
+    .expect("unknown envelope");
+    let unknown_payload_bytes = oversized_binary_bytes(
+        &RawUnknownPayload {
+            unknown: RawUnknownPayloadBody {
+                kind,
+                version: 9,
+                payload: Vec::new(),
+            },
+        },
+        limits,
+    );
+    assert!(matches!(
+        ConnectPayload::decode(kind, 9, &unknown_payload_bytes, limits),
+        Err(PayloadError::Limits(
+            devmanager::connect::ConnectLimitError::PayloadExceeded {
+                declared: actual,
+                maximum: 1024,
+            }
+        )) if actual == u64::from(declared)
+    ));
+    let unknown_frame = oversized_binary_frame(
+        &unknown_envelope,
+        RawUnknownPayload {
+            unknown: RawUnknownPayloadBody {
+                kind,
+                version: 9,
+                payload: Vec::new(),
+            },
+        },
+        limits,
+    );
+    let mut unknown_receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(unknown_frame),
+        limits,
+    )
+    .expect("unknown receiver");
+    let unknown_result = unknown_receiver.receive();
+    let unknown_result_debug = format!("{unknown_result:?}");
+    assert!(
+        matches!(
+            unknown_result,
+            Err(ConnectTransportError::Envelope(EnvelopeError::MessagePack(
+                MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Binary,
+                    declared: actual,
+                    maximum: 1024,
+                }
+            ))) if actual == declared
+        ),
+        "unexpected unknown result: {unknown_result_debug}"
+    );
+    assert!(matches!(
+        unknown_receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
+
+    let extension_envelope = ConnectEnvelope::new(
+        binding(97),
+        1,
+        None,
+        None,
+        limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::Extension(
+            GenericExtensionPayload::new(0x33, 1, Vec::new()).expect("extension payload"),
+        ),
+    )
+    .expect("extension envelope");
+    let extension_payload_bytes = oversized_binary_bytes(
+        &RawExtensionPayload {
+            extension: RawExtensionPayloadBody {
+                type_id: 0x33,
+                schema_version: 1,
+                payload: Vec::new(),
+            },
+        },
+        limits,
+    );
+    assert!(matches!(
+        ConnectPayload::decode(PayloadKind::EXTENSION, 1, &extension_payload_bytes, limits),
+        Err(PayloadError::Limits(
+            devmanager::connect::ConnectLimitError::PayloadExceeded {
+                declared: actual,
+                maximum: 1024,
+            }
+        )) if actual == u64::from(declared)
+    ));
+    let extension_frame = oversized_binary_frame(
+        &extension_envelope,
+        RawExtensionPayload {
+            extension: RawExtensionPayloadBody {
+                type_id: 0x33,
+                schema_version: 1,
+                payload: Vec::new(),
+            },
+        },
+        limits,
+    );
+    let mut extension_receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(extension_frame),
+        limits,
+    )
+    .expect("extension receiver");
+    let extension_result = extension_receiver.receive();
+    let extension_result_debug = format!("{extension_result:?}");
+    assert!(
+        matches!(
+            extension_result,
+            Err(ConnectTransportError::Envelope(EnvelopeError::MessagePack(
+                MessagePackError::DeclaredLengthExceeded {
+                    kind: MessagePackLengthKind::Binary,
+                    declared: actual,
+                    maximum: 1024,
+                }
+            ))) if actual == declared
+        ),
+        "unexpected extension result: {extension_result_debug}"
+    );
+    assert!(matches!(
+        extension_receiver.receive(),
+        Err(ConnectTransportError::Closed)
     ));
 }
 
@@ -1333,6 +1909,48 @@ fn opaque_payloads_expose_checked_getters_and_reject_hard_oversize() {
         vec![0; devmanager::connect::MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES as usize + 1]
     )
     .is_err());
+}
+
+#[test]
+fn connect_debug_paths_reveal_metadata_and_lengths_without_payload_bytes() {
+    let sentinel = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x23];
+    let sentinel_debug = format!("{sentinel:?}");
+    let extension =
+        GenericExtensionPayload::new(0x33, 7, sentinel.clone()).expect("extension payload");
+    let unknown_kind = PayloadKind::new(0x7ffc).expect("unknown kind");
+    let unknown = UnknownPayload::new(unknown_kind, 9, sentinel.clone()).expect("unknown payload");
+
+    let extension_debug = format!("{extension:?}");
+    assert!(extension_debug.contains("type_id"));
+    assert!(extension_debug.contains("schema_version"));
+    assert!(extension_debug.contains("payload_len"));
+    assert!(!extension_debug.contains(&sentinel_debug));
+
+    let unknown_debug = format!("{unknown:?}");
+    assert!(unknown_debug.contains("kind"));
+    assert!(unknown_debug.contains("version"));
+    assert!(unknown_debug.contains("payload_len"));
+    assert!(!unknown_debug.contains(&sentinel_debug));
+
+    let payload = ConnectPayload::Extension(extension);
+    let payload_debug = format!("{payload:?}");
+    assert!(payload_debug.contains("kind"));
+    assert!(payload_debug.contains("version"));
+    assert!(payload_debug.contains("payload_len"));
+    assert!(!payload_debug.contains(&sentinel_debug));
+
+    let envelope = ConnectEnvelope::new(
+        binding(98),
+        1,
+        None,
+        None,
+        ConnectLimits::v1_default(),
+        ConnectPrivacyClass::ManagedMetadata,
+        payload,
+    )
+    .expect("extension envelope");
+    let envelope_debug = format!("{envelope:?}");
+    assert!(!envelope_debug.contains(&sentinel_debug));
 }
 
 fn hex_fixture(value: &str) -> Vec<u8> {

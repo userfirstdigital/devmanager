@@ -1,9 +1,11 @@
 # Phase 9 Task 9.1 wire-boundary security report
 
 Status: COMPLETE for the independent Rust Connect wire-boundary findings owned
-by the clean `622dfcf` baseline in the isolated
+by clean commit `741c074` and the bounded review continuation in the isolated
 `phase-9-1d-connect-integration` worktree. Cross-language, service, pairing,
-relay, and UI gates remain deferred by scope.
+relay, and UI gates remain deferred by scope. Historical Batch 1 and Batch2-A
+evidence below remains labeled with its original baseline and is not re-run by
+this narrow continuation.
 
 ## Implemented
 
@@ -65,6 +67,12 @@ relay, and UI gates remain deferred by scope.
 - `connect_session` now exercises `ConnectEnvelope::encode` and
   `ConnectEnvelope::decode` directly and validates pages through
   `ConnectPayload`, with no removed-helper imports or stale compilation path.
+- Query-reply wire preflight preserves snapshot, event-replay, and artifact page
+  context through the `message`/`query_reply`/`outcome`/`ok`/result/`page`
+  wrappers, including the `event_replay_page` discriminant.
+- `GenericExtensionPayload`, `UnknownPayload`, `ConnectPayload`, and the
+  payload path used by `ConnectEnvelope` report only kind/type, version, and
+  payload length in `Debug`; payload bytes are not rendered.
 
 ## TDD and verification evidence
 
@@ -81,7 +89,43 @@ relay, and UI gates remain deferred by scope.
   `cargo fmt --all -- --check` is recorded below.
 - Final `git diff --check` and owned-path audit: passed.
 
-## Wire-boundary security verification
+## Independent review continuation on `741c074`
+
+- RED was captured before the continuation production edits with
+  `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-final2'; cargo test
+  --test connect_contract -- --nocapture`: 26 tests compiled, 23 passed, and 3
+  failed as expected on the new query-page item, Debug-redaction, and raw
+  opaque-payload contract assertions.
+- The continuation changed only `src/connect/schema.rs` and
+  `tests/connect_contract.rs`. `src/connect/transport.rs` was not changed:
+  the existing `PhysicalFrameCodec::write`/transport closure path already
+  handles a short write followed by an error.
+- Query-reply snapshot/event-replay/artifact raw fixtures now traverse
+  `FramedConnectTransport`; negotiated page item and encoded-byte limits reject
+  before typed page materialization and the second receive returns `Closed`.
+- Raw unknown and extension fixtures use an oversized MessagePack binary
+  declaration. Direct `ConnectPayload::decode` reaches the borrowed preflight
+  `PayloadExceeded` result; the same fixtures through `FramedConnectTransport`
+  stop at the earlier MessagePack length gate and permanently close.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-final2'; cargo test
+  --test connect_contract -- --nocapture`: 26 passed, 0 failed, 0 ignored.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-final2'; cargo test
+  --test connect_session -- --nocapture`: 8 passed, 0 failed, 0 ignored.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-final2'; cargo check
+  --lib`: passed with only the pre-existing library warnings.
+- `cargo fmt --all -- --check` and `git diff --check`: passed. No broad library
+  suite was run for this bounded continuation.
+- The short-write fixture wrote one byte successfully, then returned
+  `BrokenPipe`; the first send returned the physical write error, the next send
+  returned `Closed`, and the captured writer contained exactly that one byte.
+- The exact post-gate residue check found 0 Cargo, rustc, rustdoc, or test-harness
+  processes belonging to `C:\Temp\devmanager-phase91d-final2`; unrelated active
+  Cargo work from other worktrees was left untouched.
+
+## Historical Batch 1 wire-boundary security verification
+
+The following evidence records the earlier `622dfcf` baseline and is retained
+for provenance; it is not a claim about the current continuation's test count.
 
 - RED was observed first on the clean `622dfcf` baseline: `connect_session`
   still imported removed `encode_inner`/`decode_inner` helpers, and the new
@@ -108,7 +152,7 @@ relay, and UI gates remain deferred by scope.
   test-harness process after verification. No installed app, browser,
   provider, profile, UI, live service, or production persistence was used.
 
-## Batch2-A page-sizing verification
+## Historical Batch2-A page-sizing verification
 
 - Canonical command: `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91b-pages-final'; cargo test --lib 'domain::snapshot::tests' -- --nocapture`.
 - Exact result: 8 passed, 0 failed, 0 ignored, 0 measured, and 1,191 filtered.
