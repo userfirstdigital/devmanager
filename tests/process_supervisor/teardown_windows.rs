@@ -16,7 +16,7 @@ use devmanager::process::teardown::{
     AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
     TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionKey,
     TeardownCompletionStore, TeardownCoordinator, TeardownDeadline, TeardownEffects,
-    TeardownReport, TeardownScope, TeardownTicket, WaitResult, WaitStage,
+    TeardownReleaseAuthority, TeardownReport, TeardownScope, TeardownTicket, WaitResult, WaitStage,
 };
 
 fn resource_id() -> ResourceId {
@@ -177,6 +177,7 @@ impl TeardownCompletionStore for WindowsStore {
 struct WindowsEffects {
     registry: Arc<Mutex<ProcessRegistry<RegistryJob>>>,
     shared_job: SharedJob,
+    release_authority: Arc<Mutex<Option<TeardownReleaseAuthority>>>,
 }
 
 impl TeardownEffects for WindowsEffects {
@@ -259,6 +260,7 @@ impl TeardownEffects for WindowsEffects {
         ticket: &'a TeardownTicket,
     ) -> BoxFuture<'a, StageResult> {
         let registry = Arc::clone(&self.registry);
+        let release_authority = Arc::clone(&self.release_authority);
         let fence = ticket.fence().clone();
         Box::pin(async move {
             let mut registry = registry.lock().expect("Windows registry");
@@ -270,11 +272,11 @@ impl TeardownEffects for WindowsEffects {
                     };
                 }
             };
-            match registry.settle_active_process_zero_exact(proof) {
-                Ok(true) => StageResult::Completed,
-                Ok(false) => StageResult::Failed {
-                    detail: "authoritative Windows Job query still has members".to_string(),
-                },
+            match registry.mint_teardown_release_authority_exact(ticket, proof) {
+                Ok(authority) => {
+                    *release_authority.lock().expect("Windows release authority") = Some(authority);
+                    StageResult::Completed
+                }
                 Err(error) => StageResult::Failed {
                     detail: error.to_string(),
                 },
@@ -307,12 +309,22 @@ impl TeardownEffects for WindowsEffects {
     ) -> BoxFuture<'a, StageResult> {
         let registry = Arc::clone(&self.registry);
         let shared_job = Arc::clone(&self.shared_job);
-        let fence = ticket.fence().clone();
+        let release_authority = Arc::clone(&self.release_authority);
+        let ticket = ticket.clone();
         Box::pin(async move {
+            let authority = release_authority
+                .lock()
+                .expect("Windows release authority")
+                .take()
+                .ok_or_else(|| "Windows teardown release authority was not settled".to_string());
+            let authority = match authority {
+                Ok(authority) => authority,
+                Err(detail) => return StageResult::Failed { detail },
+            };
             let result = registry
                 .lock()
                 .expect("Windows registry")
-                .release_stopped_exact(&fence);
+                .release_stopped_with_authority(&ticket, authority);
             match result {
                 Ok(UnregisterOutcome::Removed(_)) => {
                     *shared_job.lock().expect("Windows Job lock") = None;
@@ -365,6 +377,7 @@ fn windows_managed_job_teardown_reaches_receiver_zero_before_registry_release() 
     let effects = WindowsEffects {
         registry: Arc::clone(&registry),
         shared_job: Arc::clone(&shared_job),
+        release_authority: Arc::new(Mutex::new(None)),
     };
     let coordinator = TeardownCoordinator::with_configuration(
         Arc::new(admission),

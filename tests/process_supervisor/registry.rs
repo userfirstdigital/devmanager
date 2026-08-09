@@ -153,10 +153,7 @@ fn empty_membership_requires_receiver_completion_proof() {
         registry.active_process_zero_proof_exact(&fence),
         Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
     ));
-    assert!(matches!(
-        registry.release_stopped_exact(&fence),
-        Err(ProcessRegistryError::InvalidLifecycleState { .. })
-    ));
+    assert!(registry.release_stopped_exact(&fence).is_err());
 }
 
 #[test]
@@ -195,10 +192,7 @@ fn externally_constructed_zero_cannot_authorize_stop_or_release() {
         registry.active_process_zero_proof_exact(&fence),
         Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
     ));
-    assert!(matches!(
-        registry.release_stopped_exact(&fence),
-        Err(ProcessRegistryError::InvalidLifecycleState { .. })
-    ));
+    assert!(registry.release_stopped_exact(&fence).is_err());
 }
 
 #[test]

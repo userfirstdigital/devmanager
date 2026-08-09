@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use devmanager::domain::id::{ResourceId, TaskId};
+use devmanager::domain::id::{OperationId, ResourceId, TaskId};
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
@@ -12,6 +12,7 @@ use devmanager::process::registry::{
     ManagedProcessFence, ManagedProcessState, OwnershipFault, ProcessClassification,
     ProcessDisplayLabel, ProcessRegistry, RegisteredProcess, UnregisterOutcome,
 };
+use devmanager::process::teardown::{TeardownScope, TeardownTicket};
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     [
@@ -896,8 +897,27 @@ fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
         ManagedProcessState::Stopped
     );
 
+    assert!(
+        registry.release_stopped_exact(&fence).is_err(),
+        "a pending completion proof must not release before dedicated settlement"
+    );
+
+    let ticket = TeardownTicket::new(
+        OperationId::from_bytes(fixed_uuid_v7(12)).expect("operation id"),
+        TeardownScope::Host,
+        1,
+        fence.clone(),
+    )
+    .expect("host teardown ticket");
+    let proof = registry
+        .active_process_zero_proof_exact(&fence)
+        .expect("receiver-owned zero proof");
+    let authority = registry
+        .mint_teardown_release_authority_exact(&ticket, proof)
+        .expect("authoritative empty membership settlement");
+
     let removed = registry
-        .release_stopped_exact(&fence)
+        .release_stopped_with_authority(&ticket, authority)
         .expect("release completed Job");
     assert!(matches!(&removed, UnregisterOutcome::Removed(_)));
     drop(removed);

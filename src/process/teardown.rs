@@ -61,6 +61,35 @@ pub struct TeardownTicket {
     fence: ManagedProcessFence,
 }
 
+/// Opaque authority for the final release of one exact teardown operation.
+///
+/// This value is minted only by the authoritative process registry after the
+/// receiver-owned zero proof and an empty membership query have both matched
+/// the exact ticket. It intentionally carries the teardown action epoch here,
+/// at settlement time, rather than in the long-lived Job completion stream.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TeardownReleaseAuthority {
+    action_epoch: u64,
+    fence: ManagedProcessFence,
+    nonce: u64,
+}
+
+impl TeardownReleaseAuthority {
+    pub(crate) fn from_registry(ticket: &TeardownTicket, nonce: u64) -> Self {
+        Self {
+            action_epoch: ticket.action_epoch(),
+            fence: ticket.fence().clone(),
+            nonce,
+        }
+    }
+
+    pub(crate) fn matches(&self, ticket: &TeardownTicket, nonce: u64) -> bool {
+        self.action_epoch == ticket.action_epoch()
+            && self.fence == *ticket.fence()
+            && self.nonce == nonce
+    }
+}
+
 impl TeardownTicket {
     pub fn new(
         operation_id: OperationId,
@@ -337,6 +366,7 @@ pub trait TeardownEffects: Send + Sync + 'static {
 }
 
 const MAX_EVIDENCE_TEXT_BYTES: usize = 256;
+const MAX_SANITIZE_INPUT_BYTES: usize = 4096;
 const MAX_RESIDUE_STAGES: usize = 32;
 const UNAVAILABLE_JOB_IDENTITY: &str = "<unavailable: managed Job identity>";
 const UNAVAILABLE_ROOT_EXECUTABLE: &str = "<unavailable: root executable>";
@@ -344,7 +374,12 @@ const UNAVAILABLE_ROOT_COMMAND: &str = "<unavailable: root command>";
 const UNAVAILABLE_LIFECYCLE_EVENT: &str = "<unavailable: lifecycle event>";
 
 fn sanitize_text(value: &str) -> String {
-    let normalized: String = value
+    let mut input_end = value.len().min(MAX_SANITIZE_INPUT_BYTES);
+    while input_end > 0 && !value.is_char_boundary(input_end) {
+        input_end -= 1;
+    }
+    let bounded = &value[..input_end];
+    let normalized: String = bounded
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -377,6 +412,41 @@ fn sanitize_text(value: &str) -> String {
                 index += 1;
             }
             continue;
+        }
+
+        if let Some((key, value)) = part.split_once(':') {
+            if is_sensitive_key(key) {
+                let separator = if key
+                    .trim_start_matches('-')
+                    .eq_ignore_ascii_case("authorization")
+                {
+                    ": "
+                } else {
+                    ":"
+                };
+                redacted.push(format!("{key}{separator}<redacted>"));
+                index += 1;
+                if key
+                    .trim_start_matches('-')
+                    .eq_ignore_ascii_case("authorization")
+                    && value.eq_ignore_ascii_case("bearer")
+                    && index < parts.len()
+                {
+                    index += 1;
+                } else if key
+                    .trim_start_matches('-')
+                    .eq_ignore_ascii_case("authorization")
+                    && value.is_empty()
+                    && index < parts.len()
+                    && parts[index].eq_ignore_ascii_case("bearer")
+                {
+                    index += 1;
+                    if index < parts.len() {
+                        index += 1;
+                    }
+                }
+                continue;
+            }
         }
 
         let key = part.trim_start_matches('-');
@@ -419,7 +489,14 @@ fn is_sensitive_key(key: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "token" | "password" | "passwd" | "secret" | "api_key" | "apikey" | "authorization"
+        "token"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "api_key"
+            | "api-key"
+            | "apikey"
+            | "authorization"
     ) || lower.ends_with("_token")
         || lower.ends_with("_password")
         || lower.ends_with("_secret")
@@ -866,13 +943,16 @@ impl Drop for TeardownExecutor {
         for work in queued {
             cancel_queued_cleanup(work);
         }
+        // A user-supplied effect or completion store can contain code that
+        // cannot be cancelled safely. Dropping the executor must therefore
+        // close admission and release queued work without joining worker
+        // threads indefinitely. Workers retain their bounded shared state and
+        // finish independently when their current operation returns.
         let mut workers = self
             .workers
             .lock()
             .expect("teardown worker handles mutex poisoned");
-        for worker in workers.drain(..) {
-            worker.join().expect("bounded teardown worker panicked");
-        }
+        workers.clear();
     }
 }
 
@@ -1388,16 +1468,31 @@ async fn persist_completion(
     report: &TeardownReport,
     budget: Duration,
 ) -> Result<(), String> {
-    let future =
-        std::panic::catch_unwind(AssertUnwindSafe(|| completion_store.persist(key, report)))
+    let store = Arc::clone(completion_store);
+    let key = key.clone();
+    let report = report.clone();
+    let runtime = tokio::runtime::Handle::current();
+    // The trait method itself is user-supplied synchronous code. Invoke and
+    // drive it on a blocking worker so a call that never returns is included
+    // in the caller's budget. Once detached on timeout it is intentionally not
+    // joined: Rust cannot safely kill arbitrary user code. The store seam is
+    // therefore fail-closed and must not own caller-critical resources.
+    let task = tokio::task::spawn_blocking(move || {
+        let future = std::panic::catch_unwind(AssertUnwindSafe(|| store.persist(&key, &report)))
             .map_err(|payload| {
                 format!("completion persistence panicked: {}", panic_detail(payload))
             })?;
-    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(payload)) => Err(format!(
-            "completion persistence panicked: {}",
-            panic_detail(payload)
+        runtime
+            .block_on(AssertUnwindSafe(future).catch_unwind())
+            .map_err(|payload| {
+                format!("completion persistence panicked: {}", panic_detail(payload))
+            })
+    });
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(detail))) => Err(detail),
+        Ok(Err(join_error)) => Err(format!(
+            "completion persistence worker failed: {join_error}"
         )),
         Err(_) => Err(format!(
             "completion persistence timed out after {:?}",
@@ -1909,4 +2004,25 @@ fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
         return sanitize_text(message);
     }
     "unknown panic payload".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_text, MAX_EVIDENCE_TEXT_BYTES};
+
+    #[test]
+    fn sanitize_text_bounds_input_and_redacts_adversarial_secret_forms() {
+        let secret = "multi-megabyte-secret-sentinel";
+        let input = format!(
+            "--api-key={secret} Authorization:Bearer {secret} token={secret} password {secret} secret:{secret} {}",
+            "x".repeat(8 * 1024 * 1024)
+        );
+        let sanitized = sanitize_text(&input);
+
+        assert!(sanitized.len() <= MAX_EVIDENCE_TEXT_BYTES);
+        assert!(!sanitized.contains(secret));
+        assert!(sanitized.contains("--api-key=<redacted>"));
+        assert!(sanitized.contains("Authorization: <redacted>"));
+        assert!(sanitized.contains("token=<redacted>"));
+    }
 }

@@ -7,6 +7,7 @@ use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
 use crate::kernel::{RuntimeRegistry, RuntimeRegistryError};
 use crate::process::identity::{ManagedProcessIdentity, ProcessOwner};
+use crate::process::teardown::{TeardownReleaseAuthority, TeardownTicket};
 
 pub const MAX_PROCESS_DISPLAY_LABEL_BYTES: usize = 256;
 
@@ -227,6 +228,7 @@ pub struct RegisteredProcess<J> {
     pending_zero_prior_state: Option<ManagedProcessState>,
     pending_zero_proof: Option<ActiveProcessZeroProof>,
     authoritative_zero_settled: bool,
+    settled_zero_nonce: Option<u64>,
     next_zero_proof_nonce: u64,
 }
 
@@ -251,6 +253,7 @@ impl<J> RegisteredProcess<J> {
             pending_zero_prior_state: None,
             pending_zero_proof: None,
             authoritative_zero_settled: false,
+            settled_zero_nonce: None,
             next_zero_proof_nonce: 1,
         }
     }
@@ -391,6 +394,12 @@ pub enum ProcessRegistryError {
     ActiveProcessZeroUnproved {
         resource_id: ResourceId,
     },
+    ReleaseAuthorityRequired {
+        resource_id: ResourceId,
+    },
+    TeardownReleaseAuthorityMismatch {
+        resource_id: ResourceId,
+    },
     InvalidLifecycleState {
         resource_id: ResourceId,
         operation: ProcessLifecycleOperation,
@@ -449,6 +458,14 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "resource {resource_id} has no matching ACTIVE_PROCESS_ZERO completion proof"
             ),
+            Self::ReleaseAuthorityRequired { resource_id } => write!(
+                f,
+                "resource {resource_id} requires an opaque teardown release authority"
+            ),
+            Self::TeardownReleaseAuthorityMismatch { resource_id } => write!(
+                f,
+                "resource {resource_id} received a stale or mismatched teardown release authority"
+            ),
             Self::InvalidLifecycleState {
                 resource_id,
                 operation,
@@ -480,6 +497,8 @@ impl std::error::Error for ProcessRegistryError {
             | Self::CompletionNotificationsFailed { .. }
             | Self::IdentityMismatch { .. }
             | Self::ActiveProcessZeroUnproved { .. }
+            | Self::ReleaseAuthorityRequired { .. }
+            | Self::TeardownReleaseAuthorityMismatch { .. }
             | Self::InvalidLifecycleState { .. }
             | Self::StaleLifecycleFence { .. } => None,
         }
@@ -609,19 +628,51 @@ impl<J> ProcessRegistry<J> {
         fence: &ManagedProcessFence,
     ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
         if let Some(current) = self.current.get(&fence.resource.resource_id) {
-            if ManagedProcessFence::from_process(current) == *fence
-                && !current.authoritative_zero_settled
-                && current.pending_zero_proof.is_none()
-            {
-                return Err(ProcessRegistryError::InvalidLifecycleState {
+            if ManagedProcessFence::from_process(current) == *fence {
+                return Err(ProcessRegistryError::ReleaseAuthorityRequired {
                     resource_id: fence.resource.resource_id,
-                    operation: ProcessLifecycleOperation::ReleaseStopped,
-                    state: current.state,
                 });
             }
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id: fence.resource.resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        Err(ProcessRegistryError::StaleLifecycleFence {
+            resource_id: fence.resource.resource_id,
+            operation: ProcessLifecycleOperation::ReleaseStopped,
+        })
+    }
+
+    /// Releases one stopped process only with the registry-minted authority
+    /// bound to the exact teardown ticket, epoch, fence, and zero receipt.
+    pub fn release_stopped_with_authority(
+        &mut self,
+        ticket: &TeardownTicket,
+        authority: TeardownReleaseAuthority,
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
+        let resource_id = ticket.resource_id();
+        let Some(current) = self.current.get(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        let current_fence = ManagedProcessFence::from_process(current);
+        if current_fence != *ticket.fence() {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        let Some(nonce) = current.settled_zero_nonce else {
+            return Err(ProcessRegistryError::ReleaseAuthorityRequired { resource_id });
+        };
+        if !current.authoritative_zero_settled || !authority.matches(ticket, nonce) {
+            return Err(ProcessRegistryError::TeardownReleaseAuthorityMismatch { resource_id });
         }
         self.take_exact_in_state(
-            fence,
+            ticket.fence(),
             ManagedProcessState::Stopped,
             ProcessLifecycleOperation::ReleaseStopped,
         )
@@ -854,6 +905,7 @@ impl<J: JobMembership> ProcessRegistry<J> {
         if !active_process_ids.is_empty() {
             current.pending_zero_proof = None;
             current.authoritative_zero_settled = false;
+            current.settled_zero_nonce = None;
             current.state = current
                 .pending_zero_prior_state
                 .take()
@@ -867,7 +919,34 @@ impl<J: JobMembership> ProcessRegistry<J> {
         current.unknown_member_pids.clear();
         current.state = ManagedProcessState::Stopped;
         current.authoritative_zero_settled = true;
+        current.settled_zero_nonce = Some(proof.nonce);
         Ok(true)
+    }
+
+    /// Performs the final receiver-proof plus authoritative empty-membership
+    /// settlement while binding the result to the exact teardown action epoch.
+    /// The returned authority is the only input accepted by final release.
+    pub fn mint_teardown_release_authority_exact(
+        &mut self,
+        ticket: &TeardownTicket,
+        proof: ActiveProcessZeroProof,
+    ) -> Result<TeardownReleaseAuthority, ProcessRegistryError> {
+        if proof.fence() != ticket.fence() {
+            return Err(ProcessRegistryError::TeardownReleaseAuthorityMismatch {
+                resource_id: ticket.resource_id(),
+            });
+        }
+        if !self.settle_active_process_zero_exact(proof.clone())? {
+            return Err(ProcessRegistryError::InvalidLifecycleState {
+                resource_id: ticket.resource_id(),
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+                state: self
+                    .current(ticket.resource_id())
+                    .map(|current| current.state)
+                    .unwrap_or(ManagedProcessState::Leaked),
+            });
+        }
+        Ok(TeardownReleaseAuthority::from_registry(ticket, proof.nonce))
     }
 
     /// Applies a public-trait observation for diagnostics only. It validates
@@ -914,6 +993,7 @@ impl<J: JobMembership> ProcessRegistry<J> {
                         current.pending_zero_prior_state = Some(current.state);
                     }
                     current.authoritative_zero_settled = false;
+                    current.settled_zero_nonce = None;
                     let fence = ManagedProcessFence::from_process(current);
                     let nonce = current.next_zero_proof_nonce;
                     current.next_zero_proof_nonce =

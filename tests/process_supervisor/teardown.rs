@@ -1843,10 +1843,7 @@ fn teardown_registry_requires_exact_fence_and_authoritative_zero_before_release(
         registry.active_process_zero_proof_exact(&fence),
         Err(devmanager::process::registry::ProcessRegistryError::ActiveProcessZeroUnproved { .. })
     ));
-    assert!(matches!(
-        registry.release_stopped_exact(&fence),
-        Err(devmanager::process::registry::ProcessRegistryError::InvalidLifecycleState { .. })
-    ));
+    assert!(registry.release_stopped_exact(&fence).is_err());
 }
 
 #[cfg(windows)]
