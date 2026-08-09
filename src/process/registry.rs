@@ -163,6 +163,34 @@ impl JobCompletionMessage {
     }
 }
 
+/// A registry-issued receipt for one exact ACTIVE_PROCESS_ZERO completion.
+///
+/// The fence and nonce are private so teardown adapters cannot invent a zero
+/// observation. The registry keeps the matching receipt pending until an
+/// authoritative membership query consumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveProcessZeroProof {
+    fence: ManagedProcessFence,
+    nonce: u64,
+}
+
+impl ActiveProcessZeroProof {
+    fn from_completion(fence: ManagedProcessFence, nonce: u64) -> Self {
+        Self { fence, nonce }
+    }
+
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+
+    /// Explicit seam for pure coordinator tests. Production adapters must
+    /// obtain proofs from `ProcessRegistry::active_process_zero_proof_exact`.
+    #[doc(hidden)]
+    pub fn for_test(fence: ManagedProcessFence) -> Self {
+        Self { fence, nonce: 0 }
+    }
+}
+
 #[derive(Debug)]
 pub struct RegisteredProcess<J> {
     fence: ResourceFence,
@@ -175,6 +203,8 @@ pub struct RegisteredProcess<J> {
     unknown_member_pids: Vec<u32>,
     last_limit: Option<(u32, Option<u32>)>,
     pending_zero_prior_state: Option<ManagedProcessState>,
+    pending_zero_proof: Option<ActiveProcessZeroProof>,
+    next_zero_proof_nonce: u64,
 }
 
 impl<J> RegisteredProcess<J> {
@@ -196,6 +226,8 @@ impl<J> RegisteredProcess<J> {
             unknown_member_pids: Vec::new(),
             last_limit: None,
             pending_zero_prior_state: None,
+            pending_zero_proof: None,
+            next_zero_proof_nonce: 1,
         }
     }
 
@@ -327,6 +359,9 @@ pub enum ProcessRegistryError {
         resource_id: ResourceId,
         detail: String,
     },
+    ActiveProcessZeroUnproved {
+        resource_id: ResourceId,
+    },
     InvalidLifecycleState {
         resource_id: ResourceId,
         operation: ProcessLifecycleOperation,
@@ -373,6 +408,10 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "could not start resource {resource_id}'s Job notifications: {detail}"
             ),
+            Self::ActiveProcessZeroUnproved { resource_id } => write!(
+                f,
+                "resource {resource_id} has no matching ACTIVE_PROCESS_ZERO completion proof"
+            ),
             Self::InvalidLifecycleState {
                 resource_id,
                 operation,
@@ -402,6 +441,7 @@ impl std::error::Error for ProcessRegistryError {
             | Self::NotJobMember { .. }
             | Self::MembershipQueryFailed { .. }
             | Self::CompletionNotificationsFailed { .. }
+            | Self::ActiveProcessZeroUnproved { .. }
             | Self::InvalidLifecycleState { .. }
             | Self::StaleLifecycleFence { .. } => None,
         }
@@ -673,18 +713,18 @@ impl<J: JobMembership> ProcessRegistry<J> {
         count
     }
 
-    /// Settle a previously observed ACTIVE_PROCESS_ZERO only after rechecking
-    /// the exact fence and querying the Job for authoritative empty membership.
+    /// Returns the pending receipt for a previously observed exact
+    /// ACTIVE_PROCESS_ZERO completion.
     ///
-    /// Ok(false) means the completion was not enough because the Job still has
-    /// members. The caller must keep the Job/completion handles alive and must
-    /// not call release_stopped_exact in that case.
-    pub fn settle_active_process_zero_exact(
-        &mut self,
+    /// The receipt is retained by the registry until
+    /// `settle_active_process_zero_exact` consumes it, so an adapter can carry
+    /// it across its wait boundary without turning a caller boolean into proof.
+    pub fn active_process_zero_proof_exact(
+        &self,
         fence: &ManagedProcessFence,
-    ) -> Result<bool, ProcessRegistryError> {
+    ) -> Result<ActiveProcessZeroProof, ProcessRegistryError> {
         let resource_id = fence.resource.resource_id;
-        let Some(current) = self.current.get_mut(&resource_id) else {
+        let Some(current) = self.current.get(&resource_id) else {
             return Err(ProcessRegistryError::StaleLifecycleFence {
                 resource_id,
                 operation: ProcessLifecycleOperation::ReleaseStopped,
@@ -696,6 +736,39 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 operation: ProcessLifecycleOperation::ReleaseStopped,
             });
         }
+        current
+            .pending_zero_proof
+            .clone()
+            .ok_or(ProcessRegistryError::ActiveProcessZeroUnproved { resource_id })
+    }
+
+    /// Settle a registry-issued ACTIVE_PROCESS_ZERO receipt only after
+    /// rechecking the exact fence and querying the Job for authoritative empty
+    /// membership.
+    ///
+    /// Ok(false) means the completion was not enough because the Job still has
+    /// members. The caller must keep the Job/completion handles alive and must
+    /// not call release_stopped_exact in that case.
+    pub fn settle_active_process_zero_exact(
+        &mut self,
+        proof: ActiveProcessZeroProof,
+    ) -> Result<bool, ProcessRegistryError> {
+        let resource_id = proof.fence.resource.resource_id;
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        if ManagedProcessFence::from_process(current) != proof.fence {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        if current.pending_zero_proof.as_ref() != Some(&proof) {
+            return Err(ProcessRegistryError::ActiveProcessZeroUnproved { resource_id });
+        }
 
         let mut active_process_ids = current.job.active_process_ids().map_err(|detail| {
             ProcessRegistryError::MembershipQueryFailed {
@@ -706,9 +779,15 @@ impl<J: JobMembership> ProcessRegistry<J> {
         active_process_ids.sort_unstable();
         active_process_ids.dedup();
         if !active_process_ids.is_empty() {
+            current.pending_zero_proof = None;
+            current.state = current
+                .pending_zero_prior_state
+                .take()
+                .unwrap_or(ManagedProcessState::Leaked);
             return Ok(false);
         }
 
+        current.pending_zero_proof = None;
         current.pending_zero_prior_state = None;
         current.known_members.clear();
         current.unknown_member_pids.clear();
@@ -742,6 +821,12 @@ impl<J: JobMembership> ProcessRegistry<J> {
             }
             JobCompletionEvent::ActiveProcessZero => {
                 if current.state != ManagedProcessState::Stopped {
+                    let fence = ManagedProcessFence::from_process(current);
+                    let nonce = current.next_zero_proof_nonce;
+                    current.next_zero_proof_nonce =
+                        current.next_zero_proof_nonce.wrapping_add(1).max(1);
+                    current.pending_zero_proof =
+                        Some(ActiveProcessZeroProof::from_completion(fence, nonce));
                     match current.job.active_process_ids() {
                         Ok(process_ids) if process_ids.is_empty() => {
                             current.pending_zero_prior_state = None;
@@ -750,6 +835,7 @@ impl<J: JobMembership> ProcessRegistry<J> {
                             current.state = ManagedProcessState::Stopped;
                         }
                         Ok(_) => {
+                            current.pending_zero_proof = None;
                             if let Some(prior_state) = current.pending_zero_prior_state.take() {
                                 current.state = prior_state;
                             }
@@ -793,14 +879,19 @@ impl<J: JobMembership> ProcessRegistry<J> {
         })?;
         active_pids.sort_unstable();
         active_pids.dedup();
-        if let Some(prior_state) = current.pending_zero_prior_state.take() {
+        if current.pending_zero_proof.is_some() {
             if active_pids.is_empty() {
+                current.pending_zero_prior_state = None;
                 current.known_members.clear();
                 current.unknown_member_pids.clear();
                 current.state = ManagedProcessState::Stopped;
                 return Ok(());
             }
-            current.state = prior_state;
+            current.pending_zero_proof = None;
+            current.state = current
+                .pending_zero_prior_state
+                .take()
+                .unwrap_or(ManagedProcessState::Leaked);
         }
         if !active_pids.is_empty() && current.state == ManagedProcessState::Starting {
             current.state = ManagedProcessState::Running;

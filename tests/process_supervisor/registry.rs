@@ -8,9 +8,9 @@ use devmanager::domain::operation::ResourceFence;
 use devmanager::kernel::RuntimeRegistryError;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
-    JobMembership, OwnershipFault, ProcessClassification, ProcessDisplayLabel,
-    ProcessDisplayLabelError, ProcessRegistry, ProcessRegistryError, RegisteredProcess,
-    UnregisterOutcome, MAX_PROCESS_DISPLAY_LABEL_BYTES,
+    JobCompletionEvent, JobCompletionMessage, JobMembership, ManagedProcessState, OwnershipFault,
+    ProcessClassification, ProcessDisplayLabel, ProcessDisplayLabelError, ProcessRegistry,
+    ProcessRegistryError, RegisteredProcess, UnregisterOutcome, MAX_PROCESS_DISPLAY_LABEL_BYTES,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -83,6 +83,55 @@ impl Drop for DropSpy {
     fn drop(&mut self) {
         self.dropped.lock().expect("drop ledger").push(self.id);
     }
+}
+
+#[test]
+fn empty_membership_requires_matching_completion_proof() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let membership = Arc::new(Mutex::new(Ok(vec![1_717])));
+    let executable = current_executable();
+    let job = DropSpy::with_membership(1, &dropped, Arc::clone(&membership));
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource_id(16),
+            1,
+            ProcessOwner::Task(TaskId::new()),
+            identity(1_717, 17_000, &executable),
+            job,
+        ))
+        .expect("registration");
+
+    *membership.lock().expect("membership state") = Ok(Vec::new());
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert_eq!(
+        registry
+            .current(resource_id(16))
+            .expect("current process")
+            .state(),
+        ManagedProcessState::Starting
+    );
+
+    assert!(registry.apply_job_completion(JobCompletionMessage::new(
+        fence.clone(),
+        JobCompletionEvent::ActiveProcessZero,
+    )));
+    let proof = registry
+        .active_process_zero_proof_exact(&fence)
+        .expect("completion adapter proof");
+    assert!(registry
+        .settle_active_process_zero_exact(proof)
+        .expect("authoritative empty membership"));
+    assert_eq!(
+        registry
+            .current(resource_id(16))
+            .expect("stopped process")
+            .state(),
+        ManagedProcessState::Stopped
+    );
 }
 
 fn registration(

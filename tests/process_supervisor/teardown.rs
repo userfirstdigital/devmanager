@@ -10,13 +10,15 @@ use devmanager::domain::id::{OperationId, ResourceId, TaskId};
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
-    JobMembership, ManagedProcessFence, ManagedProcessState, ProcessDisplayLabel, ProcessRegistry,
+    ActiveProcessZeroProof, JobCompletionEvent, JobCompletionMessage, JobMembership,
+    ManagedProcessFence, ManagedProcessState, ProcessDisplayLabel, ProcessRegistry,
     RegisteredProcess,
 };
 use devmanager::process::teardown::{
     AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
-    TeardownAdmissionError, TeardownClock, TeardownCoordinator, TeardownDeadline, TeardownEffects,
-    TeardownOutcome, TeardownScope, TeardownStage, TeardownTicket, WaitResult, WaitStage,
+    TeardownAdmissionError, TeardownClock, TeardownCompletionKey, TeardownCompletionStore,
+    TeardownCoordinator, TeardownDeadline, TeardownEffects, TeardownOutcome, TeardownReport,
+    TeardownScope, TeardownStage, TeardownTicket, WaitResult, WaitStage,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -64,6 +66,7 @@ fn ticket(
         identity(pid, creation_time_100ns),
     );
     TeardownTicket::new(operation_id(operation_tail), scope, action_epoch, fence)
+        .expect("ticket scope matches process owner")
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +192,35 @@ impl TeardownAdmission for FakeAdmission {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct FakeCompletionStore {
+    reports: Arc<Mutex<Vec<(TeardownCompletionKey, TeardownReport)>>>,
+}
+
+impl TeardownCompletionStore for FakeCompletionStore {
+    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String> {
+        Ok(self
+            .reports
+            .lock()
+            .expect("completion reports")
+            .iter()
+            .find(|(stored_key, _)| stored_key == key)
+            .map(|(_, report)| report.clone()))
+    }
+
+    fn persist(&self, key: &TeardownCompletionKey, report: &TeardownReport) -> Result<(), String> {
+        let mut reports = self.reports.lock().expect("completion reports");
+        if let Some((_, stored_report)) =
+            reports.iter_mut().find(|(stored_key, _)| stored_key == key)
+        {
+            *stored_report = report.clone();
+        } else {
+            reports.push((key.clone(), report.clone()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FakeClock {
     next: Arc<AtomicUsize>,
@@ -228,11 +260,7 @@ impl TeardownClock for FakeClock {
 #[derive(Debug, Clone)]
 enum WaitPlan {
     TimedOut,
-    Zero {
-        fence: ManagedProcessFence,
-        active_process_zero: bool,
-        active_process_ids: Vec<u32>,
-    },
+    Zero { proof: ActiveProcessZeroProof },
 }
 
 #[derive(Debug, Clone)]
@@ -241,19 +269,25 @@ struct BranchScript {
     interrupt: WaitPlan,
     termination: WaitPlan,
     residue: Option<ResidueEvidence>,
+    detach_after_zero: StageResult,
+    reconcile_ports: StageResult,
+    persist_settlement: StageResult,
+    release_stopped_exact: StageResult,
 }
 
 impl BranchScript {
     fn cooperative_zero(ticket: &TeardownTicket) -> Self {
         Self {
             cooperative: WaitPlan::Zero {
-                fence: ticket.fence().clone(),
-                active_process_zero: true,
-                active_process_ids: Vec::new(),
+                proof: ActiveProcessZeroProof::for_test(ticket.fence().clone()),
             },
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::TimedOut,
             residue: None,
+            detach_after_zero: StageResult::Completed,
+            reconcile_ports: StageResult::Completed,
+            persist_settlement: StageResult::Completed,
+            release_stopped_exact: StageResult::Completed,
         }
     }
 
@@ -262,11 +296,13 @@ impl BranchScript {
             cooperative: WaitPlan::TimedOut,
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::Zero {
-                fence: ticket.fence().clone(),
-                active_process_zero: true,
-                active_process_ids: Vec::new(),
+                proof: ActiveProcessZeroProof::for_test(ticket.fence().clone()),
             },
             residue: None,
+            detach_after_zero: StageResult::Completed,
+            reconcile_ports: StageResult::Completed,
+            persist_settlement: StageResult::Completed,
+            release_stopped_exact: StageResult::Completed,
         }
     }
 
@@ -284,6 +320,10 @@ impl BranchScript {
                 "ACTIVE_PROCESS_ZERO\nnot-authoritative",
                 vec![TeardownStage::Drain, TeardownStage::TerminateTree],
             )),
+            detach_after_zero: StageResult::Completed,
+            reconcile_ports: StageResult::Completed,
+            persist_settlement: StageResult::Completed,
+            release_stopped_exact: StageResult::Completed,
         }
     }
 }
@@ -303,6 +343,8 @@ struct FakeEffects {
     state: Arc<Mutex<FakeEffectsState>>,
 }
 
+// This fake intentionally covers only the pure core seam. The production
+// TerminalService/host adapter remains the Task 3.4 integration boundary.
 impl FakeEffects {
     fn install(&self, ticket: &TeardownTicket, script: BranchScript) {
         self.state
@@ -432,16 +474,54 @@ impl TeardownEffects for FakeEffects {
             };
             match plan {
                 WaitPlan::TimedOut => WaitResult::TimedOut,
-                WaitPlan::Zero {
-                    fence,
-                    active_process_zero,
-                    active_process_ids,
-                } => WaitResult::Zero {
-                    fence,
-                    active_process_zero,
-                    active_process_ids,
-                },
+                WaitPlan::Zero { proof } => WaitResult::Zero { proof },
             }
+        })
+    }
+
+    fn settle_active_process_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        proof: ActiveProcessZeroProof,
+    ) -> BoxFuture<'a, StageResult> {
+        let effects = self.clone();
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            effects.record(&ticket, "settle_active_process_zero");
+            if proof.fence() == ticket.fence() {
+                StageResult::Completed
+            } else {
+                StageResult::Failed {
+                    detail: "registry zero proof fence mismatch".to_string(),
+                }
+            }
+        })
+    }
+
+    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let effects = self.clone();
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            effects.record(&ticket, "detach_after_zero");
+            effects.script(ticket.resource_id()).detach_after_zero
+        })
+    }
+
+    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let effects = self.clone();
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            effects.record(&ticket, "reconcile_ports");
+            effects.script(ticket.resource_id()).reconcile_ports
+        })
+    }
+
+    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let effects = self.clone();
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            effects.record(&ticket, "persist_settlement");
+            effects.script(ticket.resource_id()).persist_settlement
         })
     }
 
@@ -459,9 +539,10 @@ impl TeardownEffects for FakeEffects {
         let ticket = ticket.clone();
         Box::pin(async move {
             effects.record(&ticket, "release_stopped_exact");
+            let result = effects.script(ticket.resource_id()).release_stopped_exact;
             let mut state = effects.state.lock().expect("effects state");
             *state.release_count.entry(ticket.resource_id()).or_default() += 1;
-            StageResult::Completed
+            result
         })
     }
 }
@@ -482,13 +563,13 @@ fn coordinator_with_limit(
     admission: &FakeAdmission,
     effects: &FakeEffects,
     clock: &FakeClock,
-    max_concurrent_branches: usize,
+    configured_capacity: usize,
 ) -> TeardownCoordinator {
-    TeardownCoordinator::with_max_concurrency(
+    TeardownCoordinator::with_capacity(
         Arc::new(admission.clone()),
         Arc::new(effects.clone()),
         Arc::new(clock.clone()),
-        max_concurrent_branches,
+        configured_capacity,
     )
 }
 
@@ -533,15 +614,16 @@ fn teardown_cooperative_exit_requires_matching_zero() {
     admission.allow(&ticket);
     let effects = FakeEffects::default();
     let mut script = BranchScript::cooperative_zero(&ticket);
+    let mismatched_fence = ManagedProcessFence::new(
+        ticket.fence().resource(),
+        ticket.fence().owner(),
+        identity(ticket.fence().root().id().pid(), 99_999),
+    );
     script.cooperative = WaitPlan::Zero {
-        fence: ticket.fence().clone(),
-        active_process_zero: false,
-        active_process_ids: Vec::new(),
+        proof: ActiveProcessZeroProof::for_test(mismatched_fence),
     };
     script.termination = WaitPlan::Zero {
-        fence: ticket.fence().clone(),
-        active_process_zero: true,
-        active_process_ids: Vec::new(),
+        proof: ActiveProcessZeroProof::for_test(ticket.fence().clone()),
     };
     effects.install(&ticket, script);
     let clock = FakeClock::default();
@@ -616,10 +698,127 @@ fn teardown_escalation_order_is_fixed() {
             "wait:InterruptGrace",
             "terminate_tree",
             "wait:Termination",
+            "settle_active_process_zero",
+            "detach_after_zero",
+            "reconcile_ports",
+            "persist_settlement",
             "release_stopped_exact",
         ]
     );
     assert_eq!(clock.deadlines().len(), 3);
+}
+
+#[test]
+fn teardown_post_zero_failure_is_reported_with_residue_before_release() {
+    let ticket = ticket(17, 37, TeardownScope::Host, 20, 117, 1_017);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    let mut script = BranchScript::cooperative_zero(&ticket);
+    script.residue = Some(ResidueEvidence::new(
+        "post-zero-job",
+        117,
+        1_017,
+        "provider.exe",
+        "provider --cleanup",
+        "detach_after_zero failed",
+        vec![
+            TeardownStage::DetachAfterZero,
+            TeardownStage::ReleaseStoppedExact,
+        ],
+    ));
+    script.detach_after_zero = StageResult::Failed {
+        detail: "terminal detach unavailable".to_string(),
+    };
+    effects.install(&ticket, script);
+    let clock = FakeClock::default();
+    let coordinator = coordinator(&admission, &effects, &clock);
+
+    let report = runtime().block_on(
+        coordinator
+            .request(ticket.clone())
+            .expect("admission winner")
+            .wait(),
+    );
+
+    assert_eq!(report.outcome(), TeardownOutcome::CleanupFailed);
+    assert!(
+        report.residue().is_some(),
+        "post-zero failure retains residue"
+    );
+    let labels: Vec<String> = effects
+        .events()
+        .into_iter()
+        .map(|event| {
+            event
+                .split_once(':')
+                .expect("event separator")
+                .1
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "drain",
+            "cooperative_close",
+            "wait:CooperativeGrace",
+            "settle_active_process_zero",
+            "detach_after_zero",
+            "reconcile_ports",
+            "persist_settlement",
+            "release_stopped_exact",
+        ]
+    );
+    assert_eq!(effects.release_count(ticket.resource_id()), 1);
+}
+
+#[test]
+fn teardown_completed_cache_evicts_deterministically_without_rerunning_cleanup() {
+    let first = ticket(18, 38, TeardownScope::Host, 21, 118, 1_018);
+    let second = ticket(19, 39, TeardownScope::Host, 21, 119, 1_019);
+    let admission = FakeAdmission::default();
+    admission.allow(&first);
+    admission.allow(&second);
+    let effects = FakeEffects::default();
+    effects.install(&first, BranchScript::cooperative_zero(&first));
+    effects.install(&second, BranchScript::cooperative_zero(&second));
+    let clock = FakeClock::default();
+    let store = FakeCompletionStore::default();
+    let coordinator = TeardownCoordinator::with_configuration_and_completion_store(
+        Arc::new(admission),
+        Arc::new(effects.clone()),
+        Arc::new(clock),
+        2,
+        devmanager::process::teardown::TeardownBudgets::default(),
+        1,
+        Some(Arc::new(store)),
+    );
+
+    runtime().block_on(
+        coordinator
+            .request(first.clone())
+            .expect("first admission")
+            .wait(),
+    );
+    runtime().block_on(
+        coordinator
+            .request(second.clone())
+            .expect("second admission")
+            .wait(),
+    );
+    assert_eq!(coordinator.active_operation_count(), 0);
+    assert_eq!(coordinator.completed_operation_count(), 1);
+    assert_eq!(coordinator.configured_capacity(), 2);
+
+    let retry = runtime().block_on(
+        coordinator
+            .request(first.clone())
+            .expect("durable exact retry")
+            .wait(),
+    );
+    assert_eq!(retry.fence(), first.fence());
+    assert_eq!(effects.release_count(first.resource_id()), 1);
 }
 
 #[test]
@@ -647,6 +846,11 @@ fn teardown_termination_timeout_retains_handles_and_sanitizes_residue() {
     assert!(residue
         .attempted_stages()
         .contains(&TeardownStage::TerminateTree));
+    assert!(effects.events().iter().all(|event| {
+        !event.ends_with(":detach_after_zero")
+            && !event.ends_with(":reconcile_ports")
+            && !event.ends_with(":persist_settlement")
+    }));
 }
 
 #[test]
@@ -702,15 +906,19 @@ fn teardown_caller_cancellation_does_not_cancel_cleanup() {
 }
 
 #[test]
-fn teardown_duplicate_task_and_host_close_shares_owned_work() {
+fn teardown_host_shutdown_joins_task_close_by_exact_key() {
     let task_id = TaskId::new();
     let task_ticket = ticket(8, 20, TeardownScope::Task(task_id), 14, 108, 1_008);
-    let host_ticket = TeardownTicket::new(
+    let mismatched = TeardownTicket::new(
         operation_id(21),
         TeardownScope::Host,
         task_ticket.action_epoch(),
         task_ticket.fence().clone(),
     );
+    assert!(matches!(
+        mismatched,
+        Err(devmanager::process::teardown::TeardownTicketError::ScopeOwnerMismatch)
+    ));
     let admission = FakeAdmission::default();
     admission.allow(&task_ticket);
     let effects = FakeEffects::default();
@@ -721,7 +929,9 @@ fn teardown_duplicate_task_and_host_close_shares_owned_work() {
     let first = coordinator
         .request(task_ticket.clone())
         .expect("task close winner");
-    let second = coordinator.request(host_ticket).expect("host close waiter");
+    let second = coordinator
+        .join(task_ticket.action_epoch(), task_ticket.fence())
+        .expect("host close joins task-owned work");
     let (first_report, second_report) =
         runtime().block_on(async { tokio::join!(first.wait(), second.wait()) });
 
@@ -780,6 +990,34 @@ fn teardown_non_closing_scope_is_rejected() {
 }
 
 #[test]
+fn teardown_registry_empty_membership_without_zero_event_does_not_stop() {
+    let ticket = ticket(15, 36, TeardownScope::Task(TaskId::new()), 19, 115, 1_015);
+    let job = ExactJob::with_root(ticket.fence().root().id().pid());
+    let mut registry = ProcessRegistry::new();
+    let registered = RegisteredProcess::new(
+        ticket.fence().resource(),
+        ticket.fence().owner(),
+        ticket.fence().root().clone(),
+        ProcessDisplayLabel::new("missing zero event").expect("display label"),
+        job.clone(),
+    );
+    let fence = registry.register(registered).expect("register exact Job");
+
+    job.set_active_process_ids(Vec::new());
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(devmanager::process::registry::ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert_eq!(
+        registry
+            .current(ticket.resource_id())
+            .expect("current process")
+            .state(),
+        ManagedProcessState::Starting
+    );
+}
+
+#[test]
 fn teardown_registry_requires_exact_fence_and_authoritative_zero_before_release() {
     let ticket = ticket(14, 35, TeardownScope::Host, 18, 114, 1_014);
     let job = ExactJob::with_root(ticket.fence().root().id().pid());
@@ -800,9 +1038,10 @@ fn teardown_registry_requires_exact_fence_and_authoritative_zero_before_release(
         identity(fence.root().id().pid(), 99_999),
     );
     assert!(!registry.exact_fence_matches(&reused_pid));
-    assert!(!registry
-        .settle_active_process_zero_exact(&fence)
-        .expect("non-empty Job query"));
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(devmanager::process::registry::ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
     assert_eq!(
         registry
             .current(ticket.resource_id())
@@ -812,8 +1051,15 @@ fn teardown_registry_requires_exact_fence_and_authoritative_zero_before_release(
     );
 
     job.set_active_process_ids(Vec::new());
+    assert!(registry.apply_job_completion(JobCompletionMessage::new(
+        fence.clone(),
+        JobCompletionEvent::ActiveProcessZero,
+    )));
+    let proof = registry
+        .active_process_zero_proof_exact(&fence)
+        .expect("matching completion proof");
     assert!(registry
-        .settle_active_process_zero_exact(&fence)
+        .settle_active_process_zero_exact(proof)
         .expect("authoritative empty Job query"));
     assert_eq!(
         registry

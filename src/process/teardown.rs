@@ -5,6 +5,7 @@
 //! owns admission ordering, exact-fence validation, escalation, bounded
 //! concurrency, and waiter lifetime.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -15,9 +16,10 @@ use tokio::sync::{watch, Semaphore};
 
 use crate::domain::id::{OperationId, ResourceId, TaskId};
 use crate::process::identity::ProcessOwner;
-use crate::process::registry::ManagedProcessFence;
+use crate::process::registry::{ActiveProcessZeroProof, ManagedProcessFence};
 
-pub const DEFAULT_MAX_CONCURRENT_BRANCHES: usize = 4;
+pub const DEFAULT_CONFIGURED_CAPACITY: usize = 4;
+pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
 
 /// A boxed asynchronous operation used by the pure runtime seams.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -26,6 +28,21 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum TeardownScope {
     Task(TaskId),
     Host,
+}
+
+impl TeardownScope {
+    fn matches_owner(self, owner: ProcessOwner) -> bool {
+        match (self, owner) {
+            (Self::Task(expected), ProcessOwner::Task(actual)) => expected == actual,
+            (Self::Host, ProcessOwner::Host) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeardownTicketError {
+    ScopeOwnerMismatch,
 }
 
 /// Exact authority for one cleanup branch.
@@ -47,13 +64,16 @@ impl TeardownTicket {
         scope: TeardownScope,
         action_epoch: u64,
         fence: ManagedProcessFence,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, TeardownTicketError> {
+        if !scope.matches_owner(fence.owner()) {
+            return Err(TeardownTicketError::ScopeOwnerMismatch);
+        }
+        Ok(Self {
             operation_id,
             scope,
             action_epoch,
             fence,
-        }
+        })
     }
 
     pub fn operation_id(&self) -> OperationId {
@@ -233,6 +253,10 @@ pub enum TeardownStage {
     InterruptWait,
     TerminateTree,
     TerminationWait,
+    SettleActiveProcessZero,
+    DetachAfterZero,
+    ReconcilePorts,
+    PersistSettlement,
     ReleaseStoppedExact,
 }
 
@@ -244,22 +268,22 @@ pub enum StageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitResult {
-    Zero {
-        fence: ManagedProcessFence,
-        active_process_zero: bool,
-        active_process_ids: Vec<u32>,
-    },
+    Zero { proof: ActiveProcessZeroProof },
     TimedOut,
-    Failed {
-        detail: String,
-    },
+    Failed { detail: String },
 }
 
 /// Small adapter surface for terminal/provider close and exact Job operations.
 ///
-/// terminate_tree receives no PID. A production adapter must retain its
-/// owned Job/completion/PTY handles until a matching zero observation has been
-/// returned and release_stopped_exact is called.
+/// `terminate_tree` receives no PID. A production adapter must retain its
+/// owned Job/completion/PTY handles until a matching registry-issued proof has
+/// been settled, all post-zero effects have completed, and
+/// `release_stopped_exact` is called.
+///
+/// The Task 3.4 TerminalService/host implementation is intentionally not part
+/// of this pure core. Its adapter must source `ActiveProcessZeroProof` from
+/// the registry completion path and make `settle_active_process_zero` perform
+/// the final exact-fence plus authoritative membership check.
 pub trait TeardownEffects: Send + Sync + 'static {
     fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
 
@@ -278,6 +302,18 @@ pub trait TeardownEffects: Send + Sync + 'static {
         stage: WaitStage,
         deadline: TeardownDeadline,
     ) -> BoxFuture<'a, WaitResult>;
+
+    fn settle_active_process_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        proof: ActiveProcessZeroProof,
+    ) -> BoxFuture<'a, StageResult>;
+
+    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
+
+    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
+
+    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
 
     fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>>;
 
@@ -450,6 +486,47 @@ impl TeardownReport {
     pub fn residue(&self) -> Option<&ResidueEvidence> {
         self.residue.as_ref()
     }
+
+    fn with_handoff_error(mut self, detail: String) -> Self {
+        self.errors.push(detail);
+        self.outcome = TeardownOutcome::CleanupFailed;
+        self
+    }
+}
+
+/// Canonical identity used for retry and host-to-task joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeardownCompletionKey {
+    action_epoch: u64,
+    fence: ManagedProcessFence,
+}
+
+impl TeardownCompletionKey {
+    pub fn new(action_epoch: u64, fence: ManagedProcessFence) -> Self {
+        Self {
+            action_epoch,
+            fence,
+        }
+    }
+
+    pub fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+}
+
+/// Durable idempotency seam for completed teardown operations.
+///
+/// The coordinator keeps only a bounded in-memory cache. When this seam is
+/// supplied, completed entries may be evicted from that cache because an
+/// exact retry can be recovered here without rerunning destructive effects.
+pub trait TeardownCompletionStore: Send + Sync + 'static {
+    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String>;
+
+    fn persist(&self, key: &TeardownCompletionKey, report: &TeardownReport) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +534,9 @@ pub enum TeardownReject {
     StaleEpoch { expected: u64, actual: u64 },
     NonClosingScope,
     FenceMismatch,
+    CompletionJournalFull,
+    CompletionLookupFailed { detail: String },
+    NoMatchingCleanup,
     Admission(TeardownAdmissionError),
 }
 
@@ -549,8 +629,21 @@ impl TeardownBatchWaiter {
 
 #[derive(Debug)]
 struct ActiveCleanup {
-    ticket: TeardownTicket,
+    key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
+}
+
+#[derive(Debug)]
+struct CompletedCleanup {
+    key: TeardownCompletionKey,
+    cell: Arc<CleanupCell>,
+}
+
+#[derive(Debug, Default)]
+struct CoordinatorState {
+    active: Vec<ActiveCleanup>,
+    completed: VecDeque<CompletedCleanup>,
+    handoff_failed: bool,
 }
 
 pub struct TeardownCoordinator {
@@ -559,7 +652,10 @@ pub struct TeardownCoordinator {
     clock: Arc<dyn TeardownClock>,
     budgets: TeardownBudgets,
     semaphore: Arc<Semaphore>,
-    active: Arc<Mutex<Vec<ActiveCleanup>>>,
+    configured_capacity: usize,
+    completed_operation_capacity: usize,
+    completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+    state: Arc<Mutex<CoordinatorState>>,
 }
 
 impl TeardownCoordinator {
@@ -572,22 +668,22 @@ impl TeardownCoordinator {
             admission,
             effects,
             clock,
-            DEFAULT_MAX_CONCURRENT_BRANCHES,
+            DEFAULT_CONFIGURED_CAPACITY,
             TeardownBudgets::default(),
         )
     }
 
-    pub fn with_max_concurrency(
+    pub fn with_capacity(
         admission: Arc<dyn TeardownAdmission>,
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
-        max_concurrent_branches: usize,
+        configured_capacity: usize,
     ) -> Self {
         Self::with_configuration(
             admission,
             effects,
             clock,
-            max_concurrent_branches,
+            configured_capacity,
             TeardownBudgets::default(),
         )
     }
@@ -596,33 +692,109 @@ impl TeardownCoordinator {
         admission: Arc<dyn TeardownAdmission>,
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
-        max_concurrent_branches: usize,
+        configured_capacity: usize,
         budgets: TeardownBudgets,
     ) -> Self {
+        Self::with_configuration_and_completion_store(
+            admission,
+            effects,
+            clock,
+            configured_capacity,
+            budgets,
+            DEFAULT_COMPLETED_OPERATION_CAPACITY,
+            None,
+        )
+    }
+
+    pub fn with_configuration_and_completion_store(
+        admission: Arc<dyn TeardownAdmission>,
+        effects: Arc<dyn TeardownEffects>,
+        clock: Arc<dyn TeardownClock>,
+        configured_capacity: usize,
+        budgets: TeardownBudgets,
+        completed_operation_capacity: usize,
+        completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+    ) -> Self {
+        let configured_capacity = configured_capacity.max(1);
+        let completed_operation_capacity = completed_operation_capacity.max(1);
         Self {
             admission,
             effects,
             clock,
             budgets,
-            semaphore: Arc::new(Semaphore::new(max_concurrent_branches.max(1))),
-            active: Arc::new(Mutex::new(Vec::new())),
+            semaphore: Arc::new(Semaphore::new(configured_capacity)),
+            configured_capacity,
+            completed_operation_capacity,
+            completion_store,
+            state: Arc::new(Mutex::new(CoordinatorState::default())),
         }
     }
 
-    pub fn max_concurrent_branches(&self) -> usize {
-        self.semaphore.available_permits()
+    pub fn configured_capacity(&self) -> usize {
+        self.configured_capacity
+    }
+
+    pub fn active_operation_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned")
+            .active
+            .len()
+    }
+
+    pub fn completed_operation_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned")
+            .completed
+            .len()
     }
 
     pub fn request(&self, ticket: TeardownTicket) -> Result<TeardownWaiter, TeardownReject> {
+        let key = completion_key(&ticket);
         let cell = {
-            let mut active = self.active.lock().expect("teardown active mutex poisoned");
-            if let Some(existing) = active.iter().find(|existing| {
-                existing.ticket.action_epoch() == ticket.action_epoch()
-                    && existing.ticket.fence() == ticket.fence()
-            }) {
+            let mut state = self
+                .state
+                .lock()
+                .expect("teardown coordinator state mutex poisoned");
+            if let Some(existing) = state.active.iter().find(|existing| existing.key == key) {
                 return Ok(TeardownWaiter {
                     cell: Arc::clone(&existing.cell),
                 });
+            }
+            if let Some(existing) = state.completed.iter().find(|existing| existing.key == key) {
+                return Ok(TeardownWaiter {
+                    cell: Arc::clone(&existing.cell),
+                });
+            }
+            if state.handoff_failed {
+                return Err(TeardownReject::CompletionLookupFailed {
+                    detail: "completed teardown handoff is unavailable".to_string(),
+                });
+            }
+            if let Some(store) = &self.completion_store {
+                match store.lookup(&key) {
+                    Ok(Some(report)) => {
+                        if report.action_epoch() != key.action_epoch
+                            || report.fence() != key.fence()
+                        {
+                            return Err(TeardownReject::CompletionLookupFailed {
+                                detail: "completion store returned a mismatched report".to_string(),
+                            });
+                        }
+                        let cell = Arc::new(CleanupCell::new());
+                        cell.finish(report);
+                        return Ok(TeardownWaiter { cell });
+                    }
+                    Ok(None) => {}
+                    Err(detail) => {
+                        return Err(TeardownReject::CompletionLookupFailed { detail });
+                    }
+                }
+            } else if state.active.len() + state.completed.len()
+                >= self.completed_operation_capacity
+            {
+                return Err(TeardownReject::CompletionJournalFull);
             }
 
             let receipt = self
@@ -631,15 +803,61 @@ impl TeardownCoordinator {
                 .map_err(TeardownReject::from)?;
             validate_receipt(&ticket, &receipt)?;
             let cell = Arc::new(CleanupCell::new());
-            active.push(ActiveCleanup {
-                ticket: ticket.clone(),
+            state.active.push(ActiveCleanup {
+                key: key.clone(),
                 cell: Arc::clone(&cell),
             });
             cell
         };
 
-        self.spawn_owned_cleanup(ticket, Arc::clone(&cell));
+        self.spawn_owned_cleanup(ticket, key, Arc::clone(&cell));
         Ok(TeardownWaiter { cell })
+    }
+
+    /// Join an already-admitted cleanup by its exact action/fence key.
+    ///
+    /// Host shutdown uses this path for Task-owned work; it never constructs a
+    /// Host ticket around a Task fence and therefore cannot receive a
+    /// mismatched scope report.
+    pub fn join(
+        &self,
+        action_epoch: u64,
+        fence: &ManagedProcessFence,
+    ) -> Result<TeardownWaiter, TeardownReject> {
+        let key = TeardownCompletionKey::new(action_epoch, fence.clone());
+        let state = self
+            .state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned");
+        if let Some(existing) = state.active.iter().find(|existing| existing.key == key) {
+            return Ok(TeardownWaiter {
+                cell: Arc::clone(&existing.cell),
+            });
+        }
+        if let Some(existing) = state.completed.iter().find(|existing| existing.key == key) {
+            return Ok(TeardownWaiter {
+                cell: Arc::clone(&existing.cell),
+            });
+        }
+        if let Some(store) = &self.completion_store {
+            match store.lookup(&key) {
+                Ok(Some(report)) => {
+                    if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
+                        return Err(TeardownReject::CompletionLookupFailed {
+                            detail: "completion store returned a mismatched report".to_string(),
+                        });
+                    }
+                    let cell = Arc::new(CleanupCell::new());
+                    cell.finish(report);
+                    return Ok(TeardownWaiter { cell });
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    return Err(TeardownReject::CompletionLookupFailed { detail });
+                }
+            }
+        }
+        Err(TeardownReject::NoMatchingCleanup)
     }
 
     pub fn request_batch(
@@ -653,10 +871,18 @@ impl TeardownCoordinator {
         Ok(TeardownBatchWaiter { waiters })
     }
 
-    fn spawn_owned_cleanup(&self, ticket: TeardownTicket, cell: Arc<CleanupCell>) {
+    fn spawn_owned_cleanup(
+        &self,
+        ticket: TeardownTicket,
+        key: TeardownCompletionKey,
+        cell: Arc<CleanupCell>,
+    ) {
         let effects = Arc::clone(&self.effects);
         let clock = Arc::clone(&self.clock);
         let semaphore = Arc::clone(&self.semaphore);
+        let state = Arc::clone(&self.state);
+        let completion_store = self.completion_store.clone();
+        let completed_operation_capacity = self.completed_operation_capacity;
         let budgets = self.budgets;
         let task = async move {
             let permit = semaphore
@@ -665,6 +891,14 @@ impl TeardownCoordinator {
                 .expect("teardown semaphore remains open for coordinator lifetime");
             let report = execute_cleanup(ticket, effects, clock, budgets).await;
             drop(permit);
+            let report = handoff_completed_cleanup(
+                &state,
+                completion_store,
+                completed_operation_capacity,
+                key,
+                Arc::clone(&cell),
+                report,
+            );
             cell.finish(report);
         };
 
@@ -683,6 +917,49 @@ impl TeardownCoordinator {
                 .expect("spawn teardown worker");
         }
     }
+}
+
+fn completion_key(ticket: &TeardownTicket) -> TeardownCompletionKey {
+    TeardownCompletionKey::new(ticket.action_epoch(), ticket.fence().clone())
+}
+
+fn handoff_completed_cleanup(
+    state: &Arc<Mutex<CoordinatorState>>,
+    completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+    completed_operation_capacity: usize,
+    key: TeardownCompletionKey,
+    cell: Arc<CleanupCell>,
+    report: TeardownReport,
+) -> TeardownReport {
+    if let Some(store) = &completion_store {
+        if let Err(detail) = store.persist(&key, &report) {
+            state
+                .lock()
+                .expect("teardown coordinator state mutex poisoned")
+                .handoff_failed = true;
+            return report.with_handoff_error(format!(
+                "completed teardown handoff failed: {}",
+                sanitize_text(&detail)
+            ));
+        }
+    }
+
+    let mut state = state
+        .lock()
+        .expect("teardown coordinator state mutex poisoned");
+    if state.completed.len() >= completed_operation_capacity {
+        if completion_store.is_some() {
+            state.completed.pop_front();
+        } else {
+            state.handoff_failed = true;
+            return report.with_handoff_error(
+                "completed teardown journal reached capacity before handoff".to_string(),
+            );
+        }
+    }
+    state.active.retain(|active| active.key != key);
+    state.completed.push_back(CompletedCleanup { key, cell });
+    report
 }
 
 fn validate_receipt(
@@ -735,7 +1012,15 @@ async fn execute_cleanup(
             clock.deadline(budgets.cooperative_grace),
         )
         .await;
-    if zero_proof_is_valid(&ticket, &cooperative, &mut errors) {
+    if try_settle_after_wait(
+        &ticket,
+        cooperative,
+        &effects,
+        &mut attempted_stages,
+        &mut errors,
+    )
+    .await
+    {
         return settle_after_zero(ticket, effects, attempted_stages, errors).await;
     }
 
@@ -754,7 +1039,15 @@ async fn execute_cleanup(
             clock.deadline(budgets.interrupt_grace),
         )
         .await;
-    if zero_proof_is_valid(&ticket, &interrupted, &mut errors) {
+    if try_settle_after_wait(
+        &ticket,
+        interrupted,
+        &effects,
+        &mut attempted_stages,
+        &mut errors,
+    )
+    .await
+    {
         return settle_after_zero(ticket, effects, attempted_stages, errors).await;
     }
 
@@ -773,7 +1066,15 @@ async fn execute_cleanup(
             clock.deadline(budgets.termination),
         )
         .await;
-    if zero_proof_is_valid(&ticket, &terminated, &mut errors) {
+    if try_settle_after_wait(
+        &ticket,
+        terminated,
+        &effects,
+        &mut attempted_stages,
+        &mut errors,
+    )
+    .await
+    {
         return settle_after_zero(ticket, effects, attempted_stages, errors).await;
     }
 
@@ -793,23 +1094,31 @@ fn collect_stage_result(result: StageResult, errors: &mut Vec<String>, stage: Te
     }
 }
 
-fn zero_proof_is_valid(
+async fn try_settle_after_wait(
     ticket: &TeardownTicket,
-    result: &WaitResult,
+    result: WaitResult,
+    effects: &Arc<dyn TeardownEffects>,
+    attempted_stages: &mut Vec<TeardownStage>,
     errors: &mut Vec<String>,
 ) -> bool {
     match result {
-        WaitResult::Zero {
-            fence,
-            active_process_zero,
-            active_process_ids,
-        } if fence == ticket.fence() && *active_process_zero && active_process_ids.is_empty() => {
-            true
+        WaitResult::Zero { proof } if proof.fence() == ticket.fence() => {
+            attempted_stages.push(TeardownStage::SettleActiveProcessZero);
+            match effects.settle_active_process_zero(ticket, proof).await {
+                StageResult::Completed => true,
+                StageResult::Failed { detail } => {
+                    errors.push(format!(
+                        "SettleActiveProcessZero: {}",
+                        sanitize_text(&detail)
+                    ));
+                    false
+                }
+            }
         }
         WaitResult::Zero { .. } => false,
         WaitResult::TimedOut => false,
         WaitResult::Failed { detail } => {
-            errors.push(format!("zero wait failed: {}", sanitize_text(detail)));
+            errors.push(format!("zero wait failed: {}", sanitize_text(&detail)));
             false
         }
     }
@@ -821,9 +1130,27 @@ async fn settle_after_zero(
     mut attempted_stages: Vec<TeardownStage>,
     errors: Vec<String>,
 ) -> TeardownReport {
+    let mut errors = errors;
+    attempted_stages.push(TeardownStage::DetachAfterZero);
+    collect_stage_result(
+        effects.detach_after_zero(&ticket).await,
+        &mut errors,
+        TeardownStage::DetachAfterZero,
+    );
+    attempted_stages.push(TeardownStage::ReconcilePorts);
+    collect_stage_result(
+        effects.reconcile_ports(&ticket).await,
+        &mut errors,
+        TeardownStage::ReconcilePorts,
+    );
+    attempted_stages.push(TeardownStage::PersistSettlement);
+    collect_stage_result(
+        effects.persist_settlement(&ticket).await,
+        &mut errors,
+        TeardownStage::PersistSettlement,
+    );
     attempted_stages.push(TeardownStage::ReleaseStoppedExact);
     let release = effects.release_stopped_exact(&ticket).await;
-    let mut errors = errors;
     let outcome = match release {
         StageResult::Completed if errors.is_empty() => TeardownOutcome::Closed,
         StageResult::Completed => TeardownOutcome::CleanupFailed,
