@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use devmanager::prompts::{
     diff_versions, diff_versions_with_budget, DiffBudget, DiffCacheKey, DiffStatus, InlineSpanKind,
-    LineChangeKind, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_DIFF_INLINE_SPANS,
-    MAX_PROMPT_DIFF_PAYLOAD_BYTES,
+    LineChangeKind, PromptDiff, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_DIFF_INLINE_SPANS,
+    MAX_PROMPT_DIFF_PAYLOAD_BYTES, PROMPT_DIFF_TRUNCATION_MARKER_BYTES,
 };
 
 #[test]
@@ -171,6 +171,184 @@ fn exact_prompt_body_bound_is_accepted_and_larger_input_is_rejected() {
 }
 
 #[test]
+fn validation_and_early_cancellation_happen_before_hashing() {
+    let body = "x".repeat(MAX_PROMPT_BODY_BYTES);
+    let too_large = format!("{body}x");
+
+    let invalid = diff_versions(&body, &too_large);
+    assert!(matches!(invalid.status, DiffStatus::InvalidInput { .. }));
+    assert_eq!(invalid.old_body_sha256, [0; 32]);
+    assert_eq!(invalid.new_body_sha256, [0; 32]);
+    assert_eq!(
+        invalid.cache_key,
+        DiffCacheKey {
+            old_body_sha256: [0; 32],
+            new_body_sha256: [0; 32],
+        }
+    );
+
+    let cancellation = AtomicBool::new(true);
+    let cancelled = diff_versions_with_budget(
+        "old",
+        "new",
+        DiffBudget::default().with_cancellation(&cancellation),
+    );
+    assert_eq!(cancelled.status, DiffStatus::Cancelled);
+    assert_eq!(cancelled.old_body_sha256, [0; 32]);
+    assert_eq!(cancelled.new_body_sha256, [0; 32]);
+}
+
+#[test]
+fn reversed_high_overlap_input_is_truthfully_approximate_and_deterministic() {
+    let old: String = (0..1_024)
+        .map(|index| format!("shared-{index}\n"))
+        .collect();
+    let new: String = (0..1_024)
+        .rev()
+        .map(|index| format!("shared-{index}\n"))
+        .collect();
+
+    let first = diff_versions(&old, &new);
+    let second = diff_versions(&old, &new);
+
+    assert_eq!(first, second);
+    assert_eq!(first.status, DiffStatus::Approximate);
+    assert!(first.truncation.is_some());
+    assert!(first.estimated_payload_bytes <= MAX_PROMPT_DIFF_PAYLOAD_BYTES);
+}
+
+#[test]
+fn shared_anchor_outside_the_line_window_is_truthfully_approximate() {
+    let old: String = (0..32)
+        .map(|index| format!("old-only-{index}\n"))
+        .chain(["shared-anchor\n".to_string()])
+        .collect();
+    let new: String = (0..32)
+        .map(|index| format!("new-only-{index}\n"))
+        .chain(["shared-anchor\n".to_string()])
+        .collect();
+
+    let diff = diff_versions(&old, &new);
+
+    assert_eq!(diff.status, DiffStatus::Approximate);
+    assert_eq!(
+        diff.truncation.unwrap().reason,
+        devmanager::prompts::TruncationReason::ComplexityLimit
+    );
+}
+
+#[test]
+fn cancellation_can_stop_after_work_has_started() {
+    let cancellation = AtomicBool::new(false);
+    let old = "old\n".repeat(2_000);
+    let new = "new\n".repeat(2_000);
+
+    let diff = diff_versions_with_budget(
+        &old,
+        &new,
+        DiffBudget::default().with_cancellation_after_work(&cancellation, 1_024),
+    );
+
+    assert_eq!(diff.status, DiffStatus::Cancelled);
+    assert!(diff.truncation.is_none());
+    assert!(cancellation.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn inline_grapheme_work_honors_mid_operation_cancellation() {
+    let cancellation = AtomicBool::new(false);
+    let old = "aX".repeat(10_000);
+    let new = "bX".repeat(10_000);
+
+    // Hashing and normalized line scanning consume 80,192 units for these
+    // inputs; the next checkpoint is the first grapheme in inline work.
+    let diff = diff_versions_with_budget(
+        &old,
+        &new,
+        DiffBudget::default().with_cancellation_after_work(&cancellation, 80_193),
+    );
+
+    assert_eq!(diff.status, DiffStatus::Cancelled);
+    assert!(
+        !diff.hunks.is_empty(),
+        "line output must precede inline cancellation"
+    );
+    assert_ne!(diff.old_body_sha256, [0; 32]);
+    assert!(diff.truncation.is_none());
+}
+
+#[test]
+fn escaped_public_result_stays_within_the_encoded_payload_cap() {
+    let old: String = (0..14_000)
+        .map(|index| format!("\"old\\🙂{index:05}\"\n"))
+        .collect();
+    let new: String = (0..14_000)
+        .map(|index| format!("\"new\\🙂{index:05}\"\n"))
+        .collect();
+
+    let diff = diff_versions(&old, &new);
+    let encoded = encode_public_result(&diff);
+
+    assert!(
+        encoded.len() <= MAX_PROMPT_DIFF_PAYLOAD_BYTES,
+        "encoded returned result is {} bytes, cap is {}",
+        encoded.len(),
+        MAX_PROMPT_DIFF_PAYLOAD_BYTES
+    );
+}
+
+#[test]
+fn inline_spans_share_the_encoded_payload_cap() {
+    let old = "aX".repeat(10_000);
+    let new = "bX".repeat(10_000);
+
+    let diff = diff_versions(&old, &new);
+
+    assert_eq!(diff.status, DiffStatus::Truncated);
+    assert!(diff.inline_spans.len() < MAX_PROMPT_DIFF_INLINE_SPANS);
+    assert!(diff.truncation.is_some());
+    assert!(diff.estimated_payload_bytes <= MAX_PROMPT_DIFF_PAYLOAD_BYTES);
+    assert!(encode_public_result(&diff).len() <= MAX_PROMPT_DIFF_PAYLOAD_BYTES);
+}
+
+#[test]
+fn truncation_estimate_includes_marker_for_overlapping_changes() {
+    let old: String = (0..20_000)
+        .map(|index| {
+            if index % 2 == 0 {
+                format!("keep-{index}\n")
+            } else {
+                format!("old-{index}\n")
+            }
+        })
+        .collect();
+    let new: String = (0..20_000)
+        .map(|index| {
+            if index % 2 == 0 {
+                format!("keep-{index}\n")
+            } else {
+                format!("new-{index}\n")
+            }
+        })
+        .collect();
+
+    let diff = diff_versions(&old, &new);
+
+    assert_eq!(diff.status, DiffStatus::Truncated);
+    let marker = diff.truncation.expect("payload cap must be marked");
+    assert_eq!(marker.retained_payload_bytes, diff.estimated_payload_bytes);
+    assert!(diff.estimated_payload_bytes <= MAX_PROMPT_DIFF_PAYLOAD_BYTES);
+    assert!(
+        diff.estimated_payload_bytes
+            > MAX_PROMPT_DIFF_PAYLOAD_BYTES - PROMPT_DIFF_TRUNCATION_MARKER_BYTES
+    );
+    assert!(
+        diff.hunks.len() > 1,
+        "the overlapping input must exercise real hunks"
+    );
+}
+
+#[test]
 fn pathological_many_line_output_stops_at_both_output_caps() {
     let old = "a\n".repeat(50_000);
     let new = "b\n".repeat(50_000);
@@ -212,8 +390,8 @@ fn cancellation_and_expired_deadline_return_bounded_results() {
 
 #[test]
 fn cache_keys_are_sha256_based_and_order_sensitive() {
-    let old_new = DiffCacheKey::from_bodies("old", "new");
-    let new_old = DiffCacheKey::from_bodies("new", "old");
+    let old_new = diff_versions("old", "new").cache_key;
+    let new_old = diff_versions("new", "old").cache_key;
 
     assert_ne!(old_new, new_old);
     assert_ne!(old_new.old_body_sha256, old_new.new_body_sha256);
@@ -238,4 +416,69 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     Sha256::digest(bytes).into()
+}
+
+fn encode_public_result(diff: &PromptDiff<'_>) -> Vec<u8> {
+    let hunks: Vec<_> = diff
+        .hunks
+        .iter()
+        .map(|hunk| {
+            serde_json::json!({
+                "old_start": hunk.old_start,
+                "old_count": hunk.old_count,
+                "new_start": hunk.new_start,
+                "new_count": hunk.new_count,
+                "kind": format!("{:?}", hunk.kind),
+                "changes": hunk.changes.iter().map(|change| serde_json::json!({
+                    "kind": format!("{:?}", change.kind),
+                    "old_line": change.old_line,
+                    "new_line": change.new_line,
+                    "text": change.text,
+                    "terminated": change.terminated,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let inline_spans: Vec<_> = diff
+        .inline_spans
+        .iter()
+        .map(|span| {
+            serde_json::json!({
+                "kind": format!("{:?}", span.kind),
+                "old_line": span.old_line,
+                "new_line": span.new_line,
+                "old_range": span.old_range.map(|range| serde_json::json!({
+                    "start": range.start,
+                    "end": range.end,
+                })),
+                "new_range": span.new_range.map(|range| serde_json::json!({
+                    "start": range.start,
+                    "end": range.end,
+                })),
+                "text": span.text,
+            })
+        })
+        .collect();
+
+    serde_json::to_vec(&serde_json::json!({
+        "old_body": diff.old_body,
+        "new_body": diff.new_body,
+        "old_body_sha256": diff.old_body_sha256,
+        "new_body_sha256": diff.new_body_sha256,
+        "cache_key": {
+            "old_body_sha256": diff.cache_key.old_body_sha256,
+            "new_body_sha256": diff.cache_key.new_body_sha256,
+        },
+        "hunks": hunks,
+        "inline_spans": inline_spans,
+        "estimated_payload_bytes": diff.estimated_payload_bytes,
+        "status": format!("{:?}", diff.status),
+        "truncation": diff.truncation.map(|marker| serde_json::json!({
+            "retained_hunks": marker.retained_hunks,
+            "retained_inline_spans": marker.retained_inline_spans,
+            "retained_payload_bytes": marker.retained_payload_bytes,
+            "reason": format!("{:?}", marker.reason),
+        })),
+    }))
+    .expect("public prompt diff result must encode")
 }
