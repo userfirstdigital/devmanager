@@ -17,6 +17,19 @@ use crate::process::registry::{
     JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
 };
 
+/// Capability held only by the managed Job completion receiver.
+///
+/// The registry requires this token before it will mark a completion message
+/// as receiver-owned. No production caller outside this module can construct
+/// one, so a fence/event pair supplied by another adapter remains untrusted.
+pub(crate) struct CompletionReceiverToken(());
+
+impl CompletionReceiverToken {
+    fn issue() -> Self {
+        Self(())
+    }
+}
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
@@ -134,7 +147,7 @@ struct CompletionMailbox {
 
 #[cfg(windows)]
 impl CompletionMailbox {
-    fn push(&mut self, message: JobCompletionMessage) {
+    fn push(&mut self, receiver: &CompletionReceiverToken, message: JobCompletionMessage) {
         let is_active_zero = matches!(message.event(), JobCompletionEvent::ActiveProcessZero);
         let has_active_zero = self
             .messages
@@ -164,12 +177,14 @@ impl CompletionMailbox {
                 .cloned()
         };
         self.messages.clear();
-        self.messages.push_back(JobCompletionMessage::new(
-            message.fence().clone(),
-            JobCompletionEvent::MonitorFailed {
-                detail: COMPLETION_OVERFLOW_DETAIL.to_string(),
-            },
-        ));
+        self.messages
+            .push_back(JobCompletionMessage::from_completion_receiver(
+                receiver,
+                message.fence().clone(),
+                JobCompletionEvent::MonitorFailed {
+                    detail: COMPLETION_OVERFLOW_DETAIL.to_string(),
+                },
+            ));
         if let Some(active_zero) = preserved_zero {
             self.messages.push_back(active_zero);
         }
@@ -374,13 +389,16 @@ impl ManagedProcessJob {
         let completion_key = self.completion_key;
         let mailbox = Arc::clone(&self.completion_mailbox);
         let listener_fence = fence.clone();
+        let receiver = CompletionReceiverToken::issue();
         let listener = std::thread::Builder::new()
             .name(format!(
                 "devmanager-job-{}-{}",
                 fence.resource().resource_id,
                 fence.resource().runtime_generation
             ))
-            .spawn(move || completion_listener(port, completion_key, listener_fence, mailbox))
+            .spawn(move || {
+                completion_listener(port, completion_key, listener_fence, mailbox, receiver)
+            })
             .map_err(|error| format!("could not spawn Job completion listener: {error}"))?;
         self.completion_fence = Some(fence);
         self.completion_listener = Some(listener);
@@ -642,6 +660,7 @@ fn completion_listener(
     expected_completion_key: usize,
     fence: ManagedProcessFence,
     mailbox: Arc<Mutex<CompletionMailbox>>,
+    receiver: CompletionReceiverToken,
 ) {
     let completion_port = completion_port_value as *mut c_void;
     loop {
@@ -668,10 +687,14 @@ fn completion_listener(
             mailbox
                 .lock()
                 .expect("managed Job completion mailbox poisoned")
-                .push(JobCompletionMessage::new(
-                    fence.clone(),
-                    JobCompletionEvent::MonitorFailed { detail },
-                ));
+                .push(
+                    &receiver,
+                    JobCompletionMessage::from_completion_receiver(
+                        &receiver,
+                        fence.clone(),
+                        JobCompletionEvent::MonitorFailed { detail },
+                    ),
+                );
             break;
         }
         if completion_key != expected_completion_key {
@@ -694,7 +717,10 @@ fn completion_listener(
         mailbox
             .lock()
             .expect("managed Job completion mailbox poisoned")
-            .push(JobCompletionMessage::new(fence.clone(), event));
+            .push(
+                &receiver,
+                JobCompletionMessage::from_completion_receiver(&receiver, fence.clone(), event),
+            );
     }
 }
 
@@ -855,17 +881,25 @@ mod tests {
     }
 
     fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
-        JobCompletionMessage::new(authority.clone(), event)
+        let receiver = super::CompletionReceiverToken::issue();
+        JobCompletionMessage::from_completion_receiver(&receiver, authority.clone(), event)
     }
 
     #[test]
     fn membership_mailbox_overflow_is_visible_and_preserves_arriving_zero() {
         let authority = authority();
+        let receiver = super::CompletionReceiverToken::issue();
         let mut mailbox = CompletionMailbox::default();
         for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
-            mailbox.push(message(&authority, JobCompletionEvent::ExitProcess { pid }));
+            mailbox.push(
+                &receiver,
+                message(&authority, JobCompletionEvent::ExitProcess { pid }),
+            );
         }
-        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+        mailbox.push(
+            &receiver,
+            message(&authority, JobCompletionEvent::ActiveProcessZero),
+        );
 
         let messages = mailbox.drain();
         assert!(messages.len() <= MAX_COMPLETION_MESSAGES);
@@ -883,10 +917,17 @@ mod tests {
     #[test]
     fn membership_mailbox_overflow_is_visible_and_preserves_queued_zero() {
         let authority = authority();
+        let receiver = super::CompletionReceiverToken::issue();
         let mut mailbox = CompletionMailbox::default();
-        mailbox.push(message(&authority, JobCompletionEvent::ActiveProcessZero));
+        mailbox.push(
+            &receiver,
+            message(&authority, JobCompletionEvent::ActiveProcessZero),
+        );
         for pid in 1..=MAX_COMPLETION_MESSAGES as u32 {
-            mailbox.push(message(&authority, JobCompletionEvent::NewProcess { pid }));
+            mailbox.push(
+                &receiver,
+                message(&authority, JobCompletionEvent::NewProcess { pid }),
+            );
         }
 
         let messages = mailbox.drain();

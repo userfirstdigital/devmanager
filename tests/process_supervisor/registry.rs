@@ -86,7 +86,7 @@ impl Drop for DropSpy {
 }
 
 #[test]
-fn empty_membership_requires_matching_completion_proof() {
+fn empty_membership_requires_receiver_completion_proof() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let membership = Arc::new(Mutex::new(Ok(vec![1_717])));
     let executable = current_executable();
@@ -119,12 +119,6 @@ fn empty_membership_requires_matching_completion_proof() {
         fence.clone(),
         JobCompletionEvent::ActiveProcessZero,
     )));
-    let proof = registry
-        .active_process_zero_proof_exact(&fence)
-        .expect("completion adapter proof");
-    assert!(registry
-        .settle_active_process_zero_exact(proof)
-        .expect("authoritative empty membership"));
     assert_eq!(
         registry
             .current(resource_id(16))
@@ -132,6 +126,46 @@ fn empty_membership_requires_matching_completion_proof() {
             .state(),
         ManagedProcessState::Stopped
     );
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert!(matches!(
+        registry.release_stopped_exact(&fence),
+        Err(ProcessRegistryError::InvalidLifecycleState { .. })
+    ));
+}
+
+#[test]
+fn externally_constructed_zero_cannot_authorize_stop_or_release() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let membership = Arc::new(Mutex::new(Ok(vec![1_818])));
+    let executable = current_executable();
+    let job = DropSpy::with_membership(1, &dropped, Arc::clone(&membership));
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource_id(17),
+            1,
+            ProcessOwner::Host,
+            identity(1_818, 18_000, &executable),
+            job,
+        ))
+        .expect("registration");
+
+    *membership.lock().expect("membership state") = Ok(Vec::new());
+    assert!(registry.apply_job_completion(JobCompletionMessage::new(
+        fence.clone(),
+        JobCompletionEvent::ActiveProcessZero,
+    )));
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert!(matches!(
+        registry.release_stopped_exact(&fence),
+        Err(ProcessRegistryError::InvalidLifecycleState { .. })
+    ));
 }
 
 fn registration(

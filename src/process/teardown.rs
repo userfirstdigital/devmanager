@@ -16,7 +16,7 @@ use tokio::sync::{watch, Semaphore};
 
 use crate::domain::id::{OperationId, ResourceId, TaskId};
 use crate::process::identity::ProcessOwner;
-use crate::process::registry::{ActiveProcessZeroProof, ManagedProcessFence};
+use crate::process::registry::ManagedProcessFence;
 
 pub const DEFAULT_CONFIGURED_CAPACITY: usize = 4;
 pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
@@ -268,7 +268,7 @@ pub enum StageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitResult {
-    Zero { proof: ActiveProcessZeroProof },
+    Zero,
     TimedOut,
     Failed { detail: String },
 }
@@ -276,14 +276,16 @@ pub enum WaitResult {
 /// Small adapter surface for terminal/provider close and exact Job operations.
 ///
 /// `terminate_tree` receives no PID. A production adapter must retain its
-/// owned Job/completion/PTY handles until a matching registry-issued proof has
-/// been settled, all post-zero effects have completed, and
-/// `release_stopped_exact` is called.
+/// owned Job/completion/PTY handles until the matching completion receiver has
+/// issued a registry-owned zero proof, that proof has been settled against the
+/// exact fence and an authoritative empty membership query, all post-zero
+/// effects have completed, and `release_stopped_exact` is called.
 ///
 /// The Task 3.4 TerminalService/host implementation is intentionally not part
-/// of this pure core. Its adapter must source `ActiveProcessZeroProof` from
-/// the registry completion path and make `settle_active_process_zero` perform
-/// the final exact-fence plus authoritative membership check.
+/// of this pure core. Its adapter must source the zero result from the
+/// registry completion path and make `settle_active_process_zero` perform the
+/// final exact-fence plus authoritative membership check. The coordinator's
+/// `WaitResult::Zero` is deliberately not itself a proof-bearing constructor.
 pub trait TeardownEffects: Send + Sync + 'static {
     fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
 
@@ -306,7 +308,6 @@ pub trait TeardownEffects: Send + Sync + 'static {
     fn settle_active_process_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
-        proof: ActiveProcessZeroProof,
     ) -> BoxFuture<'a, StageResult>;
 
     fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult>;
@@ -324,6 +325,10 @@ pub trait TeardownEffects: Send + Sync + 'static {
 }
 
 const MAX_EVIDENCE_TEXT_BYTES: usize = 256;
+const MAX_RESIDUE_STAGES: usize = 32;
+const UNAVAILABLE_JOB_IDENTITY: &str = "<unavailable: managed Job identity>";
+const UNAVAILABLE_ROOT_EXECUTABLE: &str = "<unavailable: root executable>";
+const UNAVAILABLE_ROOT_COMMAND: &str = "<unavailable: root command>";
 
 fn sanitize_text(value: &str) -> String {
     let normalized: String = value
@@ -401,7 +406,10 @@ impl ResidueEvidence {
             executable: sanitize_text(executable.as_ref()),
             command_label: sanitize_text(command_label.as_ref()),
             last_lifecycle_event: sanitize_text(last_lifecycle_event.as_ref()),
-            attempted_stages,
+            attempted_stages: attempted_stages
+                .into_iter()
+                .take(MAX_RESIDUE_STAGES)
+                .collect(),
         }
     }
 
@@ -654,7 +662,7 @@ pub struct TeardownCoordinator {
     semaphore: Arc<Semaphore>,
     configured_capacity: usize,
     completed_operation_capacity: usize,
-    completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+    completion_store: Arc<dyn TeardownCompletionStore>,
     state: Arc<Mutex<CoordinatorState>>,
 }
 
@@ -663,6 +671,7 @@ impl TeardownCoordinator {
         admission: Arc<dyn TeardownAdmission>,
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
+        completion_store: Arc<dyn TeardownCompletionStore>,
     ) -> Self {
         Self::with_configuration(
             admission,
@@ -670,6 +679,7 @@ impl TeardownCoordinator {
             clock,
             DEFAULT_CONFIGURED_CAPACITY,
             TeardownBudgets::default(),
+            completion_store,
         )
     }
 
@@ -678,6 +688,7 @@ impl TeardownCoordinator {
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
         configured_capacity: usize,
+        completion_store: Arc<dyn TeardownCompletionStore>,
     ) -> Self {
         Self::with_configuration(
             admission,
@@ -685,6 +696,7 @@ impl TeardownCoordinator {
             clock,
             configured_capacity,
             TeardownBudgets::default(),
+            completion_store,
         )
     }
 
@@ -694,6 +706,7 @@ impl TeardownCoordinator {
         clock: Arc<dyn TeardownClock>,
         configured_capacity: usize,
         budgets: TeardownBudgets,
+        completion_store: Arc<dyn TeardownCompletionStore>,
     ) -> Self {
         Self::with_configuration_and_completion_store(
             admission,
@@ -702,7 +715,7 @@ impl TeardownCoordinator {
             configured_capacity,
             budgets,
             DEFAULT_COMPLETED_OPERATION_CAPACITY,
-            None,
+            completion_store,
         )
     }
 
@@ -713,7 +726,7 @@ impl TeardownCoordinator {
         configured_capacity: usize,
         budgets: TeardownBudgets,
         completed_operation_capacity: usize,
-        completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+        completion_store: Arc<dyn TeardownCompletionStore>,
     ) -> Self {
         let configured_capacity = configured_capacity.max(1);
         let completed_operation_capacity = completed_operation_capacity.max(1);
@@ -772,29 +785,21 @@ impl TeardownCoordinator {
                     detail: "completed teardown handoff is unavailable".to_string(),
                 });
             }
-            if let Some(store) = &self.completion_store {
-                match store.lookup(&key) {
-                    Ok(Some(report)) => {
-                        if report.action_epoch() != key.action_epoch
-                            || report.fence() != key.fence()
-                        {
-                            return Err(TeardownReject::CompletionLookupFailed {
-                                detail: "completion store returned a mismatched report".to_string(),
-                            });
-                        }
-                        let cell = Arc::new(CleanupCell::new());
-                        cell.finish(report);
-                        return Ok(TeardownWaiter { cell });
+            match self.completion_store.lookup(&key) {
+                Ok(Some(report)) => {
+                    if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
+                        return Err(TeardownReject::CompletionLookupFailed {
+                            detail: "completion store returned a mismatched report".to_string(),
+                        });
                     }
-                    Ok(None) => {}
-                    Err(detail) => {
-                        return Err(TeardownReject::CompletionLookupFailed { detail });
-                    }
+                    let cell = Arc::new(CleanupCell::new());
+                    cell.finish(report);
+                    return Ok(TeardownWaiter { cell });
                 }
-            } else if state.active.len() + state.completed.len()
-                >= self.completed_operation_capacity
-            {
-                return Err(TeardownReject::CompletionJournalFull);
+                Ok(None) => {}
+                Err(detail) => {
+                    return Err(TeardownReject::CompletionLookupFailed { detail });
+                }
             }
 
             let receipt = self
@@ -839,22 +844,20 @@ impl TeardownCoordinator {
                 cell: Arc::clone(&existing.cell),
             });
         }
-        if let Some(store) = &self.completion_store {
-            match store.lookup(&key) {
-                Ok(Some(report)) => {
-                    if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
-                        return Err(TeardownReject::CompletionLookupFailed {
-                            detail: "completion store returned a mismatched report".to_string(),
-                        });
-                    }
-                    let cell = Arc::new(CleanupCell::new());
-                    cell.finish(report);
-                    return Ok(TeardownWaiter { cell });
+        match self.completion_store.lookup(&key) {
+            Ok(Some(report)) => {
+                if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
+                    return Err(TeardownReject::CompletionLookupFailed {
+                        detail: "completion store returned a mismatched report".to_string(),
+                    });
                 }
-                Ok(None) => {}
-                Err(detail) => {
-                    return Err(TeardownReject::CompletionLookupFailed { detail });
-                }
+                let cell = Arc::new(CleanupCell::new());
+                cell.finish(report);
+                return Ok(TeardownWaiter { cell });
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                return Err(TeardownReject::CompletionLookupFailed { detail });
             }
         }
         Err(TeardownReject::NoMatchingCleanup)
@@ -925,37 +928,28 @@ fn completion_key(ticket: &TeardownTicket) -> TeardownCompletionKey {
 
 fn handoff_completed_cleanup(
     state: &Arc<Mutex<CoordinatorState>>,
-    completion_store: Option<Arc<dyn TeardownCompletionStore>>,
+    completion_store: Arc<dyn TeardownCompletionStore>,
     completed_operation_capacity: usize,
     key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
     report: TeardownReport,
 ) -> TeardownReport {
-    if let Some(store) = &completion_store {
-        if let Err(detail) = store.persist(&key, &report) {
-            state
-                .lock()
-                .expect("teardown coordinator state mutex poisoned")
-                .handoff_failed = true;
-            return report.with_handoff_error(format!(
-                "completed teardown handoff failed: {}",
-                sanitize_text(&detail)
-            ));
-        }
+    if let Err(detail) = completion_store.persist(&key, &report) {
+        state
+            .lock()
+            .expect("teardown coordinator state mutex poisoned")
+            .handoff_failed = true;
+        return report.with_handoff_error(format!(
+            "completed teardown handoff failed: {}",
+            sanitize_text(&detail)
+        ));
     }
 
     let mut state = state
         .lock()
         .expect("teardown coordinator state mutex poisoned");
     if state.completed.len() >= completed_operation_capacity {
-        if completion_store.is_some() {
-            state.completed.pop_front();
-        } else {
-            state.handoff_failed = true;
-            return report.with_handoff_error(
-                "completed teardown journal reached capacity before handoff".to_string(),
-            );
-        }
+        state.completed.pop_front();
     }
     state.active.retain(|active| active.key != key);
     state.completed.push_back(CompletedCleanup { key, cell });
@@ -1078,7 +1072,13 @@ async fn execute_cleanup(
         return settle_after_zero(ticket, effects, attempted_stages, errors).await;
     }
 
-    let residue = effects.residue(&ticket).await;
+    let residue = required_residue(
+        &ticket,
+        &attempted_stages,
+        &errors,
+        TeardownOutcome::Leaked,
+        effects.residue(&ticket).await,
+    );
     TeardownReport {
         ticket,
         outcome: TeardownOutcome::Leaked,
@@ -1102,9 +1102,9 @@ async fn try_settle_after_wait(
     errors: &mut Vec<String>,
 ) -> bool {
     match result {
-        WaitResult::Zero { proof } if proof.fence() == ticket.fence() => {
+        WaitResult::Zero => {
             attempted_stages.push(TeardownStage::SettleActiveProcessZero);
-            match effects.settle_active_process_zero(ticket, proof).await {
+            match effects.settle_active_process_zero(ticket).await {
                 StageResult::Completed => true,
                 StageResult::Failed { detail } => {
                     errors.push(format!(
@@ -1115,7 +1115,6 @@ async fn try_settle_after_wait(
                 }
             }
         }
-        WaitResult::Zero { .. } => false,
         WaitResult::TimedOut => false,
         WaitResult::Failed { detail } => {
             errors.push(format!("zero wait failed: {}", sanitize_text(&detail)));
@@ -1160,7 +1159,13 @@ async fn settle_after_zero(
         }
     };
     let residue = if outcome != TeardownOutcome::Closed {
-        effects.residue(&ticket).await
+        required_residue(
+            &ticket,
+            &attempted_stages,
+            &errors,
+            outcome,
+            effects.residue(&ticket).await,
+        )
     } else {
         None
     };
@@ -1171,4 +1176,79 @@ async fn settle_after_zero(
         errors,
         residue,
     }
+}
+
+fn required_residue(
+    ticket: &TeardownTicket,
+    attempted_stages: &[TeardownStage],
+    errors: &[String],
+    outcome: TeardownOutcome,
+    residue: Option<ResidueEvidence>,
+) -> Option<ResidueEvidence> {
+    let fallback = {
+        let root = ticket.fence().root();
+        let last_stage = attempted_stages
+            .last()
+            .map(|stage| format!("{stage:?}"))
+            .unwrap_or_else(|| "<unavailable: no lifecycle stage recorded>".to_string());
+        let detail = errors
+            .last()
+            .map(|error| format!("; detail={error}"))
+            .unwrap_or_default();
+        ResidueEvidence::new(
+            UNAVAILABLE_JOB_IDENTITY,
+            root.id().pid(),
+            root.id().creation_time_100ns(),
+            UNAVAILABLE_ROOT_EXECUTABLE,
+            UNAVAILABLE_ROOT_COMMAND,
+            format!(
+                "resource={}; state={outcome:?}; last_lifecycle_stage={last_stage}{detail}",
+                ticket.resource_id()
+            ),
+            attempted_stages.to_vec(),
+        )
+    };
+    let residue = residue.unwrap_or(fallback.clone());
+    let last_lifecycle_event = if residue.last_lifecycle_event.is_empty() {
+        fallback.last_lifecycle_event.clone()
+    } else {
+        format!(
+            "resource={}; state={outcome:?}; last_lifecycle_event={}",
+            ticket.resource_id(),
+            &residue.last_lifecycle_event
+        )
+    };
+    Some(ResidueEvidence::new(
+        if residue.job_name.is_empty() {
+            &fallback.job_name
+        } else {
+            &residue.job_name
+        },
+        if residue.pid == 0 {
+            fallback.pid
+        } else {
+            residue.pid
+        },
+        if residue.creation_time_100ns == 0 {
+            fallback.creation_time_100ns
+        } else {
+            residue.creation_time_100ns
+        },
+        if residue.executable.is_empty() {
+            &fallback.executable
+        } else {
+            &residue.executable
+        },
+        if residue.command_label.is_empty() {
+            &fallback.command_label
+        } else {
+            &residue.command_label
+        },
+        last_lifecycle_event,
+        if residue.attempted_stages.is_empty() {
+            fallback.attempted_stages
+        } else {
+            residue.attempted_stages
+        },
+    ))
 }
