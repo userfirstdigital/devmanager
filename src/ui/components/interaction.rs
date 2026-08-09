@@ -34,6 +34,15 @@ pub enum ComponentError {
         actual: usize,
     },
     InvalidLimit(&'static str),
+    LimitTooLarge {
+        field: &'static str,
+        max: usize,
+        actual: usize,
+    },
+    StaleFocusEpoch {
+        current: u64,
+        attempted: u64,
+    },
 }
 
 impl Display for ComponentError {
@@ -60,6 +69,13 @@ impl Display for ComponentError {
                 )
             }
             Self::InvalidLimit(field) => write!(formatter, "{field} must be greater than zero"),
+            Self::LimitTooLarge { field, max, actual } => {
+                write!(formatter, "{field} exceeds safe maximum {max} ({actual})")
+            }
+            Self::StaleFocusEpoch { current, attempted } => write!(
+                formatter,
+                "focus epoch {attempted} is stale; current host epoch is {current}"
+            ),
         }
     }
 }
@@ -92,6 +108,63 @@ pub fn bounded_text(
         });
     }
     Ok(value)
+}
+
+pub(crate) fn redacted_bounded_text(
+    field: &'static str,
+    value: impl Into<String>,
+    max_scalars: usize,
+    max_bytes: usize,
+) -> Result<String, ComponentError> {
+    let value = crate::diagnostics::runner::redact_secrets(&value.into());
+    let value = redact_ui_credential_lines(&value);
+    bounded_text(field, value, max_scalars, max_bytes)
+}
+
+fn redact_ui_credential_lines(value: &str) -> String {
+    value
+        .split_inclusive('\n')
+        .map(|line| {
+            let (body, trailing) = line
+                .strip_suffix('\n')
+                .map(|body| (body, "\n"))
+                .unwrap_or((line, ""));
+            let lower = body.to_ascii_lowercase();
+            if contains_ui_credential_marker(&lower) {
+                format!("[redacted]{trailing}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
+fn contains_ui_credential_marker(lower: &str) -> bool {
+    [
+        "api_key",
+        "api-key",
+        "apikey",
+        "aws_access_key",
+        "aws-access-key",
+        "aws_secret_key",
+        "aws-secret-key",
+        "access_key_id",
+        "access-key-id",
+        "secret_access_key",
+        "secret-access-key",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || [
+            "authorization:",
+            "authorization=",
+            "\"authorization\"",
+            "'authorization'",
+            "authorization bearer ",
+            "authorization basic ",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,7 +264,7 @@ impl AccessibilityMetadata {
 
     pub fn set_error(&mut self, error: Option<impl Into<String>>) -> Result<(), ComponentError> {
         self.error = match error {
-            Some(error) => Some(bounded_text(
+            Some(error) => Some(redacted_bounded_text(
                 "accessible error",
                 error,
                 MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
@@ -404,16 +477,29 @@ impl InteractionStateModel {
         self.focus_epoch
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
-        if self.focus_epoch != focus_epoch {
-            self.focus_epoch = focus_epoch;
-            self.press_owner = None;
-            let state = self.state;
-            self.state = state
-                .transition(InteractionTransition::Release)
-                .and_then(|state| state.transition(InteractionTransition::Blur))
-                .unwrap_or_else(|_| state.fail_closed());
+    pub fn set_focus_epoch(&mut self, focus_epoch: u64) -> bool {
+        self.try_set_focus_epoch(focus_epoch).is_ok()
+    }
+
+    pub fn try_set_focus_epoch(&mut self, focus_epoch: u64) -> Result<(), ComponentError> {
+        if focus_epoch < self.focus_epoch {
+            return Err(ComponentError::StaleFocusEpoch {
+                current: self.focus_epoch,
+                attempted: focus_epoch,
+            });
         }
+        if self.focus_epoch == focus_epoch {
+            return Ok(());
+        }
+
+        self.focus_epoch = focus_epoch;
+        self.press_owner = None;
+        let state = self.state;
+        self.state = state
+            .transition(InteractionTransition::Release)
+            .and_then(|state| state.transition(InteractionTransition::Blur))
+            .unwrap_or_else(|_| state.fail_closed());
+        Ok(())
     }
 
     pub fn transition(&mut self, transition: InteractionTransition) -> Result<(), ComponentError> {

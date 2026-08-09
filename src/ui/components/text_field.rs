@@ -1,9 +1,13 @@
 //! Bounded text-field model with explicit read-only and disabled behavior.
 
 use super::interaction::{
-    AccessibilityMetadata, AccessibleRole, ComponentError, InteractionStateModel,
+    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ComponentError,
+    InteractionStateModel, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use std::fmt::{Display, Formatter};
+
+pub const MAX_TEXT_FIELD_SCALARS: usize = 4_096;
+pub const MAX_TEXT_FIELD_BYTES: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextFieldLimits {
@@ -13,24 +17,43 @@ pub struct TextFieldLimits {
 
 impl TextFieldLimits {
     pub const fn new(max_scalars: usize, max_bytes: usize) -> Result<Self, ComponentError> {
-        if max_scalars == 0 {
-            return Err(ComponentError::InvalidLimit("maximum scalar count"));
-        }
-        if max_bytes == 0 {
-            return Err(ComponentError::InvalidLimit("maximum byte count"));
-        }
-        Ok(Self {
+        let limits = Self {
             max_scalars,
             max_bytes,
-        })
+        };
+        limits.validate()
+    }
+
+    pub const fn validate(self) -> Result<Self, ComponentError> {
+        if self.max_scalars == 0 {
+            return Err(ComponentError::InvalidLimit("maximum scalar count"));
+        }
+        if self.max_scalars > MAX_TEXT_FIELD_SCALARS {
+            return Err(ComponentError::LimitTooLarge {
+                field: "maximum scalar count",
+                max: MAX_TEXT_FIELD_SCALARS,
+                actual: self.max_scalars,
+            });
+        }
+        if self.max_bytes == 0 {
+            return Err(ComponentError::InvalidLimit("maximum byte count"));
+        }
+        if self.max_bytes > MAX_TEXT_FIELD_BYTES {
+            return Err(ComponentError::LimitTooLarge {
+                field: "maximum byte count",
+                max: MAX_TEXT_FIELD_BYTES,
+                actual: self.max_bytes,
+            });
+        }
+        Ok(self)
     }
 }
 
 impl Default for TextFieldLimits {
     fn default() -> Self {
         Self {
-            max_scalars: 4096,
-            max_bytes: 16384,
+            max_scalars: MAX_TEXT_FIELD_SCALARS,
+            max_bytes: MAX_TEXT_FIELD_BYTES,
         }
     }
 }
@@ -102,7 +125,13 @@ impl TextField {
         label: impl Into<String>,
         limits: TextFieldLimits,
     ) -> Result<Self, TextFieldError> {
-        let label = super::interaction::bounded_text("text field label", label, 256, 1024)?;
+        let limits = limits.validate()?;
+        let label = redacted_bounded_text(
+            "text field label",
+            label,
+            MAX_ACCESSIBLE_NAME_SCALARS,
+            MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )?;
         Ok(Self {
             accessibility: AccessibilityMetadata::new(AccessibleRole::TextField, label.clone())?,
             value: String::new(),
@@ -152,8 +181,12 @@ impl TextField {
         &mut self,
         description: impl Into<String>,
     ) -> Result<(), TextFieldError> {
-        self.description =
-            super::interaction::bounded_text("text field description", description, 512, 2048)?;
+        self.description = redacted_bounded_text(
+            "text field description",
+            description,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
+        )?;
         self.accessibility
             .set_description(self.description.clone())?;
         Ok(())
@@ -161,11 +194,11 @@ impl TextField {
 
     pub fn set_error(&mut self, error: Option<impl Into<String>>) -> Result<(), TextFieldError> {
         self.error = match error {
-            Some(error) => Some(super::interaction::bounded_text(
+            Some(error) => Some(redacted_bounded_text(
                 "text field error",
                 error,
-                512,
-                2048,
+                MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+                MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
             )?),
             None => None,
         };
@@ -191,9 +224,10 @@ impl TextField {
         self.accessibility.read_only = read_only;
     }
 
-    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
-        self.interaction.set_focus_epoch(focus_epoch);
+    pub fn set_focus_epoch(&mut self, focus_epoch: u64) -> bool {
+        let accepted = self.interaction.set_focus_epoch(focus_epoch);
         self.accessibility.focused = self.interaction.state().focused;
+        accepted
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
@@ -215,8 +249,13 @@ impl TextField {
         self.accessibility.focused = false;
     }
 
-    pub fn handle_key(&mut self, key: TextFieldKey) -> Result<bool, TextFieldError> {
-        if self.interaction.state().disabled || !self.interaction.state().focused {
+    pub fn handle_key(
+        &mut self,
+        key: TextFieldKey,
+        focus_epoch: u64,
+    ) -> Result<bool, TextFieldError> {
+        let state = self.interaction.state();
+        if self.interaction.focus_epoch() != focus_epoch || state.disabled || !state.focused {
             return Ok(false);
         }
         match key {

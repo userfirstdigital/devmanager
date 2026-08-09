@@ -2,7 +2,8 @@
 
 use super::button::Button;
 use super::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ComponentError, KeyboardKey,
+    redacted_bounded_text, AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest,
+    ComponentError, KeyboardKey, MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
     MAX_RECOVERY_ACTIONS,
 };
 
@@ -15,6 +16,12 @@ impl RecoveryAction {
         label: impl Into<String>,
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
+        let label = redacted_bounded_text(
+            "recovery action label",
+            label,
+            MAX_ACCESSIBLE_NAME_SCALARS,
+            MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )?;
         Ok(Self {
             button: Button::new_variant(
                 label,
@@ -36,12 +43,28 @@ impl RecoveryAction {
         self.button.set_focus_epoch(focus_epoch);
     }
 
+    pub fn focus(&mut self) -> bool {
+        self.button.focus()
+    }
+
+    pub fn blur(&mut self) {
+        self.button.blur();
+    }
+
     pub fn accessibility(&self) -> &super::interaction::AccessibilityMetadata {
         self.button.accessibility()
     }
 
     pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
         self.button.key_activate(key, focus_epoch)
+    }
+
+    pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+        self.button.pointer_down(pointer_id, focus_epoch)
+    }
+
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
+        self.button.pointer_up(pointer_id, focus_epoch)
     }
 
     pub fn activate(&self, focus_epoch: u64) -> Option<ActionEvent> {
@@ -61,9 +84,18 @@ impl EmptyState {
         title: impl Into<String>,
         description: impl Into<String>,
     ) -> Result<Self, ComponentError> {
-        let title = super::interaction::bounded_text("empty state title", title, 256, 1024)?;
-        let description =
-            super::interaction::bounded_text("empty state description", description, 512, 2048)?;
+        let title = redacted_bounded_text(
+            "empty state title",
+            title,
+            MAX_ACCESSIBLE_NAME_SCALARS,
+            MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )?;
+        let description = redacted_bounded_text(
+            "empty state description",
+            description,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
+        )?;
         let mut accessibility = AccessibilityMetadata::new(AccessibleRole::Region, title.clone())?;
         accessibility.set_description(description.clone())?;
         Ok(Self {
@@ -107,11 +139,61 @@ impl EmptyState {
         &self.recovery_actions
     }
 
-    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
+    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+        for action in &mut self.recovery_actions {
+            action.set_focus_epoch(focus_epoch);
+        }
+    }
+
+    pub fn focus_recovery(&mut self, index: usize) -> bool {
+        self.recovery_actions
+            .get_mut(index)
+            .map(RecoveryAction::focus)
+            .unwrap_or(false)
+    }
+
+    pub fn blur_recovery(&mut self, index: usize) {
+        if let Some(action) = self.recovery_actions.get_mut(index) {
+            action.blur();
+        }
+    }
+
+    pub fn pointer_down_recovery(
+        &mut self,
+        index: usize,
+        pointer_id: u64,
+        focus_epoch: u64,
+    ) -> bool {
+        self.recovery_actions
+            .get_mut(index)
+            .map(|action| action.pointer_down(pointer_id, focus_epoch))
+            .unwrap_or(false)
+    }
+
+    pub fn pointer_up_recovery(
+        &mut self,
+        index: usize,
+        pointer_id: u64,
+        focus_epoch: u64,
+    ) -> Option<ActionEvent> {
+        self.recovery_actions
+            .get_mut(index)
+            .and_then(|action| action.pointer_up(pointer_id, focus_epoch))
+    }
+
+    pub fn key_activate_recovery(
+        &self,
+        index: usize,
+        key: KeyboardKey,
+        focus_epoch: u64,
+    ) -> Option<ActionEvent> {
         self.recovery_actions
             .get(index)
-            .map(|action| action.activate(focus_epoch))
-            .flatten()
+            .and_then(|action| action.key_activate(key, focus_epoch))
+    }
+
+    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
+        self.key_activate_recovery(index, KeyboardKey::Enter, focus_epoch)
     }
 
     pub fn accessibility(&self) -> &AccessibilityMetadata {
