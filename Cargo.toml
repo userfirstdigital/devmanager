@@ -5,6 +5,12 @@ edition = "2021"
 description = "Native GPUI rewrite of DevManager"
 license = "Apache-2.0"
 
+[[bin]]
+name = "devmanager-provider-probe-fixture"
+path = "tests/fixtures/providers/probe_fixture.rs"
+test = false
+bench = false
+
 [dependencies]
 alacritty_terminal = "0.25.1"
 arboard = "3.6.1"

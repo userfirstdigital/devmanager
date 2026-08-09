@@ -1,0 +1,1039 @@
+//! Object-safe provider adapter and bounded native-CLI boundaries.
+//!
+//! This phase defines the provider-neutral contracts only. It does not launch
+//! a provider runtime, infer authentication, or consume a quota subscription.
+
+use crate::domain::ProviderSessionId;
+use crate::providers::capabilities::{
+    ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability, ProviderExecutable,
+    ProviderExecutableError, ProviderExecutablePolicy, ProviderExecutablePolicyError, ProviderKind,
+    ProviderVersion, ProviderVersionError,
+};
+use async_trait::async_trait;
+use std::fmt;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+pub const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_SIGNAL_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_ARGUMENTS: usize = 32;
+pub const MAX_PROVIDER_ARGUMENT_BYTES: usize = 2048;
+pub const MAX_PROVIDER_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_PROBE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderInputError {
+    Empty,
+    TooLarge,
+    TooManyArguments,
+    ArgumentTooLong,
+}
+
+impl fmt::Display for ProviderInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "provider input must be non-empty"),
+            Self::TooLarge => write!(f, "provider input exceeded its byte bound"),
+            Self::TooManyArguments => write!(f, "provider launch contained too many arguments"),
+            Self::ArgumentTooLong => write!(f, "provider launch argument exceeded its byte bound"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderInputError {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderInput(Vec<u8>);
+
+impl ProviderInput {
+    pub fn new(input: impl Into<Vec<u8>>) -> Result<Self, ProviderInputError> {
+        let input = input.into();
+        if input.is_empty() {
+            return Err(ProviderInputError::Empty);
+        }
+        if input.len() > MAX_PROVIDER_INPUT_BYTES {
+            return Err(ProviderInputError::TooLarge);
+        }
+        Ok(Self(input))
+    }
+
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProviderInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderInput")
+            .field("bytes", &self.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderArgument(String);
+
+impl ProviderArgument {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProviderInputError> {
+        let value = value.into();
+        if value.len() > MAX_PROVIDER_ARGUMENT_BYTES {
+            return Err(ProviderInputError::ArgumentTooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ProviderInputError::ArgumentTooLong);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchProviderRequest {
+    executable: ProviderExecutable,
+    input: Option<ProviderInput>,
+    provider_session_id: Option<ProviderSessionId>,
+}
+
+impl LaunchProviderRequest {
+    pub const fn new(
+        executable: ProviderExecutable,
+        input: Option<ProviderInput>,
+        provider_session_id: Option<ProviderSessionId>,
+    ) -> Self {
+        Self {
+            executable,
+            input,
+            provider_session_id,
+        }
+    }
+
+    pub fn executable(&self) -> &ProviderExecutable {
+        &self.executable
+    }
+
+    pub fn input(&self) -> Option<&ProviderInput> {
+        self.input.as_ref()
+    }
+
+    pub fn provider_session_id(&self) -> Option<&ProviderSessionId> {
+        self.provider_session_id.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderLaunchSpec {
+    executable: ProviderExecutable,
+    arguments: Vec<ProviderArgument>,
+}
+
+impl ProviderLaunchSpec {
+    pub fn new(
+        executable: ProviderExecutable,
+        arguments: Vec<ProviderArgument>,
+    ) -> Result<Self, ProviderInputError> {
+        if arguments.len() > MAX_PROVIDER_ARGUMENTS {
+            return Err(ProviderInputError::TooManyArguments);
+        }
+        Ok(Self {
+            executable,
+            arguments,
+        })
+    }
+
+    pub fn executable(&self) -> &ProviderExecutable {
+        &self.executable
+    }
+
+    pub fn arguments(&self) -> impl Iterator<Item = &str> {
+        self.arguments.iter().map(ProviderArgument::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderSignal {
+    SessionStarted(ProviderSessionId),
+    SessionEnded,
+    TurnCompleted,
+    PermissionRequired,
+}
+
+/// Task 4.1 keeps the normalized journal event opaque until the journal task
+/// owns its concrete event model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEvent;
+
+/// Task 4.1 keeps runtime ownership opaque until provider runtime startup is
+/// implemented by the later provider-session task.
+#[derive(Debug, Default)]
+pub struct ProviderRuntime;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStrategy {
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderQuotaStatus {
+    Available,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaObservation {
+    status: ProviderQuotaStatus,
+    remaining_percent: Option<u8>,
+    resets_at_ms: Option<u64>,
+}
+
+impl QuotaObservation {
+    pub fn new(
+        status: ProviderQuotaStatus,
+        remaining_percent: Option<u8>,
+        resets_at_ms: Option<u64>,
+    ) -> Result<Self, ProviderInputError> {
+        if remaining_percent.is_some_and(|percent| percent > 100) {
+            return Err(ProviderInputError::ArgumentTooLong);
+        }
+        Ok(Self {
+            status,
+            remaining_percent,
+            resets_at_ms,
+        })
+    }
+
+    pub const fn status(self) -> ProviderQuotaStatus {
+        self.status
+    }
+
+    pub const fn remaining_percent(self) -> Option<u8> {
+        self.remaining_percent
+    }
+
+    pub const fn resets_at_ms(self) -> Option<u64> {
+        self.resets_at_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProbeKind {
+    Version,
+    Help,
+    AuthStatus,
+}
+
+impl ProviderProbeKind {
+    pub const fn arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Version => &["--version"],
+            Self::Help => &["--help"],
+            Self::AuthStatus => &["auth", "status"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProbeRequestError {
+    EmptyExecutable,
+    ZeroTimeout,
+    TimeoutTooLong,
+    OutputBoundTooLarge,
+}
+
+impl fmt::Display for ProviderProbeRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyExecutable => write!(f, "provider probe executable must be non-empty"),
+            Self::ZeroTimeout => write!(f, "provider probe timeout must be non-zero"),
+            Self::TimeoutTooLong => write!(f, "provider probe timeout exceeded its bound"),
+            Self::OutputBoundTooLarge => write!(f, "provider probe output bound is too large"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderProbeRequestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderProbeRequest {
+    executable: PathBuf,
+    kind: ProviderProbeKind,
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl ProviderProbeRequest {
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_OUTPUT_BYTES: usize = MAX_PROVIDER_PROBE_OUTPUT_BYTES;
+
+    pub fn version(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable.into(), ProviderProbeKind::Version)
+    }
+
+    pub fn help(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable.into(), ProviderProbeKind::Help)
+    }
+
+    pub fn auth_status(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable.into(), ProviderProbeKind::AuthStatus)
+    }
+
+    pub fn new(
+        executable: PathBuf,
+        kind: ProviderProbeKind,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        Self::with_limits(
+            executable,
+            kind,
+            Self::DEFAULT_TIMEOUT,
+            Self::DEFAULT_MAX_OUTPUT_BYTES,
+        )
+    }
+
+    pub fn with_limits(
+        executable: PathBuf,
+        kind: ProviderProbeKind,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        if executable.as_os_str().is_empty() {
+            return Err(ProviderProbeRequestError::EmptyExecutable);
+        }
+        if timeout.is_zero() {
+            return Err(ProviderProbeRequestError::ZeroTimeout);
+        }
+        if timeout > MAX_PROVIDER_PROBE_TIMEOUT {
+            return Err(ProviderProbeRequestError::TimeoutTooLong);
+        }
+        if max_output_bytes == 0 || max_output_bytes > MAX_PROVIDER_PROBE_OUTPUT_BYTES {
+            return Err(ProviderProbeRequestError::OutputBoundTooLarge);
+        }
+        Ok(Self {
+            executable,
+            kind,
+            timeout,
+            max_output_bytes,
+        })
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub const fn kind(&self) -> ProviderProbeKind {
+        self.kind
+    }
+
+    pub const fn arguments(&self) -> &'static [&'static str] {
+        self.kind.arguments()
+    }
+
+    pub const fn uses_null_stdin(&self) -> bool {
+        true
+    }
+
+    pub const fn uses_shell(&self) -> bool {
+        false
+    }
+
+    pub const fn strips_api_key_environment(&self) -> bool {
+        true
+    }
+
+    pub const fn kills_descendants_on_timeout(&self) -> bool {
+        true
+    }
+
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub const fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProbeFailureCode {
+    ExecutableMissing,
+    PermissionDenied,
+    SpawnFailed,
+    WaitFailed,
+    DescendantCleanupFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProbeStatus {
+    Completed,
+    NonZeroExit,
+    TimedOut,
+    OutputTooLarge,
+    Failed(ProviderProbeFailureCode),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderProbeOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    overflowed: bool,
+}
+
+impl fmt::Debug for ProviderProbeOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderProbeOutput")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("exit_code", &self.exit_code)
+            .finish()
+    }
+}
+
+impl ProviderProbeOutput {
+    pub(crate) fn new(
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i32>,
+    ) -> Result<Self, ProviderProbeError> {
+        if stdout.len() > MAX_PROVIDER_PROBE_OUTPUT_BYTES
+            || stderr.len() > MAX_PROVIDER_PROBE_OUTPUT_BYTES
+            || stdout.len().saturating_add(stderr.len()) > MAX_PROVIDER_PROBE_OUTPUT_BYTES
+        {
+            return Err(ProviderProbeError::OutputTooLarge);
+        }
+        Ok(Self {
+            stdout,
+            stderr,
+            exit_code,
+            overflowed: false,
+        })
+    }
+
+    fn bounded(
+        max_output_bytes: usize,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i32>,
+        overflowed: bool,
+    ) -> Result<Self, ProviderProbeError> {
+        if stdout.len() > max_output_bytes
+            || stderr.len() > max_output_bytes
+            || stdout.len().saturating_add(stderr.len()) > max_output_bytes
+        {
+            return Err(ProviderProbeError::OutputTooLarge);
+        }
+        let output = Self::new(stdout, stderr, exit_code)?;
+        Ok(Self {
+            overflowed,
+            ..output
+        })
+    }
+
+    pub(crate) fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub(crate) fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    pub(crate) const fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderProbeResult {
+    status: ProviderProbeStatus,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    output: Option<ProviderProbeOutput>,
+}
+
+impl fmt::Debug for ProviderProbeResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderProbeResult")
+            .field("status", &self.status)
+            .field("stdout_bytes", &self.stdout_bytes)
+            .field("stderr_bytes", &self.stderr_bytes)
+            .finish()
+    }
+}
+
+impl ProviderProbeResult {
+    pub fn completed(
+        request: &ProviderProbeRequest,
+        exit_code: i32,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+    ) -> Result<Self, ProviderProbeError> {
+        if stdout_bytes.saturating_add(stderr_bytes) > request.max_output_bytes() {
+            return Err(ProviderProbeError::OutputTooLarge);
+        }
+        let status = if exit_code == 0 {
+            ProviderProbeStatus::Completed
+        } else {
+            ProviderProbeStatus::NonZeroExit
+        };
+        Ok(Self {
+            status,
+            stdout_bytes,
+            stderr_bytes,
+            output: None,
+        })
+    }
+
+    fn with_output(
+        request: &ProviderProbeRequest,
+        output: ProviderProbeOutput,
+    ) -> Result<Self, ProviderProbeError> {
+        if output.stdout.len() > request.max_output_bytes()
+            || output.stderr.len() > request.max_output_bytes()
+            || output.stdout.len().saturating_add(output.stderr.len()) > request.max_output_bytes()
+        {
+            return Err(ProviderProbeError::OutputTooLarge);
+        }
+        let status = if output.overflowed {
+            ProviderProbeStatus::OutputTooLarge
+        } else if output.exit_code() == Some(0) {
+            ProviderProbeStatus::Completed
+        } else {
+            ProviderProbeStatus::NonZeroExit
+        };
+        Ok(Self {
+            status,
+            stdout_bytes: output.stdout.len(),
+            stderr_bytes: output.stderr.len(),
+            output: Some(output),
+        })
+    }
+
+    pub const fn status(&self) -> ProviderProbeStatus {
+        self.status
+    }
+
+    pub const fn stdout_bytes(&self) -> usize {
+        self.stdout_bytes
+    }
+
+    pub const fn stderr_bytes(&self) -> usize {
+        self.stderr_bytes
+    }
+
+    pub fn stdout(&self) -> &[u8] {
+        self.output
+            .as_ref()
+            .map_or(&[], ProviderProbeOutput::stdout)
+    }
+
+    pub fn stderr(&self) -> &[u8] {
+        self.output
+            .as_ref()
+            .map_or(&[], ProviderProbeOutput::stderr)
+    }
+
+    pub(crate) fn output_for_adapter(&self) -> Option<&ProviderProbeOutput> {
+        self.output.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProbeIoError {
+    ExecutableMissing,
+    ExecutableNotAllowed,
+    PermissionDenied,
+    SpawnFailed,
+    WaitFailed,
+    DescendantCleanupFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderProbeError {
+    Io(ProviderProbeIoError),
+    TimedOut,
+    OutputTooLarge,
+    NonZeroExit(Option<i32>),
+    InvalidRequest(ProviderProbeRequestError),
+}
+
+impl fmt::Display for ProviderProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "provider probe I/O failed: {error:?}"),
+            Self::TimedOut => write!(f, "provider probe timed out"),
+            Self::OutputTooLarge => write!(f, "provider probe output exceeded its bound"),
+            Self::NonZeroExit(code) => write!(f, "provider probe exited unsuccessfully: {code:?}"),
+            Self::InvalidRequest(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ProviderProbeError {}
+
+#[async_trait]
+pub trait ProviderProbeRunner: Send + Sync {
+    async fn run(
+        &self,
+        request: ProviderProbeRequest,
+    ) -> Result<ProviderProbeResult, ProviderProbeError>;
+}
+
+/// Runs only an already-resolved executable whose file name is in `policy`.
+///
+/// Windows launches are suspended, claimed by the Phase-3 kill-on-close Job,
+/// and resumed only after the claim succeeds. Both output pipes are drained
+/// concurrently, while a shared admission counter enforces the request's
+/// total byte bound exactly.
+#[derive(Debug, Clone)]
+pub struct WindowsProviderProbeRunner {
+    policy: ProviderExecutablePolicy,
+}
+
+impl WindowsProviderProbeRunner {
+    pub fn new(policy: ProviderExecutablePolicy) -> Self {
+        Self { policy }
+    }
+
+    fn run_blocking(
+        &self,
+        request: ProviderProbeRequest,
+    ) -> Result<ProviderProbeResult, ProviderProbeError> {
+        let executable = validate_probe_executable(&self.policy, request.executable())?;
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(request.arguments())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        scrub_provider_secret_environment(&mut command);
+
+        #[cfg(windows)]
+        command.creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
+
+        let mut process = ProbeProcess::spawn(command)?;
+        let stdout = process
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
+        let stderr = process
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
+        let capture = Arc::new(BoundedProbeCapture::new(request.max_output_bytes()));
+        let stdout_reader = spawn_probe_reader(stdout, Arc::clone(&capture), true);
+        let stderr_reader = spawn_probe_reader(stderr, Arc::clone(&capture), false);
+
+        let deadline = std::time::Instant::now() + request.timeout();
+        let mut timed_out = false;
+        let exit_code = loop {
+            match process
+                .child_mut()
+                .try_wait()
+                .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))?
+            {
+                Some(status) => break status.code(),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                None => {
+                    timed_out = true;
+                    process.terminate_tree();
+                    break None;
+                }
+            }
+        };
+
+        if !timed_out {
+            process.terminate_tree();
+        }
+        receive_probe_reader(stdout_reader)?;
+        receive_probe_reader(stderr_reader)?;
+        let (stdout, stderr, overflowed) = capture.finish();
+        let output = ProviderProbeOutput::bounded(
+            request.max_output_bytes(),
+            stdout,
+            stderr,
+            exit_code,
+            overflowed,
+        )?;
+        if timed_out {
+            return Err(ProviderProbeError::TimedOut);
+        }
+        ProviderProbeResult::with_output(&request, output)
+    }
+}
+
+#[async_trait]
+impl ProviderProbeRunner for WindowsProviderProbeRunner {
+    async fn run(
+        &self,
+        request: ProviderProbeRequest,
+    ) -> Result<ProviderProbeResult, ProviderProbeError> {
+        let runner = self.clone();
+        tokio::task::spawn_blocking(move || runner.run_blocking(request))
+            .await
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))?
+    }
+}
+
+fn validate_probe_executable(
+    policy: &ProviderExecutablePolicy,
+    requested: &Path,
+) -> Result<PathBuf, ProviderProbeError> {
+    if requested.as_os_str().is_empty() {
+        return Err(ProviderProbeError::InvalidRequest(
+            ProviderProbeRequestError::EmptyExecutable,
+        ));
+    }
+    let canonical = std::fs::canonicalize(requested).map_err(|error| {
+        ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
+            ProviderProbeIoError::ExecutableMissing
+        } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+            ProviderProbeIoError::PermissionDenied
+        } else {
+            ProviderProbeIoError::SpawnFailed
+        })
+    })?;
+    if !canonical.is_file() {
+        return Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableMissing,
+        ));
+    }
+    policy
+        .validate_canonical_path(&canonical)
+        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+    Ok(canonical)
+}
+
+fn scrub_provider_secret_environment(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        let normalized = key.to_string_lossy().to_ascii_uppercase();
+        if is_provider_secret_environment_key(&normalized) {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn is_provider_secret_environment_key(key: &str) -> bool {
+    [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "OPENAI_AUTH_TOKEN",
+        "CODEX_API_KEY",
+        "CODEX_AUTH_TOKEN",
+        "CURSOR_API_KEY",
+        "CURSOR_AUTH_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+    ]
+    .iter()
+    .any(|known| *known == key)
+        || key.contains("API_KEY")
+        || key.contains("APIKEY")
+        || key.contains("TOKEN")
+        || key.contains("AUTH_TOKEN")
+        || key.contains("OAUTH_TOKEN")
+        || key.contains("ACCESS_TOKEN")
+        || key.contains("SECRET")
+        || key.contains("CLIENT_SECRET")
+        || key.contains("PRIVATE_KEY")
+        || key.contains("CREDENTIAL")
+}
+
+struct ProbeProcess {
+    child: Child,
+    managed_job: Option<crate::process::job::ManagedProcessJob>,
+}
+
+impl ProbeProcess {
+    fn spawn(mut command: std::process::Command) -> Result<Self, ProviderProbeError> {
+        let mut child = command.spawn().map_err(|error| {
+            ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderProbeIoError::ExecutableMissing
+            } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+                ProviderProbeIoError::PermissionDenied
+            } else {
+                ProviderProbeIoError::SpawnFailed
+            })
+        })?;
+        let managed_job =
+            match crate::services::platform_service::claim_suspended_process(child.id()) {
+                Ok(job) => job,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+                }
+            };
+        #[cfg(windows)]
+        if managed_job.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+        }
+        Ok(Self { child, managed_job })
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn terminate_tree(&mut self) {
+        drop(self.managed_job.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ProbeProcess {
+    fn drop(&mut self) {
+        self.terminate_tree();
+    }
+}
+
+struct BoundedProbeCapture {
+    max_bytes: usize,
+    total_bytes: AtomicUsize,
+    overflowed: AtomicBool,
+    stdout: Mutex<Vec<u8>>,
+    stderr: Mutex<Vec<u8>>,
+}
+
+impl BoundedProbeCapture {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            total_bytes: AtomicUsize::new(0),
+            overflowed: AtomicBool::new(false),
+            stdout: Mutex::new(Vec::new()),
+            stderr: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn append(&self, stdout: bool, bytes: &[u8]) {
+        let mut current = self.total_bytes.load(Ordering::Acquire);
+        let allowed = loop {
+            if current >= self.max_bytes {
+                self.overflowed.store(true, Ordering::Release);
+                break 0;
+            }
+            let allowed = bytes.len().min(self.max_bytes - current);
+            match self.total_bytes.compare_exchange(
+                current,
+                current + allowed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break allowed,
+                Err(next) => current = next,
+            }
+        };
+        if allowed < bytes.len() {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        if allowed == 0 {
+            return;
+        }
+        if stdout {
+            self.stdout
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..allowed]);
+        } else {
+            self.stderr
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..allowed]);
+        }
+    }
+
+    fn finish(&self) -> (Vec<u8>, Vec<u8>, bool) {
+        (
+            std::mem::take(&mut *self.stdout.lock().unwrap()),
+            std::mem::take(&mut *self.stderr.lock().unwrap()),
+            self.overflowed.load(Ordering::Acquire),
+        )
+    }
+}
+
+fn spawn_probe_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+    capture: Arc<BoundedProbeCapture>,
+    stdout: bool,
+) -> mpsc::Receiver<()> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => capture.append(stdout, &buffer[..read]),
+            }
+        }
+        let _ = sender.send(());
+    });
+    receiver
+}
+
+fn receive_probe_reader(receiver: mpsc::Receiver<()>) -> Result<(), ProviderProbeError> {
+    receiver
+        .recv_timeout(PROVIDER_PROBE_DRAIN_TIMEOUT)
+        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    DuplicateProviderKind(ProviderKind),
+    ProviderNotRegistered(ProviderKind),
+    MissingCli {
+        kind: ProviderKind,
+        requested: Option<PathBuf>,
+    },
+    WrapperCommandNotAllowed {
+        path: PathBuf,
+    },
+    ExecutableNotAllowed {
+        kind: ProviderKind,
+        path: PathBuf,
+    },
+    Executable(ProviderExecutableError),
+    ExecutableChanged {
+        before: ProviderExecutable,
+        after: ProviderExecutable,
+    },
+    Probe(ProviderProbeError),
+    MalformedVersion(ProviderVersionError),
+    CapabilityKindMismatch {
+        expected: ProviderKind,
+        actual: ProviderKind,
+    },
+    CapabilityVersionMismatch {
+        expected: ProviderVersion,
+        actual: ProviderVersion,
+    },
+    InvalidCapabilities(ProviderCapabilitiesError),
+    InvalidExecutablePolicy(ProviderExecutablePolicyError),
+    UnsupportedCapability(ProviderCapability),
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateProviderKind(kind) => {
+                write!(f, "provider kind is already registered: {kind:?}")
+            }
+            Self::ProviderNotRegistered(kind) => {
+                write!(f, "provider kind is not registered: {kind:?}")
+            }
+            Self::MissingCli { kind, requested } => {
+                write!(f, "missing {kind:?} CLI: {requested:?}")
+            }
+            Self::WrapperCommandNotAllowed { path } => write!(
+                f,
+                "wrapper commands and package runners are not provider executables: {}",
+                path.display()
+            ),
+            Self::ExecutableNotAllowed { kind, path } => {
+                write!(
+                    f,
+                    "{kind:?} does not declare executable: {}",
+                    path.display()
+                )
+            }
+            Self::Executable(error) => error.fmt(f),
+            Self::ExecutableChanged { .. } => {
+                write!(f, "provider executable identity changed during observation")
+            }
+            Self::Probe(error) => error.fmt(f),
+            Self::MalformedVersion(error) => error.fmt(f),
+            Self::CapabilityKindMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "adapter returned {actual:?} capabilities for {expected:?}"
+                )
+            }
+            Self::CapabilityVersionMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "adapter returned version {actual} after probing {expected}"
+                )
+            }
+            Self::InvalidCapabilities(error) => write!(f, "invalid provider capabilities: {error}"),
+            Self::InvalidExecutablePolicy(error) => {
+                write!(f, "invalid provider executable policy: {error}")
+            }
+            Self::UnsupportedCapability(capability) => {
+                write!(f, "provider capability is unsupported: {capability:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+impl From<ProviderProbeError> for ProviderError {
+    fn from(error: ProviderProbeError) -> Self {
+        Self::Probe(error)
+    }
+}
+
+impl From<ProviderVersionError> for ProviderError {
+    fn from(error: ProviderVersionError) -> Self {
+        Self::MalformedVersion(error)
+    }
+}
+
+impl From<ProviderCapabilitiesError> for ProviderError {
+    fn from(error: ProviderCapabilitiesError) -> Self {
+        Self::InvalidCapabilities(error)
+    }
+}
+
+#[async_trait]
+pub trait ProviderAdapter: Send + Sync {
+    fn kind(&self) -> ProviderKind;
+
+    /// Probe all Task 4.1 capabilities, including a fresh auth-status probe.
+    /// Authenticated and auth-required results are valid only when the
+    /// returned capabilities carry matching `AuthStatusProbe` evidence.
+    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError>;
+
+    fn build_launch(
+        &self,
+        request: LaunchProviderRequest,
+    ) -> Result<ProviderLaunchSpec, ProviderError>;
+
+    fn parse_signal(&self, signal: ProviderSignal) -> Vec<JournalEvent>;
+
+    fn cooperative_stop(&self, session: &ProviderRuntime) -> StopStrategy;
+
+    async fn observe_quota(
+        &self,
+        executable: &Path,
+    ) -> Result<Option<QuotaObservation>, ProviderError>;
+}
