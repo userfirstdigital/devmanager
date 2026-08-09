@@ -11,16 +11,18 @@ use devmanager::domain::{
     ProjectId, Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
     RejectionCode, RequestId, ResourceId, ResourceKind, ResourceLifecycle, ReviewReadiness,
     SubscriptionId, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskId,
-    WorkspaceRef,
+    TransferId, WorkspaceRef,
 };
 use devmanager::protocol::{
-    Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, ClientRequest,
-    DetachAck, DetachRequest, FrameLimitField, FrameLimits, FrameLimitsError, MessagePackCodec,
-    MessagePackError, MessagePackLengthKind, PhysicalFrameCodec, PhysicalFrameError,
-    ProfileFingerprint, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
-    VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
-    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    Capability, CapabilitySet, ChunkContext, ChunkFrame, ChunkLimits, ClientBuildError,
+    ClientHello, ClientHelloError, ClientRequest, DetachAck, DetachRequest, FrameLimitField,
+    FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
+    PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint, ProtocolVersion, ServerMessage,
+    StreamFrame, StreamKey, StreamPayloadKind, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
+    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[test]
@@ -5041,4 +5043,371 @@ fn protocol_confirm_host_quit_is_strict_global_command() {
     );
 
     let _ = command;
+}
+
+fn protocol_transfer_id(tail: u8) -> TransferId {
+    TransferId::from_bytes(protocol_uuid_v7(tail)).expect("transfer id")
+}
+
+fn protocol_sha256(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn protocol_chunk(
+    transfer_id: TransferId,
+    index: u32,
+    final_chunk: bool,
+    payload: &[u8],
+    accepted: &[&[u8]],
+    resume_cursor: Option<Vec<u8>>,
+) -> ChunkFrame {
+    ChunkFrame {
+        transfer_id,
+        index,
+        final_chunk,
+        payload: payload.to_vec(),
+        cumulative_sha256: protocol_sha256(accepted),
+        resume_cursor,
+    }
+}
+
+#[test]
+fn chunk_wire_shape_is_named_binary_and_canonical() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let frame = protocol_chunk(
+        protocol_transfer_id(0xa1),
+        0,
+        true,
+        b"abc",
+        &[b"abc"],
+        Some(b"cursor-1".to_vec()),
+    );
+
+    let encoded = codec.encode(&frame).expect("encode chunk");
+    assert_eq!(encoded[0], 0x86, "chunk frame is one six-field map");
+    for field in [
+        "transfer_id",
+        "index",
+        "final_chunk",
+        "payload",
+        "cumulative_sha256",
+        "resume_cursor",
+    ] {
+        assert!(
+            encoded
+                .windows(field.len())
+                .any(|window| window == field.as_bytes()),
+            "canonical field {field} is present"
+        );
+    }
+    assert!(
+        encoded.windows(b"abc".len()).any(|window| window == b"abc"),
+        "payload is present as binary bytes"
+    );
+    assert_eq!(
+        codec
+            .encode(&codec.decode::<ChunkFrame>(&encoded).unwrap())
+            .unwrap(),
+        encoded
+    );
+
+    #[derive(serde::Serialize)]
+    struct UnknownChunk {
+        transfer_id: TransferId,
+        index: u32,
+        final_chunk: bool,
+        payload: Vec<u8>,
+        cumulative_sha256: [u8; 32],
+        resume_cursor: Option<Vec<u8>>,
+        future_field: bool,
+    }
+    let unknown = UnknownChunk {
+        transfer_id: frame.transfer_id,
+        index: frame.index,
+        final_chunk: frame.final_chunk,
+        payload: frame.payload.clone(),
+        cumulative_sha256: frame.cumulative_sha256,
+        resume_cursor: frame.resume_cursor.clone(),
+        future_field: true,
+    };
+    assert!(codec
+        .decode::<ChunkFrame>(&rmp_serde::to_vec_named(&unknown).unwrap())
+        .is_err());
+
+    let positional = rmp_serde::to_vec(&(
+        frame.transfer_id,
+        frame.index,
+        frame.final_chunk,
+        frame.payload,
+        frame.cumulative_sha256,
+        frame.resume_cursor,
+    ))
+    .unwrap();
+    assert!(codec.decode::<ChunkFrame>(&positional).is_err());
+}
+
+#[test]
+fn chunk_limits_default_try_new_and_negotiate_fail_closed() {
+    let defaults = ChunkLimits::v1_default();
+    assert_eq!(defaults.max_chunk_bytes, 256 * 1024);
+    assert_eq!(defaults.max_cumulative_bytes, 16 * 1024 * 1024);
+    assert_eq!(defaults.max_cursor_bytes, 64 * 1024);
+
+    assert!(
+        ChunkLimits::try_new(0, defaults.max_cumulative_bytes, defaults.max_cursor_bytes).is_err()
+    );
+    assert!(ChunkLimits::try_new(
+        defaults.max_chunk_bytes + 1,
+        defaults.max_cumulative_bytes,
+        defaults.max_cursor_bytes
+    )
+    .is_err());
+    assert!(ChunkLimits::try_new(
+        defaults.max_chunk_bytes,
+        defaults.max_cumulative_bytes + 1,
+        defaults.max_cursor_bytes
+    )
+    .is_err());
+    assert!(ChunkLimits::try_new(
+        defaults.max_chunk_bytes,
+        defaults.max_cumulative_bytes,
+        defaults.max_cursor_bytes + 1
+    )
+    .is_err());
+
+    let peer = ChunkLimits::try_new(4096, 8192, 1024).expect("peer limits");
+    assert_eq!(defaults.negotiate(peer).expect("minimum negotiation"), peer);
+    assert!(defaults
+        .negotiate(ChunkLimits::try_new(1, 1, 1).unwrap())
+        .is_ok());
+    assert!(ChunkLimits::try_new(0, 8192, 1024)
+        .and_then(|peer| defaults.negotiate(peer))
+        .is_err());
+}
+
+#[test]
+fn chunk_context_accepts_contiguous_cumulative_hashes_without_concatenating() {
+    let transfer_id = protocol_transfer_id(0xa2);
+    let cursor = Some(b"resume-2".to_vec());
+    let mut context =
+        ChunkContext::new(transfer_id, ChunkLimits::v1_default(), cursor.clone()).expect("context");
+    let first = b"first";
+    let second = b"second";
+
+    context
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            false,
+            first,
+            &[first],
+            cursor.clone(),
+        ))
+        .expect("first chunk");
+    assert!(!context.is_complete());
+    context
+        .accept(&protocol_chunk(
+            transfer_id,
+            1,
+            true,
+            second,
+            &[first, second],
+            cursor,
+        ))
+        .expect("final chunk");
+    assert!(context.is_complete());
+    assert!(!context.is_poisoned());
+    assert_eq!(
+        context.cumulative_bytes(),
+        (first.len() + second.len()) as u64
+    );
+}
+
+#[test]
+fn chunk_context_poisoned_after_hash_index_and_context_failures() {
+    let transfer_id = protocol_transfer_id(0xa3);
+    let limits = ChunkLimits::v1_default();
+    let payload = b"payload";
+
+    let mut bad_hash = ChunkContext::new(transfer_id, limits, None).unwrap();
+    let mut hash_frame = protocol_chunk(transfer_id, 0, false, payload, &[payload], None);
+    hash_frame.cumulative_sha256[0] ^= 1;
+    assert!(bad_hash.accept(&hash_frame).is_err());
+    assert!(bad_hash.is_poisoned());
+    assert!(bad_hash
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            payload,
+            &[payload],
+            None
+        ))
+        .is_err());
+
+    let mut bad_index = ChunkContext::new(transfer_id, limits, None).unwrap();
+    assert!(bad_index
+        .accept(&protocol_chunk(
+            transfer_id,
+            1,
+            true,
+            payload,
+            &[payload],
+            None
+        ))
+        .is_err());
+    assert!(bad_index.is_poisoned());
+
+    let mut duplicate = ChunkContext::new(transfer_id, limits, None).unwrap();
+    duplicate
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            false,
+            payload,
+            &[payload],
+            None,
+        ))
+        .unwrap();
+    assert!(duplicate
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            payload,
+            &[payload, payload],
+            None
+        ))
+        .is_err());
+    assert!(duplicate.is_poisoned());
+
+    let mut bad_context = ChunkContext::new(transfer_id, limits, Some(b"right".to_vec())).unwrap();
+    assert!(bad_context
+        .accept(&protocol_chunk(
+            protocol_transfer_id(0xa4),
+            0,
+            true,
+            payload,
+            &[payload],
+            Some(b"right".to_vec()),
+        ))
+        .is_err());
+    assert!(bad_context.is_poisoned());
+
+    let mut bad_cursor = ChunkContext::new(transfer_id, limits, Some(b"right".to_vec())).unwrap();
+    assert!(bad_cursor
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            payload,
+            &[payload],
+            Some(b"wrong".to_vec()),
+        ))
+        .is_err());
+    assert!(bad_cursor.is_poisoned());
+}
+
+#[test]
+fn chunk_context_requires_final_and_rejects_post_final() {
+    let transfer_id = protocol_transfer_id(0xa5);
+    let mut context = ChunkContext::new(transfer_id, ChunkLimits::v1_default(), None).unwrap();
+    let payload = b"terminal";
+    let nonfinal = protocol_chunk(transfer_id, 0, false, payload, &[payload], None);
+    context.accept(&nonfinal).expect("nonfinal chunk");
+    assert!(
+        !context.is_complete(),
+        "a nonfinal chunk cannot complete transfer"
+    );
+    assert!(
+        context.require_complete().is_err(),
+        "final chunk is required"
+    );
+
+    let final_payload = b"done";
+    context
+        .accept(&protocol_chunk(
+            transfer_id,
+            1,
+            true,
+            final_payload,
+            &[payload, final_payload],
+            None,
+        ))
+        .expect("final chunk");
+    assert!(context.is_complete());
+    assert!(context
+        .accept(&protocol_chunk(
+            transfer_id,
+            2,
+            true,
+            b"late",
+            &[payload, final_payload, b"late"],
+            None,
+        ))
+        .is_err());
+    assert!(context.is_poisoned());
+}
+
+#[test]
+fn chunk_context_enforces_per_chunk_cumulative_cursor_and_overflow_bounds() {
+    let small = ChunkLimits::try_new(3, 4, 2).expect("small limits");
+    assert!(
+        small.validate_chunk(u64::MAX, &[1]).is_err(),
+        "cumulative addition overflows"
+    );
+
+    let transfer_id = protocol_transfer_id(0xa6);
+    let mut too_large_chunk = ChunkContext::new(transfer_id, small, None).unwrap();
+    assert!(too_large_chunk
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            b"1234",
+            &[b"1234"],
+            None
+        ))
+        .is_err());
+    assert!(too_large_chunk.is_poisoned());
+
+    let mut too_large_total = ChunkContext::new(transfer_id, small, None).unwrap();
+    too_large_total
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            false,
+            b"123",
+            &[b"123"],
+            None,
+        ))
+        .unwrap();
+    assert!(too_large_total
+        .accept(&protocol_chunk(
+            transfer_id,
+            1,
+            true,
+            b"12",
+            &[b"123", b"12"],
+            None,
+        ))
+        .is_err());
+    assert!(too_large_total.is_poisoned());
+
+    let mut too_large_cursor = ChunkContext::new(transfer_id, small, None).unwrap();
+    assert!(too_large_cursor
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            b"1",
+            &[b"1"],
+            Some(vec![0; 3]),
+        ))
+        .is_err());
+    assert!(too_large_cursor.is_poisoned());
 }

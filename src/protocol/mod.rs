@@ -1,6 +1,7 @@
 //! Transport-neutral protocol compatibility and wire framing contracts.
 
 mod capabilities;
+mod chunk;
 mod control;
 mod envelope;
 mod frame;
@@ -10,6 +11,11 @@ mod stream;
 pub use capabilities::{
     Capability, CapabilitySet, ProtocolVersion, VersionNegotiationError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
+};
+pub use chunk::{
+    ChunkContext, ChunkError, ChunkFrame, ChunkLimitField, ChunkLimits, ChunkLimitsError,
+    MAX_CHUNK_BYTES, MAX_CHUNK_CURSOR_BYTES, MAX_CHUNK_PAYLOAD_BYTES, MAX_CHUNK_REASSEMBLY_BYTES,
+    MAX_CUMULATIVE_BYTES, MAX_CURSOR_BYTES,
 };
 pub use control::{DetachAck, DetachRequest};
 pub use envelope::{
