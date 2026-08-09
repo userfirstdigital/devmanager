@@ -190,9 +190,10 @@ impl KeyboardModel {
     }
 
     /// Resolve a local shortcut through the shared interaction policy.
-    /// Escape remains available to dismiss a transient layer even when the
-    /// active control is disabled; every action still requires the current
-    /// focus epoch, and every other shortcut also requires activation state.
+    /// Exact Escape remains available to dismiss a transient layer even when
+    /// the active control is disabled or loading; every action still requires
+    /// the current focus epoch, and every other shortcut also requires
+    /// activation state.
     pub fn activate(
         &self,
         shortcut: KeyboardShortcut,
@@ -203,7 +204,9 @@ impl KeyboardModel {
         if interaction.focus_epoch() != focus_epoch {
             return None;
         }
-        if action == KeyboardAction::DismissTransient || interaction.state().can_activate() {
+        let exact_escape_dismiss =
+            shortcut == KeyboardShortcut::escape() && action == KeyboardAction::DismissTransient;
+        if exact_escape_dismiss || interaction.state().can_activate() {
             Some(action)
         } else {
             None
