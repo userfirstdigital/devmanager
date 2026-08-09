@@ -1,14 +1,13 @@
 //! Shared interaction, action, accessibility, and bounded-text contracts.
 //!
 //! Components use this module as their policy boundary.  GPUI event plumbing
-//! may change, but an actionable control still has one stable action id,
-//! typed callback event, focus epoch, and pointer-press owner.
+//! may change, but an actionable control still has one catalog request,
+//! typed action event, focus epoch, and pointer-press owner.
 
+pub use crate::client::action::ActionRequest;
 use crate::ui::tokens::{ActionStateTokens, Color, ThemeTokens};
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
-pub const MAX_ACTION_ID_SCALARS: usize = 96;
 pub const MAX_ACCESSIBLE_NAME_SCALARS: usize = 256;
 pub const MAX_ACCESSIBLE_DESCRIPTION_SCALARS: usize = 512;
 pub const MAX_RECOVERY_ACTIONS: usize = 3;
@@ -28,7 +27,6 @@ pub enum ComponentError {
         max: usize,
         actual: usize,
     },
-    InvalidActionId,
     InvalidCombination(&'static str),
     MissingTooltip,
     TooManyRecoveryActions {
@@ -51,7 +49,6 @@ impl Display for ComponentError {
             Self::TooManyBytes { field, max, actual } => {
                 write!(formatter, "{field} exceeds {max} UTF-8 bytes ({actual})")
             }
-            Self::InvalidActionId => write!(formatter, "action id is invalid"),
             Self::InvalidCombination(reason) => {
                 write!(formatter, "invalid interaction state: {reason}")
             }
@@ -97,35 +94,6 @@ pub fn bounded_text(
     Ok(value)
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ActionId(String);
-
-impl ActionId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ComponentError> {
-        let value = value.into();
-        if value.trim().is_empty()
-            || value.chars().count() > MAX_ACTION_ID_SCALARS
-            || value.len() > MAX_ACTION_ID_SCALARS * 4
-            || value.chars().any(char::is_whitespace)
-        {
-            return Err(ComponentError::InvalidActionId);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for ActionId {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-pub type ActionCallback = Arc<dyn Fn(ActionEvent) + Send + Sync + 'static>;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyboardKey {
     Enter,
@@ -142,7 +110,7 @@ pub enum ActivationSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionEvent {
-    pub action_id: ActionId,
+    pub request: ActionRequest,
     pub source: ActivationSource,
     pub focus_epoch: u64,
 }
@@ -440,10 +408,11 @@ impl InteractionStateModel {
         if self.focus_epoch != focus_epoch {
             self.focus_epoch = focus_epoch;
             self.press_owner = None;
-            self.state = self
-                .state
+            let state = self.state;
+            self.state = state
                 .transition(InteractionTransition::Release)
-                .unwrap_or_else(|_| self.state.fail_closed());
+                .and_then(|state| state.transition(InteractionTransition::Blur))
+                .unwrap_or_else(|_| state.fail_closed());
         }
     }
 
@@ -523,6 +492,7 @@ impl InteractionStateModel {
 
     pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> bool {
         focus_epoch == self.focus_epoch
+            && self.state.focused
             && self.state.can_activate()
             && matches!(key, KeyboardKey::Enter | KeyboardKey::Space)
     }

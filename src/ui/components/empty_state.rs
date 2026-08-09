@@ -2,7 +2,7 @@
 
 use super::button::Button;
 use super::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionId, ComponentError, KeyboardKey,
+    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ComponentError, KeyboardKey,
     MAX_RECOVERY_ACTIONS,
 };
 
@@ -11,20 +11,15 @@ pub struct RecoveryAction {
 }
 
 impl RecoveryAction {
-    pub fn new<F>(
+    pub fn new(
         label: impl Into<String>,
-        action_id: ActionId,
-        callback: F,
-    ) -> Result<Self, ComponentError>
-    where
-        F: Fn(ActionEvent) + Send + Sync + 'static,
-    {
+        action_request: ActionRequest,
+    ) -> Result<Self, ComponentError> {
         Ok(Self {
             button: Button::new_variant(
                 label,
                 super::button::ButtonVariant::Secondary,
-                action_id,
-                callback,
+                action_request,
             )?,
         })
     }
@@ -33,8 +28,8 @@ impl RecoveryAction {
         self.button.label()
     }
 
-    pub fn action_id(&self) -> &ActionId {
-        self.button.action_id()
+    pub fn action_request(&self) -> &ActionRequest {
+        self.button.action_request()
     }
 
     pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
@@ -45,11 +40,11 @@ impl RecoveryAction {
         self.button.accessibility()
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> bool {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
         self.button.key_activate(key, focus_epoch)
     }
 
-    pub fn activate(&self, focus_epoch: u64) -> bool {
+    pub fn activate(&self, focus_epoch: u64) -> Option<ActionEvent> {
         self.button.key_activate(KeyboardKey::Enter, focus_epoch)
     }
 }
@@ -112,11 +107,11 @@ impl EmptyState {
         &self.recovery_actions
     }
 
-    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> bool {
+    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
         self.recovery_actions
             .get(index)
             .map(|action| action.activate(focus_epoch))
-            .unwrap_or(false)
+            .flatten()
     }
 
     pub fn accessibility(&self) -> &AccessibilityMetadata {

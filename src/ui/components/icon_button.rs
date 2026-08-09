@@ -2,7 +2,8 @@
 
 use super::button::{Button, ButtonVariant};
 use super::interaction::{
-    AccessibilityMetadata, ActionEvent, ActionId, ComponentError, ControlPresentation, KeyboardKey,
+    AccessibilityMetadata, ActionEvent, ActionRequest, ComponentError, ControlPresentation,
+    KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
 
@@ -36,21 +37,17 @@ pub struct IconButton {
 }
 
 impl IconButton {
-    pub fn new<F>(
+    pub fn new(
         icon: impl Into<String>,
         accessible_label: impl Into<String>,
         tooltip: TooltipContract,
-        action_id: ActionId,
-        callback: F,
-    ) -> Result<Self, ComponentError>
-    where
-        F: Fn(ActionEvent) + Send + Sync + 'static,
-    {
+        action_request: ActionRequest,
+    ) -> Result<Self, ComponentError> {
         let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
         }
-        let mut button = Button::new(accessible_label, action_id, callback)?;
+        let mut button = Button::new(accessible_label, action_request)?;
         button.set_accessibility_description(tooltip.label.clone())?;
         Ok(Self {
             icon,
@@ -59,22 +56,18 @@ impl IconButton {
         })
     }
 
-    pub fn new_variant<F>(
+    pub fn new_variant(
         icon: impl Into<String>,
         accessible_label: impl Into<String>,
         tooltip: TooltipContract,
         variant: ButtonVariant,
-        action_id: ActionId,
-        callback: F,
-    ) -> Result<Self, ComponentError>
-    where
-        F: Fn(ActionEvent) + Send + Sync + 'static,
-    {
+        action_request: ActionRequest,
+    ) -> Result<Self, ComponentError> {
         let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
         }
-        let mut button = Button::new_variant(accessible_label, variant, action_id, callback)?;
+        let mut button = Button::new_variant(accessible_label, variant, action_request)?;
         button.set_accessibility_description(tooltip.label.clone())?;
         Ok(Self {
             icon,
@@ -131,11 +124,11 @@ impl IconButton {
         self.button.pointer_down(pointer_id, focus_epoch)
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
         self.button.pointer_up(pointer_id, focus_epoch)
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> bool {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
         self.button.key_activate(key, focus_epoch)
     }
 

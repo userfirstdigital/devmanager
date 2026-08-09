@@ -147,6 +147,41 @@ pub struct TaskRenameArguments {
     pub title: String,
 }
 
+/// A presentational client request backed by one of the closed catalog entries.
+///
+/// Components may emit this value, but they do not turn it into a transport
+/// operation. The client boundary remains responsible for adding request and
+/// command identity before sending it to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionRequest {
+    HostActions,
+    HostStatus,
+    TaskList,
+    TaskShow { task_id: TaskId },
+    TaskCreate(TaskCreateArguments),
+    TaskRename(TaskRenameArguments),
+}
+
+impl ActionRequest {
+    pub const fn id(&self) -> &'static str {
+        match self {
+            Self::HostActions => ACTION_HOST_ACTIONS,
+            Self::HostStatus => ACTION_HOST_STATUS,
+            Self::TaskList => ACTION_TASK_LIST,
+            Self::TaskShow { .. } => ACTION_TASK_SHOW,
+            Self::TaskCreate(_) => ACTION_TASK_CREATE,
+            Self::TaskRename(_) => ACTION_TASK_RENAME,
+        }
+    }
+
+    pub fn descriptor(&self) -> &'static ActionDescriptor {
+        catalog()
+            .iter()
+            .find(|descriptor| descriptor.id == self.id())
+            .expect("every ActionRequest must have a catalog descriptor")
+    }
+}
+
 /// Return the closed catalog for this slice.
 pub fn catalog() -> &'static [ActionDescriptor] {
     ACTIONS

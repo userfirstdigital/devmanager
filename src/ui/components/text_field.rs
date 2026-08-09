@@ -140,6 +140,10 @@ impl TextField {
         self.interaction.state().focused
     }
 
+    pub fn focus_epoch(&self) -> u64 {
+        self.interaction.focus_epoch()
+    }
+
     pub fn accessibility(&self) -> &AccessibilityMetadata {
         &self.accessibility
     }
@@ -185,6 +189,11 @@ impl TextField {
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
         self.accessibility.read_only = read_only;
+    }
+
+    pub fn set_focus_epoch(&mut self, focus_epoch: u64) {
+        self.interaction.set_focus_epoch(focus_epoch);
+        self.accessibility.focused = self.interaction.state().focused;
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
@@ -252,7 +261,15 @@ impl TextField {
         }
     }
 
-    pub fn paste(&mut self, text: &str) -> Result<bool, TextFieldError> {
+    pub fn paste(&mut self, text: &str, focus_epoch: u64) -> Result<bool, TextFieldError> {
+        let state = self.interaction.state();
+        if self.interaction.focus_epoch() != focus_epoch
+            || !state.focused
+            || state.disabled
+            || self.read_only
+        {
+            return Ok(false);
+        }
         self.insert_text(text)
     }
 
@@ -260,10 +277,13 @@ impl TextField {
         if self.interaction.state().disabled || self.read_only {
             return Ok(false);
         }
+        if text.is_empty() {
+            return Ok(false);
+        }
+        self.preflight_insert(text)?;
         let byte_index = byte_index_at_scalar(&self.value, self.cursor);
         let mut next = self.value.clone();
         next.insert_str(byte_index, text);
-        self.validate_value(&next)?;
         self.value = next;
         self.cursor += text.chars().count();
         self.accessibility.value = Some(self.value.clone());
@@ -282,6 +302,33 @@ impl TextField {
             return Err(TextFieldError::ByteLimitExceeded {
                 max: self.limits.max_bytes,
                 actual: value.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn preflight_insert(&self, text: &str) -> Result<(), TextFieldError> {
+        let scalar_count = self
+            .value
+            .chars()
+            .count()
+            .checked_add(text.chars().count())
+            .unwrap_or(usize::MAX);
+        if scalar_count > self.limits.max_scalars {
+            return Err(TextFieldError::ScalarLimitExceeded {
+                max: self.limits.max_scalars,
+                actual: scalar_count,
+            });
+        }
+        let byte_count = self
+            .value
+            .len()
+            .checked_add(text.len())
+            .unwrap_or(usize::MAX);
+        if byte_count > self.limits.max_bytes {
+            return Err(TextFieldError::ByteLimitExceeded {
+                max: self.limits.max_bytes,
+                actual: byte_count,
             });
         }
         Ok(())

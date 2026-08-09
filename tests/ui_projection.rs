@@ -397,15 +397,10 @@ fn components_gallery_fixture_rejects_missing_state_coverage() {
 
 #[test]
 fn components_models_project_deterministically_for_both_token_themes() {
+    use devmanager::client::action::ActionRequest;
     use devmanager::ui::components::button::Button;
-    use devmanager::ui::components::interaction::ActionId;
     use devmanager::ui::tokens::{theme, Density, Scale, ThemeMode};
-    let button = Button::new(
-        "Inspect",
-        ActionId::new("task.inspect").expect("action id"),
-        |_event| {},
-    )
-    .expect("button");
+    let button = Button::new("Inspect", ActionRequest::TaskList).expect("button");
     let dark = button.presentation(theme(ThemeMode::Dark, Density::Compact, Scale::Scale100));
     let light = button.presentation(theme(ThemeMode::Light, Density::Compact, Scale::Scale100));
     assert_ne!(dark.background, light.background);

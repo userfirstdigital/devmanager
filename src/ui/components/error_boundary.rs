@@ -2,29 +2,66 @@
 
 use super::empty_state::RecoveryAction;
 use super::interaction::{
-    AccessibilityMetadata, AccessibleRole, ComponentError, MAX_RECOVERY_ACTIONS,
+    AccessibilityMetadata, AccessibleRole, ActionEvent, ComponentError, MAX_RECOVERY_ACTIONS,
 };
 
-pub struct ErrorBoundary {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafeErrorCode {
+    HostUnavailable,
+    InvalidProjection,
+    RendererFailure,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafeErrorProjection {
+    code: SafeErrorCode,
     title: String,
     message: String,
+}
+
+impl SafeErrorProjection {
+    pub fn new(
+        code: SafeErrorCode,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<Self, ComponentError> {
+        let title = crate::diagnostics::runner::redact_secrets(&title.into());
+        let message = crate::diagnostics::runner::redact_secrets(&message.into());
+        Ok(Self {
+            code,
+            title: super::interaction::bounded_text("error title", title, 256, 1024)?,
+            message: super::interaction::bounded_text("error message", message, 512, 2048)?,
+        })
+    }
+
+    pub fn code(&self) -> SafeErrorCode {
+        self.code
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+pub struct ErrorBoundary {
+    projection: SafeErrorProjection,
     recovery_actions: Vec<RecoveryAction>,
     accessibility: AccessibilityMetadata,
 }
 
 impl ErrorBoundary {
-    pub fn new(
-        title: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Result<Self, ComponentError> {
-        let title = super::interaction::bounded_text("error title", title, 256, 1024)?;
-        let message = super::interaction::bounded_text("error message", message, 512, 2048)?;
-        let mut accessibility = AccessibilityMetadata::new(AccessibleRole::Alert, title.clone())?;
-        accessibility.set_description(message.clone())?;
+    pub fn new(projection: SafeErrorProjection) -> Result<Self, ComponentError> {
+        let mut accessibility =
+            AccessibilityMetadata::new(AccessibleRole::Alert, projection.title.clone())?;
+        accessibility.set_description(projection.message.clone())?;
         accessibility.invalid = true;
         Ok(Self {
-            title,
-            message,
+            projection,
             recovery_actions: Vec::new(),
             accessibility,
         })
@@ -52,22 +89,26 @@ impl ErrorBoundary {
     }
 
     pub fn title(&self) -> &str {
-        &self.title
+        self.projection.title()
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        self.projection.message()
+    }
+
+    pub fn projection(&self) -> &SafeErrorProjection {
+        &self.projection
     }
 
     pub fn recovery_actions(&self) -> &[RecoveryAction] {
         &self.recovery_actions
     }
 
-    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> bool {
+    pub fn activate_recovery(&self, index: usize, focus_epoch: u64) -> Option<ActionEvent> {
         self.recovery_actions
             .get(index)
             .map(|action| action.activate(focus_epoch))
-            .unwrap_or(false)
+            .flatten()
     }
 
     pub fn accessibility(&self) -> &AccessibilityMetadata {
@@ -82,9 +123,9 @@ impl ErrorBoundary {
             .collect::<Vec<_>>()
             .join(", ");
         if actions.is_empty() {
-            format!("{}: {}", self.title, self.message)
+            format!("{}: {}", self.title(), self.message())
         } else {
-            format!("{}: {} ({actions})", self.title, self.message)
+            format!("{}: {} ({actions})", self.title(), self.message())
         }
     }
 }
