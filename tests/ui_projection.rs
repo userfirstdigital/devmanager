@@ -1,16 +1,25 @@
 use devmanager::client::{ClientModel, ClientModelBuilder};
-use devmanager::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::id::{
+    AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId, TaskId,
+};
+use devmanager::domain::resource::{
+    OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
     PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
 };
 use devmanager::ui::task_cockpit::{
-    Inbox, InboxError, InboxFilter, InboxSection, InboxState, UnreadCursor, DEFAULT_VISIBLE_ROWS,
+    Inbox, InboxError, InboxFilter, InboxItemKey, InboxPresentationWidth, InboxRenderItem,
+    InboxSection, InboxState, PrimaryProviderState, RuntimeSummary, UnreadCursor,
+    DEFAULT_VISIBLE_ROWS,
 };
 use devmanager::ui::{self, PreviewInitReport};
 use std::cell::Cell;
@@ -435,6 +444,30 @@ fn inbox_task_item(
     review_readiness: ReviewReadiness,
     created_at_ms: i64,
 ) -> SnapshotItem {
+    inbox_task_item_with_workspace(
+        id,
+        title,
+        lifecycle,
+        connectivity,
+        attention,
+        activity,
+        review_readiness,
+        created_at_ms,
+        WorkspaceRef::Main,
+    )
+}
+
+fn inbox_task_item_with_workspace(
+    id: TaskId,
+    title: &str,
+    lifecycle: TaskLifecycle,
+    connectivity: TaskConnectivity,
+    attention: TaskAttention,
+    activity: TaskActivity,
+    review_readiness: ReviewReadiness,
+    created_at_ms: i64,
+    workspace: WorkspaceRef,
+) -> SnapshotItem {
     SnapshotItem::Task(TaskSnapshotItem {
         task: TaskFacts {
             id,
@@ -442,7 +475,7 @@ fn inbox_task_item(
             title: title.into(),
             description: None,
             project_id: ProjectId::from_bytes(fixed_uuid_v7(0x11)).expect("project"),
-            workspace: WorkspaceRef::Main,
+            workspace,
             assignment: TaskAssignment::LocalOwner,
             lifecycle,
             action_epoch: 0,
@@ -458,6 +491,14 @@ fn inbox_task_item(
 }
 
 fn inbox_model(items: Vec<SnapshotItem>) -> ClientModel {
+    inbox_model_with_related(items, Vec::new(), Vec::new())
+}
+
+fn inbox_model_with_related(
+    task_items: Vec<SnapshotItem>,
+    agent_items: Vec<SnapshotItem>,
+    resource_items: Vec<SnapshotItem>,
+) -> ClientModel {
     let snapshot_id = SnapshotId::from_bytes(fixed_uuid_v7(0x20)).expect("snapshot");
     let mut builder = ClientModelBuilder::new();
     builder
@@ -466,16 +507,26 @@ fn inbox_model(items: Vec<SnapshotItem>) -> ClientModel {
             through_sequence: 1,
             section: SnapshotSection::Tasks,
             after_item: None,
-            items,
+            items: task_items,
             encoded_bytes: 1,
             next_cursor: None,
         })
         .expect("task page");
-    for section in [
-        SnapshotSection::AgentSessions,
-        SnapshotSection::Artifacts,
-        SnapshotSection::Resources,
-        SnapshotSection::Operations,
+    builder
+        .ingest_page(SnapshotPage {
+            snapshot_id,
+            through_sequence: 1,
+            section: SnapshotSection::AgentSessions,
+            after_item: None,
+            items: agent_items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        })
+        .expect("agent page");
+    for (section, items) in [
+        (SnapshotSection::Artifacts, Vec::new()),
+        (SnapshotSection::Resources, resource_items),
+        (SnapshotSection::Operations, Vec::new()),
     ] {
         builder
             .ingest_page(SnapshotPage {
@@ -483,13 +534,65 @@ fn inbox_model(items: Vec<SnapshotItem>) -> ClientModel {
                 through_sequence: 1,
                 section,
                 after_item: None,
-                items: Vec::new(),
+                items,
                 encoded_bytes: 1,
                 next_cursor: None,
             })
             .expect("empty related section");
     }
     builder.finish().expect("complete client model")
+}
+
+fn inbox_agent_item(
+    task_id: TaskId,
+    agent_id: AgentSessionId,
+    provider_kind: &str,
+) -> SnapshotItem {
+    SnapshotItem::AgentSession(AgentSessionFacts {
+        id: agent_id,
+        task_id,
+        role: AgentRole::Primary,
+        provider_kind: provider_kind.into(),
+        provider_session_id: Some(format!("session-{agent_id}")),
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 1,
+        revision: 1,
+    })
+}
+
+fn inbox_resource_item(
+    task_id: TaskId,
+    resource_id: ResourceId,
+    kind: ResourceKind,
+) -> SnapshotItem {
+    let (recipe, lifecycle) = match kind {
+        ResourceKind::Terminal => (
+            ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            ResourceLifecycle::Active,
+        ),
+        ResourceKind::BrowserContext => (
+            ResourceRecipe::Browser {
+                start_url: "https://example.test".into(),
+            },
+            ResourceLifecycle::Active,
+        ),
+        ResourceKind::Service => (
+            ResourceRecipe::Service {
+                command: "npm run dev".into(),
+            },
+            ResourceLifecycle::Releasing,
+        ),
+    };
+    SnapshotItem::Resource(ResourceFacts {
+        id: resource_id,
+        task_id: Some(task_id),
+        owner_kind: OwnerKind::Task,
+        resource_kind: kind,
+        recipe,
+        lifecycle,
+        runtime_generation: 1,
+        updated_at_ms: 1,
+    })
 }
 
 fn inbox_task_id(index: u32) -> TaskId {
@@ -598,7 +701,10 @@ fn inbox_attention_order_is_deterministic_and_selection_is_task_id_based() {
     ]);
     let model = inbox_model(items);
     let before = model.clone();
-    let unread = UnreadCursor::from([(inbox_task_id(0), 3)]);
+    let mut unread = UnreadCursor::default();
+    assert!(unread.observe_event(inbox_task_id(0), 1));
+    assert!(unread.observe_event(inbox_task_id(0), 2));
+    assert!(unread.observe_event(inbox_task_id(0), 3));
     let inbox = Inbox::from_model_with_unread(&model, &unread);
 
     assert_eq!(
@@ -722,7 +828,8 @@ fn inbox_search_includes_archived_only_when_explicit_and_reports_empty_states() 
         &InboxFilter::new("archived").including_archived(),
         &UnreadCursor::default(),
     );
-    assert_eq!(archived.len(), 1);
+    assert_eq!(archived.len(), 0);
+    assert_eq!(archived.history_rows().len(), 1);
     assert_eq!(
         archived.row(inbox_task_id(21)).unwrap().title,
         "archived target"
@@ -801,6 +908,19 @@ fn inbox_5000_task_fixture_is_bounded_and_virtualized() {
             .as_u64()
             .expect("rendered row bound") as usize
     );
+    let render = inbox.render_model(InboxPresentationWidth::Narrow);
+    let rendered_row_count = render
+        .items
+        .iter()
+        .filter(|item| matches!(item, InboxRenderItem::Row(_)))
+        .count();
+    assert_eq!(
+        rendered_row_count,
+        fixture["report"]["rendered_rows_bound"]
+            .as_u64()
+            .expect("rendered row bound") as usize,
+        "the shell-facing render model must preserve the virtualized row bound"
+    );
 }
 
 #[test]
@@ -866,4 +986,331 @@ fn inbox_projection_does_not_probe_runtime_or_process_state() {
             "inbox must remain a pure projection: {forbidden}"
         );
     }
+}
+
+#[test]
+fn inbox_fixture_drives_bounded_display_data_and_compact_render_items() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/ui/task-inbox.json"))
+            .expect("task inbox fixture");
+    let display = &fixture["behavioral_cases"]["display_rows"];
+    let rich = &display[0];
+    let missing = &display[1];
+    let rich_id = inbox_task_id(30);
+    let missing_id = inbox_task_id(31);
+    let rich_agent = AgentSessionId::from_bytes(fixed_uuid_v7(0x30)).expect("rich agent");
+    let rich_workspace = WorkspaceRef::worktree(
+        rich["workspace_path"].as_str().expect("workspace path"),
+        rich["worktree_branch"].as_str().expect("worktree branch"),
+    )
+    .expect("fixture workspace");
+    let rich_task = {
+        let SnapshotItem::Task(mut task) = inbox_task_item_with_workspace(
+            rich_id,
+            rich["title"].as_str().expect("rich title"),
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::NeedsAnswer,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            30,
+            rich_workspace,
+        ) else {
+            unreachable!("inbox task helper returns a task")
+        };
+        task.primary_agent_id = Some(rich_agent);
+        SnapshotItem::Task(task)
+    };
+    let model = inbox_model_with_related(
+        vec![
+            rich_task,
+            inbox_task_item(
+                missing_id,
+                missing["title"].as_str().expect("missing title"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Working,
+                ReviewReadiness::NotReady,
+                31,
+            ),
+        ],
+        vec![inbox_agent_item(
+            rich_id,
+            rich_agent,
+            rich["provider"].as_str().expect("provider"),
+        )],
+        vec![
+            inbox_resource_item(
+                rich_id,
+                ResourceId::from_bytes(fixed_uuid_v7(0x31)).expect("terminal resource"),
+                ResourceKind::Terminal,
+            ),
+            inbox_resource_item(
+                rich_id,
+                ResourceId::from_bytes(fixed_uuid_v7(0x32)).expect("service resource"),
+                ResourceKind::Service,
+            ),
+        ],
+    );
+
+    let inbox = Inbox::from_model(&model);
+    let rich_row = inbox.row(rich_id).expect("rich row");
+    assert_eq!(
+        rich_row.display.primary_provider,
+        PrimaryProviderState::Present {
+            kind: rich["provider"].as_str().expect("provider").into()
+        }
+    );
+    assert_eq!(
+        rich_row.display.runtime,
+        RuntimeSummary::Present {
+            lifecycle: AgentSessionLifecycle::Open,
+            generation: 1,
+        }
+    );
+    assert_eq!(
+        rich_row.display.worktree,
+        rich["worktree_branch"].as_str().expect("worktree branch")
+    );
+    assert!(!rich_row
+        .display
+        .worktree
+        .contains(rich["workspace_path"].as_str().expect("workspace path")));
+    assert_eq!(rich_row.display.resources.terminal_count, 1);
+    assert_eq!(rich_row.display.resources.service_count, 1);
+    assert_eq!(rich_row.display.resources.releasing_count, 1);
+    assert_eq!(
+        rich["resources"].as_array().map(|values| values.len()),
+        Some(2)
+    );
+    assert_eq!(rich["resources"][0]["kind"], "terminal");
+    assert_eq!(rich["resources"][1]["lifecycle"], "releasing");
+    assert!(rich_row.display.project.chars().count() <= 96);
+    assert!(rich_row.display.worktree.chars().count() <= 128);
+
+    let missing_row = inbox.row(missing_id).expect("missing provider row");
+    assert_eq!(
+        missing_row.display.primary_provider,
+        PrimaryProviderState::Missing
+    );
+    assert_eq!(missing_row.display.runtime, RuntimeSummary::Missing);
+
+    let render = inbox.render_model(InboxPresentationWidth::Narrow);
+    assert!(render.items.iter().any(|item| matches!(
+        item,
+        InboxRenderItem::SectionHeader {
+            key: InboxItemKey::Section(InboxSection::NeedsMe),
+            section: InboxSection::NeedsMe,
+            ..
+        }
+    )));
+    assert!(render.items.iter().any(|item| matches!(
+        item,
+        InboxRenderItem::Row(row)
+            if row.key == InboxItemKey::Row(rich_id)
+                && row.task_id == rich_id
+                && !row.accessible_name.is_empty()
+                && !row.accessible_description.is_empty()
+                && row.accessibility.role == AccessibleRole::Button
+                && !row.accessibility.disabled
+                && row.accessibility.value.as_deref() == Some("Needs answer")
+                && row.accessible_description.contains("Workspace path hidden")
+                && !row.accessible_description.contains(
+                    rich["workspace_path"].as_str().expect("workspace path")
+                )
+                && !row.secondary_text.contains(
+                    rich["workspace_path"].as_str().expect("workspace path")
+                )
+    )));
+}
+
+#[test]
+fn inbox_accessibility_announces_unread_and_bounded_information() {
+    let task_id = inbox_task_id(35);
+    let title = "A".repeat(devmanager::ui::task_cockpit::MAX_ACCESSIBLE_NAME_CHARS + 16);
+    let model = inbox_model(vec![inbox_task_item(
+        task_id,
+        &title,
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        35,
+    )]);
+    let mut unread = UnreadCursor::default();
+    assert!(unread.observe_event(task_id, 41));
+    assert!(unread.observe_event(task_id, 42));
+    let render =
+        Inbox::from_model_with_unread(&model, &unread).render_model(InboxPresentationWidth::Narrow);
+    let row = render
+        .items
+        .iter()
+        .find_map(|item| match item {
+            InboxRenderItem::Row(row) if row.task_id == task_id => Some(row),
+            _ => None,
+        })
+        .expect("bounded task row");
+    assert_eq!(row.accessibility.name, row.accessible_name);
+    assert_eq!(row.accessibility.description, row.accessible_description);
+    assert!(row.accessible_description.contains("2 unread events"));
+    assert!(row
+        .accessible_description
+        .contains("Some row details truncated"));
+    assert!(row.title.chars().count() <= devmanager::ui::task_cockpit::MAX_ACCESSIBLE_NAME_CHARS);
+}
+
+#[test]
+fn inbox_render_model_has_narrow_empty_filtered_and_error_states() {
+    let empty =
+        Inbox::from_model(&inbox_model(Vec::new())).render_model(InboxPresentationWidth::Narrow);
+    assert!(matches!(
+        empty.items.as_slice(),
+        [InboxRenderItem::State {
+            key: InboxItemKey::Empty,
+            ..
+        }]
+    ));
+
+    let model = inbox_model(vec![inbox_task_item(
+        inbox_task_id(40),
+        "visible task",
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        40,
+    )]);
+    let filtered = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("not present"),
+        &UnreadCursor::default(),
+    )
+    .render_model(InboxPresentationWidth::Narrow);
+    assert!(matches!(
+        filtered.items.as_slice(),
+        [InboxRenderItem::State {
+            key: InboxItemKey::FilteredEmpty,
+            ..
+        }]
+    ));
+
+    let error = Inbox::from_error(InboxError::ProjectionUnavailable)
+        .render_model(InboxPresentationWidth::Regular);
+    assert!(matches!(
+        error.items.as_slice(),
+        [InboxRenderItem::State {
+            key: InboxItemKey::Error,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn unread_cursor_is_bounded_semantic_state_and_reconnect_idempotent() {
+    let task = inbox_task_id(50);
+    let mut cursor = UnreadCursor::default();
+    assert!(cursor.observe_event(task, 7));
+    assert!(!cursor.observe_event(task, 7), "replay must be idempotent");
+    assert!(cursor.observe_event(task, 8));
+    assert_eq!(cursor.unread_count(task), 2);
+    cursor.mark_read(task);
+    assert_eq!(cursor.unread_count(task), 0);
+    assert!(
+        !cursor.observe_event(task, 8),
+        "reconnect replay must stay read"
+    );
+    assert!(cursor.observe_event(task, 9));
+    assert_eq!(cursor.unread_count(task), 1);
+
+    let model = inbox_model(vec![inbox_task_item(
+        task,
+        "Retained task",
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        50,
+    )]);
+    cursor.prune(&model);
+    assert_eq!(cursor.len(), 1);
+    cursor.prune(&inbox_model(Vec::new()));
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertions() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Task {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+    assert_eq!(model.task_projection_index_len(), 100_000);
+    assert_eq!(model.task_projection_index_rebuilds(), 1);
+
+    let first = Inbox::from_model(&model);
+    let second = Inbox::from_model(&model);
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 5_000);
+    assert_eq!(first.task_list().task_ids().len(), 5_000);
+    assert_eq!(model.task_projection_index_rebuilds(), 1);
+}
+
+#[test]
+fn case_only_titles_use_the_same_stable_order_and_fixture_exposes_action_coverage() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/ui/task-inbox.json"))
+            .expect("task inbox fixture");
+    let tie = &fixture["behavioral_cases"]["case_only_title_ties"];
+    assert_eq!(tie["titles"], serde_json::json!(["Alpha", "alpha"]));
+    assert_eq!(tie["expected_order"], serde_json::json!(["Alpha", "alpha"]));
+
+    let model = inbox_model(vec![
+        inbox_task_item(
+            inbox_task_id(60),
+            "Alpha",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            60,
+        ),
+        inbox_task_item(
+            inbox_task_id(61),
+            "alpha",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            60,
+        ),
+    ]);
+    let inbox = Inbox::from_model(&model);
+    assert_eq!(
+        inbox.task_ids().collect::<Vec<_>>(),
+        vec![inbox_task_id(60), inbox_task_id(61)]
+    );
+    assert_eq!(
+        fixture["behavioral_cases"]["actions"]["mark_read"],
+        "client-local"
+    );
+    assert_eq!(
+        fixture["behavioral_cases"]["actions"]["capture"],
+        "task-id-and-epoch"
+    );
 }

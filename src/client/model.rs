@@ -1,6 +1,7 @@
 //! Presentation-independent client model assembled from one pinned snapshot
 //! and advanced by ordered durable events.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::domain::agent::AgentSessionFacts;
@@ -12,6 +13,7 @@ use crate::domain::resource::{OwnerKind, ResourceFacts};
 use crate::domain::snapshot::{
     EventPage, SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
 };
+use crate::domain::task::{TaskLifecycle, VisibleTaskStatus};
 
 /// Finite bound on snapshot pages admitted while assembling one model.
 pub const MAX_CLIENT_MODEL_PAGES: usize = 1_024;
@@ -116,6 +118,170 @@ impl std::fmt::Display for ClientModelError {
 
 impl std::error::Error for ClientModelError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskProjectionEntry {
+    lifecycle: TaskLifecycle,
+    attention_rank: u8,
+    revision: u64,
+    lower_title: String,
+    title: String,
+}
+
+/// Incremental, client-owned ordering index for Task Cockpit projections.
+///
+/// The task map remains the only task truth. This index only stores bounded,
+/// presentation-independent identity/order metadata so unchanged projections
+/// do not rescan and re-sort every task just to produce the same first page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskProjectionIndex {
+    revision: u64,
+    entries: BTreeMap<TaskId, TaskProjectionEntry>,
+    active_task_ids: Vec<TaskId>,
+    archived_task_ids: Vec<TaskId>,
+    full_rebuilds: u64,
+}
+
+impl TaskProjectionIndex {
+    fn from_tasks(tasks: &BTreeMap<TaskId, TaskSnapshot>, revision: u64) -> Self {
+        let entries = tasks
+            .iter()
+            .map(|(task_id, snapshot)| (*task_id, TaskProjectionEntry::from_snapshot(snapshot)))
+            .collect::<BTreeMap<_, _>>();
+        let mut active_task_ids = Vec::new();
+        let mut archived_task_ids = Vec::new();
+        for (task_id, entry) in &entries {
+            if entry.lifecycle == TaskLifecycle::Archived {
+                archived_task_ids.push(*task_id);
+            } else {
+                active_task_ids.push(*task_id);
+            }
+        }
+        sort_task_ids(&mut active_task_ids, &entries);
+        sort_task_ids(&mut archived_task_ids, &entries);
+        Self {
+            revision,
+            entries,
+            active_task_ids,
+            archived_task_ids,
+            full_rebuilds: 1,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn active_task_ids(&self) -> &[TaskId] {
+        &self.active_task_ids
+    }
+
+    pub fn archived_task_ids(&self) -> &[TaskId] {
+        &self.archived_task_ids
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn full_rebuilds(&self) -> u64 {
+        self.full_rebuilds
+    }
+
+    fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+
+    fn update_task(&mut self, snapshot: &TaskSnapshot) {
+        let task_id = snapshot.task.id;
+        self.remove_task_id(task_id);
+        let entry = TaskProjectionEntry::from_snapshot(snapshot);
+        let archived = entry.lifecycle == TaskLifecycle::Archived;
+        self.entries.insert(task_id, entry);
+        let insertion = if archived {
+            self.archived_task_ids
+                .binary_search_by(|candidate| compare_task_ids(candidate, &task_id, &self.entries))
+                .unwrap_or_else(|index| index)
+        } else {
+            self.active_task_ids
+                .binary_search_by(|candidate| compare_task_ids(candidate, &task_id, &self.entries))
+                .unwrap_or_else(|index| index)
+        };
+        let ids = if archived {
+            &mut self.archived_task_ids
+        } else {
+            &mut self.active_task_ids
+        };
+        ids.insert(insertion, task_id);
+    }
+
+    fn remove_task_id(&mut self, task_id: TaskId) {
+        if let Some(index) = self
+            .active_task_ids
+            .iter()
+            .position(|candidate| *candidate == task_id)
+        {
+            self.active_task_ids.remove(index);
+        } else if let Some(index) = self
+            .archived_task_ids
+            .iter()
+            .position(|candidate| *candidate == task_id)
+        {
+            self.archived_task_ids.remove(index);
+        }
+        self.entries.remove(&task_id);
+    }
+}
+
+impl TaskProjectionEntry {
+    fn from_snapshot(snapshot: &TaskSnapshot) -> Self {
+        Self {
+            lifecycle: snapshot.task.lifecycle,
+            attention_rank: attention_rank(snapshot.visible_status()),
+            revision: snapshot.task.revision,
+            lower_title: snapshot.task.title.to_lowercase(),
+            title: snapshot.task.title.clone(),
+        }
+    }
+}
+
+fn sort_task_ids(ids: &mut [TaskId], entries: &BTreeMap<TaskId, TaskProjectionEntry>) {
+    ids.sort_by(|left, right| compare_task_ids(left, right, entries));
+}
+
+fn compare_task_ids(
+    left: &TaskId,
+    right: &TaskId,
+    entries: &BTreeMap<TaskId, TaskProjectionEntry>,
+) -> Ordering {
+    let left_entry = entries.get(left).expect("task index entry exists");
+    let right_entry = entries.get(right).expect("task index entry exists");
+    left_entry
+        .attention_rank
+        .cmp(&right_entry.attention_rank)
+        .then_with(|| right_entry.revision.cmp(&left_entry.revision))
+        .then_with(|| left_entry.lower_title.cmp(&right_entry.lower_title))
+        .then_with(|| left_entry.title.cmp(&right_entry.title))
+        .then_with(|| left.cmp(right))
+}
+
+fn attention_rank(status: VisibleTaskStatus) -> u8 {
+    match status {
+        VisibleTaskStatus::Disconnected => 0,
+        VisibleTaskStatus::Failed => 1,
+        VisibleTaskStatus::UncertainOutcome => 2,
+        VisibleTaskStatus::NeedsApproval => 3,
+        VisibleTaskStatus::NeedsAnswer => 4,
+        VisibleTaskStatus::Working => 5,
+        VisibleTaskStatus::Settling => 6,
+        VisibleTaskStatus::ReadyForReview => 7,
+        VisibleTaskStatus::Idle => 8,
+    }
+}
+
 /// Validated presentation-independent client projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientModel {
@@ -130,6 +296,7 @@ pub struct ClientModel {
     replay_through: Option<u64>,
     replay_page_count: usize,
     replay_cursors: HashSet<Vec<u8>>,
+    task_projection_index: TaskProjectionIndex,
 }
 
 impl ClientModel {
@@ -151,6 +318,18 @@ impl ClientModel {
 
     pub fn last_applied_sequence(&self) -> u64 {
         self.last_applied_sequence
+    }
+
+    pub fn task_projection_index(&self) -> &TaskProjectionIndex {
+        &self.task_projection_index
+    }
+
+    pub fn task_projection_index_len(&self) -> usize {
+        self.task_projection_index.len()
+    }
+
+    pub fn task_projection_index_rebuilds(&self) -> u64 {
+        self.task_projection_index.full_rebuilds()
     }
 
     /// Shared bound check for frozen replay continuation cursors/pages.
@@ -239,6 +418,8 @@ impl ClientModel {
                 return Err(ClientModelError::ReplayRangeInvalid);
             }
             self.last_applied_sequence = page.through_sequence;
+            self.task_projection_index
+                .set_revision(page.through_sequence);
             self.replay_through = None;
             self.replay_page_count = 0;
             self.replay_cursors.clear();
@@ -253,7 +434,8 @@ impl ClientModel {
         }
         let staged = self.stage_event(event)?;
         if let Some((task_id, snapshot)) = staged.task {
-            self.tasks.insert(task_id, snapshot);
+            self.tasks.insert(task_id, snapshot.clone());
+            self.task_projection_index.update_task(&snapshot);
         }
         if let Some((operation_id, facts)) = staged.operation {
             self.operations.insert(operation_id, facts);
@@ -262,6 +444,7 @@ impl ClientModel {
             self.artifact_summaries.insert(summary.id, summary);
         }
         self.last_applied_sequence = event.sequence;
+        self.task_projection_index.set_revision(event.sequence);
         Ok(())
     }
 
@@ -755,6 +938,8 @@ impl ClientModelBuilder {
             }
         }
 
+        let task_projection_index = TaskProjectionIndex::from_tasks(&tasks, through_sequence);
+
         Ok(ClientModel {
             tasks,
             host_resources,
@@ -764,6 +949,7 @@ impl ClientModelBuilder {
             replay_through: None,
             replay_page_count: 0,
             replay_cursors: HashSet::new(),
+            task_projection_index,
         })
     }
 

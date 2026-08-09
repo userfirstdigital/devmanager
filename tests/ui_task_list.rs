@@ -8,7 +8,10 @@ use devmanager::domain::task::{
 use devmanager::ui::shell::{
     NavigationRejection, NavigationResult, PointerButton, ReleaseRejection, Shell, TerminalRelease,
 };
-use devmanager::ui::task_cockpit::{TaskList, VirtualWindow, MAX_TASK_LIST_ITEMS};
+use devmanager::ui::task_cockpit::{
+    Inbox, InboxFilter, InboxPresentationWidth, InboxRenderItem, TaskList, VirtualWindow,
+    MAX_TASK_LIST_ITEMS,
+};
 use serde::Deserialize;
 use std::fs;
 
@@ -67,6 +70,14 @@ fn task_item_with_lifecycle(id: TaskId, ordinal: usize, lifecycle: TaskLifecycle
         review_readiness: ReviewReadiness::NotReady,
         primary_agent_id: None,
     })
+}
+
+fn task_item_with_attention(id: TaskId, ordinal: usize, attention: TaskAttention) -> SnapshotItem {
+    let SnapshotItem::Task(mut item) = task_item(id, ordinal) else {
+        unreachable!("task_item always returns a task")
+    };
+    item.attention = attention;
+    SnapshotItem::Task(item)
 }
 
 fn model_from_ids(ids: &[TaskId]) -> ClientModel {
@@ -171,7 +182,7 @@ fn navigation_mouse_down_commits_only_tasks_in_the_current_bounded_inbox() {
     let second = task_id_from_index(2);
     let foreign = task_id_from_index(3);
     let model = model_from_ids(&[first, second]);
-    let inbox = TaskList::from_model(&model);
+    let inbox = Inbox::from_model(&model);
     let mut shell = Shell::new(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
@@ -216,7 +227,7 @@ fn stale_navigation_invalidates_an_active_terminal_owner() {
     let first = task_id_from_index(4);
     let second = task_id_from_index(5);
     let model = model_from_ids(&[first, second]);
-    let inbox = TaskList::from_model(&model);
+    let inbox = Inbox::from_model(&model);
     let mut shell = Shell::new(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
@@ -245,9 +256,9 @@ fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
         task_item_with_lifecycle(open, 0, TaskLifecycle::Open),
         task_item_with_lifecycle(archived, 1, TaskLifecycle::Archived),
     ]);
-    let inbox = TaskList::from_model(&model);
+    let inbox = Inbox::from_model(&model);
 
-    assert_eq!(inbox.task_ids(), &[open]);
+    assert_eq!(inbox.task_ids().collect::<Vec<_>>(), vec![open]);
     let mut shell = Shell::new(Some(open));
     let epoch = shell.navigation_epoch();
     assert_eq!(
@@ -271,9 +282,13 @@ fn task_list_consumes_only_model_ids_and_keeps_deterministic_order() {
     let before = model.clone();
     let first = TaskList::from_model(&model);
     let second = TaskList::from_model(&model);
+    let attention_projection = Inbox::from_model(&model);
 
     assert_eq!(model, before, "projection must not mutate ClientModel");
-    assert_eq!(first.task_ids(), fixture.task_ids.as_slice());
+    assert_eq!(
+        first.task_ids(),
+        attention_projection.task_list().task_ids()
+    );
     assert_eq!(
         first, second,
         "same model must produce the same local projection"
@@ -291,13 +306,14 @@ fn task_list_reports_overflow_instead_of_silently_dropping_tasks() {
     ids.push(task_id_from_index(5_000));
     let model = model_from_ids(&ids);
     let list = TaskList::from_model(&model);
+    let attention_projection = Inbox::from_model(&model);
 
     assert_eq!(list.len(), MAX_TASK_LIST_ITEMS);
     let overflow = list.overflow().expect("overflow must be explicit");
     assert_eq!(overflow.limit, MAX_TASK_LIST_ITEMS);
     assert_eq!(overflow.total_count, 5_001);
     assert_eq!(overflow.retained_count, MAX_TASK_LIST_ITEMS);
-    assert_eq!(list.task_ids().last(), ids.get(MAX_TASK_LIST_ITEMS - 1));
+    assert_eq!(list.task_ids(), attention_projection.task_list().task_ids());
 }
 
 #[test]
@@ -327,5 +343,128 @@ fn virtual_window_keeps_visible_rows_and_fixed_bounded_overscan_local() {
         list.virtual_window(),
         before,
         "invalid viewport has zero effects"
+    );
+}
+
+#[test]
+fn shell_navigation_consumes_attention_inbox_beyond_the_legacy_5000_prefix() {
+    let high_attention = task_id_from_index(5_000);
+    let mut items = (0..5_000)
+        .map(|index| task_item(task_id_from_index(index), index as usize))
+        .collect::<Vec<_>>();
+    items.push(task_item_with_attention(
+        high_attention,
+        5_000,
+        TaskAttention::Failed,
+    ));
+    let model = model_from_task_items(items);
+    let inbox = Inbox::from_model(&model);
+
+    assert!(inbox.contains_active_task(high_attention));
+    assert!(
+        TaskList::from_model(&model)
+            .task_ids()
+            .contains(&high_attention),
+        "the compatibility list must delegate to the attention-first projection"
+    );
+
+    let mut shell = Shell::new(None);
+    assert_eq!(
+        shell.navigation_mouse_down(high_attention, 0, &inbox),
+        NavigationResult::Committed {
+            task_id: high_attention,
+            navigation_epoch: 1,
+        }
+    );
+}
+
+#[test]
+fn captured_inbox_actions_are_task_and_epoch_fenced_across_reorder_filter_and_async_work() {
+    let first = task_id_from_index(6_000);
+    let second = task_id_from_index(6_001);
+    let model = model_from_task_items(vec![task_item(first, 0), task_item(second, 1)]);
+    let inbox = Inbox::from_model(&model);
+    let mut shell = Shell::new(Some(first));
+    let epoch = shell.focus_navigation_epoch();
+    let captured = shell
+        .capture_inbox_action(first, epoch, &inbox)
+        .expect("capture the row identity and current epoch");
+
+    let filtered = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("Task 1"),
+        &devmanager::ui::task_cockpit::UnreadCursor::default(),
+    );
+    assert_eq!(
+        shell.resolve_inbox_action(captured, &filtered),
+        Err(NavigationRejection::TaskNotInInbox),
+        "a reused row cannot retarget a filtered task"
+    );
+    assert_eq!(
+        shell.resolve_inbox_action(captured, &inbox),
+        Ok(first),
+        "reordering is harmless when the captured task remains present"
+    );
+
+    assert_eq!(
+        shell.navigation_mouse_down(second, epoch, &inbox),
+        NavigationResult::Committed {
+            task_id: second,
+            navigation_epoch: epoch + 1,
+        }
+    );
+    assert_eq!(
+        shell.resolve_inbox_action(captured, &inbox),
+        Err(NavigationRejection::StaleEpoch),
+        "async completion from the old focus epoch must be rejected"
+    );
+}
+
+#[test]
+fn history_rows_are_separate_read_only_projection_and_never_actionable() {
+    let active = task_id_from_index(7_000);
+    let archived = task_id_from_index(7_001);
+    let model = model_from_task_items(vec![
+        task_item_with_lifecycle(active, 0, TaskLifecycle::Open),
+        task_item_with_lifecycle(archived, 1, TaskLifecycle::Archived),
+    ]);
+    let history = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("Task").including_archived(),
+        &devmanager::ui::task_cockpit::UnreadCursor::default(),
+    );
+    assert!(history.contains_active_task(active));
+    assert!(!history.contains_active_task(archived));
+    assert_eq!(history.history_rows().len(), 1);
+    assert!(history.history_rows()[0].read_only);
+
+    let mut shell = Shell::new(Some(active));
+    assert_eq!(
+        shell.navigation_mouse_down(archived, 0, &history),
+        NavigationResult::Rejected {
+            reason: NavigationRejection::TaskNotInInbox,
+        }
+    );
+    let render = shell.inbox_render_model(&history, InboxPresentationWidth::Regular);
+    assert!(render.items.iter().any(|item| matches!(
+        item,
+        InboxRenderItem::HistoryRow(row)
+            if row.task_id == archived
+                && row.read_only
+                && row.accessibility.role == devmanager::ui::components::AccessibleRole::Region
+                && row.accessibility.disabled
+                && row.accessibility.read_only
+                && row.accessible_description.contains("read-only")
+    )));
+}
+
+#[test]
+fn production_task_cockpit_shell_accepts_only_the_attention_inbox() {
+    let source = include_str!("../src/ui/shell.rs");
+    assert!(source.contains("task_inbox: &Inbox"));
+    assert!(source.contains("inbox_render_model"));
+    assert!(
+        !source.contains("ActiveTaskLookup") && !source.contains("TaskList"),
+        "the production shell must not retain a parallel legacy task-list navigation path"
     );
 }

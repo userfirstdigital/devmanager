@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::domain::id::TaskId;
-use crate::ui::task_cockpit::TaskList;
+use crate::ui::task_cockpit::{Inbox, InboxPresentationWidth, InboxRenderModel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerButton {
@@ -38,6 +38,24 @@ pub enum NavigationResult {
     Rejected {
         reason: NavigationRejection,
     },
+}
+
+/// An action captured from an inbox row. The task identity and the shell's
+/// current navigation epoch travel together through asynchronous work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturedInboxAction {
+    task_id: TaskId,
+    navigation_epoch: u64,
+}
+
+impl CapturedInboxAction {
+    pub fn task_id(self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn navigation_epoch(self) -> u64 {
+        self.navigation_epoch
+    }
 }
 
 impl NavigationResult {
@@ -159,12 +177,56 @@ impl Shell {
         self.navigation_epoch
     }
 
+    pub fn focus_navigation_epoch(&self) -> u64 {
+        self.navigation_epoch
+    }
+
     pub fn transient_priority(&self) -> Option<TransientPriority> {
         self.transient_priority
     }
 
     pub fn set_transient_priority(&mut self, priority: Option<TransientPriority>) {
         self.transient_priority = priority;
+    }
+
+    pub fn inbox_render_model(
+        &self,
+        inbox: &Inbox,
+        width: InboxPresentationWidth,
+    ) -> InboxRenderModel {
+        inbox.render_model(width)
+    }
+
+    pub fn capture_inbox_action(
+        &self,
+        task_id: TaskId,
+        expected_epoch: u64,
+        inbox: &Inbox,
+    ) -> Result<CapturedInboxAction, NavigationRejection> {
+        if expected_epoch != self.navigation_epoch {
+            return Err(NavigationRejection::StaleEpoch);
+        }
+        if !inbox.contains_active_task(task_id) {
+            return Err(NavigationRejection::TaskNotInInbox);
+        }
+        Ok(CapturedInboxAction {
+            task_id,
+            navigation_epoch: self.navigation_epoch,
+        })
+    }
+
+    pub fn resolve_inbox_action(
+        &self,
+        action: CapturedInboxAction,
+        inbox: &Inbox,
+    ) -> Result<TaskId, NavigationRejection> {
+        if action.navigation_epoch != self.navigation_epoch {
+            return Err(NavigationRejection::StaleEpoch);
+        }
+        if !inbox.contains_active_task(action.task_id) {
+            return Err(NavigationRejection::TaskNotInInbox);
+        }
+        Ok(action.task_id)
     }
 
     /// Commit selection only when the caller's navigation epoch is current.
@@ -174,7 +236,7 @@ impl Shell {
         &mut self,
         task_id: TaskId,
         expected_epoch: u64,
-        task_inbox: &TaskList,
+        task_inbox: &Inbox,
     ) -> NavigationResult {
         if expected_epoch != self.navigation_epoch {
             self.invalidate_pointer_owner();
@@ -182,7 +244,7 @@ impl Shell {
                 reason: NavigationRejection::StaleEpoch,
             };
         }
-        if !task_inbox.task_ids().contains(&task_id) {
+        if !task_inbox.contains_active_task(task_id) {
             self.invalidate_pointer_owner();
             return NavigationResult::Rejected {
                 reason: NavigationRejection::TaskNotInInbox,

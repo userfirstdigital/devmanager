@@ -5,6 +5,38 @@
   "report": {
     "projection": "client-model-only",
     "rendered_rows_bound": 104,
-    "selection": "task-id"
+    "selection": "task-id",
+    "display_bounds": {
+      "project_chars": 96,
+      "worktree_chars": 128,
+      "secondary_chars": 128
+    },
+    "index_candidate_bound": 5000
+  },
+  "behavioral_cases": {
+    "display_rows": [
+      {
+        "title": "Needs answer with a deliberately long worktree label",
+        "workspace_path": "C:/projects/a-project-name-that-is-long-enough-to-exercise-the-bounded-project-label-and-worktree-display/checkout",
+        "worktree_branch": "feature/task-inbox-with-a-deliberately-long-branch-name",
+        "provider": "claude",
+        "resources": [
+          {"kind": "terminal", "lifecycle": "active"},
+          {"kind": "service", "lifecycle": "releasing"}
+        ]
+      },
+      {
+        "title": "Working without a primary provider",
+        "provider": null
+      }
+    ],
+    "case_only_title_ties": {
+      "titles": ["Alpha", "alpha"],
+      "expected_order": ["Alpha", "alpha"]
+    },
+    "actions": {
+      "mark_read": "client-local",
+      "capture": "task-id-and-epoch"
+    }
   }
 }
