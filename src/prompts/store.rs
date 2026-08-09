@@ -113,15 +113,17 @@ impl PromptStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prompt_command_state(&tx, &command)?;
 
-        if let Some(receipt) = load_receipt(&tx, command_id, &command_sha256)? {
+        if let Some(receipt) = load_receipt(&tx, command_id, &command, &command_sha256)? {
             tx.commit()?;
             return Ok(receipt);
         }
 
         command.validate()?;
         let (receipt, event, prompt_id, occurred_at_ms) = apply_command(&tx, command_id, &command)?;
-        let receipt_payload = rmp_serde::to_vec_named(&receipt)
+        let receipt_payload = receipt
+            .encode()
             .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
         tx.execute(
             "INSERT INTO prompt_command_receipts(
@@ -170,7 +172,7 @@ impl PromptStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(receipt) = load_chain_receipt(&tx, command_id, &command_sha256)? {
+        if let Some(receipt) = load_chain_receipt(&tx, command_id, &command, &command_sha256)? {
             tx.commit()?;
             return Ok(receipt);
         }
@@ -178,7 +180,8 @@ impl PromptStore {
         command.validate()?;
         let (receipt, event, chain_id, occurred_at_ms) =
             apply_chain_command(&tx, command_id, &command)?;
-        let receipt_payload = rmp_serde::to_vec_named(&receipt)
+        let receipt_payload = receipt
+            .encode()
             .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
         tx.execute(
             "INSERT INTO prompt_chain_command_receipts(
@@ -291,7 +294,11 @@ impl PromptStore {
     }
 
     pub fn get_prompt(&self, prompt_id: PromptId) -> Result<Option<SavedPrompt>, PromptStoreError> {
-        load_prompt(&self.conn, prompt_id)
+        let prompt = load_prompt(&self.conn, prompt_id)?;
+        if let Some(prompt) = &prompt {
+            validate_saved_prompt_record(&self.conn, prompt)?;
+        }
+        Ok(prompt)
     }
 
     pub fn get_version(
@@ -372,11 +379,13 @@ impl PromptStore {
         limit: usize,
     ) -> Result<Vec<PromptVersion>, PromptStoreError> {
         validate_page(limit)?;
-        if load_prompt(&self.conn, prompt_id)?.is_none() {
+        let Some(prompt) = load_prompt(&self.conn, prompt_id)? else {
             return Err(PromptStoreError::NotFound);
-        }
+        };
+        validate_saved_prompt_record(&self.conn, &prompt)?;
         let mut statement = self.conn.prepare(
-            "SELECT prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+            "SELECT prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms,
+                    variables_sealed
              FROM prompt_versions
              WHERE prompt_id = ?1
              ORDER BY version DESC
@@ -396,11 +405,17 @@ impl PromptStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )?;
         rows.map(|row| {
-            let (id, owner, version, body, body_sha256, created_at_ms) = row?;
+            let (id, owner, version, body, body_sha256, created_at_ms, variables_sealed) = row?;
+            if variables_sealed != 1 {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version variables are not sealed".into(),
+                ));
+            }
             let version = PromptVersion {
                 id: version_id_from_bytes(&id)?,
                 prompt_id: prompt_id_from_bytes(&owner)?,
@@ -438,61 +453,87 @@ impl PromptStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut statement = tx.prepare(
-            "SELECT event_type, occurred_at_ms, payload
-             FROM prompt_events ORDER BY sequence ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            let (event_type, occurred_at_ms, payload) = row?;
-            let event = PromptEvent::decode(&payload)
-                .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
-            if event.event_type() != event_type {
-                return Err(PromptStoreError::Corruption(
-                    "prompt event type disagrees with payload".into(),
-                ));
-            }
-            events.push((event, occurred_at_ms));
-        }
-        drop(statement);
-        let mut chain_statement = tx.prepare(
-            "SELECT event_type, occurred_at_ms, payload
-             FROM prompt_chain_events ORDER BY sequence ASC",
-        )?;
-        let chain_rows = chain_statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        let mut chain_events = Vec::new();
-        for row in chain_rows {
-            let (event_type, occurred_at_ms, payload) = row?;
-            let event = PromptChainEvent::decode(&payload)
-                .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
-            if event.event_type() != event_type {
-                return Err(PromptStoreError::Corruption(
-                    "prompt chain event type disagrees with payload".into(),
-                ));
-            }
-            chain_events.push((event, occurred_at_ms));
-        }
-        drop(chain_statement);
+        let prompt_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Vec<u8>)> = {
+            let mut statement = tx.prepare(
+                "SELECT prompt_event_id, command_id, prompt_id, event_type,
+                        occurred_at_ms, payload
+                 FROM prompt_events ORDER BY sequence ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            rows
+        };
+        let events = prompt_rows
+            .into_iter()
+            .map(
+                |(event_id, command_id, prompt_id, event_type, occurred_at_ms, payload)| {
+                    validate_prompt_event_row(
+                        &tx,
+                        &event_id,
+                        &command_id,
+                        &prompt_id,
+                        &event_type,
+                        occurred_at_ms,
+                        &payload,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let chain_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Vec<u8>)> = {
+            let mut statement = tx.prepare(
+                "SELECT prompt_chain_event_id, command_id, chain_id, event_type,
+                        occurred_at_ms, payload
+                 FROM prompt_chain_events ORDER BY sequence ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            rows
+        };
+        let chain_events = chain_rows
+            .into_iter()
+            .map(
+                |(event_id, command_id, chain_id, event_type, occurred_at_ms, payload)| {
+                    validate_chain_event_row(
+                        &tx,
+                        &event_id,
+                        &command_id,
+                        &chain_id,
+                        &event_type,
+                        occurred_at_ms,
+                        &payload,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
         tx.execute_batch(
             "DELETE FROM prompt_chain_links;
              DELETE FROM prompt_chains;
              DELETE FROM prompt_tags;
              DELETE FROM saved_prompts;",
         )?;
-        for (event, occurred_at_ms) in &events {
+        for (event, occurred_at_ms, receipt_version_id) in &events {
+            validate_prompt_event_temporal_lineage(&tx, event, *receipt_version_id)?;
             apply_event(&tx, event, *occurred_at_ms)?;
         }
         for (event, occurred_at_ms) in &chain_events {
@@ -526,6 +567,24 @@ fn apply_command(
         PromptCommand::ArchivePrompt(command) => apply_archive(tx, command_id, command),
         PromptCommand::RestorePrompt(command) => apply_restore(tx, command_id, command),
     }
+}
+
+fn validate_prompt_command_state(
+    tx: &Transaction<'_>,
+    command: &PromptCommand,
+) -> Result<(), PromptStoreError> {
+    let prompt_id = match command {
+        PromptCommand::CreatePrompt(command) => command.prompt_id,
+        PromptCommand::CreatePromptVersion(command) => command.prompt_id,
+        PromptCommand::RenamePrompt(command) => command.prompt_id,
+        PromptCommand::SetPromptTags(command) => command.prompt_id,
+        PromptCommand::ArchivePrompt(command) => command.prompt_id,
+        PromptCommand::RestorePrompt(command) => command.prompt_id,
+    };
+    if let Some(prompt) = load_prompt(tx, prompt_id)? {
+        validate_saved_prompt_record(tx, &prompt)?;
+    }
+    Ok(())
 }
 
 fn apply_create(
@@ -583,9 +642,7 @@ fn apply_create_version(
 ) -> Result<(PromptMutationReceipt, Option<PromptEvent>, PromptId, i64), PromptStoreError> {
     let prompt = load_prompt(tx, command.prompt_id)?.ok_or(PromptStoreError::NotFound)?;
     check_revision(&prompt, command.expected_revision)?;
-    if prompt.archived_at_ms.is_some() {
-        return Err(PromptStoreError::InvalidTransition);
-    }
+    ensure_prompt_active(&prompt)?;
     let next_version = next_version_number(tx, command.prompt_id)?;
     let variables = command.normalized_variables()?;
     let version = PromptVersion::new_with_variables(
@@ -596,17 +653,6 @@ fn apply_create_version(
         variables,
         command.created_at_ms,
     )?;
-    let current_version = load_version(tx, prompt.current_version_id)?
-        .ok_or_else(|| PromptStoreError::Corruption("prompt current version is missing".into()))?;
-    if current_version.body == version.body && current_version.variables == version.variables {
-        let receipt = PromptMutationReceipt {
-            command_id,
-            prompt_id: prompt.id,
-            prompt_version_id: prompt.current_version_id,
-            revision: prompt.revision,
-        };
-        return Ok((receipt, None, prompt.id, command.created_at_ms));
-    }
     let revision = next_revision(prompt.revision)?;
     insert_version(tx, &version)?;
     update_current_version(tx, &prompt, version.id, revision, command.created_at_ms)?;
@@ -635,6 +681,7 @@ fn apply_rename(
 ) -> Result<(PromptMutationReceipt, Option<PromptEvent>, PromptId, i64), PromptStoreError> {
     let prompt = load_prompt(tx, command.prompt_id)?.ok_or(PromptStoreError::NotFound)?;
     check_revision(&prompt, command.expected_revision)?;
+    ensure_prompt_active(&prompt)?;
     command.validate()?;
     let title = command.title.trim();
     if prompt.title == title {
@@ -690,6 +737,7 @@ fn apply_tags(
 ) -> Result<(PromptMutationReceipt, Option<PromptEvent>, PromptId, i64), PromptStoreError> {
     let prompt = load_prompt(tx, command.prompt_id)?.ok_or(PromptStoreError::NotFound)?;
     check_revision(&prompt, command.expected_revision)?;
+    ensure_prompt_active(&prompt)?;
     let tags = command.validate()?;
     if prompt.tags == tags {
         let receipt = PromptMutationReceipt {
@@ -1235,6 +1283,14 @@ fn ensure_chain_active(chain: &PromptChain) -> Result<(), PromptStoreError> {
     }
 }
 
+fn ensure_prompt_active(prompt: &SavedPrompt) -> Result<(), PromptStoreError> {
+    if prompt.archived_at_ms.is_some() {
+        Err(PromptStoreError::InvalidTransition)
+    } else {
+        Ok(())
+    }
+}
+
 fn renumber_links(links: &mut [PromptChainLink]) -> Result<(), PromptStoreError> {
     for (position, link) in links.iter_mut().enumerate() {
         link.position = u32::try_from(position)
@@ -1690,8 +1746,9 @@ fn insert_version(tx: &Transaction<'_>, version: &PromptVersion) -> Result<(), P
     validate_version_record(version)?;
     tx.execute(
         "INSERT INTO prompt_versions(
-            prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms,
+            variables_sealed
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
         rusqlite::params![
             version.id.as_bytes().as_slice(),
             version.prompt_id.as_bytes().as_slice(),
@@ -1713,6 +1770,11 @@ fn insert_version(tx: &Transaction<'_>, version: &PromptVersion) -> Result<(), P
             ],
         )?;
     }
+    tx.execute(
+        "UPDATE prompt_versions SET variables_sealed = 1
+         WHERE prompt_version_id = ?1 AND variables_sealed = 0",
+        [version.id.as_bytes().as_slice()],
+    )?;
     Ok(())
 }
 
@@ -1801,48 +1863,655 @@ fn update_archive(
 fn load_receipt(
     tx: &Transaction<'_>,
     command_id: CommandId,
+    command: &PromptCommand,
     command_sha256: &[u8; 32],
 ) -> Result<Option<PromptMutationReceipt>, PromptStoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = tx
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)> = tx
         .query_row(
-            "SELECT command_sha256, receipt FROM prompt_command_receipts WHERE command_id = ?1",
+            "SELECT command_sha256, prompt_id, prompt_version_id, receipt, revision
+             FROM prompt_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((stored_hash, receipt)) = row else {
+    let Some((stored_hash, stored_prompt_id, stored_version_id, receipt_payload, stored_revision)) =
+        row
+    else {
         return Ok(None);
     };
+    if stored_hash.len() != 32 {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt command hash must be 32 bytes".into(),
+        ));
+    }
     if stored_hash.as_slice() != command_sha256 {
         return Err(PromptStoreError::IdempotencyConflict);
     }
-    let receipt = rmp_serde::from_slice(&receipt)
+    let receipt = PromptMutationReceipt::decode(&receipt_payload)
         .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if receipt
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != receipt_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt payload is not canonical".into(),
+        ));
+    }
+    let stored_prompt_id = prompt_id_from_bytes(&stored_prompt_id)?;
+    let stored_version_id = version_id_from_bytes(&stored_version_id)?;
+    let stored_revision = from_i64("prompt receipt.revision", stored_revision)?;
+    if receipt.command_id != command_id
+        || receipt.prompt_id != stored_prompt_id
+        || receipt.prompt_version_id != stored_version_id
+        || receipt.revision != stored_revision
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt fields disagree with their row".into(),
+        ));
+    }
+    validate_prompt_receipt_command(tx, command, &receipt)?;
     Ok(Some(receipt))
 }
 
 fn load_chain_receipt(
     tx: &Transaction<'_>,
     command_id: CommandId,
+    command: &PromptChainCommand,
     command_sha256: &[u8; 32],
 ) -> Result<Option<PromptChainMutationReceipt>, PromptStoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = tx
+    let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, i64)> = tx
         .query_row(
-            "SELECT command_sha256, receipt
+            "SELECT command_sha256, chain_id, chain_link_id, receipt, revision
              FROM prompt_chain_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((stored_hash, receipt)) = row else {
+    let Some((stored_hash, stored_chain_id, stored_link_id, receipt_payload, stored_revision)) =
+        row
+    else {
         return Ok(None);
     };
+    if stored_hash.len() != 32 {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt command hash must be 32 bytes".into(),
+        ));
+    }
     if stored_hash.as_slice() != command_sha256 {
         return Err(PromptStoreError::IdempotencyConflict);
     }
-    let receipt = rmp_serde::from_slice(&receipt)
+    let receipt = PromptChainMutationReceipt::decode(&receipt_payload)
         .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if receipt
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != receipt_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt payload is not canonical".into(),
+        ));
+    }
+    let stored_chain_id = prompt_chain_id_from_bytes(&stored_chain_id)?;
+    let stored_link_id = stored_link_id
+        .as_deref()
+        .map(prompt_chain_link_id_from_bytes)
+        .transpose()?;
+    let stored_revision = from_i64("prompt chain receipt.revision", stored_revision)?;
+    if receipt.command_id != command_id
+        || receipt.chain_id != stored_chain_id
+        || receipt.link_id != stored_link_id
+        || receipt.revision != stored_revision
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt fields disagree with their row".into(),
+        ));
+    }
+    validate_chain_receipt_command(tx, command, &receipt)?;
     Ok(Some(receipt))
+}
+
+fn validate_prompt_event_row(
+    tx: &Transaction<'_>,
+    event_id_bytes: &[u8],
+    command_id_bytes: &[u8],
+    row_prompt_id_bytes: &[u8],
+    row_event_type: &str,
+    occurred_at_ms: i64,
+    payload: &[u8],
+) -> Result<(PromptEvent, i64, PromptVersionId), PromptStoreError> {
+    let _event_id = event_id_from_bytes(event_id_bytes)?;
+    let command_id = command_id_from_bytes(command_id_bytes)?;
+    let row_prompt_id = prompt_id_from_bytes(row_prompt_id_bytes)?;
+    let receipt_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64)> = tx
+        .query_row(
+            "SELECT command_id, command_sha256, prompt_id, prompt_version_id,
+                    revision, receipt, created_at_ms
+             FROM prompt_command_receipts WHERE command_id = ?1",
+            [command_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        stored_command_id,
+        command_sha256,
+        stored_prompt_id,
+        stored_version_id,
+        revision,
+        receipt_payload,
+        created_at_ms,
+    )) = receipt_row
+    else {
+        return Err(PromptStoreError::Corruption(
+            "prompt event references a missing command receipt".into(),
+        ));
+    };
+    if command_sha256.len() != 32 {
+        return Err(PromptStoreError::Corruption(
+            "prompt event command hash must be 32 bytes".into(),
+        ));
+    }
+    if command_id_from_bytes(&stored_command_id)? != command_id {
+        return Err(PromptStoreError::Corruption(
+            "prompt event command receipt key mismatch".into(),
+        ));
+    }
+    let receipt = PromptMutationReceipt::decode(&receipt_payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if receipt
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != receipt_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt payload is not canonical".into(),
+        ));
+    }
+    let stored_prompt_id = prompt_id_from_bytes(&stored_prompt_id)?;
+    let stored_version_id = version_id_from_bytes(&stored_version_id)?;
+    let revision = from_i64("prompt event receipt.revision", revision)?;
+    if receipt.command_id != command_id
+        || receipt.prompt_id != stored_prompt_id
+        || receipt.prompt_version_id != stored_version_id
+        || receipt.revision != revision
+        || row_prompt_id != receipt.prompt_id
+        || occurred_at_ms != created_at_ms
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt event row disagrees with its command receipt".into(),
+        ));
+    }
+    let stored_version = load_version(tx, receipt.prompt_version_id)?.ok_or_else(|| {
+        PromptStoreError::Corruption("prompt event receipt references a missing version".into())
+    })?;
+    if stored_version.prompt_id != receipt.prompt_id {
+        return Err(PromptStoreError::Corruption(
+            "prompt event receipt version ownership mismatch".into(),
+        ));
+    }
+    let event = PromptEvent::decode(payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if event
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt event payload is not canonical".into(),
+        ));
+    }
+    if event.event_type() != row_event_type {
+        return Err(PromptStoreError::Corruption(
+            "prompt event type disagrees with payload".into(),
+        ));
+    }
+    validate_prompt_event_payload(
+        &event,
+        row_prompt_id,
+        &stored_version,
+        receipt.prompt_version_id,
+        receipt.revision,
+        occurred_at_ms,
+    )?;
+    Ok((event, occurred_at_ms, receipt.prompt_version_id))
+}
+
+fn validate_prompt_event_payload(
+    event: &PromptEvent,
+    row_prompt_id: PromptId,
+    stored_version: &PromptVersion,
+    receipt_version_id: PromptVersionId,
+    receipt_revision: u64,
+    occurred_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let invalid = || PromptStoreError::Corruption("prompt event payload lineage is invalid".into());
+    match event {
+        PromptEvent::PromptCreated { prompt, version } => {
+            if prompt.id != row_prompt_id
+                || prompt.revision != 1
+                || prompt.current_version_id != version.id
+                || version.id != receipt_version_id
+                || version.prompt_id != row_prompt_id
+                || version.version != 1
+                || prompt.revision != receipt_revision
+                || version != stored_version
+            {
+                return Err(invalid());
+            }
+        }
+        PromptEvent::PromptVersionCreated {
+            prompt_id,
+            version,
+            revision,
+        } => {
+            if *prompt_id != row_prompt_id
+                || version.id != receipt_version_id
+                || version.prompt_id != row_prompt_id
+                || *revision != receipt_revision
+                || version != stored_version
+            {
+                return Err(invalid());
+            }
+        }
+        PromptEvent::PromptRenamed {
+            prompt_id,
+            revision,
+            ..
+        }
+        | PromptEvent::PromptTagsSet {
+            prompt_id,
+            revision,
+            ..
+        }
+        | PromptEvent::PromptRestored {
+            prompt_id,
+            revision,
+        } => {
+            if *prompt_id != row_prompt_id || *revision != receipt_revision {
+                return Err(invalid());
+            }
+        }
+        PromptEvent::PromptArchived {
+            prompt_id,
+            archived_at_ms,
+            revision,
+        } => {
+            if *prompt_id != row_prompt_id
+                || *revision != receipt_revision
+                || *archived_at_ms != occurred_at_ms
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_prompt_event_temporal_lineage(
+    tx: &Transaction<'_>,
+    event: &PromptEvent,
+    receipt_version_id: PromptVersionId,
+) -> Result<(), PromptStoreError> {
+    match event {
+        PromptEvent::PromptCreated { version, .. }
+        | PromptEvent::PromptVersionCreated { version, .. }
+            if version.id != receipt_version_id =>
+        {
+            return Err(PromptStoreError::Corruption(
+                "prompt event version receipt lineage is invalid".into(),
+            ));
+        }
+        PromptEvent::PromptCreated { .. } | PromptEvent::PromptVersionCreated { .. } => {}
+        PromptEvent::PromptRenamed { prompt_id, .. }
+        | PromptEvent::PromptTagsSet { prompt_id, .. }
+        | PromptEvent::PromptArchived { prompt_id, .. }
+        | PromptEvent::PromptRestored { prompt_id, .. } => {
+            let prompt = load_prompt(tx, *prompt_id)?.ok_or_else(|| {
+                PromptStoreError::Corruption(
+                    "prompt event version lineage references a missing prompt".into(),
+                )
+            })?;
+            if prompt.current_version_id != receipt_version_id {
+                return Err(PromptStoreError::Corruption(
+                    "prompt event version receipt lineage is invalid".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_chain_event_row(
+    tx: &Transaction<'_>,
+    event_id_bytes: &[u8],
+    command_id_bytes: &[u8],
+    row_chain_id_bytes: &[u8],
+    row_event_type: &str,
+    occurred_at_ms: i64,
+    payload: &[u8],
+) -> Result<(PromptChainEvent, i64), PromptStoreError> {
+    let _event_id = event_id_from_bytes(event_id_bytes)?;
+    let command_id = command_id_from_bytes(command_id_bytes)?;
+    let row_chain_id = prompt_chain_id_from_bytes(row_chain_id_bytes)?;
+    let receipt_row: Option<(
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        i64,
+        Vec<u8>,
+        i64,
+    )> = tx
+        .query_row(
+            "SELECT command_id, command_sha256, chain_id, chain_link_id,
+                    revision, receipt, created_at_ms
+             FROM prompt_chain_command_receipts WHERE command_id = ?1",
+            [command_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        stored_command_id,
+        command_sha256,
+        stored_chain_id,
+        stored_link_id,
+        revision,
+        receipt_payload,
+        created_at_ms,
+    )) = receipt_row
+    else {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event references a missing command receipt".into(),
+        ));
+    };
+    if command_sha256.len() != 32 {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event command hash must be 32 bytes".into(),
+        ));
+    }
+    if command_id_from_bytes(&stored_command_id)? != command_id {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event command receipt key mismatch".into(),
+        ));
+    }
+    let receipt = PromptChainMutationReceipt::decode(&receipt_payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if receipt
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != receipt_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt payload is not canonical".into(),
+        ));
+    }
+    let stored_chain_id = prompt_chain_id_from_bytes(&stored_chain_id)?;
+    let stored_link_id = stored_link_id
+        .as_deref()
+        .map(prompt_chain_link_id_from_bytes)
+        .transpose()?;
+    let revision = from_i64("prompt chain event receipt.revision", revision)?;
+    if receipt.command_id != command_id
+        || receipt.chain_id != stored_chain_id
+        || receipt.link_id != stored_link_id
+        || receipt.revision != revision
+        || row_chain_id != receipt.chain_id
+        || occurred_at_ms != created_at_ms
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event row disagrees with its command receipt".into(),
+        ));
+    }
+    if load_chain(tx, receipt.chain_id)?.is_none() {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event receipt references a missing chain".into(),
+        ));
+    }
+    let event = PromptChainEvent::decode(payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if event
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+        != payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event payload is not canonical".into(),
+        ));
+    }
+    if event.event_type() != row_event_type {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event type disagrees with payload".into(),
+        ));
+    }
+    validate_chain_event_payload(&event, row_chain_id, receipt.revision, occurred_at_ms)?;
+    Ok((event, occurred_at_ms))
+}
+
+fn validate_chain_event_payload(
+    event: &PromptChainEvent,
+    row_chain_id: PromptChainId,
+    receipt_revision: u64,
+    occurred_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let invalid =
+        || PromptStoreError::Corruption("prompt chain event payload lineage is invalid".into());
+    match event {
+        PromptChainEvent::PromptChainCreated { chain } => {
+            if chain.id != row_chain_id || chain.revision != 1 || chain.revision != receipt_revision
+            {
+                return Err(invalid());
+            }
+        }
+        PromptChainEvent::PromptChainRenamed {
+            chain_id, revision, ..
+        }
+        | PromptChainEvent::PromptChainLinksReplaced {
+            chain_id, revision, ..
+        }
+        | PromptChainEvent::PromptChainRestored { chain_id, revision } => {
+            if *chain_id != row_chain_id || *revision != receipt_revision {
+                return Err(invalid());
+            }
+        }
+        PromptChainEvent::PromptChainArchived {
+            chain_id,
+            archived_at_ms,
+            revision,
+        } => {
+            if *chain_id != row_chain_id
+                || *revision != receipt_revision
+                || *archived_at_ms != occurred_at_ms
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_prompt_receipt_command(
+    tx: &Transaction<'_>,
+    command: &PromptCommand,
+    receipt: &PromptMutationReceipt,
+) -> Result<(), PromptStoreError> {
+    let version = load_version(tx, receipt.prompt_version_id)?.ok_or_else(|| {
+        PromptStoreError::Corruption("prompt receipt references a missing version".into())
+    })?;
+    if version.prompt_id != receipt.prompt_id {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt version ownership mismatch".into(),
+        ));
+    }
+    match command {
+        PromptCommand::CreatePrompt(command) => {
+            if receipt.prompt_id != command.prompt_id
+                || receipt.prompt_version_id != command.prompt_version_id
+                || receipt.revision != 1
+            {
+                return Err(PromptStoreError::Corruption(
+                    "prompt create receipt disagrees with its command".into(),
+                ));
+            }
+        }
+        PromptCommand::CreatePromptVersion(command) => {
+            if receipt.prompt_id != command.prompt_id
+                || receipt.prompt_version_id != command.prompt_version_id
+                || receipt.revision != next_revision(command.expected_revision)?
+            {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version receipt disagrees with its command".into(),
+                ));
+            }
+        }
+        PromptCommand::RenamePrompt(command) => {
+            validate_prompt_receipt_target_and_revision(
+                receipt,
+                command.prompt_id,
+                command.expected_revision,
+            )?;
+        }
+        PromptCommand::SetPromptTags(command) => {
+            validate_prompt_receipt_target_and_revision(
+                receipt,
+                command.prompt_id,
+                command.expected_revision,
+            )?;
+        }
+        PromptCommand::ArchivePrompt(command) => {
+            validate_prompt_receipt_target_and_revision(
+                receipt,
+                command.prompt_id,
+                command.expected_revision,
+            )?;
+        }
+        PromptCommand::RestorePrompt(command) => {
+            validate_prompt_receipt_target_and_revision(
+                receipt,
+                command.prompt_id,
+                command.expected_revision,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_prompt_receipt_target_and_revision(
+    receipt: &PromptMutationReceipt,
+    prompt_id: PromptId,
+    expected_revision: u64,
+) -> Result<(), PromptStoreError> {
+    if receipt.prompt_id != prompt_id
+        || (receipt.revision != expected_revision
+            && receipt.revision != next_revision(expected_revision)?)
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt target or revision disagrees with its command".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chain_receipt_command(
+    tx: &Transaction<'_>,
+    command: &PromptChainCommand,
+    receipt: &PromptChainMutationReceipt,
+) -> Result<(), PromptStoreError> {
+    if load_chain(tx, receipt.chain_id)?.is_none() {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt references a missing chain".into(),
+        ));
+    }
+    let (chain_id, link_id, expected_revision) = match command {
+        PromptChainCommand::CreatePromptChain(command) => (command.chain_id, None, None),
+        PromptChainCommand::RenamePromptChain(command) => {
+            (command.chain_id, None, Some(command.expected_revision))
+        }
+        PromptChainCommand::InsertPromptChainLink(command) => (
+            command.chain_id,
+            Some(command.link_id),
+            Some(command.expected_revision),
+        ),
+        PromptChainCommand::MovePromptChainLink(command) => (
+            command.chain_id,
+            Some(command.link_id),
+            Some(command.expected_revision),
+        ),
+        PromptChainCommand::RemovePromptChainLink(command) => (
+            command.chain_id,
+            Some(command.link_id),
+            Some(command.expected_revision),
+        ),
+        PromptChainCommand::UpdatePromptChainLinkVersion(command) => (
+            command.chain_id,
+            Some(command.link_id),
+            Some(command.expected_revision),
+        ),
+        PromptChainCommand::ArchivePromptChain(command) => {
+            (command.chain_id, None, Some(command.expected_revision))
+        }
+        PromptChainCommand::RestorePromptChain(command) => {
+            (command.chain_id, None, Some(command.expected_revision))
+        }
+    };
+    if receipt.chain_id != chain_id || receipt.link_id != link_id {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt target disagrees with its command".into(),
+        ));
+    }
+    match expected_revision {
+        Some(expected_revision) => {
+            if receipt.revision != expected_revision
+                && receipt.revision != next_revision(expected_revision)?
+            {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain receipt revision disagrees with its command".into(),
+                ));
+            }
+        }
+        None if receipt.revision != 1 => {
+            return Err(PromptStoreError::Corruption(
+                "prompt chain creation receipt revision is invalid".into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn load_prompt(
@@ -1878,7 +2547,6 @@ fn load_prompt(
         revision: from_i64("saved_prompts.revision", revision)?,
         archived_at_ms,
     };
-    validate_saved_prompt_record(conn, &prompt)?;
     Ok(Some(prompt))
 }
 
@@ -1909,6 +2577,31 @@ fn validate_saved_prompt_record(
     if current_version.prompt_id != prompt.id {
         return Err(PromptStoreError::Corruption(
             "saved prompt current version ownership mismatch".into(),
+        ));
+    }
+    let latest_version: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT prompt_version_id, version
+             FROM prompt_versions
+             WHERE prompt_id = ?1
+             ORDER BY version DESC
+             LIMIT 1",
+            [prompt.id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((latest_version_id, latest_version_number)) = latest_version else {
+        return Err(PromptStoreError::Corruption(
+            "saved prompt has no prompt versions".into(),
+        ));
+    };
+    if version_id_from_bytes(&latest_version_id)? != prompt.current_version_id
+        || u32::try_from(latest_version_number).map_err(|_| {
+            PromptStoreError::Corruption("latest prompt version is out of range".into())
+        })? != current_version.version
+    {
+        return Err(PromptStoreError::Corruption(
+            "saved prompt current version is not latest".into(),
         ));
     }
     Ok(())
@@ -2032,9 +2725,9 @@ fn load_version(
     conn: &Connection,
     version_id: PromptVersionId,
 ) -> Result<Option<PromptVersion>, PromptStoreError> {
-    let row: Option<(Vec<u8>, i64, String, Vec<u8>, i64)> = conn
+    let row: Option<(Vec<u8>, i64, String, Vec<u8>, i64, i64)> = conn
         .query_row(
-            "SELECT prompt_id, version, body, body_sha256, created_at_ms
+            "SELECT prompt_id, version, body, body_sha256, created_at_ms, variables_sealed
              FROM prompt_versions WHERE prompt_version_id = ?1",
             [version_id.as_bytes().as_slice()],
             |row| {
@@ -2044,13 +2737,19 @@ fn load_version(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((prompt_id, version, body, body_sha256, created_at_ms)) = row else {
+    let Some((prompt_id, version, body, body_sha256, created_at_ms, variables_sealed)) = row else {
         return Ok(None);
     };
+    if variables_sealed != 1 {
+        return Err(PromptStoreError::Corruption(
+            "prompt version variables are not sealed".into(),
+        ));
+    }
     let version = PromptVersion {
         id: version_id,
         prompt_id: prompt_id_from_bytes(&prompt_id)?,
@@ -2186,6 +2885,20 @@ fn digest_from_bytes(bytes: &[u8]) -> Result<[u8; 32], PromptStoreError> {
         .map_err(|_| PromptStoreError::Corruption("prompt body digest must be 32 bytes".into()))
 }
 
+fn command_id_from_bytes(bytes: &[u8]) -> Result<CommandId, PromptStoreError> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| PromptStoreError::Corruption("command id must be 16 bytes".into()))?;
+    CommandId::from_bytes(bytes).map_err(|error| PromptStoreError::Corruption(error.to_string()))
+}
+
+fn event_id_from_bytes(bytes: &[u8]) -> Result<EventId, PromptStoreError> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| PromptStoreError::Corruption("prompt event id must be 16 bytes".into()))?;
+    EventId::from_bytes(bytes).map_err(|error| PromptStoreError::Corruption(error.to_string()))
+}
+
 fn prompt_id_from_bytes(bytes: &[u8]) -> Result<PromptId, PromptStoreError> {
     let bytes: [u8; 16] = bytes
         .try_into()
@@ -2198,6 +2911,14 @@ fn version_id_from_bytes(bytes: &[u8]) -> Result<PromptVersionId, PromptStoreErr
         .try_into()
         .map_err(|_| PromptStoreError::Corruption("prompt version id must be 16 bytes".into()))?;
     PromptVersionId::from_bytes(bytes)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))
+}
+
+fn prompt_chain_id_from_bytes(bytes: &[u8]) -> Result<PromptChainId, PromptStoreError> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| PromptStoreError::Corruption("prompt chain id must be 16 bytes".into()))?;
+    PromptChainId::from_bytes(bytes)
         .map_err(|error| PromptStoreError::Corruption(error.to_string()))
 }
 

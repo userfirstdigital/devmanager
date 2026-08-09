@@ -313,6 +313,114 @@ CREATE INDEX idx_prompt_events_prompt_sequence\n\
   ON prompt_events(prompt_id, sequence);\n\
 ";
 
+const V8_SQL: &str = "\
+ALTER TABLE prompt_versions ADD COLUMN variables_sealed INTEGER NOT NULL DEFAULT 1 CHECK(variables_sealed IN (0, 1));\n\
+DROP TRIGGER prompt_versions_immutable_update;\n\
+CREATE TRIGGER prompt_versions_immutable_update\n\
+  BEFORE UPDATE ON prompt_versions\n\
+  WHEN NOT (\n\
+    OLD.variables_sealed = 0\n\
+    AND NEW.variables_sealed = 1\n\
+    AND NEW.prompt_version_id = OLD.prompt_version_id\n\
+    AND NEW.prompt_id = OLD.prompt_id\n\
+    AND NEW.version = OLD.version\n\
+    AND NEW.body = OLD.body\n\
+    AND NEW.body_sha256 = OLD.body_sha256\n\
+    AND NEW.created_at_ms = OLD.created_at_ms\n\
+  )\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version history is immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_version_variables_insert_requires_unsealed\n\
+  BEFORE INSERT ON prompt_version_variables\n\
+  WHEN NOT EXISTS (\n\
+    SELECT 1 FROM prompt_versions\n\
+    WHERE prompt_version_id = NEW.prompt_version_id AND variables_sealed = 0\n\
+  )\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version variables are sealed');\n\
+END;\n\
+CREATE TRIGGER prompt_versions_body_utf8_byte_limit\n\
+  BEFORE INSERT ON prompt_versions\n\
+  WHEN typeof(NEW.body) <> 'text' OR length(CAST(NEW.body AS BLOB)) > 262144\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version body exceeds UTF-8 byte limit');\n\
+END;\n\
+CREATE TRIGGER prompt_tags_normalized_insert\n\
+  BEFORE INSERT ON prompt_tags\n\
+  WHEN typeof(NEW.tag) <> 'text'\n\
+    OR length(NEW.tag) = 0\n\
+    OR length(NEW.tag) > 48\n\
+    OR NEW.tag <> trim(NEW.tag)\n\
+    OR NEW.tag <> lower(NEW.tag)\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt tag is not normalized');\n\
+END;\n\
+CREATE TRIGGER prompt_tags_normalized_update\n\
+  BEFORE UPDATE OF tag ON prompt_tags\n\
+  WHEN typeof(NEW.tag) <> 'text'\n\
+    OR length(NEW.tag) = 0\n\
+    OR length(NEW.tag) > 48\n\
+    OR NEW.tag <> trim(NEW.tag)\n\
+    OR NEW.tag <> lower(NEW.tag)\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt tag is not normalized');\n\
+END;\n\
+CREATE TRIGGER prompt_version_variables_normalized_insert\n\
+  BEFORE INSERT ON prompt_version_variables\n\
+  WHEN typeof(NEW.variable) <> 'text'\n\
+    OR length(NEW.variable) = 0\n\
+    OR length(NEW.variable) > 64\n\
+    OR NEW.variable <> trim(NEW.variable)\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt variable is not normalized');\n\
+END;\n\
+CREATE TRIGGER prompt_version_variables_normalized_update\n\
+  BEFORE UPDATE OF variable ON prompt_version_variables\n\
+  WHEN typeof(NEW.variable) <> 'text'\n\
+    OR length(NEW.variable) = 0\n\
+    OR length(NEW.variable) > 64\n\
+    OR NEW.variable <> trim(NEW.variable)\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt variable is not normalized');\n\
+END;\n\
+CREATE TRIGGER saved_prompts_current_version_is_latest\n\
+  BEFORE UPDATE OF current_version_id ON saved_prompts\n\
+  WHEN NOT EXISTS (\n\
+    SELECT 1\n\
+    FROM prompt_versions AS candidate\n\
+    WHERE candidate.prompt_id = NEW.prompt_id\n\
+      AND candidate.prompt_version_id = NEW.current_version_id\n\
+      AND candidate.version = (\n\
+        SELECT MAX(latest.version) FROM prompt_versions AS latest\n\
+        WHERE latest.prompt_id = NEW.prompt_id\n\
+      )\n\
+  )\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'current prompt version must be latest');\n\
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_immutable_update\n\
+  BEFORE UPDATE ON prompt_chain_command_receipts\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt chain command receipts are immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_immutable_delete\n\
+  BEFORE DELETE ON prompt_chain_command_receipts\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt chain command receipts are append-only');\n\
+END;\n\
+CREATE TRIGGER prompt_chain_events_immutable_update\n\
+  BEFORE UPDATE ON prompt_chain_events\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt chain event provenance is immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_chain_events_immutable_delete\n\
+  BEFORE DELETE ON prompt_chain_events\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt chain event provenance is append-only');\n\
+END;\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -443,6 +551,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "phase07-prompts-v1",
                     sql: V7_SQL,
                     sha256: sha256_bytes(V7_SQL),
+                },
+                Migration {
+                    version: 8,
+                    name: "phase07-prompts-corrections-v2",
+                    sql: V8_SQL,
+                    sha256: sha256_bytes(V8_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -652,7 +766,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 7);
+        assert_eq!(history.len(), 8);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -673,6 +787,9 @@ mod tests {
         assert_eq!(history[6].0, 7);
         assert_eq!(history[6].1, "phase07-prompts-v1");
         assert_eq!(history[6].2.len(), 32);
+        assert_eq!(history[7].0, 8);
+        assert_eq!(history[7].1, "phase07-prompts-corrections-v2");
+        assert_eq!(history[7].2.len(), 32);
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -692,6 +809,122 @@ mod tests {
             )
             .expect("V4 cleanup index");
         assert_eq!(cleanup_index, 1);
+    }
+
+    #[test]
+    fn schema_upgrade_matrix_reaches_corrections_before_prompt_lifecycle() {
+        for prior_version in 1_i64..=7 {
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().join(format!("prior-v{prior_version}.sqlite3"));
+            {
+                let conn = Connection::open(&path).expect("open prior schema");
+                for migration in migration_manifest()
+                    .iter()
+                    .take(usize::try_from(prior_version).expect("version fits"))
+                {
+                    conn.execute_batch(migration.sql)
+                        .expect("apply prior migration SQL");
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            migration.version,
+                            migration.name,
+                            migration.version,
+                            migration.sha256.as_slice(),
+                        ],
+                    )
+                    .expect("record prior migration");
+                }
+            }
+
+            {
+                use crate::domain::id::{CommandId, PromptId, PromptVersionId};
+                use crate::prompts::{
+                    ArchivePrompt, CreatePrompt, CreatePromptVersion, PromptCommand, PromptStore,
+                    RestorePrompt,
+                };
+
+                let mut store = PromptStore::open(&path).expect("upgrade prior schema");
+                let prompt_id = PromptId::new();
+                let first_version_id = PromptVersionId::new();
+                store
+                    .execute(
+                        CommandId::new(),
+                        PromptCommand::CreatePrompt(CreatePrompt {
+                            prompt_id,
+                            prompt_version_id: first_version_id,
+                            title: "Upgrade matrix".into(),
+                            description: None,
+                            tags: vec!["upgrade".into()],
+                            variables: Vec::new(),
+                            body: "initial body".into(),
+                            created_at_ms: 1,
+                        }),
+                    )
+                    .expect("create after upgrade");
+                store
+                    .execute(
+                        CommandId::new(),
+                        PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                            prompt_id,
+                            prompt_version_id: PromptVersionId::new(),
+                            variables: vec!["reviewer".into()],
+                            body: "edited body".into(),
+                            created_at_ms: 2,
+                            expected_revision: 1,
+                        }),
+                    )
+                    .expect("edit after upgrade");
+                store
+                    .execute(
+                        CommandId::new(),
+                        PromptCommand::ArchivePrompt(ArchivePrompt {
+                            prompt_id,
+                            archived_at_ms: 3,
+                            expected_revision: 2,
+                        }),
+                    )
+                    .expect("archive after upgrade");
+                store
+                    .execute(
+                        CommandId::new(),
+                        PromptCommand::RestorePrompt(RestorePrompt {
+                            prompt_id,
+                            expected_revision: 3,
+                        }),
+                    )
+                    .expect("restore after upgrade");
+                store.rebuild_projection().expect("rebuild after upgrade");
+                assert_eq!(store.list_versions(prompt_id, 0, 10).unwrap().len(), 2);
+                drop(store);
+
+                let mut reopened = PromptStore::open(&path).expect("reopen upgraded schema");
+                assert!(reopened
+                    .get_prompt(prompt_id)
+                    .expect("query reopened prompt")
+                    .expect("reopened prompt")
+                    .archived_at_ms
+                    .is_none());
+                reopened.rebuild_projection().expect("rebuild after reopen");
+            }
+
+            let conn = Connection::open(&path).expect("open upgraded raw schema");
+            let migration_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .expect("migration count");
+            assert_eq!(migration_count, 8, "prior schema V{prior_version}");
+            let latest_name: String = conn
+                .query_row(
+                    "SELECT name FROM schema_migrations WHERE version = 8",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("corrective migration record");
+            assert_eq!(latest_name, "phase07-prompts-corrections-v2");
+        }
     }
 
     #[test]

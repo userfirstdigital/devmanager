@@ -525,6 +525,18 @@ pub struct PromptMutationReceipt {
     pub revision: u64,
 }
 
+impl PromptMutationReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
+        rmp_serde::to_vec_named(self)
+            .map_err(|_| PromptCodecError("prompt receipt encoding failed".into()))
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
+        rmp_serde::from_slice(payload)
+            .map_err(|_| PromptCodecError("prompt receipt decoding failed".into()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PromptEvent {
@@ -767,6 +779,18 @@ pub struct PromptChainMutationReceipt {
     pub chain_id: PromptChainId,
     pub link_id: Option<PromptChainLinkId>,
     pub revision: u64,
+}
+
+impl PromptChainMutationReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
+        rmp_serde::to_vec_named(self)
+            .map_err(|_| PromptCodecError("prompt chain receipt encoding failed".into()))
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
+        rmp_serde::from_slice(payload)
+            .map_err(|_| PromptCodecError("prompt chain receipt decoding failed".into()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
