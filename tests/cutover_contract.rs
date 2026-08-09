@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -151,12 +152,8 @@ fn git(root: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn run_audit(document: Value, extra_files: &[(&str, &[u8])]) -> AuditRun {
-    let fixture = fixture_repo(document, extra_files);
-    let output_path = fixture
-        .root
-        .join(".devmanager-next/evidence/current/cutover-audit.json");
-    let output = Command::new("pwsh")
+fn spawn_audit(root: &Path, output_path: &Path) -> Output {
+    Command::new("pwsh")
         .args([
             "-NoProfile",
             "-File",
@@ -164,13 +161,63 @@ fn run_audit(document: Value, extra_files: &[(&str, &[u8])]) -> AuditRun {
             "-Mode",
             "Parity",
             "-Root",
-            fixture.root.to_str().expect("fixture root utf8"),
+            root.to_str().expect("fixture root utf8"),
             "-OutputPath",
             output_path.to_str().expect("output path utf8"),
         ])
-        .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env("APPDATA", root.join("protected-appdata"))
         .output()
-        .expect("spawn cutover audit");
+        .expect("spawn cutover audit")
+}
+
+fn force_track(root: &Path, paths: &[&str]) {
+    let mut args = vec!["add", "--force", "--"];
+    args.extend(paths.iter().copied());
+    git(root, &args);
+}
+
+fn hide_file(path: &Path) {
+    let output = Command::new("attrib")
+        .args(["+h", path.to_str().expect("hidden fixture path utf8")])
+        .output()
+        .expect("spawn attrib");
+    assert!(
+        output.status.success(),
+        "attrib failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_junction(link: &Path, target: &Path) {
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CUTOVER_LINK -Target $env:CUTOVER_TARGET -Force | Out-Null",
+        ])
+        .env("CUTOVER_LINK", link)
+        .env("CUTOVER_TARGET", target)
+        .output()
+        .expect("spawn junction fixture");
+    assert!(
+        output.status.success(),
+        "junction creation failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_audit_with_setup<F>(document: Value, extra_files: &[(&str, &[u8])], setup: F) -> AuditRun
+where
+    F: FnOnce(&Path),
+{
+    let fixture = fixture_repo(document, extra_files);
+    setup(&fixture.root);
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = spawn_audit(&fixture.root, &output_path);
     assert!(
         output_path.is_file(),
         "audit must publish JSON even when it fails\nstdout={}\nstderr={}",
@@ -187,6 +234,10 @@ fn run_audit(document: Value, extra_files: &[(&str, &[u8])]) -> AuditRun {
         report,
         human,
     }
+}
+
+fn run_audit(document: Value, extra_files: &[(&str, &[u8])]) -> AuditRun {
+    run_audit_with_setup(document, extra_files, |_| {})
 }
 
 fn row<'a>(report: &'a Value, id: &str) -> &'a Value {
@@ -446,6 +497,160 @@ fn stale_devmanager_next_entrypoint_is_reported_from_tracked_fixture() {
 }
 
 #[test]
+fn forbidden_entrypoint_tokens_are_scoped_to_the_exact_entrypoint_path() {
+    let mut document = contract(
+        vec![base_row(
+            "ordinary-row",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    document["forbiddenEntrypoints"][0]["tokens"] = json!(["devmanager-next", "main"]);
+
+    let run = run_audit(
+        document,
+        &[
+            (".gitignore", b"/.devmanager-next/\n"),
+            ("src/bin/devmanager-next.rs", b"fn main() {}\n"),
+            ("src/other.rs", b"main devmanager-next\n"),
+        ],
+    );
+    let findings = strings_at(&run.report, &["entrypointFindings"]);
+    assert!(findings
+        .iter()
+        .all(|finding| finding.ends_with(":src/bin/devmanager-next.rs")));
+    assert!(!findings
+        .iter()
+        .any(|finding| finding.contains(".gitignore") || finding.contains("src/other.rs")));
+}
+
+#[test]
+fn tracked_path_presence_requires_the_exact_requested_path() {
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "directory-alias",
+                "src/legacy",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("src/legacy/child.rs", b"LegacyFixture\n")],
+    );
+    assert_eq!(
+        row(&run.report, "directory-alias")["legacy"]["pathPresent"],
+        false
+    );
+    assert!(strings_at(&run.report, &["contractErrors"])
+        .iter()
+        .any(|error| error.contains("exact tracked path")));
+}
+
+#[test]
+fn bounded_report_fallback_keeps_the_complete_typed_shape() {
+    let long_symbols = (0..64)
+        .map(|index| format!("symbol-{index}-{}", "x".repeat(500)))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for index in 0..12 {
+        let mut row_value = base_row(
+            &format!("oversized-{index}"),
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        );
+        row_value["legacy"]["symbols"] = json!(long_symbols);
+        rows.push(row_value);
+    }
+
+    let run = run_audit(
+        contract(rows, vec![base_node("gate-parity", "gate", "HOLD")]),
+        &[],
+    );
+    for field in [
+        "schemaVersion",
+        "contractId",
+        "mode",
+        "contractStatus",
+        "ledgerPath",
+        "trackedFileCount",
+        "protectedFilesSkipped",
+        "contractErrors",
+        "blockers",
+        "entrypointFindings",
+        "prerequisiteNodes",
+        "rows",
+        "safety",
+        "scanner",
+    ] {
+        assert!(
+            run.report.get(field).is_some(),
+            "missing report field {field}"
+        );
+    }
+    for field in [
+        "protectedFilesSkipped",
+        "contractErrors",
+        "blockers",
+        "entrypointFindings",
+        "prerequisiteNodes",
+        "rows",
+    ] {
+        assert!(
+            run.report[field].is_array(),
+            "report field {field} is not an array"
+        );
+    }
+    assert!(run.human.contains("Phase 11.1 cutover audit"));
+    assert!(run.human.contains("status: HOLD"));
+}
+
+#[test]
+fn exact_session_json_output_is_rejected_before_any_publish() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "safe-output",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let requested = fixture
+        .root
+        .join(".devmanager-next/evidence/current/session.json");
+    let output = spawn_audit(&fixture.root, &requested);
+    let fallback = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    assert!(fallback.is_file(), "safe fallback report must be published");
+    assert!(
+        !requested.exists(),
+        "exact session.json must never be created"
+    );
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&fs::read(fallback).expect("fallback JSON"))
+        .expect("valid fallback JSON");
+    assert!(strings_at(&report, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("output path") || blocker.contains("session.json")));
+}
+
+#[test]
 fn exact_session_json_is_path_only_and_external_appdata_is_untouched() {
     let session_bytes = br#"{"secret":"must-not-be-read"}"#;
     let run = run_audit(
@@ -521,7 +726,10 @@ fn audit_is_read_only_for_tracked_fixture_files() {
     );
     assert_eq!(
         fs::read(run.fixture.root.join("src/legacy.rs")).unwrap(),
-        b"pub struct LegacyFixture;\n"
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cutover-contract/legacy.rs"
+        ))
     );
     let after = git(&run.fixture.root, &["ls-files"]);
     assert_eq!(
@@ -529,6 +737,318 @@ fn audit_is_read_only_for_tracked_fixture_files() {
         before_files
     );
     assert!(run.fixture.root.join("do-not-delete.txt").is_file());
+}
+
+#[test]
+fn tracked_ignored_hidden_binary_and_unicode_names_are_scanned() {
+    let composed = "src/unicode-\u{00e9}.txt";
+    let decomposed = "src/unicode-e\u{0301}.txt";
+    let tabbed = "src/tab\tname.txt";
+    let newline = "src/new\nline.txt";
+    let extra_files: &[(&str, &[u8])] = &[
+        (".gitignore", b"ignored-reference.txt\n"),
+        ("ignored-reference.txt", b"ignored-token\n"),
+        (".hidden-reference.txt", b"hidden-token\n"),
+        ("binary-reference.dat", b"\0binary-token\xff\n"),
+        (composed, b"unicode-token\n"),
+        (decomposed, b"unicode-token\n"),
+    ];
+    let mut newline_supported = false;
+    let mut tab_supported = false;
+    let run = run_audit_with_setup(
+        contract(
+            vec![base_row(
+                "tracked-safety",
+                "src/legacy.rs",
+                &[
+                    "binary-token",
+                    "ignored-token",
+                    "hidden-token",
+                    "unicode-token",
+                ],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        extra_files,
+        |root| {
+            hide_file(&root.join(".hidden-reference.txt"));
+            force_track(
+                root,
+                &[
+                    "ignored-reference.txt",
+                    ".hidden-reference.txt",
+                    "binary-reference.dat",
+                    composed,
+                    decomposed,
+                ],
+            );
+            if fs::write(root.join(tabbed), b"unicode-token\n").is_ok() {
+                tab_supported = true;
+                force_track(root, &[tabbed]);
+            }
+            if fs::write(root.join(newline), b"unicode-token\n").is_ok() {
+                newline_supported = true;
+                force_track(root, &[newline]);
+            }
+        },
+    );
+    let references = strings_at(
+        &row(&run.report, "tracked-safety"),
+        &["references", "symbol"],
+    );
+    assert!(references.contains(&"binary-reference.dat"));
+    assert!(references.contains(&"ignored-reference.txt"));
+    assert!(references.contains(&".hidden-reference.txt"));
+    assert!(references.contains(&composed));
+    assert!(references.contains(&decomposed));
+    if tab_supported {
+        assert!(references.contains(&tabbed));
+    }
+    if newline_supported {
+        assert!(references.contains(&newline));
+    }
+}
+
+#[test]
+fn tracked_path_ownership_is_ordinal_and_rejects_case_aliases() {
+    let run = run_audit(
+        contract(
+            vec![base_row(
+                "case-alias",
+                "SRC/LEGACY.RS",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    assert_eq!(
+        row(&run.report, "case-alias")["legacy"]["pathPresent"],
+        false
+    );
+    assert!(strings_at(&run.report, &["contractErrors"])
+        .iter()
+        .any(|error| error.contains("exact tracked path") || error.contains("case")));
+}
+
+#[test]
+fn ledger_alias_ads_control_and_trailing_space_paths_are_rejected() {
+    let invalid = [
+        ("dot-segment", "src/./legacy.rs"),
+        ("parent-segment", "src/../legacy.rs"),
+        ("drive-relative", "C:legacy.rs"),
+        ("alternate-stream", "src/legacy.rs:stream"),
+        ("control", "src/bad\u{0001}.rs"),
+        ("trailing-space", "src/legacy.rs "),
+    ];
+    let rows = invalid
+        .iter()
+        .map(|(id, path)| {
+            base_row(
+                id,
+                path,
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )
+        })
+        .collect();
+    let run = run_audit(
+        contract(rows, vec![base_node("gate-parity", "gate", "HOLD")]),
+        &[],
+    );
+    let errors = strings_at(&run.report, &["contractErrors"]);
+    assert!(!run.output.status.success());
+    assert!(errors.len() >= invalid.len());
+}
+
+#[test]
+fn protected_session_variants_are_not_opened_by_the_scanner() {
+    let session_bytes = b"session-exclusive-sentinel\n";
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "session-variant",
+                "src/legacy.rs",
+                &["session-exclusive-sentinel"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("nested/SESSION.JSON", session_bytes)],
+    );
+    force_track(&fixture.root, &["nested/SESSION.JSON"]);
+    let _exclusive = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(fixture.root.join("nested/SESSION.JSON"))
+        .expect("exclusive session fixture handle");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = spawn_audit(&fixture.root, &output_path);
+    assert!(
+        output_path.is_file(),
+        "safe fallback report must be published"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+        .expect("valid audit JSON");
+    assert!(!output.status.success());
+    assert!(!strings_at(&report, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("reference scan failed")));
+    assert!(!report.to_string().contains("session-exclusive-sentinel"));
+}
+
+#[test]
+fn hardlinks_are_rejected_before_reference_scanning() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "hardlink-row",
+                "src/legacy.rs",
+                &["hardlink-token"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("hardlink-source.txt", b"hardlink-token\n")],
+    );
+    let hardlink = fixture.root.join("src/hardlink-reference.txt");
+    fs::hard_link(fixture.root.join("hardlink-source.txt"), &hardlink)
+        .expect("create hardlink fixture");
+    force_track(&fixture.root, &["src/hardlink-reference.txt"]);
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let output = spawn_audit(&fixture.root, &output_path);
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+        .expect("valid audit JSON");
+    assert!(!output.status.success());
+    assert!(strings_at(&report, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("hard link") || blocker.contains("hardlink")));
+}
+
+#[test]
+fn reparse_output_evidence_and_root_attempts_fail_closed() {
+    let output_fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "reparse-output",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let outside_output = output_fixture.root.join("outside-output");
+    fs::create_dir_all(&outside_output).expect("outside output directory");
+    let evidence = output_fixture.root.join(".devmanager-next/evidence");
+    fs::create_dir_all(evidence.parent().expect("evidence parent")).expect("evidence parent");
+    create_junction(&evidence, &outside_output);
+    let output_path = evidence.join("current/cutover-audit.json");
+    let output = spawn_audit(&output_fixture.root, &output_path);
+    assert!(!output.status.success());
+    assert!(!outside_output.join("current/cutover-audit.json").exists());
+
+    let evidence_fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "reparse-evidence",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[("evidence/ready.json", b"outside-evidence\n")],
+    );
+    let outside_evidence = evidence_fixture.root.join("outside-evidence");
+    fs::create_dir_all(&outside_evidence).expect("outside evidence directory");
+    fs::write(outside_evidence.join("ready.json"), b"outside-evidence\n")
+        .expect("outside evidence file");
+    let evidence_link = evidence_fixture.root.join("evidence");
+    fs::remove_dir_all(&evidence_link).expect("remove evidence directory");
+    create_junction(&evidence_link, &outside_evidence);
+    let evidence_output = evidence_fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let evidence_run = spawn_audit(&evidence_fixture.root, &evidence_output);
+    let evidence_report: Value =
+        serde_json::from_slice(&fs::read(&evidence_output).expect("safe evidence audit JSON"))
+            .expect("valid evidence audit JSON");
+    assert!(!evidence_run.status.success());
+    assert!(strings_at(&evidence_report, &["blockers"])
+        .iter()
+        .any(|blocker| blocker.contains("reparse") || blocker.contains("evidence")));
+
+    let root_fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "reparse-root",
+                "src/legacy.rs",
+                &["LegacyFixture"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let root_alias = root_fixture.root.join("root-alias");
+    create_junction(&root_alias, &root_fixture.root);
+    let root_output = root_alias.join(".devmanager-next/evidence/current/cutover-audit.json");
+    let root_run = spawn_audit(&root_alias, &root_output);
+    assert!(!root_run.status.success());
+    assert!(!root_output.exists());
+}
+
+#[test]
+fn ledger_and_report_bounds_stop_collection_with_one_bounded_hold_diagnostic() {
+    let huge = "unbounded-token-".repeat(100_000);
+    let mut row_value = base_row(
+        "oversized-row",
+        "src/legacy.rs",
+        &["LegacyFixture"],
+        "src/replacement.rs",
+        &["gate-parity"],
+        "HOLD",
+    );
+    row_value["legacy"]["tokens"] = json!([huge]);
+    let run = run_audit(
+        contract(
+            vec![row_value],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let blockers = strings_at(&run.report, &["blockers"]);
+    let hold_diagnostics = blockers
+        .iter()
+        .filter(|blocker| blocker.contains("audit safety bound"))
+        .count();
+    assert_eq!(hold_diagnostics, 1);
+    assert!(run.report.to_string().len() <= 200_000);
+    assert!(run.human.len() <= 100_000);
 }
 
 #[test]
