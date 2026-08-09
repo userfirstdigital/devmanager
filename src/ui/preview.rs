@@ -769,6 +769,14 @@ impl PreviewError {
         error: preview_capture::PreviewCaptureError,
         output_path: &Path,
     ) -> Self {
+        Self::from_capture_error_at_depth(&error, output_path, 0)
+    }
+
+    fn from_capture_error_at_depth(
+        error: &preview_capture::PreviewCaptureError,
+        output_path: &Path,
+        depth: usize,
+    ) -> Self {
         let reason = error.to_string();
         match error {
             preview_capture::PreviewCaptureError::UnsupportedPlatform => {
@@ -793,7 +801,7 @@ impl PreviewError {
                 reason: window_reason,
             } => Self::VisibleWindowsCaptureUnavailable {
                 kind: CaptureUnavailableKind::InvalidWindowState {
-                    reason: window_reason,
+                    reason: *window_reason,
                 },
                 reason,
             },
@@ -809,33 +817,45 @@ impl PreviewError {
                     reason,
                 }
             }
-            preview_capture::PreviewCaptureError::CaptureFailed(reason) => {
-                Self::WindowsGraphicsCaptureFailed { reason }
+            preview_capture::PreviewCaptureError::CaptureFailed(message) => {
+                Self::WindowsGraphicsCaptureFailed {
+                    reason: message.to_owned(),
+                }
             }
-            preview_capture::PreviewCaptureError::ApplicationFailed(reason) => {
-                Self::ApplicationFailed { reason }
+            preview_capture::PreviewCaptureError::ApplicationFailed(message) => {
+                Self::ApplicationFailed {
+                    reason: message.to_owned(),
+                }
             }
-            preview_capture::PreviewCaptureError::PngFailed(reason) => Self::PngFailed { reason },
+            preview_capture::PreviewCaptureError::PngFailed(message) => Self::PngFailed {
+                reason: message.to_owned(),
+            },
             preview_capture::PreviewCaptureError::OutputAlreadyExists => {
                 Self::OutputAlreadyExists {
                     path: output_path.to_path_buf(),
                 }
             }
-            preview_capture::PreviewCaptureError::OutputFailed(reason) => {
-                Self::OutputFailed { reason }
-            }
-            preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
-                Self::ForegroundChanged { before, after }
-            }
-            preview_capture::PreviewCaptureError::CleanupFailed {
-                primary,
-                operation,
-                secondary,
-            } => Self::CaptureCleanupFailed {
-                primary: Box::new(Self::from_capture_error(*primary, output_path)),
-                operation,
-                reason: secondary.to_string(),
+            preview_capture::PreviewCaptureError::OutputFailed(message) => Self::OutputFailed {
+                reason: message.to_owned(),
             },
+            preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
+                Self::ForegroundChanged {
+                    before: *before,
+                    after: *after,
+                }
+            }
+            preview_capture::PreviewCaptureError::CleanupFailed(context) => {
+                let primary = if depth < preview_capture::MAX_CLEANUP_DIAGNOSTIC_DEPTH {
+                    Self::from_capture_error_at_depth(context.primary(), output_path, depth + 1)
+                } else {
+                    Self::WindowsGraphicsCaptureFailed { reason }
+                };
+                Self::CaptureCleanupFailed {
+                    primary: Box::new(primary),
+                    operation: context.operation(),
+                    reason: context.secondary().to_string(),
+                }
+            }
         }
     }
 }
