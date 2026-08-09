@@ -1,4 +1,6 @@
 pub mod env_service;
+pub mod health;
+pub mod model;
 pub mod pid_file;
 pub mod platform_service;
 pub mod ports_service;
@@ -9,6 +11,8 @@ pub mod scanner_service;
 mod session_manager;
 
 pub use env_service::*;
+pub use health::*;
+pub use model::*;
 pub use pid_file::*;
 pub use platform_service::*;
 pub use ports_service::*;
