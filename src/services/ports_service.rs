@@ -1,25 +1,185 @@
 use crate::models::{AppConfig, PortConflict, PortConflictEntry, PortStatus};
-use crate::services::{pid_file, platform_service};
+use crate::process::ports::{ListenerIdentity, PortInventorySnapshot, PortObservation};
+use crate::services::platform_service;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
+
+/// Background-owned listener inventory with an immutable read-only snapshot.
+///
+/// `refresh` is intentionally synchronous so its caller can choose the
+/// application's existing background executor/thread. `cached_snapshot` and
+/// `publish` never enumerate listeners or inspect processes.
+#[derive(Clone, Debug)]
+pub struct PortInventory {
+    snapshot: Arc<RwLock<Arc<PortInventorySnapshot>>>,
+}
+
+impl Default for PortInventory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortInventory {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(Arc::new(PortInventorySnapshot::new(
+                BTreeMap::new(),
+            )))),
+        }
+    }
+
+    pub fn cached_snapshot(&self) -> Arc<PortInventorySnapshot> {
+        self.snapshot
+            .read()
+            .expect("port inventory cache lock")
+            .clone()
+    }
+
+    pub fn publish(&self, snapshot: Arc<PortInventorySnapshot>) {
+        *self.snapshot.write().expect("port inventory cache lock") = snapshot;
+    }
+
+    /// Run one batched native probe and publish its immutable result.
+    ///
+    /// The operation is designed for a scheduler/background executor. If the
+    /// listener table itself cannot be read, an explicit per-port error
+    /// snapshot is published before returning the error; a failed probe is
+    /// never published as an empty/free result.
+    pub fn refresh(&self, ports: &[u16]) -> Result<Arc<PortInventorySnapshot>, String> {
+        match scan_listener_inventory(ports) {
+            Ok(snapshot) => {
+                let snapshot = Arc::new(snapshot);
+                self.publish(snapshot.clone());
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let snapshot = Arc::new(PortInventorySnapshot::probe_failure(
+                    ports.iter().copied(),
+                    error.clone(),
+                ));
+                self.publish(snapshot);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Probe all requested ports with one native listener-table query.
+///
+/// Listener PID-to-creation identity enrichment is still performed outside
+/// any render/input caller. An individual process that disappears between the
+/// listener query and identity probe becomes an explicit per-port error.
+pub fn scan_listener_inventory(ports: &[u16]) -> Result<PortInventorySnapshot, String> {
+    let listener_pids = platform_service::snapshot_listener_pids(ports)?;
+    let mut observations = ports
+        .iter()
+        .copied()
+        .map(|port| (port, PortObservation::Free))
+        .collect::<BTreeMap<_, _>>();
+
+    for (port, pid) in listener_pids {
+        let observation = match capture_listener_identity(pid) {
+            Ok(identity) => PortObservation::Listener(identity),
+            Err(error) => PortObservation::ProbeError(error),
+        };
+        observations.insert(port, observation);
+    }
+
+    Ok(PortInventorySnapshot::new(observations))
+}
+
+#[cfg(windows)]
+fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low_date_time: u32,
+        high_date_time: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(format!(
+            "could not open listener PID {pid} for identity verification: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut creation = FileTime::default();
+    let mut exit = FileTime::default();
+    let mut kernel = FileTime::default();
+    let mut user = FileTime::default();
+    let result =
+        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let close_result = unsafe { CloseHandle(process) };
+    if result == 0 {
+        return Err(format!(
+            "could not read listener PID {pid} creation time: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if close_result == 0 {
+        return Err(format!(
+            "could not close listener PID {pid} identity handle: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let creation_time_100ns =
+        ((creation.high_date_time as u64) << 32) | creation.low_date_time as u64;
+    ListenerIdentity::new(pid, creation_time_100ns).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
+    let identity = platform_service::capture_process_identity(pid)
+        .ok_or_else(|| format!("listener PID {pid} exited before identity verification"))?;
+    ListenerIdentity::new(pid, identity.started_at_unix_secs)
+        .map_err(|error| format!("could not verify listener PID {pid}: {error}"))
+}
 
 pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {
-    let listener_pids = platform_service::snapshot_listener_pids(ports)?;
+    let snapshot = scan_listener_inventory(ports)?;
     let mut statuses = HashMap::with_capacity(ports.len());
 
     for &port in ports {
-        let status = match listener_pids.get(&port).copied() {
-            Some(pid) => PortStatus {
+        let status = match snapshot.observation(port) {
+            Some(PortObservation::Listener(listener)) => PortStatus {
                 port,
                 in_use: true,
-                pid: Some(pid),
+                pid: Some(listener.pid()),
                 process_name: None,
             },
-            None => PortStatus {
+            Some(PortObservation::Free) => PortStatus {
                 port,
                 in_use: false,
                 pid: None,
                 process_name: None,
             },
+            Some(PortObservation::ProbeError(error)) => return Err(error.clone()),
+            None => {
+                return Err(format!(
+                    "port {port} was not included in listener inventory"
+                ))
+            }
         };
         statuses.insert(port, status);
     }
@@ -43,11 +203,11 @@ pub fn check_port_in_use(port: u16) -> Result<PortStatus, String> {
 }
 
 pub fn kill_port(port: u16) -> Result<(), String> {
-    let pid = platform_service::find_pid_on_port(port)?
-        .ok_or_else(|| format!("No process found listening on port {port}"))?;
-    platform_service::kill_process_tree(pid)?;
-    let _ = pid_file::prune_inactive_entries();
-    Ok(())
+    let _ = port;
+    Err(
+        "refusing to kill a port without an exact managed resource and process identity proof"
+            .to_string(),
+    )
 }
 
 pub fn get_port_conflicts(config: &AppConfig) -> Vec<PortConflict> {
