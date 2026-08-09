@@ -13,9 +13,11 @@
 - Give every concurrently active Rust worktree its own `CARGO_TARGET_DIR`.
   Sharing one target directory serializes builds behind Cargo locks, obscures
   which worker owns compiler processes, and can turn a focused task into a false
-  timeout. Cleanup checks and any termination must be scoped to the exact worker
-  descendant tree, worktree, and target directory; never kill unrelated global
-  Cargo or rustc processes.
+  timeout. Put that target beneath the active isolated worktree or in an
+  explicitly named external scratch root; never put it in the daily `master`
+  checkout. Cleanup checks and any termination must be scoped to the exact
+  worker descendant tree, worktree, and target directory; never kill unrelated
+  global Cargo or rustc processes.
 - Keep `persistence::app_config_dir()` fail-closed under `cfg(test)`. Unit tests
   must resolve beneath the process-unique test root and must never fall back to
   `%APPDATA%\com.userfirst.devmanager`.
