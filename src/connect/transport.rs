@@ -1,19 +1,19 @@
 //! Transport-neutral Connect boundaries and bounded projection interfaces.
 
 use std::fmt;
+use std::io::{ErrorKind, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
 use crate::domain::command::CommandReceipt;
-use crate::domain::id::{SnapshotId, TaskId};
+use crate::domain::id::{SnapshotId, TaskId, TransferId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
-use crate::domain::snapshot::{
-    canonical_event_page_size, canonical_snapshot_page_size, EventPage, PageLimits, SnapshotPage,
-    SnapshotSection,
-};
-use crate::protocol::CapabilitySet;
+use crate::domain::snapshot::{EventPage, PageLimits, SnapshotPage, SnapshotSection};
+use crate::protocol::{CapabilitySet, FrameLimitsError, PhysicalFrameCodec, PhysicalFrameError};
 
-use super::envelope::{ConnectEnvelope, EnvelopeError};
+use super::envelope::{
+    ChunkContext, ConnectEnvelope, ConnectLimitError, ConnectLimits, EnvelopeError,
+};
 
 /// Route metadata is deliberately separate from inner-envelope semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +33,154 @@ pub trait ConnectTransport {
     fn close(&mut self) -> Result<(), Self::Error>;
 }
 
-pub fn encode_inner(envelope: &ConnectEnvelope) -> Result<Vec<u8>, EnvelopeError> {
-    envelope.encode()
+#[derive(Debug)]
+pub enum ConnectTransportError {
+    Closed,
+    NegotiatedLimitsMismatch,
+    Limits(ConnectLimitError),
+    FrameLimits(FrameLimitsError),
+    Frame(PhysicalFrameError),
+    Envelope(EnvelopeError),
+    Flush { kind: ErrorKind },
 }
 
-pub fn decode_inner(bytes: &[u8]) -> Result<ConnectEnvelope, EnvelopeError> {
-    ConnectEnvelope::decode(bytes)
+impl fmt::Display for ConnectTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => formatter.write_str("Connect transport is closed"),
+            Self::NegotiatedLimitsMismatch => {
+                formatter.write_str("Connect envelope limits differ from the connection")
+            }
+            Self::Limits(error) => error.fmt(formatter),
+            Self::FrameLimits(error) => error.fmt(formatter),
+            Self::Frame(error) => error.fmt(formatter),
+            Self::Envelope(error) => error.fmt(formatter),
+            Self::Flush { kind } => write!(formatter, "Connect transport flush failed: {kind}"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Limits(error) => Some(error),
+            Self::FrameLimits(error) => Some(error),
+            Self::Frame(error) => Some(error),
+            Self::Envelope(error) => Some(error),
+            Self::Closed | Self::NegotiatedLimitsMismatch | Self::Flush { .. } => None,
+        }
+    }
+}
+
+/// One byte-framed Connect connection. The negotiated limits are immutable
+/// for the lifetime of this transport and are applied on both directions.
+pub struct FramedConnectTransport<T> {
+    io: T,
+    negotiated: ConnectLimits,
+    frame: PhysicalFrameCodec,
+    closed: bool,
+}
+
+impl<T> FramedConnectTransport<T> {
+    pub fn new(
+        io: T,
+        local: ConnectLimits,
+        peer: ConnectLimits,
+    ) -> Result<Self, ConnectTransportError> {
+        let negotiated = local
+            .negotiate(peer)
+            .map_err(ConnectTransportError::Limits)?;
+        Self::with_negotiated_limits(io, negotiated)
+    }
+
+    pub fn with_negotiated_limits(
+        io: T,
+        negotiated: ConnectLimits,
+    ) -> Result<Self, ConnectTransportError> {
+        negotiated
+            .validate()
+            .map_err(ConnectTransportError::Limits)?;
+        let frame = PhysicalFrameCodec::from_limits(negotiated.frame_limits())
+            .map_err(ConnectTransportError::FrameLimits)?;
+        Ok(Self {
+            io,
+            negotiated,
+            frame,
+            closed: false,
+        })
+    }
+
+    pub const fn negotiated_limits(&self) -> ConnectLimits {
+        self.negotiated
+    }
+
+    pub fn validate_page(&self, items: usize, encoded_bytes: u64) -> Result<(), ConnectLimitError> {
+        self.negotiated.validate_page(items, encoded_bytes)
+    }
+
+    pub fn validate_chunk(
+        &self,
+        cumulative_before: u64,
+        chunk: &[u8],
+    ) -> Result<u64, ConnectLimitError> {
+        self.negotiated.validate_chunk(cumulative_before, chunk)
+    }
+
+    pub fn chunk_context(
+        &self,
+        transfer_id: TransferId,
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<ChunkContext, ConnectLimitError> {
+        self.negotiated.chunk_context(transfer_id, resume_cursor)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.io
+    }
+}
+
+impl<T: Read + Write> ConnectTransport for FramedConnectTransport<T> {
+    type Error = ConnectTransportError;
+
+    fn send(&mut self, envelope: ConnectEnvelope) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err(ConnectTransportError::Closed);
+        }
+        if envelope.limits() != self.negotiated {
+            return Err(ConnectTransportError::NegotiatedLimitsMismatch);
+        }
+        let encoded = envelope.encode().map_err(ConnectTransportError::Envelope)?;
+        self.frame
+            .write(&mut self.io, &encoded)
+            .map_err(ConnectTransportError::Frame)?;
+        self.io
+            .flush()
+            .map_err(|error| ConnectTransportError::Flush { kind: error.kind() })?;
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Result<Option<ConnectEnvelope>, Self::Error> {
+        if self.closed {
+            return Err(ConnectTransportError::Closed);
+        }
+        let encoded = self
+            .frame
+            .read(&mut self.io)
+            .map_err(ConnectTransportError::Frame)?;
+        ConnectEnvelope::decode_with_limits(&encoded, self.negotiated)
+            .map(Some)
+            .map_err(ConnectTransportError::Envelope)
+    }
+
+    fn close(&mut self) -> Result<(), Self::Error> {
+        if !self.closed {
+            self.io
+                .flush()
+                .map_err(|error| ConnectTransportError::Flush { kind: error.kind() })?;
+            self.closed = true;
+        }
+        Ok(())
+    }
 }
 
 pub const MAX_CONNECT_RESUME_CURSOR_BYTES: usize = 64 * 1024;
@@ -141,45 +283,6 @@ pub enum ProjectionResponse {
     Events(EventPage),
     Query(QueryReply),
     Receipt(CommandReceipt),
-}
-
-pub fn validate_snapshot_page(
-    page: &SnapshotPage,
-    limits: PageLimits,
-) -> Result<(), ProjectionError> {
-    limits
-        .validate()
-        .map_err(|_| ProjectionError::InvalidRequest)?;
-    if page.items.len() > usize::try_from(limits.max_items).unwrap_or(usize::MAX)
-        || page.encoded_bytes > limits.max_encoded_bytes
-    {
-        return Err(ProjectionError::Bounds);
-    }
-    let encoded =
-        canonical_snapshot_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
-    if page.encoded_bytes != encoded {
-        return Err(ProjectionError::InvalidRequest);
-    }
-    if encoded > limits.max_encoded_bytes {
-        return Err(ProjectionError::Bounds);
-    }
-    validate_cursor(page.next_cursor.as_deref())?;
-    Ok(())
-}
-
-pub fn validate_event_page(page: &EventPage, limits: PageLimits) -> Result<(), ProjectionError> {
-    limits
-        .validate()
-        .map_err(|_| ProjectionError::InvalidRequest)?;
-    if page.events.len() > usize::try_from(limits.max_items).unwrap_or(usize::MAX) {
-        return Err(ProjectionError::Bounds);
-    }
-    validate_cursor(page.next_cursor.as_deref())?;
-    let encoded = canonical_event_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
-    if encoded > limits.max_encoded_bytes {
-        return Err(ProjectionError::Bounds);
-    }
-    Ok(())
 }
 
 fn validate_cursor(cursor: Option<&[u8]>) -> Result<(), ProjectionError> {

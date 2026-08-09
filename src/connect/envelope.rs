@@ -12,15 +12,16 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use uuid::{Uuid, Variant};
 
-use crate::domain::id::{OperationId, RequestId};
+use crate::domain::id::{OperationId, RequestId, TransferId};
 use crate::domain::snapshot::{MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::protocol::{
-    ChunkError, ChunkLimitField as ProtocolChunkLimitField, ChunkLimits, ChunkLimitsError,
-    FrameLimits, MessagePackCodec, MessagePackError, ProtocolVersion, MAX_PHYSICAL_FRAME_BYTES,
-    MAX_REASSEMBLED_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ChunkContext as ProtocolChunkContext, ChunkError, ChunkLimitField as ProtocolChunkLimitField,
+    ChunkLimits, ChunkLimitsError, FrameLimits, MessagePackCodec, MessagePackError,
+    ProtocolVersion, MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 
-use super::schema::{ConnectPayload, KnownPayloadKind, PayloadError};
+use super::schema::{ConnectPayload, ConnectPayloadWire, KnownPayloadKind, PayloadError};
 
 pub const CONNECT_PROTOCOL_MAJOR: u16 = PROTOCOL_MAJOR;
 pub const CONNECT_PROTOCOL_MINOR: u16 = PROTOCOL_MINOR;
@@ -472,6 +473,25 @@ impl ConnectLimits {
             .map_err(map_protocol_chunk_error)
     }
 
+    /// Creates a chunk receiver from these negotiated Connect limits.
+    ///
+    /// The protocol context is intentionally wrapped so Connect callers cannot
+    /// supply an independent `ChunkLimits` value.
+    pub fn chunk_context(
+        self,
+        transfer_id: TransferId,
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<ChunkContext, ConnectLimitError> {
+        self.validate()?;
+        let chunk_limits = self.canonical_chunk_limits()?;
+        if let Some(cursor) = resume_cursor.as_deref() {
+            self.validate_cursor_len(cursor.len())?;
+        }
+        ProtocolChunkContext::new(transfer_id, chunk_limits, resume_cursor)
+            .map(ChunkContext)
+            .map_err(map_protocol_chunk_error)
+    }
+
     pub(crate) fn canonical_chunk_limits(self) -> Result<ChunkLimits, ConnectLimitError> {
         ChunkLimits::try_new(
             self.max_chunk_bytes,
@@ -538,6 +558,37 @@ fn map_protocol_chunk_error(error: ChunkError) -> ConnectLimitError {
 impl Default for ConnectLimits {
     fn default() -> Self {
         Self::v1_default()
+    }
+}
+
+/// A Connect-owned chunk receiver whose limits are always negotiated from its
+/// enclosing `ConnectLimits`.
+#[derive(Debug)]
+pub struct ChunkContext(ProtocolChunkContext);
+
+impl ChunkContext {
+    pub fn accept(&mut self, frame: &crate::protocol::ChunkFrame) -> Result<(), ChunkError> {
+        self.0.accept(frame)
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.0.is_complete()
+    }
+
+    pub const fn is_poisoned(&self) -> bool {
+        self.0.is_poisoned()
+    }
+
+    pub const fn next_index(&self) -> u32 {
+        self.0.next_index()
+    }
+
+    pub const fn cumulative_bytes(&self) -> u64 {
+        self.0.cumulative_bytes()
+    }
+
+    pub fn require_complete(&mut self) -> Result<(), ChunkError> {
+        self.0.require_complete()
     }
 }
 
@@ -869,7 +920,11 @@ impl ConnectEnvelope {
         canonical.validate()?;
         let codec = MessagePackCodec::from_limits(canonical.limits.frame_limits())
             .map_err(|_| EnvelopeError::Encode)?;
-        codec.encode(&canonical).map_err(EnvelopeError::MessagePack)
+        let encoded = codec
+            .encode(&canonical.wire())
+            .map_err(EnvelopeError::MessagePack)?;
+        canonical.limits.validate_payload_len(encoded.len())?;
+        Ok(encoded)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvelopeError> {
@@ -881,15 +936,16 @@ impl ConnectEnvelope {
         negotiated: ConnectLimits,
     ) -> Result<Self, EnvelopeError> {
         negotiated.validate()?;
+        negotiated.validate_payload_len(bytes.len())?;
         let codec = MessagePackCodec::from_limits(negotiated.frame_limits())
             .map_err(|_| EnvelopeError::Encode)?;
-        let envelope = codec
-            .decode::<Self>(bytes)
+        let wire = codec
+            .decode::<ConnectEnvelopeWire>(bytes)
             .map_err(EnvelopeError::MessagePack)?;
+        let envelope = Self::from_wire(wire)?;
         if envelope.limits != negotiated {
             return Err(EnvelopeError::NegotiatedLimitsMismatch);
         }
-        envelope.validate()?;
         Ok(envelope)
     }
 
@@ -948,6 +1004,52 @@ impl ConnectEnvelope {
     pub fn is_action_payload(&self) -> bool {
         self.payload.is_action()
     }
+
+    fn wire(&self) -> ConnectEnvelopeWire {
+        ConnectEnvelopeWire {
+            protocol_major: self.version.major,
+            protocol_minor: self.version.minor,
+            connection_id: self.binding.connection_id,
+            session_id: self.binding.session_id,
+            channel_id: self.binding.channel_id,
+            channel: self.channel(),
+            sequence: self.sequence,
+            request_id: self.request_id,
+            operation_id: self.operation_id,
+            limits: self.limits,
+            compression: self.compression,
+            privacy_class: self.privacy_class,
+            payload_kind: self.payload_kind(),
+            payload_version: self.payload_version(),
+            payload: ConnectPayloadWire::from(self.payload.clone()),
+        }
+    }
+
+    fn from_wire(wire: ConnectEnvelopeWire) -> Result<Self, EnvelopeError> {
+        if !matches!(wire.compression, Compression::None) {
+            return Err(EnvelopeError::CompressionUnsupported);
+        }
+        let binding = ChannelBinding::new(wire.connection_id, wire.session_id, wire.channel_id);
+        let envelope = Self {
+            version: ProtocolVersion::new(wire.protocol_major, wire.protocol_minor),
+            binding,
+            sequence: wire.sequence,
+            request_id: wire.request_id,
+            operation_id: wire.operation_id,
+            limits: wire.limits,
+            compression: wire.compression,
+            privacy_class: wire.privacy_class,
+            payload: ConnectPayload::from(wire.payload),
+        };
+        if wire.channel != envelope.channel()
+            || wire.payload_kind != envelope.payload_kind()
+            || wire.payload_version != envelope.payload_version()
+        {
+            return Err(EnvelopeError::Payload(PayloadError::MetadataMismatch));
+        }
+        envelope.validate()?;
+        Ok(envelope)
+    }
 }
 
 #[derive(Serialize)]
@@ -967,7 +1069,7 @@ struct ConnectEnvelopeWire {
     privacy_class: ConnectPrivacyClass,
     payload_kind: PayloadKind,
     payload_version: u16,
-    payload: ConnectPayload,
+    payload: ConnectPayloadWire,
 }
 
 impl<'de> Deserialize<'de> for ConnectEnvelopeWire {
@@ -1005,7 +1107,7 @@ impl<'de> Deserialize<'de> for ConnectEnvelopeWire {
                     privacy_class: ConnectPrivacyClass,
                     payload_kind: PayloadKind,
                     payload_version: u16,
-                    payload: ConnectPayload,
+                    payload: ConnectPayloadWire,
                 }
 
                 let wire = NamedConnectEnvelopeWire::deserialize(MapAccessDeserializer::new(map))?;
@@ -1039,65 +1141,6 @@ impl<'de> Deserialize<'de> for ConnectEnvelopeWire {
         }
 
         deserializer.deserialize_map(ConnectEnvelopeWireVisitor)
-    }
-}
-
-impl Serialize for ConnectEnvelope {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.validate().map_err(serde::ser::Error::custom)?;
-        ConnectEnvelopeWire {
-            protocol_major: self.version.major,
-            protocol_minor: self.version.minor,
-            connection_id: self.binding.connection_id,
-            session_id: self.binding.session_id,
-            channel_id: self.binding.channel_id,
-            channel: self.channel(),
-            sequence: self.sequence,
-            request_id: self.request_id,
-            operation_id: self.operation_id,
-            limits: self.limits,
-            compression: self.compression,
-            privacy_class: self.privacy_class,
-            payload_kind: self.payload_kind(),
-            payload_version: self.payload_version(),
-            payload: self.payload.clone(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ConnectEnvelope {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ConnectEnvelopeWire::deserialize(deserializer)?;
-        if !matches!(wire.compression, Compression::None) {
-            return Err(de::Error::custom(EnvelopeError::CompressionUnsupported));
-        }
-        let binding = ChannelBinding::new(wire.connection_id, wire.session_id, wire.channel_id);
-        let envelope = Self {
-            version: ProtocolVersion::new(wire.protocol_major, wire.protocol_minor),
-            binding,
-            sequence: wire.sequence,
-            request_id: wire.request_id,
-            operation_id: wire.operation_id,
-            limits: wire.limits,
-            compression: wire.compression,
-            privacy_class: wire.privacy_class,
-            payload: wire.payload,
-        };
-        if wire.channel != envelope.channel()
-            || wire.payload_kind != envelope.payload_kind()
-            || wire.payload_version != envelope.payload_version()
-        {
-            return Err(de::Error::custom(PayloadError::MetadataMismatch));
-        }
-        envelope.validate().map_err(de::Error::custom)?;
-        Ok(envelope)
     }
 }
 

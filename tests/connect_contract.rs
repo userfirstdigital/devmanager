@@ -1,12 +1,13 @@
 use std::collections::HashSet;
+use std::io::{Read, Write};
 
 use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkContext, ChunkFrame,
-    ConnectEnvelope, ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectionId,
-    GenericExtensionPayload, PayloadKind, SessionId, UnknownPayload,
+    payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkFrame, ConnectEnvelope,
+    ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectTransport, ConnectionId,
+    FramedConnectTransport, GenericExtensionPayload, PayloadKind, SessionId, UnknownPayload,
 };
 use devmanager::domain::command::CommandReceipt;
 use devmanager::domain::event::DomainEvent;
@@ -23,8 +24,8 @@ use devmanager::domain::snapshot::{
     ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection,
 };
 use devmanager::protocol::{
-    ChunkError, ChunkLimits, ClientRequest, ProtocolVersion, ServerMessage, StreamFrame, StreamKey,
-    StreamPayloadKind,
+    ChunkError, ClientRequest, PhysicalFrameCodec, ProtocolVersion, ServerMessage, StreamFrame,
+    StreamKey, StreamPayloadKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -291,7 +292,12 @@ fn envelope_round_trip_preserves_the_validated_negotiated_protocol_version() {
 }
 
 #[derive(Serialize)]
-struct EnvelopeWire {
+struct RawQueryPayload {
+    request: ClientRequest,
+}
+
+#[derive(Serialize)]
+struct EnvelopeWire<P> {
     protocol_major: u16,
     protocol_minor: u16,
     connection_id: ConnectionId,
@@ -306,10 +312,10 @@ struct EnvelopeWire {
     privacy_class: ConnectPrivacyClass,
     payload_kind: PayloadKind,
     payload_version: u16,
-    payload: ConnectPayload,
+    payload: P,
 }
 
-fn wire_for(envelope: &ConnectEnvelope) -> EnvelopeWire {
+fn wire_with_payload<P>(envelope: &ConnectEnvelope, payload: P) -> EnvelopeWire<P> {
     EnvelopeWire {
         protocol_major: devmanager::connect::CONNECT_PROTOCOL_MAJOR,
         protocol_minor: devmanager::connect::CONNECT_PROTOCOL_MINOR,
@@ -325,8 +331,20 @@ fn wire_for(envelope: &ConnectEnvelope) -> EnvelopeWire {
         privacy_class: envelope.privacy_class(),
         payload_kind: envelope.payload_kind(),
         payload_version: envelope.payload_version(),
-        payload: envelope.payload().clone(),
+        payload,
     }
+}
+
+fn wire_for(envelope: &ConnectEnvelope) -> EnvelopeWire<RawQueryPayload> {
+    let ConnectPayload::Request(request) = envelope.payload() else {
+        panic!("query envelope required")
+    };
+    wire_with_payload(
+        envelope,
+        RawQueryPayload {
+            request: request.clone(),
+        },
+    )
 }
 
 #[test]
@@ -358,7 +376,7 @@ fn envelope_decode_rejects_unknown_fields_arrays_and_derived_metadata_mismatches
     struct UnknownField {
         unknown: u8,
         #[serde(flatten)]
-        envelope: EnvelopeWire,
+        envelope: EnvelopeWire<RawQueryPayload>,
     }
     let unknown = UnknownField {
         unknown: 1,
@@ -381,7 +399,12 @@ fn envelope_decode_rejects_unknown_fields_arrays_and_derived_metadata_mismatches
         envelope.privacy_class(),
         envelope.payload_kind(),
         envelope.payload_version(),
-        envelope.payload().clone(),
+        RawQueryPayload {
+            request: match envelope.payload() {
+                ConnectPayload::Request(request) => request.clone(),
+                _ => panic!("query envelope required"),
+            },
+        },
     ))
     .unwrap();
     assert!(ConnectEnvelope::decode(&positional).is_err());
@@ -483,9 +506,37 @@ fn pages_recompute_canonical_size_and_do_not_trust_claimed_encoded_bytes() {
 }
 
 #[test]
-fn transport_encode_normalizes_outgoing_page_claims() {
-    let mut page = empty_snapshot_page(53);
+fn public_payload_encoding_and_decoding_use_the_checked_wire_boundary() {
+    let limits = ConnectLimits::v1_default();
+    let mut page = empty_snapshot_page(52);
     page.encoded_bytes = u32::MAX;
+    let payload = ConnectPayload::SnapshotPage(page.clone());
+
+    let checked_bytes = payload.encode(limits).expect("checked payload encode");
+    let checked = ConnectPayload::decode(payload.kind(), payload.version(), &checked_bytes, limits)
+        .expect("checked payload decode");
+    let mut expected_page = empty_snapshot_page(52);
+    expected_page.encoded_bytes = canonical_snapshot_page_size(&expected_page).unwrap();
+    assert_eq!(checked, ConnectPayload::SnapshotPage(expected_page));
+
+    #[derive(Serialize)]
+    struct RawSnapshotPayload {
+        snapshot_page: SnapshotPage,
+    }
+    let tampered_bytes = rmp_serde::to_vec_named(&RawSnapshotPayload {
+        snapshot_page: page,
+    })
+    .expect("tampered payload fixture");
+    assert!(
+        ConnectPayload::decode(PayloadKind::SNAPSHOT_PAGE, 1, &tampered_bytes, limits).is_err(),
+        "checked public decoding must not admit a false canonical-size claim"
+    );
+}
+
+#[test]
+fn transport_encode_normalizes_outgoing_page_claims() {
+    let mut tampered_page = empty_snapshot_page(53);
+    tampered_page.encoded_bytes = u32::MAX;
     let envelope = ConnectEnvelope::new(
         binding(54),
         1,
@@ -493,19 +544,182 @@ fn transport_encode_normalizes_outgoing_page_claims() {
         None,
         ConnectLimits::v1_default(),
         ConnectPrivacyClass::ManagedMetadata,
-        ConnectPayload::SnapshotPage(page),
+        ConnectPayload::SnapshotPage(tampered_page),
     )
     .expect("page envelope");
-    let decoded = devmanager::connect::decode_inner(
-        &devmanager::connect::encode_inner(&envelope).expect("transport encode"),
-    )
-    .expect("transport decode");
+    let decoded = ConnectEnvelope::decode(&envelope.encode().expect("transport encode"))
+        .expect("transport decode");
     let ConnectPayload::SnapshotPage(page) = decoded.payload().clone() else {
         panic!("expected snapshot page")
     };
     assert_eq!(
         page.encoded_bytes,
         canonical_snapshot_page_size(&page).unwrap()
+    );
+}
+
+#[derive(Serialize)]
+struct RawChunkPayload {
+    chunk: ChunkFrame,
+}
+
+#[derive(Default)]
+struct LoopbackIo {
+    bytes: Vec<u8>,
+    read_offset: usize,
+}
+
+impl LoopbackIo {
+    fn with_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            read_offset: 0,
+        }
+    }
+}
+
+impl Read for LoopbackIo {
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+        if self.read_offset >= self.bytes.len() || destination.is_empty() {
+            return Ok(0);
+        }
+        let available = self.bytes.len() - self.read_offset;
+        let length = available.min(destination.len());
+        destination[..length]
+            .copy_from_slice(&self.bytes[self.read_offset..self.read_offset + length]);
+        self.read_offset += length;
+        Ok(length)
+    }
+}
+
+impl Write for LoopbackIo {
+    fn write(&mut self, source: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(source);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn framed_raw<P: Serialize>(wire: &P, limits: ConnectLimits) -> Vec<u8> {
+    let payload = rmp_serde::to_vec_named(wire).expect("raw wire fixture");
+    let codec = PhysicalFrameCodec::from_limits(limits.frame_limits()).expect("frame codec");
+    let mut framed = Vec::new();
+    codec.write(&mut framed, &payload).expect("physical frame");
+    framed
+}
+
+#[test]
+fn production_transport_applies_one_negotiated_limit_set_on_send_and_receive() {
+    let local = ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("local limits");
+    let peer = ConnectLimits::try_new(8192, 16384, 20, 4096, 8, 16, 4).expect("peer limits");
+    let negotiated = local.negotiate(peer).expect("negotiated limits");
+    let envelope = ConnectEnvelope::new(
+        binding(80),
+        1,
+        Some(domain_id::<RequestId>(80)),
+        None,
+        negotiated,
+        ConnectPrivacyClass::ManagedMetadata,
+        query_payload(80),
+    )
+    .expect("valid envelope");
+
+    let mut loopback = FramedConnectTransport::new(LoopbackIo::default(), local, peer)
+        .expect("production transport");
+    assert_eq!(loopback.negotiated_limits(), negotiated);
+    assert!(loopback.validate_page(10, 2048).is_ok());
+    assert!(loopback.validate_page(11, 1).is_err());
+    assert!(loopback.validate_chunk(0, &[0; 4]).is_ok());
+    assert!(loopback.validate_chunk(0, &[0; 5]).is_err());
+    loopback
+        .send(envelope.clone())
+        .expect("send valid envelope");
+    assert_eq!(
+        loopback.receive().expect("receive valid envelope"),
+        Some(envelope.clone())
+    );
+
+    let mismatched = ConnectEnvelope::new(
+        binding(81),
+        1,
+        Some(domain_id::<RequestId>(81)),
+        None,
+        ConnectLimits::v1_default(),
+        ConnectPrivacyClass::ManagedMetadata,
+        query_payload(81),
+    )
+    .expect("mismatched envelope fixture");
+    let mut sender =
+        FramedConnectTransport::with_negotiated_limits(LoopbackIo::default(), negotiated)
+            .expect("sender");
+    assert!(sender.send(mismatched).is_err());
+    assert!(
+        sender.into_inner().bytes.is_empty(),
+        "rejected send crossed no wire"
+    );
+
+    let mut invalid = wire_for(&envelope);
+    invalid.sequence = 0;
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&invalid, negotiated)),
+        negotiated,
+    )
+    .expect("invalid receiver");
+    assert!(
+        receiver.receive().is_err(),
+        "invalid envelope crossed no boundary"
+    );
+
+    let other_limits =
+        ConnectLimits::try_new(4096, 8192, 9, 2048, 4, 8, 2).expect("other valid limits");
+    let mut unnegotiated = wire_for(&envelope);
+    unnegotiated.limits = other_limits;
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&unnegotiated, negotiated)),
+        negotiated,
+    )
+    .expect("unnegotiated receiver");
+    assert!(
+        receiver.receive().is_err(),
+        "unnegotiated envelope crossed no boundary"
+    );
+
+    let wide_chunk_limits =
+        ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("wide chunk limits");
+    let oversize_limits =
+        ConnectLimits::try_new(4096, 8192, 10, 2048, 2, 4, 2).expect("oversize limits");
+    let chunk_payload = b"bad".to_vec();
+    let chunk = ChunkFrame::new(
+        domain_id::<TransferId>(82),
+        0,
+        true,
+        chunk_payload.clone(),
+        cumulative_sha256(&[&chunk_payload]),
+        None,
+    )
+    .expect("shape-valid oversized chunk");
+    let chunk_envelope = ConnectEnvelope::new(
+        binding(82),
+        1,
+        None,
+        None,
+        wide_chunk_limits,
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::Chunk(chunk.clone()),
+    )
+    .expect("wide chunk envelope");
+    let oversized_wire = wire_with_payload(&chunk_envelope, RawChunkPayload { chunk });
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&oversized_wire, oversize_limits)),
+        oversize_limits,
+    )
+    .expect("oversized receiver");
+    assert!(
+        receiver.receive().is_err(),
+        "oversized chunk crossed no boundary"
     );
 }
 
@@ -570,12 +784,10 @@ fn cumulative_sha256(parts: &[&[u8]]) -> [u8; 32] {
 
 #[test]
 fn connect_chunk_is_the_canonical_checked_primitive() {
-    let limits =
-        ConnectLimits::try_new(4096, 8192, 10, 2048, 1024, 4096, 1024).expect("bounded limits");
-    let chunk_limits = ChunkLimits::try_new(1024, 4096, 1024).expect("chunk limits");
+    let limits = ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("bounded limits");
     let transfer_id = domain_id::<TransferId>(60);
     let cursor = vec![0x71, 0x72];
-    let payload = b"payload";
+    let payload = b"pay";
     let hash = cumulative_sha256(&[payload]);
     let frame = ChunkFrame::new(
         transfer_id,
@@ -586,15 +798,21 @@ fn connect_chunk_is_the_canonical_checked_primitive() {
         Some(cursor.clone()),
     )
     .expect("chunk");
-    frame.validate(chunk_limits).expect("valid chunk");
+    limits
+        .validate_chunk(0, payload)
+        .expect("valid negotiated chunk");
     ConnectPayload::Chunk(frame.clone())
         .validate(limits)
         .expect("Connect applies negotiated chunk limits");
 
-    let mut context =
-        ChunkContext::new(transfer_id, chunk_limits, Some(cursor.clone())).expect("chunk context");
+    let mut context = limits
+        .chunk_context(transfer_id, Some(cursor.clone()))
+        .expect("chunk context");
     context.accept(&frame).expect("context accepts chunk");
     assert!(context.is_complete());
+    assert!(limits
+        .chunk_context(transfer_id, Some(vec![0x71, 0x72, 0x73]))
+        .is_err());
 
     let mut wrong_hash = hash;
     wrong_hash[0] ^= 1;
@@ -607,8 +825,9 @@ fn connect_chunk_is_the_canonical_checked_primitive() {
         Some(cursor.clone()),
     )
     .expect("shape-valid wrong hash");
-    let mut poisoned =
-        ChunkContext::new(transfer_id, chunk_limits, Some(cursor.clone())).expect("poison context");
+    let mut poisoned = limits
+        .chunk_context(transfer_id, Some(cursor.clone()))
+        .expect("poison context");
     assert!(matches!(
         poisoned.accept(&wrong_hash_frame),
         Err(ChunkError::CumulativeHashMismatch)
@@ -616,8 +835,9 @@ fn connect_chunk_is_the_canonical_checked_primitive() {
     assert!(poisoned.is_poisoned());
     assert!(matches!(poisoned.accept(&frame), Err(ChunkError::Poisoned)));
 
-    let mut post_final =
-        ChunkContext::new(transfer_id, chunk_limits, Some(cursor)).expect("post-final context");
+    let mut post_final = limits
+        .chunk_context(transfer_id, Some(cursor))
+        .expect("post-final context");
     post_final.accept(&frame).expect("final frame");
     assert!(post_final.is_complete());
     assert!(matches!(

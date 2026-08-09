@@ -31,7 +31,7 @@ use super::transport::{BrowserExtensionDescriptor, PromptExtensionDescriptor};
 pub use crate::domain::snapshot::{
     canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
 };
-pub use crate::protocol::{ChunkContext, ChunkFrame};
+pub use crate::protocol::ChunkFrame;
 
 pub const CONNECT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
 
@@ -401,6 +401,75 @@ pub enum ConnectPayload {
     Unknown(UnknownPayload),
 }
 
+/// The serde representation is deliberately kept separate from the semantic
+/// payload. It is only reached through the checked Connect wire boundaries
+/// below, so direct serde cannot bypass canonicalization or validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ConnectPayloadWire {
+    Hello(HelloPayload),
+    Capabilities(CapabilitySet),
+    SnapshotPage(SnapshotPage),
+    EventPage(EventPage),
+    Request(ClientRequest),
+    Message(ServerMessage),
+    OperationSettlement(OperationSettlementPayload),
+    Presence(LastSenderHint),
+    TerminalDelta(StreamFrame),
+    BrowserFrame(StreamFrame),
+    PromptExtension(PromptExtensionDescriptor),
+    BrowserExtension(BrowserExtensionDescriptor),
+    Chunk(ChunkFrame),
+    Error(ErrorPayload),
+    Extension(GenericExtensionPayload),
+    Unknown(UnknownPayload),
+}
+
+impl From<ConnectPayload> for ConnectPayloadWire {
+    fn from(payload: ConnectPayload) -> Self {
+        match payload {
+            ConnectPayload::Hello(value) => Self::Hello(value),
+            ConnectPayload::Capabilities(value) => Self::Capabilities(value),
+            ConnectPayload::SnapshotPage(value) => Self::SnapshotPage(value),
+            ConnectPayload::EventPage(value) => Self::EventPage(value),
+            ConnectPayload::Request(value) => Self::Request(value),
+            ConnectPayload::Message(value) => Self::Message(value),
+            ConnectPayload::OperationSettlement(value) => Self::OperationSettlement(value),
+            ConnectPayload::Presence(value) => Self::Presence(value),
+            ConnectPayload::TerminalDelta(value) => Self::TerminalDelta(value),
+            ConnectPayload::BrowserFrame(value) => Self::BrowserFrame(value),
+            ConnectPayload::PromptExtension(value) => Self::PromptExtension(value),
+            ConnectPayload::BrowserExtension(value) => Self::BrowserExtension(value),
+            ConnectPayload::Chunk(value) => Self::Chunk(value),
+            ConnectPayload::Error(value) => Self::Error(value),
+            ConnectPayload::Extension(value) => Self::Extension(value),
+            ConnectPayload::Unknown(value) => Self::Unknown(value),
+        }
+    }
+}
+
+impl From<ConnectPayloadWire> for ConnectPayload {
+    fn from(payload: ConnectPayloadWire) -> Self {
+        match payload {
+            ConnectPayloadWire::Hello(value) => Self::Hello(value),
+            ConnectPayloadWire::Capabilities(value) => Self::Capabilities(value),
+            ConnectPayloadWire::SnapshotPage(value) => Self::SnapshotPage(value),
+            ConnectPayloadWire::EventPage(value) => Self::EventPage(value),
+            ConnectPayloadWire::Request(value) => Self::Request(value),
+            ConnectPayloadWire::Message(value) => Self::Message(value),
+            ConnectPayloadWire::OperationSettlement(value) => Self::OperationSettlement(value),
+            ConnectPayloadWire::Presence(value) => Self::Presence(value),
+            ConnectPayloadWire::TerminalDelta(value) => Self::TerminalDelta(value),
+            ConnectPayloadWire::BrowserFrame(value) => Self::BrowserFrame(value),
+            ConnectPayloadWire::PromptExtension(value) => Self::PromptExtension(value),
+            ConnectPayloadWire::BrowserExtension(value) => Self::BrowserExtension(value),
+            ConnectPayloadWire::Chunk(value) => Self::Chunk(value),
+            ConnectPayloadWire::Error(value) => Self::Error(value),
+            ConnectPayloadWire::Extension(value) => Self::Extension(value),
+            ConnectPayloadWire::Unknown(value) => Self::Unknown(value),
+        }
+    }
+}
+
 impl ConnectPayload {
     pub fn kind(&self) -> PayloadKind {
         match self {
@@ -474,7 +543,11 @@ impl ConnectPayload {
         canonical.validate(limits)?;
         let codec = MessagePackCodec::from_limits(limits.frame_limits())
             .map_err(|_| PayloadError::Encode)?;
-        codec.encode(&canonical).map_err(PayloadError::MessagePack)
+        let encoded = codec
+            .encode(&ConnectPayloadWire::from(canonical))
+            .map_err(PayloadError::MessagePack)?;
+        limits.validate_payload_len(encoded.len())?;
+        Ok(encoded)
     }
 
     pub(crate) fn canonicalized_for_wire(&self) -> Result<Self, PayloadError> {
@@ -511,8 +584,9 @@ impl ConnectPayload {
         let codec = MessagePackCodec::from_limits(limits.frame_limits())
             .map_err(|_| PayloadError::Encode)?;
         let payload = codec
-            .decode::<Self>(bytes)
+            .decode::<ConnectPayloadWire>(bytes)
             .map_err(PayloadError::MessagePack)?;
+        let payload = Self::from(payload);
         if payload.kind() != kind || payload.version() != version {
             return Err(PayloadError::MetadataMismatch);
         }
@@ -900,7 +974,7 @@ impl<'de> Deserialize<'de> for PayloadTag {
     }
 }
 
-impl Serialize for ConnectPayload {
+impl Serialize for ConnectPayloadWire {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -930,7 +1004,7 @@ impl Serialize for ConnectPayload {
     }
 }
 
-impl<'de> Deserialize<'de> for ConnectPayload {
+impl<'de> Deserialize<'de> for ConnectPayloadWire {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -938,7 +1012,7 @@ impl<'de> Deserialize<'de> for ConnectPayload {
         struct PayloadVisitor;
 
         impl<'de> Visitor<'de> for PayloadVisitor {
-            type Value = ConnectPayload;
+            type Value = ConnectPayloadWire;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a one-entry named Connect payload map")
@@ -952,28 +1026,30 @@ impl<'de> Deserialize<'de> for ConnectPayload {
                     .next_key::<PayloadTag>()?
                     .ok_or_else(|| de::Error::custom("Connect payload tag is missing"))?;
                 let payload = match tag {
-                    PayloadTag::Hello => ConnectPayload::Hello(map.next_value()?),
-                    PayloadTag::Capabilities => ConnectPayload::Capabilities(map.next_value()?),
-                    PayloadTag::SnapshotPage => ConnectPayload::SnapshotPage(map.next_value()?),
-                    PayloadTag::EventPage => ConnectPayload::EventPage(map.next_value()?),
-                    PayloadTag::Request => ConnectPayload::Request(map.next_value()?),
-                    PayloadTag::Message => ConnectPayload::Message(map.next_value()?),
+                    PayloadTag::Hello => ConnectPayloadWire::Hello(map.next_value()?),
+                    PayloadTag::Capabilities => ConnectPayloadWire::Capabilities(map.next_value()?),
+                    PayloadTag::SnapshotPage => ConnectPayloadWire::SnapshotPage(map.next_value()?),
+                    PayloadTag::EventPage => ConnectPayloadWire::EventPage(map.next_value()?),
+                    PayloadTag::Request => ConnectPayloadWire::Request(map.next_value()?),
+                    PayloadTag::Message => ConnectPayloadWire::Message(map.next_value()?),
                     PayloadTag::OperationSettlement => {
-                        ConnectPayload::OperationSettlement(map.next_value()?)
+                        ConnectPayloadWire::OperationSettlement(map.next_value()?)
                     }
-                    PayloadTag::Presence => ConnectPayload::Presence(map.next_value()?),
-                    PayloadTag::TerminalDelta => ConnectPayload::TerminalDelta(map.next_value()?),
-                    PayloadTag::BrowserFrame => ConnectPayload::BrowserFrame(map.next_value()?),
+                    PayloadTag::Presence => ConnectPayloadWire::Presence(map.next_value()?),
+                    PayloadTag::TerminalDelta => {
+                        ConnectPayloadWire::TerminalDelta(map.next_value()?)
+                    }
+                    PayloadTag::BrowserFrame => ConnectPayloadWire::BrowserFrame(map.next_value()?),
                     PayloadTag::PromptExtension => {
-                        ConnectPayload::PromptExtension(map.next_value()?)
+                        ConnectPayloadWire::PromptExtension(map.next_value()?)
                     }
                     PayloadTag::BrowserExtension => {
-                        ConnectPayload::BrowserExtension(map.next_value()?)
+                        ConnectPayloadWire::BrowserExtension(map.next_value()?)
                     }
-                    PayloadTag::Chunk => ConnectPayload::Chunk(map.next_value()?),
-                    PayloadTag::Error => ConnectPayload::Error(map.next_value()?),
-                    PayloadTag::Extension => ConnectPayload::Extension(map.next_value()?),
-                    PayloadTag::Unknown => ConnectPayload::Unknown(map.next_value()?),
+                    PayloadTag::Chunk => ConnectPayloadWire::Chunk(map.next_value()?),
+                    PayloadTag::Error => ConnectPayloadWire::Error(map.next_value()?),
+                    PayloadTag::Extension => ConnectPayloadWire::Extension(map.next_value()?),
+                    PayloadTag::Unknown => ConnectPayloadWire::Unknown(map.next_value()?),
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
