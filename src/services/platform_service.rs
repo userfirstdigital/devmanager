@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, OsStr};
 use std::path::Path;
 use std::process::Command;
@@ -20,9 +20,9 @@ const CREATE_SUSPENDED: u32 = 0x00000004;
 #[cfg(windows)]
 pub const MANAGED_PROCESS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
-pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+pub fn snapshot_listener_pids(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
     if ports.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
 
     #[cfg(windows)]
@@ -37,15 +37,21 @@ pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String
 }
 
 pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
-    Ok(snapshot_listener_pids(&[port])?.remove(&port))
+    Ok(snapshot_listener_pids(&[port])?
+        .remove(&port)
+        .and_then(|pids| pids.into_iter().next()))
 }
 
 #[cfg(windows)]
-fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
-    let mut listeners = HashMap::with_capacity(filter.len());
+    let mut listeners = BTreeMap::new();
     collect_windows_listener_pids(AF_INET, &filter, &mut listeners)?;
     collect_windows_listener_pids(AF_INET6, &filter, &mut listeners)?;
+    for pids in listeners.values_mut() {
+        pids.sort_unstable();
+        pids.dedup();
+    }
     Ok(listeners)
 }
 
@@ -53,7 +59,7 @@ fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<HashMap<u16, u32>, St
 fn collect_windows_listener_pids(
     address_family: u32,
     filter: &HashSet<u16>,
-    listeners: &mut HashMap<u16, u32>,
+    listeners: &mut BTreeMap<u16, Vec<u32>>,
 ) -> Result<(), String> {
     let mut size = 0u32;
     let first = unsafe {
@@ -105,7 +111,10 @@ fn collect_windows_listener_pids(
             for row in rows {
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                    let pids = listeners.entry(port).or_default();
+                    if !pids.contains(&row.dw_owning_pid) {
+                        pids.push(row.dw_owning_pid);
+                    }
                 }
             }
         }
@@ -121,7 +130,10 @@ fn collect_windows_listener_pids(
             for row in rows {
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                    let pids = listeners.entry(port).or_default();
+                    if !pids.contains(&row.dw_owning_pid) {
+                        pids.push(row.dw_owning_pid);
+                    }
                 }
             }
         }
@@ -132,7 +144,7 @@ fn collect_windows_listener_pids(
 }
 
 #[cfg(not(windows))]
-fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
     let output = Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
@@ -142,7 +154,7 @@ fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<HashMap<u16, u32>, 
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let mut listeners = HashMap::with_capacity(filter.len());
+    let mut listeners = BTreeMap::new();
     let mut current_pid = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line.is_empty() {
@@ -159,13 +171,20 @@ fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<HashMap<u16, u32>, 
                     continue;
                 };
                 if filter.contains(&port) {
-                    listeners.entry(port).or_insert(pid);
+                    let pids = listeners.entry(port).or_default();
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    for pids in listeners.values_mut() {
+        pids.sort_unstable();
+        pids.dedup();
+    }
     Ok(listeners)
 }
 

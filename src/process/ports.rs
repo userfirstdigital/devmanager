@@ -70,15 +70,32 @@ impl std::error::Error for ListenerIdentityError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortObservation {
     Free,
-    Listener(ListenerIdentity),
+    Listeners(Arc<[ListenerIdentity]>),
     ProbeError(String),
 }
 
 impl PortObservation {
-    pub fn listener(&self) -> Option<ListenerIdentity> {
+    pub fn from_listeners(mut listeners: Vec<ListenerIdentity>) -> Self {
+        listeners.sort_unstable();
+        listeners.dedup();
+        if listeners.is_empty() {
+            Self::Free
+        } else {
+            Self::Listeners(Arc::from(listeners.into_boxed_slice()))
+        }
+    }
+
+    pub fn listeners(&self) -> &[ListenerIdentity] {
         match self {
-            Self::Listener(listener) => Some(*listener),
-            Self::Free | Self::ProbeError(_) => None,
+            Self::Free | Self::ProbeError(_) => &[],
+            Self::Listeners(listeners) => listeners,
+        }
+    }
+
+    pub fn listener(&self) -> Option<ListenerIdentity> {
+        match self.listeners() {
+            [listener] => Some(*listener),
+            _ => None,
         }
     }
 }
@@ -148,6 +165,9 @@ pub enum PortStatusKind {
     /// The listener identity is a member of the exact managed generation and
     /// the caller has supplied application-level readiness evidence.
     ManagedHealthy,
+    /// The listener identity is a member of the exact managed generation,
+    /// but application-level readiness evidence is not available yet.
+    ManagedUnready,
     /// A listener exists, but it is not owned by the requested resource
     /// generation.
     External,
@@ -162,7 +182,7 @@ pub struct PortStatus {
     pub port: u16,
     pub resource: ResourceFence,
     pub kind: PortStatusKind,
-    pub listener: Option<ListenerIdentity>,
+    pub listeners: Arc<[ListenerIdentity]>,
     pub error: Option<String>,
 }
 
@@ -172,7 +192,14 @@ impl PortStatus {
     }
 
     pub fn listener(&self) -> Option<ListenerIdentity> {
-        self.listener
+        match self.listeners.as_ref() {
+            [listener] => Some(*listener),
+            _ => None,
+        }
+    }
+
+    pub fn listeners(&self) -> &[ListenerIdentity] {
+        &self.listeners
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -250,14 +277,17 @@ pub fn project_port_status(
     observation: &PortObservation,
     managed: Option<&ManagedResourceSnapshot>,
 ) -> PortStatus {
-    if managed.is_some_and(|resource| {
-        resource.resource() == target.resource && resource.state() == ManagedProcessState::Starting
-    }) {
+    if !matches!(observation, PortObservation::ProbeError(_))
+        && managed.is_some_and(|resource| {
+            resource.resource() == target.resource
+                && resource.state() == ManagedProcessState::Starting
+        })
+    {
         return PortStatus {
             port: target.port,
             resource: target.resource,
             kind: PortStatusKind::Starting,
-            listener: observation.listener(),
+            listeners: Arc::from(observation.listeners()),
             error: None,
         };
     }
@@ -267,44 +297,48 @@ pub fn project_port_status(
             port: target.port,
             resource: target.resource,
             kind: PortStatusKind::Stopped,
-            listener: None,
+            listeners: Arc::from([]),
             error: None,
         },
         PortObservation::ProbeError(detail) => PortStatus {
             port: target.port,
             resource: target.resource,
             kind: PortStatusKind::ProbeError,
-            listener: None,
+            listeners: Arc::from([]),
             error: Some(detail.clone()),
         },
-        PortObservation::Listener(listener) => {
+        PortObservation::Listeners(listeners) => {
             let exact_owner = managed.filter(|resource| resource.resource() == target.resource);
-            if exact_owner.is_some_and(|resource| {
-                resource.state() == ManagedProcessState::Running
-                    && target.health == ManagedPortHealth::Ready
-                    && resource.owns(*listener)
-            }) {
+            let all_listeners_owned = exact_owner.is_some_and(|resource| {
+                !listeners.is_empty() && listeners.iter().all(|listener| resource.owns(*listener))
+            });
+            if all_listeners_owned
+                && exact_owner.is_some_and(|resource| {
+                    resource.state() == ManagedProcessState::Running
+                        && target.health == ManagedPortHealth::Ready
+                })
+            {
                 PortStatus {
                     port: target.port,
                     resource: target.resource,
                     kind: PortStatusKind::ManagedHealthy,
-                    listener: Some(*listener),
+                    listeners: listeners.clone(),
                     error: None,
                 }
-            } else if exact_owner.is_some_and(|resource| resource.owns(*listener)) {
+            } else if all_listeners_owned {
                 PortStatus {
                     port: target.port,
                     resource: target.resource,
-                    kind: PortStatusKind::ProbeError,
-                    listener: Some(*listener),
-                    error: Some("managed listener is not health-ready".to_string()),
+                    kind: PortStatusKind::ManagedUnready,
+                    listeners: listeners.clone(),
+                    error: None,
                 }
             } else {
                 PortStatus {
                     port: target.port,
                     resource: target.resource,
                     kind: PortStatusKind::External,
-                    listener: Some(*listener),
+                    listeners: listeners.clone(),
                     error: None,
                 }
             }
@@ -322,7 +356,7 @@ pub fn project_port_status_from_snapshot(
             port: target.port,
             resource: target.resource,
             kind: PortStatusKind::ProbeError,
-            listener: None,
+            listeners: Arc::from([]),
             error: Some("port was not included in the cached inventory snapshot".to_string()),
         };
     };
@@ -341,6 +375,10 @@ pub enum PortStartError {
     OccupiedExternal {
         port: u16,
         listener: ListenerIdentity,
+    },
+    OccupiedAmbiguous {
+        port: u16,
+        listeners: Arc<[ListenerIdentity]>,
     },
 }
 
@@ -361,6 +399,11 @@ impl fmt::Display for PortStartError {
                 "port {port} is occupied by external listener PID {} (creation {})",
                 listener.pid(),
                 listener.creation_time_100ns()
+            ),
+            Self::OccupiedAmbiguous { port, listeners } => write!(
+                formatter,
+                "port {port} has {} listener identities and cannot be admitted safely",
+                listeners.len()
             ),
         }
     }
@@ -384,9 +427,27 @@ pub fn ensure_managed_start_allowed(
             port,
             detail: detail.clone(),
         }),
-        Some(PortObservation::Listener(listener)) => Err(PortStartError::OccupiedExternal {
-            port,
-            listener: *listener,
-        }),
+        Some(PortObservation::Listeners(listeners)) => match listeners.as_ref() {
+            [listener] => Err(PortStartError::OccupiedExternal {
+                port,
+                listener: *listener,
+            }),
+            _ => Err(PortStartError::OccupiedAmbiguous {
+                port,
+                listeners: listeners.clone(),
+            }),
+        },
     }
+}
+
+/// Invoke a managed launch only after the immutable inventory proved the port
+/// free. The callback is never evaluated for a missing, occupied, ambiguous,
+/// or failed observation.
+pub fn launch_if_port_free<T>(
+    snapshot: &PortInventorySnapshot,
+    port: u16,
+    launch: impl FnOnce() -> T,
+) -> Result<T, PortStartError> {
+    ensure_managed_start_allowed(snapshot, port)?;
+    Ok(launch())
 }

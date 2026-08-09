@@ -49,15 +49,28 @@ impl PortInventory {
     pub fn refresh(&self, ports: &[u16]) -> Result<Arc<PortInventorySnapshot>, String> {
         match scan_listener_inventory(ports) {
             Ok(snapshot) => {
-                let snapshot = Arc::new(snapshot);
+                let mut observations = self.cached_snapshot().observations().clone();
+                observations.extend(
+                    snapshot
+                        .observations()
+                        .iter()
+                        .map(|(port, observation)| (*port, observation.clone())),
+                );
+                let snapshot = Arc::new(PortInventorySnapshot::new(observations));
                 self.publish(snapshot.clone());
                 Ok(snapshot)
             }
             Err(error) => {
-                let snapshot = Arc::new(PortInventorySnapshot::probe_failure(
-                    ports.iter().copied(),
-                    error.clone(),
-                ));
+                let failure =
+                    PortInventorySnapshot::probe_failure(ports.iter().copied(), error.clone());
+                let mut observations = self.cached_snapshot().observations().clone();
+                observations.extend(
+                    failure
+                        .observations()
+                        .iter()
+                        .map(|(port, observation)| (*port, observation.clone())),
+                );
+                let snapshot = Arc::new(PortInventorySnapshot::new(observations));
                 self.publish(snapshot);
                 Err(error)
             }
@@ -78,10 +91,19 @@ pub fn scan_listener_inventory(ports: &[u16]) -> Result<PortInventorySnapshot, S
         .map(|port| (port, PortObservation::Free))
         .collect::<BTreeMap<_, _>>();
 
-    for (port, pid) in listener_pids {
-        let observation = match capture_listener_identity(pid) {
-            Ok(identity) => PortObservation::Listener(identity),
-            Err(error) => PortObservation::ProbeError(error),
+    for (port, pids) in listener_pids {
+        let mut identities = Vec::with_capacity(pids.len());
+        let mut errors = Vec::new();
+        for pid in pids {
+            match capture_listener_identity(pid) {
+                Ok(identity) => identities.push(identity),
+                Err(error) => errors.push(error),
+            }
+        }
+        let observation = if errors.is_empty() {
+            PortObservation::from_listeners(identities)
+        } else {
+            PortObservation::ProbeError(errors.join("; "))
         };
         observations.insert(port, observation);
     }
@@ -158,14 +180,27 @@ fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
 
 pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {
     let snapshot = scan_listener_inventory(ports)?;
+    legacy_statuses_from_snapshot(&snapshot, ports)
+}
+
+/// Convert an inventory snapshot to the existing UI/remote port model.
+///
+/// The legacy model has one optional PID, so an ambiguous multi-listener
+/// observation intentionally retains only `in_use = true` and no PID. This
+/// preserves the blue external presentation instead of claiming ownership
+/// from an arbitrary listener.
+pub fn legacy_statuses_from_snapshot(
+    snapshot: &PortInventorySnapshot,
+    ports: &[u16],
+) -> Result<HashMap<u16, PortStatus>, String> {
     let mut statuses = HashMap::with_capacity(ports.len());
 
     for &port in ports {
         let status = match snapshot.observation(port) {
-            Some(PortObservation::Listener(listener)) => PortStatus {
+            Some(PortObservation::Listeners(listeners)) => PortStatus {
                 port,
                 in_use: true,
-                pid: Some(listener.pid()),
+                pid: (listeners.len() == 1).then(|| listeners[0].pid()),
                 process_name: None,
             },
             Some(PortObservation::Free) => PortStatus {
@@ -204,10 +239,7 @@ pub fn check_port_in_use(port: u16) -> Result<PortStatus, String> {
 
 pub fn kill_port(port: u16) -> Result<(), String> {
     let _ = port;
-    Err(
-        "refusing to kill a port without an exact managed resource and process identity proof"
-            .to_string(),
-    )
+    Err("refusing to kill port: this legacy API has no exact managed resource fence; external or unknown listeners are never controlled".to_string())
 }
 
 pub fn get_port_conflicts(config: &AppConfig) -> Vec<PortConflict> {

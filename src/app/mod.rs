@@ -187,7 +187,6 @@ pub fn run() {
 
 #[derive(Debug, Clone)]
 enum ActionableNotice {
-    PortInUse { command_id: String, message: String },
     ForceQuit { message: String },
 }
 
@@ -552,6 +551,7 @@ struct AiQuotaState {
 
 #[derive(Debug, Clone, Default)]
 struct ServerPortSnapshotState {
+    inventory: ports_service::PortInventory,
     tracked_ports: Vec<u16>,
     statuses: HashMap<u16, PortStatus>,
     last_checked_at: Option<Instant>,
@@ -11701,21 +11701,6 @@ impl NativeShell {
             self.terminal_actionable_notice
                 .as_ref()
                 .and_then(|notice| match notice {
-                    ActionableNotice::PortInUse {
-                        command_id,
-                        message,
-                        ..
-                    } => {
-                        if command_id.as_str() == active_spec.session_id.as_str() {
-                            Some(view::TerminalActionableNotice {
-                                message: message.clone(),
-                                action_label: "Kill process & start server",
-                                action_color: theme::DANGER_TEXT,
-                            })
-                        } else {
-                            None
-                        }
-                    }
                     ActionableNotice::ForceQuit { message } => {
                         Some(view::TerminalActionableNotice {
                             message: message.clone(),
@@ -11969,6 +11954,15 @@ impl NativeShell {
             self.server_port_snapshot.last_checked_at = None;
         }
 
+        if self.server_port_snapshot.statuses.is_empty() {
+            let cached_snapshot = self.server_port_snapshot.inventory.cached_snapshot();
+            if let Ok(statuses) =
+                ports_service::legacy_statuses_from_snapshot(&cached_snapshot, &tracked_ports)
+            {
+                self.server_port_snapshot.statuses = statuses;
+            }
+        }
+
         let missing_status = tracked_ports
             .iter()
             .any(|port| !self.server_port_snapshot.statuses.contains_key(port));
@@ -11984,6 +11978,7 @@ impl NativeShell {
 
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
+        let inventory = self.server_port_snapshot.inventory.clone();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -11992,7 +11987,10 @@ impl NativeShell {
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let statuses = background_executor
-                        .spawn(async move { ports_service::snapshot_ports(&ports).ok() })
+                        .spawn(async move {
+                            let snapshot = inventory.refresh(&ports)?;
+                            ports_service::legacy_statuses_from_snapshot(&snapshot, &ports)
+                        })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                         background_executor.timer(Duration::from_millis(50)).await;
@@ -12000,12 +11998,19 @@ impl NativeShell {
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         this.server_port_snapshot.refresh_in_flight = false;
                         this.server_port_snapshot.last_checked_at = Some(Instant::now());
-                        if let Some(statuses) = statuses {
-                            this.server_port_snapshot.statuses = statuses;
-                            let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
-                            this.server_port_snapshot
-                                .statuses
-                                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+                        match statuses {
+                            Ok(statuses) => {
+                                this.server_port_snapshot.statuses = statuses;
+                                let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
+                                this.server_port_snapshot
+                                    .statuses
+                                    .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+                            }
+                            Err(error) => {
+                                this.terminal_notice = Some(format!(
+                                    "Port status refresh failed; no ownership was assumed: {error}"
+                                ));
+                            }
                         }
                         cx.notify();
                     });
@@ -12076,7 +12081,6 @@ impl NativeShell {
         state.refresh_in_flight = true;
         self.server_port_snapshot.statuses.remove(&port);
         self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
         self.sync_active_port_state(&command_id, Some(port));
         cx.notify();
     }
@@ -12093,7 +12097,6 @@ impl NativeShell {
             }
         }
         self.server_port_snapshot.last_checked_at = None;
-        self.server_port_snapshot.refresh_in_flight = false;
     }
 
     fn record_port_kill_feedback(
@@ -12488,7 +12491,10 @@ impl NativeShell {
             can_stop: allow_mutation && status.is_live(),
             can_restart: allow_mutation && status.is_live(),
             can_clear: active_session.is_some() && !remote,
-            can_kill_port: !remote && port.is_some() && has_port_conflict,
+            can_kill_port: !remote
+                && port.is_some()
+                && has_port_conflict
+                && legacy_port_control_allowed(port_status.as_ref()),
             can_open_url: (remote && remote_url_available)
                 || (!remote
                     && port.is_some()
@@ -12891,7 +12897,18 @@ impl NativeShell {
             return;
         };
 
+        if !server_start_probe_allowed(self.server_port_snapshot.refresh_in_flight) {
+            self.terminal_actionable_notice = None;
+            self.terminal_notice = Some(
+                "Port status refresh is still in progress; try starting again when it completes."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+
         self.invalidate_server_port_snapshot(Some(port));
+        self.server_port_snapshot.refresh_in_flight = true;
         if let Some(state) = self.active_port_state.as_mut() {
             if state.command_id == command_id && state.port == port {
                 state.status = None;
@@ -12901,6 +12918,7 @@ impl NativeShell {
         }
 
         let command_id = command_id.to_string();
+        let inventory = self.server_port_snapshot.inventory.clone();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -12908,13 +12926,14 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
-                    let status = background_executor
-                        .spawn(async move { ports_service::check_port_in_use(port).ok() })
+                    let scan = background_executor
+                        .spawn(async move { inventory.refresh(&[port]) })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        this.server_port_snapshot.refresh_in_flight = false;
                         if let Err(error) = this
                             .process_manager
                             .validate_server_launch(&this.state, &command_id)
@@ -12923,6 +12942,11 @@ impl NativeShell {
                             cx.notify();
                             return;
                         }
+                        let status = scan.as_ref().ok().and_then(|snapshot| {
+                            ports_service::legacy_statuses_from_snapshot(snapshot, &[port])
+                                .ok()
+                                .and_then(|mut statuses| statuses.remove(&port))
+                        });
                         if let Some(state) = this.active_port_state.as_mut() {
                             if state.command_id == command_id && state.port == port {
                                 state.status = status.clone();
@@ -12930,46 +12954,50 @@ impl NativeShell {
                                 state.refresh_in_flight = false;
                             }
                         }
-
-                        if let Some(status) = status.filter(|status| status.in_use) {
-                            let owner = status
-                                .process_name
-                                .clone()
-                                .unwrap_or_else(|| "another process".to_string());
-                            let owner_label = status
-                                .pid
-                                .map(|pid| format!("{owner} ({pid})"))
-                                .unwrap_or(owner);
-                            let message =
-                                format!("Port {port} is already in use by {owner_label}.");
-                            this.terminal_notice = Some(message.clone());
-                            this.terminal_actionable_notice = Some(ActionableNotice::PortInUse {
-                                command_id: command_id.clone(),
-                                message,
-                            });
-                            cx.notify();
-                            return;
-                        }
-
-                        if focus_started_server {
-                            this.interrupt_active_browser_replay_before_route_change(None);
-                        }
-                        let result = if focus_started_server {
-                            this.process_manager.start_server(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
+                        if let Some(status) = status.clone() {
+                            this.server_port_snapshot.statuses.insert(port, status);
                         } else {
-                            this.process_manager.start_server_in_background(
-                                &mut this.state,
-                                &command_id,
-                                dimensions,
-                            )
+                            this.server_port_snapshot.statuses.remove(&port);
+                        }
+                        this.server_port_snapshot.last_checked_at = None;
+
+                        let snapshot = match scan {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                this.terminal_actionable_notice = None;
+                                this.terminal_notice = Some(format!(
+                                    "Failed to start server: could not establish whether port {port} is free: {error}"
+                                ));
+                                cx.notify();
+                                return;
+                            }
                         };
 
-                        match result {
-                            Ok(()) => {
+                        let start_result = crate::process::ports::launch_if_port_free(
+                            &snapshot,
+                            port,
+                            || {
+                                if focus_started_server {
+                                    this.interrupt_active_browser_replay_before_route_change(None);
+                                }
+                                if focus_started_server {
+                                    this.process_manager.start_server(
+                                        &mut this.state,
+                                        &command_id,
+                                        dimensions,
+                                    )
+                                } else {
+                                    this.process_manager.start_server_in_background(
+                                        &mut this.state,
+                                        &command_id,
+                                        dimensions,
+                                    )
+                                }
+                            },
+                        );
+
+                        match start_result {
+                            Ok(Ok(())) => {
                                 if focus_started_server {
                                     this.synced_session_id = Some(command_id.clone());
                                 }
@@ -12977,9 +13005,42 @@ impl NativeShell {
                                 this.terminal_actionable_notice = None;
                                 this.save_session_state();
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
+                                this.terminal_actionable_notice = None;
                                 this.terminal_notice =
                                     Some(format!("Failed to start server: {error}"));
+                            }
+                            Err(error) => {
+                                let occupied = matches!(
+                                    &error,
+                                    crate::process::ports::PortStartError::OccupiedExternal { .. }
+                                        | crate::process::ports::PortStartError::OccupiedAmbiguous { .. }
+                                );
+                                if occupied {
+                                    let owner = status
+                                        .as_ref()
+                                        .and_then(|status| status.process_name.clone())
+                                        .unwrap_or_else(|| "another process".to_string());
+                                    let owner_label = status
+                                        .as_ref()
+                                        .and_then(|status| status.pid)
+                                        .map(|pid| format!("{owner} ({pid})"))
+                                        .unwrap_or(owner);
+                                    let message = if status
+                                        .as_ref()
+                                        .is_some_and(|status| status.in_use)
+                                    {
+                                        format!("Port {port} is already in use by {owner_label}.")
+                                    } else {
+                                        error.to_string()
+                                    };
+                                    this.terminal_actionable_notice = None;
+                                    this.terminal_notice = Some(message);
+                                } else {
+                                    this.terminal_actionable_notice = None;
+                                    this.terminal_notice =
+                                        Some(format!("Failed to start server: {error}"));
+                                }
                             }
                         }
                         cx.notify();
@@ -13143,6 +13204,15 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !legacy_port_control_allowed(None) {
+            self.terminal_actionable_notice = None;
+            self.terminal_notice = Some(
+                "Port control is unavailable without an exact managed resource fence.".to_string(),
+            );
+            cx.notify();
+            return;
+        }
+
         if let Err(error) = self
             .process_manager
             .validate_server_launch(&self.state, command_id)
@@ -15489,9 +15559,6 @@ impl Render for NativeShell {
                     .map(|_| make_kill_port_handler(command_id.clone())),
                 on_actionable_notice_action: self.terminal_actionable_notice.as_ref().map(
                     |notice| match notice {
-                        ActionableNotice::PortInUse {
-                            command_id: cmd_id, ..
-                        } => make_kill_port_handler(cmd_id.clone()),
                         ActionableNotice::ForceQuit { .. } => make_force_quit_handler(),
                     },
                 ),
@@ -16693,6 +16760,10 @@ fn server_port_snapshot_plan(
     (tracked_server_ports(state), refresh_interval)
 }
 
+fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
+    !refresh_in_flight
+}
+
 fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
     let mut ports = Vec::new();
     for project in state.projects() {
@@ -16896,15 +16967,17 @@ fn is_managed_port_owner(
 }
 
 fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let Some(pid) = status.pid else {
-        return false;
-    };
+    let _ = (session, status);
+    // The legacy UI status contains only a PID. It has no listener creation
+    // identity and no live ProcessRegistry/resource fence, so it cannot prove
+    // managed ownership or authorize a green/control path.
+    false
+}
 
-    if session.pid == Some(pid) {
-        return true;
-    }
-
-    session.resources.process_ids.contains(&pid)
+fn legacy_port_control_allowed(_status: Option<&PortStatus>) -> bool {
+    // PortStatus is a compatibility projection. Until the live
+    // ProcessRegistry fence is supplied here, port control must fail closed.
+    false
 }
 
 fn normalize_optional_string(value: &str) -> Option<String> {
@@ -20271,7 +20344,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_uses_managed_port_ownership() {
+    fn derive_server_indicator_does_not_claim_managed_port_from_legacy_pid() {
         let mut state = AppState::default();
         let mut project = sample_project();
         project.folders[0].commands[0].port = Some(5174);
@@ -20303,7 +20376,7 @@ mod tests {
         let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::Ready)
+            Some(&sidebar::ServerIndicatorState::External)
         );
 
         port_statuses.insert(
@@ -20338,6 +20411,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_port_status_never_authorizes_port_control() {
+        let status = PortStatus {
+            port: 5174,
+            in_use: true,
+            pid: Some(42),
+            process_name: None,
+        };
+
+        assert!(!legacy_port_control_allowed(Some(&status)));
+    }
+
+    #[test]
+    fn server_start_probe_waits_for_existing_snapshot_refresh() {
+        assert!(!server_start_probe_allowed(true));
+        assert!(server_start_probe_allowed(false));
+    }
+
+    #[test]
     fn derive_server_indicator_detects_external_listener_without_session() {
         let statuses = HashMap::from([(
             5174,
@@ -20351,6 +20442,31 @@ mod tests {
 
         assert_eq!(
             derive_server_indicator(None, Some(5174), &statuses),
+            sidebar::ServerIndicatorState::External
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_keeps_ambiguous_listener_external() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses),
             sidebar::ServerIndicatorState::External
         );
     }

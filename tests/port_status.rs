@@ -7,14 +7,16 @@ use devmanager::domain::id::ResourceId;
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::ports::{
-    ensure_managed_start_allowed, project_port_status, registered_resource_snapshot,
-    ListenerIdentity, ManagedPortHealth, PortInventorySnapshot, PortObservation, PortStartError,
-    PortStatusKind, PortTarget,
+    ensure_managed_start_allowed, launch_if_port_free, project_port_status,
+    registered_resource_snapshot, ListenerIdentity, ManagedPortHealth, PortInventorySnapshot,
+    PortObservation, PortStartError, PortStatusKind, PortTarget,
 };
 use devmanager::process::registry::{
     JobMembership, ManagedProcessFence, ProcessRegistry, RegisteredProcess,
 };
-use devmanager::services::ports_service::{kill_port, scan_listener_inventory, PortInventory};
+use devmanager::services::ports_service::{
+    kill_port, legacy_statuses_from_snapshot, scan_listener_inventory, PortInventory,
+};
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     [
@@ -45,6 +47,10 @@ fn identity(pid: u32, creation_time_100ns: u64, executable: &Path) -> ManagedPro
 
 fn listener(pid: u32, creation_time_100ns: u64) -> ListenerIdentity {
     ListenerIdentity::new(pid, creation_time_100ns).expect("listener identity")
+}
+
+fn single_listener(identity: ListenerIdentity) -> PortObservation {
+    PortObservation::from_listeners(vec![identity])
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +99,22 @@ fn starting_resource_is_orange_even_before_a_listener_appears() {
 }
 
 #[test]
+fn probe_failure_remains_visible_while_managed_resource_is_starting() {
+    let resource = fence(10, 1);
+    let (registry, _) = registry_with_root(resource, 11_013, 1_013);
+    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+
+    let status = project_port_status(
+        &target(resource),
+        &PortObservation::ProbeError("listener table unavailable".to_string()),
+        Some(&managed),
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::ProbeError);
+    assert_eq!(status.error(), Some("listener table unavailable"));
+}
+
+#[test]
 fn matching_managed_ready_listener_is_green() {
     let resource = fence(2, 1);
     let (mut registry, managed_fence) = registry_with_root(resource, 11_002, 202);
@@ -103,7 +125,7 @@ fn matching_managed_ready_listener_is_green() {
 
     let status = project_port_status(
         &target(resource),
-        &PortObservation::Listener(listener(11_002, 202)),
+        &single_listener(listener(11_002, 202)),
         Some(&managed),
     );
 
@@ -111,16 +133,57 @@ fn matching_managed_ready_listener_is_green() {
 }
 
 #[test]
+fn matching_managed_listener_without_readiness_is_orange_unready() {
+    let resource = fence(8, 1);
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_008, 808);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let target = PortTarget::new(43001, resource, ManagedPortHealth::NotReady);
+
+    let status = project_port_status(
+        &target,
+        &single_listener(listener(11_008, 808)),
+        Some(&managed),
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::ManagedUnready);
+    assert_eq!(status.error(), None);
+}
+
+#[test]
 fn listener_owned_by_another_resource_is_blue() {
     let resource = fence(3, 1);
     let status = project_port_status(
         &target(resource),
-        &PortObservation::Listener(listener(11_003, 303)),
+        &single_listener(listener(11_003, 303)),
         None,
     );
 
     assert_eq!(status.kind(), PortStatusKind::External);
     assert_eq!(status.listener(), Some(listener(11_003, 303)));
+}
+
+#[test]
+fn mixed_managed_and_external_listeners_are_preserved_and_fail_closed() {
+    let resource = fence(9, 1);
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_009, 909);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed_listener = listener(11_009, 909);
+    let external_listener = listener(11_010, 910);
+    let observation = PortObservation::Listeners(Arc::from(
+        vec![managed_listener, external_listener].into_boxed_slice(),
+    ));
+
+    let status = project_port_status(&target(resource), &observation, Some(&managed));
+
+    assert_eq!(status.kind(), PortStatusKind::External);
+    assert_eq!(status.listener(), None);
+    assert_eq!(status.listeners(), &[managed_listener, external_listener]);
 }
 
 #[test]
@@ -156,7 +219,7 @@ fn pid_reuse_does_not_make_a_reused_pid_managed() {
 
     let status = project_port_status(
         &target(resource),
-        &PortObservation::Listener(listener(11_006, 999_999)),
+        &single_listener(listener(11_006, 999_999)),
         Some(&managed),
     );
 
@@ -175,7 +238,7 @@ fn a_stale_resource_generation_cannot_claim_a_current_listener() {
     let stale_snapshot = registered_resource_snapshot(&registry, stale_resource);
     let status = project_port_status(
         &target(stale_resource),
-        &PortObservation::Listener(listener(11_007, 707)),
+        &single_listener(listener(11_007, 707)),
         stale_snapshot.as_ref(),
     );
 
@@ -203,10 +266,7 @@ fn cached_snapshots_are_read_without_running_a_probe() {
 #[test]
 fn occupied_external_start_is_rejected_with_listener_evidence() {
     let occupied = listener(11_009, 909);
-    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(
-        43001,
-        PortObservation::Listener(occupied),
-    )]));
+    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(43001, single_listener(occupied))]));
 
     let error = ensure_managed_start_allowed(&snapshot, 43001).expect_err("occupied port");
 
@@ -222,6 +282,44 @@ fn occupied_external_start_is_rejected_with_listener_evidence() {
 }
 
 #[test]
+fn probe_error_cannot_invoke_the_server_launch_callback() {
+    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(
+        43001,
+        PortObservation::ProbeError("listener table unavailable".to_string()),
+    )]));
+    let launched = std::sync::atomic::AtomicBool::new(false);
+
+    let error = launch_if_port_free(&snapshot, 43001, || {
+        launched.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .expect_err("probe failure must reject launch");
+
+    assert_eq!(
+        error,
+        PortStartError::ProbeFailed {
+            port: 43001,
+            detail: "listener table unavailable".to_string(),
+        }
+    );
+    assert!(!launched.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn ambiguous_legacy_status_does_not_claim_one_managed_pid() {
+    let first = listener(11_011, 1_101);
+    let second = listener(11_012, 1_102);
+    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(
+        43001,
+        PortObservation::Listeners(Arc::from(vec![first, second].into_boxed_slice())),
+    )]));
+
+    let statuses = legacy_statuses_from_snapshot(&snapshot, &[43001]).expect("legacy status");
+    let status = statuses.get(&43001).expect("port status");
+    assert!(status.in_use);
+    assert_eq!(status.pid, None);
+}
+
+#[test]
 fn real_temporary_listener_is_observed_and_never_touched_by_rejection() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("temporary listener");
     let port = listener.local_addr().expect("listener address").port();
@@ -229,7 +327,7 @@ fn real_temporary_listener_is_observed_and_never_touched_by_rejection() {
     let snapshot = scan_listener_inventory(&[port]).expect("listener inventory");
     let observed = snapshot.observation(port).expect("observed port");
     let observed_listener = match observed {
-        PortObservation::Listener(listener) => *listener,
+        PortObservation::Listeners(listeners) if listeners.len() == 1 => listeners[0],
         other => panic!("expected listener observation, got {other:?}"),
     };
     assert_eq!(observed_listener.pid(), std::process::id());
