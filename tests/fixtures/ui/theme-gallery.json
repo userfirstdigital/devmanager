@@ -1,0 +1,9 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "theme-gallery",
+  "title": "Theme Gallery",
+  "root": {
+    "kind": "minimal",
+    "label": "DevManager native preview"
+  }
+}
