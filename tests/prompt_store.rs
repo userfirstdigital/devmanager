@@ -11,7 +11,7 @@ use devmanager::prompts::{
     RestorePrompt, SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion,
 };
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -19,6 +19,14 @@ use tempfile::TempDir;
 struct PromptChainCommandWire<'a> {
     schema_version: u32,
     command: &'a PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+}
+
+#[derive(Deserialize)]
+struct PromptChainCommandWireOwned {
+    schema_version: u32,
+    command: PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
 }
 
 fn db_path(dir: &TempDir) -> PathBuf {
@@ -121,10 +129,23 @@ fn noncanonical_prompt_renamed_payload(prompt_id: PromptId, title: &str, revisio
 
 fn chain_command_payload(command: &PromptChainCommand) -> Vec<u8> {
     rmp_serde::to_vec_named(&PromptChainCommandWire {
-        schema_version: devmanager::prompts::PROMPT_WIRE_SCHEMA_VERSION,
+        schema_version: 2,
         command,
+        resolved_prompt_version_id: None,
     })
     .expect("canonical chain command payload")
+}
+
+fn stored_chain_command(path: &Path, command_id: CommandId) -> PromptChainCommandWireOwned {
+    let conn = Connection::open(path).expect("open command payload database");
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT command_payload FROM prompt_chain_command_receipts WHERE command_id = ?1",
+            [command_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("load durable chain command payload");
+    rmp_serde::from_slice(&payload).expect("decode durable chain command payload")
 }
 
 #[test]
@@ -272,6 +293,8 @@ fn idempotent_receipt_requires_correlated_command_target_version_and_revision() 
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_command_receipts(
             command_id, command_sha256, command_payload, prompt_id,
@@ -321,6 +344,8 @@ fn idempotent_receipt_requires_exact_canonical_payload_bytes() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_command_receipts(
             command_id, command_sha256, command_payload, prompt_id,
@@ -364,6 +389,8 @@ fn idempotent_receipt_missing_legacy_command_bytes_fails_closed() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_command_receipts(
             command_id, command_sha256, prompt_id, prompt_version_id, revision,
@@ -390,6 +417,188 @@ fn idempotent_receipt_missing_legacy_command_bytes_fails_closed() {
 }
 
 #[test]
+fn idempotent_effectful_receipt_requires_exactly_one_effect_event() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(136);
+    let create_version = version_id(137);
+    let rename_command_id = command_id(138);
+    let rename = PromptCommand::RenamePrompt(RenamePrompt {
+        prompt_id: prompt,
+        title: "Renamed code".into(),
+        expected_revision: 1,
+    });
+
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(139), create_prompt(prompt, create_version))
+        .expect("create prompt");
+    store
+        .execute(rename_command_id, rename.clone())
+        .expect("rename prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    let (occurred_at_ms, payload): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT occurred_at_ms, payload FROM prompt_events WHERE command_id = ?1",
+            [rename_command_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load canonical rename effect");
+    conn.execute(
+        "INSERT INTO prompt_events(
+            prompt_event_id, command_id, prompt_id, event_type, occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, 'prompt.renamed', ?4, ?5)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            rename_command_id.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            occurred_at_ms,
+            payload,
+        ],
+    )
+    .expect("insert duplicate effect row");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute(rename_command_id, rename)
+        .expect_err("duplicate effect rows must reject idempotent replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn idempotent_effectful_receipt_requires_one_event_not_zero() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(140);
+    let create_version = version_id(141);
+    let rename_command_id = command_id(142);
+    let rename = PromptCommand::RenamePrompt(RenamePrompt {
+        prompt_id: prompt,
+        title: "Renamed code".into(),
+        expected_revision: 1,
+    });
+
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(143), create_prompt(prompt, create_version))
+        .expect("create prompt");
+    store
+        .execute(rename_command_id, rename.clone())
+        .expect("rename prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_events_immutable_delete")
+        .expect("disable append-only trigger for corruption fixture");
+    conn.execute(
+        "DELETE FROM prompt_events WHERE command_id = ?1",
+        [rename_command_id.as_bytes().as_slice()],
+    )
+    .expect("remove effect row");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute(rename_command_id, rename)
+        .expect_err("missing effect row must reject idempotent replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn idempotent_semantic_noop_requires_unchanged_state_and_zero_events() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(144);
+    let create_version = version_id(145);
+    let noop_command_id = command_id(146);
+    let noop = PromptCommand::RenamePrompt(RenamePrompt {
+        prompt_id: prompt,
+        title: "Review code".into(),
+        expected_revision: 1,
+    });
+
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(147), create_prompt(prompt, create_version))
+        .expect("create prompt");
+    store
+        .execute(noop_command_id, noop.clone())
+        .expect("semantic no-op");
+    assert_eq!(store.count_prompt_events().expect("count events"), 1);
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER saved_prompts_metadata_update_bounds")
+        .expect("disable metadata trigger for corruption fixture");
+    conn.execute(
+        "UPDATE saved_prompts SET title = 'Forged state' WHERE prompt_id = ?1",
+        [prompt.as_bytes().as_slice()],
+    )
+    .expect("forge changed state after no-op receipt");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute(noop_command_id, noop)
+        .expect_err("no-op replay must prove unchanged exact state");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn idempotent_semantic_noop_rejects_a_forged_event() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(148);
+    let create_version = version_id(149);
+    let noop_command_id = command_id(150);
+    let noop = PromptCommand::RenamePrompt(RenamePrompt {
+        prompt_id: prompt,
+        title: "Review code".into(),
+        expected_revision: 1,
+    });
+
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(151), create_prompt(prompt, create_version))
+        .expect("create prompt");
+    store
+        .execute(noop_command_id, noop.clone())
+        .expect("semantic no-op");
+    drop(store);
+
+    let forged_event = PromptEvent::PromptRenamed {
+        prompt_id: prompt,
+        title: "Review code".into(),
+        revision: 1,
+    };
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "INSERT INTO prompt_events(
+            prompt_event_id, command_id, prompt_id, event_type, occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            noop_command_id.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            forged_event.event_type(),
+            1_i64,
+            forged_event.encode().expect("canonical forged event"),
+        ],
+    )
+    .expect("insert forged no-op event");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute(noop_command_id, noop)
+        .expect_err("no-op replay must reject a nonzero effect count");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
 fn idempotent_chain_receipt_requires_correlated_chain_target() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
@@ -412,6 +621,8 @@ fn idempotent_chain_receipt_requires_correlated_chain_target() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_chain_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_chain_command_receipts(
             command_id, command_sha256, command_payload, chain_id,
@@ -710,12 +921,7 @@ fn corrupt_tag_projection_fails_closed() {
         "UPDATE prompt_tags SET tag = 'É' WHERE prompt_id = ?1 AND tag = 'rust'",
         [prompt.as_bytes().as_slice()],
     )
-    .expect("corrupt isolated fixture");
-    let store = open_store(&path);
-    let error = store
-        .get_prompt(prompt)
-        .expect_err("non-normalized tag must not be returned as valid data");
-    assert!(matches!(error, PromptStoreError::Corruption(_)));
+    .expect_err("SQLite must reject a tag outside the shared ASCII grammar");
 }
 
 #[test]
@@ -818,6 +1024,8 @@ fn projection_rejects_noncanonical_prompt_created_event() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("foreign keys");
     let receipt = PromptMutationReceipt {
@@ -1545,6 +1753,251 @@ fn chain_update_to_current_is_explicit_and_replayable() {
 }
 
 #[test]
+fn rebuild_chain_insert_uses_the_pinned_version_after_a_later_version() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(191);
+    let first = version_id(192);
+    let second = version_id(193);
+    let chain = chain_id(194);
+    let link = link_id(195);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(196), create_prompt(prompt, first))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(197), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(198),
+            insert_link(chain, link, prompt, None, None, 1),
+        )
+        .expect("insert link at the current version");
+    let stored_insert = stored_chain_command(&path, command_id(198));
+    assert_eq!(stored_insert.schema_version, 2);
+    assert_eq!(stored_insert.resolved_prompt_version_id, Some(first));
+    match stored_insert.command {
+        PromptChainCommand::InsertPromptChainLink(command) => {
+            assert_eq!(command.prompt_version_id, Some(first));
+        }
+        other => panic!("unexpected durable insert command: {other:?}"),
+    }
+    store
+        .execute(
+            command_id(199),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second,
+                variables: Vec::new(),
+                body: "later body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create later version");
+
+    let retry = store
+        .execute_chain(
+            command_id(198),
+            insert_link(chain, link, prompt, None, None, 1),
+        )
+        .expect("retry must use the originally resolved insert version");
+    assert_eq!(retry.revision, 2);
+
+    store
+        .rebuild_projection()
+        .expect("rebuild must use the durable link effect");
+    assert_eq!(
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        first
+    );
+}
+
+#[test]
+fn rebuild_chain_update_uses_the_version_pinned_by_the_effect() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(196);
+    let first = version_id(197);
+    let second = version_id(198);
+    let third = version_id(199);
+    let chain = chain_id(200);
+    let link = link_id(201);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(202), create_prompt(prompt, first))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(203), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(204),
+            insert_link(chain, link, prompt, Some(first), None, 1),
+        )
+        .expect("insert first version");
+    store
+        .execute(
+            command_id(205),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second,
+                variables: Vec::new(),
+                body: "second body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create second version");
+    store
+        .execute_chain(
+            command_id(206),
+            PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+                chain_id: chain,
+                link_id: link,
+                expected_revision: 2,
+            }),
+        )
+        .expect("pin second version");
+    let stored_update = stored_chain_command(&path, command_id(206));
+    assert_eq!(stored_update.schema_version, 2);
+    assert_eq!(stored_update.resolved_prompt_version_id, Some(second));
+    store
+        .execute(
+            command_id(207),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: third,
+                variables: Vec::new(),
+                body: "third body".into(),
+                created_at_ms: 3,
+                expected_revision: 2,
+            }),
+        )
+        .expect("create third version");
+
+    store
+        .execute_chain(
+            command_id(206),
+            PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+                chain_id: chain,
+                link_id: link,
+                expected_revision: 2,
+            }),
+        )
+        .expect("retry must use the originally resolved update version");
+
+    store
+        .rebuild_projection()
+        .expect("rebuild must use the durable update effect");
+    assert_eq!(
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        second
+    );
+}
+
+#[test]
+fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(202);
+    let first = version_id(203);
+    let second = version_id(204);
+    let chain = chain_id(205);
+    let first_link = link_id(206);
+    let second_link = link_id(207);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(208), create_prompt(prompt, first))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(209), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(210),
+            insert_link(chain, first_link, prompt, Some(first), None, 1),
+        )
+        .expect("insert first link");
+    store
+        .execute_chain(
+            command_id(211),
+            insert_link(chain, second_link, prompt, Some(first), None, 2),
+        )
+        .expect("insert second link");
+    store
+        .execute(
+            command_id(212),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second,
+                variables: Vec::new(),
+                body: "second body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create second version");
+
+    let immediate_successor = PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+        chain_id: chain,
+        link_id: first_link,
+        before_link_id: Some(second_link),
+        expected_revision: 3,
+    });
+    store
+        .execute_chain(command_id(213), immediate_successor.clone())
+        .expect("immediate-successor move is a semantic no-op");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute(
+        "UPDATE prompt_chain_links SET prompt_version_id = ?1 WHERE link_id = ?2",
+        rusqlite::params![
+            second.as_bytes().as_slice(),
+            first_link.as_bytes().as_slice()
+        ],
+    )
+    .expect("forge changed immediate-successor no-op state");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute_chain(command_id(213), immediate_successor)
+        .expect_err("immediate-successor no-op must prove unchanged state");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+
+    let end_move = PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+        chain_id: chain,
+        link_id: second_link,
+        before_link_id: None,
+        expected_revision: 3,
+    });
+    store
+        .execute_chain(command_id(214), end_move.clone())
+        .expect("end move is a semantic no-op");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("reopen isolated raw connection");
+    conn.execute(
+        "UPDATE prompt_chain_links SET prompt_version_id = ?1 WHERE link_id = ?2",
+        rusqlite::params![
+            second.as_bytes().as_slice(),
+            second_link.as_bytes().as_slice()
+        ],
+    )
+    .expect("forge changed end no-op state");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .execute_chain(command_id(214), end_move)
+        .expect_err("end no-op must prove unchanged state");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
 fn rebuild_repairs_missing_chain_projection_through_ordered_events() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
@@ -1600,7 +2053,7 @@ fn chain_link_create_rejects_stale_prompt_current_pointer() {
     let body = "later version";
     let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
     let conn = Connection::open(&path).expect("open isolated raw connection");
-    conn.execute_batch("DROP TRIGGER prompt_versions_advance_current_after_insert")
+    conn.execute_batch("DROP TRIGGER IF EXISTS prompt_versions_advance_current_after_insert")
         .expect("disable current-version trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_versions(
@@ -1655,7 +2108,7 @@ fn chain_link_update_rejects_stale_prompt_current_pointer() {
     let body = "later version";
     let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
     let conn = Connection::open(&path).expect("open isolated raw connection");
-    conn.execute_batch("DROP TRIGGER prompt_versions_advance_current_after_insert")
+    conn.execute_batch("DROP TRIGGER IF EXISTS prompt_versions_advance_current_after_insert")
         .expect("disable current-version trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_versions(
@@ -1847,7 +2300,7 @@ fn database_rejects_rollback_to_an_older_prompt_version() {
 }
 
 #[test]
-fn stale_current_version_after_direct_later_insert_advances_at_sqlite_boundary() {
+fn rebuild_rejects_direct_sql_orphan_version_and_preserves_projection() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
     let prompt = prompt_id(138);
@@ -1880,15 +2333,25 @@ fn stale_current_version_after_direct_later_insert_advances_at_sqlite_boundary()
             |row| row.get(0),
         )
         .expect("load current pointer after direct version insert");
-    assert_eq!(current_version_id, version_id(141).as_bytes().to_vec());
+    assert_eq!(current_version_id, first.as_bytes().to_vec());
     drop(conn);
 
-    let store = open_store(&path);
-    let current = store
-        .get_prompt(prompt)
-        .expect("current pointer must remain truthful")
-        .expect("prompt remains present");
-    assert_eq!(current.current_version_id, version_id(141));
+    let mut store = open_store(&path);
+    let error = store
+        .rebuild_projection()
+        .expect_err("orphan version must reject projection rebuild");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+    drop(store);
+    let conn = Connection::open(&path).expect("reopen database after rollback");
+    let (current_version_id, revision): (Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT current_version_id, revision FROM saved_prompts WHERE prompt_id = ?1",
+            [prompt.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prior projection must remain present after rollback");
+    assert_eq!(current_version_id, first.as_bytes().to_vec());
+    assert_eq!(revision, 1);
 }
 
 #[test]
@@ -2045,6 +2508,113 @@ fn schema_rejects_prompt_metadata_bounds_and_collection_overflow() {
         )
         .expect_err("SQLite must reject more than 32 version variables");
     assert!(variable_overflow.to_string().contains("variable"));
+}
+
+#[test]
+fn prompt_chain_links_have_a_bounded_sqlite_maximum() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(173);
+    let version = version_id(174);
+    let chain = chain_id(175);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(176), create_prompt(prompt, version))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(177), create_chain(chain))
+        .expect("create chain");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    for position in 0..2_000_i64 {
+        let link = PromptChainLinkId::new();
+        conn.execute(
+            "INSERT INTO prompt_chain_links(
+                link_id, chain_id, position, prompt_id, prompt_version_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                link.as_bytes().as_slice(),
+                chain.as_bytes().as_slice(),
+                position,
+                prompt.as_bytes().as_slice(),
+                version.as_bytes().as_slice(),
+            ],
+        )
+        .expect("fill chain to its bounded maximum");
+    }
+    let overflow = PromptChainLinkId::new();
+    let error = conn
+        .execute(
+            "INSERT INTO prompt_chain_links(
+                link_id, chain_id, position, prompt_id, prompt_version_id
+             ) VALUES (?1, ?2, 2000, ?3, ?4)",
+            rusqlite::params![
+                overflow.as_bytes().as_slice(),
+                chain.as_bytes().as_slice(),
+                prompt.as_bytes().as_slice(),
+                version.as_bytes().as_slice(),
+            ],
+        )
+        .expect_err("chain link count must be bounded before projection allocation");
+    assert!(error.to_string().contains("chain"));
+}
+
+#[test]
+fn prompt_rebuild_rejects_an_oversized_journal_before_allocating_rows() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(176);
+    let version = version_id(177);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(178), create_prompt(prompt, version))
+        .expect("create prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
+    let transaction = conn
+        .unchecked_transaction()
+        .expect("start oversized journal fixture transaction");
+    for index in 0..10_001_u64 {
+        let mut raw_command_id = [0_u8; 16];
+        raw_command_id[..8].copy_from_slice(&index.to_be_bytes());
+        transaction
+            .execute(
+                "INSERT INTO prompt_command_receipts(
+                    command_id, command_sha256, prompt_id, prompt_version_id,
+                    revision, receipt, created_at_ms
+                 ) VALUES (?1, zeroblob(32), zeroblob(16), zeroblob(16), 1, X'00', 1)",
+                [raw_command_id.as_slice()],
+            )
+            .expect("seed bounded journal fixture row");
+    }
+    transaction
+        .commit()
+        .expect("commit oversized journal fixture");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .rebuild_projection()
+        .expect_err("oversized journal must fail before projection allocation");
+    match error {
+        PromptStoreError::Corruption(message) => assert!(message.contains("10000")),
+        other => panic!("unexpected oversized journal error: {other:?}"),
+    }
+    drop(store);
+
+    let conn = Connection::open(&path).expect("reopen database after bounded-journal rollback");
+    let current_version_id: Vec<u8> = conn
+        .query_row(
+            "SELECT current_version_id FROM saved_prompts WHERE prompt_id = ?1",
+            [prompt.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("prior projection must remain present");
+    assert_eq!(current_version_id, version.as_bytes().to_vec());
 }
 
 #[test]
@@ -2207,6 +2777,8 @@ fn projection_rebuild_rejects_prompt_event_row_target_mismatch() {
         revision: 2,
     };
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_command_receipts(
             command_id, command_sha256, prompt_id, prompt_version_id, revision,
@@ -2471,6 +3043,8 @@ fn chain_projection_rebuild_rejects_row_target_mismatch() {
         revision: 2,
     };
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_chain_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_chain_command_receipts(
             command_id, command_sha256, chain_id, chain_link_id, revision,
@@ -2573,7 +3147,7 @@ fn chain_link_reads_move_and_remove_reject_stale_prompt_pointer() {
     let body = "later version";
     let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
     let conn = Connection::open(&path).expect("open isolated raw connection");
-    conn.execute_batch("DROP TRIGGER prompt_versions_advance_current_after_insert")
+    conn.execute_batch("DROP TRIGGER IF EXISTS prompt_versions_advance_current_after_insert")
         .expect("disable current-version trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_versions(
@@ -2643,6 +3217,8 @@ fn replay_rejects_archived_chain_create_event() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_chain_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     conn.execute(
         "INSERT INTO prompt_chain_command_receipts(
             command_id, command_sha256, chain_id, chain_link_id, revision,
@@ -2681,6 +3257,212 @@ fn replay_rejects_archived_chain_create_event() {
         store.rebuild_projection(),
         Err(PromptStoreError::Corruption(_))
     ));
+}
+
+#[test]
+fn sqlite_rejects_stale_current_pointer_on_saved_prompt_insert() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(230);
+    let first = version_id(231);
+    let second = version_id(232);
+    devmanager::kernel::KernelStore::open(&path).expect("apply prompt schema");
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let first_body = "first";
+    let second_body = "second";
+    let first_hash: [u8; 32] = Sha256::digest(first_body.as_bytes()).into();
+    let second_hash: [u8; 32] = Sha256::digest(second_body.as_bytes()).into();
+    let transaction = conn
+        .unchecked_transaction()
+        .expect("start deferred stale-pointer fixture");
+    for (version_id, version, body, body_hash) in [
+        (first, 1_i64, first_body, first_hash),
+        (second, 2_i64, second_body, second_hash),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO prompt_versions(
+                    prompt_version_id, prompt_id, version, body,
+                    body_sha256, created_at_ms, variables_sealed
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                rusqlite::params![
+                    version_id.as_bytes().as_slice(),
+                    prompt.as_bytes().as_slice(),
+                    version,
+                    body,
+                    body_hash.as_slice(),
+                    version,
+                ],
+            )
+            .expect("seed deferred version history");
+    }
+    let insert = transaction.execute(
+        "INSERT INTO saved_prompts(
+            prompt_id, title, description, current_version_id, revision,
+            created_at_ms, updated_at_ms, archived_at_ms
+         ) VALUES (?1, 'stale', NULL, ?2, 1, 1, 1, NULL)",
+        rusqlite::params![prompt.as_bytes().as_slice(), first.as_bytes().as_slice()],
+    );
+    assert!(
+        insert.is_err(),
+        "SQLite must reject a stale current pointer on insert"
+    );
+    transaction
+        .rollback()
+        .expect("rollback stale-pointer fixture");
+}
+
+#[test]
+fn sqlite_rejects_sparse_prompt_version_history_atomically() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(233);
+    let first = version_id(234);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(235), create_prompt(prompt, first))
+        .expect("create prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let body = "sparse";
+    let body_hash: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let sparse = version_id(236);
+    let insert = conn.execute(
+        "INSERT INTO prompt_versions(
+            prompt_version_id, prompt_id, version, body,
+            body_sha256, created_at_ms, variables_sealed
+         ) VALUES (?1, ?2, 3, ?3, ?4, 3, 1)",
+        rusqlite::params![
+            sparse.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            body,
+            body_hash.as_slice(),
+        ],
+    );
+    assert!(
+        insert.is_err(),
+        "SQLite must reject a sparse version number"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prompt_versions WHERE prompt_id = ?1",
+            [prompt.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("count prompt versions");
+    assert_eq!(
+        count, 1,
+        "failed sparse insert must leave history unchanged"
+    );
+}
+
+#[test]
+fn sqlite_rejects_orphan_prompt_receipt_atomically() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let _store = open_store(&path);
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let command = command_id(237);
+    let insert = conn.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, command_payload, prompt_id,
+            prompt_version_id, revision, receipt, created_at_ms
+         ) VALUES (?1, zeroblob(32), X'01', zeroblob(16), zeroblob(16),
+                   1, X'01', 1)",
+        [command.as_bytes().as_slice()],
+    );
+    assert!(
+        insert.is_err(),
+        "SQLite must reject a receipt without prompt lineage"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prompt_command_receipts WHERE command_id = ?1",
+            [command.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("count prompt receipts");
+    assert_eq!(count, 0, "failed orphan receipt insert must be atomic");
+}
+
+#[test]
+fn sqlite_rejects_orphan_chain_receipt_atomically() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let _store = open_store(&path);
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let command = command_id(238);
+    let insert = conn.execute(
+        "INSERT INTO prompt_chain_command_receipts(
+            command_id, command_sha256, command_payload, chain_id,
+            chain_link_id, revision, receipt, created_at_ms
+         ) VALUES (?1, zeroblob(32), X'01', zeroblob(16), NULL, 1, X'01', 1)",
+        [command.as_bytes().as_slice()],
+    );
+    assert!(
+        insert.is_err(),
+        "SQLite must reject a receipt without chain lineage"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prompt_chain_command_receipts WHERE command_id = ?1",
+            [command.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("count chain receipts");
+    assert_eq!(
+        count, 0,
+        "failed orphan chain receipt insert must be atomic"
+    );
+}
+
+#[test]
+fn projection_rebuild_rejects_oversized_command_payload_before_decode() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(239);
+    let version = version_id(240);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(241), create_prompt(prompt, version))
+        .expect("create prompt");
+    drop(store);
+
+    let command = command_id(242);
+    let payload = vec![0_u8; 512 * 1024 + 1];
+    let receipt = PromptMutationReceipt {
+        command_id: command,
+        prompt_id: prompt,
+        prompt_version_id: version,
+        revision: 1,
+    };
+    let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, command_payload, prompt_id,
+            prompt_version_id, revision, receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, 2)",
+        rusqlite::params![
+            command.as_bytes().as_slice(),
+            Sha256::digest(&payload).as_slice(),
+            payload,
+            prompt.as_bytes().as_slice(),
+            version.as_bytes().as_slice(),
+            receipt.encode().expect("encode receipt"),
+        ],
+    )
+    .expect("seed oversized command receipt");
+    drop(conn);
+
+    let mut store = open_store(&path);
+    let error = store
+        .rebuild_projection()
+        .expect_err("oversized command payload must fail closed");
+    assert!(
+        error.to_string().contains("exceeds maximum"),
+        "expected bounded-wire error, got {error:?}"
+    );
 }
 
 #[test]
@@ -2735,6 +3517,8 @@ fn replay_rejects_duplicate_chain_link_ids() {
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_chain_command_receipts_lineage_insert")
+        .expect("disable lineage trigger for corruption fixture");
     for (command, receipt) in [
         (create_command, create_receipt),
         (link_command, link_receipt),

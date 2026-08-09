@@ -426,30 +426,108 @@ ALTER TABLE prompt_command_receipts ADD COLUMN command_payload BLOB
   CHECK(command_payload IS NULL OR length(command_payload) > 0);\n\
 ALTER TABLE prompt_chain_command_receipts ADD COLUMN command_payload BLOB
   CHECK(command_payload IS NULL OR length(command_payload) > 0);\n\
-CREATE TRIGGER prompt_versions_advance_current_after_insert
-  AFTER INSERT ON prompt_versions
-  WHEN NEW.version = (
-    SELECT MAX(latest.version) FROM prompt_versions AS latest
-    WHERE latest.prompt_id = NEW.prompt_id
+-- V8 receipts/events predate durable command bytes. They cannot be replayed
+-- safely, so quarantine them in this migration transaction and block the
+-- prompt store until an operator supplies an exact reconstruction.
+CREATE TABLE prompt_lineage_quarantine (
+  quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind TEXT NOT NULL,
+  command_id BLOB NOT NULL CHECK(length(command_id) = 16),
+  event_id BLOB CHECK(event_id IS NULL OR length(event_id) = 16),
+  reason TEXT NOT NULL,
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
+  quarantined_at_ms INTEGER NOT NULL
+);\n\
+CREATE TABLE prompt_lineage_migration_state (
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+  blocked INTEGER NOT NULL CHECK(blocked IN (0, 1))
+);\n\
+INSERT INTO prompt_lineage_quarantine(
+  source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+)
+SELECT 'prompt_receipt', command_id, NULL,
+       'legacy prompt receipt has no canonical command bytes', command_sha256, 0
+FROM prompt_command_receipts
+WHERE command_payload IS NULL;\n\
+INSERT INTO prompt_lineage_quarantine(
+  source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+)
+SELECT 'prompt_chain_receipt', command_id, NULL,
+       'legacy prompt chain receipt has no canonical command bytes', command_sha256, 0
+FROM prompt_chain_command_receipts
+WHERE command_payload IS NULL;\n\
+INSERT INTO prompt_lineage_quarantine(
+  source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+)
+SELECT 'prompt_event', events.command_id, events.prompt_event_id,
+       CASE WHEN receipts.command_id IS NULL
+            THEN 'prompt event has no command receipt'
+            ELSE 'prompt event receipt has no canonical command bytes' END,
+       COALESCE(receipts.command_sha256, zeroblob(32)), 0
+FROM prompt_events AS events
+LEFT JOIN prompt_command_receipts AS receipts
+  ON receipts.command_id = events.command_id
+WHERE receipts.command_id IS NULL OR receipts.command_payload IS NULL;\n\
+INSERT INTO prompt_lineage_quarantine(
+  source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+)
+SELECT 'prompt_chain_event', events.command_id, events.prompt_chain_event_id,
+       CASE WHEN receipts.command_id IS NULL
+            THEN 'prompt chain event has no command receipt'
+            ELSE 'prompt chain event receipt has no canonical command bytes' END,
+       COALESCE(receipts.command_sha256, zeroblob(32)), 0
+FROM prompt_chain_events AS events
+LEFT JOIN prompt_chain_command_receipts AS receipts
+  ON receipts.command_id = events.command_id
+WHERE receipts.command_id IS NULL OR receipts.command_payload IS NULL;\n\
+INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
+VALUES (1, EXISTS(
+  SELECT 1 FROM prompt_lineage_quarantine
+));\n\
+CREATE TRIGGER saved_prompts_current_version_is_latest_insert
+  BEFORE INSERT ON saved_prompts
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM prompt_versions AS candidate
+    WHERE candidate.prompt_id = NEW.prompt_id
+      AND candidate.prompt_version_id = NEW.current_version_id
+      AND candidate.version = (
+        SELECT MAX(latest.version) FROM prompt_versions AS latest
+        WHERE latest.prompt_id = NEW.prompt_id
+      )
   )\n\
 BEGIN
-  UPDATE saved_prompts
-  SET current_version_id = NEW.prompt_version_id
-  WHERE prompt_id = NEW.prompt_id
-    AND current_version_id <> NEW.prompt_version_id;
+  SELECT RAISE(ABORT, 'current prompt version must be latest');
 END;\n\
-UPDATE saved_prompts
-SET current_version_id = (
-  SELECT latest.prompt_version_id
-  FROM prompt_versions AS latest
-  WHERE latest.prompt_id = saved_prompts.prompt_id
-  ORDER BY latest.version DESC
-  LIMIT 1
-)
-WHERE EXISTS (
-  SELECT 1 FROM prompt_versions
-  WHERE prompt_versions.prompt_id = saved_prompts.prompt_id
-);\n\
+CREATE TRIGGER prompt_versions_next_sequence_insert
+  BEFORE INSERT ON prompt_versions
+  WHEN NEW.version <> COALESCE((
+    SELECT MAX(existing.version) + 1
+    FROM prompt_versions AS existing
+    WHERE existing.prompt_id = NEW.prompt_id
+  ), 1)\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt version history must be contiguous');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_lineage_insert
+  BEFORE INSERT ON prompt_command_receipts
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM prompt_versions
+    WHERE prompt_version_id = NEW.prompt_version_id
+      AND prompt_id = NEW.prompt_id
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt lineage is missing');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_lineage_insert
+  BEFORE INSERT ON prompt_chain_command_receipts
+  WHEN NOT EXISTS (
+    SELECT 1 FROM prompt_chains WHERE chain_id = NEW.chain_id
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt lineage is missing');
+END;\n\
 CREATE TRIGGER saved_prompts_metadata_insert_bounds
   BEFORE INSERT ON saved_prompts
   WHEN typeof(NEW.title) <> 'text'
@@ -527,12 +605,45 @@ CREATE TRIGGER prompt_tags_max_count_update
 BEGIN
   SELECT RAISE(ABORT, 'prompt tag count exceeds maximum');
 END;\n\
+CREATE TRIGGER prompt_tags_ascii_lower_insert
+  BEFORE INSERT ON prompt_tags
+  WHEN typeof(NEW.tag) <> 'text'
+    OR length(NEW.tag) = 0
+    OR NEW.tag <> trim(NEW.tag)
+    OR NEW.tag <> lower(NEW.tag)
+    OR NEW.tag GLOB '*[^ -~]*'\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt tags must use printable lowercase ASCII');
+END;\n\
+CREATE TRIGGER prompt_tags_ascii_lower_update
+  BEFORE UPDATE OF tag ON prompt_tags
+  WHEN typeof(NEW.tag) <> 'text'
+    OR length(NEW.tag) = 0
+    OR NEW.tag <> trim(NEW.tag)
+    OR NEW.tag <> lower(NEW.tag)
+    OR NEW.tag GLOB '*[^ -~]*'\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt tags must use printable lowercase ASCII');
+END;\n\
 CREATE TRIGGER prompt_version_variables_max_count_insert
   BEFORE INSERT ON prompt_version_variables
   WHEN (SELECT COUNT(*) FROM prompt_version_variables
         WHERE prompt_version_id = NEW.prompt_version_id) >= 32\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt variable count exceeds maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_links_max_count_insert
+  BEFORE INSERT ON prompt_chain_links
+  WHEN (SELECT COUNT(*) FROM prompt_chain_links WHERE chain_id = NEW.chain_id) >= 2000\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain link count exceeds maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_links_max_count_update
+  BEFORE UPDATE OF chain_id ON prompt_chain_links
+  WHEN NEW.chain_id <> OLD.chain_id
+    AND (SELECT COUNT(*) FROM prompt_chain_links WHERE chain_id = NEW.chain_id) >= 2000\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain link count exceeds maximum');
 END;\n\
 ";
 
@@ -963,6 +1074,189 @@ mod tests {
             }
 
             {
+                if prior_version == 8 {
+                    use crate::domain::id::{
+                        CommandId, EventId, PromptChainId, PromptId, PromptVersionId,
+                    };
+                    use crate::prompts::{
+                        CreatePrompt, CreatePromptChain, PromptChain, PromptChainCommand,
+                        PromptChainEvent, PromptChainMutationReceipt, PromptCommand, PromptEvent,
+                        PromptMutationReceipt, PromptVersion, SavedPrompt,
+                    };
+                    let prompt_id = PromptId::new();
+                    let prompt_version_id = PromptVersionId::new();
+                    let prompt_command_id = CommandId::new();
+                    let prompt_version = PromptVersion::new(
+                        prompt_version_id,
+                        prompt_id,
+                        1,
+                        "legacy prompt body".into(),
+                        1,
+                    )
+                    .expect("legacy prompt version");
+                    let prompt = SavedPrompt {
+                        id: prompt_id,
+                        title: "Legacy prompt".into(),
+                        description: None,
+                        tags: Vec::new(),
+                        current_version_id: prompt_version_id,
+                        revision: 1,
+                        archived_at_ms: None,
+                    };
+                    let prompt_command = PromptCommand::CreatePrompt(CreatePrompt {
+                        prompt_id,
+                        prompt_version_id,
+                        title: prompt.title.clone(),
+                        description: None,
+                        tags: Vec::new(),
+                        variables: Vec::new(),
+                        body: prompt_version.body.clone(),
+                        created_at_ms: 1,
+                    });
+                    let prompt_receipt = PromptMutationReceipt {
+                        command_id: prompt_command_id,
+                        prompt_id,
+                        prompt_version_id,
+                        revision: 1,
+                    };
+                    let prompt_event = PromptEvent::PromptCreated {
+                        prompt: prompt.clone(),
+                        version: prompt_version.clone(),
+                    };
+                    let chain_id = PromptChainId::new();
+                    let chain_command_id = CommandId::new();
+                    let chain = PromptChain {
+                        id: chain_id,
+                        title: "Legacy chain".into(),
+                        description: None,
+                        revision: 1,
+                        archived_at_ms: None,
+                    };
+                    let chain_command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+                        chain_id,
+                        title: chain.title.clone(),
+                        description: None,
+                        created_at_ms: 1,
+                    });
+                    let chain_receipt = PromptChainMutationReceipt {
+                        command_id: chain_command_id,
+                        chain_id,
+                        link_id: None,
+                        revision: 1,
+                    };
+                    let chain_event = PromptChainEvent::PromptChainCreated { chain };
+                    let conn = Connection::open(&path).expect("open legacy lineage fixture");
+                    let transaction = conn
+                        .unchecked_transaction()
+                        .expect("start legacy prompt fixture transaction");
+                    transaction
+                        .execute(
+                            "INSERT INTO prompt_versions(
+                            prompt_version_id, prompt_id, version, body,
+                            body_sha256, created_at_ms, variables_sealed
+                         ) VALUES (?1, ?2, 1, ?3, ?4, 1, 1)",
+                            rusqlite::params![
+                                prompt_version_id.as_bytes().as_slice(),
+                                prompt_id.as_bytes().as_slice(),
+                                prompt_version.body,
+                                prompt_version.body_sha256.as_slice(),
+                            ],
+                        )
+                        .expect("seed legacy prompt version");
+                    transaction
+                        .execute(
+                            "INSERT INTO saved_prompts(
+                            prompt_id, title, description, current_version_id, revision,
+                            created_at_ms, updated_at_ms, archived_at_ms
+                         ) VALUES (?1, ?2, NULL, ?3, 1, 1, 1, NULL)",
+                            rusqlite::params![
+                                prompt_id.as_bytes().as_slice(),
+                                prompt.title,
+                                prompt_version_id.as_bytes().as_slice(),
+                            ],
+                        )
+                        .expect("seed legacy prompt projection");
+                    transaction.commit().expect("commit legacy prompt fixture");
+                    conn.execute(
+                        "INSERT INTO prompt_command_receipts(
+                            command_id, command_sha256, prompt_id, prompt_version_id,
+                            revision, receipt, created_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 1)",
+                        rusqlite::params![
+                            prompt_command_id.as_bytes().as_slice(),
+                            prompt_command.fingerprint().as_slice(),
+                            prompt_id.as_bytes().as_slice(),
+                            prompt_version_id.as_bytes().as_slice(),
+                            prompt_receipt.encode().expect("legacy prompt receipt"),
+                        ],
+                    )
+                    .expect("seed legacy prompt receipt");
+                    conn.execute(
+                        "INSERT INTO prompt_events(
+                            prompt_event_id, command_id, prompt_id, event_type,
+                            occurred_at_ms, payload
+                         ) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                        rusqlite::params![
+                            EventId::new().as_bytes().as_slice(),
+                            prompt_command_id.as_bytes().as_slice(),
+                            prompt_id.as_bytes().as_slice(),
+                            prompt_event.event_type(),
+                            prompt_event.encode().expect("legacy prompt event"),
+                        ],
+                    )
+                    .expect("seed legacy prompt event");
+                    conn.execute(
+                        "INSERT INTO prompt_chain_command_receipts(
+                            command_id, command_sha256, chain_id, chain_link_id,
+                            revision, receipt, created_at_ms
+                         ) VALUES (?1, ?2, ?3, NULL, 1, ?4, 1)",
+                        rusqlite::params![
+                            chain_command_id.as_bytes().as_slice(),
+                            chain_command.fingerprint().as_slice(),
+                            chain_id.as_bytes().as_slice(),
+                            chain_receipt.encode().expect("legacy chain receipt"),
+                        ],
+                    )
+                    .expect("seed legacy chain receipt");
+                    conn.execute(
+                        "INSERT INTO prompt_chain_events(
+                            prompt_chain_event_id, command_id, chain_id, event_type,
+                            occurred_at_ms, payload
+                         ) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                        rusqlite::params![
+                            EventId::new().as_bytes().as_slice(),
+                            chain_command_id.as_bytes().as_slice(),
+                            chain_id.as_bytes().as_slice(),
+                            chain_event.event_type(),
+                            chain_event.encode().expect("legacy chain event"),
+                        ],
+                    )
+                    .expect("seed legacy chain event");
+                    drop(conn);
+
+                    let error = crate::prompts::PromptStore::open(&path)
+                        .expect_err("legacy lineage must block the prompt store");
+                    assert!(error.to_string().contains("legacy prompt lineage"));
+                    let conn = Connection::open(&path).expect("reopen quarantined legacy schema");
+                    let quarantine_count: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM prompt_lineage_quarantine",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .expect("legacy rows must be quarantined");
+                    assert_eq!(quarantine_count, 4);
+                    let blocked: i64 = conn
+                        .query_row(
+                            "SELECT blocked FROM prompt_lineage_migration_state WHERE singleton_key = 1",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .expect("legacy lineage block marker");
+                    assert_eq!(blocked, 1);
+                    continue;
+                }
+
                 use crate::domain::id::{CommandId, PromptId, PromptVersionId};
                 use crate::prompts::{
                     ArchivePrompt, CreatePrompt, CreatePromptVersion, PromptCommand, PromptStore,
