@@ -589,7 +589,7 @@ struct PressOwner {
     focus_epoch: FocusEpoch,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct InteractionStateModel {
     state: InteractionState,
     focus_epoch: FocusEpoch,

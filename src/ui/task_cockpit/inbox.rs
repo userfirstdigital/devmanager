@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use crate::client::ClientModel;
 use crate::domain::id::TaskId;
+use crate::domain::task::TaskLifecycle;
 
 pub const MAX_TASK_LIST_ITEMS: usize = 5_000;
 pub const FIXED_VIRTUAL_OVERSCAN: usize = 32;
@@ -67,11 +68,16 @@ impl TaskList {
     /// Project only the ordered task identities from one immutable client
     /// model. Snapshot facts, host status, and subscriptions are not retained.
     pub fn from_model(model: &ClientModel) -> Self {
-        let total_count = model.tasks().len();
+        let total_count = model
+            .tasks()
+            .values()
+            .filter(|task| task.task.lifecycle != TaskLifecycle::Archived)
+            .count();
         let task_ids: Vec<TaskId> = model
             .tasks()
-            .keys()
-            .copied()
+            .iter()
+            .filter(|(_, task)| task.task.lifecycle != TaskLifecycle::Archived)
+            .map(|(task_id, _)| *task_id)
             .take(MAX_TASK_LIST_ITEMS)
             .collect();
         let overflow = (total_count > MAX_TASK_LIST_ITEMS).then_some(TaskListOverflow {

@@ -5,6 +5,9 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use devmanager::ui::shell::{
+    NavigationRejection, NavigationResult, PointerButton, ReleaseRejection, Shell, TerminalRelease,
+};
 use devmanager::ui::task_cockpit::{TaskList, VirtualWindow, MAX_TASK_LIST_ITEMS};
 use serde::Deserialize;
 use std::fs;
@@ -40,6 +43,10 @@ fn task_id_from_index(index: u32) -> TaskId {
 }
 
 fn task_item(id: TaskId, ordinal: usize) -> SnapshotItem {
+    task_item_with_lifecycle(id, ordinal, TaskLifecycle::Open)
+}
+
+fn task_item_with_lifecycle(id: TaskId, ordinal: usize, lifecycle: TaskLifecycle) -> SnapshotItem {
     SnapshotItem::Task(devmanager::domain::snapshot::TaskSnapshotItem {
         task: TaskFacts {
             id,
@@ -49,7 +56,7 @@ fn task_item(id: TaskId, ordinal: usize) -> SnapshotItem {
             project_id: ProjectId::from_bytes(fixed_uuid_v7(0x11)).expect("project"),
             workspace: WorkspaceRef::Main,
             assignment: TaskAssignment::LocalOwner,
-            lifecycle: TaskLifecycle::Open,
+            lifecycle,
             action_epoch: 0,
             revision: 1,
             created_at_ms: 1_725_000_000_000 + ordinal as i64,
@@ -121,6 +128,110 @@ fn model_from_ids(ids: &[TaskId]) -> ClientModel {
             .expect("empty related section");
     }
     builder.finish().expect("complete client model")
+}
+
+fn model_from_task_items(items: Vec<SnapshotItem>) -> ClientModel {
+    let snapshot_id = SnapshotId::from_bytes(fixed_uuid_v7(0x20)).expect("snapshot");
+    let mut builder = ClientModelBuilder::new();
+    builder
+        .ingest_page(SnapshotPage {
+            snapshot_id,
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        })
+        .expect("task page");
+    for section in [
+        SnapshotSection::AgentSessions,
+        SnapshotSection::Artifacts,
+        SnapshotSection::Resources,
+        SnapshotSection::Operations,
+    ] {
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id,
+                through_sequence: 1,
+                section,
+                after_item: None,
+                items: Vec::new(),
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("empty related section");
+    }
+    builder.finish().expect("complete client model")
+}
+
+#[test]
+fn navigation_mouse_down_commits_only_tasks_in_the_current_bounded_inbox() {
+    let first = task_id_from_index(1);
+    let second = task_id_from_index(2);
+    let foreign = task_id_from_index(3);
+    let model = model_from_ids(&[first, second]);
+    let inbox = TaskList::from_model(&model);
+    let mut shell = Shell::new(Some(first));
+    let epoch = shell.navigation_epoch();
+    let owner = shell
+        .terminal_mouse_down(7, first, PointerButton::Primary, epoch, Some(first))
+        .expect("selected task owns the pointer before navigation");
+
+    let navigation = shell.navigation_mouse_down(second, epoch, &inbox);
+    assert!(navigation.consumed());
+    assert_eq!(
+        navigation,
+        NavigationResult::Committed {
+            task_id: second,
+            navigation_epoch: epoch + 1,
+        }
+    );
+    assert_eq!(shell.selected_task(), Some(second));
+    assert!(shell.navigation_mouse_up());
+    assert_eq!(
+        shell.terminal_mouse_up(Some(owner)),
+        TerminalRelease::Rejected(ReleaseRejection::NoOwner)
+    );
+
+    let epoch = shell.navigation_epoch();
+    assert_eq!(
+        shell.navigation_mouse_down(foreign, epoch, &inbox),
+        NavigationResult::Rejected {
+            reason: NavigationRejection::TaskNotInInbox,
+        }
+    );
+    assert_eq!(shell.selected_task(), Some(second));
+    assert_eq!(shell.navigation_epoch(), epoch);
+    assert_eq!(
+        shell.navigation_mouse_down(first, epoch - 1, &inbox),
+        NavigationResult::Rejected {
+            reason: NavigationRejection::StaleEpoch,
+        }
+    );
+}
+
+#[test]
+fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
+    let open = task_id_from_index(11);
+    let archived = task_id_from_index(12);
+    let model = model_from_task_items(vec![
+        task_item_with_lifecycle(open, 0, TaskLifecycle::Open),
+        task_item_with_lifecycle(archived, 1, TaskLifecycle::Archived),
+    ]);
+    let inbox = TaskList::from_model(&model);
+
+    assert_eq!(inbox.task_ids(), &[open]);
+    let mut shell = Shell::new(Some(open));
+    let epoch = shell.navigation_epoch();
+    assert_eq!(
+        shell.navigation_mouse_down(archived, epoch, &inbox),
+        NavigationResult::Rejected {
+            reason: NavigationRejection::TaskNotInInbox,
+        }
+    );
+    assert_eq!(shell.selected_task(), Some(open));
+    assert_eq!(shell.navigation_epoch(), epoch);
 }
 
 #[test]

@@ -15,6 +15,9 @@ use devmanager::ui::components::text_field::{
     TextField, TextFieldError, TextFieldKey, TextFieldLimits,
 };
 use devmanager::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
+use static_assertions::assert_not_impl_any;
+
+assert_not_impl_any!(InteractionStateModel: Clone);
 #[test]
 fn interaction_transition_table_rejects_invalid_combinations_and_fails_closed() {
     let state = InteractionState::default()

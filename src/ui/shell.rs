@@ -3,7 +3,10 @@
 //! The shell owns only local interaction state. It never emits terminal input
 //! and never calls a host, terminal, provider, or component callback.
 
+use std::sync::Arc;
+
 use crate::domain::id::TaskId;
+use crate::ui::task_cockpit::TaskList;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerButton {
@@ -22,6 +25,7 @@ pub enum TransientPriority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationRejection {
     StaleEpoch,
+    TaskNotInInbox,
     EpochExhausted,
 }
 
@@ -45,6 +49,7 @@ impl NavigationResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalPressRejection {
+    StaleEpoch,
     TaskNotSelected,
     PointerAlreadyOwned,
     GenerationExhausted,
@@ -78,23 +83,58 @@ pub enum InvalidationReason {
     Resync,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct PointerOwner {
-    pub pointer_id: u64,
-    pub task_id: TaskId,
-    pub generation: u64,
-    pub button: PointerButton,
-    pub navigation_epoch: u64,
+    identity: Arc<()>,
+    pointer_id: u64,
+    task_id: TaskId,
+    generation: u64,
+    button: PointerButton,
+    navigation_epoch: u64,
+}
+
+impl PartialEq for PointerOwner {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+            && self.pointer_id == other.pointer_id
+            && self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.button == other.button
+            && self.navigation_epoch == other.navigation_epoch
+    }
+}
+
+impl Eq for PointerOwner {}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PointerCapture {
+    identity: Arc<()>,
+    pointer_id: u64,
+    task_id: TaskId,
+    generation: u64,
+    button: PointerButton,
+    navigation_epoch: u64,
+}
+
+impl PointerCapture {
+    fn matches(&self, release: &PointerOwner) -> bool {
+        Arc::ptr_eq(&self.identity, &release.identity)
+            && self.pointer_id == release.pointer_id
+            && self.task_id == release.task_id
+            && self.generation == release.generation
+            && self.button == release.button
+            && self.navigation_epoch == release.navigation_epoch
+    }
 }
 
 pub type TerminalPointerOwner = PointerOwner;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Shell {
     selected_task: Option<TaskId>,
     navigation_epoch: u64,
     transient_priority: Option<TransientPriority>,
-    pointer_owner: Option<PointerOwner>,
+    pointer_owner: Option<PointerCapture>,
     generation: u64,
 }
 
@@ -127,21 +167,25 @@ impl Shell {
         self.transient_priority = priority;
     }
 
-    pub fn pointer_owner(&self) -> Option<PointerOwner> {
-        self.pointer_owner
-    }
-
     /// Commit selection only when the caller's navigation epoch is current.
-    /// A navigation mouse-down is always consumed, including a stale one.
+    /// A navigation mouse-down is always consumed, including a stale or
+    /// out-of-projection one.
     pub fn navigation_mouse_down(
         &mut self,
         task_id: TaskId,
         expected_epoch: u64,
+        task_inbox: &TaskList,
     ) -> NavigationResult {
         if expected_epoch != self.navigation_epoch {
             self.invalidate_pointer_owner();
             return NavigationResult::Rejected {
                 reason: NavigationRejection::StaleEpoch,
+            };
+        }
+        if !task_inbox.task_ids().contains(&task_id) {
+            self.invalidate_pointer_owner();
+            return NavigationResult::Rejected {
+                reason: NavigationRejection::TaskNotInInbox,
             };
         }
 
@@ -170,42 +214,62 @@ impl Shell {
         pointer_id: u64,
         task_id: TaskId,
         button: PointerButton,
+        expected_navigation_epoch: u64,
+        projected_selected_task: Option<TaskId>,
     ) -> Result<PointerOwner, TerminalPressRejection> {
+        if expected_navigation_epoch != self.navigation_epoch {
+            return Err(TerminalPressRejection::StaleEpoch);
+        }
+        if projected_selected_task != self.selected_task || projected_selected_task != Some(task_id)
+        {
+            return Err(TerminalPressRejection::TaskNotSelected);
+        }
         if self.pointer_owner.is_some() {
             return Err(TerminalPressRejection::PointerAlreadyOwned);
-        }
-        if self.selected_task != Some(task_id) {
-            return Err(TerminalPressRejection::TaskNotSelected);
         }
         let Some(generation) = self.generation.checked_add(1) else {
             return Err(TerminalPressRejection::GenerationExhausted);
         };
         self.generation = generation;
-        let owner = PointerOwner {
+        let identity = Arc::new(());
+        let capture = PointerCapture {
+            identity: Arc::clone(&identity),
             pointer_id,
             task_id,
             generation,
             button,
-            navigation_epoch: self.navigation_epoch,
+            navigation_epoch: expected_navigation_epoch,
         };
-        self.pointer_owner = Some(owner);
+        let owner = PointerOwner {
+            identity,
+            pointer_id,
+            task_id,
+            generation,
+            button,
+            navigation_epoch: expected_navigation_epoch,
+        };
+        self.pointer_owner = Some(capture);
         Ok(owner)
     }
 
-    /// Consume every terminal mouse-up; only an exact current owner is
-    /// authorized, and all other releases are rejected without synthesis.
-    pub fn terminal_mouse_up(&mut self, release: PointerOwner) -> TerminalRelease {
-        match self.pointer_owner.take() {
-            Some(owner) if owner == release => TerminalRelease::Authorized,
-            Some(_) => TerminalRelease::Rejected(ReleaseRejection::MismatchedOwner),
-            None => TerminalRelease::Rejected(ReleaseRejection::NoOwner),
+    /// Consume every terminal mouse-up; only an exact host-issued current
+    /// owner token is authorized, and all other releases are rejected without
+    /// synthesis. The token is moved in so it cannot be replayed.
+    pub fn terminal_mouse_up(&mut self, release: Option<PointerOwner>) -> TerminalRelease {
+        match (self.pointer_owner.take(), release) {
+            (Some(owner), Some(release)) if owner.matches(&release) => TerminalRelease::Authorized,
+            (Some(_), _) => TerminalRelease::Rejected(ReleaseRejection::MismatchedOwner),
+            (None, _) => TerminalRelease::Rejected(ReleaseRejection::NoOwner),
         }
     }
 
     /// Consume a view/focus lifecycle boundary and invalidate the owner.
     pub fn invalidate(&mut self, _reason: InvalidationReason) -> bool {
         self.invalidate_pointer_owner();
-        self.navigation_epoch = self.navigation_epoch.saturating_add(1);
+        let Some(next_epoch) = self.navigation_epoch.checked_add(1) else {
+            return false;
+        };
+        self.navigation_epoch = next_epoch;
         true
     }
 
