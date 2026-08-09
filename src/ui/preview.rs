@@ -89,6 +89,124 @@ pub struct PreviewCaptureFixture {
 pub struct PreviewRootFixture {
     pub kind: String,
     pub label: String,
+    #[serde(default)]
+    pub gallery: Option<ComponentGalleryFixture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryTheme {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryDensity {
+    Compact,
+    Comfortable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryState {
+    Default,
+    Hover,
+    Pressed,
+    Focused,
+    Disabled,
+    Loading,
+    Destructive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentGallerySamples {
+    pub long_text: String,
+    pub unicode: String,
+    pub missing: String,
+    pub error: String,
+    pub loading: String,
+    pub empty: String,
+    pub overflow: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentGalleryFixture {
+    pub themes: Vec<GalleryTheme>,
+    pub densities: Vec<GalleryDensity>,
+    pub scales: Vec<u16>,
+    pub states: Vec<GalleryState>,
+    pub samples: ComponentGallerySamples,
+}
+
+impl ComponentGalleryFixture {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.themes.len() != 2
+            || !self.themes.contains(&GalleryTheme::Dark)
+            || !self.themes.contains(&GalleryTheme::Light)
+        {
+            return Err("component gallery must cover dark and light themes".to_string());
+        }
+        if self.densities.len() != 2
+            || !self.densities.contains(&GalleryDensity::Compact)
+            || !self.densities.contains(&GalleryDensity::Comfortable)
+        {
+            return Err("component gallery must cover compact and comfortable density".to_string());
+        }
+        if self.scales != [100, 125, 150, 200] {
+            return Err(
+                "component gallery must cover 100, 125, 150, and 200 percent scales".to_string(),
+            );
+        }
+        let required_states = [
+            GalleryState::Default,
+            GalleryState::Hover,
+            GalleryState::Pressed,
+            GalleryState::Focused,
+            GalleryState::Disabled,
+            GalleryState::Loading,
+            GalleryState::Destructive,
+        ];
+        if self.states.len() != required_states.len()
+            || required_states
+                .iter()
+                .any(|state| !self.states.contains(state))
+        {
+            return Err(
+                "component gallery must cover every reusable interaction state".to_string(),
+            );
+        }
+        for (name, value) in [
+            ("long_text", &self.samples.long_text),
+            ("unicode", &self.samples.unicode),
+            ("missing", &self.samples.missing),
+            ("error", &self.samples.error),
+            ("loading", &self.samples.loading),
+            ("empty", &self.samples.empty),
+            ("overflow", &self.samples.overflow),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("component gallery sample {name} must not be blank"));
+            }
+            if value.chars().count() > 4096 || value.len() > 16384 {
+                return Err(format!("component gallery sample {name} is oversized"));
+            }
+        }
+        if self.samples.long_text.chars().count() <= 256 {
+            return Err("component gallery long_text must exercise overflow wrapping".to_string());
+        }
+        if !self
+            .samples
+            .unicode
+            .chars()
+            .any(|character| !character.is_ascii())
+        {
+            return Err("component gallery unicode sample must contain non-ASCII text".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +432,7 @@ pub struct PreviewRootSnapshot {
     pub fixture_id: String,
     pub title: String,
     pub body: String,
+    pub component_gallery: Option<ComponentGalleryFixture>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,10 +509,42 @@ impl PreviewApplication {
             });
         }
 
+        let component_gallery = match (fixture.root.kind.as_str(), fixture.root.gallery) {
+            ("minimal", None) => None,
+            ("minimal", Some(_)) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "minimal preview roots cannot carry a component gallery".into(),
+                });
+            }
+            ("component_gallery", Some(gallery)) => {
+                gallery
+                    .validate()
+                    .map_err(|message| PreviewError::MalformedFixture {
+                        path: request.fixture_path.clone(),
+                        message,
+                    })?;
+                Some(gallery)
+            }
+            ("component_gallery", None) => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "component gallery roots must carry gallery data".into(),
+                });
+            }
+            _ => {
+                return Err(PreviewError::MalformedFixture {
+                    path: request.fixture_path,
+                    message: "fixture root kind is unsupported".into(),
+                });
+            }
+        };
+
         let root_snapshot = PreviewRootSnapshot {
             fixture_id: fixture.id,
             body: format!("{}: {}", fixture.root.label, fixture.title),
             title: fixture.title,
+            component_gallery,
         };
         Ok(Self {
             request,
@@ -418,6 +569,10 @@ impl PreviewApplication {
 
     pub fn capture_border(&self) -> PreviewCaptureSetting {
         self.capture.border
+    }
+
+    pub fn component_gallery(&self) -> Option<&ComponentGalleryFixture> {
+        self.root_snapshot.component_gallery.as_ref()
     }
 
     pub fn output_metadata(&self) -> PreviewOutputMetadata {
