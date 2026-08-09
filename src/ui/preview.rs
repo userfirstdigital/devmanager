@@ -1,6 +1,9 @@
 //! Deterministic, isolated native UI preview contracts.
 
-use gpui::{div, Action, Context, IntoElement, ParentElement, Render, Window};
+use gpui::{
+    div, Action, Context, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    Window,
+};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::error::Error;
@@ -20,6 +23,39 @@ const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
 
 gpui::actions!(devmanager_next, [PreviewDismiss]);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "host.actions")]
+pub struct HostActions;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "host.status")]
+pub struct HostStatus;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.list")]
+pub struct TaskList;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.show")]
+pub struct TaskShow;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.create")]
+pub struct TaskCreate;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "task.rename")]
+pub struct TaskRename;
+
+const TASK_COCKPIT_ACTION_NAMES: [&str; 6] = [
+    action::ACTION_HOST_ACTIONS,
+    action::ACTION_HOST_STATUS,
+    action::ACTION_TASK_LIST,
+    action::ACTION_TASK_SHOW,
+    action::ACTION_TASK_CREATE,
+    action::ACTION_TASK_RENAME,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,11 +117,19 @@ impl PreviewPathPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewRequest {
-    pub fixture_path: PathBuf,
-    pub output_path: PathBuf,
+    fixture_path: PathBuf,
+    output_path: PathBuf,
 }
 
 impl PreviewRequest {
+    pub fn fixture_path(&self) -> &Path {
+        &self.fixture_path
+    }
+
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
+    }
+
     pub fn validate(
         fixture_path: impl AsRef<Path>,
         output_path: impl AsRef<Path>,
@@ -282,7 +326,12 @@ pub struct PreviewApplication {
 }
 
 impl PreviewApplication {
-    pub fn load(request: PreviewRequest) -> Result<Self, PreviewError> {
+    pub fn load(request: PreviewRequest, policy: &PreviewPathPolicy) -> Result<Self, PreviewError> {
+        let request = PreviewRequest::validate(
+            request.fixture_path.clone(),
+            request.output_path.clone(),
+            policy,
+        )?;
         let bytes = read_fixture_bytes(&request.fixture_path)?;
         let fixture: PreviewFixture =
             serde_json::from_slice(&bytes).map_err(|error| PreviewError::MalformedFixture {
@@ -370,8 +419,21 @@ impl PreviewApplication {
                 let _ = cx.text_system().resolve_font(&font);
                 true
             };
-            let action_name = PreviewDismiss::name_for_type();
-            let actions_registered = cx.all_action_names().contains(&action_name);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-alt-1", HostActions, None),
+                KeyBinding::new("ctrl-alt-2", HostStatus, None),
+                KeyBinding::new("ctrl-alt-3", TaskList, None),
+                KeyBinding::new("ctrl-alt-4", TaskShow, None),
+                KeyBinding::new("ctrl-alt-5", TaskCreate, None),
+                KeyBinding::new("ctrl-alt-6", TaskRename, None),
+                KeyBinding::new("escape", PreviewDismiss, None),
+            ]);
+            let actions_registered = TASK_COCKPIT_ACTION_NAMES
+                .iter()
+                .all(|name| cx.all_action_names().contains(name))
+                && cx
+                    .all_action_names()
+                    .contains(&PreviewDismiss::name_for_type());
             let root = PreviewRoot::new(root_snapshot);
             let _root_element = root.element();
             let after = crate::ui::component_init_count();
@@ -414,7 +476,9 @@ impl PreviewRoot {
     }
 
     pub fn element(&self) -> impl IntoElement {
-        div().child(self.snapshot.body.clone())
+        div()
+            .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
+            .child(self.snapshot.body.clone())
     }
 }
 
@@ -430,7 +494,7 @@ where
     S: Into<OsString>,
 {
     let request = parse_preview_args(args, policy)?;
-    let preview = PreviewApplication::load(request)?;
+    let preview = PreviewApplication::load(request, policy)?;
     preview.render_to_output()
 }
 
@@ -660,7 +724,7 @@ impl Display for PreviewError {
                 f.write_str("headless preview initialization did not complete")
             }
             Self::HeadlessRenderingUnsupported => f.write_str(
-                "headless PNG rendering is unsupported until Windows GPUI capture is proven",
+                "GPUI 0.2.2 exposes no isolated offscreen pixel readback or PNG encoder; Windows rendering ends in a private swap chain",
             ),
         }
     }

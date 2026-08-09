@@ -1,10 +1,12 @@
 use devmanager::ui::preview::{
-    parse_preview_args, PreviewApplication, PreviewError, PreviewOutputCapability,
+    parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
     PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
 };
 use devmanager::ui::{self, PreviewInitReport};
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Mutex;
 use tempfile::{tempdir, TempDir};
 
@@ -68,7 +70,7 @@ fn component_init_registers_devmanager_resources_once() {
         &policy,
     )
     .expect("checked-in fixture should be accepted");
-    let preview = PreviewApplication::load(request).expect("fixture should load");
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
 
     let before = ui::component_init_count();
     let report: PreviewInitReport = preview
@@ -92,8 +94,8 @@ fn component_init_registers_devmanager_resources_once() {
 fn preview_output_metadata_is_deterministic_and_refuses_fake_png() {
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy);
-    let output = request.output_path.clone();
-    let preview = PreviewApplication::load(request).expect("fixture should load");
+    let output = request.output_path().to_path_buf();
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
 
     let first = preview.output_metadata();
     let second = preview.output_metadata();
@@ -135,7 +137,7 @@ fn preview_fixture_rejects_whitespace_only_required_fields() {
     )
     .expect("path validation should precede fixture parsing");
 
-    let error = PreviewApplication::load(request)
+    let error = PreviewApplication::load(request, &policy)
         .expect_err("whitespace-only fixture fields must be rejected");
     assert!(matches!(error, PreviewError::MalformedFixture { .. }));
 }
@@ -143,7 +145,7 @@ fn preview_fixture_rejects_whitespace_only_required_fields() {
 #[test]
 fn preview_root_projection_is_deterministic() {
     let (_root, policy) = temporary_policy();
-    let first = PreviewApplication::load(valid_request(&policy)).expect("first fixture");
+    let first = PreviewApplication::load(valid_request(&policy), &policy).expect("first fixture");
 
     let fixture = write_fixture(&policy, "valid-again.json", FIXTURE_JSON);
     let second_request = PreviewRequest::validate(
@@ -152,7 +154,7 @@ fn preview_root_projection_is_deterministic() {
         &policy,
     )
     .expect("second request");
-    let second = PreviewApplication::load(second_request).expect("second fixture");
+    let second = PreviewApplication::load(second_request, &policy).expect("second fixture");
 
     assert_eq!(first.root_snapshot(), second.root_snapshot());
     assert_eq!(first.resources(), second.resources());
@@ -168,11 +170,11 @@ fn preview_validation_accepts_only_checked_fixture_and_png_roots() {
     let request = valid_request(&policy);
 
     assert_eq!(
-        request.fixture_path,
+        request.fixture_path(),
         policy.fixture_root().join("valid.json")
     );
     assert_eq!(
-        request.output_path,
+        request.output_path(),
         policy.output_root().join("preview.png")
     );
 }
@@ -219,8 +221,8 @@ fn preview_validation_rejects_missing_oversized_and_malformed_fixtures() {
         &policy,
     )
     .expect("path validation should precede parsing");
-    let malformed_error =
-        PreviewApplication::load(malformed_request).expect_err("malformed fixture must fail");
+    let malformed_error = PreviewApplication::load(malformed_request, &policy)
+        .expect_err("malformed fixture must fail");
     assert!(matches!(
         malformed_error,
         PreviewError::MalformedFixture { .. }
@@ -274,12 +276,84 @@ fn preview_validation_rejects_existing_sensitive_output() {
 fn preview_execution_returns_explicit_headless_support_error_without_writing_output() {
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy);
-    let output = request.output_path.clone();
-    let preview = PreviewApplication::load(request).expect("fixture should load");
+    let output = request.output_path().to_path_buf();
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
 
     let error = preview
         .render_to_output()
         .expect_err("unproven Windows headless PNG rendering must be visible");
     assert!(matches!(error, PreviewError::HeadlessRenderingUnsupported));
     assert!(!output.exists());
+}
+
+#[test]
+#[ignore = "GPUI 0.2.2 has no official isolated pixel readback or PNG encoder"]
+fn preview_renders_a_concrete_png_from_the_native_gpui_root() {
+    let (_root, policy) = temporary_policy();
+    let request = valid_request(&policy);
+    let output = request.output_path().to_path_buf();
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
+
+    preview
+        .render_to_output()
+        .expect("the native GPUI root must render to the requested PNG");
+
+    let bytes = fs::read(&output).expect("preview PNG should be written");
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(&bytes[12..16], b"IHDR");
+    assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 320);
+    assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 160);
+}
+
+#[test]
+fn preview_request_construction_rejects_production_paths_before_load() {
+    let (root, policy) = temporary_policy();
+    let production_root = root.path().join("production");
+    fs::create_dir_all(&production_root).expect("production fixture directory");
+    let production_fixture = production_root.join("session.json");
+    fs::write(&production_fixture, FIXTURE_JSON).expect("production fixture");
+
+    let error = PreviewRequest::validate(
+        production_fixture,
+        policy.output_root().join("bypass.png"),
+        &policy,
+    )
+    .expect_err("PreviewRequest construction must not bypass isolation");
+    assert!(matches!(error, PreviewError::OutsideApprovedRoot { .. }));
+}
+
+#[test]
+fn task_cockpit_actions_are_registered_and_dispatch_through_gpui() {
+    let dispatched = Rc::new(Cell::new(false));
+    let dispatched_in_app = Rc::clone(&dispatched);
+    let application = gpui::Application::headless();
+
+    application.run(move |cx| {
+        let expected = [
+            "host.actions",
+            "host.status",
+            "task.list",
+            "task.show",
+            "task.create",
+            "task.rename",
+        ];
+        for action_name in expected {
+            assert!(
+                cx.all_action_names().contains(&action_name),
+                "{action_name} must be an actual GPUI action registration"
+            );
+            let action = cx
+                .build_action(action_name, None)
+                .expect("registered actions must be dynamically buildable");
+            cx.dispatch_action(action.as_ref());
+        }
+
+        cx.on_action::<PreviewDismiss>(move |_, _| dispatched_in_app.set(true));
+        cx.dispatch_action(&PreviewDismiss);
+        assert!(
+            dispatched.get(),
+            "GPUI must dispatch the retained PreviewDismiss action"
+        );
+        cx.quit();
+    });
 }
