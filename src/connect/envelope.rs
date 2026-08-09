@@ -15,6 +15,7 @@ use uuid::{Uuid, Variant};
 use crate::domain::id::{OperationId, RequestId};
 use crate::domain::snapshot::{MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::protocol::{
+    ChunkError, ChunkLimitField as ProtocolChunkLimitField, ChunkLimits, ChunkLimitsError,
     FrameLimits, MessagePackCodec, MessagePackError, ProtocolVersion, MAX_PHYSICAL_FRAME_BYTES,
     MAX_REASSEMBLED_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -460,40 +461,77 @@ impl ConnectLimits {
         cumulative_before: u64,
         chunk: &[u8],
     ) -> Result<u64, ConnectLimitError> {
-        if chunk.is_empty() {
-            return Err(ConnectLimitError::EmptyChunk);
-        }
-        let chunk_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-        if chunk_bytes > u64::from(self.max_chunk_bytes) {
-            return Err(ConnectLimitError::ChunkExceeded {
-                declared: chunk_bytes,
-                maximum: self.max_chunk_bytes,
-            });
-        }
-        let cumulative = cumulative_before
-            .checked_add(chunk_bytes)
-            .ok_or(ConnectLimitError::CumulativeOverflow)?;
-        if cumulative > self.max_cumulative_bytes {
-            return Err(ConnectLimitError::CumulativeExceeded {
-                declared: cumulative,
-                maximum: self.max_cumulative_bytes,
-            });
-        }
-        Ok(cumulative)
+        self.canonical_chunk_limits()?
+            .validate_chunk(cumulative_before, chunk)
+            .map_err(map_protocol_chunk_error)
     }
 
     pub fn validate_cursor_len(self, length: usize) -> Result<(), ConnectLimitError> {
-        let declared = u64::try_from(length).unwrap_or(u64::MAX);
-        if declared == 0 {
-            return Err(ConnectLimitError::CursorEmpty);
+        self.canonical_chunk_limits()?
+            .validate_cursor_len(length)
+            .map_err(map_protocol_chunk_error)
+    }
+
+    pub(crate) fn canonical_chunk_limits(self) -> Result<ChunkLimits, ConnectLimitError> {
+        ChunkLimits::try_new(
+            self.max_chunk_bytes,
+            self.max_cumulative_bytes,
+            self.max_cursor_bytes,
+        )
+        .map_err(map_protocol_chunk_limits_error)
+    }
+}
+
+fn map_protocol_chunk_limits_error(error: ChunkLimitsError) -> ConnectLimitError {
+    match error {
+        ChunkLimitsError::Zero { field } => ConnectLimitError::Zero {
+            field: match field {
+                ProtocolChunkLimitField::ChunkBytes => ConnectLimitField::ChunkBytes,
+                ProtocolChunkLimitField::CumulativeBytes => ConnectLimitField::CumulativeBytes,
+                ProtocolChunkLimitField::CursorBytes => ConnectLimitField::CursorBytes,
+            },
+        },
+        ChunkLimitsError::ExceedsHardMaximum {
+            field,
+            declared,
+            maximum,
+        } => ConnectLimitError::ExceedsHardMaximum {
+            field: match field {
+                ProtocolChunkLimitField::ChunkBytes => ConnectLimitField::ChunkBytes,
+                ProtocolChunkLimitField::CumulativeBytes => ConnectLimitField::CumulativeBytes,
+                ProtocolChunkLimitField::CursorBytes => ConnectLimitField::CursorBytes,
+            },
+            declared,
+            maximum,
+        },
+        ChunkLimitsError::ChunkExceedsCumulative { chunk, cumulative } => {
+            ConnectLimitError::CumulativeBelowChunk { cumulative, chunk }
         }
-        if declared > u64::from(self.max_cursor_bytes) {
-            return Err(ConnectLimitError::CursorExceeded {
-                declared,
-                maximum: self.max_cursor_bytes,
-            });
+    }
+}
+
+fn map_protocol_chunk_error(error: ChunkError) -> ConnectLimitError {
+    match error {
+        ChunkError::Limits(error) => map_protocol_chunk_limits_error(error),
+        ChunkError::EmptyPayload => ConnectLimitError::EmptyChunk,
+        ChunkError::ChunkTooLarge { declared, maximum } => {
+            ConnectLimitError::ChunkExceeded { declared, maximum }
         }
-        Ok(())
+        ChunkError::CumulativeOverflow => ConnectLimitError::CumulativeOverflow,
+        ChunkError::CumulativeTooLarge { declared, maximum } => {
+            ConnectLimitError::CumulativeExceeded { declared, maximum }
+        }
+        ChunkError::CursorEmpty => ConnectLimitError::CursorEmpty,
+        ChunkError::CursorTooLarge { declared, maximum } => {
+            ConnectLimitError::CursorExceeded { declared, maximum }
+        }
+        ChunkError::TransferIdMismatch
+        | ChunkError::IndexMismatch { .. }
+        | ChunkError::ResumeCursorMismatch
+        | ChunkError::CumulativeHashMismatch
+        | ChunkError::AlreadyComplete
+        | ChunkError::FinalRequired
+        | ChunkError::Poisoned => ConnectLimitError::EmptyChunk,
     }
 }
 
@@ -744,6 +782,7 @@ impl ConnectEnvelope {
         privacy_class: ConnectPrivacyClass,
         payload: ConnectPayload,
     ) -> Result<Self, EnvelopeError> {
+        let payload = payload.canonicalized_for_wire()?;
         let envelope = Self {
             version,
             binding,
@@ -825,10 +864,12 @@ impl ConnectEnvelope {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, EnvelopeError> {
-        self.validate()?;
-        let codec = MessagePackCodec::from_limits(self.limits.frame_limits())
+        let mut canonical = self.clone();
+        canonical.payload = canonical.payload.canonicalized_for_wire()?;
+        canonical.validate()?;
+        let codec = MessagePackCodec::from_limits(canonical.limits.frame_limits())
             .map_err(|_| EnvelopeError::Encode)?;
-        codec.encode(self).map_err(EnvelopeError::MessagePack)
+        codec.encode(&canonical).map_err(EnvelopeError::MessagePack)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvelopeError> {

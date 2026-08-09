@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::command::CommandReceipt;
 use crate::domain::id::{SnapshotId, TaskId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
-use crate::domain::snapshot::{EventPage, PageLimits, SnapshotPage, SnapshotSection};
+use crate::domain::snapshot::{
+    canonical_event_page_size, canonical_snapshot_page_size, EventPage, PageLimits, SnapshotPage,
+    SnapshotSection,
+};
 use crate::protocol::CapabilitySet;
 
 use super::envelope::{ConnectEnvelope, EnvelopeError};
@@ -152,6 +155,14 @@ pub fn validate_snapshot_page(
     {
         return Err(ProjectionError::Bounds);
     }
+    let encoded =
+        canonical_snapshot_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
+    if page.encoded_bytes != encoded {
+        return Err(ProjectionError::InvalidRequest);
+    }
+    if encoded > limits.max_encoded_bytes {
+        return Err(ProjectionError::Bounds);
+    }
     validate_cursor(page.next_cursor.as_deref())?;
     Ok(())
 }
@@ -164,8 +175,8 @@ pub fn validate_event_page(page: &EventPage, limits: PageLimits) -> Result<(), P
         return Err(ProjectionError::Bounds);
     }
     validate_cursor(page.next_cursor.as_deref())?;
-    let encoded = rmp_serde::to_vec_named(page).map_err(|_| ProjectionError::InvalidRequest)?;
-    if encoded.len() > usize::try_from(limits.max_encoded_bytes).unwrap_or(usize::MAX) {
+    let encoded = canonical_event_page_size(page).map_err(|_| ProjectionError::InvalidRequest)?;
+    if encoded > limits.max_encoded_bytes {
         return Err(ProjectionError::Bounds);
     }
     Ok(())

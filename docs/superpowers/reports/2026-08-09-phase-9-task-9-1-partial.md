@@ -1,9 +1,11 @@
 # Phase 9 Task 9.1 partial report
 
-Status: PARTIAL — Batch1 Rust contract repair complete in the isolated
+Status: PARTIAL — Batch1 Rust contract repair is complete in the isolated
 `phase-9-1a-wire-catalog` worktree. Batch2-A canonical page-sizing proof is
-complete in the isolated `phase-9-1b-page-sizing` worktree; chunk transfer repair
-and Connect Slice C remain explicitly deferred.
+complete in the isolated `phase-9-1b-page-sizing` worktree. Connect Slice C's
+bounded Rust integration is implemented and its focused contracts are green in
+the isolated `phase-9-1d-connect-integration` worktree; cross-language/service
+gates remain deferred.
 
 ## Implemented
 
@@ -36,6 +38,16 @@ and Connect Slice C remain explicitly deferred.
 - `ProjectionSource` reuses existing bounded snapshot, replay, query, and
   command-receipt domain types, with optional prompt/browser extension
   descriptors only.
+- Connect page validation and outgoing normalization now use the domain
+  `canonical_snapshot_page_size`, `canonical_event_page_size`, and
+  `canonical_artifact_content_page_size` helpers. Direct and nested QueryReply
+  pages are normalized before wire encoding; inbound encoded-byte claims must
+  equal the canonical final named-MessagePack size and are never trusted.
+- Connect re-exports the reviewed `protocol::ChunkFrame` and
+  `protocol::ChunkContext` primitives. The former Connect-local chunk
+  constructor, serde, hash, context, poison, and limit algorithms were
+  removed; Connect's negotiated chunk/cursor checks delegate to canonical
+  `protocol::ChunkLimits` while retaining the envelope limit schema.
 
 ## TDD and verification evidence
 
@@ -51,6 +63,21 @@ and Connect Slice C remain explicitly deferred.
 - `cargo fmt --all -- --check` still reports only the preserved salvage
   formatting in `tests/connect_session.rs`; that file was not rewritten.
 - Final `git diff --check` and owned-path audit: passed.
+
+## Connect Slice C focused verification
+
+- RED was observed first: the new contract tests rejected the old Connect
+  five-argument chunk constructor/signature and the stale outgoing envelope
+  page claim with the expected compile/runtime failures.
+- `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91d-connect'; cargo test --test connect_contract --test connect_session --test protocol_contract -- --nocapture`:
+  13 + 8 + 50 passed, 0 failed, 0 ignored.
+- The focused run emitted only preserved library warnings. No Cargo, rustc,
+  rustdoc, or Rust test-harness process remained for the isolated target after
+  completion.
+- The hard 18-minute cutoff was reached while the focused gate was running;
+  no additional rustfmt, diff-check, full-suite, push, merge, install, tag, or
+  publish gate was started afterward. The Slice C worktree remains uncommitted
+  pending those intentionally skipped final checks.
 
 ## Batch2-A page-sizing verification
 
@@ -82,10 +109,9 @@ This partial does not implement and does not claim to prove:
 - host/kernel command integration, provider/browser/process/prompt behavior,
   UI, `AppData`, or `session.json` changes;
 - migration or porting of legacy `RemoteAction` or `WriterLease` semantics.
-- chunk transfer repair, including any custom snapshot/chunk implementation
-  changes; canonical page sizing is covered by the Batch2-A proof above.
-- Connect Slice C and its cross-language, transport, pairing, relay, and
-  live-service work remain explicitly deferred.
+- Connect Slice C cross-language codec, pairing, relay, and live-service work
+  remain explicitly deferred; the bounded Rust page/chunk integration is
+  covered by the focused evidence above.
 
 No live service, installed DevManager, browser, or production persistence was
 used or modified.

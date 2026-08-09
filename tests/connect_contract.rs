@@ -4,22 +4,29 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use devmanager::connect::{
-    canonical_snapshot_page_size, payload_catalog, ChannelBinding, ChannelId, ChannelKind,
-    ChunkContext, ChunkFrame, ConnectEnvelope, ConnectLimits, ConnectPayload, ConnectPrivacyClass,
-    ConnectionId, GenericExtensionPayload, PayloadKind, SessionId, UnknownPayload,
+    payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkContext, ChunkFrame,
+    ConnectEnvelope, ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectionId,
+    GenericExtensionPayload, PayloadKind, SessionId, UnknownPayload,
 };
 use devmanager::domain::command::CommandReceipt;
 use devmanager::domain::event::DomainEvent;
 use devmanager::domain::id::{
-    ClientId, CommandId, EventId, OperationId, RequestId, ResourceId, SnapshotId, SubscriptionId,
-    TaskId, TransferId,
+    ArtifactId, ClientId, CommandId, EventId, OperationId, RequestId, ResourceId, SnapshotId,
+    SubscriptionId, TaskId, TransferId,
 };
 use devmanager::domain::operation::{OperationOutcome, OperationOutcomeKind, OutcomeSource};
-use devmanager::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply};
-use devmanager::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection};
-use devmanager::protocol::{
-    ClientRequest, ProtocolVersion, ServerMessage, StreamFrame, StreamKey, StreamPayloadKind,
+use devmanager::domain::query::{
+    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
 };
+use devmanager::domain::snapshot::{
+    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
+    ArtifactContentPage, EventPage, SnapshotPage, SnapshotSection,
+};
+use devmanager::protocol::{
+    ChunkError, ChunkLimits, ClientRequest, ProtocolVersion, ServerMessage, StreamFrame, StreamKey,
+    StreamPayloadKind,
+};
+use sha2::{Digest, Sha256};
 
 fn uuid_v7(tail: u8) -> Uuid {
     let mut bytes = [0_u8; 16];
@@ -79,6 +86,7 @@ impl_from_bytes!(
     ResourceId,
     SnapshotId,
     SubscriptionId,
+    ArtifactId,
     TaskId,
     TransferId,
 );
@@ -416,6 +424,43 @@ fn pages_recompute_canonical_size_and_do_not_trust_claimed_encoded_bytes() {
     page.encoded_bytes += 1;
     assert!(ConnectPayload::SnapshotPage(page).validate(limits).is_err());
 
+    let mut boundary = empty_snapshot_page(51);
+    let mut found_boundary = false;
+    for cursor_len in 0..512 {
+        boundary.next_cursor = Some(vec![0; cursor_len]);
+        boundary.encoded_bytes = 0;
+        let zero_claim_length = rmp_serde::to_vec_named(&boundary)
+            .expect("encode zero-claim boundary page")
+            .len();
+        if zero_claim_length != 128 {
+            continue;
+        }
+        let canonical = canonical_snapshot_page_size(&boundary).expect("canonical boundary size");
+        assert_ne!(canonical as usize, zero_claim_length);
+        boundary.encoded_bytes = canonical;
+        ConnectPayload::SnapshotPage(boundary.clone())
+            .validate(limits)
+            .expect("canonical final MessagePack size");
+        found_boundary = true;
+        break;
+    }
+    assert!(found_boundary, "boundary fixture must reach a width change");
+
+    let mut outgoing = empty_snapshot_page(52);
+    outgoing.encoded_bytes = u32::MAX;
+    let encoded = ConnectPayload::SnapshotPage(outgoing)
+        .encode(limits)
+        .expect("outgoing page recomputes its claim");
+    let normalized = ConnectPayload::decode(PayloadKind::SNAPSHOT_PAGE, 1, &encoded, limits)
+        .expect("normalized page decodes");
+    let ConnectPayload::SnapshotPage(normalized) = normalized else {
+        panic!("expected normalized snapshot page")
+    };
+    assert_eq!(
+        normalized.encoded_bytes,
+        canonical_snapshot_page_size(&normalized).expect("normalized canonical size")
+    );
+
     let events = ConnectPayload::EventPage(EventPage {
         after_sequence: 0,
         through_sequence: 0,
@@ -423,33 +468,163 @@ fn pages_recompute_canonical_size_and_do_not_trust_claimed_encoded_bytes() {
         next_cursor: None,
     });
     events.validate(limits).expect("valid empty event page");
+    let event_page = EventPage {
+        after_sequence: 3,
+        through_sequence: 8,
+        events: Vec::new(),
+        next_cursor: Some(vec![1, 2, 3]),
+    };
+    let event_size = canonical_event_page_size(&event_page).expect("canonical event size");
+    let event_limits = ConnectLimits::try_new(4096, 8192, 10, event_size, 1024, 4096, 1024)
+        .expect("event page limits");
+    ConnectPayload::EventPage(event_page)
+        .validate(event_limits)
+        .expect("event page uses canonical size");
 }
 
 #[test]
-fn chunk_uses_transfer_id_and_validates_index_count_digest_cumulative_and_cursor_context() {
+fn transport_encode_normalizes_outgoing_page_claims() {
+    let mut page = empty_snapshot_page(53);
+    page.encoded_bytes = u32::MAX;
+    let envelope = ConnectEnvelope::new(
+        binding(54),
+        1,
+        None,
+        None,
+        ConnectLimits::v1_default(),
+        ConnectPrivacyClass::ManagedMetadata,
+        ConnectPayload::SnapshotPage(page),
+    )
+    .expect("page envelope");
+    let decoded = devmanager::connect::decode_inner(
+        &devmanager::connect::encode_inner(&envelope).expect("transport encode"),
+    )
+    .expect("transport decode");
+    let ConnectPayload::SnapshotPage(page) = decoded.payload().clone() else {
+        panic!("expected snapshot page")
+    };
+    assert_eq!(
+        page.encoded_bytes,
+        canonical_snapshot_page_size(&page).unwrap()
+    );
+}
+
+#[test]
+fn pages_validate_artifact_claims_and_normalize_outgoing_artifacts() {
+    let limits = ConnectLimits::v1_default();
+    let mut page = ArtifactContentPage {
+        artifact_id: domain_id(61),
+        offset: 4,
+        total_bytes: 9,
+        sha256: [7; 32],
+        payload: vec![8, 9, 10],
+        encoded_bytes: u32::MAX,
+        next_cursor: Some(vec![11, 12]),
+    };
+    let canonical = canonical_artifact_content_page_size(&page).expect("canonical artifact size");
+    page.encoded_bytes = canonical + 1;
+    let incoming = ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
+        request_id: domain_id(62),
+        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+            subscription_id: domain_id(63),
+            page: page.clone(),
+        }),
+    }));
+    assert!(
+        incoming.validate(limits).is_err(),
+        "false artifact claims are rejected"
+    );
+
+    page.encoded_bytes = u32::MAX;
+    let encoded = ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
+        request_id: domain_id(62),
+        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage {
+            subscription_id: domain_id(63),
+            page,
+        }),
+    }))
+    .encode(limits)
+    .expect("outgoing artifact recomputes its claim");
+    let normalized = ConnectPayload::decode(PayloadKind::QUERY_REPLY, 1, &encoded, limits)
+        .expect("normalized artifact reply decodes");
+    let ConnectPayload::Message(ServerMessage::QueryReply(QueryReply {
+        outcome: QueryOutcome::Ok(QueryResult::ArtifactContentPage { page, .. }),
+        ..
+    })) = normalized
+    else {
+        panic!("expected normalized artifact reply")
+    };
+    assert_eq!(
+        page.encoded_bytes,
+        canonical_artifact_content_page_size(&page).unwrap()
+    );
+}
+
+fn cumulative_sha256(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+#[test]
+fn connect_chunk_is_the_canonical_checked_primitive() {
     let limits =
         ConnectLimits::try_new(4096, 8192, 10, 2048, 1024, 4096, 1024).expect("bounded limits");
+    let chunk_limits = ChunkLimits::try_new(1024, 4096, 1024).expect("chunk limits");
     let transfer_id = domain_id::<TransferId>(60);
     let cursor = vec![0x71, 0x72];
-    let frame =
-        ChunkFrame::new(transfer_id, 0, 1, vec![1, 2, 3], Some(cursor.clone())).expect("chunk");
-    frame.validate(limits).expect("valid chunk");
+    let payload = b"payload";
+    let hash = cumulative_sha256(&[payload]);
+    let frame = ChunkFrame::new(
+        transfer_id,
+        0,
+        true,
+        payload.to_vec(),
+        hash,
+        Some(cursor.clone()),
+    )
+    .expect("chunk");
+    frame.validate(chunk_limits).expect("valid chunk");
+    ConnectPayload::Chunk(frame.clone())
+        .validate(limits)
+        .expect("Connect applies negotiated chunk limits");
 
-    let mut context = ChunkContext::new(transfer_id, 1, Some(cursor)).expect("chunk context");
+    let mut context =
+        ChunkContext::new(transfer_id, chunk_limits, Some(cursor.clone())).expect("chunk context");
     context.accept(&frame).expect("context accepts chunk");
     assert!(context.is_complete());
 
-    let mut bad_digest = frame.clone();
-    bad_digest.digest[0] ^= 1;
-    assert!(bad_digest.validate(limits).is_err());
+    let mut wrong_hash = hash;
+    wrong_hash[0] ^= 1;
+    let wrong_hash_frame = ChunkFrame::new(
+        transfer_id,
+        0,
+        true,
+        payload.to_vec(),
+        wrong_hash,
+        Some(cursor.clone()),
+    )
+    .expect("shape-valid wrong hash");
+    let mut poisoned =
+        ChunkContext::new(transfer_id, chunk_limits, Some(cursor.clone())).expect("poison context");
+    assert!(matches!(
+        poisoned.accept(&wrong_hash_frame),
+        Err(ChunkError::CumulativeHashMismatch)
+    ));
+    assert!(poisoned.is_poisoned());
+    assert!(matches!(poisoned.accept(&frame), Err(ChunkError::Poisoned)));
 
-    let mut bad_index = frame.clone();
-    bad_index.index = 1;
-    assert!(bad_index.validate(limits).is_err());
-
-    let mut bad_cursor = frame;
-    bad_cursor.cursor = Some(vec![0; 1025]);
-    assert!(bad_cursor.validate(limits).is_err());
+    let mut post_final =
+        ChunkContext::new(transfer_id, chunk_limits, Some(cursor)).expect("post-final context");
+    post_final.accept(&frame).expect("final frame");
+    assert!(post_final.is_complete());
+    assert!(matches!(
+        post_final.accept(&frame),
+        Err(ChunkError::AlreadyComplete)
+    ));
+    assert!(post_final.is_poisoned());
 }
 
 #[test]

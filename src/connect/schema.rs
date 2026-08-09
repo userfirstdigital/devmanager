@@ -7,23 +7,31 @@
 
 use std::fmt;
 
+use crate::domain::id::OperationId;
+use crate::domain::operation::{OperationOutcome, OperationOutcomeKind, OutcomeFenceError};
+use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, QueryResult};
+use crate::domain::snapshot::{
+    ArtifactContentPage, CanonicalPageSizeError, EventPage, SnapshotPage,
+};
+use crate::protocol::{
+    CapabilitySet, ChunkError, ChunkLimits, ClientHello, ClientRequest, MessagePackCodec,
+    MessagePackError, ServerHello, ServerMessage, StreamFrame,
+};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-use crate::domain::id::{OperationId, TransferId};
-use crate::domain::operation::{OperationOutcome, OperationOutcomeKind, OutcomeFenceError};
-use crate::domain::query::{Query, QueryEnvelope, QueryReply};
-use crate::domain::snapshot::{EventPage, SnapshotPage};
-use crate::protocol::{
-    CapabilitySet, ClientHello, ClientRequest, MessagePackCodec, MessagePackError, ServerHello,
-    ServerMessage, StreamFrame,
-};
 
 use super::envelope::{ChannelKind, ConnectLimitError, ConnectLimits, PayloadKind};
 use super::presence::LastSenderHint;
 use super::transport::{BrowserExtensionDescriptor, PromptExtensionDescriptor};
+
+// Connect carries the protocol primitive directly. Its checked constructor,
+// named MessagePack serde, cumulative hash, and poisoned context are defined
+// once in src::protocol.
+pub use crate::domain::snapshot::{
+    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
+};
+pub use crate::protocol::{ChunkContext, ChunkFrame};
 
 pub const CONNECT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
 
@@ -300,190 +308,6 @@ impl OperationSettlementPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkFrame {
-    pub transfer_id: TransferId,
-    pub index: u32,
-    pub count: u32,
-    pub cumulative_bytes: u64,
-    pub digest: [u8; 32],
-    pub payload: Vec<u8>,
-    pub cursor: Option<Vec<u8>>,
-}
-
-fn digest(payload: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(payload);
-    hasher.finalize().into()
-}
-
-impl ChunkFrame {
-    pub fn new(
-        transfer_id: TransferId,
-        index: u32,
-        count: u32,
-        payload: Vec<u8>,
-        cursor: Option<Vec<u8>>,
-    ) -> Result<Self, PayloadError> {
-        let cumulative_bytes = u64::try_from(payload.len()).map_err(|_| PayloadError::Bounds)?;
-        let digest = digest(&payload);
-        let frame = Self {
-            transfer_id,
-            index,
-            count,
-            cumulative_bytes,
-            digest,
-            payload,
-            cursor,
-        };
-        frame.validate_shape()?;
-        Ok(frame)
-    }
-
-    fn validate_shape(&self) -> Result<(), PayloadError> {
-        if self.count == 0 || self.index >= self.count || self.payload.is_empty() {
-            return Err(PayloadError::Bounds);
-        }
-        let payload_len = u64::try_from(self.payload.len()).map_err(|_| PayloadError::Bounds)?;
-        if self.cumulative_bytes < payload_len
-            || self.cumulative_bytes - payload_len > super::envelope::MAX_CONNECT_CUMULATIVE_BYTES
-        {
-            return Err(PayloadError::Bounds);
-        }
-        if self.digest != digest(&self.payload) {
-            return Err(PayloadError::DigestMismatch);
-        }
-        Ok(())
-    }
-
-    pub fn validate(&self, limits: ConnectLimits) -> Result<(), PayloadError> {
-        self.validate_shape()?;
-        let payload_len = u64::try_from(self.payload.len()).map_err(|_| PayloadError::Bounds)?;
-        let cumulative_before = self
-            .cumulative_bytes
-            .checked_sub(payload_len)
-            .ok_or(PayloadError::Bounds)?;
-        limits
-            .validate_chunk(cumulative_before, &self.payload)
-            .map_err(PayloadError::Limits)?;
-        if let Some(cursor) = self.cursor.as_deref() {
-            limits
-                .validate_cursor_len(cursor.len())
-                .map_err(PayloadError::Limits)?;
-        }
-        Ok(())
-    }
-}
-
-impl Serialize for ChunkFrame {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut map = serializer.serialize_map(Some(7))?;
-        map.serialize_entry("transfer_id", &self.transfer_id)?;
-        map.serialize_entry("index", &self.index)?;
-        map.serialize_entry("count", &self.count)?;
-        map.serialize_entry("cumulative_bytes", &self.cumulative_bytes)?;
-        map.serialize_entry("digest", &self.digest)?;
-        map.serialize_entry("payload", &BinaryRef(&self.payload))?;
-        map.serialize_entry("cursor", &OptionalBinaryRef(self.cursor.as_deref()))?;
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ChunkFrame {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            transfer_id: TransferId,
-            index: u32,
-            count: u32,
-            cumulative_bytes: u64,
-            digest: [u8; 32],
-            #[serde(with = "binary")]
-            payload: Vec<u8>,
-            #[serde(with = "optional_binary")]
-            cursor: Option<Vec<u8>>,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        let frame = Self {
-            transfer_id: wire.transfer_id,
-            index: wire.index,
-            count: wire.count,
-            cumulative_bytes: wire.cumulative_bytes,
-            digest: wire.digest,
-            payload: wire.payload,
-            cursor: wire.cursor,
-        };
-        frame.validate_shape().map_err(de::Error::custom)?;
-        Ok(frame)
-    }
-}
-
-/// Context needed to validate cross-frame chunk identity and cumulative
-/// cursor continuity. It is deliberately not serialized into a frame.
-#[derive(Debug)]
-pub struct ChunkContext {
-    transfer_id: TransferId,
-    count: u32,
-    next_index: u32,
-    cumulative_bytes: u64,
-    cursor: Option<Vec<u8>>,
-    cumulative_hasher: Sha256,
-}
-
-impl ChunkContext {
-    pub fn new(
-        transfer_id: TransferId,
-        count: u32,
-        cursor: Option<Vec<u8>>,
-    ) -> Result<Self, PayloadError> {
-        if count == 0 {
-            return Err(PayloadError::Bounds);
-        }
-        Ok(Self {
-            transfer_id,
-            count,
-            next_index: 0,
-            cumulative_bytes: 0,
-            cursor,
-            cumulative_hasher: Sha256::new(),
-        })
-    }
-
-    pub fn accept(&mut self, frame: &ChunkFrame) -> Result<(), PayloadError> {
-        frame.validate_shape()?;
-        if frame.transfer_id != self.transfer_id
-            || frame.count != self.count
-            || frame.index != self.next_index
-            || frame.cursor != self.cursor
-        {
-            return Err(PayloadError::CursorContext);
-        }
-        let payload_len = u64::try_from(frame.payload.len()).map_err(|_| PayloadError::Bounds)?;
-        let expected_cumulative = self
-            .cumulative_bytes
-            .checked_add(payload_len)
-            .ok_or(PayloadError::Bounds)?;
-        if frame.cumulative_bytes != expected_cumulative {
-            return Err(PayloadError::CursorContext);
-        }
-        self.cumulative_hasher.update(&frame.payload);
-        self.cumulative_bytes = expected_cumulative;
-        self.next_index = self.next_index.checked_add(1).ok_or(PayloadError::Bounds)?;
-        Ok(())
-    }
-
-    pub const fn is_complete(&self) -> bool {
-        self.next_index == self.count
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorPayload {
@@ -646,10 +470,28 @@ impl ConnectPayload {
 
     pub fn encode(&self, limits: ConnectLimits) -> Result<Vec<u8>, PayloadError> {
         limits.validate()?;
-        self.validate(limits)?;
+        let canonical = self.canonicalized_for_wire()?;
+        canonical.validate(limits)?;
         let codec = MessagePackCodec::from_limits(limits.frame_limits())
             .map_err(|_| PayloadError::Encode)?;
-        codec.encode(self).map_err(PayloadError::MessagePack)
+        codec.encode(&canonical).map_err(PayloadError::MessagePack)
+    }
+
+    pub(crate) fn canonicalized_for_wire(&self) -> Result<Self, PayloadError> {
+        let mut canonical = self.clone();
+        match &mut canonical {
+            Self::SnapshotPage(page) => {
+                page.encoded_bytes = canonical_snapshot_page_size(page).map_err(map_page_size)?;
+            }
+            Self::EventPage(page) => {
+                canonical_event_page_size(page).map_err(map_page_size)?;
+            }
+            Self::Message(ServerMessage::QueryReply(reply)) => {
+                normalize_query_result(&mut reply.outcome)?;
+            }
+            _ => {}
+        }
+        Ok(canonical)
     }
 
     pub fn decode(
@@ -720,7 +562,9 @@ impl ConnectPayload {
                     return Err(PayloadError::Bounds);
                 }
             }
-            Self::Chunk(frame) => frame.validate(limits)?,
+            Self::Chunk(frame) => frame
+                .validate(canonical_chunk_limits(limits)?)
+                .map_err(PayloadError::Chunk)?,
             Self::Error(error) => error.validate(limits)?,
             Self::Extension(extension) => {
                 if extension.type_id == 0 || extension.schema_version == 0 {
@@ -764,7 +608,7 @@ fn validate_query(query: &QueryEnvelope, limits: ConnectLimits) -> Result<(), Pa
         _ => None,
     };
     if let Some(cursor) = cursor {
-        limits.validate_cursor_len(cursor.len())?;
+        validate_cursor(limits, cursor.len())?;
     }
     Ok(())
 }
@@ -773,11 +617,7 @@ fn validate_message(message: &ServerMessage, limits: ConnectLimits) -> Result<()
     match message {
         ServerMessage::CommandReceipt(_) => Ok(()),
         ServerMessage::QueryReply(QueryReply { outcome, .. }) => {
-            if matches!(outcome, crate::domain::query::QueryOutcome::Err(_)) {
-                Ok(())
-            } else {
-                Ok(())
-            }
+            validate_query_result(outcome, limits)
         }
         ServerMessage::DurableEvent { event, .. } => {
             if event.sequence == 0 {
@@ -799,6 +639,42 @@ fn validate_message(message: &ServerMessage, limits: ConnectLimits) -> Result<()
         ServerMessage::Detached(_) => Ok(()),
     }
 }
+fn validate_query_result(
+    outcome: &QueryOutcome,
+    limits: ConnectLimits,
+) -> Result<(), PayloadError> {
+    let QueryOutcome::Ok(result) = outcome else {
+        return Ok(());
+    };
+    match result {
+        QueryResult::SnapshotPage { page } => validate_snapshot_page(page, limits),
+        QueryResult::EventReplayPage { page, .. } => validate_event_page(page, limits),
+        QueryResult::ArtifactContentPage { page, .. } => {
+            validate_artifact_content_page(page, limits)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn normalize_query_result(outcome: &mut QueryOutcome) -> Result<(), PayloadError> {
+    let QueryOutcome::Ok(result) = outcome else {
+        return Ok(());
+    };
+    match result {
+        QueryResult::SnapshotPage { page } => {
+            page.encoded_bytes = canonical_snapshot_page_size(page).map_err(map_page_size)?;
+        }
+        QueryResult::EventReplayPage { page, .. } => {
+            canonical_event_page_size(page).map_err(map_page_size)?;
+        }
+        QueryResult::ArtifactContentPage { page, .. } => {
+            page.encoded_bytes =
+                canonical_artifact_content_page_size(page).map_err(map_page_size)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 fn validate_stream_frame(frame: &StreamFrame, limits: ConnectLimits) -> Result<(), PayloadError> {
     if frame.generation == 0 || frame.sequence == 0 || frame.schema_version == 0 {
@@ -808,21 +684,14 @@ fn validate_stream_frame(frame: &StreamFrame, limits: ConnectLimits) -> Result<(
     Ok(())
 }
 
-pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, PayloadError> {
-    let mut canonical = page.clone();
-    canonical.encoded_bytes = 0;
-    let encoded = rmp_serde::to_vec_named(&canonical).map_err(|_| PayloadError::Encode)?;
-    u32::try_from(encoded.len()).map_err(|_| PayloadError::Bounds)
-}
-
 fn validate_snapshot_page(page: &SnapshotPage, limits: ConnectLimits) -> Result<(), PayloadError> {
-    let encoded = canonical_snapshot_page_size(page)?;
+    let encoded = canonical_snapshot_page_size(page).map_err(map_page_size)?;
     if u64::from(page.encoded_bytes) != u64::from(encoded) {
         return Err(PayloadError::CanonicalSizeMismatch);
     }
     limits.validate_page(page.items.len(), u64::from(encoded))?;
     if let Some(cursor) = page.next_cursor.as_deref() {
-        limits.validate_cursor_len(cursor.len())?;
+        validate_cursor(limits, cursor.len())?;
     }
     if page.through_sequence == 0 && !page.items.is_empty() {
         return Err(PayloadError::Bounds);
@@ -841,19 +710,48 @@ fn validate_event_page(page: &EventPage, limits: ConnectLimits) -> Result<(), Pa
         }
         previous = event.sequence;
     }
-    limits.validate_page(
-        page.events.len(),
-        u64::try_from(
-            rmp_serde::to_vec_named(page)
-                .map_err(|_| PayloadError::Encode)?
-                .len(),
-        )
-        .map_err(|_| PayloadError::Bounds)?,
-    )?;
+    let encoded = canonical_event_page_size(page).map_err(map_page_size)?;
+    limits.validate_page(page.events.len(), u64::from(encoded))?;
     if let Some(cursor) = page.next_cursor.as_deref() {
-        limits.validate_cursor_len(cursor.len())?;
+        validate_cursor(limits, cursor.len())?;
     }
     Ok(())
+}
+
+fn validate_artifact_content_page(
+    page: &ArtifactContentPage,
+    limits: ConnectLimits,
+) -> Result<(), PayloadError> {
+    let encoded = canonical_artifact_content_page_size(page).map_err(map_page_size)?;
+    if page.encoded_bytes != encoded {
+        return Err(PayloadError::CanonicalSizeMismatch);
+    }
+    limits.validate_page(1, u64::from(encoded))?;
+    if let Some(cursor) = page.next_cursor.as_deref() {
+        validate_cursor(limits, cursor.len())?;
+    }
+    Ok(())
+}
+
+fn validate_cursor(limits: ConnectLimits, length: usize) -> Result<(), PayloadError> {
+    canonical_chunk_limits(limits)?
+        .validate_cursor_len(length)
+        .map_err(PayloadError::Chunk)
+}
+
+fn canonical_chunk_limits(limits: ConnectLimits) -> Result<ChunkLimits, PayloadError> {
+    limits
+        .canonical_chunk_limits()
+        .map_err(PayloadError::Limits)
+}
+
+fn map_page_size(error: CanonicalPageSizeError) -> PayloadError {
+    match error {
+        CanonicalPageSizeError::Encode { .. } => PayloadError::Encode,
+        CanonicalPageSizeError::TooLarge { .. } | CanonicalPageSizeError::DidNotConverge => {
+            PayloadError::Bounds
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,12 +760,11 @@ pub enum PayloadError {
     MetadataMismatch,
     Correlation,
     Settlement,
-    CursorContext,
     CanonicalSizeMismatch,
-    DigestMismatch,
     Bounds,
     Invalid,
     Encode,
+    Chunk(ChunkError),
     Limits(ConnectLimitError),
     MessagePack(MessagePackError),
 }
@@ -885,14 +782,13 @@ impl fmt::Display for PayloadError {
             Self::Settlement => {
                 formatter.write_str("Connect operation settlement is not authoritative")
             }
-            Self::CursorContext => formatter.write_str("Connect chunk cursor context is invalid"),
             Self::CanonicalSizeMismatch => {
                 formatter.write_str("Connect page encoded byte count is not canonical")
             }
-            Self::DigestMismatch => formatter.write_str("Connect chunk digest is invalid"),
             Self::Bounds => formatter.write_str("Connect payload exceeds its typed bounds"),
             Self::Invalid => formatter.write_str("Connect payload is invalid"),
             Self::Encode => formatter.write_str("Connect payload encoding failed"),
+            Self::Chunk(error) => error.fmt(formatter),
             Self::Limits(error) => error.fmt(formatter),
             Self::MessagePack(error) => error.fmt(formatter),
         }
@@ -1131,67 +1027,5 @@ mod binary {
         }
 
         deserializer.deserialize_bytes(BinaryVisitor)
-    }
-}
-
-mod optional_binary {
-    use serde::de::{self, Deserializer, Visitor};
-    use std::fmt;
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct OptionalBinaryVisitor;
-
-        impl<'de> Visitor<'de> for OptionalBinaryVisitor {
-            type Value = Option<Vec<u8>>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("optional MessagePack binary bytes")
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-
-            fn visit_some<D: Deserializer<'de>>(
-                self,
-                deserializer: D,
-            ) -> Result<Self::Value, D::Error> {
-                super::binary::deserialize(deserializer).map(Some)
-            }
-        }
-
-        deserializer.deserialize_option(OptionalBinaryVisitor)
-    }
-}
-
-struct BinaryRef<'a>(&'a [u8]);
-
-impl Serialize for BinaryRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.0)
-    }
-}
-
-struct OptionalBinaryRef<'a>(Option<&'a [u8]>);
-
-impl Serialize for OptionalBinaryRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self.0 {
-            Some(value) => serializer.serialize_some(&BinaryRef(value)),
-            None => serializer.serialize_none(),
-        }
     }
 }
