@@ -1,8 +1,9 @@
 # Phase 9 Task 9.1 partial report
 
 Status: PARTIAL — Batch1 Rust contract repair complete in the isolated
-`phase-9-1a-wire-catalog` worktree. Canonical snapshot sizing and chunk transfer
-repair remain an explicit Batch2 blocker.
+`phase-9-1a-wire-catalog` worktree. Batch2-A canonical page-sizing proof is
+complete in the isolated `phase-9-1b-page-sizing` worktree; chunk transfer repair
+and Connect Slice C remain explicitly deferred.
 
 ## Implemented
 
@@ -51,6 +52,21 @@ repair remain an explicit Batch2 blocker.
   formatting in `tests/connect_session.rs`; that file was not rewritten.
 - Final `git diff --check` and owned-path audit: passed.
 
+## Batch2-A page-sizing verification
+
+- Canonical command: `$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase91b-pages-final'; cargo test --lib 'domain::snapshot::tests' -- --nocapture`.
+- Exact result: 8 passed, 0 failed, 0 ignored, 0 measured, and 1,191 filtered.
+  This includes 3/3 independent golden-fixture tests, 2/2 MessagePack
+  integer-width boundary tests, and 3/3 final named-MessagePack size tests.
+- `rustfmt --edition 2021 src/domain/snapshot.rs`: passed. The page slice
+  remains test-only in `src/domain/snapshot.rs`; no semantic production or
+  Connect edits were made.
+- `git diff --check`: passed. The scoped residue check found 0 slice-owned
+  Cargo, rustc, or Rust test-harness processes after verification; unrelated
+  global compiler processes were left untouched.
+- Connect Slice C is explicitly deferred. Batch2-A makes no claim for
+  cross-language codec, transport, pairing, relay, or live-service coverage.
+
 ## Explicit later gates
 
 This partial does not implement and does not claim to prove:
@@ -66,8 +82,10 @@ This partial does not implement and does not claim to prove:
 - host/kernel command integration, provider/browser/process/prompt behavior,
   UI, `AppData`, or `session.json` changes;
 - migration or porting of legacy `RemoteAction` or `WriterLease` semantics.
-- canonical snapshot sizing and chunk transfer repair; those remain Batch2,
-  including any custom snapshot/chunk implementation changes.
+- chunk transfer repair, including any custom snapshot/chunk implementation
+  changes; canonical page sizing is covered by the Batch2-A proof above.
+- Connect Slice C and its cross-language, transport, pairing, relay, and
+  live-service work remain explicitly deferred.
 
 No live service, installed DevManager, browser, or production persistence was
 used or modified.
