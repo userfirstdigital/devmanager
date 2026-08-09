@@ -165,6 +165,154 @@ CREATE TABLE host_cleanup_branches (\n\
 );\n\
 ";
 
+const V7_SQL: &str = "\
+CREATE TABLE saved_prompts (\n\
+  prompt_id BLOB PRIMARY KEY CHECK(length(prompt_id) = 16),\n\
+  title TEXT NOT NULL,\n\
+  description TEXT,\n\
+  current_version_id BLOB NOT NULL CHECK(length(current_version_id) = 16),\n\
+  revision INTEGER NOT NULL CHECK(revision > 0),\n\
+  created_at_ms INTEGER NOT NULL,\n\
+  updated_at_ms INTEGER NOT NULL,\n\
+  archived_at_ms INTEGER,\n\
+  FOREIGN KEY(prompt_id, current_version_id)\n\
+    REFERENCES prompt_versions(prompt_id, prompt_version_id)\n\
+    DEFERRABLE INITIALLY DEFERRED\n\
+);\n\
+CREATE TABLE prompt_versions (\n\
+  prompt_version_id BLOB PRIMARY KEY CHECK(length(prompt_version_id) = 16),\n\
+  prompt_id BLOB NOT NULL REFERENCES saved_prompts(prompt_id)\n\
+    DEFERRABLE INITIALLY DEFERRED,\n\
+  version INTEGER NOT NULL CHECK(version > 0),\n\
+  body TEXT NOT NULL,\n\
+  body_sha256 BLOB NOT NULL CHECK(length(body_sha256) = 32),\n\
+  created_at_ms INTEGER NOT NULL,\n\
+  UNIQUE(prompt_id, version),\n\
+  UNIQUE(prompt_id, prompt_version_id)\n\
+);\n\
+CREATE TABLE prompt_version_variables (\n\
+  prompt_version_id BLOB NOT NULL REFERENCES prompt_versions(prompt_version_id),\n\
+  variable TEXT NOT NULL CHECK(length(variable) > 0),\n\
+  position INTEGER NOT NULL CHECK(position >= 0),\n\
+  PRIMARY KEY(prompt_version_id, variable),\n\
+  UNIQUE(prompt_version_id, position)\n\
+);\n\
+CREATE TRIGGER prompt_version_variables_immutable_update\n\
+  BEFORE UPDATE ON prompt_version_variables\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version variables are immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_version_variables_immutable_delete\n\
+  BEFORE DELETE ON prompt_version_variables\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version variables are append-only');\n\
+END;\n\
+CREATE TRIGGER prompt_versions_immutable_update\n\
+  BEFORE UPDATE ON prompt_versions\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version history is immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_versions_immutable_delete\n\
+  BEFORE DELETE ON prompt_versions\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt version history is immutable');\n\
+END;\n\
+CREATE TABLE prompt_tags (\n\
+  prompt_id BLOB NOT NULL REFERENCES saved_prompts(prompt_id),\n\
+  tag TEXT NOT NULL CHECK(length(tag) > 0),\n\
+  position INTEGER NOT NULL CHECK(position >= 0),\n\
+  PRIMARY KEY(prompt_id, tag),\n\
+  UNIQUE(prompt_id, position)\n\
+);\n\
+CREATE TABLE prompt_chains (\n\
+  chain_id BLOB PRIMARY KEY CHECK(length(chain_id) = 16),\n\
+  title TEXT NOT NULL,\n\
+  description TEXT,\n\
+  revision INTEGER NOT NULL CHECK(revision > 0),\n\
+  created_at_ms INTEGER NOT NULL,\n\
+  updated_at_ms INTEGER NOT NULL,\n\
+  archived_at_ms INTEGER\n\
+);\n\
+CREATE TABLE prompt_chain_links (\n\
+  link_id BLOB PRIMARY KEY CHECK(length(link_id) = 16),\n\
+  chain_id BLOB NOT NULL REFERENCES prompt_chains(chain_id),\n\
+  position INTEGER NOT NULL CHECK(position >= 0),\n\
+  prompt_id BLOB NOT NULL CHECK(length(prompt_id) = 16),\n\
+  prompt_version_id BLOB NOT NULL CHECK(length(prompt_version_id) = 16),\n\
+  FOREIGN KEY(prompt_id, prompt_version_id)\n\
+    REFERENCES prompt_versions(prompt_id, prompt_version_id),\n\
+  UNIQUE(chain_id, position)\n\
+);\n\
+CREATE TABLE prompt_chain_command_receipts (\n\
+  command_id BLOB PRIMARY KEY CHECK(length(command_id) = 16),\n\
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),\n\
+  chain_id BLOB NOT NULL CHECK(length(chain_id) = 16),\n\
+  chain_link_id BLOB CHECK(chain_link_id IS NULL OR length(chain_link_id) = 16),\n\
+  revision INTEGER NOT NULL CHECK(revision > 0),\n\
+  receipt BLOB NOT NULL,\n\
+  created_at_ms INTEGER NOT NULL\n\
+);\n\
+CREATE TABLE prompt_chain_events (\n\
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+  prompt_chain_event_id BLOB NOT NULL UNIQUE CHECK(length(prompt_chain_event_id) = 16),\n\
+  command_id BLOB NOT NULL REFERENCES prompt_chain_command_receipts(command_id),\n\
+  chain_id BLOB NOT NULL CHECK(length(chain_id) = 16),\n\
+  event_type TEXT NOT NULL,\n\
+  occurred_at_ms INTEGER NOT NULL,\n\
+  payload BLOB NOT NULL\n\
+);\n\
+CREATE TABLE prompt_command_receipts (\n\
+  command_id BLOB PRIMARY KEY CHECK(length(command_id) = 16),\n\
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),\n\
+  prompt_id BLOB NOT NULL CHECK(length(prompt_id) = 16),\n\
+  prompt_version_id BLOB NOT NULL CHECK(length(prompt_version_id) = 16),\n\
+  revision INTEGER NOT NULL CHECK(revision > 0),\n\
+  receipt BLOB NOT NULL,\n\
+  created_at_ms INTEGER NOT NULL\n\
+);\n\
+CREATE TABLE prompt_events (\n\
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+  prompt_event_id BLOB NOT NULL UNIQUE CHECK(length(prompt_event_id) = 16),\n\
+  command_id BLOB NOT NULL REFERENCES prompt_command_receipts(command_id),\n\
+  prompt_id BLOB NOT NULL CHECK(length(prompt_id) = 16),\n\
+  event_type TEXT NOT NULL,\n\
+  occurred_at_ms INTEGER NOT NULL,\n\
+  payload BLOB NOT NULL\n\
+);\n\
+CREATE TRIGGER prompt_command_receipts_immutable_update\n\
+  BEFORE UPDATE ON prompt_command_receipts\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt command receipts are immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_command_receipts_immutable_delete\n\
+  BEFORE DELETE ON prompt_command_receipts\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt command receipts are append-only');\n\
+END;\n\
+CREATE TRIGGER prompt_events_immutable_update\n\
+  BEFORE UPDATE ON prompt_events\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt event provenance is immutable');\n\
+END;\n\
+CREATE TRIGGER prompt_events_immutable_delete\n\
+  BEFORE DELETE ON prompt_events\n\
+BEGIN\n\
+  SELECT RAISE(ABORT, 'prompt event provenance is append-only');\n\
+END;\n\
+CREATE INDEX idx_prompt_versions_prompt_version\n\
+  ON prompt_versions(prompt_id, version DESC);\n\
+CREATE INDEX idx_prompt_version_variables_version_position\n\
+  ON prompt_version_variables(prompt_version_id, position);\n\
+CREATE INDEX idx_prompt_tags_prompt_position\n\
+  ON prompt_tags(prompt_id, position);\n\
+CREATE INDEX idx_prompt_chain_links_chain_position\n\
+  ON prompt_chain_links(chain_id, position);\n\
+CREATE INDEX idx_prompt_chain_events_chain_sequence\n\
+  ON prompt_chain_events(chain_id, sequence);\n\
+CREATE INDEX idx_prompt_events_prompt_sequence\n\
+  ON prompt_events(prompt_id, sequence);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -289,6 +437,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v6_host_cleanup_branches",
                     sql: V6_SQL,
                     sha256: V6_SHA256,
+                },
+                Migration {
+                    version: 7,
+                    name: "phase07-prompts-v1",
+                    sql: V7_SQL,
+                    sha256: sha256_bytes(V7_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -498,7 +652,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 6);
+        assert_eq!(history.len(), 7);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -516,6 +670,9 @@ mod tests {
         assert_eq!(history[5].0, 6);
         assert_eq!(history[5].1, "v6_host_cleanup_branches");
         assert_eq!(history[5].2, V6_SHA256.to_vec());
+        assert_eq!(history[6].0, 7);
+        assert_eq!(history[6].1, "phase07-prompts-v1");
+        assert_eq!(history[6].2.len(), 32);
 
         let compacted_column: (String, i64) = conn
             .query_row(

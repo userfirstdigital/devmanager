@@ -177,3 +177,8 @@ define_id!(SubscriptionId);
 define_id!(SnapshotId);
 define_id!(EventId);
 define_id!(OutboxId);
+define_id!(PromptId);
+define_id!(PromptVersionId);
+define_id!(PromptChainId);
+define_id!(PromptChainLinkId);
+define_id!(PromptHistoryId);

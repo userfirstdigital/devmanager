@@ -691,7 +691,12 @@ fn detect_interrupted_partial_schema(
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
                         'agent_sessions', 'artifacts', 'resources', 'event_retention',
-                        'host_admission', 'host_cleanup_branches')",
+                        'host_admission', 'host_cleanup_branches',
+                        'saved_prompts', 'prompt_versions', 'prompt_tags',
+                        'prompt_version_variables',
+                        'prompt_chains', 'prompt_chain_links',
+                        'prompt_chain_command_receipts', 'prompt_chain_events',
+                        'prompt_command_receipts', 'prompt_events')",
         [],
         |row| row.get(0),
     )?;
