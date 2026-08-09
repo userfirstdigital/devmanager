@@ -37,7 +37,7 @@ impl Button {
         variant: ButtonVariant,
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
-        let label = super::interaction::bounded_text(
+        let label = super::interaction::redacted_bounded_text(
             "button label",
             label,
             super::interaction::MAX_ACCESSIBLE_NAME_SCALARS,
@@ -115,7 +115,7 @@ impl Button {
     }
 
     pub fn disable(&mut self, reason: impl Into<String>) -> Result<(), ComponentError> {
-        let reason = super::interaction::bounded_text(
+        let reason = super::interaction::redacted_bounded_text(
             "disabled reason",
             reason,
             super::interaction::MAX_ACCESSIBLE_DESCRIPTION_SCALARS,

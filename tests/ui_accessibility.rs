@@ -419,6 +419,31 @@ fn paste_requires_current_focus_and_preflights_both_limits() {
 }
 
 #[test]
+fn literal_paste_remains_exact_user_data_inside_field_limits() {
+    const PASTED_SECRET_LIKE_DATA: &str = "api_key=UI_LITERAL_PASTE_SECRET_SENTINEL";
+    let mut field = TextField::with_limits(
+        "Preview input",
+        TextFieldLimits::new(
+            PASTED_SECRET_LIKE_DATA.chars().count(),
+            PASTED_SECRET_LIKE_DATA.len(),
+        )
+        .expect("paste limits"),
+    )
+    .expect("text field");
+    let epoch = field.focus_epoch();
+    assert!(field.focus());
+
+    assert!(field
+        .paste(PASTED_SECRET_LIKE_DATA, epoch)
+        .expect("focused paste should be accepted"));
+    assert_eq!(field.value(), PASTED_SECRET_LIKE_DATA);
+    assert_eq!(
+        field.accessibility().value.as_deref(),
+        Some(PASTED_SECRET_LIKE_DATA)
+    );
+}
+
+#[test]
 fn error_boundary_accepts_only_safe_redacted_projection() {
     const SECRET_SENTINEL: &str = "UI_ERROR_BOUNDARY_SECRET_SENTINEL";
     let projection = SafeErrorProjection::new(
@@ -543,4 +568,79 @@ fn error_label_redaction_normalizes_key_separators_without_redacting_unrelated_p
         assert!(!rendered.contains(secret), "rendered error leaked {secret}");
     }
     assert!(rendered.contains("The AccessKeyId field is documented here."));
+}
+
+#[test]
+fn public_component_labels_tooltips_and_accessibility_descriptions_are_redacted() {
+    const SECRET: &str = "UI_PUBLIC_COMPONENT_SECRET_SENTINEL";
+    let label = format!("api_key={SECRET}");
+    let description = format!("credential: {SECRET}");
+
+    let button = Button::new(label.clone(), ActionRequest::TaskList).expect("button");
+    let status = StatusLight::new(StatusMeaning::Warning, label.clone(), description.clone())
+        .expect("status light");
+    let icon_button = IconButton::new(
+        "warning",
+        label.clone(),
+        TooltipContract::new(description.clone(), 250).expect("tooltip"),
+        ActionRequest::TaskList,
+    )
+    .expect("icon button");
+    let mut metadata = AccessibilityMetadata::new(AccessibleRole::Region, label).expect("metadata");
+    metadata.set_description(description).expect("description");
+
+    for value in [
+        button.label(),
+        button.accessibility().name.as_str(),
+        status.label(),
+        status.accessibility().name.as_str(),
+        status.accessibility().description.as_str(),
+        icon_button.tooltip().label.as_str(),
+        icon_button.accessibility().name.as_str(),
+        icon_button.accessibility().description.as_str(),
+        metadata.name.as_str(),
+        metadata.description.as_str(),
+    ] {
+        assert!(!value.contains(SECRET), "public metadata leaked {value:?}");
+        assert!(!value.is_empty());
+    }
+}
+
+#[test]
+fn icon_button_revalidates_public_tooltip_contract_labels() {
+    const SECRET: &str = "UI_PUBLIC_TOOLTIP_SECRET_SENTINEL";
+    let icon_button = IconButton::new(
+        "warning",
+        "Warning",
+        TooltipContract {
+            label: format!("credential: {SECRET}"),
+            delay_ms: 250,
+        },
+        ActionRequest::TaskList,
+    )
+    .expect("icon button should normalize a public tooltip contract");
+
+    assert!(!icon_button.tooltip().label.contains(SECRET));
+    assert!(!icon_button.accessibility().description.contains(SECRET));
+}
+
+#[test]
+fn icon_button_revalidates_public_tooltip_delay() {
+    let error = match IconButton::new(
+        "warning",
+        "Warning",
+        TooltipContract {
+            label: "Warning details".into(),
+            delay_ms: 0,
+        },
+        ActionRequest::TaskList,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("public tooltip contracts must retain the delay invariant"),
+    };
+
+    assert!(matches!(
+        error,
+        ComponentError::InvalidLimit("tooltip delay")
+    ));
 }

@@ -15,19 +15,26 @@ pub struct TooltipContract {
 
 impl TooltipContract {
     pub fn new(label: impl Into<String>, delay_ms: u16) -> Result<Self, ComponentError> {
-        if delay_ms == 0 {
-            return Err(ComponentError::InvalidLimit("tooltip delay"));
-        }
-        Ok(Self {
-            label: super::interaction::bounded_text(
-                "tooltip label",
-                label,
-                super::interaction::MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
-                super::interaction::MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
-            )?,
+        normalize_tooltip(Self {
+            label: label.into(),
             delay_ms,
         })
     }
+}
+
+fn normalize_tooltip(tooltip: TooltipContract) -> Result<TooltipContract, ComponentError> {
+    if tooltip.delay_ms == 0 {
+        return Err(ComponentError::InvalidLimit("tooltip delay"));
+    }
+    Ok(TooltipContract {
+        label: super::interaction::redacted_bounded_text(
+            "tooltip label",
+            tooltip.label,
+            super::interaction::MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+            super::interaction::MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
+        )?,
+        delay_ms: tooltip.delay_ms,
+    })
 }
 
 pub struct IconButton {
@@ -44,6 +51,7 @@ impl IconButton {
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
         let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
+        let tooltip = normalize_tooltip(tooltip)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
         }
@@ -64,6 +72,7 @@ impl IconButton {
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
         let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
+        let tooltip = normalize_tooltip(tooltip)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
         }

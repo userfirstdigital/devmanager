@@ -3,9 +3,10 @@ use devmanager::ui::preview::{
     PreviewPathPolicy, PreviewRequest,
 };
 use devmanager::ui::preview_capture::{
-    active_capture_thread_count, capture_contract, receive_first_frame,
+    active_capture_thread_count, capture_contract, cleanup_output_after_deadline,
+    encode_bgra_png_atomic, receive_first_frame, settle_capture_result,
     settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat, CaptureDeadline,
-    CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
+    CaptureReport, CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
     FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
 };
 use image::GenericImageView;
@@ -96,6 +97,30 @@ fn theme_gallery_fixture_requires_capture_exclusion_semantics() {
 }
 
 #[test]
+fn fixture_display_text_is_redacted_at_the_preview_mapping_boundary() {
+    const SECRET: &str = "UI_PREVIEW_FIXTURE_SECRET_SENTINEL";
+    let (_root, policy) = temporary_policy();
+    let fixture_path = policy.fixture_root().join("redacted-labels.json");
+    let output_path = policy.output_root().join("redacted-labels.png");
+    let fixture = format!(
+        r#"{{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "redacted-labels",
+  "title": "api_key={SECRET}",
+  "capture": {{ "cursor": "excluded", "border": "excluded" }},
+  "root": {{ "kind": "minimal", "label": "credential: {SECRET}" }}
+}}"#
+    );
+    fs::write(&fixture_path, fixture).expect("fixture contents");
+    let request = PreviewRequest::validate(fixture_path, output_path, &policy)
+        .expect("fixture request should validate");
+
+    let preview = PreviewApplication::load(request, &policy).expect("fixture should load");
+    assert!(!preview.root_snapshot().title.contains(SECRET));
+    assert!(!preview.root_snapshot().body.contains(SECRET));
+}
+
+#[test]
 fn first_frame_wait_uses_a_fixed_deadline_and_returns_without_thread_residue() {
     assert_eq!(FIRST_FRAME_DEADLINE, Duration::from_secs(5));
 
@@ -166,10 +191,7 @@ fn settle_cleanup_failure_is_bounded_and_keeps_primary_typed() {
         PreviewCaptureError::CleanupFailed(context)
             if matches!(context.primary(), PreviewCaptureError::CaptureClosed)
             && context.operation() == "stop"
-            && matches!(
-                context.secondary(),
-                PreviewCaptureError::CaptureFailed(message) if message.contains("deadline")
-            )
+            && matches!(context.secondary(), PreviewCaptureError::DeadlineExceeded)
     ));
 
     drop(release_tx);
@@ -255,6 +277,303 @@ fn oversized_multibyte_cleanup_diagnostics_are_utf8_and_exactly_bounded() {
                 && reason.len() == MAX_CLEANUP_DIAGNOSTIC_BYTES
                 && reason.ends_with(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER)
     ));
+}
+
+#[test]
+fn long_secret_like_capture_diagnostics_are_redacted_at_low_and_high_boundaries() {
+    const SECRET: &str = "UI_PREVIEW_CAPTURE_LONG_SECRET_SENTINEL";
+    let message = format!(
+        "capture failed token={SECRET} {}",
+        "x".repeat(MAX_CLEANUP_DIAGNOSTIC_BYTES * 2)
+    );
+    let low = PreviewCaptureError::CaptureFailed(message);
+    let low_rendered = low.to_string();
+    assert!(!low_rendered.contains(SECRET));
+    assert!(low_rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+
+    let high = PreviewError::from_capture_error(low, PathBuf::from("approved.png").as_path());
+    let high_reason = match &high {
+        PreviewError::WindowsGraphicsCaptureFailed { reason } => reason,
+        other => panic!("unexpected mapped error: {other:?}"),
+    };
+    assert!(!high_reason.contains(SECRET));
+    assert!(high_reason.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+    assert!(!high.to_string().contains(SECRET));
+}
+
+#[test]
+fn high_level_preview_paths_and_errors_are_bounded_and_redacted() {
+    const SECRET: &str = "UI_PREVIEW_PATH_SECRET_SENTINEL";
+    let path = PathBuf::from(format!(
+        r"C:\Users\preview-user\api_key={SECRET}\capture.png"
+    ));
+    let oversized_message = format!(
+        "credential={SECRET} {}",
+        "x".repeat(8 * MAX_CLEANUP_DIAGNOSTIC_BYTES)
+    );
+    let errors = [
+        PreviewError::InvalidArgument(oversized_message.clone()),
+        PreviewError::InvalidArgument(format!(
+            "fixture must use the .json extension: {}",
+            path.display()
+        )),
+        PreviewError::OutsideApprovedRoot {
+            path: path.clone(),
+            root_kind: "output",
+        },
+        PreviewError::SensitivePath { path: path.clone() },
+        PreviewError::FixtureMissing { path: path.clone() },
+        PreviewError::FixtureNotRegular { path: path.clone() },
+        PreviewError::FixtureTooLarge {
+            path: path.clone(),
+            bytes: 999,
+            max_bytes: 1,
+        },
+        PreviewError::FixtureIo {
+            path: path.clone(),
+            message: oversized_message.clone(),
+        },
+        PreviewError::MalformedFixture {
+            path: path.clone(),
+            message: oversized_message.clone(),
+        },
+        PreviewError::UnsupportedSchema {
+            path: path.clone(),
+            schema: oversized_message.clone(),
+        },
+        PreviewError::OutputAlreadyExists { path },
+    ];
+
+    for error in errors {
+        let rendered = error.to_string();
+        assert!(
+            rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES,
+            "high-level error exceeded the diagnostic budget: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "high-level error leaked a secret: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_output_extension_diagnostic_omits_the_source_path() {
+    let (_root, policy) = temporary_policy();
+    let output = policy
+        .output_root()
+        .join("nested")
+        .join("output-api_key=UI_OUTPUT_PATH_SECRET_SENTINEL.txt");
+    let error = match PreviewRequest::validate(write_fixture(&policy), output.clone(), &policy) {
+        Err(error) => error,
+        Ok(_) => panic!("a non-PNG output must be rejected"),
+    };
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("output must use the .png extension"));
+    assert!(!rendered.contains(policy.output_root().to_string_lossy().as_ref()));
+    assert!(!rendered.contains("UI_OUTPUT_PATH_SECRET_SENTINEL"));
+    assert!(rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+}
+
+#[test]
+fn diagnostics_redact_a_complete_secret_bearing_line_before_bounding() {
+    const SECRET: &str = "UI_PREVIEW_CAPTURE_PREFIX_SECRET_SENTINEL";
+    let message = format!(
+        "{SECRET} {} token=late-secret",
+        "x".repeat(MAX_CLEANUP_DIAGNOSTIC_BYTES * 2)
+    );
+
+    let rendered = PreviewCaptureError::CaptureFailed(message).to_string();
+
+    assert!(!rendered.contains(SECRET));
+    assert!(rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+}
+
+#[test]
+fn cleanup_timeout_is_reported_as_a_typed_deadline_failure() {
+    let error = settle_capture_with_cleanup(
+        Ok::<_, PreviewCaptureError>(()),
+        CaptureDeadline::from_now(Duration::ZERO),
+        |_| Ok(()),
+    )
+    .expect_err("an expired shared deadline must fail cleanup settlement");
+
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.secondary(), PreviewCaptureError::DeadlineExceeded)
+    ));
+}
+
+#[test]
+fn late_cleanup_remains_owned_after_shared_deadline() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let error = settle_capture_with_cleanup(
+        Err::<(), _>(PreviewCaptureError::DeadlineExceeded),
+        CaptureDeadline::from_now(Duration::ZERO),
+        move |_| {
+            started_tx
+                .send(())
+                .expect("the cleanup probe receiver should remain available");
+            release_rx
+                .recv()
+                .map_err(|_| PreviewCaptureError::DeadlineExceeded)?;
+            finished_tx
+                .send(())
+                .expect("the cleanup worker should remain owned");
+            Ok(())
+        },
+    )
+    .expect_err("an expired deadline must return its cleanup failure");
+
+    assert!(started_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.secondary(), PreviewCaptureError::DeadlineExceeded)
+    ));
+
+    release_tx
+        .send(())
+        .expect("the cleanup worker should be released");
+    finished_rx
+        .recv_timeout(Duration::from_millis(100))
+        .expect("late cleanup must remain owned until it settles");
+    assert_eq!(active_capture_thread_count(), 0);
+}
+
+#[test]
+fn cleanup_worker_panics_are_reported_without_unwinding_the_capture_caller() {
+    let error = settle_capture_with_cleanup(
+        Err::<(), _>(PreviewCaptureError::CaptureClosed),
+        CaptureDeadline::from_now(Duration::from_secs(1)),
+        |_| -> Result<(), PreviewCaptureError> {
+            panic!("capture cleanup worker panic");
+        },
+    )
+    .expect_err("a panicking cleanup worker must remain a typed capture error");
+
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.primary(), PreviewCaptureError::CaptureClosed)
+                && matches!(
+                    context.secondary(),
+                    PreviewCaptureError::CaptureFailed(message)
+                        if message == "cleanup worker stopped without reporting a result"
+                )
+    ));
+}
+
+#[test]
+fn late_output_cleanup_is_owned_and_leaves_no_residue() {
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("late-output.png");
+    fs::write(&output, b"late output").expect("late output fixture");
+
+    let error = cleanup_output_after_deadline(
+        &output,
+        PreviewCaptureError::DeadlineExceeded,
+        CaptureDeadline::from_now(Duration::ZERO),
+    );
+
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.secondary(), PreviewCaptureError::DeadlineExceeded)
+    ));
+    for _ in 0..20 {
+        active_capture_thread_count();
+        if !output.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !output.exists(),
+        "late output cleanup left a published file"
+    );
+}
+
+#[test]
+fn final_capture_settlement_fences_a_late_success_and_cleans_output() {
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("late-success.png");
+    fs::write(&output, b"late success").expect("late output fixture");
+    let report = CaptureReport {
+        width: 1,
+        height: 1,
+        foreground_before: 1,
+        foreground_after: 1,
+    };
+
+    let deadline = CaptureDeadline::from_now(Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(5));
+    let error = settle_capture_result(&output, Ok(report), deadline)
+        .expect_err("a success crossing the deadline must be rejected");
+
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.primary(), PreviewCaptureError::DeadlineExceeded)
+    ));
+    for _ in 0..20 {
+        active_capture_thread_count();
+        if !output.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !output.exists(),
+        "late success left a published file behind"
+    );
+}
+
+#[test]
+fn expired_png_encoding_is_bounded_and_leaves_no_temp_residue() {
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("expired.png");
+    let error = encode_bgra_png_atomic(
+        &output,
+        1,
+        1,
+        &[0x1e, 0x14, 0x0a, 0xff],
+        CaptureDeadline::from_now(Duration::ZERO),
+    )
+    .expect_err("expired PNG encoding must stop at the shared deadline");
+
+    assert!(matches!(error, PreviewCaptureError::DeadlineExceeded));
+    assert!(!output.exists());
+    assert!(fs::read_dir(policy.output_root())
+        .expect("output directory")
+        .next()
+        .is_none());
+}
+
+#[test]
+fn png_dimension_overflow_is_rejected_without_output_or_temp_residue() {
+    let (_root, policy) = temporary_policy();
+    let output = policy.output_root().join("overflow.png");
+    let error = encode_bgra_png_atomic(
+        &output,
+        u32::MAX,
+        u32::MAX,
+        &[],
+        CaptureDeadline::from_now(FIRST_FRAME_DEADLINE),
+    )
+    .expect_err("overflowing dimensions must not enter PNG output");
+
+    assert!(matches!(error, PreviewCaptureError::PngFailed(_)));
+    assert!(!output.exists());
+    assert!(fs::read_dir(policy.output_root())
+        .expect("output directory")
+        .next()
+        .is_none());
 }
 
 #[test]

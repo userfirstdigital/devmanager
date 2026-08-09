@@ -105,6 +105,34 @@ pub fn active_capture_thread_count() -> usize {
     ACTIVE_CAPTURE_THREADS.load(Ordering::SeqCst)
 }
 
+pub(crate) fn bounded_redacted_diagnostic(value: &str) -> String {
+    let mut diagnostic = BoundedDiagnostic::new();
+    diagnostic.write_bounded_text(value);
+    diagnostic.rendered
+}
+
+#[doc(hidden)]
+pub fn cleanup_output_after_deadline(
+    output: &Path,
+    primary: PreviewCaptureError,
+    deadline: CaptureDeadline,
+) -> PreviewCaptureError {
+    let output = output.to_path_buf();
+    let (waiter, result_receiver) = spawn_cleanup_worker(move || match fs::remove_file(output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PreviewCaptureError::OutputFailed(error.to_string())),
+    });
+    match wait_for_worker_result(waiter, result_receiver, deadline) {
+        Ok(()) => primary,
+        Err(error) => PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+            primary,
+            "remove output",
+            error,
+        )),
+    }
+}
+
 struct CaptureCleanupReaper {
     waiter: JoinHandle<()>,
 }
@@ -143,11 +171,12 @@ fn retain_or_join_cleanup_worker(waiter: JoinHandle<()>) {
     }
 }
 
-fn spawn_cleanup_worker<F>(
+fn spawn_cleanup_worker<F, T>(
     cleanup: F,
-) -> (JoinHandle<()>, Receiver<Result<(), PreviewCaptureError>>)
+) -> (JoinHandle<()>, Receiver<Result<T, PreviewCaptureError>>)
 where
-    F: FnOnce() -> Result<(), PreviewCaptureError> + Send + 'static,
+    F: FnOnce() -> Result<T, PreviewCaptureError> + Send + 'static,
+    T: Send + 'static,
 {
     let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
     let waiter = std::thread::Builder::new()
@@ -158,6 +187,54 @@ where
         })
         .expect("capture cleanup worker must be spawnable");
     (waiter, result_receiver)
+}
+
+fn wait_for_worker_result<T>(
+    waiter: JoinHandle<()>,
+    result_receiver: Receiver<Result<T, PreviewCaptureError>>,
+    deadline: CaptureDeadline,
+) -> Result<T, PreviewCaptureError>
+where
+    T: Send + 'static,
+{
+    match deadline.remaining() {
+        Ok(remaining) => match result_receiver.recv_timeout(remaining) {
+            Ok(result) => {
+                let result = match deadline.remaining() {
+                    Ok(_) => result,
+                    Err(error) => Err(error),
+                };
+                retain_or_join_cleanup_worker(waiter);
+                result
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                retain_cleanup_reaper(waiter);
+                Err(PreviewCaptureError::DeadlineExceeded)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if waiter.is_finished() {
+                    let _ = waiter.join();
+                } else {
+                    retain_cleanup_reaper(waiter);
+                }
+                Err(PreviewCaptureError::CaptureFailed(
+                    "cleanup worker stopped without reporting a result".into(),
+                ))
+            }
+        },
+        Err(error) => {
+            retain_cleanup_reaper(waiter);
+            Err(error)
+        }
+    }
+}
+
+fn run_bounded_cleanup<F>(deadline: CaptureDeadline, cleanup: F)
+where
+    F: FnOnce() -> Result<(), PreviewCaptureError> + Send + 'static,
+{
+    let (waiter, result_receiver) = spawn_cleanup_worker(cleanup);
+    let _ = wait_for_worker_result(waiter, result_receiver, deadline);
 }
 
 /// Settles a first-frame result while keeping cleanup ownership if the
@@ -177,36 +254,7 @@ where
         CaptureCleanupOperation::Stop
     };
     let (waiter, result_receiver) = spawn_cleanup_worker(move || cleanup(operation));
-    let cleanup_result = match deadline.remaining() {
-        Ok(remaining) => match result_receiver.recv_timeout(remaining) {
-            Ok(result) => {
-                retain_or_join_cleanup_worker(waiter);
-                result
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                retain_cleanup_reaper(waiter);
-                Err(PreviewCaptureError::CaptureFailed(
-                    "cleanup deadline exceeded before the operation completed".into(),
-                ))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if waiter.is_finished() {
-                    let _ = waiter.join();
-                } else {
-                    retain_cleanup_reaper(waiter);
-                }
-                Err(PreviewCaptureError::CaptureFailed(
-                    "cleanup worker stopped without reporting a result".into(),
-                ))
-            }
-        },
-        Err(_) => {
-            retain_cleanup_reaper(waiter);
-            Err(PreviewCaptureError::CaptureFailed(
-                "cleanup deadline exceeded before cleanup could settle".into(),
-            ))
-        }
-    };
+    let cleanup_result = wait_for_worker_result(waiter, result_receiver, deadline);
 
     match (primary, cleanup_result) {
         (Ok(value), Ok(())) => Ok(value),
@@ -242,6 +290,18 @@ pub struct CaptureReport {
     pub height: u32,
     pub foreground_before: isize,
     pub foreground_after: isize,
+}
+
+#[doc(hidden)]
+pub fn settle_capture_result(
+    output: &Path,
+    result: Result<CaptureReport, PreviewCaptureError>,
+    deadline: CaptureDeadline,
+) -> Result<CaptureReport, PreviewCaptureError> {
+    match deadline.remaining() {
+        Ok(_) => result,
+        Err(error) => Err(cleanup_output_after_deadline(output, error, deadline)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,12 +390,13 @@ impl BoundedDiagnostic {
         let payload_available = MAX_CLEANUP_DIAGNOSTIC_BYTES
             .saturating_sub(self.rendered.len())
             .saturating_sub(CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER.len());
+        let value = crate::ui::components::interaction::redact_sensitive_text(value);
         if value.len() > payload_available {
-            let boundary = utf8_prefix_len(value, payload_available);
+            let boundary = utf8_prefix_len(&value, payload_available);
             self.rendered.push_str(&value[..boundary]);
             self.truncate();
         } else {
-            self.rendered.push_str(value);
+            self.rendered.push_str(&value);
         }
     }
 }
@@ -452,18 +513,51 @@ pub fn receive_first_frame<T>(
     deadline: CaptureDeadline,
 ) -> Result<T, PreviewCaptureError> {
     match receiver.recv_timeout(deadline.remaining()?) {
-        Ok(frame) => Ok(frame),
+        Ok(frame) => {
+            deadline.remaining()?;
+            Ok(frame)
+        }
         Err(RecvTimeoutError::Timeout) => Err(PreviewCaptureError::DeadlineExceeded),
         Err(RecvTimeoutError::Disconnected) => Err(PreviewCaptureError::CaptureClosed),
     }
 }
 
-pub(crate) fn encode_bgra_png_atomic(
+#[doc(hidden)]
+pub fn encode_bgra_png_atomic(
     output: &Path,
     width: u32,
     height: u32,
     bgra: &[u8],
+    deadline: CaptureDeadline,
 ) -> Result<(), PreviewCaptureError> {
+    deadline.remaining()?;
+    let bgra = bgra.to_vec();
+    deadline.remaining()?;
+    encode_bgra_png_atomic_owned(output.to_path_buf(), width, height, bgra, deadline)
+}
+
+fn encode_bgra_png_atomic_owned(
+    output: PathBuf,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+    deadline: CaptureDeadline,
+) -> Result<(), PreviewCaptureError> {
+    deadline.remaining()?;
+    let (waiter, result_receiver) = spawn_cleanup_worker(move || {
+        encode_bgra_png_atomic_sync(&output, width, height, &bgra, deadline)
+    });
+    wait_for_worker_result(waiter, result_receiver, deadline)
+}
+
+fn encode_bgra_png_atomic_sync(
+    output: &Path,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    deadline: CaptureDeadline,
+) -> Result<(), PreviewCaptureError> {
+    deadline.remaining()?;
     let expected_bytes = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -489,10 +583,12 @@ pub(crate) fn encode_bgra_png_atomic(
         })?;
     fs::create_dir_all(parent)
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+    deadline.remaining()?;
 
-    let temp_path = next_temp_path(output, parent)?;
-    let mut temp = TempOutput::new(temp_path.clone());
-    let file = OpenOptions::new()
+    let temp_path = next_temp_path(output, parent, deadline)?;
+    let mut temp = TempOutput::new(temp_path.clone(), output.to_path_buf());
+    deadline.remaining()?;
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
@@ -500,31 +596,45 @@ pub(crate) fn encode_bgra_png_atomic(
 
     let mut rgba = Vec::with_capacity(expected_bytes);
     for pixel in bgra.chunks_exact(4) {
+        deadline.remaining()?;
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
 
     {
-        let encoder = image::codecs::png::PngEncoder::new(file);
+        deadline.remaining()?;
+        let encoder = image::codecs::png::PngEncoder::new(&mut file);
         encoder
             .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
             .map_err(|error| PreviewCaptureError::PngFailed(error.to_string()))?;
     }
 
+    deadline.remaining()?;
+    file.sync_all()
+        .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+    deadline.remaining()?;
+    drop(file);
     if output.exists() {
         return Err(PreviewCaptureError::OutputAlreadyExists);
     }
     fs::rename(&temp_path, output)
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+    temp.renamed = true;
+    deadline.remaining()?;
     temp.committed = true;
     Ok(())
 }
 
-fn next_temp_path(output: &Path, parent: &Path) -> Result<PathBuf, PreviewCaptureError> {
+fn next_temp_path(
+    output: &Path,
+    parent: &Path,
+    deadline: CaptureDeadline,
+) -> Result<PathBuf, PreviewCaptureError> {
     let stem = output
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("preview");
     for _ in 0..32 {
+        deadline.remaining()?;
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{stem}.{counter}.tmp"));
         if !candidate.exists() {
@@ -538,13 +648,17 @@ fn next_temp_path(output: &Path, parent: &Path) -> Result<PathBuf, PreviewCaptur
 
 struct TempOutput {
     path: PathBuf,
+    output: PathBuf,
+    renamed: bool,
     committed: bool,
 }
 
 impl TempOutput {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, output: PathBuf) -> Self {
         Self {
             path,
+            output,
+            renamed: false,
             committed: false,
         }
     }
@@ -552,8 +666,11 @@ impl TempOutput {
 
 impl Drop for TempOutput {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.renamed {
             let _ = fs::remove_file(&self.path);
+        }
+        if self.renamed && !self.committed {
+            let _ = fs::remove_file(&self.output);
         }
     }
 }
@@ -570,7 +687,7 @@ mod windows_capture_impl {
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::mpsc::{self, SyncSender};
     use std::sync::Arc;
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -613,13 +730,13 @@ mod windows_capture_impl {
     }
 
     struct FirstFrameHandler {
-        sender: Sender<Result<CapturedFrame, HandlerError>>,
+        sender: SyncSender<Result<CapturedFrame, HandlerError>>,
         hwnd: NativeHwnd,
     }
 
     impl FirstFrameHandler {
         fn send_error(&self, error: PreviewCaptureError, capture_control: InternalCaptureControl) {
-            let _ = self.sender.send(Err(HandlerError(error)));
+            let _ = self.sender.try_send(Err(HandlerError(error)));
             capture_control.stop();
         }
     }
@@ -629,8 +746,23 @@ mod windows_capture_impl {
 
     impl gpui::Global for CaptureNotificationTask {}
 
+    #[allow(dead_code)]
+    struct CaptureDeadlineTask(gpui::Task<()>);
+
+    impl gpui::Global for CaptureDeadlineTask {}
+
+    fn store_capture_result(
+        slot: &Arc<Mutex<Option<Result<CaptureReport, PreviewCaptureError>>>>,
+        result: Result<CaptureReport, PreviewCaptureError>,
+    ) {
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(result);
+        }
+    }
+
     impl GraphicsCaptureApiHandler for FirstFrameHandler {
-        type Flags = (Sender<Result<CapturedFrame, HandlerError>>, NativeHwnd);
+        type Flags = (SyncSender<Result<CapturedFrame, HandlerError>>, NativeHwnd);
         type Error = HandlerError;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
@@ -682,7 +814,7 @@ mod windows_capture_impl {
                 return Ok(());
             }
 
-            let _ = self.sender.send(Ok(CapturedFrame {
+            let _ = self.sender.try_send(Ok(CapturedFrame {
                 width,
                 height,
                 bgra,
@@ -694,19 +826,24 @@ mod windows_capture_impl {
         fn on_closed(&mut self) -> Result<(), Self::Error> {
             let _ = self
                 .sender
-                .send(Err(HandlerError(PreviewCaptureError::CaptureClosed)));
+                .try_send(Err(HandlerError(PreviewCaptureError::CaptureClosed)));
             Ok(())
         }
     }
 
     struct CaptureControlGuard {
         control: Option<CaptureControl<FirstFrameHandler, HandlerError>>,
+        deadline: CaptureDeadline,
     }
 
     impl CaptureControlGuard {
-        fn new(control: CaptureControl<FirstFrameHandler, HandlerError>) -> Self {
+        fn new(
+            control: CaptureControl<FirstFrameHandler, HandlerError>,
+            deadline: CaptureDeadline,
+        ) -> Self {
             Self {
                 control: Some(control),
+                deadline,
             }
         }
 
@@ -729,14 +866,14 @@ mod windows_capture_impl {
             let Some(control) = self.control.take() else {
                 return;
             };
-            let (waiter, _result_receiver) = spawn_cleanup_worker(move || {
+            let deadline = self.deadline;
+            run_bounded_cleanup(deadline, move || {
                 control.stop().map_err(|error| {
                     PreviewCaptureError::CaptureFailed(format!(
                         "capture guard drop cleanup: {error}"
                     ))
                 })
             });
-            retain_cleanup_reaper(waiter);
         }
     }
 
@@ -786,8 +923,18 @@ mod windows_capture_impl {
         active: ActiveCaptureGuard,
     }
 
+    fn cleanup_started_capture_after_enqueue_failure(started: StartedCapture) {
+        let StartedCapture { control, active } = started;
+        let deadline = control.deadline;
+        run_bounded_cleanup(deadline, move || {
+            let result = control.cleanup(CaptureCleanupOperation::Stop);
+            drop(active);
+            result
+        });
+    }
+
     type CaptureSettings = Settings<
-        (Sender<Result<CapturedFrame, HandlerError>>, NativeHwnd),
+        (SyncSender<Result<CapturedFrame, HandlerError>>, NativeHwnd),
         windows_capture::window::Window,
     >;
 
@@ -805,13 +952,12 @@ mod windows_capture_impl {
                 match result {
                     Ok(control) => {
                         let started = StartedCapture {
-                            control: CaptureControlGuard::new(control),
+                            control: CaptureControlGuard::new(control, deadline),
                             active,
                         };
                         if let Err(error) = result_sender.send(Ok(started)) {
                             if let Ok(started) = error.0 {
-                                let _ = started.control.cleanup(CaptureCleanupOperation::Stop);
-                                drop(started.active);
+                                cleanup_started_capture_after_enqueue_failure(started);
                             }
                         }
                     }
@@ -827,7 +973,14 @@ mod windows_capture_impl {
             Ok(remaining) => match result_receiver.recv_timeout(remaining) {
                 Ok(result) => {
                     retain_or_join_cleanup_worker(waiter);
-                    result
+                    if let Err(error) = deadline.remaining() {
+                        if let Ok(started) = result {
+                            drop(started);
+                        }
+                        Err(error)
+                    } else {
+                        result
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     retain_cleanup_reaper(waiter);
@@ -990,7 +1143,7 @@ mod windows_capture_impl {
         let _validated = validate_native_window(hwnd)?;
         deadline.remaining()?;
         let contract = capture_contract();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let settings = Settings::new(
             windows_capture::window::Window::from_raw_hwnd(hwnd.as_ptr()),
             match contract.cursor {
@@ -1030,8 +1183,16 @@ mod windows_capture_impl {
             });
         }
         deadline.remaining()?;
-        encode_bgra_png_atomic(&output, frame.width, frame.height, &frame.bgra)?;
-        deadline.remaining()?;
+        encode_bgra_png_atomic_owned(
+            output.clone(),
+            frame.width,
+            frame.height,
+            frame.bgra,
+            deadline,
+        )?;
+        if let Err(error) = deadline.remaining() {
+            return Err(cleanup_output_after_deadline(&output, error, deadline));
+        }
         Ok(CaptureReport {
             width: frame.width,
             height: frame.height,
@@ -1054,10 +1215,34 @@ mod windows_capture_impl {
         let hwnd_for_window = Rc::clone(&hwnd_slot);
         let result_for_window = Arc::clone(&result_for_app);
         let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
+        deadline.remaining()?;
+        let output_for_cleanup = output.clone();
 
         let run_result = catch_unwind(AssertUnwindSafe(|| {
             application.run(move |cx| {
                 crate::ui::preview::register_preview_environment(cx);
+                let result_for_supervisor = Arc::clone(&result_for_app);
+                let supervisor_executor = cx.background_executor().clone();
+                let supervision_task = cx.spawn(async move |cx| {
+                    supervisor_executor
+                        .timer(deadline.remaining().unwrap_or_default())
+                        .await;
+                    let should_quit = {
+                        let mut result = result_for_supervisor
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if result.is_none() {
+                            *result = Some(Err(PreviewCaptureError::DeadlineExceeded));
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_quit {
+                        let _ = cx.update(|cx| cx.quit());
+                    }
+                });
+                cx.set_global(CaptureDeadlineTask(supervision_task));
                 let root_entity = cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -1082,7 +1267,7 @@ mod windows_capture_impl {
                         match hwnd_from_gpui_window(window) {
                             Ok(hwnd) => *hwnd_for_window.borrow_mut() = Some(hwnd),
                             Err(error) => {
-                                let _ = result_for_window.lock().unwrap().replace(Err(error));
+                                store_capture_result(&result_for_window, Err(error));
                             }
                         }
                         cx.new(|_| root)
@@ -1093,19 +1278,21 @@ mod windows_capture_impl {
                     Ok(_) => match *hwnd_slot.borrow() {
                         Some(hwnd) => hwnd,
                         None => {
-                            let _ = result_for_app.lock().unwrap().replace(Err(
-                                PreviewCaptureError::ApplicationFailed(
+                            store_capture_result(
+                                &result_for_app,
+                                Err(PreviewCaptureError::ApplicationFailed(
                                     "GPUI did not expose a Windows HWND".into(),
-                                ),
-                            ));
+                                )),
+                            );
                             cx.quit();
                             return;
                         }
                     },
                     Err(error) => {
-                        let _ = result_for_app.lock().unwrap().replace(Err(
-                            PreviewCaptureError::ApplicationFailed(error.to_string()),
-                        ));
+                        store_capture_result(
+                            &result_for_app,
+                            Err(PreviewCaptureError::ApplicationFailed(error.to_string())),
+                        );
                         cx.quit();
                         return;
                     }
@@ -1116,18 +1303,28 @@ mod windows_capture_impl {
                 }
 
                 if let Err(error) = configure_native_window(hwnd, foreground_before, deadline) {
-                    let _ = result_for_app.lock().unwrap().replace(Err(error));
+                    store_capture_result(&result_for_app, Err(error));
                     cx.quit();
                     return;
                 }
 
                 let result_for_task = Arc::clone(&result_for_app);
+                let output_for_late_cleanup = output.clone();
                 let capture_task = cx.background_executor().spawn(async move {
                     capture_window_once(hwnd, output, foreground_before, deadline)
                 });
                 let notification_task = cx.spawn(async move |cx| {
                     let result = capture_task.await;
-                    let _ = result_for_task.lock().unwrap().replace(result);
+                    let result = if deadline.remaining().is_err() {
+                        Err(cleanup_output_after_deadline(
+                            &output_for_late_cleanup,
+                            PreviewCaptureError::DeadlineExceeded,
+                            deadline,
+                        ))
+                    } else {
+                        result
+                    };
+                    store_capture_result(&result_for_task, result);
                     let _ = cx.update(|cx| cx.quit());
                 });
                 cx.set_global(CaptureNotificationTask(notification_task));
@@ -1135,8 +1332,17 @@ mod windows_capture_impl {
         }));
 
         if run_result.is_err() {
-            return Err(PreviewCaptureError::ApplicationFailed(
-                "the visible GPUI preview could not start on this desktop".into(),
+            let error = if deadline.remaining().is_err() {
+                PreviewCaptureError::DeadlineExceeded
+            } else {
+                PreviewCaptureError::ApplicationFailed(
+                    "the visible GPUI preview could not start on this desktop".into(),
+                )
+            };
+            return Err(cleanup_output_after_deadline(
+                &output_for_cleanup,
+                error,
+                deadline,
             ));
         }
         let result = match result_slot.lock().unwrap().take() {
@@ -1148,7 +1354,7 @@ mod windows_capture_impl {
                 Err(error) => Err(error),
             },
         };
-        result
+        settle_capture_result(&output_for_cleanup, result, deadline)
     }
 
     trait NativeHwndExt {
@@ -1188,4 +1394,36 @@ pub fn foreground_hwnd() -> isize {
 #[cfg(not(windows))]
 pub fn validate_native_window(_hwnd: NativeHwnd) -> Result<ValidatedWindow, PreviewCaptureError> {
     Err(PreviewCaptureError::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn bounded_enqueue_cleanup_returns_at_the_deadline_and_reaps_late_worker() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started_at = Instant::now();
+
+        run_bounded_cleanup(CaptureDeadline::from_now(Duration::ZERO), move || {
+            started_tx.send(()).expect("cleanup worker should start");
+            release_rx
+                .recv()
+                .map_err(|_| PreviewCaptureError::DeadlineExceeded)?;
+            finished_tx.send(()).expect("cleanup worker should finish");
+            Ok(())
+        });
+
+        assert!(started_at.elapsed() < Duration::from_millis(300));
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("the cleanup worker must be owned after an enqueue stall");
+        release_tx.send(()).expect("release late cleanup worker");
+        finished_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("late enqueue cleanup must eventually settle");
+    }
 }

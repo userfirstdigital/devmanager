@@ -276,7 +276,13 @@ impl PreviewRequest {
         height: u32,
         bgra: &[u8],
     ) -> Result<(), preview_capture::PreviewCaptureError> {
-        preview_capture::encode_bgra_png_atomic(&self.output_path, width, height, bgra)
+        preview_capture::encode_bgra_png_atomic(
+            &self.output_path,
+            width,
+            height,
+            bgra,
+            preview_capture::CaptureDeadline::from_now(preview_capture::FIRST_FRAME_DEADLINE),
+        )
     }
 
     pub fn validate(
@@ -301,7 +307,7 @@ impl PreviewRequest {
         if fixture_path.extension().and_then(OsStr::to_str) != Some("json") {
             return Err(PreviewError::InvalidArgument(format!(
                 "fixture must use the .json extension: {}",
-                fixture_path.display()
+                safe_preview_path(&fixture_path)
             )));
         }
         match fs::metadata(&fixture_path) {
@@ -345,7 +351,7 @@ impl PreviewRequest {
         if output_path.extension().and_then(OsStr::to_str) != Some("png") {
             return Err(PreviewError::InvalidArgument(format!(
                 "output must use the .png extension: {}",
-                output_path.display()
+                safe_preview_path(&output_path)
             )));
         }
         if output_path.exists() {
@@ -512,6 +518,27 @@ impl PreviewApplication {
             });
         }
 
+        let title = crate::ui::components::interaction::redacted_bounded_text(
+            "preview title",
+            fixture.title,
+            crate::ui::components::interaction::MAX_ACCESSIBLE_NAME_SCALARS,
+            crate::ui::components::interaction::MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )
+        .map_err(|_| PreviewError::MalformedFixture {
+            path: request.fixture_path.clone(),
+            message: "preview title is empty, oversized, or unsafe".into(),
+        })?;
+        let root_label = crate::ui::components::interaction::redacted_bounded_text(
+            "preview root label",
+            fixture.root.label,
+            crate::ui::components::interaction::MAX_ACCESSIBLE_NAME_SCALARS,
+            crate::ui::components::interaction::MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )
+        .map_err(|_| PreviewError::MalformedFixture {
+            path: request.fixture_path.clone(),
+            message: "preview root label is empty, oversized, or unsafe".into(),
+        })?;
+
         let component_gallery = match (fixture.root.kind.as_str(), fixture.root.gallery) {
             ("minimal", None) => None,
             ("minimal", Some(_)) => {
@@ -545,8 +572,8 @@ impl PreviewApplication {
 
         let root_snapshot = PreviewRootSnapshot {
             fixture_id: fixture.id,
-            body: format!("{}: {}", fixture.root.label, fixture.title),
-            title: fixture.title,
+            body: format!("{root_label}: {title}"),
+            title,
             component_gallery,
         };
         Ok(Self {
@@ -847,6 +874,18 @@ fn is_sensitive_path(path: &Path) -> bool {
     })
 }
 
+fn safe_preview_path(path: &Path) -> String {
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "<path>".into());
+    preview_capture::bounded_redacted_diagnostic(&label)
+}
+
+fn bounded_preview_error(message: String) -> String {
+    preview_capture::bounded_redacted_diagnostic(&message)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureUnavailableKind {
     UnsupportedPlatform,
@@ -977,16 +1016,16 @@ impl PreviewError {
             }
             preview_capture::PreviewCaptureError::CaptureFailed(message) => {
                 Self::WindowsGraphicsCaptureFailed {
-                    reason: message.to_owned(),
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
                 }
             }
             preview_capture::PreviewCaptureError::ApplicationFailed(message) => {
                 Self::ApplicationFailed {
-                    reason: message.to_owned(),
+                    reason: preview_capture::bounded_redacted_diagnostic(message),
                 }
             }
             preview_capture::PreviewCaptureError::PngFailed(message) => Self::PngFailed {
-                reason: message.to_owned(),
+                reason: preview_capture::bounded_redacted_diagnostic(message),
             },
             preview_capture::PreviewCaptureError::OutputAlreadyExists => {
                 Self::OutputAlreadyExists {
@@ -994,7 +1033,7 @@ impl PreviewError {
                 }
             }
             preview_capture::PreviewCaptureError::OutputFailed(message) => Self::OutputFailed {
-                reason: message.to_owned(),
+                reason: preview_capture::bounded_redacted_diagnostic(message),
             },
             preview_capture::PreviewCaptureError::ForegroundChanged { before, after } => {
                 Self::ForegroundChanged {
@@ -1011,7 +1050,9 @@ impl PreviewError {
                 Self::CaptureCleanupFailed {
                     primary: Box::new(primary),
                     operation: context.operation(),
-                    reason: context.secondary().to_string(),
+                    reason: preview_capture::bounded_redacted_diagnostic(
+                        &context.secondary().to_string(),
+                    ),
                 }
             }
         }
@@ -1021,79 +1062,88 @@ impl PreviewError {
 impl Display for PreviewError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) => write!(f, "{message}\n{PREVIEW_USAGE}"),
-            Self::InvalidArgument(message) => f.write_str(message),
+            Self::Usage(message) => f.write_str(&bounded_preview_error(format!(
+                "{message}\n{PREVIEW_USAGE}"
+            ))),
+            Self::InvalidArgument(message) => f.write_str(&bounded_preview_error(message.clone())),
             Self::OutsideApprovedRoot { path, root_kind } => {
-                write!(
-                    f,
+                f.write_str(&bounded_preview_error(format!(
                     "{root_kind} path is outside approved roots: {}",
-                    path.display()
-                )
+                    safe_preview_path(path)
+                )))
             }
-            Self::SensitivePath { path } => {
-                write!(f, "sensitive production path refused: {}", path.display())
-            }
-            Self::FixtureMissing { path } => {
-                write!(f, "fixture does not exist: {}", path.display())
-            }
-            Self::FixtureNotRegular { path } => {
-                write!(f, "fixture is not a regular file: {}", path.display())
-            }
+            Self::SensitivePath { path } => f.write_str(&bounded_preview_error(format!(
+                "sensitive production path refused: {}",
+                safe_preview_path(path)
+            ))),
+            Self::FixtureMissing { path } => f.write_str(&bounded_preview_error(format!(
+                "fixture does not exist: {}",
+                safe_preview_path(path)
+            ))),
+            Self::FixtureNotRegular { path } => f.write_str(&bounded_preview_error(format!(
+                "fixture is not a regular file: {}",
+                safe_preview_path(path)
+            ))),
             Self::FixtureTooLarge {
                 path,
                 bytes,
                 max_bytes,
-            } => write!(
-                f,
+            } => f.write_str(&bounded_preview_error(format!(
                 "fixture is too large ({} bytes; max {}): {}",
                 bytes,
                 max_bytes,
-                path.display()
-            ),
-            Self::FixtureIo { path, message } => {
-                write!(f, "fixture I/O failed for {}: {message}", path.display())
+                safe_preview_path(path)
+            ))),
+            Self::FixtureIo { path, message } => f.write_str(&bounded_preview_error(format!(
+                "fixture I/O failed for {}: {message}",
+                safe_preview_path(path)
+            ))),
+            Self::MalformedFixture { path, message } => f.write_str(&bounded_preview_error(
+                format!("malformed fixture {}: {message}", safe_preview_path(path)),
+            )),
+            Self::UnsupportedSchema { path, schema } => {
+                f.write_str(&bounded_preview_error(format!(
+                    "unsupported fixture schema {schema} in {}",
+                    safe_preview_path(path)
+                )))
             }
-            Self::MalformedFixture { path, message } => {
-                write!(f, "malformed fixture {}: {message}", path.display())
-            }
-            Self::UnsupportedSchema { path, schema } => write!(
-                f,
-                "unsupported fixture schema {schema} in {}",
-                path.display()
-            ),
-            Self::OutputAlreadyExists { path } => write!(
-                f,
+            Self::OutputAlreadyExists { path } => f.write_str(&bounded_preview_error(format!(
                 "refusing to overwrite existing output: {}",
-                path.display()
-            ),
-            Self::HeadlessInitializationFailed => {
-                f.write_str("headless preview initialization did not complete")
-            }
+                safe_preview_path(path)
+            ))),
+            Self::HeadlessInitializationFailed => f.write_str(&bounded_preview_error(
+                "headless preview initialization did not complete".into(),
+            )),
             Self::VisibleWindowsCaptureUnavailable { kind, reason } => {
-                write!(
-                    f,
+                f.write_str(&bounded_preview_error(format!(
                     "visible Windows preview capture unavailable ({kind:?}): {reason}"
-                )
+                )))
             }
-            Self::PngFailed { reason } => write!(f, "PNG encoding failed: {reason}"),
-            Self::OutputFailed { reason } => write!(f, "PNG output failed: {reason}"),
-            Self::ForegroundChanged { before, after } => write!(
-                f,
-                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
-            ),
-            Self::ApplicationFailed { reason } => {
-                write!(f, "GPUI preview application failed: {reason}")
+            Self::PngFailed { reason } => f.write_str(&bounded_preview_error(format!(
+                "PNG encoding failed: {reason}"
+            ))),
+            Self::OutputFailed { reason } => f.write_str(&bounded_preview_error(format!(
+                "PNG output failed: {reason}"
+            ))),
+            Self::ForegroundChanged { before, after } => {
+                f.write_str(&bounded_preview_error(format!(
+                    "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
+                )))
             }
-            Self::WindowsGraphicsCaptureFailed { reason } => {
-                write!(f, "Windows Graphics Capture failed: {reason}")
-            }
+            Self::ApplicationFailed { reason } => f.write_str(&bounded_preview_error(format!(
+                "GPUI preview application failed: {reason}"
+            ))),
+            Self::WindowsGraphicsCaptureFailed { reason } => f.write_str(&bounded_preview_error(
+                format!("Windows Graphics Capture failed: {reason}"),
+            )),
             Self::CaptureCleanupFailed {
                 primary,
                 operation,
                 reason,
-            } => {
-                write!(f, "{primary}; cleanup {operation} failed: {reason}")
-            }
+            } => f.write_str(&bounded_preview_error(format!(
+                "{primary}; cleanup {operation} failed: {}",
+                reason
+            ))),
         }
     }
 }

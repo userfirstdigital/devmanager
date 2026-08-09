@@ -260,3 +260,76 @@ production profile, AppData/config/session state, installed DevManager, merge,
 push, install, or reviewer was used. Final process-idle verification must show
 no owned Cargo/rustc/test-harness/`devmanager-next` child; any pre-existing
 installed DevManager process is reported separately and left untouched.
+
+## Resume correction after the expired wrapper (2026-08-09)
+
+Base remained `48a65ab`. The continuation preserved the eight-file UI/capture
+diff and stayed within its established blockers. It added no second preview or
+capture path and did not run the installed product, touch production profiles,
+AppData/session state, or use network/merge/push/install operations.
+
+### TDD RED evidence
+
+The exact serial focused commands used the required target and environment:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\Temp\devmanager-phase5-ui-fix'
+$env:CARGO_BUILD_JOBS='1'
+$env:CARGO_INCREMENTAL='0'
+$env:CARGO_PROFILE_DEV_DEBUG='0'
+cargo test --locked --test ui_preview_capture -- --nocapture
+cargo test --locked --test ui_accessibility -- --nocapture
+```
+
+- The saved preview-capture implementation first ran `25 passed, 0 failed,
+  1 ignored`.
+- Accessibility then produced the expected compile RED at
+  `tests/ui_accessibility.rs:638`: `IconButton` does not implement `Debug`
+  because the new tooltip invariant assertion used `Result::expect_err`.
+  The test was kept strict with an explicit `match`; no public `Debug` API was
+  added.
+- The new output-extension path regression first ran `25 passed, 1 failed,
+  1 ignored`, proving the raw `output_path.display()` diagnostic leak.
+- After the basename-safe output path correction, the same regression exposed
+  a hyphen-prefixed credential redaction miss; the redactor boundary was then
+  corrected so `output-api_key=...` and common `--api-key=...` forms are safe.
+
+### GREEN evidence and correction
+
+The final serial focused results were:
+
+- `cargo test --locked --test ui_preview_capture -- --nocapture` — `26 passed,
+  0 failed, 1 ignored`; the ignored test is the manual VM visual matrix.
+- `cargo test --locked --test ui_accessibility -- --nocapture` — `22 passed,
+  0 failed, 0 ignored`.
+- `cargo fmt --all -- --check` — passed.
+- `git diff --check` — passed; only Git's normal LF-to-CRLF warnings were
+  emitted for the eight owned files.
+
+The complete-diff review covered all eight owned files. The final correction
+keeps high-level diagnostics bounded and basename-only for source paths,
+redacts secret-bearing values at capture and public accessibility boundaries,
+keeps the single absolute five-second deadline through capture/PNG/result and
+late cleanup settlement, uses bounded sync channels with atomic temp output
+cleanup, and revalidates public tooltip contracts in both IconButton
+constructors.
+
+The exact target process/harness query after verification reported
+`OWNED_RESIDUE_COUNT=0` for Cargo, rustc/rustdoc, focused harnesses, and
+`devmanager-next` processes whose command lines referenced this worktree or
+`C:\Temp\devmanager-phase5-ui-fix`. The visible capture test also removed its
+sentinel output and asserted `active_capture_thread_count() == 0`.
+
+### Deferred gate
+
+The only deferred gate remains the intentionally ignored external VM matrix:
+100%, 125%, 150%, and 200% DPI, compositor occlusion, and minimized/closed
+preview transitions. No claim is made for that visual/VM matrix here.
+
+### Changed files in this continuation
+
+Implementation/test scope remains the original eight files:
+
+`src/ui/components/{button,icon_button,interaction,status_light}.rs`,
+`src/ui/{preview,preview_capture}.rs`, and
+`tests/{ui_accessibility,ui_preview_capture}.rs`.

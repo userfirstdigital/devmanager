@@ -1,6 +1,9 @@
 //! Noninteractive semantic status indicator.
 
-use super::interaction::{status_tokens, AccessibilityMetadata, AccessibleRole, ComponentError};
+use super::interaction::{
+    redacted_bounded_text, status_tokens, AccessibilityMetadata, AccessibleRole, ComponentError,
+    MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
+};
 use crate::ui::tokens::{Color, StatusMeaning, ThemeTokens};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,9 +27,18 @@ impl StatusLight {
         label: impl Into<String>,
         description: impl Into<String>,
     ) -> Result<Self, ComponentError> {
-        let label = super::interaction::bounded_text("status label", label, 256, 1024)?;
-        let description =
-            super::interaction::bounded_text("status description", description, 512, 2048)?;
+        let label = redacted_bounded_text(
+            "status label",
+            label,
+            MAX_ACCESSIBLE_NAME_SCALARS,
+            MAX_ACCESSIBLE_NAME_SCALARS * 4,
+        )?;
+        let description = redacted_bounded_text(
+            "status description",
+            description,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
+            MAX_ACCESSIBLE_DESCRIPTION_SCALARS * 4,
+        )?;
         let mut accessibility = AccessibilityMetadata::new(AccessibleRole::Status, label.clone())?;
         accessibility.set_description(description.clone())?;
         Ok(Self {

@@ -176,10 +176,14 @@ pub(crate) fn redacted_bounded_text(
     max_scalars: usize,
     max_bytes: usize,
 ) -> Result<String, ComponentError> {
-    let value = bounded_text(field, value, max_scalars, max_bytes)?;
-    let value = crate::diagnostics::runner::redact_secrets(&value);
-    let value = redact_ui_credential_lines(&value);
+    let value = value.into();
+    let value = redact_sensitive_text(&value);
     bounded_text(field, value, max_scalars, max_bytes)
+}
+
+pub(crate) fn redact_sensitive_text(value: &str) -> String {
+    let value = crate::diagnostics::runner::redact_secrets(value);
+    redact_ui_credential_lines(&value)
 }
 
 fn redact_ui_credential_lines(value: &str) -> String {
@@ -203,7 +207,7 @@ fn contains_ui_credential_marker(value: &str) -> bool {
     for (start, _) in value.char_indices() {
         if start > 0 {
             let previous = value[..start].chars().next_back().unwrap_or_default();
-            if previous.is_ascii_alphanumeric() || matches!(previous, '_' | '-') {
+            if previous.is_ascii_alphanumeric() || previous == '_' {
                 continue;
             }
         }
@@ -353,7 +357,7 @@ impl AccessibilityMetadata {
     pub fn new(role: AccessibleRole, name: impl Into<String>) -> Result<Self, ComponentError> {
         Ok(Self {
             role,
-            name: bounded_text(
+            name: redacted_bounded_text(
                 "accessible name",
                 name,
                 MAX_ACCESSIBLE_NAME_SCALARS,
@@ -374,7 +378,7 @@ impl AccessibilityMetadata {
         &mut self,
         description: impl Into<String>,
     ) -> Result<(), ComponentError> {
-        self.description = bounded_text(
+        self.description = redacted_bounded_text(
             "accessible description",
             description,
             MAX_ACCESSIBLE_DESCRIPTION_SCALARS,
