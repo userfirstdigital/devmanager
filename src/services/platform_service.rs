@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, OsStr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
@@ -10,6 +11,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+use crate::process::ports::TcpEndpointRecord;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,18 +23,35 @@ const CREATE_SUSPENDED: u32 = 0x00000004;
 pub const MANAGED_PROCESS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
 pub fn snapshot_listener_pids(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
+    let endpoints = snapshot_listener_endpoints(ports)?;
+    let mut listeners = BTreeMap::new();
+    for (port, rows) in endpoints {
+        let pids = listeners.entry(port).or_insert_with(Vec::new);
+        for row in rows {
+            if !pids.contains(&row.pid()) {
+                pids.push(row.pid());
+            }
+        }
+        pids.sort_unstable();
+    }
+    Ok(listeners)
+}
+
+pub fn snapshot_listener_endpoints(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     if ports.is_empty() {
         return Ok(BTreeMap::new());
     }
 
     #[cfg(windows)]
     {
-        snapshot_listener_pids_windows(ports)
+        snapshot_listener_endpoints_windows(ports)
     }
 
     #[cfg(not(windows))]
     {
-        snapshot_listener_pids_with_lsof(ports)
+        snapshot_listener_endpoints_with_lsof(ports)
     }
 }
 
@@ -43,23 +62,25 @@ pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
 }
 
 #[cfg(windows)]
-fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
+fn snapshot_listener_endpoints_windows(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
     let mut listeners = BTreeMap::new();
-    collect_windows_listener_pids(AF_INET, &filter, &mut listeners)?;
-    collect_windows_listener_pids(AF_INET6, &filter, &mut listeners)?;
-    for pids in listeners.values_mut() {
-        pids.sort_unstable();
-        pids.dedup();
+    collect_windows_listener_endpoints(AF_INET, &filter, &mut listeners)?;
+    collect_windows_listener_endpoints(AF_INET6, &filter, &mut listeners)?;
+    for rows in listeners.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
     }
     Ok(listeners)
 }
 
 #[cfg(windows)]
-fn collect_windows_listener_pids(
+fn collect_windows_listener_endpoints(
     address_family: u32,
     filter: &HashSet<u16>,
-    listeners: &mut BTreeMap<u16, Vec<u32>>,
+    listeners: &mut BTreeMap<u16, Vec<TcpEndpointRecord>>,
 ) -> Result<(), String> {
     let mut size = 0u32;
     let first = unsafe {
@@ -111,9 +132,17 @@ fn collect_windows_listener_pids(
             for row in rows {
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    let pids = listeners.entry(port).or_default();
-                    if !pids.contains(&row.dw_owning_pid) {
-                        pids.push(row.dw_owning_pid);
+                    let rows = listeners.entry(port).or_default();
+                    rows.push(TcpEndpointRecord::tcp(
+                        IpAddr::V4(Ipv4Addr::from(row.dw_local_addr.to_be())),
+                        port,
+                        row.dw_owning_pid,
+                    ));
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!(
+                            "listener endpoint count exceeds {}",
+                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
+                        ));
                     }
                 }
             }
@@ -130,9 +159,17 @@ fn collect_windows_listener_pids(
             for row in rows {
                 let port = windows_port(row.dw_local_port);
                 if filter.contains(&port) {
-                    let pids = listeners.entry(port).or_default();
-                    if !pids.contains(&row.dw_owning_pid) {
-                        pids.push(row.dw_owning_pid);
+                    let rows = listeners.entry(port).or_default();
+                    rows.push(TcpEndpointRecord::tcp(
+                        IpAddr::V6(Ipv6Addr::from(row.uc_local_addr)),
+                        port,
+                        row.dw_owning_pid,
+                    ));
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!(
+                            "listener endpoint count exceeds {}",
+                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
+                        ));
                     }
                 }
             }
@@ -144,7 +181,9 @@ fn collect_windows_listener_pids(
 }
 
 #[cfg(not(windows))]
-fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u32>>, String> {
+fn snapshot_listener_endpoints_with_lsof(
+    ports: &[u16],
+) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
     let output = Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
@@ -167,13 +206,17 @@ fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u
                 let Some(pid) = current_pid else {
                     continue;
                 };
-                let Some(port) = parse_lsof_listener_port(value) else {
+                let Some(endpoint) = parse_lsof_listener_endpoint(value, pid) else {
                     continue;
                 };
-                if filter.contains(&port) {
-                    let pids = listeners.entry(port).or_default();
-                    if !pids.contains(&pid) {
-                        pids.push(pid);
+                if filter.contains(&endpoint.port()) {
+                    let rows = listeners.entry(endpoint.port()).or_default();
+                    rows.push(endpoint);
+                    if rows.len() > crate::process::ports::MAX_ENDPOINTS_PER_SCAN {
+                        return Err(format!(
+                            "listener endpoint count exceeds {}",
+                            crate::process::ports::MAX_ENDPOINTS_PER_SCAN
+                        ));
                     }
                 }
             }
@@ -181,15 +224,15 @@ fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<BTreeMap<u16, Vec<u
         }
     }
 
-    for pids in listeners.values_mut() {
-        pids.sort_unstable();
-        pids.dedup();
+    for rows in listeners.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
     }
     Ok(listeners)
 }
 
 #[cfg(not(windows))]
-fn parse_lsof_listener_port(value: &str) -> Option<u16> {
+fn parse_lsof_listener_endpoint(value: &str, pid: u32) -> Option<TcpEndpointRecord> {
     let endpoint = value
         .trim()
         .split("->")
@@ -197,8 +240,19 @@ fn parse_lsof_listener_port(value: &str) -> Option<u16> {
         .unwrap_or(value)
         .trim_end_matches(" (LISTEN)")
         .trim();
-    let port_text = endpoint.rsplit(':').next()?.trim();
-    port_text.parse::<u16>().ok()
+    let (address, port_text) = if let Some(endpoint) = endpoint.strip_prefix('[') {
+        let (address, port_text) = endpoint.split_once("]:")?;
+        (address, port_text)
+    } else {
+        endpoint.rsplit_once(':')?
+    };
+    let port = port_text.trim().parse::<u16>().ok()?;
+    let address = match address.trim() {
+        "*" | "0.0.0.0" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        "[::]" | "*:*" => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        address => address.parse().ok()?,
+    };
+    Some(TcpEndpointRecord::tcp(address, port, pid))
 }
 
 #[cfg(windows)]

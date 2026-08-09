@@ -7,12 +7,82 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
 use crate::process::identity::ManagedProcessId;
 use crate::process::registry::{ManagedProcessState, ProcessRegistry};
+
+pub const MAX_PORTS_PER_SCAN: usize = 256;
+pub const MAX_ENDPOINTS_PER_SCAN: usize = 4096;
+pub const MAX_SCAN_ERRORS: usize = 64;
+pub const MAX_SCAN_WAITERS: usize = 64;
+pub const DEFAULT_FREE_PROOF_MAX_AGE: Duration = Duration::from_secs(5);
+pub const DEFAULT_MEMBERSHIP_MAX_AGE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+pub struct ScanCancellation {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl ScanCancellation {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortScanError {
+    TimedOut,
+    Cancelled,
+    Shutdown,
+    TooManyPorts { actual: usize, max: usize },
+    QueueFull { actual: usize, max: usize },
+    Scan(String),
+}
+
+impl fmt::Display for PortScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(formatter, "port inventory scan timed out"),
+            Self::Cancelled => write!(formatter, "port inventory scan was cancelled"),
+            Self::Shutdown => write!(formatter, "port inventory is shut down"),
+            Self::TooManyPorts { actual, max } => {
+                write!(
+                    formatter,
+                    "port inventory request has {actual} ports; maximum is {max}"
+                )
+            }
+            Self::QueueFull { actual, max } => write!(
+                formatter,
+                "port inventory has {actual} queued requests; maximum is {max}"
+            ),
+            Self::Scan(detail) => write!(formatter, "port inventory scan failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for PortScanError {}
 
 const MAX_PORT_DETAIL_CHARS: usize = 256;
 const MAX_LISTENER_IDENTITY_DISPLAY_CHARS: usize = 2048;
@@ -37,6 +107,13 @@ fn bounded_sanitized_detail(detail: &str) -> String {
     sanitized
 }
 
+fn normalized_ports(ports: impl IntoIterator<Item = u16>) -> Vec<u16> {
+    let mut ports = ports.into_iter().collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn listener_identity_display(listeners: &[ListenerIdentity]) -> String {
     let mut display = String::new();
     for (index, listener) in listeners.iter().enumerate() {
@@ -56,6 +133,141 @@ fn listener_identity_display(listeners: &[ListenerIdentity]) -> String {
         display.push_str(&identity);
     }
     display
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TcpProtocol {
+    Tcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TcpAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+/// A raw listener-table row before process creation time is captured.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TcpEndpointRecord {
+    protocol: TcpProtocol,
+    family: TcpAddressFamily,
+    bind_address: IpAddr,
+    port: u16,
+    pid: u32,
+}
+
+impl TcpEndpointRecord {
+    pub fn tcp(bind_address: IpAddr, port: u16, pid: u32) -> Self {
+        Self {
+            protocol: TcpProtocol::Tcp,
+            family: if bind_address.is_ipv4() {
+                TcpAddressFamily::Ipv4
+            } else {
+                TcpAddressFamily::Ipv6
+            },
+            bind_address,
+            port,
+            pid,
+        }
+    }
+
+    pub fn protocol(&self) -> TcpProtocol {
+        self.protocol
+    }
+
+    pub fn family(&self) -> TcpAddressFamily {
+        self.family
+    }
+
+    pub fn bind_address(&self) -> IpAddr {
+        self.bind_address
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn is_ipv4(&self) -> bool {
+        self.bind_address.is_ipv4()
+    }
+
+    pub fn is_ipv6(&self) -> bool {
+        self.bind_address.is_ipv6()
+    }
+
+    pub fn is_wildcard(&self) -> bool {
+        self.bind_address.is_unspecified()
+    }
+}
+
+/// One listener endpoint after the PID-plus-creation identity was captured.
+///
+/// Keeping the protocol, family, and bind address is important: an IPv4
+/// wildcard and an IPv6 wildcard are separate rows, and a dual-stack port can
+/// contain both managed and unrelated endpoint identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TcpEndpoint {
+    protocol: TcpProtocol,
+    family: TcpAddressFamily,
+    bind_address: IpAddr,
+    port: u16,
+    identity: ListenerIdentity,
+}
+
+impl TcpEndpoint {
+    pub fn tcp(bind_address: IpAddr, port: u16, identity: ListenerIdentity) -> Self {
+        Self {
+            protocol: TcpProtocol::Tcp,
+            family: if bind_address.is_ipv4() {
+                TcpAddressFamily::Ipv4
+            } else {
+                TcpAddressFamily::Ipv6
+            },
+            bind_address,
+            port,
+            identity,
+        }
+    }
+
+    pub fn from_record(record: &TcpEndpointRecord, identity: ListenerIdentity) -> Self {
+        Self::tcp(record.bind_address, record.port, identity)
+    }
+
+    pub fn protocol(self) -> TcpProtocol {
+        self.protocol
+    }
+
+    pub fn family(self) -> TcpAddressFamily {
+        self.family
+    }
+
+    pub fn bind_address(self) -> IpAddr {
+        self.bind_address
+    }
+
+    pub fn port(self) -> u16 {
+        self.port
+    }
+
+    pub fn identity(self) -> ListenerIdentity {
+        self.identity
+    }
+
+    pub fn is_ipv4(self) -> bool {
+        self.bind_address.is_ipv4()
+    }
+
+    pub fn is_ipv6(self) -> bool {
+        self.bind_address.is_ipv6()
+    }
+
+    pub fn is_wildcard(self) -> bool {
+        self.bind_address.is_unspecified()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -144,22 +356,98 @@ impl PortObservation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortObservationIssue {
+    /// The listener table changed during identity capture and must be retried.
+    ReconciliationFault(String),
+    /// A process identity or table read was denied/unavailable.
+    ProbeError(String),
+}
+
+impl PortObservationIssue {
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::ReconciliationFault(detail) | Self::ProbeError(detail) => detail,
+        }
+    }
+}
+
 /// An immutable, batched result of one listener-table probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortInventorySnapshot {
     observations: Arc<BTreeMap<u16, PortObservation>>,
+    endpoints: Arc<BTreeMap<u16, Arc<[TcpEndpoint]>>>,
+    issues: Arc<BTreeMap<u16, PortObservationIssue>>,
+    requested_ports: Arc<[u16]>,
+    observed_at: Instant,
+    publication_sequence: u64,
+    endpoint_count: usize,
+    error_count: usize,
 }
 
 impl PortInventorySnapshot {
     pub fn new(observations: BTreeMap<u16, PortObservation>) -> Self {
+        Self::from_parts(
+            observations,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Instant::now(),
+        )
+    }
+
+    pub fn with_endpoints(
+        observations: BTreeMap<u16, PortObservation>,
+        endpoints: BTreeMap<u16, Vec<TcpEndpoint>>,
+    ) -> Self {
+        let endpoints = endpoints
+            .into_iter()
+            .map(|(port, mut values)| {
+                values.sort_unstable();
+                values.dedup();
+                (port, Arc::from(values.into_boxed_slice()))
+            })
+            .collect();
+        Self::from_parts(observations, endpoints, BTreeMap::new(), Instant::now())
+    }
+
+    pub fn from_parts(
+        observations: BTreeMap<u16, PortObservation>,
+        endpoints: BTreeMap<u16, Arc<[TcpEndpoint]>>,
+        issues: BTreeMap<u16, PortObservationIssue>,
+        observed_at: Instant,
+    ) -> Self {
+        let requested_ports = normalized_ports(observations.keys().copied());
+        let endpoint_count = endpoints.values().map(|values| values.len()).sum();
+        let observation_error_count = observations
+            .values()
+            .filter(|observation| matches!(observation, PortObservation::ProbeError(_)))
+            .count();
+        let issue_only_error_count = issues
+            .iter()
+            .filter(|(port, issue)| {
+                matches!(
+                    issue,
+                    PortObservationIssue::ReconciliationFault(_)
+                        | PortObservationIssue::ProbeError(_)
+                ) && !matches!(observations.get(port), Some(PortObservation::ProbeError(_)))
+            })
+            .count();
+        let error_count = observation_error_count + issue_only_error_count;
         Self {
             observations: Arc::new(observations),
+            endpoints: Arc::new(endpoints),
+            issues: Arc::new(issues),
+            requested_ports: Arc::from(requested_ports.into_boxed_slice()),
+            observed_at,
+            publication_sequence: 0,
+            endpoint_count,
+            error_count,
         }
     }
 
     pub fn probe_failure(ports: impl IntoIterator<Item = u16>, detail: impl Into<String>) -> Self {
         let detail = bounded_sanitized_detail(&detail.into());
-        let observations = ports
+        let observations = normalized_ports(ports)
             .into_iter()
             .map(|port| (port, PortObservation::ProbeError(detail.clone())))
             .collect();
@@ -172,6 +460,57 @@ impl PortInventorySnapshot {
 
     pub fn observations(&self) -> &BTreeMap<u16, PortObservation> {
         &self.observations
+    }
+
+    pub fn endpoints(&self, port: u16) -> &[TcpEndpoint] {
+        self.endpoints.get(&port).map_or(&[], Arc::as_ref)
+    }
+
+    pub fn issue(&self, port: u16) -> Option<&PortObservationIssue> {
+        self.issues.get(&port)
+    }
+
+    pub fn issues(&self) -> &BTreeMap<u16, PortObservationIssue> {
+        &self.issues
+    }
+
+    pub fn requested_ports(&self) -> &[u16] {
+        &self.requested_ports
+    }
+
+    pub fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+
+    pub fn publication_sequence(&self) -> u64 {
+        self.publication_sequence
+    }
+
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoint_count
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    pub fn is_exactly_for(&self, ports: &[u16]) -> bool {
+        self.requested_ports.as_ref() == normalized_ports(ports.iter().copied()).as_slice()
+    }
+
+    pub fn is_fresh_at(&self, now: Instant, max_age: Duration) -> bool {
+        now.checked_duration_since(self.observed_at)
+            .is_some_and(|age| age <= max_age)
+    }
+
+    pub fn with_observed_at(mut self, observed_at: Instant) -> Self {
+        self.observed_at = observed_at;
+        self
+    }
+
+    pub fn with_publication_sequence(mut self, publication_sequence: u64) -> Self {
+        self.publication_sequence = publication_sequence;
+        self
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u16, &PortObservation)> {
@@ -212,6 +551,9 @@ pub enum PortStatusKind {
     /// The listener identity is a member of the exact managed generation,
     /// but application-level readiness evidence is not available yet.
     ManagedUnready,
+    /// A valid registry snapshot proves the listener is outside the managed
+    /// generation. This is distinct from an occupied/unverified listener.
+    ProvenExternal,
     /// A listener exists, but this projection cannot prove ownership by the
     /// requested resource generation. Control must remain fail-closed.
     Occupied,
@@ -251,14 +593,125 @@ impl PortStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedProcessSnapshotValidity {
+    Valid,
+    Stale,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryMembershipSnapshot {
+    membership_revision: u64,
+    observation_sequence: u64,
+    observed_at: Instant,
+    max_age: Duration,
+    validity: ManagedProcessSnapshotValidity,
+    detail: Option<String>,
+}
+
+impl RegistryMembershipSnapshot {
+    pub fn valid(
+        membership_revision: u64,
+        observation_sequence: u64,
+        observed_at: Instant,
+        max_age: Duration,
+    ) -> Self {
+        Self {
+            membership_revision,
+            observation_sequence,
+            observed_at,
+            max_age,
+            validity: ManagedProcessSnapshotValidity::Valid,
+            detail: None,
+        }
+    }
+
+    pub fn stale(
+        membership_revision: u64,
+        observation_sequence: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            membership_revision,
+            observation_sequence,
+            observed_at,
+            max_age: Duration::ZERO,
+            validity: ManagedProcessSnapshotValidity::Stale,
+            detail: Some("membership observation is stale".to_string()),
+        }
+    }
+
+    pub fn failed(
+        membership_revision: u64,
+        observation_sequence: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            membership_revision,
+            observation_sequence,
+            observed_at: Instant::now(),
+            max_age: Duration::ZERO,
+            validity: ManagedProcessSnapshotValidity::Failed,
+            detail: Some(bounded_sanitized_detail(&detail.into())),
+        }
+    }
+
+    pub fn membership_revision(&self) -> u64 {
+        self.membership_revision
+    }
+
+    pub fn observation_sequence(&self) -> u64 {
+        self.observation_sequence
+    }
+
+    pub fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+
+    pub fn validity(&self) -> ManagedProcessSnapshotValidity {
+        self.validity
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    pub fn is_fresh_at(&self, now: Instant) -> bool {
+        self.validity == ManagedProcessSnapshotValidity::Valid
+            && self.membership_revision > 0
+            && self.observation_sequence > 0
+            && now
+                .checked_duration_since(self.observed_at)
+                .is_some_and(|age| age <= self.max_age)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedResourceSnapshot {
     resource: ResourceFence,
     state: ManagedProcessState,
     members: Arc<[ManagedProcessId]>,
+    membership: RegistryMembershipSnapshot,
 }
 
 impl ManagedResourceSnapshot {
+    pub fn new(
+        resource: ResourceFence,
+        state: ManagedProcessState,
+        mut members: Vec<ManagedProcessId>,
+        membership: RegistryMembershipSnapshot,
+    ) -> Self {
+        members.sort_unstable_by_key(|identity| (identity.pid(), identity.creation_time_100ns()));
+        members.dedup();
+        Self {
+            resource,
+            state,
+            members: Arc::from(members.into_boxed_slice()),
+            membership,
+        }
+    }
+
     pub fn resource(&self) -> ResourceFence {
         self.resource
     }
@@ -279,8 +732,45 @@ impl ManagedResourceSnapshot {
         &self.members
     }
 
+    pub fn membership_revision(&self) -> u64 {
+        self.membership.membership_revision()
+    }
+
+    pub fn observation_sequence(&self) -> u64 {
+        self.membership.observation_sequence()
+    }
+
+    pub fn observed_at(&self) -> Instant {
+        self.membership.observed_at()
+    }
+
+    pub fn validity(&self) -> ManagedProcessSnapshotValidity {
+        self.membership.validity()
+    }
+
+    pub fn membership(&self) -> &RegistryMembershipSnapshot {
+        &self.membership
+    }
+
+    pub fn is_fresh_at(&self, now: Instant) -> bool {
+        self.membership.is_fresh_at(now)
+    }
+
     fn owns(&self, listener: ListenerIdentity) -> bool {
         self.members.contains(&listener.managed_id())
+    }
+
+    fn shares_pid(&self, listener: ListenerIdentity) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.pid() == listener.pid())
+    }
+
+    fn ownership_confident_at(&self, now: Instant) -> bool {
+        matches!(
+            self.state,
+            ManagedProcessState::Starting | ManagedProcessState::Running
+        ) && self.is_fresh_at(now)
     }
 }
 
@@ -292,6 +782,18 @@ impl ManagedResourceSnapshot {
 pub fn registered_resource_snapshot<J>(
     registry: &ProcessRegistry<J>,
     resource: ResourceFence,
+) -> Option<ManagedResourceSnapshot> {
+    registered_resource_snapshot_with_membership(
+        registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), DEFAULT_MEMBERSHIP_MAX_AGE),
+    )
+}
+
+pub fn registered_resource_snapshot_with_membership<J>(
+    registry: &ProcessRegistry<J>,
+    resource: ResourceFence,
+    membership: RegistryMembershipSnapshot,
 ) -> Option<ManagedResourceSnapshot> {
     let current = registry.current(resource.resource_id)?;
     if current.fence() != resource {
@@ -309,11 +811,161 @@ pub fn registered_resource_snapshot<J>(
     members.sort_unstable_by_key(|identity| (identity.pid(), identity.creation_time_100ns()));
     members.dedup();
 
-    Some(ManagedResourceSnapshot {
+    let membership = if current.unknown_member_pids().is_empty() {
+        membership
+    } else {
+        RegistryMembershipSnapshot::failed(
+            membership.membership_revision(),
+            membership.observation_sequence(),
+            format!(
+                "{} managed Job member PIDs have unverified identity",
+                current.unknown_member_pids().len()
+            ),
+        )
+    };
+
+    Some(ManagedResourceSnapshot::new(
         resource,
-        state: current.state(),
-        members: Arc::from(members.into_boxed_slice()),
-    })
+        current.state(),
+        members,
+        membership,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortAuthority {
+    Managed,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+}
+
+fn classify_listener_authority(
+    listeners: &[ListenerIdentity],
+    managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+) -> PortAuthority {
+    if listeners.is_empty() {
+        return PortAuthority::Free;
+    }
+    let Some(managed) = managed else {
+        return PortAuthority::Unknown;
+    };
+    if !managed.is_fresh_at(now) {
+        return PortAuthority::Unknown;
+    }
+
+    let any_owned = listeners.iter().any(|listener| managed.owns(*listener));
+    let all_owned = listeners.iter().all(|listener| managed.owns(*listener));
+    if managed.ownership_confident_at(now) {
+        if all_owned {
+            PortAuthority::Managed
+        } else if any_owned
+            || listeners
+                .iter()
+                .any(|listener| managed.shares_pid(*listener))
+        {
+            // A PID reuse or a managed/external mixture is a reconciliation
+            // fault. It is not safe to paint it green or external blue.
+            PortAuthority::Unknown
+        } else {
+            PortAuthority::ProvenExternal
+        }
+    } else if any_owned
+        || listeners
+            .iter()
+            .any(|listener| managed.shares_pid(*listener))
+    {
+        PortAuthority::Unknown
+    } else {
+        PortAuthority::ProvenExternal
+    }
+}
+
+pub fn classify_port_authority(
+    observation: &PortObservation,
+    managed: Option<&ManagedResourceSnapshot>,
+) -> PortAuthority {
+    match observation {
+        PortObservation::Free => PortAuthority::Free,
+        PortObservation::ProbeError(_) => PortAuthority::ProbeError,
+        PortObservation::Listeners(listeners) => {
+            classify_listener_authority(listeners, managed, Instant::now())
+        }
+    }
+}
+
+pub fn classify_port_authority_from_snapshot(
+    target: &PortTarget,
+    snapshot: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+) -> PortAuthority {
+    let Some(observation) = snapshot.observation(target.port) else {
+        return PortAuthority::ProbeError;
+    };
+    match snapshot.issue(target.port) {
+        Some(PortObservationIssue::ProbeError(_)) => return PortAuthority::ProbeError,
+        Some(PortObservationIssue::ReconciliationFault(_)) => return PortAuthority::Unknown,
+        None => {}
+    }
+    if matches!(observation, PortObservation::ProbeError(_)) {
+        return PortAuthority::ProbeError;
+    }
+    if let Some(managed) = managed {
+        if managed.resource() != target.resource {
+            return PortAuthority::Unknown;
+        }
+    }
+    let listeners = if snapshot.endpoints(target.port).is_empty() {
+        observation.listeners().to_vec()
+    } else {
+        let mut endpoint_listeners = snapshot
+            .endpoints(target.port)
+            .iter()
+            .map(|endpoint| endpoint.identity())
+            .collect::<Vec<_>>();
+        endpoint_listeners.sort_unstable();
+        endpoint_listeners.dedup();
+        let mut observed_listeners = observation.listeners().to_vec();
+        observed_listeners.sort_unstable();
+        if endpoint_listeners != observed_listeners {
+            return PortAuthority::Unknown;
+        }
+        endpoint_listeners
+    };
+    classify_listener_authority(&listeners, managed, Instant::now())
+}
+
+fn status_for_authority(
+    target: &PortTarget,
+    listeners: Arc<[ListenerIdentity]>,
+    authority: PortAuthority,
+    managed: Option<&ManagedResourceSnapshot>,
+) -> PortStatus {
+    let kind = match authority {
+        PortAuthority::Free => PortStatusKind::Stopped,
+        PortAuthority::ProbeError => PortStatusKind::ProbeError,
+        PortAuthority::ProvenExternal => PortStatusKind::ProvenExternal,
+        PortAuthority::Unknown => PortStatusKind::Occupied,
+        PortAuthority::Managed => {
+            if managed.is_some_and(|resource| {
+                resource.state() == ManagedProcessState::Running
+                    && target.health == ManagedPortHealth::Ready
+            }) {
+                PortStatusKind::ManagedHealthy
+            } else {
+                PortStatusKind::ManagedUnready
+            }
+        }
+    };
+    PortStatus {
+        port: target.port,
+        resource: target.resource,
+        kind,
+        listeners,
+        error: None,
+    }
 }
 
 pub fn project_port_status(
@@ -321,6 +973,7 @@ pub fn project_port_status(
     observation: &PortObservation,
     managed: Option<&ManagedResourceSnapshot>,
 ) -> PortStatus {
+    let managed = managed.filter(|resource| resource.resource() == target.resource);
     if !matches!(observation, PortObservation::ProbeError(_))
         && managed.is_some_and(|resource| {
             resource.resource() == target.resource
@@ -337,13 +990,9 @@ pub fn project_port_status(
     }
 
     match observation {
-        PortObservation::Free => PortStatus {
-            port: target.port,
-            resource: target.resource,
-            kind: PortStatusKind::Stopped,
-            listeners: Arc::from([]),
-            error: None,
-        },
+        PortObservation::Free => {
+            status_for_authority(target, Arc::from([]), PortAuthority::Free, managed)
+        }
         PortObservation::ProbeError(detail) => PortStatus {
             port: target.port,
             resource: target.resource,
@@ -352,40 +1001,8 @@ pub fn project_port_status(
             error: Some(bounded_sanitized_detail(detail)),
         },
         PortObservation::Listeners(listeners) => {
-            let exact_owner = managed.filter(|resource| resource.resource() == target.resource);
-            let all_listeners_owned = exact_owner.is_some_and(|resource| {
-                !listeners.is_empty() && listeners.iter().all(|listener| resource.owns(*listener))
-            });
-            if all_listeners_owned
-                && exact_owner.is_some_and(|resource| {
-                    resource.state() == ManagedProcessState::Running
-                        && target.health == ManagedPortHealth::Ready
-                })
-            {
-                PortStatus {
-                    port: target.port,
-                    resource: target.resource,
-                    kind: PortStatusKind::ManagedHealthy,
-                    listeners: listeners.clone(),
-                    error: None,
-                }
-            } else if all_listeners_owned {
-                PortStatus {
-                    port: target.port,
-                    resource: target.resource,
-                    kind: PortStatusKind::ManagedUnready,
-                    listeners: listeners.clone(),
-                    error: None,
-                }
-            } else {
-                PortStatus {
-                    port: target.port,
-                    resource: target.resource,
-                    kind: PortStatusKind::Occupied,
-                    listeners: listeners.clone(),
-                    error: None,
-                }
-            }
+            let authority = classify_listener_authority(listeners, managed, Instant::now());
+            status_for_authority(target, listeners.clone(), authority, managed)
         }
     }
 }
@@ -406,12 +1023,47 @@ pub fn project_port_status_from_snapshot(
             )),
         };
     };
-    project_port_status(target, observation, managed)
+    if !matches!(observation, PortObservation::ProbeError(_))
+        && managed.is_some_and(|resource| {
+            resource.resource() == target.resource
+                && resource.state() == ManagedProcessState::Starting
+        })
+    {
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::Starting,
+            listeners: Arc::from(observation.listeners()),
+            error: None,
+        };
+    }
+    if let Some(PortObservationIssue::ProbeError(detail)) = snapshot.issue(target.port) {
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::ProbeError,
+            listeners: Arc::from(observation.listeners()),
+            error: Some(bounded_sanitized_detail(detail)),
+        };
+    }
+    let authority = classify_port_authority_from_snapshot(target, snapshot, managed);
+    status_for_authority(
+        target,
+        Arc::from(observation.listeners()),
+        authority,
+        managed,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortStartError {
     NotScanned {
+        port: u16,
+    },
+    NotExactSnapshot {
+        port: u16,
+    },
+    StaleProof {
         port: u16,
     },
     ProbeFailed {
@@ -434,6 +1086,14 @@ impl fmt::Display for PortStartError {
             Self::NotScanned { port } => {
                 write!(formatter, "port {port} has no cached listener observation")
             }
+            Self::NotExactSnapshot { port } => write!(
+                formatter,
+                "port {port} has no exact single-port free proof; a partial snapshot cannot authorize launch"
+            ),
+            Self::StaleProof { port } => write!(
+                formatter,
+                "port {port} has a stale free proof; a fresh listener observation is required"
+            ),
             Self::ProbeFailed { port, detail } => {
                 write!(
                     formatter,
@@ -462,34 +1122,61 @@ impl std::error::Error for PortStartError {}
 ///
 /// This function has no process-control capability. In particular, a
 /// listener is reported with evidence and is never assigned, adopted,
-/// signaled, or killed as part of the rejection.
+/// signaled, or killed as part of the rejection. The proof must be a fresh,
+/// exact single-port snapshot; a later bind race is left to the launch path.
 pub fn ensure_managed_start_allowed(
     snapshot: &PortInventorySnapshot,
     port: u16,
 ) -> Result<(), PortStartError> {
     match snapshot.observation(port) {
         None => Err(PortStartError::NotScanned { port }),
-        Some(PortObservation::Free) => Ok(()),
+        Some(_) if !snapshot.is_exactly_for(&[port]) => {
+            Err(PortStartError::NotExactSnapshot { port })
+        }
+        Some(_) if !snapshot.is_fresh_at(Instant::now(), DEFAULT_FREE_PROOF_MAX_AGE) => {
+            Err(PortStartError::StaleProof { port })
+        }
+        Some(_) if snapshot.issue(port).is_some() => Err(PortStartError::ProbeFailed {
+            port,
+            detail: snapshot
+                .issue(port)
+                .expect("issue checked above")
+                .detail()
+                .to_string(),
+        }),
+        Some(PortObservation::Free) if snapshot.endpoints(port).is_empty() => Ok(()),
+        Some(PortObservation::Free) => Err(PortStartError::ProbeFailed {
+            port,
+            detail: "free observation retained endpoint evidence".to_string(),
+        }),
         Some(PortObservation::ProbeError(detail)) => Err(PortStartError::ProbeFailed {
             port,
             detail: detail.clone(),
         }),
-        Some(PortObservation::Listeners(listeners)) => match listeners.as_ref() {
-            [listener] => Err(PortStartError::Occupied {
-                port,
-                listener: *listener,
-            }),
-            _ => Err(PortStartError::OccupiedAmbiguous {
-                port,
-                listeners: listeners.clone(),
-            }),
-        },
+        Some(PortObservation::Listeners(listeners)) => {
+            if let Some(issue) = snapshot.issue(port) {
+                return Err(PortStartError::ProbeFailed {
+                    port,
+                    detail: issue.detail().to_string(),
+                });
+            }
+            match listeners.as_ref() {
+                [listener] => Err(PortStartError::Occupied {
+                    port,
+                    listener: *listener,
+                }),
+                _ => Err(PortStartError::OccupiedAmbiguous {
+                    port,
+                    listeners: listeners.clone(),
+                }),
+            }
+        }
     }
 }
 
 /// Invoke a managed launch only after the immutable inventory proved the port
 /// free. The callback is never evaluated for a missing, occupied, ambiguous,
-/// or failed observation.
+/// stale, partial, or failed observation.
 pub fn launch_if_port_free<T>(
     snapshot: &PortInventorySnapshot,
     port: u16,
