@@ -18,9 +18,9 @@ use devmanager::protocol::{
     ClientHello, ClientHelloError, ClientRequest, DetachAck, DetachRequest, FrameLimitField,
     FrameLimits, FrameLimitsError, MessagePackCodec, MessagePackError, MessagePackLengthKind,
     PhysicalFrameCodec, PhysicalFrameError, ProfileFingerprint, ProtocolVersion, ServerMessage,
-    StreamFrame, StreamKey, StreamPayloadKind, VersionNegotiationError, MAX_CLIENT_BUILD_BYTES,
-    MAX_MESSAGEPACK_COLLECTION_ITEMS, MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    StreamFrame, StreamKey, StreamPayloadKind, VersionNegotiationError, MAX_CHUNK_BYTES,
+    MAX_CLIENT_BUILD_BYTES, MAX_CURSOR_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
+    MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -5065,14 +5065,68 @@ fn protocol_chunk(
     accepted: &[&[u8]],
     resume_cursor: Option<Vec<u8>>,
 ) -> ChunkFrame {
-    ChunkFrame {
+    ChunkFrame::new(
         transfer_id,
         index,
         final_chunk,
-        payload: payload.to_vec(),
-        cumulative_sha256: protocol_sha256(accepted),
+        payload.to_vec(),
+        protocol_sha256(accepted),
         resume_cursor,
-    }
+    )
+    .expect("valid chunk")
+}
+
+#[test]
+fn chunk_frame_constructor_checks_hard_shape_and_exposes_read_only_fields() {
+    let transfer_id = protocol_transfer_id(0xa0);
+    let hash = protocol_sha256(&[b"payload"]);
+    let limits = ChunkLimits::v1_default();
+
+    assert!(ChunkFrame::new(transfer_id, 0, true, vec![], hash, None).is_err());
+    assert!(ChunkFrame::new(
+        transfer_id,
+        0,
+        true,
+        vec![0; MAX_CHUNK_BYTES as usize + 1],
+        hash,
+        None,
+    )
+    .is_err());
+    assert!(ChunkFrame::new(
+        transfer_id,
+        0,
+        true,
+        b"payload".to_vec(),
+        hash,
+        Some(vec![]),
+    )
+    .is_err());
+    assert!(ChunkFrame::new(
+        transfer_id,
+        0,
+        true,
+        b"payload".to_vec(),
+        hash,
+        Some(vec![0; MAX_CURSOR_BYTES as usize + 1]),
+    )
+    .is_err());
+
+    let frame = ChunkFrame::new(
+        transfer_id,
+        7,
+        true,
+        b"payload".to_vec(),
+        hash,
+        Some(b"cursor".to_vec()),
+    )
+    .expect("valid frame");
+    assert_eq!(frame.transfer_id(), transfer_id);
+    assert_eq!(frame.index(), 7);
+    assert!(frame.final_chunk());
+    assert_eq!(frame.payload(), b"payload");
+    assert_eq!(frame.cumulative_sha256(), hash);
+    assert_eq!(frame.resume_cursor(), Some(&b"cursor"[..]));
+    frame.validate(limits).expect("valid frame shape");
 }
 
 #[test]
@@ -5126,12 +5180,12 @@ fn chunk_wire_shape_is_named_binary_and_canonical() {
         future_field: bool,
     }
     let unknown = UnknownChunk {
-        transfer_id: frame.transfer_id,
-        index: frame.index,
-        final_chunk: frame.final_chunk,
-        payload: frame.payload.clone(),
-        cumulative_sha256: frame.cumulative_sha256,
-        resume_cursor: frame.resume_cursor.clone(),
+        transfer_id: frame.transfer_id(),
+        index: frame.index(),
+        final_chunk: frame.final_chunk(),
+        payload: frame.payload().to_vec(),
+        cumulative_sha256: frame.cumulative_sha256(),
+        resume_cursor: frame.resume_cursor().map(ToOwned::to_owned),
         future_field: true,
     };
     assert!(codec
@@ -5139,12 +5193,12 @@ fn chunk_wire_shape_is_named_binary_and_canonical() {
         .is_err());
 
     let positional = rmp_serde::to_vec(&(
-        frame.transfer_id,
-        frame.index,
-        frame.final_chunk,
-        frame.payload,
-        frame.cumulative_sha256,
-        frame.resume_cursor,
+        frame.transfer_id(),
+        frame.index(),
+        frame.final_chunk(),
+        frame.payload(),
+        frame.cumulative_sha256(),
+        frame.resume_cursor(),
     ))
     .unwrap();
     assert!(codec.decode::<ChunkFrame>(&positional).is_err());
@@ -5234,8 +5288,10 @@ fn chunk_context_poisoned_after_hash_index_and_context_failures() {
     let payload = b"payload";
 
     let mut bad_hash = ChunkContext::new(transfer_id, limits, None).unwrap();
-    let mut hash_frame = protocol_chunk(transfer_id, 0, false, payload, &[payload], None);
-    hash_frame.cumulative_sha256[0] ^= 1;
+    let mut wrong_hash = protocol_sha256(&[payload]);
+    wrong_hash[0] ^= 1;
+    let hash_frame = ChunkFrame::new(transfer_id, 0, false, payload.to_vec(), wrong_hash, None)
+        .expect("shape-valid frame");
     assert!(bad_hash.accept(&hash_frame).is_err());
     assert!(bad_hash.is_poisoned());
     assert!(bad_hash
@@ -5313,7 +5369,7 @@ fn chunk_context_poisoned_after_hash_index_and_context_failures() {
 }
 
 #[test]
-fn chunk_context_requires_final_and_rejects_post_final() {
+fn chunk_context_requires_final_poisoning_is_permanent() {
     let transfer_id = protocol_transfer_id(0xa5);
     let mut context = ChunkContext::new(transfer_id, ChunkLimits::v1_default(), None).unwrap();
     let payload = b"terminal";
@@ -5327,15 +5383,33 @@ fn chunk_context_requires_final_and_rejects_post_final() {
         context.require_complete().is_err(),
         "final chunk is required"
     );
-
-    let final_payload = b"done";
-    context
+    assert!(context.is_poisoned());
+    assert!(!context.is_complete());
+    assert!(context
         .accept(&protocol_chunk(
             transfer_id,
             1,
             true,
-            final_payload,
-            &[payload, final_payload],
+            b"done",
+            &[payload, b"done"],
+            None,
+        ))
+        .is_err());
+    assert!(!context.is_complete());
+}
+
+#[test]
+fn chunk_context_rejecting_post_final_frame_fails_closed() {
+    let transfer_id = protocol_transfer_id(0xa6);
+    let payload = b"terminal";
+    let mut context = ChunkContext::new(transfer_id, ChunkLimits::v1_default(), None).unwrap();
+    context
+        .accept(&protocol_chunk(
+            transfer_id,
+            0,
+            true,
+            payload,
+            &[payload],
             None,
         ))
         .expect("final chunk");
@@ -5343,14 +5417,15 @@ fn chunk_context_requires_final_and_rejects_post_final() {
     assert!(context
         .accept(&protocol_chunk(
             transfer_id,
-            2,
+            1,
             true,
             b"late",
-            &[payload, final_payload, b"late"],
+            &[payload, b"late"],
             None,
         ))
         .is_err());
     assert!(context.is_poisoned());
+    assert!(!context.is_complete());
 }
 
 #[test]

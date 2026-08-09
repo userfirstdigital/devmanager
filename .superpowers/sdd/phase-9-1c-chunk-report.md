@@ -6,14 +6,16 @@ Implemented only the Phase 1 protocol chunk primitive. Connect schema, envelope,
 and transport remain untouched.
 
 - `src/protocol/chunk.rs`: strict named MessagePack `ChunkFrame`, negotiated
-  `ChunkLimits`, and incremental poisoned `ChunkContext`.
+  `ChunkLimits`, and incremental poisoned `ChunkContext`; `ChunkFrame` now has
+  private fields, checked construction/accessors, and serialization-time shape
+  validation, while completion failures remain permanently fail-closed.
 - `src/protocol/mod.rs`: public protocol exports only.
-- `tests/protocol_contract.rs`: six focused chunk contract tests.
+- `tests/protocol_contract.rs`: eight focused chunk contract tests.
 
 ## Proof
 
-RED was observed first: the focused test target failed because the three new
-protocol exports did not yet exist.
+RED was observed first: the focused test target failed because the new checked
+constructor/accessors did not yet exist.
 
 GREEN command:
 
@@ -21,7 +23,7 @@ GREEN command:
 CARGO_TARGET_DIR=C:\Temp\devmanager-phase91-chunk cargo test --test protocol_contract chunk_ -- --nocapture
 ```
 
-Result: 6 passed, 0 failed, 42 filtered out.
+Result: 8 passed, 0 failed, 42 filtered out.
 
 The tests cover the six-field canonical map and binary fields, unknown and
 positional rejection, limit negotiation/fail-closed validation, cumulative

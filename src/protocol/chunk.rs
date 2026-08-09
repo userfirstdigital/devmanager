@@ -374,31 +374,75 @@ impl<'de> Deserialize<'de> for ChunkLimitsField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkFrame {
-    pub transfer_id: TransferId,
-    pub index: u32,
-    pub final_chunk: bool,
-    pub payload: Vec<u8>,
-    pub cumulative_sha256: [u8; 32],
-    pub resume_cursor: Option<Vec<u8>>,
+    transfer_id: TransferId,
+    index: u32,
+    final_chunk: bool,
+    payload: Vec<u8>,
+    cumulative_sha256: [u8; 32],
+    resume_cursor: Option<Vec<u8>>,
 }
 
 impl ChunkFrame {
-    pub const fn new(
+    pub fn new(
         transfer_id: TransferId,
         index: u32,
         final_chunk: bool,
         payload: Vec<u8>,
         cumulative_sha256: [u8; 32],
         resume_cursor: Option<Vec<u8>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ChunkError> {
+        let frame = Self {
             transfer_id,
             index,
             final_chunk,
             payload,
             cumulative_sha256,
             resume_cursor,
-        }
+        };
+        frame.validate_shape()?;
+        Ok(frame)
+    }
+
+    pub fn try_new(
+        transfer_id: TransferId,
+        index: u32,
+        final_chunk: bool,
+        payload: Vec<u8>,
+        cumulative_sha256: [u8; 32],
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<Self, ChunkError> {
+        Self::new(
+            transfer_id,
+            index,
+            final_chunk,
+            payload,
+            cumulative_sha256,
+            resume_cursor,
+        )
+    }
+
+    pub const fn transfer_id(&self) -> TransferId {
+        self.transfer_id
+    }
+
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub const fn final_chunk(&self) -> bool {
+        self.final_chunk
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub const fn cumulative_sha256(&self) -> [u8; 32] {
+        self.cumulative_sha256
+    }
+
+    pub fn resume_cursor(&self) -> Option<&[u8]> {
+        self.resume_cursor.as_deref()
     }
 
     fn validate_shape(&self) -> Result<(), ChunkError> {
@@ -443,6 +487,7 @@ impl Serialize for ChunkFrame {
     where
         S: Serializer,
     {
+        self.validate_shape().map_err(ser::Error::custom)?;
         let mut map = serializer.serialize_map(Some(6))?;
         map.serialize_entry("transfer_id", &self.transfer_id)?;
         map.serialize_entry("index", &self.index)?;
@@ -528,20 +573,16 @@ impl<'de> Deserialize<'de> for ChunkFrame {
                     }
                 }
 
-                let frame = ChunkFrame {
-                    transfer_id: transfer_id
-                        .ok_or_else(|| de::Error::missing_field("transfer_id"))?,
-                    index: index.ok_or_else(|| de::Error::missing_field("index"))?,
-                    final_chunk: final_chunk
-                        .ok_or_else(|| de::Error::missing_field("final_chunk"))?,
-                    payload: payload.ok_or_else(|| de::Error::missing_field("payload"))?,
-                    cumulative_sha256: cumulative_sha256
+                ChunkFrame::new(
+                    transfer_id.ok_or_else(|| de::Error::missing_field("transfer_id"))?,
+                    index.ok_or_else(|| de::Error::missing_field("index"))?,
+                    final_chunk.ok_or_else(|| de::Error::missing_field("final_chunk"))?,
+                    payload.ok_or_else(|| de::Error::missing_field("payload"))?,
+                    cumulative_sha256
                         .ok_or_else(|| de::Error::missing_field("cumulative_sha256"))?,
-                    resume_cursor: resume_cursor
-                        .ok_or_else(|| de::Error::missing_field("resume_cursor"))?,
-                };
-                frame.validate_shape().map_err(de::Error::custom)?;
-                Ok(frame)
+                    resume_cursor.ok_or_else(|| de::Error::missing_field("resume_cursor"))?,
+                )
+                .map_err(de::Error::custom)
             }
         }
 
@@ -651,6 +692,7 @@ impl ChunkContext {
         let result = self.accept_inner(frame);
         if result.is_err() {
             self.poisoned = true;
+            self.complete = false;
         }
         result
     }
@@ -694,7 +736,7 @@ impl ChunkContext {
     }
 
     pub const fn is_complete(&self) -> bool {
-        self.complete
+        self.complete && !self.poisoned
     }
 
     pub const fn is_poisoned(&self) -> bool {
@@ -709,13 +751,14 @@ impl ChunkContext {
         self.cumulative_bytes
     }
 
-    pub fn require_complete(&self) -> Result<(), ChunkError> {
+    pub fn require_complete(&mut self) -> Result<(), ChunkError> {
         if self.poisoned {
             return Err(ChunkError::Poisoned);
         }
         if self.complete {
             Ok(())
         } else {
+            self.poisoned = true;
             Err(ChunkError::FinalRequired)
         }
     }
