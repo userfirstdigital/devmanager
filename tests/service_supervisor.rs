@@ -12,9 +12,10 @@ use devmanager::services::health::{
 };
 use devmanager::services::model::{
     ActiveOperation, AdmissionDecision, AdmissionFence, AdmissionRejection, AdmissionRequest,
-    AdmissionSnapshot, CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, PortProtocol,
-    RuntimeOwnership, RuntimeRecord, ServiceAction, ServiceCatalog, ServiceDefinition, ServiceId,
-    ServiceScope, StartupPolicy, StopPolicy, ValidationError, MAX_ARGUMENT_COUNT,
+    AdmissionSnapshot, CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, LaunchIntent,
+    PortProtocol, RuntimeOwnership, RuntimeRecord, ServiceAction, ServiceCatalog,
+    ServiceDefinition, ServiceId, ServiceScope, StartupPolicy, StopPolicy, ValidationError,
+    MAX_ARGUMENT_COUNT,
 };
 use serde::Deserialize;
 
@@ -185,6 +186,146 @@ fn validation_rejects_unsafe_paths_raw_secrets_unbounded_args_and_duplicate_ids(
         ServiceCatalog::new(vec![unknown_dependency]),
         Err(ValidationError::UnknownDependency { .. })
     ));
+}
+
+#[test]
+fn wire_deserializers_validate_ids_definitions_and_launch_intents() {
+    assert!(serde_json::from_str::<ServiceId>(r#"\"\""#).is_err());
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/services/valid.json")).unwrap();
+    fixture["services"][0]["id"] = serde_json::json!("../escape");
+    let definition = serde_json::from_value::<ServiceDefinition>(fixture["services"][0].clone());
+    assert!(definition.is_err());
+
+    let invalid_intent = serde_json::json!({
+        "service_id": "../escape",
+        "scope": { "Task": { "task_id": "task-a" } },
+        "command": {
+            "program": "node",
+            "args": ["server.js"],
+            "cwd": "apps/api",
+            "env": [{ "name": "PORT" }]
+        },
+        "dependencies": [],
+        "expected_port": { "protocol": "Tcp", "port": 8080 }
+    });
+    assert!(serde_json::from_value::<LaunchIntent>(invalid_intent).is_err());
+}
+
+#[test]
+fn nested_contract_types_reject_unknown_fields_invalid_values_and_secret_debug_output() {
+    let invalid_command = CommandSpec {
+        program: "node".to_owned(),
+        args: vec!["--token".to_owned(), "secret-value".to_owned()],
+        cwd: None,
+        env: Vec::new(),
+    };
+    let debug = format!("{invalid_command:?}");
+    assert!(!debug.contains("secret-value"));
+    assert!(serde_json::to_value(&invalid_command).is_err());
+    assert!(serde_json::from_value::<CommandSpec>(serde_json::json!({
+        "program": "node",
+        "args": [],
+        "cwd": null,
+        "env": [],
+        "unexpected": true
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<CommandSpec>(serde_json::json!({
+        "program": "node",
+        "args": ["--token", "secret-value"],
+        "cwd": null,
+        "env": []
+    }))
+    .is_err());
+
+    assert!(serde_json::from_value::<ServiceScope>(serde_json::json!({
+        "Task": { "task_id": "../task" }
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<HealthPolicy>(serde_json::json!({
+        "startup_deadline_ms": 0,
+        "probe_interval_ms": 1000,
+        "max_probe_interval_ms": 1000,
+        "backoff_multiplier": 1,
+        "success_threshold": 1,
+        "failure_threshold": 1,
+        "stale_after_ms": 1000,
+        "unexpected": true
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<ExpectedPort>(serde_json::json!({
+        "protocol": "Tcp",
+        "port": 0
+    }))
+    .is_err());
+}
+
+#[test]
+fn command_cwd_accepts_only_canonical_workspace_relative_paths() {
+    for cwd in ["apps\\api", "apps//api", "apps/./api", " apps/api"] {
+        let mut definition = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+        definition.command.cwd = Some(cwd.to_owned());
+        assert!(
+            ServiceCatalog::new(vec![definition]).is_err(),
+            "non-canonical cwd should be rejected: {cwd:?}"
+        );
+    }
+}
+
+#[test]
+fn secret_flags_and_assignments_are_rejected_structurally_but_name_only_refs_are_safe() {
+    for args in [
+        vec!["--token", "raw-secret"],
+        vec!["--api-key=raw-secret"],
+        vec!["--secret", "raw-secret"],
+        vec!["--password=raw-secret"],
+        vec!["--private-key", "raw-secret"],
+    ] {
+        let mut definition = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+        definition.command.args = args.into_iter().map(str::to_owned).collect();
+        assert!(matches!(
+            ServiceCatalog::new(vec![definition]),
+            Err(ValidationError::RawSecret { .. })
+        ));
+    }
+
+    let mut assignment = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    assignment.command.env = vec![devmanager::services::model::EnvReference::new(
+        "API_TOKEN=raw-secret",
+    )];
+    assert!(matches!(
+        ServiceCatalog::new(vec![assignment]),
+        Err(ValidationError::RawSecret { .. })
+    ));
+
+    let mut reference = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    reference.command.env = vec![devmanager::services::model::EnvReference::new("API_TOKEN")];
+    assert!(ServiceCatalog::new(vec![reference]).is_ok());
+}
+
+#[test]
+fn expected_port_must_match_health_or_be_derived_from_health() {
+    let mut mismatch = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    mismatch.expected_port = Some(ExpectedPort {
+        protocol: PortProtocol::Tcp,
+        port: 9090,
+    });
+    assert!(ServiceCatalog::new(vec![mismatch]).is_err());
+
+    let mut derived = service("api", ServiceScope::task("task-a"), vec![], Some(8080));
+    derived.expected_port = None;
+    let catalog = ServiceCatalog::new(vec![derived]).unwrap();
+    assert_eq!(
+        catalog
+            .launch_intent(&id("api"))
+            .unwrap()
+            .expected_port
+            .unwrap()
+            .port,
+        8080
+    );
 }
 
 #[test]
@@ -547,6 +688,7 @@ fn admission_rejects_external_stop_stale_fences_and_limits_task_close_to_owned_t
     ));
 
     snapshot.set_task_epoch("task-a", 9);
+    snapshot.mark_task_closing("task-a");
     snapshot.set_service(
         id("other-task"),
         record(
@@ -563,9 +705,190 @@ fn admission_rejects_external_stop_stale_fences_and_limits_task_close_to_owned_t
         record(ServiceState::Healthy, fence, RuntimeOwnership::Host, None),
     );
     let close = catalog.admit_task_close("task-a", 9, &snapshot).unwrap();
-    assert_eq!(close.ordered, vec![id("task-api")]);
-    assert!(!close.ordered.contains(&id("other-task")));
-    assert!(!close.ordered.contains(&id("host-db")));
+    assert_eq!(
+        close
+            .ordered
+            .iter()
+            .map(|item| item.service_id.clone())
+            .collect::<Vec<_>>(),
+        vec![id("task-api")]
+    );
+    assert!(!close
+        .ordered
+        .iter()
+        .any(|item| item.service_id == id("other-task")));
+    assert!(!close
+        .ordered
+        .iter()
+        .any(|item| item.service_id == id("host-db")));
+}
+
+#[test]
+fn task_close_requires_closing_barrier_and_rejects_member_operations() {
+    let catalog = ServiceCatalog::new(vec![
+        service("api", ServiceScope::task("task-a"), vec![], Some(8080)),
+        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
+    ])
+    .unwrap();
+    let fence = AdmissionFence::new(4, 9);
+    let owned = RuntimeOwnership::Task {
+        task_id: "task-a".to_owned(),
+    };
+    let mut snapshot = AdmissionSnapshot::default();
+    snapshot.set_task_epoch("task-a", 9);
+    snapshot.set_service(
+        id("api"),
+        record(
+            ServiceState::Healthy,
+            fence,
+            owned.clone(),
+            Some(ActiveOperation {
+                id: 91,
+                action: ServiceAction::Start,
+            }),
+        ),
+    );
+    snapshot.set_service(
+        id("db"),
+        record(ServiceState::Healthy, fence, owned.clone(), None),
+    );
+
+    assert!(catalog.admit_task_close("task-a", 9, &snapshot).is_err());
+    snapshot.mark_task_closing("task-a");
+    assert!(catalog.admit_task_close("task-a", 9, &snapshot).is_err());
+
+    snapshot.set_service(id("api"), record(ServiceState::Healthy, fence, owned, None));
+    let close = catalog.admit_task_close("task-a", 9, &snapshot).unwrap();
+    assert_eq!(
+        close
+            .ordered
+            .iter()
+            .map(|item| item.service_id.clone())
+            .collect::<Vec<_>>(),
+        vec![id("db"), id("api")]
+    );
+    assert!(matches!(
+        &close.ordered[0].fence.ownership,
+        RuntimeOwnership::Task { task_id } if task_id == "task-a"
+    ));
+    assert!(close.revalidate(&snapshot).is_ok());
+}
+
+#[test]
+fn operations_require_exact_scope_ownership_and_none_is_only_initial_start_claim() {
+    let catalog = ServiceCatalog::new(vec![
+        service("task-api", ServiceScope::task("task-a"), vec![], Some(8080)),
+        service("host-db", ServiceScope::Host, vec![], Some(5432)),
+    ])
+    .unwrap();
+    let fence = AdmissionFence::new(4, 9);
+    let mut snapshot = AdmissionSnapshot::default();
+    snapshot.set_service(
+        id("task-api"),
+        record(
+            ServiceState::Healthy,
+            fence,
+            RuntimeOwnership::Task {
+                task_id: "task-b".to_owned(),
+            },
+            None,
+        ),
+    );
+    assert!(matches!(
+        catalog.admit(
+            AdmissionRequest::new(ServiceAction::Stop, id("task-api"), fence),
+            &snapshot
+        ),
+        AdmissionDecision::Refused(_)
+    ));
+
+    snapshot.set_service(
+        id("task-api"),
+        record(ServiceState::Healthy, fence, RuntimeOwnership::None, None),
+    );
+    assert!(matches!(
+        catalog.admit(
+            AdmissionRequest::new(ServiceAction::Stop, id("task-api"), fence),
+            &snapshot
+        ),
+        AdmissionDecision::Refused(_)
+    ));
+
+    snapshot.set_service(
+        id("task-api"),
+        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+    );
+    assert!(matches!(
+        catalog.admit(
+            AdmissionRequest::new(ServiceAction::Start, id("task-api"), fence),
+            &snapshot
+        ),
+        AdmissionDecision::Start(_)
+    ));
+
+    snapshot.set_service(
+        id("host-db"),
+        record(
+            ServiceState::Healthy,
+            fence,
+            RuntimeOwnership::Task {
+                task_id: "task-a".to_owned(),
+            },
+            None,
+        ),
+    );
+    assert!(matches!(
+        catalog.admit(
+            AdmissionRequest::new(ServiceAction::Stop, id("host-db"), fence),
+            &snapshot
+        ),
+        AdmissionDecision::Refused(_)
+    ));
+}
+
+#[test]
+fn plan_members_capture_exact_fences_and_support_atomic_revalidation() {
+    let catalog = ServiceCatalog::new(vec![
+        service(
+            "api",
+            ServiceScope::task("task-a"),
+            vec![id("db")],
+            Some(8080),
+        ),
+        service("db", ServiceScope::task("task-a"), vec![], Some(5432)),
+    ])
+    .unwrap();
+    let fence = AdmissionFence::new(4, 9);
+    let mut snapshot = AdmissionSnapshot::default();
+    snapshot.set_service(
+        id("api"),
+        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+    );
+    snapshot.set_service(
+        id("db"),
+        record(ServiceState::Stopped, fence, RuntimeOwnership::None, None),
+    );
+    let AdmissionDecision::Start(plan) = catalog.admit(
+        AdmissionRequest::new(ServiceAction::Start, id("api"), fence),
+        &snapshot,
+    ) else {
+        panic!("expected start plan");
+    };
+    assert_eq!(plan.ordered[0].fence.generation, 4);
+    assert_eq!(plan.ordered[0].fence.epoch, 9);
+    assert_eq!(plan.ordered[0].fence.ownership, RuntimeOwnership::None);
+    assert!(plan.revalidate(&snapshot).is_ok());
+
+    snapshot.set_service(
+        id("db"),
+        record(
+            ServiceState::Stopped,
+            AdmissionFence::new(5, 9),
+            RuntimeOwnership::None,
+            None,
+        ),
+    );
+    assert!(plan.revalidate(&snapshot).is_err());
 }
 
 #[test]
@@ -595,20 +918,76 @@ fn admission_stop_reverses_dependencies_and_restart_returns_typed_plans() {
         AdmissionRequest::new(ServiceAction::Stop, id("db"), fence),
         &snapshot,
     );
-    assert!(
-        matches!(stop, AdmissionDecision::Stop(plan) if plan.ordered == vec![id("api"), id("db")])
+    assert!(matches!(
+        stop,
+        AdmissionDecision::Stop(plan)
+            if plan
+                .ordered
+                .iter()
+                .map(|item| item.service_id.clone())
+                .collect::<Vec<_>>() == vec![id("api"), id("db")]
+    ));
+
+    let AdmissionDecision::Stop(stop_plan) = catalog.admit(
+        AdmissionRequest::new(ServiceAction::Stop, id("db"), fence),
+        &snapshot,
+    ) else {
+        panic!("expected stop plan");
+    };
+    assert!(stop_plan.revalidate(&snapshot).is_ok());
+    snapshot.set_service(
+        id("api"),
+        record(
+            ServiceState::Healthy,
+            fence,
+            RuntimeOwnership::Task {
+                task_id: "task-a".to_owned(),
+            },
+            Some(ActiveOperation {
+                id: 93,
+                action: ServiceAction::Start,
+            }),
+        ),
+    );
+    assert!(stop_plan.revalidate(&snapshot).is_err());
+    snapshot.set_service(
+        id("api"),
+        record(
+            ServiceState::Healthy,
+            fence,
+            RuntimeOwnership::Task {
+                task_id: "task-a".to_owned(),
+            },
+            None,
+        ),
     );
 
     let restart = catalog.admit(
         AdmissionRequest::new(ServiceAction::Restart, id("api"), fence),
         &snapshot,
     );
-    assert!(matches!(
-        restart,
-        AdmissionDecision::Restart(plan)
-            if plan.stop.ordered == vec![id("api")]
-                && plan.start.ordered.iter().map(|intent| intent.service_id.clone()).collect::<Vec<_>>() == vec![id("api")]
-    ));
+    let AdmissionDecision::Restart(restart_plan) = restart else {
+        panic!("expected restart plan");
+    };
+    assert!(restart_plan.revalidate(&snapshot).is_ok());
+    assert_eq!(
+        restart_plan
+            .stop
+            .ordered
+            .iter()
+            .map(|item| item.service_id.clone())
+            .collect::<Vec<_>>(),
+        vec![id("api")]
+    );
+    assert_eq!(
+        restart_plan
+            .start
+            .ordered
+            .iter()
+            .map(|item| item.service_id.clone())
+            .collect::<Vec<_>>(),
+        vec![id("db"), id("api")]
+    );
 }
 
 #[test]

@@ -53,8 +53,7 @@
         }
       },
       "startup": { "trigger": "Manual", "restart_limit": 0 },
-      "stop": { "graceful_timeout_ms": 1000, "kill_after_ms": 3000 },
-      "expected_port": { "protocol": "Tcp", "port": 8080 }
+      "stop": { "graceful_timeout_ms": 1000, "kill_after_ms": 3000 }
     }
   ]
 }
