@@ -3,6 +3,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::id::{
     CommandId, EventId, PromptChainId, PromptChainLinkId, PromptId, PromptVersionId,
@@ -20,6 +22,21 @@ use super::model::{
 };
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+const PROMPT_WIRE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct PromptChainCommandWire<'a> {
+    schema_version: u32,
+    command: &'a PromptChainCommand,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptChainCommandWireOwned {
+    schema_version: u32,
+    command: PromptChainCommand,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptStoreError {
@@ -109,8 +126,12 @@ impl PromptStore {
         command_id: CommandId,
         command: PromptCommand,
     ) -> Result<PromptMutationReceipt, PromptStoreError> {
+        let command = canonical_prompt_command(command)?;
         command.validate()?;
-        let command_sha256 = command.fingerprint();
+        let command_payload = command
+            .encode()
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        let command_sha256 = sha256_bytes(&command_payload);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -127,12 +148,13 @@ impl PromptStore {
             .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
         tx.execute(
             "INSERT INTO prompt_command_receipts(
-                command_id, command_sha256, prompt_id, prompt_version_id, revision,
-                receipt, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                command_id, command_sha256, command_payload, prompt_id, prompt_version_id,
+                revision, receipt, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 command_id.as_bytes().as_slice(),
                 command_sha256.as_slice(),
+                command_payload,
                 receipt.prompt_id.as_bytes().as_slice(),
                 receipt.prompt_version_id.as_bytes().as_slice(),
                 to_i64(receipt.revision)?,
@@ -167,8 +189,10 @@ impl PromptStore {
         command_id: CommandId,
         command: PromptChainCommand,
     ) -> Result<PromptChainMutationReceipt, PromptStoreError> {
+        let command = canonical_prompt_chain_command(command)?;
         command.validate()?;
-        let command_sha256 = command.fingerprint();
+        let command_payload = encode_chain_command(&command)?;
+        let command_sha256 = sha256_bytes(&command_payload);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -185,12 +209,13 @@ impl PromptStore {
             .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
         tx.execute(
             "INSERT INTO prompt_chain_command_receipts(
-                command_id, command_sha256, chain_id, chain_link_id, revision,
-                receipt, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                command_id, command_sha256, command_payload, chain_id, chain_link_id,
+                revision, receipt, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 command_id.as_bytes().as_slice(),
                 command_sha256.as_slice(),
+                command_payload,
                 chain_id.as_bytes().as_slice(),
                 receipt.link_id.map(|id| id.as_bytes().as_slice().to_vec()),
                 to_i64(receipt.revision)?,
@@ -250,7 +275,9 @@ impl PromptStore {
         if load_chain(&self.conn, chain_id)?.is_none() {
             return Err(PromptStoreError::NotFound);
         }
-        load_chain_links(&self.conn, chain_id)
+        let links = load_chain_links(&self.conn, chain_id)?;
+        validate_chain_links(&self.conn, chain_id, &links)?;
+        Ok(links)
     }
 
     pub fn list_prompt_chain_links(
@@ -536,8 +563,8 @@ impl PromptStore {
             validate_prompt_event_temporal_lineage(&tx, event, *receipt_version_id)?;
             apply_event(&tx, event, *occurred_at_ms)?;
         }
-        for (event, occurred_at_ms) in &chain_events {
-            apply_chain_event(&tx, event, *occurred_at_ms)?;
+        for (event, occurred_at_ms, command) in &chain_events {
+            apply_chain_event(&tx, event, *occurred_at_ms, command)?;
         }
         let events_replayed = events
             .len()
@@ -550,6 +577,57 @@ impl PromptStore {
             })?,
         })
     }
+}
+
+fn canonical_prompt_command(mut command: PromptCommand) -> Result<PromptCommand, PromptStoreError> {
+    match &mut command {
+        PromptCommand::CreatePrompt(command) => {
+            command.title = command.title.trim().to_string();
+            command.description = command
+                .description
+                .take()
+                .map(|description| description.trim().to_string());
+            command.tags = normalized_tags(&command.tags)?;
+            command.variables = normalized_variables(&command.variables)?;
+        }
+        PromptCommand::CreatePromptVersion(command) => {
+            command.variables = normalized_variables(&command.variables)?;
+        }
+        PromptCommand::RenamePrompt(command) => {
+            command.title = command.title.trim().to_string();
+        }
+        PromptCommand::SetPromptTags(command) => {
+            command.tags = normalized_tags(&command.tags)?;
+        }
+        PromptCommand::ArchivePrompt(_) | PromptCommand::RestorePrompt(_) => {}
+    }
+    command.validate()?;
+    Ok(command)
+}
+
+fn canonical_prompt_chain_command(
+    mut command: PromptChainCommand,
+) -> Result<PromptChainCommand, PromptStoreError> {
+    match &mut command {
+        PromptChainCommand::CreatePromptChain(command) => {
+            command.title = command.title.trim().to_string();
+            command.description = command
+                .description
+                .take()
+                .map(|description| description.trim().to_string());
+        }
+        PromptChainCommand::RenamePromptChain(command) => {
+            command.title = command.title.trim().to_string();
+        }
+        PromptChainCommand::InsertPromptChainLink(_)
+        | PromptChainCommand::MovePromptChainLink(_)
+        | PromptChainCommand::RemovePromptChainLink(_)
+        | PromptChainCommand::UpdatePromptChainLinkVersion(_)
+        | PromptChainCommand::ArchivePromptChain(_)
+        | PromptChainCommand::RestorePromptChain(_) => {}
+    }
+    command.validate()?;
+    Ok(command)
 }
 
 fn apply_command(
@@ -997,6 +1075,7 @@ fn apply_insert_chain_link(
     check_chain_revision(&chain, command.expected_revision)?;
     ensure_chain_active(&chain)?;
     let mut links = load_chain_links(tx, chain.id)?;
+    validate_chain_links(tx, chain.id, &links)?;
     if links.iter().any(|link| link.id == command.link_id) {
         return Err(PromptStoreError::AlreadyExists);
     }
@@ -1059,6 +1138,7 @@ fn apply_move_chain_link(
     check_chain_revision(&chain, command.expected_revision)?;
     ensure_chain_active(&chain)?;
     let mut links = load_chain_links(tx, chain.id)?;
+    validate_chain_links(tx, chain.id, &links)?;
     let old_order: Vec<PromptChainLinkId> = links.iter().map(|link| link.id).collect();
     let moving_index = links
         .iter()
@@ -1117,6 +1197,7 @@ fn apply_remove_chain_link(
     check_chain_revision(&chain, command.expected_revision)?;
     ensure_chain_active(&chain)?;
     let mut links = load_chain_links(tx, chain.id)?;
+    validate_chain_links(tx, chain.id, &links)?;
     let position = links
         .iter()
         .position(|link| link.id == command.link_id)
@@ -1147,6 +1228,7 @@ fn apply_update_chain_link_version(
     check_chain_revision(&chain, command.expected_revision)?;
     ensure_chain_active(&chain)?;
     let mut links = load_chain_links(tx, chain.id)?;
+    validate_chain_links(tx, chain.id, &links)?;
     let position = links
         .iter()
         .position(|link| link.id == command.link_id)
@@ -1302,7 +1384,7 @@ fn renumber_links(links: &mut [PromptChainLink]) -> Result<(), PromptStoreError>
 }
 
 fn validate_chain_links(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     chain_id: PromptChainId,
     links: &[PromptChainLink],
 ) -> Result<(), PromptStoreError> {
@@ -1319,13 +1401,13 @@ fn validate_chain_links(
                 "prompt chain links must be a dense ordered prefix".into(),
             ));
         }
-        let version = load_version(tx, link.prompt_version_id)?.ok_or_else(|| {
+        let version = load_version(conn, link.prompt_version_id)?.ok_or_else(|| {
             PromptStoreError::Corruption("prompt chain link references missing version".into())
         })?;
-        let prompt = load_prompt(tx, link.prompt_id)?.ok_or_else(|| {
+        let prompt = load_prompt(conn, link.prompt_id)?.ok_or_else(|| {
             PromptStoreError::Corruption("prompt chain link references missing prompt".into())
         })?;
-        validate_saved_prompt_record(tx, &prompt)?;
+        validate_saved_prompt_record(conn, &prompt)?;
         if version.prompt_id != link.prompt_id {
             return Err(PromptStoreError::Corruption(
                 "prompt chain link version ownership mismatch".into(),
@@ -1618,11 +1700,157 @@ fn apply_event(
     Ok(())
 }
 
+fn validate_chain_command_effect(
+    tx: &Transaction<'_>,
+    command: &PromptChainCommand,
+    event: &PromptChainEvent,
+) -> Result<(), PromptStoreError> {
+    let (chain_id, expected_revision) = match command {
+        PromptChainCommand::InsertPromptChainLink(command) => {
+            (command.chain_id, command.expected_revision)
+        }
+        PromptChainCommand::MovePromptChainLink(command) => {
+            (command.chain_id, command.expected_revision)
+        }
+        PromptChainCommand::RemovePromptChainLink(command) => {
+            (command.chain_id, command.expected_revision)
+        }
+        PromptChainCommand::UpdatePromptChainLinkVersion(command) => {
+            (command.chain_id, command.expected_revision)
+        }
+        _ => return Ok(()),
+    };
+    let PromptChainEvent::PromptChainLinksReplaced { links, .. } = event else {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain link command has a non-link event".into(),
+        ));
+    };
+    let chain = load_chain(tx, chain_id)?.ok_or_else(|| {
+        PromptStoreError::Corruption("prompt chain link command references missing chain".into())
+    })?;
+    if chain.revision != expected_revision || chain.archived_at_ms.is_some() {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain link command revision or archive state is invalid".into(),
+        ));
+    }
+    let current_links = load_chain_links(tx, chain_id)?;
+    let mut expected_links = current_links.clone();
+    match command {
+        PromptChainCommand::InsertPromptChainLink(command) => {
+            if expected_links.iter().any(|link| link.id == command.link_id) {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain insert command link already exists".into(),
+                ));
+            }
+            let prompt = load_prompt(tx, command.prompt_id)?.ok_or_else(|| {
+                PromptStoreError::Corruption("prompt chain insert command prompt is missing".into())
+            })?;
+            validate_saved_prompt_record(tx, &prompt)?;
+            let prompt_version_id = match command.prompt_version_id {
+                Some(version_id) => {
+                    let version = load_version(tx, version_id)?.ok_or_else(|| {
+                        PromptStoreError::Corruption(
+                            "prompt chain insert command version is missing".into(),
+                        )
+                    })?;
+                    if version.prompt_id != prompt.id {
+                        return Err(PromptStoreError::Corruption(
+                            "prompt chain insert command version ownership is invalid".into(),
+                        ));
+                    }
+                    version.id
+                }
+                None => prompt.current_version_id,
+            };
+            let position = command
+                .before_link_id
+                .and_then(|before| expected_links.iter().position(|link| link.id == before))
+                .unwrap_or(expected_links.len());
+            if command.before_link_id.is_some() && position == expected_links.len() {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain insert command before-link is missing".into(),
+                ));
+            }
+            expected_links.insert(
+                position,
+                PromptChainLink {
+                    id: command.link_id,
+                    chain_id,
+                    position: 0,
+                    prompt_id: prompt.id,
+                    prompt_version_id,
+                },
+            );
+        }
+        PromptChainCommand::MovePromptChainLink(command) => {
+            let position = expected_links
+                .iter()
+                .position(|link| link.id == command.link_id)
+                .ok_or_else(|| {
+                    PromptStoreError::Corruption("prompt chain move link is missing".into())
+                })?;
+            if command.before_link_id == Some(command.link_id) {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain move no-op must not have an event".into(),
+                ));
+            }
+            let moving = expected_links.remove(position);
+            let target = command
+                .before_link_id
+                .and_then(|before| expected_links.iter().position(|link| link.id == before))
+                .unwrap_or(expected_links.len());
+            if command.before_link_id.is_some() && target == expected_links.len() {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain move before-link is missing".into(),
+                ));
+            }
+            expected_links.insert(target, moving);
+        }
+        PromptChainCommand::RemovePromptChainLink(command) => {
+            let position = expected_links
+                .iter()
+                .position(|link| link.id == command.link_id)
+                .ok_or_else(|| {
+                    PromptStoreError::Corruption("prompt chain remove link is missing".into())
+                })?;
+            expected_links.remove(position);
+        }
+        PromptChainCommand::UpdatePromptChainLinkVersion(command) => {
+            let position = expected_links
+                .iter()
+                .position(|link| link.id == command.link_id)
+                .ok_or_else(|| {
+                    PromptStoreError::Corruption("prompt chain update link is missing".into())
+                })?;
+            let prompt = load_prompt(tx, expected_links[position].prompt_id)?.ok_or_else(|| {
+                PromptStoreError::Corruption("prompt chain update prompt is missing".into())
+            })?;
+            validate_saved_prompt_record(tx, &prompt)?;
+            if expected_links[position].prompt_version_id == prompt.current_version_id {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain update no-op must not have an event".into(),
+                ));
+            }
+            expected_links[position].prompt_version_id = prompt.current_version_id;
+        }
+        _ => unreachable!(),
+    }
+    renumber_links(&mut expected_links)?;
+    if expected_links != *links {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event links do not match its exact command".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_chain_event(
     tx: &Transaction<'_>,
     event: &PromptChainEvent,
     occurred_at_ms: i64,
+    command: &PromptChainCommand,
 ) -> Result<(), PromptStoreError> {
+    validate_chain_command_effect(tx, command, event)?;
     match event {
         PromptChainEvent::PromptChainCreated { chain } => {
             if chain.revision != 1
@@ -1879,9 +2107,9 @@ fn load_receipt(
     command: &PromptCommand,
     command_sha256: &[u8; 32],
 ) -> Result<Option<PromptMutationReceipt>, PromptStoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)> = tx
+    let row: Option<(Vec<u8>, Option<Vec<u8>>, Vec<u8>, Vec<u8>, Vec<u8>, i64)> = tx
         .query_row(
-            "SELECT command_sha256, prompt_id, prompt_version_id, receipt, revision
+            "SELECT command_sha256, command_payload, prompt_id, prompt_version_id, receipt, revision
              FROM prompt_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
             |row| {
@@ -1891,12 +2119,19 @@ fn load_receipt(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((stored_hash, stored_prompt_id, stored_version_id, receipt_payload, stored_revision)) =
-        row
+    let Some((
+        stored_hash,
+        stored_command_payload,
+        stored_prompt_id,
+        stored_version_id,
+        receipt_payload,
+        stored_revision,
+    )) = row
     else {
         return Ok(None);
     };
@@ -1905,7 +2140,35 @@ fn load_receipt(
             "prompt receipt command hash must be 32 bytes".into(),
         ));
     }
+    let Some(stored_command_payload) = stored_command_payload else {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt command payload is missing".into(),
+        ));
+    };
+    if stored_command_payload.is_empty() {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt command payload is empty".into(),
+        ));
+    }
     if stored_hash.as_slice() != command_sha256 {
+        return Err(PromptStoreError::IdempotencyConflict);
+    }
+    let stored_command = PromptCommand::decode(&stored_command_payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if sha256_bytes(&stored_command_payload).as_slice() != stored_hash.as_slice()
+        || stored_command
+            .encode()
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+            != stored_command_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt receipt command payload digest or encoding is invalid".into(),
+        ));
+    }
+    let command_payload = command
+        .encode()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if stored_command_payload != command_payload {
         return Err(PromptStoreError::IdempotencyConflict);
     }
     let receipt = PromptMutationReceipt::decode(&receipt_payload)
@@ -1931,7 +2194,7 @@ fn load_receipt(
             "prompt receipt fields disagree with their row".into(),
         ));
     }
-    validate_prompt_receipt_command(tx, command, &receipt)?;
+    validate_prompt_receipt_command(tx, &stored_command, &receipt)?;
     Ok(Some(receipt))
 }
 
@@ -1941,9 +2204,16 @@ fn load_chain_receipt(
     command: &PromptChainCommand,
     command_sha256: &[u8; 32],
 ) -> Result<Option<PromptChainMutationReceipt>, PromptStoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, i64)> = tx
+    let row: Option<(
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        i64,
+    )> = tx
         .query_row(
-            "SELECT command_sha256, chain_id, chain_link_id, receipt, revision
+            "SELECT command_sha256, command_payload, chain_id, chain_link_id, receipt, revision
              FROM prompt_chain_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
             |row| {
@@ -1953,12 +2223,19 @@ fn load_chain_receipt(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((stored_hash, stored_chain_id, stored_link_id, receipt_payload, stored_revision)) =
-        row
+    let Some((
+        stored_hash,
+        stored_command_payload,
+        stored_chain_id,
+        stored_link_id,
+        receipt_payload,
+        stored_revision,
+    )) = row
     else {
         return Ok(None);
     };
@@ -1967,7 +2244,29 @@ fn load_chain_receipt(
             "prompt chain receipt command hash must be 32 bytes".into(),
         ));
     }
+    let Some(stored_command_payload) = stored_command_payload else {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt command payload is missing".into(),
+        ));
+    };
+    if stored_command_payload.is_empty() {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt command payload is empty".into(),
+        ));
+    }
     if stored_hash.as_slice() != command_sha256 {
+        return Err(PromptStoreError::IdempotencyConflict);
+    }
+    let stored_command = decode_chain_command(&stored_command_payload)?;
+    if sha256_bytes(&stored_command_payload).as_slice() != stored_hash.as_slice()
+        || encode_chain_command(&stored_command)? != stored_command_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain receipt command payload digest or encoding is invalid".into(),
+        ));
+    }
+    let command_payload = encode_chain_command(command)?;
+    if stored_command_payload != command_payload {
         return Err(PromptStoreError::IdempotencyConflict);
     }
     let receipt = PromptChainMutationReceipt::decode(&receipt_payload)
@@ -1996,7 +2295,7 @@ fn load_chain_receipt(
             "prompt chain receipt fields disagree with their row".into(),
         ));
     }
-    validate_chain_receipt_command(tx, command, &receipt)?;
+    validate_chain_receipt_command(tx, &stored_command, &receipt)?;
     Ok(Some(receipt))
 }
 
@@ -2012,10 +2311,19 @@ fn validate_prompt_event_row(
     let _event_id = event_id_from_bytes(event_id_bytes)?;
     let command_id = command_id_from_bytes(command_id_bytes)?;
     let row_prompt_id = prompt_id_from_bytes(row_prompt_id_bytes)?;
-    let receipt_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64)> = tx
+    let receipt_row: Option<(
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        i64,
+    )> = tx
         .query_row(
-            "SELECT command_id, command_sha256, prompt_id, prompt_version_id,
-                    revision, receipt, created_at_ms
+            "SELECT command_id, command_sha256, command_payload, prompt_id,
+                    prompt_version_id, revision, receipt, created_at_ms
              FROM prompt_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
             |row| {
@@ -2027,6 +2335,7 @@ fn validate_prompt_event_row(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -2034,6 +2343,7 @@ fn validate_prompt_event_row(
     let Some((
         stored_command_id,
         command_sha256,
+        command_payload,
         stored_prompt_id,
         stored_version_id,
         revision,
@@ -2050,9 +2360,31 @@ fn validate_prompt_event_row(
             "prompt event command hash must be 32 bytes".into(),
         ));
     }
+    let Some(command_payload) = command_payload else {
+        return Err(PromptStoreError::Corruption(
+            "prompt event command payload is missing".into(),
+        ));
+    };
+    if command_payload.is_empty() {
+        return Err(PromptStoreError::Corruption(
+            "prompt event command payload is empty".into(),
+        ));
+    }
     if command_id_from_bytes(&stored_command_id)? != command_id {
         return Err(PromptStoreError::Corruption(
             "prompt event command receipt key mismatch".into(),
+        ));
+    }
+    let command = PromptCommand::decode(&command_payload)
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if sha256_bytes(&command_payload).as_slice() != command_sha256.as_slice()
+        || command
+            .encode()
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+            != command_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt event command payload digest or encoding is invalid".into(),
         ));
     }
     let receipt = PromptMutationReceipt::decode(&receipt_payload)
@@ -2112,6 +2444,7 @@ fn validate_prompt_event_row(
         receipt.revision,
         occurred_at_ms,
     )?;
+    validate_prompt_event_command(&command, &event, &receipt, occurred_at_ms)?;
     Ok((event, occurred_at_ms, receipt.prompt_version_id))
 }
 
@@ -2186,6 +2519,137 @@ fn validate_prompt_event_payload(
     Ok(())
 }
 
+fn validate_prompt_event_command(
+    command: &PromptCommand,
+    event: &PromptEvent,
+    receipt: &PromptMutationReceipt,
+    occurred_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let invalid = || PromptStoreError::Corruption("prompt command/event lineage is invalid".into());
+    match (command, event) {
+        (PromptCommand::CreatePrompt(command), PromptEvent::PromptCreated { prompt, version }) => {
+            let expected_version = PromptVersion::new_with_variables(
+                command.prompt_version_id,
+                command.prompt_id,
+                1,
+                command.body.clone(),
+                command.normalized_variables()?,
+                command.created_at_ms,
+            )?;
+            let expected_prompt = SavedPrompt {
+                id: command.prompt_id,
+                title: command.title.trim().to_string(),
+                description: command
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_string),
+                tags: normalized_tags(&command.tags)?,
+                current_version_id: command.prompt_version_id,
+                revision: 1,
+                archived_at_ms: None,
+            };
+            if receipt.revision != 1
+                || occurred_at_ms != command.created_at_ms
+                || prompt != &expected_prompt
+                || version != &expected_version
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptCommand::CreatePromptVersion(command),
+            PromptEvent::PromptVersionCreated {
+                prompt_id,
+                version,
+                revision,
+            },
+        ) => {
+            let expected_version = PromptVersion::new_with_variables(
+                command.prompt_version_id,
+                command.prompt_id,
+                version.version,
+                command.body.clone(),
+                command.normalized_variables()?,
+                command.created_at_ms,
+            )?;
+            if *prompt_id != command.prompt_id
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.revision != *revision
+                || occurred_at_ms != command.created_at_ms
+                || version != &expected_version
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptCommand::RenamePrompt(command),
+            PromptEvent::PromptRenamed {
+                prompt_id,
+                title,
+                revision,
+            },
+        ) => {
+            if *prompt_id != command.prompt_id
+                || title != command.title.trim()
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptCommand::SetPromptTags(command),
+            PromptEvent::PromptTagsSet {
+                prompt_id,
+                tags,
+                revision,
+            },
+        ) => {
+            if *prompt_id != command.prompt_id
+                || tags != &command.validate()?
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptCommand::ArchivePrompt(command),
+            PromptEvent::PromptArchived {
+                prompt_id,
+                archived_at_ms,
+                revision,
+            },
+        ) => {
+            if *prompt_id != command.prompt_id
+                || *archived_at_ms != command.archived_at_ms
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.revision != *revision
+                || occurred_at_ms != command.archived_at_ms
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptCommand::RestorePrompt(command),
+            PromptEvent::PromptRestored {
+                prompt_id,
+                revision,
+            },
+        ) => {
+            if *prompt_id != command.prompt_id
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
 fn validate_prompt_event_temporal_lineage(
     tx: &Transaction<'_>,
     event: &PromptEvent,
@@ -2228,13 +2692,14 @@ fn validate_chain_event_row(
     row_event_type: &str,
     occurred_at_ms: i64,
     payload: &[u8],
-) -> Result<(PromptChainEvent, i64), PromptStoreError> {
+) -> Result<(PromptChainEvent, i64, PromptChainCommand), PromptStoreError> {
     let _event_id = event_id_from_bytes(event_id_bytes)?;
     let command_id = command_id_from_bytes(command_id_bytes)?;
     let row_chain_id = prompt_chain_id_from_bytes(row_chain_id_bytes)?;
     let receipt_row: Option<(
         Vec<u8>,
         Vec<u8>,
+        Option<Vec<u8>>,
         Vec<u8>,
         Option<Vec<u8>>,
         i64,
@@ -2242,8 +2707,8 @@ fn validate_chain_event_row(
         i64,
     )> = tx
         .query_row(
-            "SELECT command_id, command_sha256, chain_id, chain_link_id,
-                    revision, receipt, created_at_ms
+            "SELECT command_id, command_sha256, command_payload, chain_id,
+                    chain_link_id, revision, receipt, created_at_ms
              FROM prompt_chain_command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
             |row| {
@@ -2255,6 +2720,7 @@ fn validate_chain_event_row(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -2262,6 +2728,7 @@ fn validate_chain_event_row(
     let Some((
         stored_command_id,
         command_sha256,
+        command_payload,
         stored_chain_id,
         stored_link_id,
         revision,
@@ -2278,9 +2745,27 @@ fn validate_chain_event_row(
             "prompt chain event command hash must be 32 bytes".into(),
         ));
     }
+    let Some(command_payload) = command_payload else {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event command payload is missing".into(),
+        ));
+    };
+    if command_payload.is_empty() {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event command payload is empty".into(),
+        ));
+    }
     if command_id_from_bytes(&stored_command_id)? != command_id {
         return Err(PromptStoreError::Corruption(
             "prompt chain event command receipt key mismatch".into(),
+        ));
+    }
+    let command = decode_chain_command(&command_payload)?;
+    if sha256_bytes(&command_payload).as_slice() != command_sha256.as_slice()
+        || encode_chain_command(&command)? != command_payload
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain event command payload digest or encoding is invalid".into(),
         ));
     }
     let receipt = PromptChainMutationReceipt::decode(&receipt_payload)
@@ -2328,7 +2813,8 @@ fn validate_chain_event_row(
         ));
     }
     validate_chain_event_payload(&event, row_chain_id, receipt.revision, occurred_at_ms)?;
-    Ok((event, occurred_at_ms))
+    validate_chain_event_command(&command, &event, &receipt, occurred_at_ms)?;
+    Ok((event, occurred_at_ms, command))
 }
 
 fn validate_chain_event_payload(
@@ -2369,6 +2855,129 @@ fn validate_chain_event_payload(
                 return Err(invalid());
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_chain_event_command(
+    command: &PromptChainCommand,
+    event: &PromptChainEvent,
+    receipt: &PromptChainMutationReceipt,
+    occurred_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let invalid =
+        || PromptStoreError::Corruption("prompt chain command/event lineage is invalid".into());
+    match (command, event) {
+        (
+            PromptChainCommand::CreatePromptChain(command),
+            PromptChainEvent::PromptChainCreated { chain },
+        ) => {
+            if chain.id != command.chain_id
+                || chain.title != command.title.trim()
+                || chain.description
+                    != command
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .map(str::to_string)
+                || chain.revision != 1
+                || chain.archived_at_ms.is_some()
+                || receipt.chain_id != command.chain_id
+                || receipt.link_id.is_some()
+                || receipt.revision != 1
+                || occurred_at_ms != command.created_at_ms
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptChainCommand::RenamePromptChain(command),
+            PromptChainEvent::PromptChainRenamed {
+                chain_id,
+                title,
+                revision,
+            },
+        ) => {
+            if *chain_id != command.chain_id
+                || title != command.title.trim()
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.chain_id != command.chain_id
+                || receipt.link_id.is_some()
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            command,
+            PromptChainEvent::PromptChainLinksReplaced {
+                chain_id, revision, ..
+            },
+        ) if matches!(
+            command,
+            PromptChainCommand::InsertPromptChainLink(_)
+                | PromptChainCommand::MovePromptChainLink(_)
+                | PromptChainCommand::RemovePromptChainLink(_)
+                | PromptChainCommand::UpdatePromptChainLinkVersion(_)
+        ) =>
+        {
+            let (expected_chain_id, link_id, expected_revision) = match command {
+                PromptChainCommand::InsertPromptChainLink(command) => {
+                    (command.chain_id, command.link_id, command.expected_revision)
+                }
+                PromptChainCommand::MovePromptChainLink(command) => {
+                    (command.chain_id, command.link_id, command.expected_revision)
+                }
+                PromptChainCommand::RemovePromptChainLink(command) => {
+                    (command.chain_id, command.link_id, command.expected_revision)
+                }
+                PromptChainCommand::UpdatePromptChainLinkVersion(command) => {
+                    (command.chain_id, command.link_id, command.expected_revision)
+                }
+                _ => unreachable!(),
+            };
+            if *chain_id != expected_chain_id
+                || *revision != next_revision(expected_revision)?
+                || receipt.chain_id != expected_chain_id
+                || receipt.link_id != Some(link_id)
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptChainCommand::ArchivePromptChain(command),
+            PromptChainEvent::PromptChainArchived {
+                chain_id,
+                archived_at_ms,
+                revision,
+            },
+        ) => {
+            if *chain_id != command.chain_id
+                || *archived_at_ms != command.archived_at_ms
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.chain_id != command.chain_id
+                || receipt.link_id.is_some()
+                || receipt.revision != *revision
+                || occurred_at_ms != command.archived_at_ms
+            {
+                return Err(invalid());
+            }
+        }
+        (
+            PromptChainCommand::RestorePromptChain(command),
+            PromptChainEvent::PromptChainRestored { chain_id, revision },
+        ) => {
+            if *chain_id != command.chain_id
+                || *revision != next_revision(command.expected_revision)?
+                || receipt.chain_id != command.chain_id
+                || receipt.link_id.is_some()
+                || receipt.revision != *revision
+            {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
     }
     Ok(())
 }
@@ -2913,9 +3522,40 @@ fn validate_page(limit: usize) -> Result<(), PromptStoreError> {
     Ok(())
 }
 
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 fn body_hash(body: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(body.as_bytes()).into()
+    sha256_bytes(body.as_bytes())
+}
+
+fn encode_chain_command(command: &PromptChainCommand) -> Result<Vec<u8>, PromptStoreError> {
+    rmp_serde::to_vec_named(&PromptChainCommandWire {
+        schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+        command,
+    })
+    .map_err(|_| PromptStoreError::Corruption("prompt chain command encoding failed".into()))
+}
+
+fn decode_chain_command(payload: &[u8]) -> Result<PromptChainCommand, PromptStoreError> {
+    let wire: PromptChainCommandWireOwned = rmp_serde::from_slice(payload)
+        .map_err(|_| PromptStoreError::Corruption("prompt chain command decoding failed".into()))?;
+    if wire.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
+        return Err(PromptStoreError::Corruption(
+            "unsupported prompt chain command schema".into(),
+        ));
+    }
+    wire.command.validate().map_err(|_| {
+        PromptStoreError::Corruption("prompt chain command validation failed".into())
+    })?;
+    let canonical = encode_chain_command(&wire.command)?;
+    if canonical != payload {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain command payload is not canonical".into(),
+        ));
+    }
+    Ok(wire.command)
 }
 
 fn digest_from_bytes(bytes: &[u8]) -> Result<[u8; 32], PromptStoreError> {

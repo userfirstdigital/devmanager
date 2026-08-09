@@ -421,6 +421,121 @@ BEGIN\n\
 END;\n\
 ";
 
+const V9_SQL: &str = "\
+ALTER TABLE prompt_command_receipts ADD COLUMN command_payload BLOB
+  CHECK(command_payload IS NULL OR length(command_payload) > 0);\n\
+ALTER TABLE prompt_chain_command_receipts ADD COLUMN command_payload BLOB
+  CHECK(command_payload IS NULL OR length(command_payload) > 0);\n\
+CREATE TRIGGER prompt_versions_advance_current_after_insert
+  AFTER INSERT ON prompt_versions
+  WHEN NEW.version = (
+    SELECT MAX(latest.version) FROM prompt_versions AS latest
+    WHERE latest.prompt_id = NEW.prompt_id
+  )\n\
+BEGIN
+  UPDATE saved_prompts
+  SET current_version_id = NEW.prompt_version_id
+  WHERE prompt_id = NEW.prompt_id
+    AND current_version_id <> NEW.prompt_version_id;
+END;\n\
+UPDATE saved_prompts
+SET current_version_id = (
+  SELECT latest.prompt_version_id
+  FROM prompt_versions AS latest
+  WHERE latest.prompt_id = saved_prompts.prompt_id
+  ORDER BY latest.version DESC
+  LIMIT 1
+)
+WHERE EXISTS (
+  SELECT 1 FROM prompt_versions
+  WHERE prompt_versions.prompt_id = saved_prompts.prompt_id
+);\n\
+CREATE TRIGGER saved_prompts_metadata_insert_bounds
+  BEFORE INSERT ON saved_prompts
+  WHEN typeof(NEW.title) <> 'text'
+    OR length(NEW.title) = 0
+    OR length(NEW.title) > 160
+    OR length(CAST(NEW.title AS BLOB)) > 640
+    OR NEW.title <> trim(NEW.title)
+    OR (NEW.description IS NOT NULL AND (
+      typeof(NEW.description) <> 'text'
+      OR length(NEW.description) > 2000
+      OR length(CAST(NEW.description AS BLOB)) > 8000
+      OR NEW.description <> trim(NEW.description)
+    ))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'saved prompt title or description is out of bounds');
+END;\n\
+CREATE TRIGGER saved_prompts_metadata_update_bounds
+  BEFORE UPDATE OF title, description ON saved_prompts
+  WHEN typeof(NEW.title) <> 'text'
+    OR length(NEW.title) = 0
+    OR length(NEW.title) > 160
+    OR length(CAST(NEW.title AS BLOB)) > 640
+    OR NEW.title <> trim(NEW.title)
+    OR (NEW.description IS NOT NULL AND (
+      typeof(NEW.description) <> 'text'
+      OR length(NEW.description) > 2000
+      OR length(CAST(NEW.description AS BLOB)) > 8000
+      OR NEW.description <> trim(NEW.description)
+    ))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'saved prompt title or description is out of bounds');
+END;\n\
+CREATE TRIGGER prompt_chains_metadata_insert_bounds
+  BEFORE INSERT ON prompt_chains
+  WHEN typeof(NEW.title) <> 'text'
+    OR length(NEW.title) = 0
+    OR length(NEW.title) > 160
+    OR length(CAST(NEW.title AS BLOB)) > 640
+    OR NEW.title <> trim(NEW.title)
+    OR (NEW.description IS NOT NULL AND (
+      typeof(NEW.description) <> 'text'
+      OR length(NEW.description) > 2000
+      OR length(CAST(NEW.description AS BLOB)) > 8000
+      OR NEW.description <> trim(NEW.description)
+    ))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain title or description is out of bounds');
+END;\n\
+CREATE TRIGGER prompt_chains_metadata_update_bounds
+  BEFORE UPDATE OF title, description ON prompt_chains
+  WHEN typeof(NEW.title) <> 'text'
+    OR length(NEW.title) = 0
+    OR length(NEW.title) > 160
+    OR length(CAST(NEW.title AS BLOB)) > 640
+    OR NEW.title <> trim(NEW.title)
+    OR (NEW.description IS NOT NULL AND (
+      typeof(NEW.description) <> 'text'
+      OR length(NEW.description) > 2000
+      OR length(CAST(NEW.description AS BLOB)) > 8000
+      OR NEW.description <> trim(NEW.description)
+    ))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain title or description is out of bounds');
+END;\n\
+CREATE TRIGGER prompt_tags_max_count_insert
+  BEFORE INSERT ON prompt_tags
+  WHEN (SELECT COUNT(*) FROM prompt_tags WHERE prompt_id = NEW.prompt_id) >= 32\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt tag count exceeds maximum');
+END;\n\
+CREATE TRIGGER prompt_tags_max_count_update
+  BEFORE UPDATE OF prompt_id ON prompt_tags
+  WHEN NEW.prompt_id <> OLD.prompt_id
+    AND (SELECT COUNT(*) FROM prompt_tags WHERE prompt_id = NEW.prompt_id) >= 32\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt tag count exceeds maximum');
+END;\n\
+CREATE TRIGGER prompt_version_variables_max_count_insert
+  BEFORE INSERT ON prompt_version_variables
+  WHEN (SELECT COUNT(*) FROM prompt_version_variables
+        WHERE prompt_version_id = NEW.prompt_version_id) >= 32\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt variable count exceeds maximum');
+END;\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -557,6 +672,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "phase07-prompts-corrections-v2",
                     sql: V8_SQL,
                     sha256: sha256_bytes(V8_SQL),
+                },
+                Migration {
+                    version: 9,
+                    name: "phase07-prompts-lineage-authority-v3",
+                    sql: V9_SQL,
+                    sha256: sha256_bytes(V9_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -766,7 +887,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 8);
+        assert_eq!(history.len(), 9);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -790,6 +911,9 @@ mod tests {
         assert_eq!(history[7].0, 8);
         assert_eq!(history[7].1, "phase07-prompts-corrections-v2");
         assert_eq!(history[7].2.len(), 32);
+        assert_eq!(history[8].0, 9);
+        assert_eq!(history[8].1, "phase07-prompts-lineage-authority-v3");
+        assert_eq!(history[8].2.len(), 32);
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -813,7 +937,7 @@ mod tests {
 
     #[test]
     fn schema_upgrade_matrix_reaches_corrections_before_prompt_lifecycle() {
-        for prior_version in 1_i64..=7 {
+        for prior_version in 1_i64..=8 {
             let dir = TempDir::new().expect("tempdir");
             let path = dir.path().join(format!("prior-v{prior_version}.sqlite3"));
             {
@@ -915,15 +1039,27 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 8, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 9, "prior schema V{prior_version}");
+            let missing_prompt_command_payloads: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM prompt_command_receipts
+                     WHERE command_payload IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("prompt command payload count");
+            assert_eq!(
+                missing_prompt_command_payloads, 0,
+                "new prompt receipts must persist canonical command bytes for prior schema V{prior_version}"
+            );
             let latest_name: String = conn
                 .query_row(
-                    "SELECT name FROM schema_migrations WHERE version = 8",
+                    "SELECT name FROM schema_migrations WHERE version = 9",
                     [],
                     |row| row.get(0),
                 )
                 .expect("corrective migration record");
-            assert_eq!(latest_name, "phase07-prompts-corrections-v2");
+            assert_eq!(latest_name, "phase07-prompts-lineage-authority-v3");
         }
     }
 

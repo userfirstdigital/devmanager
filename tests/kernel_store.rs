@@ -287,7 +287,7 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
             .map(|r| r.unwrap())
             .collect()
     };
-    assert_eq!(rows.len(), 8);
+    assert_eq!(rows.len(), 9);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "v1_initial");
     assert_eq!(rows[0].2.len(), 32);
@@ -312,6 +312,9 @@ fn schema_open_applies_v1_tables_indexes_and_settings() {
     assert_eq!(rows[7].0, 8);
     assert_eq!(rows[7].1, "phase07-prompts-corrections-v2");
     assert_eq!(rows[7].2.len(), 32);
+    assert_eq!(rows[8].0, 9);
+    assert_eq!(rows[8].1, "phase07-prompts-lineage-authority-v3");
+    assert_eq!(rows[8].2.len(), 32);
 
     let compacted_digest_column: (String, i64) = conn
         .query_row(
@@ -394,7 +397,7 @@ fn schema_rejects_newer_changed_and_gapped_migrations() {
         let conn = open_raw(&path);
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at_ms, sha256)
-             VALUES (9, 'v9_future', 1, ?1)",
+             VALUES (10, 'v10_future', 1, ?1)",
             rusqlite::params![vec![0u8; 32]],
         )
         .expect("insert newer");
