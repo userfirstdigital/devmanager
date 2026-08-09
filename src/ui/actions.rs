@@ -9,6 +9,7 @@ use crate::client::action::{
     ACTION_TASK_CREATE, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
 };
 use crate::domain::id::TaskId;
+use crate::ui::components::interaction::FocusEpoch;
 use crate::ui::components::{AccessibilityMetadata, AccessibleRole, InteractionStateModel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,7 +199,7 @@ impl KeyboardModel {
         &self,
         shortcut: KeyboardShortcut,
         interaction: &InteractionStateModel,
-        focus_epoch: u64,
+        focus_epoch: FocusEpoch,
     ) -> Option<KeyboardAction> {
         let action = self.resolve(shortcut)?;
         if interaction.focus_epoch() != focus_epoch {

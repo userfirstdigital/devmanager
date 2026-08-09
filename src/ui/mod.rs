@@ -9,10 +9,10 @@ use gpui::{App, Global};
 pub mod actions;
 pub mod components;
 pub mod preview;
+pub mod preview_capture;
 pub mod shell;
 pub mod task_cockpit;
 pub mod tokens;
-pub mod preview_capture;
 
 pub use preview::PreviewInitReport;
 

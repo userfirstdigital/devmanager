@@ -4,6 +4,7 @@ use devmanager::ui::actions::{
     self, ActionAvailability, DockTool, KeyboardAction, KeyboardBinding, KeyboardModel,
     KeyboardShortcut, ShortcutKey,
 };
+use devmanager::ui::components::interaction::FocusEpochSource;
 use devmanager::ui::components::{AccessibleRole, InteractionStateModel};
 use serde::Deserialize;
 use std::fs;
@@ -173,11 +174,10 @@ fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
         Some(KeyboardAction::DismissTransient)
     );
     assert_eq!(
-        model.activate(
-            KeyboardShortcut::escape(),
-            &disabled,
-            disabled.focus_epoch() + 1
-        ),
+        model.activate(KeyboardShortcut::escape(), &disabled, {
+            let mut source = FocusEpochSource::new();
+            source.advance()
+        }),
         None,
         "Escape may bypass disabled state but never a stale focus epoch"
     );
