@@ -1,15 +1,20 @@
 # Phase 10.1a management/privacy policy report
 
-Status: GREEN — pure transport-independent policy contract implemented in the
-isolated `phase-10-1-management-policy` worktree.
+Status: GREEN — pure transport-independent policy contract and Luna-max
+authority correction implemented in the isolated
+`phase-10-1-management-policy` worktree.
 
 ## Owned files
 
 - `src/connect/policy.rs` — closed privacy classes, managed-field allowlist and
   explicit denylist, validated enrollment/grants, role/scope decisions, fixed
-  reason codes, and the validated 15-minute active-session interval.
-- `src/connect/mod.rs` — policy module and public contract export only.
-- `tests/management_policy.rs` — RED/GREEN contract tests.
+  reason codes, and the validated 15-minute active-session interval. Decision
+  construction is private; callers only inspect decisions. Grants are
+  non-copyable/non-cloneable, revoke in place, and are borrowed by principals.
+- `tests/management_policy.rs` — RED/GREEN contract tests, including public
+  negative trait assertions and same-grant post-revocation denial.
+- `docs/superpowers/reports/2026-08-09-phase-10-1a-management-policy.md` —
+  phase evidence report.
 
 The policy type is named `ManagementPrivacyClass` because Phase 9 already
 exports a wire `connect::PrivacyClass` alias. The policy has no serde derives,
@@ -33,17 +38,19 @@ remote, or provider-runtime dependency.
 
 ## Verification
 
-- RED: the new integration test first failed with unresolved policy imports
-  before any policy production code existed.
-- GREEN: `CARGO_TARGET_DIR=C:\Temp\devmanager-phase101a-policy cargo test
-  --test management_policy -- --nocapture` — 10 passed, 0 failed.
-- Library: `CARGO_TARGET_DIR=C:\Temp\devmanager-phase101a-policy cargo check
-  --lib` — exit 0. It retains seven pre-existing warnings in unrelated
+- RED: the public-style borrowed-principal calls and negative `Clone`/`Copy`
+  assertions failed against the original owned, copyable grant API.
+- GREEN: `CARGO_TARGET_DIR=C:\Temp\devmanager-phase101a-final cargo test
+  --locked --test management_policy -- --nocapture` — 11 passed, 0 failed.
+- Library: `CARGO_TARGET_DIR=C:\Temp\devmanager-phase101a-final cargo check
+  --locked --lib` — exit 0. It retains seven pre-existing warnings in unrelated
   `src/kernel`/`src/host` code.
-- `rustfmt --edition 2021` passed for the three owned Rust files.
+- `rustfmt --edition 2021` and its `--check` pass completed for the two owned
+  Rust files.
 - `git diff --check` passed.
-- The exact policy Cargo/rustc/test-harness process tree was empty after the
-  checks; unrelated concurrent worktree Cargo processes were left untouched.
+- The exact final-target/worktree residue check found no Cargo, rustc,
+  rustfmt, or test-harness process; unrelated concurrent worktree processes
+  were left untouched.
 
 ## Residual risks and later gates
 

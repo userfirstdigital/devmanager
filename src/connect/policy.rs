@@ -261,7 +261,7 @@ pub enum GrantError {
 }
 
 /// A time-bounded, task-scoped management grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ManagementGrant {
     task_id: TaskId,
     role: ManagementRole,
@@ -289,33 +289,27 @@ impl ManagementGrant {
         })
     }
 
-    pub const fn revoke(self) -> Self {
-        Self {
-            task_id: self.task_id,
-            role: self.role,
-            issued_at_ms: self.issued_at_ms,
-            expires_at_ms: self.expires_at_ms,
-            revoked: true,
-        }
+    pub fn revoke(&mut self) {
+        self.revoked = true;
     }
 
-    pub const fn task_id(self) -> TaskId {
+    pub const fn task_id(&self) -> TaskId {
         self.task_id
     }
 
-    pub const fn role(self) -> ManagementRole {
+    pub const fn role(&self) -> ManagementRole {
         self.role
     }
 
-    pub const fn is_revoked(self) -> bool {
+    pub const fn is_revoked(&self) -> bool {
         self.revoked
     }
 
-    pub const fn issued_at_ms(self) -> u64 {
+    pub const fn issued_at_ms(&self) -> u64 {
         self.issued_at_ms
     }
 
-    pub const fn expires_at_ms(self) -> u64 {
+    pub const fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
     }
 }
@@ -327,10 +321,10 @@ pub enum ManagementRole {
     TaskCollaborator,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyPrincipal {
+#[derive(Debug, PartialEq, Eq)]
+pub enum PolicyPrincipal<'grant> {
     Owner,
-    Grant(ManagementGrant),
+    Grant(&'grant ManagementGrant),
     NoGrant,
 }
 
@@ -412,7 +406,7 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
-    pub const fn allow() -> Self {
+    const fn allow() -> Self {
         Self {
             allowed: true,
             reason_code: PolicyReasonCode::Allowed,
@@ -451,7 +445,7 @@ impl ManagementPolicy {
     pub fn decide(
         &self,
         task: &TaskContext,
-        principal: PolicyPrincipal,
+        principal: PolicyPrincipal<'_>,
         operation: PolicyOperation,
         now_ms: u64,
     ) -> PolicyDecision {
@@ -471,7 +465,7 @@ impl ManagementPolicy {
     fn decide_metadata(
         &self,
         task: &TaskContext,
-        principal: PolicyPrincipal,
+        principal: PolicyPrincipal<'_>,
         field: ManagedField,
         now_ms: u64,
     ) -> PolicyDecision {
@@ -509,7 +503,7 @@ impl ManagementPolicy {
     fn decide_mutation(
         &self,
         task: &TaskContext,
-        principal: PolicyPrincipal,
+        principal: PolicyPrincipal<'_>,
         now_ms: u64,
     ) -> PolicyDecision {
         match principal {
@@ -529,7 +523,7 @@ impl ManagementPolicy {
         }
     }
 
-    fn decide_dangerous(&self, principal: PolicyPrincipal) -> PolicyDecision {
+    fn decide_dangerous(&self, principal: PolicyPrincipal<'_>) -> PolicyDecision {
         match principal {
             PolicyPrincipal::Owner => PolicyDecision::allow(),
             PolicyPrincipal::Grant(_) | PolicyPrincipal::NoGrant => {
@@ -541,7 +535,7 @@ impl ManagementPolicy {
     fn authorize_read(
         &self,
         task: &TaskContext,
-        principal: PolicyPrincipal,
+        principal: PolicyPrincipal<'_>,
         now_ms: u64,
     ) -> PolicyDecision {
         match principal {
@@ -556,7 +550,7 @@ impl ManagementPolicy {
     fn validate_grant(
         &self,
         task: &TaskContext,
-        grant: ManagementGrant,
+        grant: &ManagementGrant,
         now_ms: u64,
     ) -> Option<PolicyDecision> {
         if grant.task_id() != task.task_id {
