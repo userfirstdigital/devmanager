@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use devmanager::theme;
 use devmanager::ui::tokens::{
-    contrast_ratio, srgb_luminance, theme as build_theme, Color, Density, Scale, ThemeMode,
-    ThemeTokens,
+    contrast_ratio, srgb_luminance, theme as build_theme, Color, ContrastPair, Density, Scale,
+    TerminalSlotRole, ThemeMode, ThemeTokens,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
 const EXPECTED_COLOR_KEYS: &[&str] = &[
@@ -82,14 +83,126 @@ const EXPECTED_COLOR_KEYS: &[&str] = &[
     "terminal_bright_white",
 ];
 
-const ALL_MODES: &[ThemeMode] = &[ThemeMode::Dark, ThemeMode::Light];
-const ALL_DENSITIES: &[Density] = &[Density::Compact, Density::Comfortable];
-const ALL_SCALES: &[Scale] = &[
-    Scale::Scale100,
-    Scale::Scale125,
-    Scale::Scale150,
-    Scale::Scale200,
-];
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThemeMatrixFixture {
+    schema_version: u16,
+    content: MatrixContent,
+    interaction_bindings: Vec<MatrixInteractionBinding>,
+    status_bindings: Vec<MatrixStatusBinding>,
+    cases: Vec<ThemeMatrixCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixContent {
+    long_text: String,
+    unicode: String,
+    disabled_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixInteractionBinding {
+    state: MatrixInteractionState,
+    content_key: MatrixContentKey,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixStatusBinding {
+    status: MatrixStatus,
+    content_key: MatrixContentKey,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum MatrixInteractionState {
+    Default,
+    Hover,
+    Focus,
+    Selected,
+    Disabled,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum MatrixStatus {
+    External,
+    Attention,
+    Success,
+    Warning,
+    Destructive,
+    Inactive,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum MatrixContentKey {
+    LongText,
+    Unicode,
+    DisabledText,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+enum MatrixTheme {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+enum MatrixDensity {
+    Compact,
+    Comfortable,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+enum MatrixScale {
+    #[serde(rename = "100%")]
+    Scale100,
+    #[serde(rename = "125%")]
+    Scale125,
+    #[serde(rename = "150%")]
+    Scale150,
+    #[serde(rename = "200%")]
+    Scale200,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThemeMatrixCase {
+    theme: MatrixTheme,
+    density: MatrixDensity,
+    scale: MatrixScale,
+}
+
+fn load_theme_matrix() -> ThemeMatrixFixture {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ui/theme-matrix.json"
+    )))
+    .expect("typed theme matrix fixture")
+}
+
+fn matrix_case_tokens(case: &ThemeMatrixCase) -> ThemeTokens {
+    let mode = match case.theme {
+        MatrixTheme::Dark => ThemeMode::Dark,
+        MatrixTheme::Light => ThemeMode::Light,
+    };
+    let density = match case.density {
+        MatrixDensity::Compact => Density::Compact,
+        MatrixDensity::Comfortable => Density::Comfortable,
+    };
+    let scale = match case.scale {
+        MatrixScale::Scale100 => Scale::Scale100,
+        MatrixScale::Scale125 => Scale::Scale125,
+        MatrixScale::Scale150 => Scale::Scale150,
+        MatrixScale::Scale200 => Scale::Scale200,
+    };
+    build_theme(mode, density, scale)
+}
 
 fn colors(tokens: &ThemeTokens) -> BTreeSet<&'static str> {
     tokens
@@ -185,6 +298,60 @@ fn assert_color_contrast(tokens: &ThemeTokens) {
     }
 }
 
+fn minimum_contrast_pair(pairs: &[ContrastPair]) -> ContrastPair {
+    *pairs
+        .iter()
+        .min_by(|left, right| {
+            contrast_ratio(left.foreground, left.background)
+                .partial_cmp(&contrast_ratio(right.foreground, right.background))
+                .expect("finite contrast ratio")
+        })
+        .expect("non-empty contrast pair set")
+}
+
+#[test]
+fn exhaustive_contrast_diagnostics_report_minimum_ratios() {
+    let mut minima = [
+        ("normal_text", f64::INFINITY, ""),
+        ("large_text", f64::INFINITY, ""),
+        ("ui_indicator", f64::INFINITY, ""),
+        ("disabled_text", f64::INFINITY, ""),
+        ("interaction_text", f64::INFINITY, ""),
+        ("status_surface", f64::INFINITY, ""),
+    ];
+
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
+        let categories = [
+            ("normal_text", tokens.normal_text_contrast_pairs()),
+            ("large_text", tokens.large_text_contrast_pairs()),
+            ("ui_indicator", tokens.ui_indicator_contrast_pairs()),
+            ("disabled_text", tokens.disabled_text_contrast_pairs()),
+            (
+                "interaction_text",
+                tokens.interaction_state_contrast_pairs(),
+            ),
+            ("status_surface", tokens.status_surface_contrast_pairs()),
+        ];
+        for (category, pairs) in categories {
+            let pair = minimum_contrast_pair(&pairs);
+            let ratio = contrast_ratio(pair.foreground, pair.background);
+            let (_, minimum, minimum_name) = minima
+                .iter_mut()
+                .find(|(name, _, _)| *name == category)
+                .expect("diagnostic category");
+            if ratio < *minimum {
+                *minimum = ratio;
+                *minimum_name = pair.name;
+            }
+        }
+    }
+
+    for (category, ratio, name) in minima {
+        println!("minimum {category} contrast: {ratio:.3}:1 ({name})");
+    }
+}
+
 fn assert_orange(color: Color) {
     assert!(
         color.red() > color.green() && color.green() > color.blue(),
@@ -229,8 +396,19 @@ fn assert_neutral(color: Color) {
 
 #[test]
 fn dark_and_light_themes_share_one_complete_semantic_color_contract() {
-    let dark = build_theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
-    let light = build_theme(ThemeMode::Light, Density::Comfortable, Scale::Scale100);
+    let matrix = load_theme_matrix();
+    let dark_case = matrix
+        .cases
+        .iter()
+        .find(|case| case.theme == MatrixTheme::Dark)
+        .expect("dark matrix case");
+    let light_case = matrix
+        .cases
+        .iter()
+        .find(|case| case.theme == MatrixTheme::Light)
+        .expect("light matrix case");
+    let dark = matrix_case_tokens(dark_case);
+    let light = matrix_case_tokens(light_case);
 
     assert_eq!(colors(&dark), colors(&light));
     for key in EXPECTED_COLOR_KEYS {
@@ -246,13 +424,194 @@ fn dark_and_light_themes_share_one_complete_semantic_color_contract() {
 
 #[test]
 fn every_semantic_color_and_contrast_foreground_is_opaque_and_conforming() {
-    for mode in ALL_MODES {
-        let tokens = build_theme(*mode, Density::Comfortable, Scale::Scale100);
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
         for token in tokens.semantic_color_tokens() {
             assert!(token.color.is_opaque(), "{} is not opaque", token.name);
         }
         assert_color_contrast(&tokens);
     }
+}
+
+#[test]
+fn action_state_backgrounds_and_borders_are_visible_against_their_owning_surface() {
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
+        let action_states = [
+            ("action_primary_default", tokens.actions.primary.default),
+            ("action_primary_hover", tokens.actions.primary.hover),
+            ("action_primary_focus", tokens.actions.primary.focus),
+            ("action_primary_selected", tokens.actions.primary.selected),
+            ("action_primary_disabled", tokens.actions.primary.disabled),
+            (
+                "action_destructive_default",
+                tokens.actions.destructive.default,
+            ),
+            ("action_destructive_hover", tokens.actions.destructive.hover),
+            ("action_destructive_focus", tokens.actions.destructive.focus),
+            (
+                "action_destructive_selected",
+                tokens.actions.destructive.selected,
+            ),
+            (
+                "action_destructive_disabled",
+                tokens.actions.destructive.disabled,
+            ),
+        ];
+        for (name, state) in action_states {
+            for (edge, color) in [("background", state.background), ("border", state.border)] {
+                let ratio = contrast_ratio(color, tokens.surfaces.canvas);
+                assert!(
+                    ratio >= 3.0,
+                    "{name}_{edge}_on_canvas must provide 3:1 UI-indicator contrast, got {ratio:.3}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ui_indicator_pairs_expose_every_action_background_and_border() {
+    let expected = [
+        "action_primary_default_background_on_canvas",
+        "action_primary_default_border_on_canvas",
+        "action_primary_hover_background_on_canvas",
+        "action_primary_hover_border_on_canvas",
+        "action_primary_focus_background_on_canvas",
+        "action_primary_focus_border_on_canvas",
+        "action_primary_selected_background_on_canvas",
+        "action_primary_selected_border_on_canvas",
+        "action_primary_disabled_background_on_canvas",
+        "action_primary_disabled_border_on_canvas",
+        "action_destructive_default_background_on_canvas",
+        "action_destructive_default_border_on_canvas",
+        "action_destructive_hover_background_on_canvas",
+        "action_destructive_hover_border_on_canvas",
+        "action_destructive_focus_background_on_canvas",
+        "action_destructive_focus_border_on_canvas",
+        "action_destructive_selected_background_on_canvas",
+        "action_destructive_selected_border_on_canvas",
+        "action_destructive_disabled_background_on_canvas",
+        "action_destructive_disabled_border_on_canvas",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
+        let actual = tokens
+            .ui_indicator_contrast_pairs()
+            .into_iter()
+            .map(|pair| pair.name)
+            .filter(|name| name.starts_with("action_"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn every_terminal_foreground_slot_is_named_and_contrast_compliant() {
+    let expected = [
+        "terminal_foreground_on_background",
+        "terminal_black_on_background",
+        "terminal_red_on_background",
+        "terminal_green_on_background",
+        "terminal_yellow_on_background",
+        "terminal_blue_on_background",
+        "terminal_magenta_on_background",
+        "terminal_cyan_on_background",
+        "terminal_white_on_background",
+        "terminal_bright_black_on_background",
+        "terminal_bright_red_on_background",
+        "terminal_bright_green_on_background",
+        "terminal_bright_yellow_on_background",
+        "terminal_bright_blue_on_background",
+        "terminal_bright_magenta_on_background",
+        "terminal_bright_cyan_on_background",
+        "terminal_bright_white_on_background",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
+        let pairs = tokens
+            .normal_text_contrast_pairs()
+            .into_iter()
+            .filter(|pair| pair.name.starts_with("terminal_"))
+            .collect::<Vec<_>>();
+        let actual = pairs.iter().map(|pair| pair.name).collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        for pair in pairs {
+            let ratio = contrast_ratio(pair.foreground, pair.background);
+            assert!(
+                ratio >= 4.5,
+                "{} must provide 4.5:1 terminal foreground contrast, got {ratio:.3}",
+                pair.name
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_slots_explicitly_classify_foreground_and_non_foreground_roles() {
+    let expected_foreground = [
+        "terminal_foreground",
+        "terminal_black",
+        "terminal_red",
+        "terminal_green",
+        "terminal_yellow",
+        "terminal_blue",
+        "terminal_magenta",
+        "terminal_cyan",
+        "terminal_white",
+        "terminal_bright_black",
+        "terminal_bright_red",
+        "terminal_bright_green",
+        "terminal_bright_yellow",
+        "terminal_bright_blue",
+        "terminal_bright_magenta",
+        "terminal_bright_cyan",
+        "terminal_bright_white",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let expected_non_foreground = [
+        "terminal_background",
+        "terminal_cursor",
+        "terminal_selection",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    let tokens = build_theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+    let slots = tokens.terminal.slots();
+    assert_eq!(slots.len(), 20);
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| slot.is_foreground_capable())
+            .map(|slot| slot.name)
+            .collect::<BTreeSet<_>>(),
+        expected_foreground
+    );
+    assert_eq!(
+        slots
+            .iter()
+            .filter(|slot| !slot.is_foreground_capable())
+            .map(|slot| slot.name)
+            .collect::<BTreeSet<_>>(),
+        expected_non_foreground
+    );
+    assert!(slots.iter().any(|slot| {
+        slot.name == "terminal_background" && slot.role == TerminalSlotRole::Background
+    }));
+    assert!(slots.iter().any(|slot| {
+        slot.name == "terminal_cursor" && slot.role == TerminalSlotRole::CursorIndicator
+    }));
+    assert!(slots.iter().any(|slot| {
+        slot.name == "terminal_selection" && slot.role == TerminalSlotRole::SelectionBackground
+    }));
 }
 
 #[test]
@@ -265,8 +624,8 @@ fn luminance_and_contrast_use_deterministic_srgb_calculation() {
 
 #[test]
 fn status_colors_encode_meaning_without_relying_on_text_or_shape() {
-    for mode in ALL_MODES {
-        let status = build_theme(*mode, Density::Comfortable, Scale::Scale100).status;
+    for case in load_theme_matrix().cases {
+        let status = matrix_case_tokens(&case).status;
         assert_blue(status.external);
         assert_orange(status.attention);
         assert_green(status.success);
@@ -303,8 +662,8 @@ fn semantic_action_and_status_surfaces_declare_every_exposed_state() {
     .into_iter()
     .collect::<BTreeSet<_>>();
 
-    for mode in ALL_MODES {
-        let tokens = build_theme(*mode, Density::Comfortable, Scale::Scale100);
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
         let action_states = tokens
             .interaction_state_contrast_pairs()
             .into_iter()
@@ -343,8 +702,8 @@ fn semantic_action_and_status_surfaces_declare_every_exposed_state() {
 
 #[test]
 fn focus_and_selection_are_distinguishable_and_visible() {
-    for mode in ALL_MODES {
-        let tokens = build_theme(*mode, Density::Comfortable, Scale::Scale100);
+    for case in load_theme_matrix().cases {
+        let tokens = matrix_case_tokens(&case);
         assert_ne!(tokens.borders.focus, tokens.borders.default);
         assert_ne!(tokens.borders.selection, tokens.borders.default);
         assert_ne!(tokens.surfaces.selection, tokens.surfaces.hover);
@@ -365,43 +724,35 @@ fn focus_and_selection_are_distinguishable_and_visible() {
 
 #[test]
 fn density_metrics_remain_internally_valid_at_supported_windows_scales() {
-    for mode in ALL_MODES {
-        for density in ALL_DENSITIES {
-            for scale in ALL_SCALES {
-                let metrics = build_theme(*mode, *density, *scale).density;
-                let physical = metrics.physical();
-                assert!(
-                    physical.control_height >= physical.icon_size + 2 * physical.control_padding
-                );
-                assert!(
-                    physical.row_height >= physical.body_line_height + 2 * physical.row_padding
-                );
-                assert!(physical.terminal_line_height >= physical.code_line_height);
-                assert!(physical.focus_ring_width >= 1);
-                assert!(physical.label_min_width >= physical.icon_size);
-                assert!(metrics.spacing.xxs > 0.0);
-                assert!(metrics.spacing.xxs < metrics.spacing.xs);
-                assert!(metrics.spacing.xs < metrics.spacing.sm);
-                assert!(metrics.spacing.sm < metrics.spacing.md);
-                assert!(metrics.spacing.md < metrics.spacing.lg);
-                assert!(metrics.spacing.lg < metrics.spacing.xl);
-                assert!(metrics.spacing.xl < metrics.spacing.xxl);
-                assert!(metrics.radii.none <= metrics.radii.sm);
-                assert!(metrics.radii.sm < metrics.radii.md);
-                assert!(metrics.radii.md < metrics.radii.lg);
-                assert!(metrics.typography.body_line_height >= metrics.typography.body);
-                assert!(metrics.typography.code_line_height >= metrics.typography.code);
-                assert!(metrics.icons.xs < metrics.icons.sm);
-                assert!(metrics.icons.sm < metrics.icons.md);
-                assert!(metrics.icons.md < metrics.icons.lg);
-                assert!(metrics.icons.lg < metrics.icons.xl);
-                assert!(metrics.controls.input_height >= metrics.controls.control_height);
-                assert!(metrics.controls.button_height <= metrics.controls.input_height);
-                assert!(metrics.motion.fast_ms <= metrics.motion.normal_ms);
-                assert!(metrics.motion.normal_ms <= metrics.motion.slow_ms);
-                assert_eq!(metrics.motion.reduced_motion_ms, 0);
-            }
-        }
+    for case in load_theme_matrix().cases {
+        let metrics = matrix_case_tokens(&case).density;
+        let physical = metrics.physical();
+        assert!(physical.control_height >= physical.icon_size + 2 * physical.control_padding);
+        assert!(physical.row_height >= physical.body_line_height + 2 * physical.row_padding);
+        assert!(physical.terminal_line_height >= physical.code_line_height);
+        assert!(physical.focus_ring_width >= 1);
+        assert!(physical.label_min_width >= physical.icon_size);
+        assert!(metrics.spacing.xxs > 0.0);
+        assert!(metrics.spacing.xxs < metrics.spacing.xs);
+        assert!(metrics.spacing.xs < metrics.spacing.sm);
+        assert!(metrics.spacing.sm < metrics.spacing.md);
+        assert!(metrics.spacing.md < metrics.spacing.lg);
+        assert!(metrics.spacing.lg < metrics.spacing.xl);
+        assert!(metrics.spacing.xl < metrics.spacing.xxl);
+        assert!(metrics.radii.none <= metrics.radii.sm);
+        assert!(metrics.radii.sm < metrics.radii.md);
+        assert!(metrics.radii.md < metrics.radii.lg);
+        assert!(metrics.typography.body_line_height >= metrics.typography.body);
+        assert!(metrics.typography.code_line_height >= metrics.typography.code);
+        assert!(metrics.icons.xs < metrics.icons.sm);
+        assert!(metrics.icons.sm < metrics.icons.md);
+        assert!(metrics.icons.md < metrics.icons.lg);
+        assert!(metrics.icons.lg < metrics.icons.xl);
+        assert!(metrics.controls.input_height >= metrics.controls.control_height);
+        assert!(metrics.controls.button_height <= metrics.controls.input_height);
+        assert!(metrics.motion.fast_ms <= metrics.motion.normal_ms);
+        assert!(metrics.motion.normal_ms <= metrics.motion.slow_ms);
+        assert_eq!(metrics.motion.reduced_motion_ms, 0);
     }
 
     let compact = build_theme(ThemeMode::Dark, Density::Compact, Scale::Scale100).density;
@@ -473,13 +824,36 @@ fn theme_exports_the_library_token_module_without_a_shadow_source() {
 
 #[test]
 fn ui_source_outside_tokens_contains_no_direct_color_literals() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(r"src\ui");
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let canonical_token_path = source_root
+        .join(r"ui\tokens.rs")
+        .canonicalize()
+        .expect("canonical token module");
+    let mut production_files = Vec::new();
+    collect_rust_files(&source_root, &mut production_files);
+    let token_modules = production_files
+        .iter()
+        .filter(|path| is_token_module(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        token_modules.len(),
+        1,
+        "expected exactly one production token module"
+    );
+    assert_eq!(
+        token_modules[0]
+            .canonicalize()
+            .expect("canonical token module path"),
+        canonical_token_path
+    );
+
+    let root = source_root.join(r"ui");
     let mut files = Vec::new();
     collect_rust_files(&root, &mut files);
 
     assert!(!files.is_empty(), "expected the new src/ui module to exist");
     for path in files {
-        if path.file_name().and_then(|name| name.to_str()) == Some("tokens.rs") {
+        if path.canonicalize().expect("canonical UI source path") == canonical_token_path {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read UI source");
@@ -501,6 +875,10 @@ fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn is_token_module(path: &Path) -> bool {
+    path.file_stem().and_then(|name| name.to_str()) == Some("tokens")
 }
 
 fn contains_direct_color_literal(source: &str) -> bool {
@@ -573,6 +951,87 @@ fn direct_color_scan_allows_token_to_rgb_conversion_but_rejects_literals() {
 }
 
 #[test]
+fn direct_color_scan_uses_only_the_exact_canonical_token_module_exemption() {
+    let test_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(r"tests\ui_tokens.rs"))
+            .expect("read token tests");
+    assert!(
+        !test_source
+            .contains("path.file_name().and_then(|name| name.to_str()) == Some(\"tokens.rs\")"),
+        "the source scan must exempt only the exact canonical token path"
+    );
+
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_files(&source_root, &mut files);
+    let token_modules = files
+        .iter()
+        .filter(|path| is_token_module(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        token_modules.len(),
+        1,
+        "expected exactly one production token module"
+    );
+
+    let canonical = source_root
+        .join(r"ui\tokens.rs")
+        .canonicalize()
+        .expect("canonical token module");
+    assert_eq!(
+        token_modules[0]
+            .canonicalize()
+            .expect("canonical token module path"),
+        canonical
+    );
+}
+
+#[test]
+fn theme_matrix_is_typed_independent_fixture_data_not_generated_expectations() {
+    let test_source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(r"tests\ui_tokens.rs"))
+            .expect("read token tests");
+    let generated_matrix_marker = ["serde_json", "::json!({"].concat();
+    assert!(
+        !test_source.contains(&generated_matrix_marker),
+        "theme coverage must come from the checked-in typed matrix fixture"
+    );
+
+    let fixture = load_theme_matrix();
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(
+        fixture.cases.len(),
+        16,
+        "theme matrix must contain 2 x 2 x 4 cases"
+    );
+    let interaction_states = fixture
+        .interaction_bindings
+        .iter()
+        .map(|binding| &binding.state)
+        .collect::<BTreeSet<_>>();
+    let status_states = fixture
+        .status_bindings
+        .iter()
+        .map(|binding| &binding.status)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(interaction_states.len(), 5);
+    assert_eq!(status_states.len(), 6);
+    assert!(fixture.content.long_text.chars().count() > 120);
+    assert!(!fixture.content.unicode.is_ascii());
+    assert!(!fixture.content.disabled_text.is_empty());
+
+    let mut combinations = BTreeSet::new();
+    for case in &fixture.cases {
+        let _tokens = matrix_case_tokens(case);
+        combinations.insert(format!(
+            "{:?}:{:?}:{:?}",
+            case.theme, case.density, case.scale
+        ));
+    }
+    assert_eq!(combinations.len(), 16);
+}
+
+#[test]
 fn theme_gallery_preview_fixture_and_token_matrix_cover_phase_5_2() {
     let preview_fixture: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -583,148 +1042,46 @@ fn theme_gallery_preview_fixture_and_token_matrix_cover_phase_5_2() {
     assert_eq!(preview_fixture["id"], "theme-gallery");
     assert_eq!(preview_fixture["root"]["kind"], "minimal");
 
-    // Task 5.1 deliberately owns the checked-in file's strict preview schema.
-    // Keep this matrix deterministic in the scoped token test until the
-    // preview contract accepts extensions without weakening its validation.
-    let themes = ["dark", "light"];
-    let densities = ["compact", "comfortable"];
-    let scales = [100, 125, 150, 200];
-    let interaction_states = ["default", "hover", "focus", "selected", "disabled"];
-    let status_lights = [
-        "external",
-        "attention",
-        "success",
-        "warning",
-        "destructive",
-        "inactive",
-    ];
-    let state_bindings = serde_json::json!({
-        "default": "long_text",
-        "hover": "long_text",
-        "focus": "unicode",
-        "selected": "long_text",
-        "disabled": "disabled_text",
-        "external": "unicode",
-        "attention": "long_text",
-        "success": "long_text",
-        "warning": "disabled_text",
-        "destructive": "long_text",
-        "inactive": "disabled_text"
-    });
-    let content = serde_json::json!({
-        "long_text": "A long task title demonstrates wrapping without clipping while the token gallery exercises status, controls, terminal text, and focus affordances at every approved Windows scale.",
-        "unicode": "Résumé • 日本語 • العربية • Ελληνικά • 🚀",
-        "disabled_text": "Unavailable until the host reconnects"
-    });
-    let cases = themes
-        .into_iter()
-        .flat_map(|theme| {
-            densities.into_iter().flat_map(move |density| {
-                scales.into_iter().map(move |scale| {
-                    serde_json::json!({
-                        "theme": theme,
-                        "density": density,
-                        "scale": scale,
-                        "interaction_states": interaction_states,
-                        "status_lights": status_lights,
-                        "content_keys": ["long_text", "unicode", "disabled_text"]
-                    })
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    let fixture = serde_json::json!({
-        "schema_version": 1,
-        "themes": themes,
-        "densities": densities,
-        "scales": scales,
-        "interaction_states": interaction_states,
-        "status_lights": status_lights,
-        "state_bindings": state_bindings,
-        "content": content,
-        "cases": cases
-    });
-
-    assert_eq!(fixture["schema_version"], 1);
-    assert_eq!(fixture["themes"], serde_json::json!(["dark", "light"]));
-    assert_eq!(
-        fixture["densities"],
-        serde_json::json!(["compact", "comfortable"])
-    );
-    assert_eq!(fixture["scales"], serde_json::json!([100, 125, 150, 200]));
-    assert_eq!(
-        fixture["interaction_states"],
-        serde_json::json!(["default", "hover", "focus", "selected", "disabled"])
-    );
-    assert_eq!(
-        fixture["status_lights"],
-        serde_json::json!([
-            "external",
-            "attention",
-            "success",
-            "warning",
-            "destructive",
-            "inactive"
-        ])
-    );
-
-    let content = &fixture["content"];
-    assert!(content["long_text"]
-        .as_str()
-        .is_some_and(|text| text.chars().count() > 120));
-    assert!(content["unicode"]
-        .as_str()
-        .is_some_and(|text| !text.is_ascii()));
-    assert!(content["disabled_text"]
-        .as_str()
-        .is_some_and(|text| !text.is_empty()));
-
-    let state_bindings = fixture["state_bindings"]
-        .as_object()
-        .expect("state/content bindings");
-    assert_eq!(state_bindings.len(), 11);
-    for (state, content_key) in state_bindings {
-        let content_key = content_key.as_str().expect("binding content key");
-        assert!(
-            content.get(content_key).and_then(Value::as_str).is_some(),
-            "{state} binding must point to fixture content"
-        );
+    // Task 5.1 deliberately owns the checked-in preview schema. The independent
+    // typed matrix remains separate so this test never weakens that loader.
+    let matrix = load_theme_matrix();
+    assert_eq!(matrix.schema_version, 1);
+    assert_eq!(matrix.interaction_bindings.len(), 5);
+    assert_eq!(matrix.status_bindings.len(), 6);
+    for binding in matrix
+        .interaction_bindings
+        .iter()
+        .map(|binding| &binding.content_key)
+        .chain(
+            matrix
+                .status_bindings
+                .iter()
+                .map(|binding| &binding.content_key),
+        )
+    {
+        let content = match binding {
+            MatrixContentKey::LongText => &matrix.content.long_text,
+            MatrixContentKey::Unicode => &matrix.content.unicode,
+            MatrixContentKey::DisabledText => &matrix.content.disabled_text,
+        };
+        assert!(!content.is_empty());
     }
 
-    let cases = fixture["cases"].as_array().expect("gallery cases");
-    assert_eq!(cases.len(), 16, "one case per theme, density, and scale");
     let mut combinations = BTreeSet::new();
-    for case in cases {
-        let theme_name = case["theme"].as_str().expect("case theme");
-        let density_name = case["density"].as_str().expect("case density");
-        let scale = case["scale"].as_u64().expect("case scale");
-        assert!(combinations.insert(format!("{theme_name}:{density_name}:{scale}")));
-        assert_eq!(case["interaction_states"], fixture["interaction_states"]);
-        assert_eq!(case["status_lights"], fixture["status_lights"]);
-        assert_eq!(
-            case["content_keys"],
-            serde_json::json!(["long_text", "unicode", "disabled_text"])
-        );
-        for content_key in state_bindings.values() {
-            assert!(
-                case["content_keys"]
-                    .as_array()
-                    .expect("case content keys")
-                    .contains(content_key),
-                "matrix case must bind every state content key"
-            );
-        }
+    for case in &matrix.cases {
+        let tokens = matrix_case_tokens(case);
+        assert_color_contrast(&tokens);
+        let physical = tokens.density.physical();
+        assert!(physical.control_height >= physical.icon_size + 2 * physical.control_padding);
+        assert!(physical.row_height >= physical.body_line_height + 2 * physical.row_padding);
+        combinations.insert(format!(
+            "{:?}:{:?}:{:?}",
+            case.theme, case.density, case.scale
+        ));
     }
-
-    let expected_combinations = themes
-        .into_iter()
-        .flat_map(|theme| {
-            densities.into_iter().flat_map(move |density| {
-                scales
-                    .into_iter()
-                    .map(move |scale| format!("{theme}:{density}:{scale}"))
-            })
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(combinations, expected_combinations);
+    assert_eq!(
+        combinations.len(),
+        16,
+        "one case per theme, density, and scale"
+    );
 }

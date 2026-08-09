@@ -249,6 +249,145 @@ pub struct TerminalPalette {
     pub bright_white: Color,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSlotRole {
+    Background,
+    NormalForeground,
+    CursorIndicator,
+    SelectionBackground,
+    AnsiForeground,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalColorSlot {
+    pub name: &'static str,
+    pub color: Color,
+    pub role: TerminalSlotRole,
+}
+
+impl TerminalColorSlot {
+    pub fn is_foreground_capable(self) -> bool {
+        matches!(
+            self.role,
+            TerminalSlotRole::NormalForeground | TerminalSlotRole::AnsiForeground
+        )
+    }
+}
+
+impl TerminalPalette {
+    pub fn slots(self) -> Vec<TerminalColorSlot> {
+        vec![
+            TerminalColorSlot {
+                name: "terminal_background",
+                color: self.background,
+                role: TerminalSlotRole::Background,
+            },
+            TerminalColorSlot {
+                name: "terminal_foreground",
+                color: self.foreground,
+                role: TerminalSlotRole::NormalForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_cursor",
+                color: self.cursor,
+                role: TerminalSlotRole::CursorIndicator,
+            },
+            TerminalColorSlot {
+                name: "terminal_selection",
+                color: self.selection,
+                role: TerminalSlotRole::SelectionBackground,
+            },
+            TerminalColorSlot {
+                name: "terminal_black",
+                color: self.black,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_red",
+                color: self.red,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_green",
+                color: self.green,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_yellow",
+                color: self.yellow,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_blue",
+                color: self.blue,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_magenta",
+                color: self.magenta,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_cyan",
+                color: self.cyan,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_white",
+                color: self.white,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_black",
+                color: self.bright_black,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_red",
+                color: self.bright_red,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_green",
+                color: self.bright_green,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_yellow",
+                color: self.bright_yellow,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_blue",
+                color: self.bright_blue,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_magenta",
+                color: self.bright_magenta,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_cyan",
+                color: self.bright_cyan,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+            TerminalColorSlot {
+                name: "terminal_bright_white",
+                color: self.bright_white,
+                role: TerminalSlotRole::AnsiForeground,
+            },
+        ]
+    }
+
+    pub fn foreground_slots(self) -> Vec<TerminalColorSlot> {
+        self.slots()
+            .into_iter()
+            .filter(|slot| slot.is_foreground_capable())
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpacingTokens {
     pub xxs: f32,
@@ -406,6 +545,29 @@ const fn contrast_pair(name: &'static str, foreground: Color, background: Color)
         name,
         foreground,
         background,
+    }
+}
+
+fn terminal_foreground_pair_name(name: &'static str) -> &'static str {
+    match name {
+        "terminal_foreground" => "terminal_foreground_on_background",
+        "terminal_black" => "terminal_black_on_background",
+        "terminal_red" => "terminal_red_on_background",
+        "terminal_green" => "terminal_green_on_background",
+        "terminal_yellow" => "terminal_yellow_on_background",
+        "terminal_blue" => "terminal_blue_on_background",
+        "terminal_magenta" => "terminal_magenta_on_background",
+        "terminal_cyan" => "terminal_cyan_on_background",
+        "terminal_white" => "terminal_white_on_background",
+        "terminal_bright_black" => "terminal_bright_black_on_background",
+        "terminal_bright_red" => "terminal_bright_red_on_background",
+        "terminal_bright_green" => "terminal_bright_green_on_background",
+        "terminal_bright_yellow" => "terminal_bright_yellow_on_background",
+        "terminal_bright_blue" => "terminal_bright_blue_on_background",
+        "terminal_bright_magenta" => "terminal_bright_magenta_on_background",
+        "terminal_bright_cyan" => "terminal_bright_cyan_on_background",
+        "terminal_bright_white" => "terminal_bright_white_on_background",
+        _ => unreachable!("terminal foreground slot must have a declared pair name"),
     }
 }
 
@@ -717,7 +879,7 @@ impl ThemeTokens {
             ("selection", self.surfaces.selection),
             ("disabled", self.surfaces.disabled),
         ];
-        let mut pairs = Vec::with_capacity(28 + 2 + 9 + 10 + 6);
+        let mut pairs = Vec::with_capacity(28 + 2 + 8 + 17 + 10 + 6);
         for (surface_name, surface) in surfaces {
             let names = [
                 ("text_primary", self.text.primary),
@@ -810,14 +972,24 @@ impl ThemeTokens {
             self.text.on_accent,
             self.actions.destructive.selected.background,
         ));
-        pairs.push(contrast_pair(
-            "terminal_foreground_on_background",
-            self.terminal.foreground,
-            self.terminal.background,
-        ));
+        pairs.extend(self.terminal_foreground_contrast_pairs());
         pairs.extend(self.interaction_state_contrast_pairs());
         pairs.extend(self.status_surface_contrast_pairs());
         pairs
+    }
+
+    pub fn terminal_foreground_contrast_pairs(self) -> Vec<ContrastPair> {
+        self.terminal
+            .foreground_slots()
+            .into_iter()
+            .map(|slot| {
+                contrast_pair(
+                    terminal_foreground_pair_name(slot.name),
+                    slot.color,
+                    self.terminal.background,
+                )
+            })
+            .collect()
     }
 
     pub fn large_text_contrast_pairs(self) -> Vec<ContrastPair> {
@@ -841,8 +1013,117 @@ impl ThemeTokens {
                 self.surfaces.canvas,
             ),
         ];
+        pairs.extend(self.action_indicator_contrast_pairs());
         pairs.extend(self.status_indicator_contrast_pairs());
         pairs
+    }
+
+    pub fn action_indicator_contrast_pairs(self) -> Vec<ContrastPair> {
+        let owner = self.surfaces.canvas;
+        let primary = self.actions.primary;
+        let destructive = self.actions.destructive;
+        vec![
+            contrast_pair(
+                "action_primary_default_background_on_canvas",
+                primary.default.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_default_border_on_canvas",
+                primary.default.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_hover_background_on_canvas",
+                primary.hover.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_hover_border_on_canvas",
+                primary.hover.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_focus_background_on_canvas",
+                primary.focus.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_focus_border_on_canvas",
+                primary.focus.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_selected_background_on_canvas",
+                primary.selected.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_selected_border_on_canvas",
+                primary.selected.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_disabled_background_on_canvas",
+                primary.disabled.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_primary_disabled_border_on_canvas",
+                primary.disabled.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_default_background_on_canvas",
+                destructive.default.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_default_border_on_canvas",
+                destructive.default.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_hover_background_on_canvas",
+                destructive.hover.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_hover_border_on_canvas",
+                destructive.hover.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_focus_background_on_canvas",
+                destructive.focus.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_focus_border_on_canvas",
+                destructive.focus.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_selected_background_on_canvas",
+                destructive.selected.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_selected_border_on_canvas",
+                destructive.selected.border,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_disabled_background_on_canvas",
+                destructive.disabled.background,
+                owner,
+            ),
+            contrast_pair(
+                "action_destructive_disabled_border_on_canvas",
+                destructive.disabled.border,
+                owner,
+            ),
+        ]
     }
 
     pub fn status_indicator_contrast_pairs(self) -> Vec<ContrastPair> {
@@ -1031,17 +1312,17 @@ const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
 const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xfb7185);
 const DARK_STATUS_INACTIVE: Color = Color::from_u32(0xa1a1aa);
 
-const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x4f46e5);
-const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x4338ca);
-const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x3730a3);
-const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x312e81);
-const DARK_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x27272a);
+const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x5757c8);
+const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x5959d0);
+const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x5b5bd6);
+const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x5c5bd6);
+const DARK_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x606876);
 const DARK_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xf8fafc);
-const DARK_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xb42318);
-const DARK_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0x991b1b);
-const DARK_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0x7f1d1d);
-const DARK_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0x7f1d1d);
-const DARK_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x27272a);
+const DARK_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xc62828);
+const DARK_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0xc92a2a);
+const DARK_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0xc62828);
+const DARK_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0xc92a2a);
+const DARK_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x606876);
 const DARK_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
 
 const DARK_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0x172554);
@@ -1057,7 +1338,7 @@ const DARK_STATUS_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffe4e6);
 const DARK_STATUS_INACTIVE_SURFACE: Color = Color::from_u32(0x27272a);
 const DARK_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0xd4d4d8);
 
-const DARK_TERMINAL_BLACK: Color = Color::from_u32(0x18181b);
+const DARK_TERMINAL_BLACK: Color = Color::from_u32(0x818894);
 const DARK_TERMINAL_RED: Color = Color::from_u32(0xef4444);
 const DARK_TERMINAL_GREEN: Color = Color::from_u32(0x22c55e);
 const DARK_TERMINAL_YELLOW: Color = Color::from_u32(0xeab308);
@@ -1065,7 +1346,7 @@ const DARK_TERMINAL_BLUE: Color = Color::from_u32(0x3b82f6);
 const DARK_TERMINAL_MAGENTA: Color = Color::from_u32(0xa855f7);
 const DARK_TERMINAL_CYAN: Color = Color::from_u32(0x06b6d4);
 const DARK_TERMINAL_WHITE: Color = Color::from_u32(0xe4e4e7);
-const DARK_TERMINAL_BRIGHT_BLACK: Color = Color::from_u32(0x71717a);
+const DARK_TERMINAL_BRIGHT_BLACK: Color = Color::from_u32(0xa1a1aa);
 const DARK_TERMINAL_BRIGHT_RED: Color = Color::from_u32(0xf87171);
 const DARK_TERMINAL_BRIGHT_GREEN: Color = Color::from_u32(0x4ade80);
 const DARK_TERMINAL_BRIGHT_YELLOW: Color = Color::from_u32(0xfacc15);
@@ -1108,13 +1389,13 @@ const LIGHT_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0x4f46e5);
 const LIGHT_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0x4338ca);
 const LIGHT_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0x3730a3);
 const LIGHT_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0x312e81);
-const LIGHT_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0xe2e8f0);
+const LIGHT_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x475569);
 const LIGHT_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xffffff);
 const LIGHT_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xb42318);
 const LIGHT_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0x991b1b);
 const LIGHT_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0x7f1d1d);
 const LIGHT_ACTION_DESTRUCTIVE_SELECTED: Color = Color::from_u32(0x7f1d1d);
-const LIGHT_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0xe2e8f0);
+const LIGHT_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x475569);
 const LIGHT_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
 
 const LIGHT_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0xeff6ff);
@@ -1133,21 +1414,21 @@ const LIGHT_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0x334155);
 const LIGHT_TERMINAL_BACKGROUND: Color = Color::from_u32(0x1e293b);
 const LIGHT_TERMINAL_FOREGROUND: Color = Color::from_u32(0xf8fafc);
 const LIGHT_TERMINAL_SELECTION: Color = Color::from_u32(0x475569);
-const LIGHT_TERMINAL_BLACK: Color = Color::from_u32(0x0f172a);
-const LIGHT_TERMINAL_RED: Color = Color::from_u32(0xb42318);
-const LIGHT_TERMINAL_GREEN: Color = Color::from_u32(0x087a42);
-const LIGHT_TERMINAL_YELLOW: Color = Color::from_u32(0x8f4b00);
-const LIGHT_TERMINAL_BLUE: Color = Color::from_u32(0x075eaf);
-const LIGHT_TERMINAL_MAGENTA: Color = Color::from_u32(0x7e22ce);
-const LIGHT_TERMINAL_CYAN: Color = Color::from_u32(0x0e7490);
+const LIGHT_TERMINAL_BLACK: Color = Color::from_u32(0x94a3b8);
+const LIGHT_TERMINAL_RED: Color = Color::from_u32(0xff7b72);
+const LIGHT_TERMINAL_GREEN: Color = Color::from_u32(0x7ee787);
+const LIGHT_TERMINAL_YELLOW: Color = Color::from_u32(0xf0c674);
+const LIGHT_TERMINAL_BLUE: Color = Color::from_u32(0x8ab4f8);
+const LIGHT_TERMINAL_MAGENTA: Color = Color::from_u32(0xd8a0ff);
+const LIGHT_TERMINAL_CYAN: Color = Color::from_u32(0x67e8f9);
 const LIGHT_TERMINAL_WHITE: Color = Color::from_u32(0xf8fafc);
-const LIGHT_TERMINAL_BRIGHT_BLACK: Color = Color::from_u32(0x475569);
-const LIGHT_TERMINAL_BRIGHT_RED: Color = Color::from_u32(0xdc2626);
-const LIGHT_TERMINAL_BRIGHT_GREEN: Color = Color::from_u32(0x16a34a);
-const LIGHT_TERMINAL_BRIGHT_YELLOW: Color = Color::from_u32(0xa16207);
-const LIGHT_TERMINAL_BRIGHT_BLUE: Color = Color::from_u32(0x1d4ed8);
-const LIGHT_TERMINAL_BRIGHT_MAGENTA: Color = Color::from_u32(0x9333ea);
-const LIGHT_TERMINAL_BRIGHT_CYAN: Color = Color::from_u32(0x0891b2);
+const LIGHT_TERMINAL_BRIGHT_BLACK: Color = Color::from_u32(0xe2e8f0);
+const LIGHT_TERMINAL_BRIGHT_RED: Color = Color::from_u32(0xffa198);
+const LIGHT_TERMINAL_BRIGHT_GREEN: Color = Color::from_u32(0xa7f3d0);
+const LIGHT_TERMINAL_BRIGHT_YELLOW: Color = Color::from_u32(0xfde68a);
+const LIGHT_TERMINAL_BRIGHT_BLUE: Color = Color::from_u32(0xbfdbfe);
+const LIGHT_TERMINAL_BRIGHT_MAGENTA: Color = Color::from_u32(0xe9d5ff);
+const LIGHT_TERMINAL_BRIGHT_CYAN: Color = Color::from_u32(0xa5f3fc);
 const LIGHT_TERMINAL_BRIGHT_WHITE: Color = Color::from_u32(0xffffff);
 
 fn density_metrics(density: Density, scale: Scale) -> DensityMetrics {
@@ -1340,9 +1621,9 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
                     border: DARK_BORDER_SELECTION,
                 },
                 disabled: ActionStateTokens {
-                    foreground: DARK_TEXT_DISABLED,
+                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
                     background: DARK_ACTION_PRIMARY_DISABLED,
-                    border: DARK_BORDER_DISABLED,
+                    border: DARK_BORDER_SELECTION,
                 },
             },
             destructive: InteractionStateTokens {
@@ -1367,9 +1648,9 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
                     border: DARK_BORDER_SELECTION,
                 },
                 disabled: ActionStateTokens {
-                    foreground: DARK_TEXT_DISABLED,
+                    foreground: DARK_ACTION_DESTRUCTIVE_FOREGROUND,
                     background: DARK_ACTION_DESTRUCTIVE_DISABLED,
-                    border: DARK_BORDER_DISABLED,
+                    border: DARK_BORDER_SELECTION,
                 },
             },
         },
@@ -1471,9 +1752,9 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
                     border: LIGHT_BORDER_SELECTION,
                 },
                 disabled: ActionStateTokens {
-                    foreground: LIGHT_TEXT_DISABLED,
+                    foreground: LIGHT_TEXT_INVERSE,
                     background: LIGHT_ACTION_PRIMARY_DISABLED,
-                    border: LIGHT_BORDER_DISABLED,
+                    border: LIGHT_BORDER_FOCUS,
                 },
             },
             destructive: InteractionStateTokens {
@@ -1498,9 +1779,9 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
                     border: LIGHT_BORDER_SELECTION,
                 },
                 disabled: ActionStateTokens {
-                    foreground: LIGHT_TEXT_DISABLED,
+                    foreground: LIGHT_TEXT_INVERSE,
                     background: LIGHT_ACTION_DESTRUCTIVE_DISABLED,
-                    border: LIGHT_BORDER_DISABLED,
+                    border: LIGHT_BORDER_FOCUS,
                 },
             },
         },
