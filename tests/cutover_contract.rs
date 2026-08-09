@@ -708,27 +708,74 @@ fn oversized_contract_id_keeps_bounded_sanitized_fallback_json() {
 }
 
 #[test]
-fn oversized_ready_report_propagates_fallback_hold_to_exit() {
+fn normal_report_sanitizes_and_bounds_contract_id_without_fallback() {
     let mut document = contract(
         vec![base_row(
-            "oversized-ready",
+            "normal-contract-id",
+            "src/legacy.rs",
+            &["LegacyFixture"],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    document["contractId"] = Value::String(format!("contract-\u{1}{}", "x".repeat(300)));
+
+    let run = run_audit(document, &[]);
+    let bytes = fs::read(
+        run.fixture
+            .root
+            .join(".devmanager-next/evidence/current/cutover-audit.json"),
+    )
+    .expect("normal report JSON");
+    assert!(
+        bytes.len() < 262_144,
+        "normal report was {} bytes",
+        bytes.len()
+    );
+    assert_eq!(run.report["safety"]["boundReached"], false);
+
+    let contract_id = run.report["contractId"]
+        .as_str()
+        .expect("normal contractId");
+    assert_eq!(contract_id.len(), 256);
+    assert!(!contract_id.chars().any(char::is_control));
+    assert!(contract_id.starts_with("contract-?"));
+    assert!(contract_id.ends_with("..."));
+}
+
+#[test]
+fn oversized_ready_report_propagates_fallback_hold_to_exit() {
+    let long_symbols = (0..64)
+        .map(|index| format!("symbol-{index}-{}", "x".repeat(500)))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut evidence = vec![(
+        "evidence/gate-parity.json".to_string(),
+        br#"{"ok":true}"#.to_vec(),
+    )];
+    for index in 0..12 {
+        let id = format!("oversized-ready-{index}");
+        let mut row_value = base_row(
+            &id,
             "src/legacy.rs",
             &["LegacyFixture"],
             "src/replacement.rs",
             &["gate-parity"],
             "READY",
-        )],
-        vec![base_node("gate-parity", "gate", "READY")],
-    );
-    document["contractId"] = Value::String(format!("ready-{}", "y".repeat(300_000)));
+        );
+        row_value["legacy"]["symbols"] = json!(long_symbols.clone());
+        rows.push(row_value);
+        evidence.push((format!("evidence/{id}.json"), br#"{"ok":true}"#.to_vec()));
+    }
+    let document = contract(rows, vec![base_node("gate-parity", "gate", "READY")]);
+    let evidence_refs = evidence
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_slice()))
+        .collect::<Vec<_>>();
 
-    let run = run_audit(
-        document,
-        &[
-            ("evidence/gate-parity.json", br#"{"ok":true}"#),
-            ("evidence/oversized-ready.json", br#"{"ok":true}"#),
-        ],
-    );
+    let run = run_audit(document, &evidence_refs);
 
     assert!(!run.output.status.success());
     assert_eq!(run.report["contractStatus"], "HOLD");

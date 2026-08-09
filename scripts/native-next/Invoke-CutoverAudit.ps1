@@ -1647,7 +1647,7 @@ if ($null -eq $rootPath -or $null -eq $evidenceRoot -or $null -eq $reportPath -o
 
 $report = [pscustomobject]([ordered]@{
         schemaVersion = 1
-        contractId = [string](Get-ContractProperty -Object $contract -Name 'contractId')
+        contractId = ConvertTo-SafeDiagnosticText -Message ([string](Get-ContractProperty -Object $contract -Name 'contractId'))
         mode = $Mode
         contractStatus = $contractStatus
         ledgerPath = 'docs/replacement-deletion-ledger.md'
