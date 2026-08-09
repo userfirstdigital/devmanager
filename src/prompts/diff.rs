@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ pub struct PromptDiff<'a> {
     pub new_body: &'a str,
     pub old_body_sha256: [u8; 32],
     pub new_body_sha256: [u8; 32],
-    pub cache_key: DiffCacheKey,
+    pub cache_key: Option<DiffCacheKey>,
     pub hunks: Vec<LineHunk>,
     pub inline_spans: Vec<InlineSpan>,
     pub estimated_payload_bytes: usize,
@@ -114,6 +115,8 @@ pub enum TruncationReason {
     InlineSpanLimit,
     PayloadLimit,
     ComplexityLimit,
+    ComplexityAndPayloadLimit,
+    ComplexityAndInlineSpanLimit,
 }
 
 /// An explicit marker attached whenever an output cap or bounded approximation
@@ -134,6 +137,7 @@ pub enum DiffStatus {
     /// a region whose exact alignment would exceed the comparison budget.
     Approximate,
     Truncated,
+    ApproximateAndTruncated,
     Cancelled,
     InvalidInput {
         old_bytes: usize,
@@ -151,6 +155,32 @@ pub struct DiffCacheKey {
     pub old_body_sha256: [u8; 32],
     pub new_body_sha256: [u8; 32],
 }
+
+/// A failure to encode the canonical public diff projection within its wire
+/// budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDiffEncodeError {
+    PayloadLimit {
+        encoded_bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+impl fmt::Display for PromptDiffEncodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadLimit {
+                encoded_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "encoded prompt diff is {encoded_bytes} bytes; maximum is {max_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PromptDiffEncodeError {}
 
 /// Cooperative cancellation/deadline and cost inputs for a host background
 /// worker.
@@ -295,7 +325,7 @@ pub fn diff_versions_with_budget<'a>(
         Err(BudgetStop::WorkLimit) => {
             return finish_approximate(
                 empty_result(old, new, DiffStatus::Approximate),
-                OutputBudget::new(old, new),
+                OutputBudget::new(),
             );
         }
     };
@@ -305,7 +335,7 @@ pub fn diff_versions_with_budget<'a>(
         Err(BudgetStop::WorkLimit) => {
             return finish_approximate(
                 empty_result(old, new, DiffStatus::Approximate),
-                OutputBudget::new(old, new),
+                OutputBudget::new(),
             );
         }
     };
@@ -319,14 +349,14 @@ pub fn diff_versions_with_budget<'a>(
         new_body: new,
         old_body_sha256,
         new_body_sha256,
-        cache_key,
+        cache_key: Some(cache_key),
         hunks: Vec::new(),
         inline_spans: Vec::new(),
-        estimated_payload_bytes: base_payload_bytes(old, new),
+        estimated_payload_bytes: base_payload_bytes(),
         status: DiffStatus::Complete,
         truncation: None,
     };
-    let mut output = OutputBudget::new(old, new);
+    let mut output = OutputBudget::new();
 
     let old_lines = match scan_normalized_lines(old, &mut budget) {
         Ok(lines) => lines,
@@ -375,11 +405,10 @@ pub fn diff_versions_with_budget<'a>(
                 ) {
                     Ok(was_approximate) => approximate |= was_approximate,
                     Err(PhaseStop::Cancelled) => return finish_cancelled(result, output),
-                    Err(PhaseStop::WorkLimit) => {
-                        approximate = true;
-                        break;
+                    Err(PhaseStop::WorkLimit) => return finish_approximate(result, output),
+                    Err(PhaseStop::OutputLimit) => {
+                        return finish_truncated(result, output, approximate)
                     }
-                    Err(PhaseStop::OutputLimit) => return finish_truncated(result, output),
                 }
                 old_index = anchor_old;
                 new_index = anchor_new;
@@ -402,7 +431,9 @@ pub fn diff_versions_with_budget<'a>(
                     Ok(was_approximate) => approximate |= was_approximate,
                     Err(PhaseStop::Cancelled) => return finish_cancelled(result, output),
                     Err(PhaseStop::WorkLimit) => approximate = true,
-                    Err(PhaseStop::OutputLimit) => return finish_truncated(result, output),
+                    Err(PhaseStop::OutputLimit) => {
+                        return finish_truncated(result, output, approximate)
+                    }
                 }
                 old_index = old_lines.len();
                 new_index = new_lines.len();
@@ -421,7 +452,9 @@ pub fn diff_versions_with_budget<'a>(
                 ) {
                     Ok(_) | Err(PhaseStop::WorkLimit) => {}
                     Err(PhaseStop::Cancelled) => return finish_cancelled(result, output),
-                    Err(PhaseStop::OutputLimit) => return finish_truncated(result, output),
+                    Err(PhaseStop::OutputLimit) => {
+                        return finish_truncated(result, output, approximate)
+                    }
                 }
                 old_index = old_lines.len();
                 new_index = new_lines.len();
@@ -443,7 +476,7 @@ pub fn diff_versions_with_budget<'a>(
             Ok(was_approximate) => approximate |= was_approximate,
             Err(PhaseStop::Cancelled) => return finish_cancelled(result, output),
             Err(PhaseStop::WorkLimit) => approximate = true,
-            Err(PhaseStop::OutputLimit) => return finish_truncated(result, output),
+            Err(PhaseStop::OutputLimit) => return finish_truncated(result, output, approximate),
         }
     }
 
@@ -459,19 +492,119 @@ pub fn diff_versions_with_budget<'a>(
     }
 }
 
+/// Encode the canonical public diff projection.
+///
+/// The borrowed source bodies are private operation inputs and are deliberately
+/// not part of this projection. The returned bytes are the authority for the
+/// advertised payload limit; callers must handle the typed limit error.
+pub fn encode_public_diff(diff: &PromptDiff<'_>) -> Result<Vec<u8>, PromptDiffEncodeError> {
+    let hunks: Vec<_> = diff
+        .hunks
+        .iter()
+        .map(|hunk| {
+            serde_json::json!({
+                "old_start": hunk.old_start,
+                "old_count": hunk.old_count,
+                "new_start": hunk.new_start,
+                "new_count": hunk.new_count,
+                "kind": format!("{:?}", hunk.kind),
+                "changes": hunk.changes.iter().map(|change| serde_json::json!({
+                    "kind": format!("{:?}", change.kind),
+                    "old_line": change.old_line,
+                    "new_line": change.new_line,
+                    "text": change.text,
+                    "terminated": change.terminated,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let inline_spans: Vec<_> = diff
+        .inline_spans
+        .iter()
+        .map(|span| {
+            serde_json::json!({
+                "kind": format!("{:?}", span.kind),
+                "old_line": span.old_line,
+                "new_line": span.new_line,
+                "old_range": span.old_range.map(|range| serde_json::json!({
+                    "start": range.start,
+                    "end": range.end,
+                })),
+                "new_range": span.new_range.map(|range| serde_json::json!({
+                    "start": range.start,
+                    "end": range.end,
+                })),
+                "text": span.text,
+            })
+        })
+        .collect();
+    let cache_key = diff.cache_key.map(|key| {
+        serde_json::json!({
+            "old_body_sha256": key.old_body_sha256,
+            "new_body_sha256": key.new_body_sha256,
+        })
+    });
+
+    let value = serde_json::json!({
+        "old_body_sha256": diff.old_body_sha256,
+        "new_body_sha256": diff.new_body_sha256,
+        "cache_key": cache_key,
+        "hunks": hunks,
+        "inline_spans": inline_spans,
+        "estimated_payload_bytes": diff.estimated_payload_bytes,
+        "status": encode_status(diff.status),
+        "truncation": diff.truncation.map(encode_truncation_marker),
+    });
+    let encoded = serde_json::to_vec(&value).expect("public prompt diff result must encode");
+    if encoded.len() > MAX_PROMPT_DIFF_PAYLOAD_BYTES {
+        return Err(PromptDiffEncodeError::PayloadLimit {
+            encoded_bytes: encoded.len(),
+            max_bytes: MAX_PROMPT_DIFF_PAYLOAD_BYTES,
+        });
+    }
+    Ok(encoded)
+}
+
+fn encode_status(status: DiffStatus) -> serde_json::Value {
+    match status {
+        DiffStatus::Complete => serde_json::json!("Complete"),
+        DiffStatus::Approximate => serde_json::json!("Approximate"),
+        DiffStatus::Truncated => serde_json::json!("Truncated"),
+        DiffStatus::ApproximateAndTruncated => serde_json::json!("ApproximateAndTruncated"),
+        DiffStatus::Cancelled => serde_json::json!("Cancelled"),
+        DiffStatus::InvalidInput {
+            old_bytes,
+            new_bytes,
+            max_bytes,
+        } => serde_json::json!({
+            "InvalidInput": {
+                "old_bytes": old_bytes,
+                "new_bytes": new_bytes,
+                "max_bytes": max_bytes,
+            }
+        }),
+    }
+}
+
+fn encode_truncation_marker(marker: TruncationMarker) -> serde_json::Value {
+    serde_json::json!({
+        "retained_hunks": marker.retained_hunks,
+        "retained_inline_spans": marker.retained_inline_spans,
+        "retained_payload_bytes": marker.retained_payload_bytes,
+        "reason": format!("{:?}", marker.reason),
+    })
+}
+
 fn empty_result<'a>(old: &'a str, new: &'a str, status: DiffStatus) -> PromptDiff<'a> {
     PromptDiff {
         old_body: old,
         new_body: new,
         old_body_sha256: [0; 32],
         new_body_sha256: [0; 32],
-        cache_key: DiffCacheKey {
-            old_body_sha256: [0; 32],
-            new_body_sha256: [0; 32],
-        },
+        cache_key: None,
         hunks: Vec::new(),
         inline_spans: Vec::new(),
-        estimated_payload_bytes: base_payload_bytes(old, new).min(MAX_PROMPT_DIFF_PAYLOAD_BYTES),
+        estimated_payload_bytes: base_payload_bytes().min(MAX_PROMPT_DIFF_PAYLOAD_BYTES),
         status,
         truncation: None,
     }
@@ -706,6 +839,7 @@ fn append_inline_spans(
                 > LINE_ANCHOR_WINDOW
         {
             approximate = true;
+            output.approximate = true;
         }
 
         append_inline_span_pair(
@@ -931,15 +1065,32 @@ fn finish_cancelled<'a>(mut result: PromptDiff<'a>, output: OutputBudget) -> Pro
     result
 }
 
-fn finish_truncated<'a>(mut result: PromptDiff<'a>, output: OutputBudget) -> PromptDiff<'a> {
+fn finish_truncated<'a>(
+    mut result: PromptDiff<'a>,
+    output: OutputBudget,
+    approximate: bool,
+) -> PromptDiff<'a> {
     let estimated_payload_bytes = output.bytes_with_marker();
+    let approximate = approximate || output.approximate;
+    let reason = match (
+        approximate,
+        output.reason.unwrap_or(TruncationReason::PayloadLimit),
+    ) {
+        (true, TruncationReason::InlineSpanLimit) => TruncationReason::ComplexityAndInlineSpanLimit,
+        (true, _) => TruncationReason::ComplexityAndPayloadLimit,
+        (false, reason) => reason,
+    };
     result.estimated_payload_bytes = estimated_payload_bytes;
-    result.status = DiffStatus::Truncated;
+    result.status = if approximate {
+        DiffStatus::ApproximateAndTruncated
+    } else {
+        DiffStatus::Truncated
+    };
     result.truncation = Some(TruncationMarker {
         retained_hunks: result.hunks.len(),
         retained_inline_spans: result.inline_spans.len(),
         retained_payload_bytes: estimated_payload_bytes,
-        reason: output.reason.unwrap_or(TruncationReason::PayloadLimit),
+        reason,
     });
     result
 }
@@ -1001,14 +1152,16 @@ struct OutputBudget {
     bytes: usize,
     spans: usize,
     reason: Option<TruncationReason>,
+    approximate: bool,
 }
 
 impl OutputBudget {
-    fn new(old: &str, new: &str) -> Self {
+    fn new() -> Self {
         Self {
-            bytes: base_payload_bytes(old, new),
+            bytes: base_payload_bytes(),
             spans: 0,
             reason: None,
+            approximate: false,
         }
     }
 
@@ -1103,6 +1256,7 @@ fn json_status_bytes() -> usize {
         json_string_bytes("Complete"),
         json_string_bytes("Approximate"),
         json_string_bytes("Truncated"),
+        json_string_bytes("ApproximateAndTruncated"),
         json_string_bytes("Cancelled"),
         invalid_input,
     ]
@@ -1112,20 +1266,28 @@ fn json_status_bytes() -> usize {
 }
 
 fn json_truncation_marker_bytes() -> usize {
+    let reason = [
+        json_string_bytes("InlineSpanLimit"),
+        json_string_bytes("PayloadLimit"),
+        json_string_bytes("ComplexityLimit"),
+        json_string_bytes("ComplexityAndPayloadLimit"),
+        json_string_bytes("ComplexityAndInlineSpanLimit"),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
     let marker = json_object_bytes(&[
         json_field_bytes("retained_hunks", MAX_JSON_NUMBER_BYTES),
         json_field_bytes("retained_inline_spans", MAX_JSON_NUMBER_BYTES),
         json_field_bytes("retained_payload_bytes", MAX_JSON_NUMBER_BYTES),
-        json_field_bytes("reason", json_string_bytes("ComplexityLimit")),
+        json_field_bytes("reason", reason),
     ]);
     debug_assert!(marker <= PROMPT_DIFF_TRUNCATION_MARKER_BYTES);
     marker
 }
 
-fn base_payload_bytes(old: &str, new: &str) -> usize {
+fn base_payload_bytes() -> usize {
     json_object_bytes(&[
-        json_field_bytes("old_body", json_string_bytes(old)),
-        json_field_bytes("new_body", json_string_bytes(new)),
         json_field_bytes("old_body_sha256", json_hash_bytes()),
         json_field_bytes("new_body_sha256", json_hash_bytes()),
         json_field_bytes(
