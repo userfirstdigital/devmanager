@@ -101,6 +101,31 @@ and safe-projection APIs; the final focused passes were 13/13 and 3/3. No
 5.3b widget, real capture, runtime/provider/process/config/AppData/session
 surface, installed app, network, merge, or push was touched.
 
+## Correction round 2
+
+The second correction round closed four focused findings without widening the
+component scope:
+
+- `TextFieldLimits` now enforces hard 4,096-scalar and 16,384-byte maxima for
+  both constructor and public-struct input; paste preflight remains before
+  candidate-string allocation.
+- Host focus epochs advance monotonically, reject stale updates without
+  clearing current focus, and are required by every text-field keyboard input
+  and paste path; an accepted epoch advance clears focus and pointer capture.
+- `RecoveryAction`, `EmptyState`, and `ErrorBoundary` delegate typed focus,
+  pointer, and keyboard events while preserving the exact `ActionRequest` and
+  existing epoch/pointer fences.
+- Renderable error and recovery labels are bounded and redacted. UI redaction
+  reuses the diagnostics redactor and adds API-key, AWS access/secret-key, and
+  Authorization Basic/Bearer coverage with sentinel regressions.
+
+The round-2 RED pass first failed on the missing epoch-aware keyboard and
+recovery delegation APIs, then failed on the deliberately reverted shared
+accessibility-error redaction assertion. Final focused GREEN counts are
+`ui_accessibility` 16/16 and `ui_projection` component cases 3/3. The report's
+earlier 9-test and 13-test counts are retained as historical implementation
+and first-review evidence; 16/16 is the current correction-round count.
+
 ## Explicit 5.3b blockers
 
 The following remain outside this slice and must not be implied as complete:

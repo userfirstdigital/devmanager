@@ -7,8 +7,8 @@ use devmanager::ui::components::error_boundary::{
 };
 use devmanager::ui::components::icon_button::{IconButton, TooltipContract};
 use devmanager::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, InteractionState, InteractionStateModel,
-    InteractionTransition, KeyboardKey,
+    AccessibilityMetadata, AccessibleRole, ActivationSource, ComponentError, InteractionState,
+    InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use devmanager::ui::components::status_light::StatusLight;
 use devmanager::ui::components::text_field::{
@@ -164,10 +164,12 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
         .set_description("Text is sent only after explicit user submission")
         .expect("description");
     assert!(!field
-        .handle_key(TextFieldKey::Character('x'))
+        .handle_key(TextFieldKey::Character('x'), field.focus_epoch())
         .expect("unfocused input is ignored"));
     field.focus();
-    assert!(field.handle_key(TextFieldKey::Character('界')).is_ok());
+    assert!(field
+        .handle_key(TextFieldKey::Character('界'), field.focus_epoch())
+        .is_ok());
     assert!(field.paste("🙂", field.focus_epoch()).is_ok());
     assert_eq!(field.value(), "界🙂");
     assert_eq!(field.value().chars().count(), 2);
@@ -197,7 +199,7 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
     field.set_read_only(true);
     assert!(field.accessibility().read_only);
     assert!(!field
-        .handle_key(TextFieldKey::Character('x'))
+        .handle_key(TextFieldKey::Character('x'), field.focus_epoch())
         .expect("read-only input is safe"));
     field.set_read_only(false);
     field.set_disabled(true);
@@ -211,7 +213,7 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
 #[test]
 fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
     let action = RecoveryAction::new("Retry", ActionRequest::TaskList).expect("action");
-    let empty = EmptyState::new("No tasks", "Create a task to get started")
+    let mut empty = EmptyState::new("No tasks", "Create a task to get started")
         .expect("empty state")
         .with_recovery_action(action)
         .expect("recovery action");
@@ -222,9 +224,31 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
         &ActionRequest::TaskList
     );
     assert!(empty.activate_recovery(0, 0).is_none());
+    empty.set_focus_epoch(30);
+    assert!(empty.focus_recovery(0));
+    let keyboard_event = empty
+        .key_activate_recovery(0, KeyboardKey::Enter, 30)
+        .expect("focused recovery action accepts Enter");
+    assert_eq!(keyboard_event.request, ActionRequest::TaskList);
+    assert_eq!(keyboard_event.focus_epoch, 30);
+    assert!(matches!(
+        keyboard_event.source,
+        ActivationSource::Keyboard {
+            key: KeyboardKey::Enter
+        }
+    ));
+    assert!(empty.pointer_down_recovery(0, 7, 30));
+    let pointer_event = empty
+        .pointer_up_recovery(0, 7, 30)
+        .expect("matching recovery pointer release activates");
+    assert_eq!(pointer_event.request, ActionRequest::TaskList);
+    assert!(matches!(
+        pointer_event.source,
+        ActivationSource::Pointer { pointer_id: 7 }
+    ));
     assert!(!empty.rendered_payload().contains("debug"));
 
-    let error = ErrorBoundary::new(
+    let mut error = ErrorBoundary::new(
         SafeErrorProjection::new(
             SafeErrorCode::HostUnavailable,
             "Could not load tasks",
@@ -240,6 +264,15 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
     assert_eq!(error.accessibility().role, AccessibleRole::Alert);
     assert!(error.accessibility().invalid);
     assert_eq!(error.recovery_actions().len(), 1);
+    error.set_focus_epoch(40);
+    assert!(error.focus_recovery(0));
+    let delegated = error
+        .key_activate_recovery(0, KeyboardKey::Space, 40)
+        .expect("error recovery action delegates keyboard activation");
+    assert_eq!(delegated.request, ActionRequest::TaskList);
+    assert!(error.pointer_down_recovery(0, 9, 40));
+    assert!(error.pointer_up_recovery(0, 9, 40).is_some());
+    error.blur_recovery(0);
     assert!(!error.rendered_payload().contains("provider"));
 }
 
@@ -280,6 +313,56 @@ fn keyboard_activation_requires_current_focus_and_epoch_changes_clear_focus() {
     model.set_focus_epoch(11);
     assert!(!model.state().focused);
     assert!(!model.key_activate(KeyboardKey::Space, 11));
+
+    assert!(model.focus());
+    model.set_focus_epoch(10);
+    assert!(!model.set_focus_epoch(10));
+    assert_eq!(
+        model.focus_epoch(),
+        11,
+        "stale host epochs must be rejected"
+    );
+    assert!(
+        model.state().focused,
+        "rejected epochs must not clear focus"
+    );
+    assert!(model.key_activate(KeyboardKey::Enter, 11));
+    assert!(matches!(
+        model.try_set_focus_epoch(9),
+        Err(ComponentError::StaleFocusEpoch {
+            current: 11,
+            attempted: 9
+        })
+    ));
+}
+
+#[test]
+fn text_field_limits_reject_oversized_public_limits() {
+    assert!(TextFieldLimits::new(4_097, 16_384).is_err());
+    assert!(TextFieldLimits::new(4_096, 16_385).is_err());
+    assert!(TextField::with_limits(
+        "Prompt",
+        TextFieldLimits {
+            max_scalars: 4_097,
+            max_bytes: 16_384,
+        },
+    )
+    .is_err());
+}
+
+#[test]
+fn text_field_keyboard_input_requires_the_current_focus_epoch() {
+    let mut field = TextField::new("Prompt").expect("field");
+    field.set_focus_epoch(8);
+    assert!(field.focus());
+
+    assert!(!field
+        .handle_key(TextFieldKey::Character('x'), 7)
+        .expect("stale keyboard input is ignored"));
+    assert!(field
+        .handle_key(TextFieldKey::Character('x'), 8)
+        .expect("current keyboard input is accepted"));
+    assert_eq!(field.value(), "x");
 }
 
 #[test]
@@ -329,4 +412,64 @@ fn error_boundary_accepts_only_safe_redacted_projection() {
 
     assert!(!error.rendered_payload().contains(SECRET_SENTINEL));
     assert!(error.rendered_payload().contains("***"));
+}
+
+#[test]
+fn every_renderable_error_and_recovery_label_is_bounded_and_redacted() {
+    const API_KEY: &str = "UI_API_KEY_SENTINEL";
+    const AWS_ACCESS: &str = "UI_AWS_ACCESS_SENTINEL";
+    const AWS_SECRET: &str = "UI_AWS_SECRET_SENTINEL";
+    const BASIC: &str = "UI_BASIC_AUTH_SENTINEL";
+    const BEARER: &str = "UI_BEARER_AUTH_SENTINEL";
+
+    let empty = EmptyState::new(
+        format!("AWS_ACCESS_KEY_ID={AWS_ACCESS}"),
+        format!("api_key={API_KEY}"),
+    )
+    .expect("empty state labels are bounded")
+    .with_recovery_action(
+        RecoveryAction::new(
+            format!("Authorization: Basic {BASIC}"),
+            ActionRequest::TaskList,
+        )
+        .expect("recovery label is bounded"),
+    )
+    .expect("recovery action");
+    let empty_payload = empty.rendered_payload();
+
+    let error = ErrorBoundary::new(
+        SafeErrorProjection::new(
+            SafeErrorCode::RendererFailure,
+            format!("AWS_SECRET_ACCESS_KEY={AWS_SECRET}"),
+            format!("Authorization: Bearer {BEARER}"),
+        )
+        .expect("error labels are bounded"),
+    )
+    .expect("error boundary")
+    .with_recovery_action(
+        RecoveryAction::new(format!("api_key={API_KEY}"), ActionRequest::TaskList)
+            .expect("recovery label is bounded"),
+    )
+    .expect("recovery action");
+    let error_payload = error.rendered_payload();
+
+    for secret in [API_KEY, AWS_ACCESS, AWS_SECRET, BASIC, BEARER] {
+        assert!(
+            !empty_payload.contains(secret),
+            "empty payload leaked {secret}"
+        );
+        assert!(
+            !error_payload.contains(secret),
+            "error payload leaked {secret}"
+        );
+    }
+    assert!(empty_payload.contains("***") || empty_payload.contains("[redacted]"));
+    assert!(error_payload.contains("***") || error_payload.contains("[redacted]"));
+
+    let mut metadata =
+        AccessibilityMetadata::new(AccessibleRole::Alert, "Error").expect("metadata");
+    metadata
+        .set_error(Some(format!("api_key={API_KEY}")))
+        .expect("metadata error is bounded");
+    assert!(!metadata.error.as_deref().unwrap().contains(API_KEY));
 }
