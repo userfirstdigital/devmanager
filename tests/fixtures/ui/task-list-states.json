@@ -1,0 +1,15 @@
+{
+  "schema": "devmanager.ui.task-cockpit.states/v1",
+  "states": [
+    {
+      "id": "empty",
+      "selected_task": false,
+      "disabled_ids": ["task.show", "task.rename"]
+    },
+    {
+      "id": "selected",
+      "selected_task": true,
+      "disabled_ids": []
+    }
+  ]
+}
