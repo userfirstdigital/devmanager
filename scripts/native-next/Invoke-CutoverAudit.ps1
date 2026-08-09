@@ -46,6 +46,8 @@ $maxNeedleChars = 512
 $maxMatchesPerOwner = 20
 $maxScanBytesPerFile = [int64]1048576
 $maxScannerFiles = 4096
+$maxScannerOutputBytes = [int64]262144
+$maxScannerDurationMs = 500
 $maxErrorCount = 64
 $maxReportJsonBytes = [int64]262144
 $maxReportHumanBytes = [int64]131072
@@ -353,7 +355,14 @@ function Open-CutoverConfinedFile {
     if ($item -is [System.IO.DirectoryInfo]) {
         $options = [System.IO.FileOptions]0x02000000
     }
-    $share = if ($ReadOnlyShare) { [System.IO.FileShare]::Read } else { [System.IO.FileShare]::ReadWrite }
+    # A scanner handle is read-only for this process, but writers and atomic
+    # path replacement must remain observable through the post-scan checks.
+    $share = if ($ReadOnlyShare) {
+        [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    }
+    else {
+        [System.IO.FileShare]::ReadWrite
+    }
     $stream = [System.IO.FileStream]::new(
         $full,
         [System.IO.FileMode]::Open,
@@ -452,6 +461,7 @@ function Read-CutoverScanBytes {
         throw 'tracked scanner input cannot be represented in memory.'
     }
 
+    $Opened.stream.Position = 0
     $bytes = [byte[]]::new([int]$length)
     $bytesRead = 0
     while ($bytesRead -lt $bytes.Length) {
@@ -459,15 +469,22 @@ function Read-CutoverScanBytes {
         if ($read -le 0) { break }
         $bytesRead += $read
     }
-    if ($bytesRead -eq $bytes.Length) {
-        return ,$bytes
+    if ($bytesRead -ne $bytes.Length) {
+        throw 'tracked scanner input changed while it was read.'
     }
+    return ,$bytes
+}
 
-    $shortBytes = [byte[]]::new($bytesRead)
-    if ($bytesRead -gt 0) {
-        [System.Array]::Copy($bytes, $shortBytes, $bytesRead)
+function Get-CutoverSha256Hex {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
     }
-    return ,$shortBytes
+    finally {
+        $sha.Dispose()
+    }
 }
 
 function Ensure-CutoverAuditDirectory {
@@ -878,6 +895,7 @@ function Invoke-ReferenceScan {
             }
 
             $scanBytes = Read-CutoverScanBytes -Opened $opened -MaxBytes $maxScanBytesPerFile
+            $scanDigest = Get-CutoverSha256Hex -Bytes $scanBytes
 
             $arguments = @(
                 '--json', '--fixed-strings', '--line-number', '--no-heading', '--color', 'never',
@@ -894,7 +912,7 @@ function Invoke-ReferenceScan {
                 -FileName 'rg' `
                 -Arguments $arguments `
                 -InputBytes $scanBytes `
-                -MaxBytes ([int64]262144)
+                -MaxBytes $maxScannerOutputBytes
             if ($scan.exitCode -gt 1) {
                 Add-GlobalBlocker 'rg reference scan failed for a validated tracked file.'
                 continue
@@ -903,8 +921,23 @@ function Invoke-ReferenceScan {
 
             $after = Get-CutoverHandleIdentity -Stream $opened.stream
             if (-not (Compare-CutoverIdentity -Before $opened.identity -After $after)) {
-                Add-SafetyBound
-                break
+                throw 'tracked scanner opened-handle identity changed during the scan.'
+            }
+            $recheckBytes = Read-CutoverScanBytes -Opened $opened -MaxBytes $maxScanBytesPerFile
+            $recheckDigest = Get-CutoverSha256Hex -Bytes $recheckBytes
+            if (-not [string]::Equals($scanDigest, $recheckDigest, [System.StringComparison]::Ordinal)) {
+                throw 'tracked scanner opened-handle content changed during the scan.'
+            }
+
+            $reopened = $null
+            try {
+                $reopened = Open-CutoverConfinedFile -LiteralPath $absolutePath -ReadOnlyShare
+                if (-not (Compare-CutoverIdentity -Before $opened.identity -After $reopened.identity)) {
+                    throw 'tracked scanner pathname identity changed during the scan.'
+                }
+            }
+            finally {
+                if ($null -ne $reopened) { $reopened.stream.Dispose() }
             }
             foreach ($rawLine in $scan.lines) {
                 if ([string]::IsNullOrWhiteSpace([string]$rawLine)) { continue }
@@ -963,6 +996,266 @@ function Invoke-ReferenceScan {
     return @($matches.ToArray())
 }
 
+function Initialize-CutoverProcessMethods {
+    if ($null -eq ([System.Management.Automation.PSTypeName]'CutoverProcessMethods').Type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class CutoverProcessResult
+{
+    public bool Success { get; set; }
+    public string Failure { get; set; }
+    public int ExitCode { get; set; }
+    public byte[] StandardOutput { get; set; }
+}
+
+public static class CutoverProcessMethods
+{
+    private sealed class OutputResult
+    {
+        public byte[] Bytes { get; set; }
+    }
+
+    private sealed class OutputLimitException : Exception
+    {
+    }
+
+    public static CutoverProcessResult Run(
+        string fileName,
+        string[] arguments,
+        byte[] inputBytes,
+        int maxOutputBytes,
+        int deadlineMilliseconds)
+    {
+        return RunAsync(fileName, arguments, inputBytes, maxOutputBytes, deadlineMilliseconds)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    private static async Task<OutputResult> ReadBoundedAsync(
+        Stream stream,
+        int maxBytes,
+        CancellationToken cancellationToken)
+    {
+        using (var output = new MemoryStream(Math.Min(maxBytes + 1, 8192)))
+        {
+            var buffer = new byte[8192];
+            while (true)
+            {
+                var remaining = maxBytes - output.Length + 1;
+                if (remaining <= 0) throw new OutputLimitException();
+                var read = await stream.ReadAsync(
+                    buffer,
+                    0,
+                    (int)Math.Min(buffer.Length, remaining),
+                    cancellationToken).ConfigureAwait(false);
+                if (read == 0) break;
+                if (output.Length + read > maxBytes) throw new OutputLimitException();
+                output.Write(buffer, 0, read);
+            }
+            return new OutputResult { Bytes = output.ToArray() };
+        }
+    }
+
+    private static async Task WriteInputAsync(
+        Stream stream,
+        byte[] inputBytes,
+        CancellationToken cancellationToken)
+    {
+        if (inputBytes.Length > 0)
+        {
+            await stream.WriteAsync(inputBytes, 0, inputBytes.Length, cancellationToken)
+                .ConfigureAwait(false);
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        stream.Close();
+    }
+
+    private static async Task<bool> WaitUntilAsync(Task task, DateTime deadline)
+    {
+        while (!task.IsCompleted)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero) return false;
+            var winner = await Task.WhenAny(task, Task.Delay(remaining)).ConfigureAwait(false);
+            if (winner != task) return false;
+        }
+        return true;
+    }
+
+    private static void KillProcessTree(Process process)
+    {
+        if (process == null) return;
+        try
+        {
+            if (!process.HasExited) process.Kill(true);
+        }
+        catch
+        {
+            try
+            {
+                if (!process.HasExited) process.Kill();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static async Task<CutoverProcessResult> AbortAsync(
+        Process process,
+        CancellationTokenSource cancellation,
+        Task stdoutTask,
+        Task stderrTask,
+        Task stdinTask,
+        Task exitTask,
+        string failure)
+    {
+        try { cancellation?.Cancel(); } catch { }
+        KillProcessTree(process);
+
+        var cleanupTasks = new List<Task>();
+        if (stdoutTask != null) cleanupTasks.Add(stdoutTask);
+        if (stderrTask != null) cleanupTasks.Add(stderrTask);
+        if (stdinTask != null) cleanupTasks.Add(stdinTask);
+        if (exitTask != null) cleanupTasks.Add(exitTask);
+        if (cleanupTasks.Count > 0)
+        {
+            var cleanup = Task.WhenAll(cleanupTasks.ToArray());
+            await WaitUntilAsync(cleanup, DateTime.UtcNow.AddMilliseconds(500))
+                .ConfigureAwait(false);
+        }
+        return new CutoverProcessResult
+        {
+            Success = false,
+            Failure = failure,
+            ExitCode = -1,
+            StandardOutput = Array.Empty<byte>()
+        };
+    }
+
+    private static async Task<CutoverProcessResult> RunAsync(
+        string fileName,
+        string[] arguments,
+        byte[] inputBytes,
+        int maxOutputBytes,
+        int deadlineMilliseconds)
+    {
+        Process process = null;
+        CancellationTokenSource cancellation = null;
+        Task<OutputResult> stdoutTask = null;
+        Task<OutputResult> stderrTask = null;
+        Task stdinTask = null;
+        Task exitTask = null;
+        OutputResult stdout = null;
+        OutputResult stderr = null;
+        var stdoutChecked = false;
+        var stderrChecked = false;
+        var stdinChecked = false;
+        var exitChecked = false;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+            process = new Process { StartInfo = startInfo };
+            if (!process.Start())
+            {
+                return new CutoverProcessResult
+                {
+                    Success = false,
+                    Failure = "start-error",
+                    ExitCode = -1,
+                    StandardOutput = Array.Empty<byte>()
+                };
+            }
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(deadlineMilliseconds);
+            cancellation = new CancellationTokenSource();
+            stdoutTask = ReadBoundedAsync(process.StandardOutput.BaseStream, maxOutputBytes, cancellation.Token);
+            stderrTask = ReadBoundedAsync(process.StandardError.BaseStream, maxOutputBytes, cancellation.Token);
+            stdinTask = WriteInputAsync(process.StandardInput.BaseStream, inputBytes, cancellation.Token);
+            exitTask = process.WaitForExitAsync();
+
+            while (!(stdoutChecked && stderrChecked && stdinChecked && exitChecked))
+            {
+                if (stdoutTask.IsCompleted && !stdoutChecked)
+                {
+                    try { stdout = stdoutTask.GetAwaiter().GetResult(); }
+                    catch (OutputLimitException) { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "stdout-overflow").ConfigureAwait(false); }
+                    catch { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "stdout-error").ConfigureAwait(false); }
+                    stdoutChecked = true;
+                }
+                if (stderrTask.IsCompleted && !stderrChecked)
+                {
+                    try { stderr = stderrTask.GetAwaiter().GetResult(); }
+                    catch (OutputLimitException) { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "stderr-overflow").ConfigureAwait(false); }
+                    catch { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "stderr-error").ConfigureAwait(false); }
+                    stderrChecked = true;
+                }
+                if (stdinTask.IsCompleted && !stdinChecked)
+                {
+                    try { stdinTask.GetAwaiter().GetResult(); }
+                    catch { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "stdin-error").ConfigureAwait(false); }
+                    stdinChecked = true;
+                }
+                if (exitTask.IsCompleted && !exitChecked)
+                {
+                    try { exitTask.GetAwaiter().GetResult(); }
+                    catch { return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "exit-error").ConfigureAwait(false); }
+                    exitChecked = true;
+                }
+                if (stdoutChecked && stderrChecked && stdinChecked && exitChecked) break;
+
+                var pending = new List<Task>();
+                if (!stdoutChecked) pending.Add(stdoutTask);
+                if (!stderrChecked) pending.Add(stderrTask);
+                if (!stdinChecked) pending.Add(stdinTask);
+                if (!exitChecked) pending.Add(exitTask);
+                if (!await WaitUntilAsync(Task.WhenAny(pending.ToArray()), deadline).ConfigureAwait(false))
+                {
+                    return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "timeout").ConfigureAwait(false);
+                }
+            }
+
+            return new CutoverProcessResult
+            {
+                Success = true,
+                Failure = null,
+                ExitCode = process.ExitCode,
+                StandardOutput = stdout.Bytes
+            };
+        }
+        catch
+        {
+            return await AbortAsync(process, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, "process-error").ConfigureAwait(false);
+        }
+        finally
+        {
+            try { process?.StandardInput?.Dispose(); } catch { }
+            try { process?.StandardOutput?.BaseStream?.Dispose(); } catch { }
+            try { process?.StandardError?.BaseStream?.Dispose(); } catch { }
+            try { process?.Dispose(); } catch { }
+            try { cancellation?.Dispose(); } catch { }
+        }
+    }
+}
+'@
+    }
+}
+
 function Invoke-CutoverProcessLines {
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
@@ -971,36 +1264,26 @@ function Invoke-CutoverProcessLines {
         [Parameter(Mandatory = $true)][int64]$MaxBytes
     )
 
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FileName
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardInput = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($argument in $Arguments) { $null = $startInfo.ArgumentList.Add($argument) }
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw "Unable to start bounded $FileName process." }
+    Initialize-CutoverProcessMethods
+    $result = [CutoverProcessMethods]::Run(
+        $FileName,
+        $Arguments,
+        $InputBytes,
+        [int]$MaxBytes,
+        [int]$maxScannerDurationMs)
+    if (-not $result.Success) {
+        Add-SafetyBound
+        throw "bounded scanner invocation failed ($($result.Failure))."
+    }
     try {
-        # Start both readers before writing stdin so a noisy rg stderr stream
-        # cannot block the scan while stdout is being consumed.
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if ($InputBytes.Length -gt 0) {
-            $process.StandardInput.BaseStream.Write($InputBytes, 0, $InputBytes.Length)
-            $process.StandardInput.BaseStream.Flush()
-        }
-        $process.StandardInput.Close()
-        $process.WaitForExit()
-        [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask))
-        $stdout = $stdoutTask.Result
-        $boundHit = [System.Text.Encoding]::UTF8.GetByteCount($stdout) -gt $MaxBytes
-        $lines = if ($boundHit) { @() } else { @($stdout -split "`r?`n" | Where-Object { $_ -ne '' }) }
-        return [pscustomobject]@{ lines = $lines; exitCode = $process.ExitCode; boundHit = $boundHit }
+        $stdout = [System.Text.UTF8Encoding]::new($false, $true).GetString($result.StandardOutput)
     }
-    finally {
-        $process.Dispose()
+    catch {
+        Add-SafetyBound
+        throw 'bounded scanner output was not valid UTF-8.'
     }
+    $lines = @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
+    return [pscustomobject]@{ lines = $lines; exitCode = $result.ExitCode; boundHit = $false }
 }
 
 function Get-RelativeReportPath {
@@ -1182,6 +1465,8 @@ function New-BoundedAuditReport {
                     needles = $maxNeedles
                     scannerFiles = $maxScannerFiles
                     scanBytesPerFile = $maxScanBytesPerFile
+                    scannerOutputBytes = $maxScannerOutputBytes
+                    scannerDeadlineMilliseconds = $maxScannerDurationMs
                     errors = $maxErrorCount
                     jsonBytes = $maxReportJsonBytes
                     humanBytes = $maxReportHumanBytes
@@ -1193,6 +1478,8 @@ function New-BoundedAuditReport {
                 allowedLedgerSelfReferences = @('docs/replacement-deletion-ledger.md')
                 protectedFileBasenames = @('session.json')
                 maxMatchesPerRow = $maxMatches
+                maxOutputBytes = $maxScannerOutputBytes
+                deadlineMilliseconds = $maxScannerDurationMs
             }
         })
 }
@@ -1718,6 +2005,8 @@ $report = [pscustomobject]([ordered]@{
                 needles = $maxNeedles
                 scannerFiles = $maxScannerFiles
                 scanBytesPerFile = $maxScanBytesPerFile
+                scannerOutputBytes = $maxScannerOutputBytes
+                scannerDeadlineMilliseconds = $maxScannerDurationMs
                 errors = $maxErrorCount
                 jsonBytes = $maxReportJsonBytes
                 humanBytes = $maxReportHumanBytes
@@ -1729,6 +2018,8 @@ $report = [pscustomobject]([ordered]@{
             allowedLedgerSelfReferences = @('docs/replacement-deletion-ledger.md')
             protectedFileBasenames = @('session.json')
             maxMatchesPerRow = $maxMatches
+            maxOutputBytes = $maxScannerOutputBytes
+            deadlineMilliseconds = $maxScannerDurationMs
         }
     })
 

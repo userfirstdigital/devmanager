@@ -4,6 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -170,26 +172,6 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
         .expect("spawn cutover audit")
 }
 
-fn real_rg_path() -> PathBuf {
-    let output = Command::new("where.exe")
-        .arg("rg")
-        .output()
-        .expect("locate real rg");
-    assert!(
-        output.status.success(),
-        "where.exe rg failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    PathBuf::from(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .expect("real rg path")
-            .trim(),
-    )
-}
-
 fn write_rg_shim(shim_root: &Path) -> PathBuf {
     fs::create_dir_all(shim_root).expect("rg shim directory");
     let source_path = shim_root.join("rg-shim.cs");
@@ -224,6 +206,85 @@ public static class Program
         return builder.ToString();
     }
 
+    private static void SpawnResidue()
+    {
+        var startInfo = new ProcessStartInfo("pwsh");
+        startInfo.UseShellExecute = false;
+        startInfo.Arguments = "-NoProfile -Command \"Start-Sleep -Seconds 2; [IO.File]::WriteAllText($env:RG_FAKE_RESIDUE, 'residue')\"";
+        Process.Start(startInfo);
+    }
+
+    private static void Emit(Stream stream, byte value, int count)
+    {
+        var buffer = new byte[8192];
+        for (var index = 0; index < buffer.Length; index++) buffer[index] = value;
+        var remaining = count;
+        while (remaining > 0)
+        {
+            var size = Math.Min(remaining, buffer.Length);
+            stream.Write(buffer, 0, size);
+            stream.Flush();
+            remaining -= size;
+        }
+    }
+
+    private static void RunFakeMode(string mode)
+    {
+        if (mode == "stdin-match")
+        {
+            using (var input = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8))
+            {
+                var stdin = input.ReadToEnd();
+                if (stdin.IndexOf("original-only", StringComparison.Ordinal) >= 0)
+                {
+                    Console.WriteLine("{\"type\":\"match\",\"data\":{\"line_number\":1,\"submatches\":[{\"match\":{\"text\":\"original-only\"}}]}}");
+                }
+            }
+            return;
+        }
+        if (mode == "hang")
+        {
+            SpawnResidue();
+            System.Threading.Thread.Sleep(30000);
+            return;
+        }
+        if (mode == "stdout-overflow")
+        {
+            SpawnResidue();
+            Emit(Console.OpenStandardOutput(), (byte)'x', 400000);
+            System.Threading.Thread.Sleep(30000);
+            return;
+        }
+        if (mode == "stderr-overflow")
+        {
+            SpawnResidue();
+            Emit(Console.OpenStandardError(), (byte)'x', 400000);
+            System.Threading.Thread.Sleep(30000);
+            return;
+        }
+
+        var path = Environment.GetEnvironmentVariable("RG_FAKE_TARGET");
+        if (string.IsNullOrEmpty(path)) throw new InvalidOperationException("missing fake target");
+        var bytes = File.ReadAllBytes(path);
+        var before = Encoding.UTF8.GetString(bytes);
+        var after = before.Replace("original-only", "replaced-only");
+        if (mode == "mutate")
+        {
+            System.Threading.Thread.Sleep(100);
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes(after));
+            return;
+        }
+        if (mode == "swap")
+        {
+            var moved = path + ".cutover-swap";
+            if (File.Exists(moved)) File.Delete(moved);
+            File.Move(path, moved);
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes(after));
+            return;
+        }
+        throw new InvalidOperationException("unknown fake mode");
+    }
+
     public static int Main(string[] args)
     {
         var rawArgs = string.Join(" ", Array.ConvertAll(args, value => "\"" + Escape(value) + "\""));
@@ -235,7 +296,7 @@ public static class Program
         foreach (var argument in args)
         {
             if (argument == "-") usedStdin = true;
-            if (Path.IsPathFullyQualified(argument) && File.Exists(argument)) path = argument;
+            if (Path.IsPathRooted(argument) && File.Exists(argument)) path = argument;
         }
         if (path != null)
         {
@@ -261,9 +322,16 @@ public static class Program
             + (rewriteSameLength ? "true" : "false") + "}" + Environment.NewLine;
         File.AppendAllText(Environment.GetEnvironmentVariable("RG_SHIM_LOG"), logLine, new UTF8Encoding(false));
 
+        var fakeMode = Environment.GetEnvironmentVariable("RG_FAKE_MODE");
+        if (!string.IsNullOrEmpty(fakeMode))
+        {
+            RunFakeMode(fakeMode);
+            return 0;
+        }
+
         var startInfo = new ProcessStartInfo(Environment.GetEnvironmentVariable("RG_REAL"));
         startInfo.UseShellExecute = false;
-        foreach (var argument in args) startInfo.ArgumentList.Add(argument);
+        startInfo.Arguments = string.Join(" ", Array.ConvertAll(args, value => "\"" + Escape(value) + "\""));
         using (var process = Process.Start(startInfo))
         {
             process.WaitForExit();
@@ -274,7 +342,7 @@ public static class Program
 "#,
     )
     .expect("rg shim source");
-    let compile = Command::new("pwsh")
+    let compile = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-Command",
@@ -291,6 +359,67 @@ public static class Program
         String::from_utf8_lossy(&compile.stderr)
     );
     executable_path
+}
+
+fn spawn_fake_audit(
+    root: &Path,
+    output_path: &Path,
+    mode: &str,
+    target: &Path,
+    log: &Path,
+    residue: &Path,
+    shim_root: &Path,
+) -> (Output, Duration) {
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let mut path_entries = vec![shim_root.to_path_buf()];
+    path_entries.extend(std::env::split_paths(&original_path));
+    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let mut child = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            root.to_str().expect("fixture root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("APPDATA", root.join("protected-appdata"))
+        .env("RG_FAKE_MODE", mode)
+        .env("RG_FAKE_TARGET", target)
+        .env("RG_FAKE_RESIDUE", residue)
+        .env("RG_SHIM_LOG", log)
+        .env("PATH", isolated_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn bounded fake audit");
+    let started = Instant::now();
+    loop {
+        if child.try_wait().expect("poll bounded fake audit").is_some() {
+            let elapsed = started.elapsed();
+            return (
+                child
+                    .wait_with_output()
+                    .expect("collect bounded fake audit"),
+                elapsed,
+            );
+        }
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed out fake audit");
+            panic!(
+                "fake scanner mode {mode} exceeded the 15 second audit deadline\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn force_track(root: &Path, paths: &[&str]) {
@@ -1195,8 +1324,14 @@ fn protected_session_variants_are_not_opened_by_the_scanner() {
     assert!(!output.status.success());
     assert!(!strings_at(&report, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("reference scan failed")));
-    assert!(!report.to_string().contains("session-exclusive-sentinel"));
+        .any(|blocker| blocker.contains("tracked scanner skipped")));
+    for kind in ["path", "symbol", "token"] {
+        assert!(!row(&report, "session-variant")["references"][kind]
+            .as_array()
+            .expect("protected reference list")
+            .iter()
+            .any(|path| path == "nested/SESSION.JSON"));
+    }
 }
 
 #[test]
@@ -1447,7 +1582,7 @@ fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", fixture.root.join("protected-appdata"))
-        .env("RG_REAL", real_rg_path())
+        .env("RG_FAKE_MODE", "stdin-match")
         .env("RG_SHIM_LOG", &log_path)
         .env("PATH", isolated_path)
         .output()
@@ -1500,4 +1635,103 @@ fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
             .all(|record| record["rewriteAttempted"] == false),
         "the shim's equal-length rewrite path must remain unreachable: {records:?}"
     );
+}
+
+#[test]
+fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
+    let modes = [
+        "hang",
+        "stdout-overflow",
+        "stderr-overflow",
+        "mutate",
+        "swap",
+    ];
+    let mut residue_paths = Vec::new();
+    let mut fixtures = Vec::new();
+
+    for mode in modes {
+        let fixture = fixture_repo(
+            contract(
+                vec![base_row(
+                    "scanner-safety",
+                    "src/legacy.rs",
+                    &["original-only"],
+                    "src/replacement.rs",
+                    &["gate-parity"],
+                    "HOLD",
+                )],
+                vec![base_node("gate-parity", "gate", "HOLD")],
+            ),
+            &[("README.md", b"original-only\n")],
+        );
+        let shim_root = fixture._temp.path().join("rg-shim");
+        let shim = write_rg_shim(&shim_root);
+        assert!(shim.is_file(), "fake scanner shim must be executable");
+        let log_path = shim_root.join("rg-shim.jsonl");
+        let residue = shim_root.join("residue.txt");
+        let output_path = fixture
+            .root
+            .join(".devmanager-next/evidence/current/cutover-audit.json");
+        let (output, elapsed) = spawn_fake_audit(
+            &fixture.root,
+            &output_path,
+            mode,
+            &fixture.root.join("README.md"),
+            &log_path,
+            &residue,
+            &shim_root,
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "fake scanner mode {mode} took {elapsed:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output_path.is_file(), "mode {mode} must publish a report");
+        let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
+            .expect("valid audit JSON");
+        assert!(!output.status.success(), "mode {mode} must fail closed");
+        let blockers = strings_at(&report, &["blockers"]);
+        match mode {
+            "mutate" => assert!(
+                blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("content") || blocker.contains("changed")),
+                "same-length in-place mutation was not rejected: {report}"
+            ),
+            "swap" => assert!(
+                blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("identity") || blocker.contains("changed")),
+                "atomic pathname swap was not rejected: {report}"
+            ),
+            _ => assert!(
+                blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("scanner") || blocker.contains("safety")),
+                "bounded scanner failure was not reported: {report}"
+            ),
+        }
+        let log = fs::read_to_string(&log_path).expect("fake scanner log");
+        assert!(
+            log.contains("\"usedStdin\":true"),
+            "mode {mode} did not use stdin"
+        );
+        assert!(
+            log.lines()
+                .all(|line| !line.contains(&fixture.root.to_string_lossy().to_ascii_lowercase())),
+            "mode {mode} received a fixture path in its arguments: {log}"
+        );
+        residue_paths.push(residue);
+        fixtures.push(fixture);
+    }
+
+    thread::sleep(Duration::from_secs(3));
+    for residue in residue_paths {
+        assert!(
+            !residue.exists(),
+            "fake scanner residue survived: {}",
+            residue.display()
+        );
+    }
 }
