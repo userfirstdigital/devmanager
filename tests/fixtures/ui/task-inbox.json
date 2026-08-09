@@ -1,0 +1,10 @@
+{
+  "schema": "devmanager.ui.task-cockpit.task-inbox/v1",
+  "expected_count": 5000,
+  "expected_overscan": 32,
+  "report": {
+    "projection": "client-model-only",
+    "rendered_rows_bound": 104,
+    "selection": "task-id"
+  }
+}

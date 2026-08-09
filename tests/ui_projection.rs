@@ -1,6 +1,16 @@
+use devmanager::client::{ClientModel, ClientModelBuilder};
+use devmanager::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+use devmanager::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+    TaskLifecycle, WorkspaceRef,
+};
 use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
     PreviewPathPolicy, PreviewRequest, PREVIEW_SCHEMA,
+};
+use devmanager::ui::task_cockpit::{
+    Inbox, InboxError, InboxFilter, InboxSection, InboxState, UnreadCursor, DEFAULT_VISIBLE_ROWS,
 };
 use devmanager::ui::{self, PreviewInitReport};
 use std::cell::Cell;
@@ -25,6 +35,13 @@ const FIXTURE_JSON: &str = r#"{
 }"#;
 
 static HEADLESS_INIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+    [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        tail,
+    ]
+}
 
 fn repository_policy() -> PreviewPathPolicy {
     PreviewPathPolicy::for_workspace(env!("CARGO_MANIFEST_DIR"))
@@ -406,4 +423,447 @@ fn components_models_project_deterministically_for_both_token_themes() {
     assert_ne!(dark.background, light.background);
     assert_eq!(dark.focus_ring, None);
     assert_eq!(light.focus_ring, None);
+}
+
+fn inbox_task_item(
+    id: TaskId,
+    title: &str,
+    lifecycle: TaskLifecycle,
+    connectivity: TaskConnectivity,
+    attention: TaskAttention,
+    activity: TaskActivity,
+    review_readiness: ReviewReadiness,
+    created_at_ms: i64,
+) -> SnapshotItem {
+    SnapshotItem::Task(TaskSnapshotItem {
+        task: TaskFacts {
+            id,
+            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x10)).expect("environment"),
+            title: title.into(),
+            description: None,
+            project_id: ProjectId::from_bytes(fixed_uuid_v7(0x11)).expect("project"),
+            workspace: WorkspaceRef::Main,
+            assignment: TaskAssignment::LocalOwner,
+            lifecycle,
+            action_epoch: 0,
+            revision: created_at_ms as u64,
+            created_at_ms,
+        },
+        connectivity,
+        attention,
+        activity,
+        review_readiness,
+        primary_agent_id: None,
+    })
+}
+
+fn inbox_model(items: Vec<SnapshotItem>) -> ClientModel {
+    let snapshot_id = SnapshotId::from_bytes(fixed_uuid_v7(0x20)).expect("snapshot");
+    let mut builder = ClientModelBuilder::new();
+    builder
+        .ingest_page(SnapshotPage {
+            snapshot_id,
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        })
+        .expect("task page");
+    for section in [
+        SnapshotSection::AgentSessions,
+        SnapshotSection::Artifacts,
+        SnapshotSection::Resources,
+        SnapshotSection::Operations,
+    ] {
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id,
+                through_sequence: 1,
+                section,
+                after_item: None,
+                items: Vec::new(),
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("empty related section");
+    }
+    builder.finish().expect("complete client model")
+}
+
+fn inbox_task_id(index: u32) -> TaskId {
+    let mut bytes = fixed_uuid_v7(0);
+    bytes[12..].copy_from_slice(&index.to_be_bytes());
+    TaskId::from_bytes(bytes).expect("task id")
+}
+
+#[test]
+fn inbox_attention_order_is_deterministic_and_selection_is_task_id_based() {
+    let states = [
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::Failed,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::Ready,
+        ),
+        (
+            TaskConnectivity::Disconnected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::NeedsAnswer,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Settling,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Working,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::NeedsApproval,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+        (
+            TaskConnectivity::Connected,
+            TaskAttention::UncertainOutcome,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+        ),
+    ];
+    let mut items = states
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (connectivity, attention, activity, review_readiness))| {
+                inbox_task_item(
+                    inbox_task_id(index as u32),
+                    "same title",
+                    TaskLifecycle::Open,
+                    connectivity,
+                    attention,
+                    activity,
+                    review_readiness,
+                    1_000,
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+    items.extend([
+        inbox_task_item(
+            inbox_task_id(9),
+            "Beta",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            2_000,
+        ),
+        inbox_task_item(
+            inbox_task_id(10),
+            "alpha",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            2_000,
+        ),
+    ]);
+    let model = inbox_model(items);
+    let before = model.clone();
+    let unread = UnreadCursor::from([(inbox_task_id(0), 3)]);
+    let inbox = Inbox::from_model_with_unread(&model, &unread);
+
+    assert_eq!(
+        model, before,
+        "inbox projection must not mutate ClientModel"
+    );
+    assert_eq!(inbox.section_rows(InboxSection::NeedsMe).len(), 5);
+    assert_eq!(inbox.section_rows(InboxSection::Running).len(), 2);
+    assert_eq!(inbox.section_rows(InboxSection::Ready).len(), 1);
+    assert_eq!(inbox.section_rows(InboxSection::Recent).len(), 3);
+    assert_eq!(
+        inbox
+            .section_rows(InboxSection::NeedsMe)
+            .iter()
+            .map(|row| row.task_id)
+            .collect::<Vec<_>>(),
+        vec![
+            inbox_task_id(3),
+            inbox_task_id(1),
+            inbox_task_id(8),
+            inbox_task_id(7),
+            inbox_task_id(4)
+        ]
+    );
+    assert_eq!(
+        inbox
+            .section_rows(InboxSection::Running)
+            .iter()
+            .map(|row| row.task_id)
+            .collect::<Vec<_>>(),
+        vec![inbox_task_id(6), inbox_task_id(5)]
+    );
+    assert_eq!(
+        inbox
+            .section_rows(InboxSection::Recent)
+            .iter()
+            .map(|row| row.task_id)
+            .collect::<Vec<_>>(),
+        vec![inbox_task_id(10), inbox_task_id(9), inbox_task_id(0)]
+    );
+    assert_eq!(inbox.row(inbox_task_id(0)).unwrap().unread_event_count, 3);
+    assert_eq!(inbox.select_task(inbox_task_id(8)), Some(inbox_task_id(8)));
+    assert_eq!(inbox.select_task(TaskId::new()), None);
+}
+
+#[test]
+fn inbox_keeps_legacy_task_list_identity_and_viewport_accessors_synchronized() {
+    let model = inbox_model(vec![
+        inbox_task_item(
+            inbox_task_id(0),
+            "recent",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            1,
+        ),
+        inbox_task_item(
+            inbox_task_id(1),
+            "failed",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::Failed,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            2,
+        ),
+    ]);
+    let mut inbox = Inbox::from_model(&model);
+
+    assert_eq!(
+        inbox.task_list().task_ids(),
+        &[inbox_task_id(1), inbox_task_id(0)]
+    );
+    inbox
+        .task_list_mut()
+        .set_viewport(1, 1)
+        .expect("legacy viewport accessor must remain usable");
+    assert_eq!(inbox.virtual_window(), inbox.task_list().virtual_window());
+    assert_eq!(inbox.visible_rows()[0].task_id, inbox_task_id(0));
+}
+
+#[test]
+fn inbox_search_includes_archived_only_when_explicit_and_reports_empty_states() {
+    let model = inbox_model(vec![
+        inbox_task_item(
+            inbox_task_id(20),
+            "keep me",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            1,
+        ),
+        inbox_task_item(
+            inbox_task_id(21),
+            "archived target",
+            TaskLifecycle::Archived,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            2,
+        ),
+    ]);
+    let normal = Inbox::from_model(&model);
+    assert_eq!(normal.state(), InboxState::Ready);
+    assert_eq!(normal.len(), 1);
+
+    let filtered = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("missing"),
+        &UnreadCursor::default(),
+    );
+    assert_eq!(filtered.state(), InboxState::FilteredEmpty);
+
+    let archived = Inbox::from_model_with_filter(
+        &model,
+        &InboxFilter::new("archived").including_archived(),
+        &UnreadCursor::default(),
+    );
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        archived.row(inbox_task_id(21)).unwrap().title,
+        "archived target"
+    );
+    assert_eq!(
+        Inbox::from_model(&inbox_model(Vec::new())).state(),
+        InboxState::Empty
+    );
+    let projected_error = Inbox::from_projection(
+        Err(InboxError::ProjectionUnavailable),
+        &InboxFilter::new("keep"),
+        &UnreadCursor::default(),
+    );
+    assert_eq!(
+        projected_error.state(),
+        InboxState::Error(InboxError::ProjectionUnavailable)
+    );
+    assert_eq!(projected_error.filter().query(), "keep");
+
+    assert_eq!(
+        Inbox::from_error(InboxError::ProjectionUnavailable).state(),
+        InboxState::Error(InboxError::ProjectionUnavailable)
+    );
+}
+
+#[test]
+fn inbox_5000_task_fixture_is_bounded_and_virtualized() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/ui/task-inbox.json"))
+            .expect("task inbox fixture");
+    assert_eq!(fixture["expected_count"], 5_000);
+    assert_eq!(fixture["expected_overscan"], 32);
+    assert_eq!(fixture["report"]["projection"], "client-model-only");
+    assert_eq!(fixture["report"]["rendered_rows_bound"], 104);
+    assert_eq!(fixture["report"]["selection"], "task-id");
+
+    let items = (0..5_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Task {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let mut inbox = Inbox::from_model(&inbox_model(items));
+    assert_eq!(inbox.len(), 5_000);
+    assert_eq!(inbox.virtual_window().overscan(), 32);
+    assert_eq!(
+        inbox.virtual_window().visible_range(),
+        0..DEFAULT_VISIBLE_ROWS
+    );
+    assert_eq!(
+        inbox.rendered_rows().len(),
+        DEFAULT_VISIBLE_ROWS + inbox.virtual_window().overscan()
+    );
+    inbox
+        .set_viewport(2_500, DEFAULT_VISIBLE_ROWS)
+        .expect("valid local viewport");
+    assert_eq!(
+        inbox.virtual_window().visible_range(),
+        2_500..2_500 + DEFAULT_VISIBLE_ROWS
+    );
+    assert_eq!(
+        inbox.virtual_window().render_range(inbox.len()),
+        2_500 - 32..2_500 + DEFAULT_VISIBLE_ROWS + 32
+    );
+    assert_eq!(
+        inbox.rendered_rows().len(),
+        fixture["report"]["rendered_rows_bound"]
+            .as_u64()
+            .expect("rendered row bound") as usize
+    );
+}
+
+#[test]
+fn inbox_overflow_retains_attention_order_before_capping() {
+    let mut items = (0..5_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Recent {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect::<Vec<_>>();
+    items.push(inbox_task_item(
+        inbox_task_id(5_000),
+        "Needs attention",
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::Failed,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        5_000,
+    ));
+
+    let inbox = Inbox::from_model(&inbox_model(items));
+
+    assert_eq!(inbox.len(), 5_000);
+    assert_eq!(
+        inbox.overflow(),
+        Some(devmanager::ui::task_cockpit::TaskListOverflow {
+            limit: 5_000,
+            total_count: 5_001,
+            retained_count: 5_000,
+        })
+    );
+    assert!(
+        inbox.row(inbox_task_id(5_000)).is_some(),
+        "high-attention rows must be retained before the finite cap"
+    );
+    assert!(
+        inbox.row(inbox_task_id(0)).is_none(),
+        "the lowest-priority row should be the overflow victim"
+    );
+}
+
+#[test]
+fn inbox_projection_does_not_probe_runtime_or_process_state() {
+    let source = include_str!("../src/ui/task_cockpit/inbox.rs");
+    for forbidden in [
+        "std::process",
+        "process_monitor",
+        "host_client",
+        "reqwest",
+        "network",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "inbox must remain a pure projection: {forbidden}"
+        );
+    }
 }
