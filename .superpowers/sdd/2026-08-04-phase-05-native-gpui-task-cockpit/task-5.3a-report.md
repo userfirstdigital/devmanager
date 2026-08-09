@@ -10,18 +10,21 @@ gate remains intentionally open for the concurrent capture lane.
 
 - Added one shared interaction-state and accessibility boundary under
   `src/ui/components/interaction.rs`.
-- Added DevManager-owned Button and IconButton models with stable `ActionId`,
-  typed callback events, semantic role/name/state metadata, Enter/Space
+- Added DevManager-owned Button and IconButton models backed only by typed
+  requests from the existing client `ActionCatalog`; activation returns typed
+  events and presentational components store or execute no callbacks or host
+  effects. They retain semantic role/name/state metadata, Enter/Space
   activation, token focus rings, disabled reasons, loading rejection, and
   focus-epoch/pointer-press fencing.
 - Added noninteractive Badge and StatusLight semantic presentations using the
   existing status tokens and explicit text/description signals.
 - Added bounded TextField state with Unicode scalar and UTF-8 byte limits,
   focus/keyboard behavior, read-only/disabled metadata, error metadata, and a
-  paste path that only inserts data.
+  paste path gated by the focused current epoch with scalar/byte preflight
+  before candidate allocation.
 - Added bounded EmptyState and ErrorBoundary models with only explicitly
-  supplied typed recovery actions; no raw debug/provider payload field or
-  rendering path exists.
+  supplied typed recovery actions. ErrorBoundary accepts a typed redacted safe
+  projection; no raw debug/provider payload field or rendering path exists.
 - Added the typed `component-gallery.json` fixture and structural preview
   validation for both themes, both densities, 100/125/150/200 scales, every
   implemented interaction state, long text, Unicode, missing/error/loading/
@@ -81,12 +84,22 @@ Commit subject: `feat(ui): add reusable native component vocabulary (partial 5.3
 ## Files owned by this slice
 
 - `src/ui/components/{mod,interaction,button,icon_button,badge,status_light,text_field,empty_state,error_boundary}.rs`
+- the existing typed request extension in `src/client/action.rs`
 - `src/ui/mod.rs`
 - `src/ui/preview.rs`
 - `tests/ui_accessibility.rs`
 - focused component cases in `tests/ui_projection.rs`
 - `tests/fixtures/ui/component-gallery.json`
 - this report
+
+## Review correction
+
+The focused review fix added RED coverage for the four findings above and then
+GREEN coverage for 13 accessibility tests and 3 component projection tests.
+The RED pass failed at the expected missing `ActionRequest`, focus-epoch paste,
+and safe-projection APIs; the final focused passes were 13/13 and 3/3. No
+5.3b widget, real capture, runtime/provider/process/config/AppData/session
+surface, installed app, network, merge, or push was touched.
 
 ## Explicit 5.3b blockers
 

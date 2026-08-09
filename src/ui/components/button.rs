@@ -1,12 +1,11 @@
 //! DevManager-owned actionable button model.
 
 use super::interaction::{
-    control_presentation, AccessibilityMetadata, AccessibleRole, ActionCallback, ActionEvent,
-    ActionId, ActivationSource, ComponentError, ControlPresentation, InteractionState,
-    InteractionStateModel, InteractionTransition, KeyboardKey,
+    control_presentation, AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest,
+    ActivationSource, ComponentError, ControlPresentation, InteractionState, InteractionStateModel,
+    InteractionTransition, KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
-use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ButtonVariant {
@@ -18,8 +17,7 @@ pub enum ButtonVariant {
 
 pub struct Button {
     label: String,
-    action_id: ActionId,
-    callback: ActionCallback,
+    action_request: ActionRequest,
     variant: ButtonVariant,
     interaction: InteractionStateModel,
     accessibility: AccessibilityMetadata,
@@ -27,26 +25,18 @@ pub struct Button {
 }
 
 impl Button {
-    pub fn new<F>(
+    pub fn new(
         label: impl Into<String>,
-        action_id: ActionId,
-        callback: F,
-    ) -> Result<Self, ComponentError>
-    where
-        F: Fn(ActionEvent) + Send + Sync + 'static,
-    {
-        Self::new_variant(label, ButtonVariant::Primary, action_id, callback)
+        action_request: ActionRequest,
+    ) -> Result<Self, ComponentError> {
+        Self::new_variant(label, ButtonVariant::Primary, action_request)
     }
 
-    pub fn new_variant<F>(
+    pub fn new_variant(
         label: impl Into<String>,
         variant: ButtonVariant,
-        action_id: ActionId,
-        callback: F,
-    ) -> Result<Self, ComponentError>
-    where
-        F: Fn(ActionEvent) + Send + Sync + 'static,
-    {
+        action_request: ActionRequest,
+    ) -> Result<Self, ComponentError> {
         let label = super::interaction::bounded_text(
             "button label",
             label,
@@ -60,8 +50,7 @@ impl Button {
         Ok(Self {
             accessibility: AccessibilityMetadata::new(AccessibleRole::Button, label.clone())?,
             label,
-            action_id,
-            callback: Arc::new(callback),
+            action_request,
             variant,
             interaction,
             disabled_reason: None,
@@ -72,8 +61,8 @@ impl Button {
         &self.label
     }
 
-    pub fn action_id(&self) -> &ActionId {
-        &self.action_id
+    pub fn action_request(&self) -> &ActionRequest {
+        &self.action_request
     }
 
     pub fn variant(&self) -> ButtonVariant {
@@ -157,20 +146,24 @@ impl Button {
         self.interaction.pointer_down(pointer_id, focus_epoch)
     }
 
-    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> bool {
+    pub fn pointer_up(&mut self, pointer_id: u64, focus_epoch: u64) -> Option<ActionEvent> {
         let activated = self.interaction.pointer_up(pointer_id, focus_epoch);
-        if activated {
-            self.dispatch(ActivationSource::Pointer { pointer_id }, focus_epoch);
-        }
-        activated
+        activated.then(|| ActionEvent {
+            request: self.action_request.clone(),
+            source: ActivationSource::Pointer { pointer_id },
+            focus_epoch,
+        })
     }
 
-    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> bool {
+    pub fn key_activate(&self, key: KeyboardKey, focus_epoch: u64) -> Option<ActionEvent> {
         if !self.interaction.key_activate(key.clone(), focus_epoch) {
-            return false;
+            return None;
         }
-        self.dispatch(ActivationSource::Keyboard { key }, focus_epoch);
-        true
+        Some(ActionEvent {
+            request: self.action_request.clone(),
+            source: ActivationSource::Keyboard { key },
+            focus_epoch,
+        })
     }
 
     pub fn presentation(&self, tokens: ThemeTokens) -> ControlPresentation {
@@ -192,14 +185,6 @@ impl Button {
 
     pub fn loading(&self) -> bool {
         self.interaction.state().loading
-    }
-
-    pub(crate) fn dispatch(&self, source: ActivationSource, focus_epoch: u64) {
-        (self.callback)(ActionEvent {
-            action_id: self.action_id.clone(),
-            source,
-            focus_epoch,
-        });
     }
 
     fn sync_accessibility(&mut self) {

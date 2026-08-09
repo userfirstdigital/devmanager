@@ -1,34 +1,20 @@
+use devmanager::client::action::ActionRequest;
 use devmanager::ui::components::badge::Badge;
 use devmanager::ui::components::button::{Button, ButtonVariant};
 use devmanager::ui::components::empty_state::{EmptyState, RecoveryAction};
-use devmanager::ui::components::error_boundary::ErrorBoundary;
+use devmanager::ui::components::error_boundary::{
+    ErrorBoundary, SafeErrorCode, SafeErrorProjection,
+};
 use devmanager::ui::components::icon_button::{IconButton, TooltipContract};
 use devmanager::ui::components::interaction::{
-    AccessibilityMetadata, AccessibleRole, ActionEvent, ActionId, InteractionState,
-    InteractionStateModel, InteractionTransition, KeyboardKey,
+    AccessibilityMetadata, AccessibleRole, InteractionState, InteractionStateModel,
+    InteractionTransition, KeyboardKey,
 };
 use devmanager::ui::components::status_light::StatusLight;
 use devmanager::ui::components::text_field::{
     TextField, TextFieldError, TextFieldKey, TextFieldLimits,
 };
 use devmanager::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
-use std::sync::{Arc, Mutex};
-
-fn action_id(value: &str) -> ActionId {
-    ActionId::new(value).expect("test action ids are stable and valid")
-}
-
-fn recording_callback() -> (
-    Arc<Mutex<Vec<ActionEvent>>>,
-    impl Fn(ActionEvent) + Send + Sync + 'static,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&events);
-    (events, move |event| {
-        sink.lock().expect("event sink lock").push(event)
-    })
-}
-
 #[test]
 fn interaction_transition_table_rejects_invalid_combinations_and_fails_closed() {
     let state = InteractionState::default()
@@ -70,6 +56,8 @@ fn pointer_capture_and_keyboard_activation_reject_stale_focus_epochs() {
     assert!(!model.pointer_up(42, 10));
     assert!(!model.state().pressed);
 
+    assert!(!model.key_activate(KeyboardKey::Enter, 11));
+    assert!(model.focus());
     assert!(model.key_activate(KeyboardKey::Enter, 11));
     assert!(model.key_activate(KeyboardKey::Space, 11));
     assert!(!model.key_activate(KeyboardKey::Escape, 11));
@@ -79,8 +67,7 @@ fn pointer_capture_and_keyboard_activation_reject_stale_focus_epochs() {
 
 #[test]
 fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_input() {
-    let (events, callback) = recording_callback();
-    let mut button = Button::new("Save changes", action_id("task.save"), callback)
+    let mut button = Button::new("Save changes", ActionRequest::TaskList)
         .expect("button should be constructible");
 
     assert_eq!(button.accessibility().role, AccessibleRole::Button);
@@ -90,14 +77,13 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
 
     button.set_focus_epoch(4);
     assert!(button.pointer_down(7, 4));
-    assert!(button.pointer_up(7, 4));
-    assert_eq!(events.lock().expect("event sink lock").len(), 1);
+    let event = button.pointer_up(7, 4).expect("pointer activation");
+    assert_eq!(event.request, ActionRequest::TaskList);
 
     button.set_focus_epoch(5);
     assert!(button.pointer_down(8, 5));
     button.set_focus_epoch(6);
-    assert!(!button.pointer_up(8, 5));
-    assert_eq!(events.lock().expect("event sink lock").len(), 1);
+    assert!(button.pointer_up(8, 5).is_none());
 
     button
         .disable("saving is already in progress")
@@ -110,19 +96,16 @@ fn button_requires_accessible_metadata_and_never_dispatches_stale_or_blocked_inp
         button.accessibility().description,
         "saving is already in progress"
     );
-    assert!(!button.key_activate(KeyboardKey::Enter, 6));
-    assert_eq!(events.lock().expect("event sink lock").len(), 1);
+    assert!(button.key_activate(KeyboardKey::Enter, 6).is_none());
 
     button.enable().expect("button can be enabled");
     button.set_loading(true).expect("button can enter loading");
-    assert!(!button.key_activate(KeyboardKey::Space, 6));
-    assert_eq!(events.lock().expect("event sink lock").len(), 1);
+    assert!(button.key_activate(KeyboardKey::Space, 6).is_none());
 }
 
 #[test]
 fn focused_button_exposes_a_visible_semantic_token_focus_ring() {
-    let (_events, callback) = recording_callback();
-    let mut button = Button::new("Open", action_id("task.open"), callback).expect("button");
+    let mut button = Button::new("Open", ActionRequest::TaskList).expect("button");
     button.focus();
     let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
     let style = button.presentation(tokens);
@@ -136,14 +119,12 @@ fn focused_button_exposes_a_visible_semantic_token_focus_ring() {
 
 #[test]
 fn icon_button_requires_nonempty_accessible_label_and_tooltip_contract() {
-    let (_events, callback) = recording_callback();
     let tooltip = TooltipContract::new("Open task details", 500).expect("tooltip");
     let icon_button = IconButton::new(
         "open-in-new",
         "Open task details",
         tooltip,
-        action_id("task.open"),
-        callback,
+        ActionRequest::TaskList,
     )
     .expect("icon button");
 
@@ -187,7 +168,7 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
         .expect("unfocused input is ignored"));
     field.focus();
     assert!(field.handle_key(TextFieldKey::Character('界')).is_ok());
-    assert!(field.paste("🙂").is_ok());
+    assert!(field.paste("🙂", field.focus_epoch()).is_ok());
     assert_eq!(field.value(), "界🙂");
     assert_eq!(field.value().chars().count(), 2);
     assert_eq!(field.value().len(), "界🙂".len());
@@ -223,14 +204,13 @@ fn text_field_enforces_scalar_and_utf8_byte_bounds_and_keeps_paste_as_data() {
     assert!(field.accessibility().disabled);
     assert!(!field.focus());
     assert!(!field
-        .paste("never-execute-this")
+        .paste("never-execute-this", field.focus_epoch())
         .expect("disabled paste is ignored"));
 }
 
 #[test]
 fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
-    let (events, callback) = recording_callback();
-    let action = RecoveryAction::new("Retry", action_id("task.retry"), callback).expect("action");
+    let action = RecoveryAction::new("Retry", ActionRequest::TaskList).expect("action");
     let empty = EmptyState::new("No tasks", "Create a task to get started")
         .expect("empty state")
         .with_recovery_action(action)
@@ -238,20 +218,25 @@ fn empty_and_error_states_expose_only_explicit_typed_recovery_actions() {
     assert_eq!(empty.accessibility().role, AccessibleRole::Region);
     assert_eq!(empty.recovery_actions().len(), 1);
     assert_eq!(
-        empty.recovery_actions()[0].action_id().as_str(),
-        "task.retry"
+        empty.recovery_actions()[0].action_request(),
+        &ActionRequest::TaskList
     );
-    assert!(empty.activate_recovery(0, 0));
-    assert_eq!(events.lock().expect("event sink lock").len(), 1);
+    assert!(empty.activate_recovery(0, 0).is_none());
     assert!(!empty.rendered_payload().contains("debug"));
 
-    let (_events, callback) = recording_callback();
-    let error = ErrorBoundary::new("Could not load tasks", "Try again or check the connection")
-        .expect("error boundary")
-        .with_recovery_action(
-            RecoveryAction::new("Try again", action_id("task.retry"), callback).expect("action"),
+    let error = ErrorBoundary::new(
+        SafeErrorProjection::new(
+            SafeErrorCode::HostUnavailable,
+            "Could not load tasks",
+            "Try again or check the connection",
         )
-        .expect("recovery action");
+        .expect("safe projection"),
+    )
+    .expect("error boundary")
+    .with_recovery_action(
+        RecoveryAction::new("Try again", ActionRequest::TaskList).expect("action"),
+    )
+    .expect("recovery action");
     assert_eq!(error.accessibility().role, AccessibleRole::Alert);
     assert!(error.accessibility().invalid);
     assert_eq!(error.recovery_actions().len(), 1);
@@ -268,4 +253,80 @@ fn accessibility_metadata_is_bounded_and_rejects_blank_names() {
     let error = AccessibilityMetadata::new(AccessibleRole::Button, long_name)
         .expect_err("accessible names are bounded");
     assert!(error.to_string().contains("256"));
+}
+
+#[test]
+fn presentational_button_emits_only_a_typed_catalog_request() {
+    let mut button = Button::new("List tasks", ActionRequest::TaskList).expect("button");
+    button.set_focus_epoch(7);
+    button.focus();
+
+    let event = button
+        .key_activate(KeyboardKey::Enter, 7)
+        .expect("focused button should emit an event");
+    assert_eq!(event.request, ActionRequest::TaskList);
+    assert_eq!(event.request.id(), "task.list");
+}
+
+#[test]
+fn keyboard_activation_requires_current_focus_and_epoch_changes_clear_focus() {
+    let mut model = InteractionStateModel::default();
+    model.set_focus_epoch(10);
+    assert!(!model.key_activate(KeyboardKey::Enter, 10));
+
+    assert!(model.focus());
+    assert!(model.key_activate(KeyboardKey::Enter, 10));
+
+    model.set_focus_epoch(11);
+    assert!(!model.state().focused);
+    assert!(!model.key_activate(KeyboardKey::Space, 11));
+}
+
+#[test]
+fn paste_requires_current_focus_and_preflights_both_limits() {
+    let limits = TextFieldLimits::new(3, 5).expect("valid limits");
+    let mut field = TextField::with_limits("Prompt", limits).expect("field");
+
+    assert!(!field.paste("x", 0).expect("unfocused paste is ignored"));
+    field.set_focus_epoch(20);
+    field.focus();
+    assert!(field.paste("界", 20).expect("focused paste is accepted"));
+
+    field.set_focus_epoch(21);
+    assert!(!field.paste("x", 20).expect("stale paste is ignored"));
+    assert_eq!(field.value(), "界");
+
+    field.focus();
+    let scalar_error = field
+        .paste("xyz", 21)
+        .expect_err("scalar bound must be checked before insertion");
+    assert!(matches!(
+        scalar_error,
+        TextFieldError::ScalarLimitExceeded { .. }
+    ));
+    assert_eq!(field.value(), "界");
+
+    let byte_error = field
+        .paste("🙂", 21)
+        .expect_err("byte bound must be checked before insertion");
+    assert!(matches!(
+        byte_error,
+        TextFieldError::ByteLimitExceeded { .. }
+    ));
+    assert_eq!(field.value(), "界");
+}
+
+#[test]
+fn error_boundary_accepts_only_safe_redacted_projection() {
+    const SECRET_SENTINEL: &str = "UI_ERROR_BOUNDARY_SECRET_SENTINEL";
+    let projection = SafeErrorProjection::new(
+        SafeErrorCode::RendererFailure,
+        "Could not render task",
+        format!("token={SECRET_SENTINEL}"),
+    )
+    .expect("safe projection");
+    let error = ErrorBoundary::new(projection).expect("error boundary");
+
+    assert!(!error.rendered_payload().contains(SECRET_SENTINEL));
+    assert!(error.rendered_payload().contains("***"));
 }
