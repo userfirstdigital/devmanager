@@ -23,7 +23,10 @@ use crate::domain::artifact::{
     verify_inline_content_digest, ArtifactContentRef, ArtifactValidationError,
 };
 use crate::domain::id::{ArtifactId, ClientId, SubscriptionId, TaskId};
-use crate::domain::snapshot::{ArtifactContentPage, PageLimits, PageLimitsError};
+use crate::domain::snapshot::{
+    canonical_artifact_content_page_size, ArtifactContentPage, CanonicalPageSizeError, PageLimits,
+    PageLimitsError,
+};
 use crate::kernel::command_bus;
 use crate::kernel::store::{KernelStore, StoreError};
 
@@ -313,34 +316,31 @@ impl ArtifactContentSession {
         next_cursor: &Option<Vec<u8>>,
     ) -> Result<u32, ArtifactContentError> {
         let total_bytes = u64::try_from(self.content.len()).map_err(|_| StoreError::Corruption)?;
-        let mut encoded_bytes = 0u32;
-        for _ in 0..8 {
-            let page = ArtifactContentPage {
-                artifact_id: self.artifact_id,
-                offset,
-                total_bytes,
-                sha256: self.sha256,
-                payload: payload.to_vec(),
-                encoded_bytes,
-                next_cursor: next_cursor.clone(),
-            };
-            let bytes =
-                rmp_serde::to_vec_named(&page).map_err(|error| StoreError::CodecMismatch {
-                    detail: format!("encode artifact content page: {error}"),
-                })?;
-            let actual = u32::try_from(bytes.len()).map_err(|_| StoreError::IntegerOutOfRange {
-                field: "artifact_content_page.encoded_bytes",
-                value: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            })?;
-            if actual == encoded_bytes {
-                return Ok(actual);
-            }
-            encoded_bytes = actual;
-        }
-        Err(StoreError::CodecMismatch {
-            detail: "artifact content page encoded length did not converge".into(),
-        }
-        .into())
+        let page = ArtifactContentPage {
+            artifact_id: self.artifact_id,
+            offset,
+            total_bytes,
+            sha256: self.sha256,
+            payload: payload.to_vec(),
+            encoded_bytes: 0,
+            next_cursor: next_cursor.clone(),
+        };
+        canonical_artifact_content_page_size(&page).map_err(|error| {
+            ArtifactContentError::Store(match error {
+                CanonicalPageSizeError::Encode { detail } => StoreError::CodecMismatch {
+                    detail: format!("encode artifact content page: {detail}"),
+                },
+                CanonicalPageSizeError::TooLarge { encoded_bytes } => {
+                    StoreError::IntegerOutOfRange {
+                        field: "artifact_content_page.encoded_bytes",
+                        value: u64::try_from(encoded_bytes).unwrap_or(u64::MAX),
+                    }
+                }
+                CanonicalPageSizeError::DidNotConverge => StoreError::CodecMismatch {
+                    detail: "artifact content page encoded length did not converge".into(),
+                },
+            })
+        })
     }
 
     fn encode_cursor(&self, next_offset: u64) -> Result<Vec<u8>, ArtifactContentError> {

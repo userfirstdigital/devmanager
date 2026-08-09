@@ -218,6 +218,83 @@ pub struct ArtifactContentPage {
     pub next_cursor: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalPageSizeError {
+    Encode { detail: String },
+    TooLarge { encoded_bytes: usize },
+    DidNotConverge,
+}
+
+impl fmt::Display for CanonicalPageSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode { detail } => write!(f, "canonical page encode failed: {detail}"),
+            Self::TooLarge { encoded_bytes } => write!(
+                f,
+                "canonical page encoded length {encoded_bytes} does not fit u32"
+            ),
+            Self::DidNotConverge => write!(f, "canonical page encoded length did not converge"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalPageSizeError {}
+
+const CANONICAL_PAGE_SIZE_MAX_PASSES: usize = 8;
+
+fn canonical_fixed_point_page_size<T, F>(
+    page: &T,
+    mut set_encoded_bytes: F,
+) -> Result<u32, CanonicalPageSizeError>
+where
+    T: Clone + Serialize,
+    F: FnMut(&mut T, u32),
+{
+    let mut encoded_bytes = 0u32;
+    for _ in 0..CANONICAL_PAGE_SIZE_MAX_PASSES {
+        let mut final_page = page.clone();
+        set_encoded_bytes(&mut final_page, encoded_bytes);
+        let encoded = rmp_serde::to_vec_named(&final_page).map_err(|error| {
+            CanonicalPageSizeError::Encode {
+                detail: error.to_string(),
+            }
+        })?;
+        let actual =
+            u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+                encoded_bytes: encoded.len(),
+            })?;
+        if actual == encoded_bytes {
+            return Ok(actual);
+        }
+        encoded_bytes = actual;
+    }
+    Err(CanonicalPageSizeError::DidNotConverge)
+}
+
+pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+pub fn canonical_event_page_size(page: &EventPage) -> Result<u32, CanonicalPageSizeError> {
+    let encoded =
+        rmp_serde::to_vec_named(page).map_err(|error| CanonicalPageSizeError::Encode {
+            detail: error.to_string(),
+        })?;
+    u32::try_from(encoded.len()).map_err(|_| CanonicalPageSizeError::TooLarge {
+        encoded_bytes: encoded.len(),
+    })
+}
+
+pub fn canonical_artifact_content_page_size(
+    page: &ArtifactContentPage,
+) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
 struct ArtifactContentBinaryRef<'a>(&'a [u8]);
 
 impl Serialize for ArtifactContentBinaryRef<'_> {
@@ -441,75 +518,111 @@ impl<'de> Deserialize<'de> for ArtifactContentPage {
     }
 }
 
-/// The confidence of a background-produced process accounting sample.
-///
-/// A numeric zero is not a substitute for a failed query or an unavailable
-/// first-sample baseline. Consumers must inspect this status before treating
-/// CPU/resource values as complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessMetricStatus {
-    Complete,
-    Partial,
-    #[default]
-    Unknown,
-    Failed,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl ProcessMetricStatus {
-    pub fn is_complete(self) -> bool {
-        matches!(self, Self::Complete)
+    fn empty_snapshot_page() -> SnapshotPage {
+        SnapshotPage {
+            snapshot_id: SnapshotId::new(),
+            through_sequence: 1,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: Vec::new(),
+            encoded_bytes: 0,
+            next_cursor: None,
+        }
     }
 
-    pub fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
+    #[test]
+    fn snapshot_page_size_converges_across_messagepack_integer_width_boundary() {
+        let mut page = empty_snapshot_page();
+        let mut found_boundary = false;
+
+        for cursor_len in 0..512 {
+            page.next_cursor = Some(vec![0; cursor_len]);
+            page.encoded_bytes = 0;
+            let zero_claim_length = rmp_serde::to_vec_named(&page)
+                .expect("encode zero-claim snapshot page")
+                .len();
+            if zero_claim_length != 128 {
+                continue;
+            }
+
+            let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+            let mut final_page = page.clone();
+            final_page.encoded_bytes = encoded_bytes;
+            let final_length = rmp_serde::to_vec_named(&final_page)
+                .expect("encode final snapshot page")
+                .len();
+
+            assert!(encoded_bytes as usize > zero_claim_length);
+            assert_eq!(encoded_bytes as usize, final_length);
+            found_boundary = true;
+            break;
+        }
+
+        assert!(
+            found_boundary,
+            "test fixture must reach the encoded_bytes MessagePack width boundary"
+        );
     }
-}
 
-/// Immutable, background-produced accounting for one owned process tree.
-///
-/// This is intentionally a runtime projection rather than a durable domain
-/// fact. It carries enough information for consumers to distinguish a complete
-/// tree from a partial observation without making the render/input path query
-/// the operating system.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcessAccountingSnapshot {
-    pub sampled_at: std::time::Duration,
-    pub interval: Option<std::time::Duration>,
-    pub logical_processors: u32,
-    pub machine_cpu_percent: f64,
-    pub core_equivalent_percent: f64,
-    pub memory_bytes: u64,
-    pub process_count: u32,
-    pub metrics_unavailable: bool,
-    pub status: ProcessMetricStatus,
-    /// A bounded, sanitized diagnostic for a failed/partial observation. Raw
-    /// command lines and environment values never enter this projection.
-    pub error: Option<String>,
-    /// Monotonic sampler generation. A new generation fences PID reuse and
-    /// counter baselines even when a PID number is recycled.
-    pub generation: u64,
-    pub io_read_bytes: Option<u64>,
-    pub io_write_bytes: Option<u64>,
-    pub members: Vec<ProcessAccountingMemberSnapshot>,
-}
+    #[test]
+    fn canonical_snapshot_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = empty_snapshot_page();
+        page.encoded_bytes = u32::MAX;
 
-/// One unique Job-member observation in an accounting snapshot.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcessAccountingMemberSnapshot {
-    pub pid: u32,
-    pub creation_time_100ns: Option<u64>,
-    pub machine_cpu_percent: Option<f64>,
-    pub core_equivalent_percent: Option<f64>,
-    /// Platform-private memory bytes. Windows uses `PrivateUsage` (private
-    /// committed bytes); Unix uses `/proc/<pid>/smaps_rollup` private
-    /// clean+dirty (private resident bytes). This is deliberately not named
-    /// working set.
-    pub private_memory_bytes: Option<u64>,
-    pub io_read_bytes: Option<u64>,
-    pub io_write_bytes: Option<u64>,
-    pub metrics_unavailable: bool,
-    pub status: ProcessMetricStatus,
-    pub executable: Option<String>,
-    pub generation: u64,
+        let encoded_bytes = canonical_snapshot_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final snapshot page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_event_page_size_matches_named_messagepack() {
+        let page = EventPage {
+            after_sequence: 3,
+            through_sequence: 8,
+            events: Vec::new(),
+            next_cursor: Some(vec![1, 2, 3]),
+        };
+
+        let encoded_bytes = canonical_event_page_size(&page).expect("canonical size");
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode event page")
+                .len()
+        );
+    }
+
+    #[test]
+    fn canonical_artifact_content_page_size_matches_final_named_messagepack_and_ignores_claim() {
+        let mut page = ArtifactContentPage {
+            artifact_id: ArtifactId::new(),
+            offset: 4,
+            total_bytes: 9,
+            sha256: [7; 32],
+            payload: vec![8, 9, 10],
+            encoded_bytes: u32::MAX,
+            next_cursor: Some(vec![11, 12]),
+        };
+
+        let encoded_bytes = canonical_artifact_content_page_size(&page).expect("canonical size");
+        page.encoded_bytes = encoded_bytes;
+
+        assert_eq!(
+            usize::try_from(encoded_bytes).expect("size fits"),
+            rmp_serde::to_vec_named(&page)
+                .expect("encode final artifact content page")
+                .len()
+        );
+    }
 }

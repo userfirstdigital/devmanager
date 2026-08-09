@@ -46,9 +46,10 @@ pub use resource::{
     ResourceValidationError,
 };
 pub use snapshot::{
-    ArtifactContentPage, EventPage, PageLimits, PageLimitsError, SnapshotItem, SnapshotItemKey,
-    SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
-    MAX_SNAPSHOT_PAGE_ITEMS,
+    canonical_artifact_content_page_size, canonical_event_page_size, canonical_snapshot_page_size,
+    ArtifactContentPage, CanonicalPageSizeError, EventPage, PageLimits, PageLimitsError,
+    SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection, TaskSnapshot, TaskSnapshotItem,
+    MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
