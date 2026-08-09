@@ -13,10 +13,14 @@ use crate::browser::{
     BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
+use crate::domain::snapshot::ProcessAccountingMemberSnapshot;
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
+use crate::process::identity::ManagedProcessIdentity;
+use crate::process::job::JobMemberObservation;
+use crate::process::sampler::{InaccessibleProcess, ProcessMemberObservation, ProcessSampler};
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
 use crate::services::process_ops::{
@@ -243,6 +247,7 @@ pub(crate) struct ProcessManagerInner {
     codex_hooks_support_probe: RwLock<CodexHooksSupportProbe>,
     codex_adapter_generation: AtomicU64,
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
+    resource_samplers: Mutex<HashMap<String, ProcessSampler>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
@@ -531,6 +536,7 @@ impl ProcessManager {
             codex_hooks_support_probe: RwLock::new(Arc::new(codex_supports_hooks)),
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
+            resource_samplers: Mutex::new(HashMap::new()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
             op_queue: Mutex::new(Weak::new()),
@@ -3765,6 +3771,9 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         .unwrap_or_default();
 
     if sessions.is_empty() {
+        if let Ok(mut samplers) = inner.resource_samplers.lock() {
+            samplers.clear();
+        }
         return;
     }
 
@@ -3786,11 +3795,10 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         })
         .unwrap_or_default();
 
-    let mut job_member_pids: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut job_member_observations: HashMap<String, Option<Vec<JobMemberObservation>>> =
+        HashMap::new();
     for (session_id, session) in &terminal_sessions {
-        if let Some(process_ids) = session.managed_process_ids() {
-            job_member_pids.insert(session_id.clone(), process_ids);
-        }
+        job_member_observations.insert(session_id.clone(), session.managed_process_observations());
     }
     drop(terminal_sessions);
 
@@ -3804,18 +3812,29 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
             .collect();
     let sampled_at = Instant::now();
     let mut snapshots = Vec::with_capacity(sessions.len());
+    let active_sampler_ids: BTreeSet<String> = sessions
+        .iter()
+        .map(|(session_id, _, _)| session_id.clone())
+        .collect();
+    let mut resource_samplers = inner
+        .resource_samplers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    resource_samplers.retain(|session_id, _| active_sampler_ids.contains(session_id));
 
     for (session_id, runtime_pid, is_ai_session) in sessions {
-        let job_pids = job_member_pids
+        let job_members = job_member_observations
             .get(&session_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .and_then(|members| members.as_deref());
         let sample_ctx = ResourceSampleContext {
             is_ai_session,
             logical_cpu_count,
             sampled_at,
         };
-        let (snapshot, awaiting_external_editor) = tracked_processes
+        let sampler = resource_samplers
+            .entry(session_id.clone())
+            .or_insert_with(ProcessSampler::new);
+        let sampled = tracked_processes
             .get(&session_id)
             .filter(|entry| ledger_compatible_with_runtime(system, entry, runtime_pid))
             .and_then(|entry| {
@@ -3824,23 +3843,27 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                     &session_id,
                     entry,
                     runtime_pid,
-                    job_pids,
+                    job_members,
                     sample_ctx,
+                    sampler,
                 )
             })
-            .or_else(|| sample_runtime_only_resources(system, runtime_pid, job_pids, sample_ctx))
-            .unwrap_or_else(|| {
-                (
-                    ResourceSnapshot {
-                        logical_cpu_count,
-                        last_sample_at: Some(sampled_at),
-                        ..ResourceSnapshot::default()
-                    },
-                    false,
-                )
+            .or_else(|| {
+                sample_runtime_only_resources(system, runtime_pid, job_members, sample_ctx, sampler)
             });
+        let (snapshot, awaiting_external_editor) = sampled.unwrap_or_else(|| {
+            (
+                ResourceSnapshot {
+                    logical_cpu_count,
+                    last_sample_at: Some(sampled_at),
+                    ..ResourceSnapshot::default()
+                },
+                false,
+            )
+        });
         snapshots.push((session_id, snapshot, awaiting_external_editor));
     }
+    drop(resource_samplers);
 
     let mut touched_sessions = Vec::new();
     let mut cleared_reap_sessions = Vec::new();
@@ -3882,8 +3905,9 @@ fn sample_session_resources(
     session_id: &str,
     entry: &pid_file::ManagedProcessRecord,
     runtime_pid: u32,
-    job_pids: &[u32],
+    job_members: Option<&[JobMemberObservation]>,
     ctx: ResourceSampleContext,
+    sampler: &mut ProcessSampler,
 ) -> Option<(ResourceSnapshot, bool)> {
     let root_verified = platform_service::process_matches_identity_with_system(
         system,
@@ -3912,11 +3936,17 @@ fn sample_session_resources(
     let ancestry_pids = sample_root
         .map(|root| collect_ancestry_pids(system, root))
         .unwrap_or_default();
-    let owned_pids = merge_owned_process_ids(sample_root, &ancestry_pids, job_pids, &ledger_pids);
+    // A successful managed Job query, including an empty member set, is
+    // ownership truth. The ancestry/ledger union remains only as a
+    // compatibility fallback when the Job query is unavailable; it never
+    // overrides a current Job member set.
+    let owned_pids =
+        select_owned_process_ids(job_members, sample_root, &ancestry_pids, &ledger_pids);
     if owned_pids.is_empty()
-        || owned_pids
-            .iter()
-            .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none())
+        || (job_members.is_none()
+            && owned_pids
+                .iter()
+                .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none()))
     {
         return None;
     }
@@ -3941,28 +3971,44 @@ fn sample_session_resources(
         );
     }
 
-    let snapshot =
-        build_resource_snapshot(system, &owned_pids, ctx.logical_cpu_count, ctx.sampled_at);
+    let snapshot = build_resource_snapshot(
+        system,
+        &owned_pids,
+        ctx.logical_cpu_count,
+        ctx.sampled_at,
+        job_members,
+        sampler,
+    );
     Some((snapshot, awaiting_external_editor))
 }
 
 fn sample_runtime_only_resources(
     system: &mut sysinfo::System,
     runtime_pid: u32,
-    job_pids: &[u32],
+    job_members: Option<&[JobMemberObservation]>,
     ctx: ResourceSampleContext,
+    sampler: &mut ProcessSampler,
 ) -> Option<(ResourceSnapshot, bool)> {
     let ancestry_pids = collect_ancestry_pids(system, runtime_pid);
-    let owned_pids = merge_owned_process_ids(Some(runtime_pid), &ancestry_pids, job_pids, &[]);
-    if owned_pids
-        .iter()
-        .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none())
+    let owned_pids = select_owned_process_ids(job_members, Some(runtime_pid), &ancestry_pids, &[]);
+    if owned_pids.is_empty()
+        || (job_members.is_none()
+            && owned_pids
+                .iter()
+                .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none()))
     {
         return None;
     }
     refresh_command_metadata_for_pids(system, &owned_pids);
     Some((
-        build_resource_snapshot(system, &owned_pids, ctx.logical_cpu_count, ctx.sampled_at),
+        build_resource_snapshot(
+            system,
+            &owned_pids,
+            ctx.logical_cpu_count,
+            ctx.sampled_at,
+            job_members,
+            sampler,
+        ),
         false,
     ))
 }
@@ -4046,45 +4092,106 @@ fn build_resource_snapshot(
     owned_pids: &[u32],
     logical_cpu_count: u32,
     sampled_at: Instant,
+    job_members: Option<&[JobMemberObservation]>,
+    sampler: &mut ProcessSampler,
 ) -> ResourceSnapshot {
-    let mut cpu_percent = 0.0;
-    let mut memory_bytes = 0;
+    let observations = job_members
+        .map(|members| {
+            members
+                .iter()
+                .map(job_member_to_process_observation)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            owned_pids
+                .iter()
+                .copied()
+                .map(ProcessSampler::observe_process)
+                .collect()
+        });
+    let accounting = sampler.sample_now(logical_cpu_count, observations).ok();
+    let member_by_pid: HashMap<u32, &ProcessAccountingMemberSnapshot> = accounting
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .members
+                .iter()
+                .map(|member| (member.pid, member))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut processes = Vec::with_capacity(owned_pids.len());
 
     for pid in owned_pids {
-        let Some(process) = system.process(sysinfo::Pid::from_u32(*pid)) else {
-            continue;
-        };
-        let process_cpu =
-            crate::state::normalized_cpu_percent(process.cpu_usage(), logical_cpu_count);
-        let process_memory = process.memory();
-        cpu_percent += process_cpu;
-        memory_bytes += process_memory;
-        let os_name = platform_service::process_identity_with_system(system, *pid)
-            .and_then(|identity| identity.process_name)
+        let process = system.process(sysinfo::Pid::from_u32(*pid));
+        let member = member_by_pid.get(pid).copied();
+        let process_cpu = member
+            .and_then(|member| member.machine_cpu_percent)
+            .unwrap_or(0.0) as f32;
+        let process_memory = member
+            .and_then(|member| member.private_memory_bytes)
+            .unwrap_or(0);
+        let os_name = process
+            .and_then(|_| {
+                platform_service::process_identity_with_system(system, *pid)
+                    .and_then(|identity| identity.process_name)
+            })
             .unwrap_or_else(|| format!("pid-{pid}"));
         let cmd: Vec<String> = process
-            .cmd()
-            .iter()
-            .map(|part| part.to_string_lossy().into_owned())
-            .collect();
+            .map(|process| {
+                process
+                    .cmd()
+                    .iter()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
         let name = classify_process_display_name(&os_name, &cmd);
+        let name = if member.is_some_and(|member| member.metrics_unavailable) {
+            format!("{name} (metrics unavailable)")
+        } else {
+            name
+        };
         processes.push(crate::state::ProcessResourceNode {
             pid: *pid,
-            parent_pid: process.parent().map(|parent| parent.as_u32()),
+            parent_pid: process.and_then(|process| process.parent().map(|parent| parent.as_u32())),
             name,
             cpu_percent: process_cpu,
             memory_bytes: process_memory,
         });
     }
 
+    let process_ids = accounting
+        .as_ref()
+        .map(|snapshot| snapshot.members.iter().map(|member| member.pid).collect())
+        .unwrap_or_else(|| owned_pids.to_vec());
+    let (cpu_percent, memory_bytes, process_count) = accounting
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.machine_cpu_percent as f32,
+                snapshot.memory_bytes,
+                snapshot.process_count,
+            )
+        })
+        .unwrap_or((0.0, 0, process_ids.len() as u32));
+
     ResourceSnapshot {
         cpu_percent: cpu_percent.clamp(0.0, 100.0),
         memory_bytes,
-        process_count: processes.len() as u32,
-        process_ids: processes.iter().map(|process| process.pid).collect(),
+        process_count,
+        process_ids,
         processes,
-        logical_cpu_count,
+        metrics_unavailable: accounting
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.metrics_unavailable),
+        io_read_bytes: accounting
+            .as_ref()
+            .and_then(|snapshot| snapshot.io_read_bytes),
+        io_write_bytes: accounting
+            .as_ref()
+            .and_then(|snapshot| snapshot.io_write_bytes),
+        logical_cpu_count: logical_cpu_count.max(1),
         last_sample_at: Some(sampled_at),
     }
 }
@@ -4118,6 +4225,48 @@ fn merge_owned_process_ids(
             process_ids
         }
         None => extras.into_iter().collect(),
+    }
+}
+
+fn unique_job_member_pids(job_members: &[JobMemberObservation]) -> Vec<u32> {
+    job_members
+        .iter()
+        .map(|member| match member {
+            JobMemberObservation::Accessible { identity } => identity.id().pid(),
+            JobMemberObservation::Inaccessible { pid, .. } => *pid,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn select_owned_process_ids(
+    job_members: Option<&[JobMemberObservation]>,
+    root_pid: Option<u32>,
+    ancestry_pids: &[u32],
+    ledger_pids: &[u32],
+) -> Vec<u32> {
+    match job_members {
+        Some(job_members) => unique_job_member_pids(job_members),
+        None => merge_owned_process_ids(root_pid, ancestry_pids, &[], ledger_pids),
+    }
+}
+
+fn job_member_to_process_observation(member: &JobMemberObservation) -> ProcessMemberObservation {
+    match member {
+        JobMemberObservation::Accessible { identity } => {
+            ProcessSampler::observe_process_with_expected_identity(
+                identity.id().pid(),
+                Some(identity),
+            )
+        }
+        JobMemberObservation::Inaccessible {
+            pid,
+            creation_time_100ns,
+            reason,
+        } => ProcessMemberObservation::Inaccessible(
+            InaccessibleProcess::new(*pid, *creation_time_100ns).with_reason(reason.clone()),
+        ),
     }
 }
 
@@ -4280,7 +4429,7 @@ fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &s
 
 fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Vec<u32> {
     let mut pids = BTreeSet::new();
-    let job_pids = session_managed_process_ids(inner, session_id);
+    let job_members = session_managed_process_observations(inner, session_id);
 
     for entry in pid_file::active_tracked_processes_for_session(session_id) {
         let root_verified = platform_service::process_matches_identity(
@@ -4314,24 +4463,42 @@ fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str)
         }
     }
 
-    for pid in job_pids {
-        if platform_service::is_pid_running(pid) {
-            pids.insert(pid);
+    for member in job_members {
+        if let JobMemberObservation::Accessible { identity } = member {
+            if platform_service::is_pid_running(identity.id().pid()) {
+                pids.insert(identity.id().pid());
+            }
         }
     }
 
     pids.into_iter().collect()
 }
 
-fn session_managed_process_ids(inner: &ProcessManagerInner, session_id: &str) -> Vec<u32> {
+fn session_managed_process_observations(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+) -> Vec<JobMemberObservation> {
     let session = inner
         .sessions
         .lock()
         .ok()
         .and_then(|guard| guard.get(session_id).cloned());
     session
-        .and_then(|session| session.managed_process_ids())
+        .and_then(|session| session.managed_process_observations())
         .unwrap_or_default()
+}
+
+fn session_managed_process_identity(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    pid: u32,
+) -> Option<ManagedProcessIdentity> {
+    let session = inner
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(session_id).cloned());
+    session.and_then(|session| session.managed_process_identity(pid))
 }
 
 fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
@@ -6465,13 +6632,11 @@ fn verified_session_process_identity(
         }
     }
 
-    // Job membership survives broken parent links. Capture identity, then re-check
-    // membership so a PID that left the job between the two OS queries is rejected.
-    if session_managed_process_ids(inner, session_id).contains(&pid) {
-        let identity = platform_service::capture_process_identity(pid)?;
-        if session_managed_process_ids(inner, session_id).contains(&pid) {
-            return Some(identity);
-        }
+    // Job membership survives broken parent links, but the PID list is never
+    // control authority. Require the Job's exact IsProcessInJob plus creation
+    // identity observation before capturing the kill-time identity.
+    if session_managed_process_identity(inner, session_id, pid).is_some() {
+        return platform_service::capture_process_identity(pid);
     }
     None
 }
@@ -10659,6 +10824,20 @@ mod tests {
         let process_ids = merge_owned_process_ids(None, &[], &[21], &[31]);
 
         assert_eq!(process_ids, vec![21, 31]);
+    }
+
+    #[test]
+    fn empty_job_observation_forbids_legacy_ancestry_fallback() {
+        let process_ids = select_owned_process_ids(Some(&[]), Some(10), &[10, 11], &[12]);
+
+        assert!(process_ids.is_empty());
+    }
+
+    #[test]
+    fn unavailable_job_observation_uses_identity_verified_legacy_candidates() {
+        let process_ids = select_owned_process_ids(None, Some(10), &[10, 11], &[12]);
+
+        assert_eq!(process_ids, vec![10, 11, 12]);
     }
 
     #[test]

@@ -160,6 +160,14 @@ pub struct ResourceSnapshot {
     pub memory_bytes: u64,
     pub process_count: u32,
     pub process_ids: Vec<u32>,
+    /// Some owned members may be inaccessible; totals remain useful but are
+    /// explicitly partial rather than silently presented as complete.
+    #[serde(default)]
+    pub metrics_unavailable: bool,
+    #[serde(default)]
+    pub io_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub io_write_bytes: Option<u64>,
     #[serde(default)]
     pub processes: Vec<ProcessResourceNode>,
     /// Logical CPU count used to normalize `cpu_percent`. Defaults to 1 for
@@ -177,6 +185,9 @@ impl Default for ResourceSnapshot {
             memory_bytes: 0,
             process_count: 0,
             process_ids: Vec::new(),
+            metrics_unavailable: false,
+            io_read_bytes: None,
+            io_write_bytes: None,
             processes: Vec::new(),
             logical_cpu_count: 1,
             last_sample_at: None,

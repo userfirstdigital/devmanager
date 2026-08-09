@@ -12,10 +12,61 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
-use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
+use crate::process::identity::ManagedProcessId;
+use crate::process::identity::ManagedProcessIdentity;
 use crate::process::registry::{
     JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobMemberObservation {
+    Accessible {
+        identity: ManagedProcessIdentity,
+    },
+    Inaccessible {
+        pid: u32,
+        creation_time_100ns: Option<u64>,
+        reason: String,
+    },
+}
+
+/// Turn a Job's PID list into exact observations without granting a PID-only
+/// ownership claim. The inspector must perform the current `IsProcessInJob`
+/// and creation-time checks; failures remain visible as partial members.
+pub fn collect_exact_job_observations<F>(
+    active_process_ids: Result<Vec<u32>, String>,
+    mut inspect_process: F,
+) -> Result<Vec<JobMemberObservation>, String>
+where
+    F: FnMut(u32) -> Result<JobMemberInfo, String>,
+{
+    let mut process_ids = active_process_ids?;
+    process_ids.sort_unstable();
+    process_ids.dedup();
+
+    Ok(process_ids
+        .into_iter()
+        .filter(|pid| *pid != 0)
+        .map(|pid| match inspect_process(pid) {
+            Ok(member) if member.identity().id().pid() == pid => JobMemberObservation::Accessible {
+                identity: member.identity().clone(),
+            },
+            Ok(member) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: Some(member.identity().id().creation_time_100ns()),
+                reason: format!(
+                    "Job inspection returned PID {} while observing PID {pid}",
+                    member.identity().id().pid()
+                ),
+            },
+            Err(reason) => JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns: None,
+                reason,
+            },
+        })
+        .collect())
+}
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -270,6 +321,11 @@ impl ManagedProcessJob {
         {
             Ok(Vec::new())
         }
+    }
+
+    pub fn active_process_observations(&self) -> Result<Vec<JobMemberObservation>, String> {
+        let active_process_ids = self.active_process_ids();
+        collect_exact_job_observations(active_process_ids, |pid| self.inspect_process(pid))
     }
 
     pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {

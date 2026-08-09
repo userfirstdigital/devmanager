@@ -1,4 +1,6 @@
 use crate::models::{DefaultTerminal, MacTerminalProfile};
+use crate::process::identity::ManagedProcessIdentity;
+use crate::process::job::JobMemberObservation;
 use crate::services::{pid_file, platform_service};
 use crate::state::{
     PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
@@ -1853,23 +1855,35 @@ fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::Man
 }
 
 impl TerminalSession {
-    /// Returns active PIDs from the session's managed Job Object, if any.
-    ///
-    /// Does not expose the raw Job handle. Query failures degrade to `None`
-    /// after emitting a concise diagnostic.
-    pub fn managed_process_ids(&self) -> Option<Vec<u32>> {
+    /// Returns exact observations for the current Job member set. A successful
+    /// empty result is authoritative; a missing Job or query error returns
+    /// `None` so callers may use the identity-verified legacy fallback.
+    pub fn managed_process_observations(&self) -> Option<Vec<JobMemberObservation>> {
         let job_slot = self.process_job.lock().ok()?;
         let job = job_slot.as_ref()?;
-        match job.active_process_ids() {
-            Ok(process_ids) => Some(process_ids),
+        match job.active_process_observations() {
+            Ok(observations) => Some(observations),
             Err(error) => {
                 eprintln!(
-                    "[terminal:{}] managed job query failed: {error}",
+                    "[terminal:{}] managed job observation failed: {error}",
                     self.session_id
                 );
                 None
             }
         }
+    }
+
+    /// Return an exact Job-verified identity for control authorization. An
+    /// active PID list alone is never sufficient.
+    pub fn managed_process_identity(&self, pid: u32) -> Option<ManagedProcessIdentity> {
+        self.managed_process_observations()?
+            .into_iter()
+            .find_map(|member| match member {
+                JobMemberObservation::Accessible { identity } if identity.id().pid() == pid => {
+                    Some(identity)
+                }
+                _ => None,
+            })
     }
 }
 

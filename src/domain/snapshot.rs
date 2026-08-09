@@ -440,3 +440,39 @@ impl<'de> Deserialize<'de> for ArtifactContentPage {
         deserializer.deserialize_struct("ArtifactContentPage", FIELDS, PageVisitor)
     }
 }
+
+/// Immutable, background-produced accounting for one owned process tree.
+///
+/// This is intentionally a runtime projection rather than a durable domain
+/// fact. It carries enough information for consumers to distinguish a complete
+/// tree from a partial observation without making the render/input path query
+/// the operating system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingSnapshot {
+    pub sampled_at: std::time::Duration,
+    pub interval: Option<std::time::Duration>,
+    pub logical_processors: u32,
+    pub machine_cpu_percent: f64,
+    pub core_equivalent_percent: f64,
+    pub memory_bytes: u64,
+    pub process_count: u32,
+    pub metrics_unavailable: bool,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub members: Vec<ProcessAccountingMemberSnapshot>,
+}
+
+/// One unique Job-member observation in an accounting snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessAccountingMemberSnapshot {
+    pub pid: u32,
+    pub creation_time_100ns: Option<u64>,
+    pub machine_cpu_percent: Option<f64>,
+    pub core_equivalent_percent: Option<f64>,
+    /// Private memory bytes (Windows `PrivateUsage` is private committed
+    /// bytes; this is deliberately not named working set).
+    pub private_memory_bytes: Option<u64>,
+    pub io_read_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
+    pub metrics_unavailable: bool,
+}

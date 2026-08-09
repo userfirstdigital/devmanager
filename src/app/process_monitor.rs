@@ -37,7 +37,7 @@ pub fn render_process_monitor(
     let (open_terminals, total_memory) = monitor_totals(runtime);
     let sessions = process_monitor_entries(app_state, runtime);
     let description = format!(
-        "{open_terminals} terminal{} · {} total memory",
+        "{open_terminals} terminal{} · {} total private memory",
         if open_terminals == 1 { "" } else { "s" },
         format_memory(total_memory)
     );
@@ -183,6 +183,7 @@ fn render_session_card(
     let cpu = entry.cpu_percent;
     let memory = entry.memory_bytes;
     let process_count = entry.process_count;
+    let metrics_unavailable = entry.metrics_unavailable;
     let unreaped = entry.unreaped;
     let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
@@ -271,19 +272,33 @@ fn render_session_card(
                                                     theme::TEXT_MUTED
                                                 }))
                                                 .child(status_label),
-                                        ),
+                                        )
+                                        .children(metrics_unavailable.then(|| {
+                                            div()
+                                                .px(px(5.0))
+                                                .py(px(1.0))
+                                                .rounded_sm()
+                                                .bg(rgb(theme::PRIMARY_MUTED))
+                                                .text_xs()
+                                                .text_color(rgb(theme::WARNING_TEXT))
+                                                .child("Partial metrics")
+                                                .into_any_element()
+                                        })),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(theme::TEXT_SUBTLE))
                                         .child(SharedString::from(format!(
-                                            "{project_name} · {} · {process_count} proc · {:.1}% CPU · {}",
+                                            "{project_name} · {} · {process_count} proc · {:.1}% machine CPU · private {}{}",
                                             root_pid
                                                 .map(|pid| format!("pid {pid}"))
                                                 .unwrap_or_else(|| "no root pid".to_string()),
                                             cpu,
                                             format_memory(memory),
+                                            metrics_unavailable
+                                                .then_some(" · partial")
+                                                .unwrap_or_default(),
                                         ))),
                                 ),
                         ),
@@ -476,6 +491,7 @@ fn process_monitor_entries(
                 cpu_percent: session.resources.cpu_percent,
                 memory_bytes: session.resources.memory_bytes,
                 process_count,
+                metrics_unavailable: session.resources.metrics_unavailable,
                 unreaped: session.reap_incomplete,
                 logical_cpu_count: session.resources.logical_cpu_count.max(1),
                 processes: ordered_process_nodes(&session),
@@ -554,7 +570,7 @@ fn ordered_process_nodes(session: &SessionRuntimeState) -> Vec<ProcessResourceNo
         .map(|pid| ProcessResourceNode {
             pid: *pid,
             parent_pid: None,
-            name: format!("pid-{pid}"),
+            name: format!("pid-{pid} (compatibility-only observation)"),
             cpu_percent: 0.0,
             memory_bytes: 0,
         })
@@ -626,7 +642,7 @@ fn format_memory(bytes: u64) -> String {
 
 fn format_cpu_detail(system_cpu_percent: f32, logical_cpu_count: u32) -> String {
     let cores = crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count);
-    format!("{system_cpu_percent:.1}% system · {cores:.2} cores")
+    format!("{system_cpu_percent:.1}% machine · {cores:.2} cores")
 }
 
 #[cfg(test)]
@@ -809,6 +825,27 @@ mod tests {
     }
 
     #[test]
+    fn process_monitor_entries_preserve_and_mark_partial_metrics() {
+        let app_state = AppState::default();
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "partial",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.resources.metrics_unavailable = true;
+        session.resources.io_read_bytes = Some(75);
+        session.resources.io_write_bytes = Some(60);
+        runtime.sessions.insert(session.session_id.clone(), session);
+
+        let entries = process_monitor_entries(&app_state, &runtime);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metrics_unavailable);
+    }
+
+    #[test]
     fn modal_interactions_consume_internal_pointer_events() {
         assert_eq!(
             pointer_disposition(PointerTarget::Backdrop),
@@ -825,9 +862,12 @@ mod tests {
     }
 
     #[test]
-    fn cpu_detail_explains_system_percent_and_equivalent_cores() {
-        assert_eq!(format_cpu_detail(1.953_125, 64), "2.0% system · 1.25 cores");
-        assert_eq!(format_cpu_detail(0.0, 1), "0.0% system · 0.00 cores");
+    fn cpu_detail_explains_machine_percent_and_equivalent_cores() {
+        assert_eq!(
+            format_cpu_detail(1.953_125, 64),
+            "2.0% machine · 1.25 cores"
+        );
+        assert_eq!(format_cpu_detail(0.0, 1), "0.0% machine · 0.00 cores");
     }
 }
 
@@ -843,6 +883,7 @@ struct ProcessMonitorEntry {
     cpu_percent: f32,
     memory_bytes: u64,
     process_count: u32,
+    metrics_unavailable: bool,
     unreaped: bool,
     logical_cpu_count: u32,
     processes: Vec<ProcessResourceNode>,
