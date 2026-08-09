@@ -14,6 +14,50 @@ use crate::domain::operation::ResourceFence;
 use crate::process::identity::ManagedProcessId;
 use crate::process::registry::{ManagedProcessState, ProcessRegistry};
 
+const MAX_PORT_DETAIL_CHARS: usize = 256;
+const MAX_LISTENER_IDENTITY_DISPLAY_CHARS: usize = 2048;
+
+fn bounded_sanitized_detail(detail: &str) -> String {
+    let mut sanitized = String::with_capacity(detail.len().min(MAX_PORT_DETAIL_CHARS));
+    let mut truncated = false;
+    for character in detail.chars() {
+        if sanitized.chars().count() >= MAX_PORT_DETAIL_CHARS {
+            truncated = true;
+            break;
+        }
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if truncated {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn listener_identity_display(listeners: &[ListenerIdentity]) -> String {
+    let mut display = String::new();
+    for (index, listener) in listeners.iter().enumerate() {
+        let identity = format!(
+            "PID {} (creation {})",
+            listener.pid(),
+            listener.creation_time_100ns()
+        );
+        let separator = if index == 0 { "" } else { ", " };
+        if display.chars().count() + separator.chars().count() + identity.chars().count()
+            > MAX_LISTENER_IDENTITY_DISPLAY_CHARS
+        {
+            display.push_str(" …");
+            break;
+        }
+        display.push_str(separator);
+        display.push_str(&identity);
+    }
+    display
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ListenerIdentity {
     pid: u32,
@@ -114,7 +158,7 @@ impl PortInventorySnapshot {
     }
 
     pub fn probe_failure(ports: impl IntoIterator<Item = u16>, detail: impl Into<String>) -> Self {
-        let detail = detail.into();
+        let detail = bounded_sanitized_detail(&detail.into());
         let observations = ports
             .into_iter()
             .map(|port| (port, PortObservation::ProbeError(detail.clone())))
@@ -168,9 +212,9 @@ pub enum PortStatusKind {
     /// The listener identity is a member of the exact managed generation,
     /// but application-level readiness evidence is not available yet.
     ManagedUnready,
-    /// A listener exists, but it is not owned by the requested resource
-    /// generation.
-    External,
+    /// A listener exists, but this projection cannot prove ownership by the
+    /// requested resource generation. Control must remain fail-closed.
+    Occupied,
     /// No listener was observed and no managed launch is in progress.
     Stopped,
     /// The listener state could not be established safely.
@@ -305,7 +349,7 @@ pub fn project_port_status(
             resource: target.resource,
             kind: PortStatusKind::ProbeError,
             listeners: Arc::from([]),
-            error: Some(detail.clone()),
+            error: Some(bounded_sanitized_detail(detail)),
         },
         PortObservation::Listeners(listeners) => {
             let exact_owner = managed.filter(|resource| resource.resource() == target.resource);
@@ -337,7 +381,7 @@ pub fn project_port_status(
                 PortStatus {
                     port: target.port,
                     resource: target.resource,
-                    kind: PortStatusKind::External,
+                    kind: PortStatusKind::Occupied,
                     listeners: listeners.clone(),
                     error: None,
                 }
@@ -357,7 +401,9 @@ pub fn project_port_status_from_snapshot(
             resource: target.resource,
             kind: PortStatusKind::ProbeError,
             listeners: Arc::from([]),
-            error: Some("port was not included in the cached inventory snapshot".to_string()),
+            error: Some(bounded_sanitized_detail(
+                "port was not included in the cached inventory snapshot",
+            )),
         };
     };
     project_port_status(target, observation, managed)
@@ -372,7 +418,7 @@ pub enum PortStartError {
         port: u16,
         detail: String,
     },
-    OccupiedExternal {
+    Occupied {
         port: u16,
         listener: ListenerIdentity,
     },
@@ -391,19 +437,20 @@ impl fmt::Display for PortStartError {
             Self::ProbeFailed { port, detail } => {
                 write!(
                     formatter,
-                    "could not establish whether port {port} is free: {detail}"
+                    "could not establish whether port {port} is free: {}",
+                    bounded_sanitized_detail(detail)
                 )
             }
-            Self::OccupiedExternal { port, listener } => write!(
+            Self::Occupied { port, listener } => write!(
                 formatter,
-                "port {port} is occupied by external listener PID {} (creation {})",
+                "port {port} is occupied; ownership is unverified (PID {} (creation {}))",
                 listener.pid(),
                 listener.creation_time_100ns()
             ),
             Self::OccupiedAmbiguous { port, listeners } => write!(
                 formatter,
-                "port {port} has {} listener identities and cannot be admitted safely",
-                listeners.len()
+                "port {port} is occupied by multiple listeners; ownership is unverified. Captured identities: {}",
+                listener_identity_display(listeners)
             ),
         }
     }
@@ -413,9 +460,9 @@ impl std::error::Error for PortStartError {}
 
 /// Admit a managed launch only when the immutable scan proved the port free.
 ///
-/// This function has no process-control capability. In particular, an
-/// external listener is reported with evidence and is never assigned,
-/// adopted, signaled, or killed as part of the rejection.
+/// This function has no process-control capability. In particular, a
+/// listener is reported with evidence and is never assigned, adopted,
+/// signaled, or killed as part of the rejection.
 pub fn ensure_managed_start_allowed(
     snapshot: &PortInventorySnapshot,
     port: u16,
@@ -428,7 +475,7 @@ pub fn ensure_managed_start_allowed(
             detail: detail.clone(),
         }),
         Some(PortObservation::Listeners(listeners)) => match listeners.as_ref() {
-            [listener] => Err(PortStartError::OccupiedExternal {
+            [listener] => Err(PortStartError::Occupied {
                 port,
                 listener: *listener,
             }),

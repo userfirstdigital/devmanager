@@ -554,8 +554,15 @@ struct ServerPortSnapshotState {
     inventory: ports_service::PortInventory,
     tracked_ports: Vec<u16>,
     statuses: HashMap<u16, PortStatus>,
+    probe_failures: HashMap<u16, String>,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PortRefreshProjection {
+    statuses: HashMap<u16, PortStatus>,
+    probe_failures: HashMap<u16, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6334,6 +6341,13 @@ impl NativeShell {
             .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
     }
 
+    fn current_port_probe_failures(&self) -> HashMap<u16, String> {
+        self.remote_mode
+            .as_ref()
+            .map(|_| HashMap::new())
+            .unwrap_or_else(|| self.server_port_snapshot.probe_failures.clone())
+    }
+
     fn sync_remote_port_forwards(&mut self) -> bool {
         let Some(remote_mode) = self.remote_mode.as_ref() else {
             return false;
@@ -11951,6 +11965,9 @@ impl NativeShell {
             self.server_port_snapshot
                 .statuses
                 .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot
+                .probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
             self.server_port_snapshot.last_checked_at = None;
         }
 
@@ -11982,10 +11999,20 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
-                    let statuses = background_executor
+                    let projection = background_executor
                         .spawn(async move {
-                            let snapshot = inventory.refresh(&ports)?;
-                            ports_service::legacy_statuses_from_snapshot(&snapshot, &ports)
+                            let refresh_result = inventory.refresh(&ports);
+                            let snapshot = inventory.cached_snapshot();
+                            let mut projection = project_legacy_port_snapshot(&snapshot, &ports);
+                            if projection.probe_failures.is_empty() {
+                                if let Err(error) = refresh_result {
+                                    let detail = bounded_port_probe_detail(&error);
+                                    for &port in &ports {
+                                        projection.probe_failures.insert(port, detail.clone());
+                                    }
+                                }
+                            }
+                            projection
                         })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
@@ -11997,8 +12024,9 @@ impl NativeShell {
                         let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
                         if let Some(notice) = apply_server_port_refresh(
                             &mut this.server_port_snapshot.statuses,
+                            &mut this.server_port_snapshot.probe_failures,
                             &tracked_ports,
-                            statuses,
+                            Ok(projection),
                         ) {
                             this.terminal_notice = Some(notice);
                         }
@@ -12393,6 +12421,9 @@ impl NativeShell {
         } else {
             None
         };
+        let current_port_probe_failures = self.current_port_probe_failures();
+        let port_probe_failure =
+            port.and_then(|value| current_port_probe_failures.get(&value).cloned());
         let port_status = if remote {
             self.active_port_state = None;
             port.and_then(|port| self.current_port_statuses().get(&port).cloned())
@@ -12419,21 +12450,19 @@ impl NativeShell {
             .is_some_and(|session| session.runtime.status.is_live())
             && port_status.as_ref().is_some_and(|status| !status.in_use);
         let port_label = port.map(|port| {
-            if let Some(status) = port_status.as_ref() {
+            if let Some(detail) = port_probe_failure.as_deref() {
+                format!(
+                    "port {port} • status unknown (probe failed: {})",
+                    bounded_port_probe_detail(detail)
+                )
+            } else if let Some(status) = port_status.as_ref() {
                 let base = if probe_disagrees_with_live_session {
                     format!("port {port} • probing")
                 } else if status.in_use {
                     if is_managed_port_owner(active_session, status) {
                         format!("port {port} • live")
                     } else {
-                        let owner = status
-                            .process_name
-                            .clone()
-                            .unwrap_or_else(|| "external process".to_string());
-                        match status.pid {
-                            Some(pid) => format!("port {port} • {owner} ({pid})"),
-                            None => format!("port {port} • {owner}"),
-                        }
+                        legacy_port_occupancy_copy(port, status)
                     }
                 } else {
                     format!("port {port} • free")
@@ -12454,7 +12483,9 @@ impl NativeShell {
                 format!("port {port} • checking")
             }
         });
-        let port_color = if has_port_conflict {
+        let port_color = if port_probe_failure.is_some() {
+            theme::DANGER_TEXT
+        } else if has_port_conflict {
             theme::WARNING_TEXT
         } else if probe_disagrees_with_live_session {
             theme::TEXT_MUTED
@@ -12489,7 +12520,8 @@ impl NativeShell {
                 || (!remote
                     && port.is_some()
                     && status == crate::state::SessionStatus::Running
-                    && !has_port_conflict),
+                    && !has_port_conflict
+                    && port_probe_failure.is_none()),
             kill_label,
             kill_color,
             prompt_action_label: None,
@@ -14795,6 +14827,7 @@ impl Render for NativeShell {
             &self.state,
             &runtime_snapshot,
             &self.current_port_statuses(),
+            &self.current_port_probe_failures(),
         );
         let updater_snapshot = self.updater.snapshot();
         let quota_statuses = self.ai_quota_statuses();
@@ -16726,32 +16759,134 @@ fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
     !refresh_in_flight
 }
 
+const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
+const MAX_PORT_PROBE_NOTICE_CHARS: usize = 1024;
+
+fn bounded_port_text(text: &str, max_chars: usize) -> String {
+    let mut sanitized = String::with_capacity(text.len().min(max_chars));
+    let mut truncated = false;
+    for character in text.chars() {
+        if sanitized.chars().count() >= max_chars {
+            truncated = true;
+            break;
+        }
+        sanitized.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if truncated {
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn bounded_port_probe_detail(detail: &str) -> String {
+    bounded_port_text(detail, MAX_PORT_PROBE_DETAIL_CHARS)
+}
+
+fn project_legacy_port_snapshot(
+    snapshot: &crate::process::ports::PortInventorySnapshot,
+    ports: &[u16],
+) -> PortRefreshProjection {
+    let mut projection = PortRefreshProjection::default();
+    for &port in ports {
+        match snapshot.observation(port) {
+            Some(crate::process::ports::PortObservation::Listeners(listeners)) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: true,
+                        pid: (listeners.len() == 1).then(|| listeners[0].pid()),
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::Free) => {
+                projection.statuses.insert(
+                    port,
+                    PortStatus {
+                        port,
+                        in_use: false,
+                        pid: None,
+                        process_name: None,
+                    },
+                );
+            }
+            Some(crate::process::ports::PortObservation::ProbeError(detail)) => {
+                projection
+                    .probe_failures
+                    .insert(port, bounded_port_probe_detail(detail));
+            }
+            None => {
+                projection.probe_failures.insert(
+                    port,
+                    format!("port {port} was not included in listener inventory"),
+                );
+            }
+        }
+    }
+    projection
+}
+
+fn port_probe_failure_notice(probe_failures: &HashMap<u16, String>) -> Option<String> {
+    if probe_failures.is_empty() {
+        return None;
+    }
+
+    let mut ports = probe_failures.keys().copied().collect::<Vec<_>>();
+    ports.sort_unstable();
+    let details = ports
+        .iter()
+        .filter_map(|port| {
+            probe_failures.get(port).map(|detail| {
+                format!(
+                    "Port {port} status is unknown (probe failed: {})",
+                    bounded_port_probe_detail(detail)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{}. Ownership is unverified; no green or blue ownership state is shown.",
+        bounded_port_text(&details, MAX_PORT_PROBE_NOTICE_CHARS)
+    ))
+}
+
 fn apply_server_port_refresh(
     current: &mut HashMap<u16, PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
     tracked_ports: &[u16],
-    result: Result<HashMap<u16, PortStatus>, String>,
+    result: Result<PortRefreshProjection, String>,
 ) -> Option<String> {
     match result {
         Ok(mut next) => {
-            next.retain(|port, _| tracked_ports.binary_search(port).is_ok());
-            *current = next;
-            None
+            next.statuses
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            next.probe_failures
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            *current = next.statuses;
+            *probe_failures = next.probe_failures;
+            port_probe_failure_notice(probe_failures)
         }
         Err(error) => {
-            // Unknown must replace prior green/blue/gray evidence. An empty
-            // projection renders managed sessions unready and unmanaged ports
-            // stopped until the next bounded background refresh succeeds.
             current.clear();
-            Some(format!(
-                "Port status refresh failed; no ownership was assumed: {error}"
-            ))
+            probe_failures.clear();
+            let detail = bounded_port_probe_detail(&error);
+            for &port in tracked_ports {
+                probe_failures.insert(port, detail.clone());
+            }
+            port_probe_failure_notice(probe_failures)
         }
     }
 }
 
 fn port_start_error_notice(error: &crate::process::ports::PortStartError) -> String {
     match error {
-        crate::process::ports::PortStartError::OccupiedExternal { .. }
+        crate::process::ports::PortStartError::Occupied { .. }
         | crate::process::ports::PortStartError::OccupiedAmbiguous { .. } => error.to_string(),
         _ => format!("Failed to start server: {error}"),
     }
@@ -16881,6 +17016,7 @@ fn derive_server_indicator_states(
     state: &AppState,
     runtime: &RuntimeState,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> HashMap<String, sidebar::ServerIndicatorState> {
     let mut indicators = HashMap::new();
     for project in state.projects() {
@@ -16889,7 +17025,7 @@ fn derive_server_indicator_states(
                 let session = runtime.sessions.get(&command.id);
                 indicators.insert(
                     command.id.clone(),
-                    derive_server_indicator(session, command.port, port_statuses),
+                    derive_server_indicator(session, command.port, port_statuses, probe_failures),
                 );
             }
         }
@@ -16901,9 +17037,14 @@ fn derive_server_indicator(
     session: Option<&SessionRuntimeState>,
     port: Option<u16>,
     port_statuses: &HashMap<u16, PortStatus>,
+    probe_failures: &HashMap<u16, String>,
 ) -> sidebar::ServerIndicatorState {
+    if port.is_some_and(|port| probe_failures.contains_key(&port)) {
+        return sidebar::ServerIndicatorState::Failed;
+    }
+
     let port_status = port.and_then(|port| port_statuses.get(&port));
-    let external_listener = port_status.is_some_and(|status| {
+    let occupied_listener = port_status.is_some_and(|status| {
         status.in_use
             && session
                 .map(|session| !runtime_owns_port(session, status))
@@ -16911,8 +17052,8 @@ fn derive_server_indicator(
     });
 
     let Some(session) = session else {
-        return if external_listener {
-            sidebar::ServerIndicatorState::External
+        return if occupied_listener {
+            occupied_indicator_state()
         } else {
             sidebar::ServerIndicatorState::Stopped
         };
@@ -16923,9 +17064,9 @@ fn derive_server_indicator(
         | SessionStatus::Crashed
         | SessionStatus::Exited
         | SessionStatus::Failed
-            if external_listener =>
+            if occupied_listener =>
         {
-            sidebar::ServerIndicatorState::External
+            occupied_indicator_state()
         }
         SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
         SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
@@ -16935,8 +17076,8 @@ fn derive_server_indicator(
                 if status.is_some_and(|status| status.in_use && runtime_owns_port(session, status))
                 {
                     sidebar::ServerIndicatorState::Ready
-                } else if external_listener {
-                    sidebar::ServerIndicatorState::External
+                } else if occupied_listener {
+                    occupied_indicator_state()
                 } else {
                     sidebar::ServerIndicatorState::Unready
                 }
@@ -16947,6 +17088,25 @@ fn derive_server_indicator(
         SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
         SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
         SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
+    }
+}
+
+fn occupied_indicator_state() -> sidebar::ServerIndicatorState {
+    // The sidebar's existing blue enum variant predates the ownership fence.
+    // Its user-facing meaning here is occupied with ownership unverified, not
+    // proof that the listener belongs to any particular process.
+    sidebar::ServerIndicatorState::External
+}
+
+fn legacy_port_occupancy_copy(port: u16, status: &PortStatus) -> String {
+    let owner = status
+        .process_name
+        .as_deref()
+        .map(|name| bounded_port_text(name, MAX_PORT_PROBE_DETAIL_CHARS))
+        .unwrap_or_else(|| "listener".to_string());
+    match status.pid {
+        Some(pid) => format!("port {port} • occupied (ownership unverified) • {owner} (PID {pid})"),
+        None => format!("port {port} • occupied (ownership unverified) • {owner}"),
     }
 }
 
@@ -20337,7 +20497,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_port_refresh_clears_stale_colors() {
+    fn failed_port_refresh_keeps_unknown_indicator_and_copy() {
         let mut statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20348,21 +20508,31 @@ mod tests {
             },
         )]);
 
+        let mut probe_failures = HashMap::new();
         let notice = apply_server_port_refresh(
             &mut statuses,
+            &mut probe_failures,
             &[5174],
             Err("listener inventory unavailable".to_string()),
         );
 
         assert!(statuses.is_empty());
+        assert_eq!(
+            probe_failures.get(&5174).map(String::as_str),
+            Some("listener inventory unavailable")
+        );
         assert!(notice
             .as_deref()
-            .is_some_and(|message| message.contains("no ownership was assumed")));
+            .is_some_and(|message| message.contains("Port 5174 status is unknown")));
+        assert_eq!(
+            derive_server_indicator(None, Some(5174), &statuses, &probe_failures),
+            sidebar::ServerIndicatorState::Failed
+        );
     }
 
     #[test]
     fn occupied_start_notice_preserves_exact_listener_identity() {
-        let error = crate::process::ports::PortStartError::OccupiedExternal {
+        let error = crate::process::ports::PortStartError::Occupied {
             port: 5174,
             listener: crate::process::ports::ListenerIdentity::new(42, 9_876_543)
                 .expect("listener identity"),
@@ -20372,6 +20542,25 @@ mod tests {
 
         assert!(notice.contains("PID 42"));
         assert!(notice.contains("creation 9876543"));
+        assert!(notice.contains("ownership is unverified"));
+        assert!(!notice.contains("external"));
+    }
+
+    #[test]
+    fn occupied_port_copy_states_ownership_is_unverified() {
+        let status = PortStatus {
+            port: 5174,
+            in_use: true,
+            pid: Some(42),
+            process_name: Some("listener".to_string()),
+        };
+
+        let copy = legacy_port_occupancy_copy(5174, &status);
+
+        assert!(copy.contains("occupied"));
+        assert!(copy.contains("ownership unverified"));
+        assert!(copy.contains("PID 42"));
+        assert!(!copy.contains("external"));
     }
 
     #[test]
@@ -20404,10 +20593,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::External)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20419,10 +20609,11 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
-            Some(&sidebar::ServerIndicatorState::External)
+            Some(&occupied_indicator_state())
         );
 
         port_statuses.insert(
@@ -20434,7 +20625,8 @@ mod tests {
                 process_name: None,
             },
         );
-        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        let indicators =
+            derive_server_indicator_states(&state, &runtime, &port_statuses, &HashMap::new());
         assert_eq!(
             indicators.get("server-cmd"),
             Some(&sidebar::ServerIndicatorState::Unready)
@@ -20460,7 +20652,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_server_indicator_detects_external_listener_without_session() {
+    fn derive_server_indicator_detects_occupied_listener_without_session() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20472,13 +20664,13 @@ mod tests {
         )]);
 
         assert_eq!(
-            derive_server_indicator(None, Some(5174), &statuses),
-            sidebar::ServerIndicatorState::External
+            derive_server_indicator(None, Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
         );
     }
 
     #[test]
-    fn derive_server_indicator_keeps_ambiguous_listener_external() {
+    fn derive_server_indicator_keeps_ambiguous_listener_ownership_unverified() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20497,13 +20689,13 @@ mod tests {
         session.status = SessionStatus::Running;
 
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
-            sidebar::ServerIndicatorState::External
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new()),
+            occupied_indicator_state()
         );
     }
 
     #[test]
-    fn derive_server_indicator_preserves_active_transitions_over_external_listener() {
+    fn derive_server_indicator_preserves_active_transitions_over_occupied_listener() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20522,19 +20714,19 @@ mod tests {
 
         session.status = SessionStatus::Starting;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Unready
         );
 
         session.status = SessionStatus::Stopping;
         assert_eq!(
-            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
             sidebar::ServerIndicatorState::Stopping
         );
     }
 
     #[test]
-    fn derive_server_indicator_prefers_external_listener_for_inactive_sessions() {
+    fn derive_server_indicator_prefers_occupied_listener_for_inactive_sessions() {
         let statuses = HashMap::from([(
             5174,
             PortStatus {
@@ -20559,8 +20751,8 @@ mod tests {
         ] {
             session.status = status;
             assert_eq!(
-                derive_server_indicator(Some(&session), Some(5174), &statuses),
-                sidebar::ServerIndicatorState::External,
+                derive_server_indicator(Some(&session), Some(5174), &statuses, &HashMap::new(),),
+                occupied_indicator_state(),
                 "status {status:?}"
             );
         }
@@ -20577,7 +20769,7 @@ mod tests {
         session.status = SessionStatus::Running;
 
         assert_eq!(
-            derive_server_indicator(Some(&session), None, &HashMap::new()),
+            derive_server_indicator(Some(&session), None, &HashMap::new(), &HashMap::new()),
             sidebar::ServerIndicatorState::Ready
         );
     }

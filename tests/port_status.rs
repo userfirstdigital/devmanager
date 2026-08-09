@@ -153,7 +153,7 @@ fn matching_managed_listener_without_readiness_is_orange_unready() {
 }
 
 #[test]
-fn listener_owned_by_another_resource_is_blue() {
+fn listener_with_unverified_ownership_is_occupied() {
     let resource = fence(3, 1);
     let status = project_port_status(
         &target(resource),
@@ -161,12 +161,12 @@ fn listener_owned_by_another_resource_is_blue() {
         None,
     );
 
-    assert_eq!(status.kind(), PortStatusKind::External);
+    assert_eq!(status.kind(), PortStatusKind::Occupied);
     assert_eq!(status.listener(), Some(listener(11_003, 303)));
 }
 
 #[test]
-fn mixed_managed_and_external_listeners_are_preserved_and_fail_closed() {
+fn mixed_managed_and_ownership_unverified_listeners_are_preserved_and_fail_closed() {
     let resource = fence(9, 1);
     let (mut registry, managed_fence) = registry_with_root(resource, 11_009, 909);
     registry
@@ -174,16 +174,19 @@ fn mixed_managed_and_external_listeners_are_preserved_and_fail_closed() {
         .expect("resume generation");
     let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
     let managed_listener = listener(11_009, 909);
-    let external_listener = listener(11_010, 910);
+    let ownership_unverified_listener = listener(11_010, 910);
     let observation = PortObservation::Listeners(Arc::from(
-        vec![managed_listener, external_listener].into_boxed_slice(),
+        vec![managed_listener, ownership_unverified_listener].into_boxed_slice(),
     ));
 
     let status = project_port_status(&target(resource), &observation, Some(&managed));
 
-    assert_eq!(status.kind(), PortStatusKind::External);
+    assert_eq!(status.kind(), PortStatusKind::Occupied);
     assert_eq!(status.listener(), None);
-    assert_eq!(status.listeners(), &[managed_listener, external_listener]);
+    assert_eq!(
+        status.listeners(),
+        &[managed_listener, ownership_unverified_listener]
+    );
 }
 
 #[test]
@@ -223,7 +226,7 @@ fn pid_reuse_does_not_make_a_reused_pid_managed() {
         Some(&managed),
     );
 
-    assert_eq!(status.kind(), PortStatusKind::External);
+    assert_eq!(status.kind(), PortStatusKind::Occupied);
 }
 
 #[test]
@@ -242,7 +245,7 @@ fn a_stale_resource_generation_cannot_claim_a_current_listener() {
         stale_snapshot.as_ref(),
     );
 
-    assert_eq!(status.kind(), PortStatusKind::External);
+    assert_eq!(status.kind(), PortStatusKind::Occupied);
 }
 
 #[test]
@@ -264,7 +267,7 @@ fn cached_snapshots_are_read_without_running_a_probe() {
 }
 
 #[test]
-fn occupied_external_start_is_rejected_with_listener_evidence() {
+fn occupied_start_is_rejected_with_listener_evidence() {
     let occupied = listener(11_009, 909);
     let snapshot = PortInventorySnapshot::new(BTreeMap::from([(43001, single_listener(occupied))]));
 
@@ -272,13 +275,42 @@ fn occupied_external_start_is_rejected_with_listener_evidence() {
 
     assert_eq!(
         error,
-        PortStartError::OccupiedExternal {
+        PortStartError::Occupied {
             port: 43001,
             listener: occupied,
         }
     );
     assert!(error.to_string().contains("PID 11009"));
     assert!(error.to_string().contains("creation 909"));
+}
+
+#[test]
+fn occupied_ambiguous_start_reports_all_captured_listener_identities() {
+    // Distinct identities model IPv4 and IPv6 listener rows after the native
+    // inventory has enriched each row with its exact PID and creation time.
+    let ipv4_listener = listener(11_013, 1_313);
+    let ipv6_listener = listener(11_014, 1_414);
+    let listeners: Arc<[ListenerIdentity]> =
+        Arc::from(vec![ipv4_listener, ipv6_listener].into_boxed_slice());
+    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(
+        43001,
+        PortObservation::Listeners(listeners.clone()),
+    )]));
+
+    let error = ensure_managed_start_allowed(&snapshot, 43001)
+        .expect_err("multiple listener identities must be rejected");
+
+    assert_eq!(
+        error,
+        PortStartError::OccupiedAmbiguous {
+            port: 43001,
+            listeners,
+        }
+    );
+    let display = error.to_string();
+    assert!(display.contains("ownership is unverified"));
+    assert!(display.contains("PID 11013 (creation 1313)"));
+    assert!(display.contains("PID 11014 (creation 1414)"));
 }
 
 #[test]
@@ -335,13 +367,14 @@ fn real_temporary_listener_is_observed_and_never_touched_by_rejection() {
     let error = ensure_managed_start_allowed(&snapshot, port).expect_err("occupied port");
     assert_eq!(
         error,
-        PortStartError::OccupiedExternal {
+        PortStartError::Occupied {
             port,
             listener: observed_listener,
         }
     );
 
-    let kill_error = kill_port(port).expect_err("external listener must never be killed");
+    let kill_error =
+        kill_port(port).expect_err("ownership-unverified listener must never be killed");
     assert!(kill_error.contains("exact managed resource"));
 
     let still_occupied = TcpListener::bind(("127.0.0.1", port));
