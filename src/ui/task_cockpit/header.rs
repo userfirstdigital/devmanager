@@ -46,6 +46,48 @@ const MAX_ACCESSIBLE_SCALARS: usize = 512;
 const COMPACT_TITLE_SCALARS: usize = 28;
 const WRAPPED_TITLE_LINE_SCALARS: usize = 28;
 const MAX_MACHINE_CPU_INPUT_PERCENT: f64 = 1_000_000.0;
+const MAX_INPUT_TEXT_SCALARS: usize = 4_096;
+const MAX_INPUT_TEXT_BYTES: usize = 16 * 1_024;
+const MAX_INPUT_QUOTAS: usize = 64;
+
+/// Failure returned before a top-bar observation is copied, scanned, or
+/// truncated for presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TopBarProjectionError {
+    InvalidNow,
+    InvalidGeneration,
+    TooManyQuotas {
+        actual: usize,
+        max: usize,
+    },
+    InputTooLarge {
+        field: &'static str,
+        actual_scalars: usize,
+        actual_bytes: usize,
+    },
+}
+
+impl fmt::Display for TopBarProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidNow => formatter.write_str("top-bar now_ms must be non-negative"),
+            Self::InvalidGeneration => formatter.write_str("top-bar generation must be host-issued"),
+            Self::TooManyQuotas { actual, max } => {
+                write!(formatter, "top-bar quota count {actual} exceeds bound {max}")
+            }
+            Self::InputTooLarge {
+                field,
+                actual_scalars,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "top-bar input {field} is oversized ({actual_scalars} scalars, {actual_bytes} bytes)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TopBarProjectionError {}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct TaskActionContext {
@@ -727,6 +769,76 @@ pub struct TopBarProjectionInput {
     pub resources: Option<HostResourceObservation>,
 }
 
+impl TopBarProjectionInput {
+    /// Check every caller-owned string and collection before any projection
+    /// code scans, copies, redacts, or truncates it.
+    pub fn preflight(&self) -> Result<(), TopBarProjectionError> {
+        if self.now_ms < 0 {
+            return Err(TopBarProjectionError::InvalidNow);
+        }
+        if self.generation == 0 {
+            return Err(TopBarProjectionError::InvalidGeneration);
+        }
+        if self.quotas.len() > MAX_INPUT_QUOTAS {
+            return Err(TopBarProjectionError::TooManyQuotas {
+                actual: self.quotas.len(),
+                max: MAX_INPUT_QUOTAS,
+            });
+        }
+
+        if let Some(host) = &self.host {
+            check_input_text("host_id", &host.identity.host_id)?;
+        }
+        if let Some(connect) = &self.connect {
+            check_input_text("connect.host_id", &connect.identity.host_id)?;
+        }
+        if let Some(update) = &self.update {
+            check_input_text("update.current_version", &update.identity.current_version)?;
+            if let Some(target_version) = &update.identity.target_version {
+                check_input_text("update.target_version", target_version)?;
+            }
+        }
+        for quota in &self.quotas {
+            check_input_text("quota.provider", &quota.identity.provider)?;
+            check_input_text(
+                "quota.provider_session_id",
+                &quota.identity.provider_session_id,
+            )?;
+            if let Some(detail) = &quota.detail {
+                check_input_text("quota.detail", detail)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_input_text(field: &'static str, value: &str) -> Result<(), TopBarProjectionError> {
+    let actual_bytes = value.len();
+    if actual_bytes > MAX_INPUT_TEXT_BYTES {
+        // Do not walk an unbounded caller string merely to report its exact
+        // scalar count. A bounded prefix is enough to prove the scalar limit
+        // is not the first violated limit, while the byte count is O(1).
+        let actual_scalars = value
+            .chars()
+            .take(MAX_INPUT_TEXT_SCALARS.saturating_add(1))
+            .count();
+        return Err(TopBarProjectionError::InputTooLarge {
+            field,
+            actual_scalars,
+            actual_bytes,
+        });
+    }
+    let actual_scalars = value.chars().count();
+    if actual_scalars > MAX_INPUT_TEXT_SCALARS {
+        return Err(TopBarProjectionError::InputTooLarge {
+            field,
+            actual_scalars,
+            actual_bytes,
+        });
+    }
+    Ok(())
+}
+
 impl fmt::Debug for HostObservationIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -967,7 +1079,78 @@ pub struct TopBarModel {
 }
 
 impl TopBarModel {
+    /// Empty host-client state used before the Phase 4 observation transport
+    /// is attached.  It contains no fabricated generation or quota value.
+    pub fn unavailable() -> Self {
+        Self {
+            host: None,
+            connect: None,
+            update: None,
+            quotas: Vec::new(),
+            quota_hidden_count: 0,
+            quotas_truncated: false,
+            quota_overflow_action: None,
+            resources: None,
+            unavailable: vec![
+                TopBarUnavailable::HostStatus,
+                TopBarUnavailable::ConnectionStatus,
+                TopBarUnavailable::UpdateStatus,
+                TopBarUnavailable::Quota,
+                TopBarUnavailable::Cpu,
+                TopBarUnavailable::Memory,
+            ],
+            accessible_description:
+                "Host, connection, update, resource, and quota observations are unavailable."
+                    .to_string(),
+        }
+    }
+
     pub fn from_input(input: &TopBarProjectionInput) -> Self {
+        match Self::try_from_input(input) {
+            Ok(model) => model,
+            Err(_) => Self::unavailable_after_preflight_rejection(input),
+        }
+    }
+
+    pub fn try_from_input(input: &TopBarProjectionInput) -> Result<Self, TopBarProjectionError> {
+        input.preflight()?;
+        Ok(Self::from_input_after_preflight(input))
+    }
+
+    fn unavailable_after_preflight_rejection(input: &TopBarProjectionInput) -> Self {
+        let mut unavailable = Vec::new();
+        if input.host.is_some() {
+            unavailable.push(TopBarUnavailable::HostStatus);
+        }
+        if input.connect.is_some() {
+            unavailable.push(TopBarUnavailable::ConnectionStatus);
+        }
+        if input.update.is_some() {
+            unavailable.push(TopBarUnavailable::UpdateStatus);
+        }
+        if !input.quotas.is_empty() {
+            unavailable.push(TopBarUnavailable::Quota);
+        }
+        if input.resources.as_ref().is_some_and(|resource| {
+            resource.cpu_percent.is_some() || resource.memory_bytes.is_some()
+        }) {
+            unavailable.extend([TopBarUnavailable::Cpu, TopBarUnavailable::Memory]);
+        }
+        Self {
+            host: None,
+            connect: None,
+            update: None,
+            quotas: Vec::new(),
+            quota_hidden_count: 0,
+            quotas_truncated: false,
+            quota_overflow_action: None,
+            resources: None,
+            unavailable,
+            accessible_description: "Top-bar observations unavailable.".to_string(),
+        }
+    }
+
+    fn from_input_after_preflight(input: &TopBarProjectionInput) -> Self {
         let host = input.host.as_ref().and_then(|observation| {
             fresh_stamp(observation.observed_at_ms, observation.generation, input)
                 .map(|stamp| host_status_link(observation, stamp))
@@ -1115,6 +1298,132 @@ impl TopBarModel {
                 .as_ref()
                 .is_some_and(|overflow| overflow == action)
             || self.quotas.iter().any(|quota| quota.action == *action)
+    }
+}
+
+/// Stateful top-bar projection boundary used by the native-next host-client
+/// seam.  Quota observations are retained once, keyed by canonical provider
+/// and current host generation.  Within one generation, the host-issued
+/// observation sequence is authoritative and the timestamp only breaks a
+/// sequence tie; late events can never roll the visible value backward.
+#[derive(Clone)]
+pub struct TopBarProjectionController {
+    input: TopBarProjectionInput,
+    quota_cache: BTreeMap<String, QuotaObservation>,
+    generation: u64,
+}
+
+impl fmt::Debug for TopBarProjectionController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TopBarProjectionController")
+            .field("input", &self.input)
+            .field("quota_count", &self.quota_cache.len())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for TopBarProjectionController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("top-bar-controller[redacted]")
+    }
+}
+
+impl TopBarProjectionController {
+    pub fn new(input: TopBarProjectionInput) -> Result<Self, TopBarProjectionError> {
+        input.preflight()?;
+        let generation = input.generation;
+        let mut controller = Self {
+            input,
+            quota_cache: BTreeMap::new(),
+            generation,
+        };
+        let observations = controller.input.quotas.clone();
+        controller.admit_quota_observations(&observations, generation, true);
+        controller.sync_cached_quotas();
+        Ok(controller)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn model(&self) -> TopBarModel {
+        TopBarModel::try_from_input(&self.input)
+            .expect("TopBarProjectionController maintains preflighted input")
+    }
+
+    /// Apply one host-client projection snapshot.  Returning `false` means
+    /// that the input was stale or contained only late quota observations;
+    /// this is intentionally not an error because replay can deliver those
+    /// events after a newer observation.
+    pub fn apply(&mut self, input: TopBarProjectionInput) -> Result<bool, TopBarProjectionError> {
+        input.preflight()?;
+        if input.generation < self.generation {
+            return Ok(false);
+        }
+        if input.generation == self.generation && input.now_ms < self.input.now_ms {
+            return Ok(false);
+        }
+
+        let generation_changed = input.generation > self.generation;
+        if generation_changed {
+            self.generation = input.generation;
+            self.quota_cache.clear();
+        }
+
+        let mut changed = generation_changed
+            || self.input.now_ms != input.now_ms
+            || self.input.host != input.host
+            || self.input.connect != input.connect
+            || self.input.update != input.update
+            || self.input.resources != input.resources;
+        changed |=
+            self.admit_quota_observations(&input.quotas, input.generation, generation_changed);
+
+        self.input.now_ms = input.now_ms;
+        self.input.generation = self.generation;
+        self.input.host = input.host;
+        self.input.connect = input.connect;
+        self.input.update = input.update;
+        self.input.resources = input.resources;
+        self.sync_cached_quotas();
+        Ok(changed)
+    }
+
+    fn admit_quota_observations(
+        &mut self,
+        observations: &[QuotaObservation],
+        generation: u64,
+        allow_session_replacement: bool,
+    ) -> bool {
+        let mut changed = false;
+        for observation in observations {
+            if observation.generation != Some(generation) {
+                continue;
+            }
+            let key = provider_key(&observation.identity.provider);
+            let replace = match self.quota_cache.get(&key) {
+                None => true,
+                Some(current) if allow_session_replacement => {
+                    quota_authority(observation) > quota_authority(current)
+                }
+                Some(current) => {
+                    current.identity.provider_session_id == observation.identity.provider_session_id
+                        && quota_authority(observation) > quota_authority(current)
+                }
+            };
+            if replace {
+                self.quota_cache.insert(key, observation.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn sync_cached_quotas(&mut self) {
+        self.input.quotas = self.quota_cache.values().cloned().collect();
     }
 }
 
@@ -1492,16 +1801,13 @@ fn fresh_quotas<'a>(
 }
 
 fn quota_is_newer(candidate: &QuotaObservation, current: &QuotaObservation) -> bool {
+    quota_authority(candidate) > quota_authority(current)
+}
+
+fn quota_authority(observation: &QuotaObservation) -> (u64, i64) {
     (
-        candidate.observed_at_ms,
-        candidate.identity.observation_id,
-        candidate.identity.provider_session_id.as_str(),
-        candidate.detail.as_deref().unwrap_or_default(),
-    ) > (
-        current.observed_at_ms,
-        current.identity.observation_id,
-        current.identity.provider_session_id.as_str(),
-        current.detail.as_deref().unwrap_or_default(),
+        observation.identity.observation_id,
+        observation.observed_at_ms.unwrap_or(-1),
     )
 }
 
@@ -1678,13 +1984,9 @@ fn presentation_text(value: &str, max_scalars: usize) -> String {
             }
             continue;
         }
-        if is_key_prefix_word(word)
-            && input_words
-                .get(index + 1)
-                .is_some_and(|next| is_key_suffix_word(next))
-        {
+        if let Some(suffix_index) = separated_key_suffix_index(&input_words, index) {
             words.push("[redacted]");
-            index += 2;
+            index = suffix_index + 1;
             if input_words
                 .get(index)
                 .is_some_and(|next| is_secret_value_candidate(next))
@@ -1724,18 +2026,62 @@ fn is_sensitive_presentation_word(word: &str) -> bool {
 }
 
 fn is_key_prefix_word(word: &str) -> bool {
-    matches!(
-        word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
-            .to_ascii_lowercase()
-            .as_str(),
-        "api" | "access" | "private"
-    )
+    let normalized = word
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    if matches!(normalized.as_str(), "api" | "access" | "private") {
+        return true;
+    }
+    let pieces = normalized
+        .split(['/', '\\', '|'])
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>();
+    pieces.len() > 1
+        && pieces
+            .iter()
+            .all(|piece| matches!(*piece, "api" | "access" | "private"))
 }
 
 fn is_key_suffix_word(word: &str) -> bool {
     word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
         .to_ascii_lowercase()
         .starts_with("key")
+}
+
+fn separated_key_suffix_index(words: &[&str], start: usize) -> Option<usize> {
+    if !is_key_prefix_word(words.get(start).copied()?) {
+        return None;
+    }
+
+    let mut cursor = start + 1;
+    loop {
+        while words
+            .get(cursor)
+            .is_some_and(|word| is_key_separator_word(word))
+        {
+            cursor += 1;
+        }
+        if words
+            .get(cursor)
+            .is_some_and(|word| is_key_prefix_word(word))
+        {
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+    words
+        .get(cursor)
+        .is_some_and(|word| is_key_suffix_word(word))
+        .then_some(cursor)
+}
+
+fn is_key_separator_word(word: &str) -> bool {
+    let word = word.trim();
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|character| matches!(character, '/' | '\\' | '|' | '_' | '-' | ':' | ',' | ';'))
 }
 
 fn is_secret_value_candidate(word: &str) -> bool {

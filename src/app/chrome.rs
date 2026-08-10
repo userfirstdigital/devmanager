@@ -1,5 +1,5 @@
 use crate::state::RuntimeState;
-use crate::ui::task_cockpit::{QuotaProjection, TopBarModel};
+use crate::ui::task_cockpit::TopBarModel;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use crate::{icons, theme};
 use gpui::{
@@ -61,7 +61,7 @@ pub fn render_status_bar(
     runtime: &RuntimeState,
     updater: &UpdaterSnapshot,
     remote: Option<&RemoteStatusBarModel>,
-    top_bar: &TopBarModel,
+    _top_bar: &TopBarModel,
     actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
     let (open_terminals, total_memory_bytes) = running_terminal_metrics(runtime);
@@ -120,12 +120,6 @@ pub fn render_status_bar(
                 .gap(px(8.0))
                 .children(
                     remote.map(|remote| render_remote_status(remote, &actions).into_any_element()),
-                )
-                .children(
-                    top_bar
-                        .quotas
-                        .iter()
-                        .map(|quota| render_ai_quota_status(quota).into_any_element()),
                 )
                 .child(update_content)
                 .child(
@@ -275,28 +269,6 @@ fn render_remote_status(
                     render_status_bar_action(action, handler).into_any_element()
                 }),
         )
-}
-
-fn render_ai_quota_status(quota: &QuotaProjection) -> impl IntoElement {
-    let color = match quota.provider.as_str() {
-        "Claude" => theme::AI_DOT,
-        "Codex" => theme::SUCCESS_TEXT,
-        _ => theme::TEXT_SUBTLE,
-    };
-
-    div()
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded_full()
-        .bg(rgb(theme::STATUS_BAR_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .text_xs()
-        .text_color(rgb(color))
-        .child(SharedString::from(format!(
-            "{}: {}",
-            quota.provider, quota.detail
-        )))
 }
 
 fn render_status_bar_transport_toggle(

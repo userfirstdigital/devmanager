@@ -341,6 +341,8 @@ struct NativeShell {
     splash_fetch_in_flight: bool,
     native_dialog_blockers: Arc<AtomicUsize>,
     remote_connect_request_id: u64,
+    /// Monotonic host-owned epoch for legacy quota replay observations.
+    ai_quota_generation: u64,
     ai_quota_states: HashMap<String, AiQuotaState>,
     remote_status_notice: Option<RemoteStatusNotice>,
     pending_shutdown_op_id: Option<u64>,
@@ -1384,6 +1386,7 @@ impl NativeShell {
             splash_fetch_in_flight: false,
             native_dialog_blockers,
             remote_connect_request_id: 0,
+            ai_quota_generation: 1,
             remote_status_notice: None,
             pending_shutdown_op_id: None,
             pending_window_close: false,
@@ -4886,9 +4889,17 @@ impl NativeShell {
 
         for (tab_id, tab_type, provider_session_id) in active_ai_tabs {
             let provider_name = Self::ai_provider_name(&tab_type).expect("only ai tabs");
+            let provider_key = provider_name.to_string();
+            let session_changed = self
+                .ai_quota_states
+                .get(&provider_key)
+                .is_some_and(|state| state.provider_session_id != provider_session_id);
+            if session_changed {
+                self.ai_quota_generation = self.ai_quota_generation.saturating_add(1).max(1);
+            }
             let entry = self
                 .ai_quota_states
-                .entry(provider_name.to_string())
+                .entry(provider_key)
                 .or_insert_with(|| AiQuotaState {
                     tab_id: tab_id.clone(),
                     tab_type: tab_type.clone(),
@@ -4976,14 +4987,14 @@ impl NativeShell {
                     },
                     detail: state.latest_usage.clone(),
                     observed_at_ms: i64::try_from(state.latest_usage_seen_at_epoch_ms).ok(),
-                    generation: Some(0),
+                    generation: Some(self.ai_quota_generation),
                 })
             })
             .collect();
 
         TopBarModel::from_input(&TopBarProjectionInput {
             now_ms,
-            generation: 0,
+            generation: self.ai_quota_generation,
             host: None,
             connect: None,
             update: None,

@@ -12,7 +12,8 @@ use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{PointerButton, Shell};
 use devmanager::ui::task_cockpit::header::{AgentRoleProjection, CpuInputUnit, TitleLayout};
 use devmanager::ui::task_cockpit::{
-    HeaderField, PrimaryAgentProjection, TaskHeaderModel, TopBarModel, TopBarProjectionInput,
+    HeaderField, NativeNextTaskCockpit, NativeNextTaskCockpitProjection, PrimaryAgentProjection,
+    TaskHeaderModel, TopBarModel, TopBarProjectionController, TopBarProjectionInput,
     WorkspaceProjection, MAX_HEADER_SPECIALISTS, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 use serde::Deserialize;
@@ -887,6 +888,9 @@ fn separated_secret_key_values_are_redacted_from_public_projection_text() {
                     "access-key ordinary_value_two",
                     "PRIVATE KEY ordinary_value_three",
                     "ToKeN ordinary_value_four",
+                    "ACCESS/PRIVATE KEY ordinary_value_five",
+                    "api\\private-key ordinary_value_six",
+                    "ACCESS / PRIVATE KEY ordinary_value_seven",
                 ]
                 .join(" | ");
             }
@@ -903,6 +907,9 @@ fn separated_secret_key_values_are_redacted_from_public_projection_text() {
             "ordinary_value_two",
             "ordinary_value_three",
             "ordinary_value_four",
+            "ordinary_value_five",
+            "ordinary_value_six",
+            "ordinary_value_seven",
         ] {
             assert!(
                 !output.contains(secret),
@@ -944,4 +951,192 @@ fn public_identity_input_and_action_debug_display_are_opaque() {
         .clone();
     assert!(!format!("{action:?}").contains(action.id()));
     assert!(!format!("{action}").contains(action.id()));
+}
+
+#[test]
+fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    let controller = TopBarProjectionController::new(fixture.top_bar)
+        .expect("fixture top bar must pass controller preflight");
+    let mut cockpit = NativeNextTaskCockpit::from_host(model, shell, controller);
+
+    let surface = cockpit.render_surface(360);
+    assert_eq!(
+        surface.header.as_ref().expect("task header").title,
+        "Ship the native cockpit"
+    );
+    let details = surface
+        .overflow_control
+        .as_ref()
+        .expect("narrow header must expose a details control");
+    assert_eq!(details.role, AccessibleRole::Button);
+    assert!(details.focusable);
+    assert!(!details.tooltip.is_empty());
+    assert_eq!(
+        details.keyboard_action,
+        devmanager::ui::actions::KeyboardAction::OpenTaskDetails
+    );
+
+    assert!(cockpit.activate_open_task_details());
+    let action = cockpit
+        .take_dispatched_action()
+        .expect("activation must dispatch the projected action");
+    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
+    assert!(matches!(
+        action.target(),
+        devmanager::ui::task_cockpit::header::ActionTarget::Task(_)
+    ));
+}
+
+#[test]
+fn native_next_surface_has_one_top_bar_projection_truth() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    let top_bar = TopBarModel::from_input(&fixture.top_bar);
+    let controller = TopBarProjectionController::new(fixture.top_bar)
+        .expect("fixture top bar must pass controller preflight");
+    let cockpit = NativeNextTaskCockpit::from_host(model, shell, controller);
+
+    let surface = cockpit.render_surface(720);
+    assert_eq!(surface.top_bar, top_bar);
+    assert!(surface.header.is_some());
+}
+
+#[test]
+fn native_next_projection_consumes_controller_and_keeps_controller_debug_opaque() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    let controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+
+    let projection = NativeNextTaskCockpitProjection::from_client_model_with_controller(
+        &model,
+        &shell,
+        &controller,
+    );
+    assert_eq!(projection.top_bar, controller.model());
+
+    let mut controller_input = fixture.top_bar;
+    controller_input.quotas[0].identity.provider = "PROVIDER_KEY_SECRET_SENTINEL".into();
+    controller_input.quotas[0].identity.provider_session_id =
+        "PROVIDER_SESSION_SECRET_SENTINEL".into();
+    let controller = TopBarProjectionController::new(controller_input)
+        .expect("bounded provider values must pass controller preflight");
+    let debug = format!("{controller:?}");
+    let display = format!("{controller}");
+    assert!(!debug.contains("PROVIDER_KEY_SECRET_SENTINEL"));
+    assert!(!debug.contains("PROVIDER_SESSION_SECRET_SENTINEL"));
+    assert!(!display.contains("PROVIDER_KEY_SECRET_SENTINEL"));
+    assert!(!display.contains("PROVIDER_SESSION_SECRET_SENTINEL"));
+}
+
+#[test]
+fn native_next_dispatch_rechecks_shell_epochs_after_projection() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut cockpit_shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(cockpit_shell.sync_client_epoch(model.last_applied_sequence()));
+    let mut stale_shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(stale_shell.sync_client_epoch(model.last_applied_sequence()));
+    let controller = TopBarProjectionController::new(fixture.top_bar)
+        .expect("fixture top bar must pass controller preflight");
+    let mut cockpit = NativeNextTaskCockpit::from_host(model.clone(), cockpit_shell, controller);
+
+    assert!(cockpit.activate_open_task_details());
+    assert!(cockpit.take_dispatched_action().is_some());
+
+    assert!(stale_shell.advance_focus_epoch());
+    cockpit.update_shell_state(stale_shell);
+    assert!(!cockpit.activate_open_task_details());
+    assert!(cockpit.take_dispatched_action().is_none());
+}
+
+#[test]
+fn quota_controller_rejects_late_observations_by_provider_generation_and_authority() {
+    let fixture = fixture();
+    let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+    let current_detail = controller.model().quotas[0].detail.clone();
+
+    let mut late_same_generation = fixture.top_bar.clone();
+    late_same_generation.quotas[0].detail = Some("1% remaining".into());
+    late_same_generation.quotas[0].identity.observation_id = late_same_generation.quotas[0]
+        .identity
+        .observation_id
+        .saturating_sub(1);
+    late_same_generation.quotas[0].observed_at_ms = Some(late_same_generation.now_ms);
+    assert!(!controller
+        .apply(late_same_generation)
+        .expect("late same-generation event must be handled"));
+    assert_eq!(controller.model().quotas[0].detail, current_detail);
+
+    let mut newer_sequence = fixture.top_bar.clone();
+    newer_sequence.quotas[0].identity.observation_id = 42;
+    newer_sequence.quotas[0].observed_at_ms = Some(fixture.top_bar.now_ms - 100);
+    newer_sequence.quotas[0].detail = Some("2% remaining".into());
+    assert!(controller
+        .apply(newer_sequence)
+        .expect("newer same-generation sequence must be admitted"));
+    assert_eq!(controller.model().quotas[0].detail, "2% remaining");
+
+    let mut same_sequence_older_timestamp = fixture.top_bar.clone();
+    same_sequence_older_timestamp.quotas[0]
+        .identity
+        .observation_id = 42;
+    same_sequence_older_timestamp.quotas[0].observed_at_ms = Some(fixture.top_bar.now_ms - 200);
+    same_sequence_older_timestamp.quotas[0].detail = Some("1% remaining".into());
+    assert!(!controller
+        .apply(same_sequence_older_timestamp)
+        .expect("older timestamp for the same sequence must be rejected"));
+    assert_eq!(controller.model().quotas[0].detail, "2% remaining");
+
+    let mut older_clock = fixture.top_bar.clone();
+    older_clock.now_ms = fixture.top_bar.now_ms - 1;
+    older_clock.quotas[0].identity.observation_id = 43;
+    older_clock.quotas[0].observed_at_ms = Some(older_clock.now_ms);
+    older_clock.quotas[0].detail = Some("3% remaining".into());
+    assert!(!controller
+        .apply(older_clock)
+        .expect("older host clock observation must be rejected"));
+    assert_eq!(controller.model().quotas[0].detail, "2% remaining");
+
+    let mut newer_generation = fixture.top_bar.clone();
+    newer_generation.generation += 1;
+    newer_generation.quotas[0].identity.observation_id = 1;
+    newer_generation.quotas[0].observed_at_ms = Some(newer_generation.now_ms);
+    newer_generation.quotas[0].generation = Some(newer_generation.generation);
+    newer_generation.quotas[0].detail = Some("33% remaining".into());
+    assert!(controller
+        .apply(newer_generation.clone())
+        .expect("new generation must be admitted"));
+    assert_eq!(controller.model().quotas[0].detail, "33% remaining");
+
+    let mut old_generation = newer_generation;
+    old_generation.generation -= 1;
+    old_generation.quotas[0].generation = Some(old_generation.generation);
+    old_generation.quotas[0].identity.observation_id = u64::MAX;
+    old_generation.quotas[0].detail = Some("99% remaining".into());
+    assert!(!controller
+        .apply(old_generation)
+        .expect("old generation must be rejected without error"));
+    assert_eq!(controller.model().quotas[0].detail, "33% remaining");
+    assert_ne!(controller.generation(), 0);
+}
+
+#[test]
+fn top_bar_input_is_preflight_bounded_before_projection_copy_or_truncation() {
+    let fixture = fixture();
+    let mut oversized = fixture.top_bar;
+    oversized.update.as_mut().unwrap().identity.current_version = "x".repeat(16 * 1024);
+
+    assert!(oversized.preflight().is_err());
+    assert!(TopBarModel::try_from_input(&oversized).is_err());
+    assert!(TopBarProjectionController::new(oversized).is_err());
 }
