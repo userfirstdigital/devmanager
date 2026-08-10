@@ -1,8 +1,15 @@
 use devmanager::domain::id::TaskId;
 use devmanager::ui::shell::{
-    InvalidationReason, PointerButton, ReleaseRejection, Shell, TerminalPressRejection,
-    TerminalRelease, TransientPriority,
+    HostEpochSnapshot, InvalidationReason, PointerButton, ReleaseRejection, Shell,
+    TerminalPressRejection, TerminalRelease, TransientPriority,
 };
+
+fn attached_shell(task: devmanager::domain::id::TaskId) -> Shell {
+    Shell::new(
+        Some(task),
+        HostEpochSnapshot::try_from_host(3, 5, 7, 11, 13).expect("test host epochs"),
+    )
+}
 
 fn task_id(tail: u8) -> TaskId {
     let mut bytes = [
@@ -16,7 +23,7 @@ fn task_id(tail: u8) -> TaskId {
 #[test]
 fn transient_priority_is_shell_local_and_has_no_host_effect_surface() {
     let task = task_id(3);
-    let mut shell = Shell::new(Some(task));
+    let mut shell = attached_shell(task);
 
     assert_eq!(shell.transient_priority(), None);
     shell.set_transient_priority(Some(TransientPriority::High));
@@ -28,7 +35,7 @@ fn transient_priority_is_shell_local_and_has_no_host_effect_surface() {
 #[test]
 fn terminal_release_requires_the_exact_pointer_task_generation_button_and_epoch_owner() {
     let task = task_id(4);
-    let mut shell = Shell::new(Some(task));
+    let mut shell = attached_shell(task);
     let epoch = shell.navigation_epoch();
     let owner = shell
         .terminal_mouse_down(41, task, PointerButton::Primary, epoch, Some(task))
@@ -47,7 +54,7 @@ fn terminal_release_requires_the_exact_pointer_task_generation_button_and_epoch_
 fn foreign_task_and_projected_selection_cannot_capture_terminal_pointer() {
     let task = task_id(6);
     let foreign = task_id(9);
-    let mut shell = Shell::new(Some(task));
+    let mut shell = attached_shell(task);
     let epoch = shell.navigation_epoch();
 
     assert_eq!(
@@ -73,7 +80,7 @@ fn lifecycle_boundaries_reject_stale_release_and_input_after_invalidating_active
         InvalidationReason::Resync,
         InvalidationReason::Deactivate,
     ] {
-        let mut shell = Shell::new(Some(task));
+        let mut shell = attached_shell(task);
         let captured_epoch = shell.navigation_epoch();
         let owner = shell
             .terminal_mouse_down(9, task, PointerButton::Primary, captured_epoch, Some(task))
@@ -98,8 +105,8 @@ fn lifecycle_boundaries_reject_stale_release_and_input_after_invalidating_active
 #[test]
 fn forged_foreign_release_token_is_rejected_and_invalid_mouse_up_is_consumed() {
     let task = task_id(10);
-    let mut receiver = Shell::new(Some(task));
-    let mut foreign_shell = Shell::new(Some(task));
+    let mut receiver = attached_shell(task);
+    let mut foreign_shell = attached_shell(task);
     let epoch = receiver.navigation_epoch();
 
     receiver

@@ -6,11 +6,19 @@ use devmanager::domain::task::{
     TaskLifecycle, WorkspaceRef,
 };
 use devmanager::ui::shell::{
-    NavigationRejection, NavigationResult, PointerButton, ReleaseRejection, Shell, TerminalRelease,
+    HostEpochSnapshot, NavigationRejection, NavigationResult, PointerButton, ReleaseRejection,
+    Shell, TerminalRelease,
 };
 use devmanager::ui::task_cockpit::{TaskList, VirtualWindow, MAX_TASK_LIST_ITEMS};
 use serde::Deserialize;
 use std::fs;
+
+fn attached_shell(task: Option<TaskId>) -> Shell {
+    Shell::new(
+        task,
+        HostEpochSnapshot::try_from_host(3, 5, 7, 11, 13).expect("test host epochs"),
+    )
+}
 
 #[derive(Debug, Deserialize)]
 struct TaskListFixture {
@@ -172,7 +180,7 @@ fn navigation_mouse_down_commits_only_tasks_in_the_current_bounded_inbox() {
     let foreign = task_id_from_index(3);
     let model = model_from_ids(&[first, second]);
     let inbox = TaskList::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = attached_shell(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
         .terminal_mouse_down(7, first, PointerButton::Primary, epoch, Some(first))
@@ -217,7 +225,7 @@ fn stale_navigation_invalidates_an_active_terminal_owner() {
     let second = task_id_from_index(5);
     let model = model_from_ids(&[first, second]);
     let inbox = TaskList::from_model(&model);
-    let mut shell = Shell::new(Some(first));
+    let mut shell = attached_shell(Some(first));
     let epoch = shell.navigation_epoch();
     let owner = shell
         .terminal_mouse_down(8, first, PointerButton::Primary, epoch, Some(first))
@@ -248,7 +256,7 @@ fn inbox_excludes_archived_tasks_and_rejects_their_navigation() {
     let inbox = TaskList::from_model(&model);
 
     assert_eq!(inbox.task_ids(), &[open]);
-    let mut shell = Shell::new(Some(open));
+    let mut shell = attached_shell(Some(open));
     let epoch = shell.navigation_epoch();
     assert_eq!(
         shell.navigation_mouse_down(archived, epoch, &inbox),

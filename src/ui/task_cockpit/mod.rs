@@ -13,8 +13,8 @@ pub use header::{
     QuotaProjection, StatusLink, TaskHeaderModel, TaskIdentity, TopBarAction, TopBarModel,
     TopBarProjectionController, TopBarProjectionError, TopBarProjectionInput, TopBarStatus,
     TopBarStatusLink, TurnProjection, UpdateObservation, UpdateObservationIdentity, UpdateState,
-    WorkspaceProjection, MAX_HEADER_SPECIALISTS, MAX_TOP_BAR_QUOTAS, NARROW_HEADER_WIDTH_PX,
-    PROVIDER_QUOTA_MAX_AGE_MS, STANDARD_HEADER_WIDTH_PX,
+    WorkspaceProjection, MAX_HEADER_SPECIALISTS, MAX_TOP_BAR_QUOTAS, MAX_TOP_BAR_QUOTA_CACHE,
+    NARROW_HEADER_WIDTH_PX, PROVIDER_QUOTA_MAX_AGE_MS, STANDARD_HEADER_WIDTH_PX,
 };
 
 pub use inbox::{
@@ -23,6 +23,7 @@ pub use inbox::{
 };
 
 pub use native::{
-    bind_native_next_actions, is_task_details_action, run_native_next, NativeNextTaskCockpit,
-    NativeNextTaskCockpitProjection, NativeNextTaskCockpitSurface,
+    bind_native_next_actions, is_task_details_action, run_native_next, NativeNextActionDispatcher,
+    NativeNextHeaderMenu, NativeNextHeaderMenuItem, NativeNextHostAttachment,
+    NativeNextTaskCockpit, NativeNextTaskCockpitProjection, NativeNextTaskCockpitSurface,
 };

@@ -1,40 +1,44 @@
 //! Native-next GPUI boundary for the task header and one global top bar.
 //!
-//! The renderer consumes only the immutable projection supplied by the
-//! native-next host-client seam.  It does not read `NativeShell`, session
-//! persistence, provider sessions, or any other legacy runtime source.
+//! The renderer consumes only bounded projections supplied by the isolated
+//! host attachment. It never reads `NativeShell`, session persistence, or
+//! provider runtime state.
 
 use gpui::{
     div, App, AppContext, Application, Context, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Render, SharedString, Styled, Window, WindowOptions,
 };
 use gpui_component::button::Button;
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 
 use crate::assets::AppAssets;
 use crate::client::ClientModel;
+use crate::ui::components::AccessibleRole;
 use crate::ui::shell::Shell;
 
+use super::header::TitleLayout;
 use super::{
-    ActionTarget, AgentProjection, OverflowControl, ProjectedAction, QuotaProjection,
-    TaskHeaderModel, TopBarModel, TopBarProjectionController, TopBarStatusLink,
-    NARROW_HEADER_WIDTH_PX,
+    ActionTarget, AgentProjection, HeaderField, HeaderLayout, OverflowControl,
+    PrimaryAgentProjection, ProjectedAction, QuotaProjection, TaskHeaderModel, TopBarModel,
+    TopBarProjectionController, TopBarProjectionError, TopBarProjectionInput, TopBarStatusLink,
+    WorkspaceProjection, NARROW_HEADER_WIDTH_PX,
 };
 
 gpui::actions!(native_next_task_cockpit, [OpenTaskDetailsAction]);
 
-/// Register the GPUI action and the keyboard shortcut owned by the native-next
-/// task cockpit.  The pure [`KeyboardAction`] model remains the source of
-/// truth for resolving the shortcut; this binds that action at the actual
-/// native renderer boundary.
+/// A typed sink owned by the host attachment. The renderer dispatches directly
+/// to this sink; it never accumulates actions in an unbounded local queue.
+pub trait NativeNextActionDispatcher {
+    fn dispatch(&mut self, action: ProjectedAction) -> bool;
+}
+
+/// Register the GPUI action and keyboard shortcut owned by the native-next
+/// task cockpit.
 pub fn bind_native_next_actions(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("ctrl-m", OpenTaskDetailsAction, None)]);
 }
 
-/// The only projection consumed by the native-next task cockpit renderer.
-///
-/// The host/client integration can update this value whenever its pinned
-/// snapshot or bounded top-bar observations advance.  In particular, the
-/// renderer has no fallback to the legacy `NativeShell` or `session.json`.
+/// The only immutable projection consumed by the native-next renderer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeNextTaskCockpitProjection {
     pub header: Option<TaskHeaderModel>,
@@ -46,17 +50,10 @@ impl NativeNextTaskCockpitProjection {
         Self { header, top_bar }
     }
 
-    /// Build the native-next projection from the host-client's pinned model
-    /// and the shell's current selection/epochs.  This is the reusable seam
-    /// consumed by a future live `HostClient` subscription; it does not read
-    /// the legacy app shell or persisted session state.
     pub fn from_client_model(model: &ClientModel, shell: &Shell, top_bar: TopBarModel) -> Self {
         Self::new(shell.task_header(model), top_bar)
     }
 
-    /// Build the projection directly from the host-client's stateful top-bar
-    /// controller. The controller is the sole owner of provider quota replay
-    /// ordering; the renderer receives only its immutable model snapshot.
     pub fn from_client_model_with_controller(
         model: &ClientModel,
         shell: &Shell,
@@ -66,74 +63,161 @@ impl NativeNextTaskCockpitProjection {
     }
 }
 
-/// One render snapshot used by the native-next surface and its deterministic
-/// tests.  There is exactly one `TopBarModel`; legacy remote/updater/quota
-/// status models are deliberately not represented here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeNextHeaderMenuItem {
+    pub field: HeaderField,
+    pub label: String,
+    pub description: String,
+    pub tooltip: String,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub action: ProjectedAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeNextHeaderMenu {
+    pub label: String,
+    pub description: String,
+    pub tooltip: String,
+    pub accessible_description: String,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub items: Vec<NativeNextHeaderMenuItem>,
+}
+
+/// One render snapshot. `header_layout` is the renderer's source of truth for
+/// width-dependent fields; `overflow_menu` is present only when fields are
+/// actually hidden behind the accessible menu trigger.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeNextTaskCockpitSurface {
     pub header: Option<TaskHeaderModel>,
+    pub header_layout: Option<HeaderLayout>,
     pub overflow_control: Option<OverflowControl>,
+    pub overflow_menu: Option<NativeNextHeaderMenu>,
     pub top_bar: TopBarModel,
 }
 
-/// GPUI renderer/controller for the native-next task cockpit.
-///
-/// `pending_action` is an in-memory handoff to the host-client action
-/// dispatcher.  Rendering and input only enqueue a validated projected action;
-/// they do not perform host, filesystem, network, or provider work.
-pub struct NativeNextTaskCockpit {
-    projection: NativeNextTaskCockpitProjection,
-    host_model: Option<ClientModel>,
-    host_shell: Option<Shell>,
-    host_top_bar: Option<TopBarProjectionController>,
-    pending_action: Option<ProjectedAction>,
+/// Bounded host-client state and typed action sink consumed by the renderer.
+pub struct NativeNextHostAttachment {
+    model: ClientModel,
+    shell: Shell,
+    top_bar: TopBarProjectionController,
+    dispatcher: Box<dyn NativeNextActionDispatcher>,
 }
 
-impl NativeNextTaskCockpit {
-    /// Create a projection-only renderer. Actions stay disabled until the
-    /// host-client constructor supplies the current Shell and top-bar
-    /// controller; a captured header alone is never dispatch authority.
-    pub fn new(projection: NativeNextTaskCockpitProjection) -> Self {
-        Self {
-            projection,
-            host_model: None,
-            host_shell: None,
-            host_top_bar: None,
-            pending_action: None,
-        }
-    }
-
-    /// Construct the renderer from the isolated host-client seam.  The host
-    /// snapshot and Shell stay alongside the renderer so every GPUI action is
-    /// revalidated against Shell-owned current epochs at dispatch time.
-    pub fn from_host(
+impl NativeNextHostAttachment {
+    pub fn new<D>(
         model: ClientModel,
         shell: Shell,
         top_bar: TopBarProjectionController,
-    ) -> Self {
-        let projection = NativeNextTaskCockpitProjection::from_client_model_with_controller(
-            &model, &shell, &top_bar,
-        );
+        dispatcher: D,
+    ) -> Self
+    where
+        D: NativeNextActionDispatcher + 'static,
+    {
+        Self {
+            model,
+            shell,
+            top_bar,
+            dispatcher: Box::new(dispatcher),
+        }
+    }
+
+    pub fn projection(&self) -> NativeNextTaskCockpitProjection {
+        NativeNextTaskCockpitProjection::from_client_model_with_controller(
+            &self.model,
+            &self.shell,
+            &self.top_bar,
+        )
+    }
+
+    pub fn apply_projection(
+        &mut self,
+        model: ClientModel,
+        top_bar: TopBarProjectionInput,
+    ) -> Result<bool, TopBarProjectionError> {
+        top_bar.preflight()?;
+        let top_bar_changed = self.top_bar.apply(top_bar)?;
+        let model_changed = if model.last_applied_sequence() < self.model.last_applied_sequence() {
+            false
+        } else if model.last_applied_sequence() == self.model.last_applied_sequence()
+            && model != self.model
+        {
+            false
+        } else if model != self.model {
+            if !self.shell.sync_client_epoch(model.last_applied_sequence()) {
+                return Ok(top_bar_changed);
+            }
+            self.model = model;
+            true
+        } else {
+            false
+        };
+        Ok(top_bar_changed || model_changed)
+    }
+
+    pub fn apply_top_bar_projection(
+        &mut self,
+        top_bar: TopBarProjectionInput,
+    ) -> Result<bool, TopBarProjectionError> {
+        self.top_bar.apply(top_bar)
+    }
+
+    pub fn update_shell(&mut self, shell: Shell) {
+        self.shell = shell;
+    }
+
+    fn dispatch_projected_action(&mut self, action: &ProjectedAction) -> bool {
+        let accepted = match action.target() {
+            ActionTarget::Task(_) | ActionTarget::Agent(_) => {
+                self.shell.dispatch_task_action(&self.model, action)
+            }
+            ActionTarget::Host { .. }
+            | ActionTarget::Connect { .. }
+            | ActionTarget::Update { .. }
+            | ActionTarget::QuotaSummary { .. }
+            | ActionTarget::Quota { .. } => self.top_bar.model().accepts_action(action),
+        };
+        accepted && self.dispatcher.dispatch(action.clone())
+    }
+}
+
+/// GPUI renderer/controller for the native-next task cockpit.
+pub struct NativeNextTaskCockpit {
+    projection: NativeNextTaskCockpitProjection,
+    attachment: Option<NativeNextHostAttachment>,
+}
+
+impl NativeNextTaskCockpit {
+    pub fn new(projection: NativeNextTaskCockpitProjection) -> Self {
         Self {
             projection,
-            host_model: Some(model),
-            host_shell: Some(shell),
-            host_top_bar: Some(top_bar),
-            pending_action: None,
+            attachment: None,
         }
     }
 
-    /// Replace only the current Shell state while retaining the captured
-    /// projection. Navigation/focus/connection changes therefore invalidate a
-    /// previously rendered action before it can reach the host dispatcher.
-    pub fn update_shell_state(&mut self, shell: Shell) {
-        if self.host_model.is_some() {
-            self.host_shell = Some(shell);
+    pub fn from_host<D>(
+        model: ClientModel,
+        shell: Shell,
+        top_bar: TopBarProjectionController,
+        dispatcher: D,
+    ) -> Self
+    where
+        D: NativeNextActionDispatcher + 'static,
+    {
+        Self::from_attachment(NativeNextHostAttachment::new(
+            model, shell, top_bar, dispatcher,
+        ))
+    }
+
+    pub fn from_attachment(attachment: NativeNextHostAttachment) -> Self {
+        let projection = attachment.projection();
+        Self {
+            projection,
+            attachment: Some(attachment),
         }
     }
 
-    /// Explicit unavailable state used until the Phase 4 host subscription is
-    /// attached. It contains no action-dispatch authority or fabricated facts.
     pub fn unavailable() -> Self {
         Self::new(NativeNextTaskCockpitProjection::new(
             None,
@@ -145,23 +229,62 @@ impl NativeNextTaskCockpit {
         &self.projection
     }
 
+    pub fn apply_host_projection(
+        &mut self,
+        model: ClientModel,
+        top_bar: TopBarProjectionInput,
+    ) -> Result<bool, TopBarProjectionError> {
+        let Some(attachment) = self.attachment.as_mut() else {
+            return Ok(false);
+        };
+        let changed = attachment.apply_projection(model, top_bar)?;
+        if changed {
+            self.projection = attachment.projection();
+        }
+        Ok(changed)
+    }
+
+    pub fn apply_top_bar_projection(
+        &mut self,
+        top_bar: TopBarProjectionInput,
+    ) -> Result<bool, TopBarProjectionError> {
+        let Some(attachment) = self.attachment.as_mut() else {
+            return Ok(false);
+        };
+        let changed = attachment.apply_top_bar_projection(top_bar)?;
+        if changed {
+            self.projection = attachment.projection();
+        }
+        Ok(changed)
+    }
+
+    pub fn update_shell_state(&mut self, shell: Shell) {
+        if let Some(attachment) = self.attachment.as_mut() {
+            attachment.update_shell(shell);
+        }
+    }
+
     pub fn render_surface(&self, width_px: u16) -> NativeNextTaskCockpitSurface {
-        let overflow_control = self
+        let (header_layout, overflow_control, overflow_menu) = self
             .projection
             .header
             .as_ref()
-            .and_then(|header| header.responsive_layout(width_px).overflow_control);
+            .map(|header| {
+                let layout = header.responsive_layout(width_px);
+                let overflow_control = layout.overflow_control.clone();
+                let overflow_menu = build_header_menu(header, &layout);
+                (Some(layout), overflow_control, overflow_menu)
+            })
+            .unwrap_or((None, None, None));
         NativeNextTaskCockpitSurface {
             header: self.projection.header.clone(),
+            header_layout,
             overflow_control,
+            overflow_menu,
             top_bar: self.projection.top_bar.clone(),
         }
     }
 
-    /// Dispatch the current task's details action, equivalent to activating
-    /// the responsive overflow control with Ctrl+M.  This is also used by the
-    /// GPUI action callback, so the test seam exercises the production action
-    /// path rather than merely inspecting accessibility metadata.
     pub fn activate_open_task_details(&mut self) -> bool {
         let Some(header) = self.projection.header.as_ref() else {
             return false;
@@ -175,33 +298,10 @@ impl NativeNextTaskCockpit {
         self.dispatch_projected_action(&control.action)
     }
 
-    pub fn take_dispatched_action(&mut self) -> Option<ProjectedAction> {
-        self.pending_action.take()
-    }
-
     fn dispatch_projected_action(&mut self, action: &ProjectedAction) -> bool {
-        let accepted = match (
-            self.host_model.as_ref(),
-            self.host_shell.as_ref(),
-            self.host_top_bar.as_ref(),
-        ) {
-            (Some(model), Some(shell), Some(top_bar)) => match action.target() {
-                ActionTarget::Task(_) | ActionTarget::Agent(_) => {
-                    shell.dispatch_task_action(model, action)
-                }
-                ActionTarget::Host { .. }
-                | ActionTarget::Connect { .. }
-                | ActionTarget::Update { .. }
-                | ActionTarget::QuotaSummary { .. }
-                | ActionTarget::Quota { .. } => top_bar.model().accepts_action(action),
-            },
-            _ => false,
-        };
-        if !accepted {
-            return false;
-        }
-        self.pending_action = Some(action.clone());
-        true
+        self.attachment
+            .as_mut()
+            .is_some_and(|attachment| attachment.dispatch_projected_action(action))
     }
 
     fn render_projected_button(
@@ -267,18 +367,73 @@ impl NativeNextTaskCockpit {
         )
     }
 
-    fn render_overflow(cx: &mut Context<Self>, control: &OverflowControl) -> gpui::AnyElement {
-        Self::render_projected_button(
-            cx,
-            "native-next-task-overflow",
-            control.label.clone(),
-            control.tooltip.clone(),
-            control.action.clone(),
-        )
+    fn render_header_field(
+        cx: &mut Context<Self>,
+        header: &TaskHeaderModel,
+        layout: &HeaderLayout,
+        field: HeaderField,
+    ) -> gpui::AnyElement {
+        match field {
+            HeaderField::Title => div().child(title_text(&layout.title)).into_any_element(),
+            HeaderField::Project => div()
+                .child(format!("Project: {}", header.project.label))
+                .into_any_element(),
+            HeaderField::Workspace => div()
+                .child(format!("Workspace: {}", workspace_label(&header.workspace)))
+                .into_any_element(),
+            HeaderField::Primary => match &header.primary {
+                PrimaryAgentProjection::Present(agent) => Self::render_agent(cx, 0, agent),
+                PrimaryAgentProjection::Unavailable { label, .. } => {
+                    div().child(label.clone()).into_any_element()
+                }
+            },
+            HeaderField::Specialists => {
+                let mut specialists = div().flex().gap_1();
+                for (index, agent) in header.specialists.iter().enumerate() {
+                    specialists = specialists.child(Self::render_agent(cx, index + 1, agent));
+                }
+                specialists.into_any_element()
+            }
+            HeaderField::TurnStatus => Self::render_projected_button(
+                cx,
+                "native-next-task-status",
+                header.status.label.clone(),
+                header.status.tooltip.clone(),
+                header.status.action.clone(),
+            ),
+        }
     }
 
-    fn element(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let surface = self.render_surface(NARROW_HEADER_WIDTH_PX);
+    fn render_overflow_menu(
+        cx: &mut Context<Self>,
+        menu: &NativeNextHeaderMenu,
+    ) -> gpui::AnyElement {
+        let menu_items = menu.items.clone();
+        let entity = cx.entity();
+        Button::new("native-next-task-overflow")
+            .label(menu.label.clone())
+            .tooltip(menu.tooltip.clone())
+            .tab_stop(menu.focusable)
+            .dropdown_menu(move |popup, _, _| {
+                menu_items.iter().cloned().fold(popup, |popup, item| {
+                    let action = item.action.clone();
+                    let entity = entity.clone();
+                    let label = format!("{} — {}", item.label, item.description);
+                    popup.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if this.dispatch_projected_action(&action) {
+                                cx.notify();
+                            }
+                        });
+                    }))
+                })
+            })
+            .into_any_element()
+    }
+
+    fn element(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width_px = window_width_px(window);
+        let surface = self.render_surface(width_px);
         let mut top_bar = div().flex().items_center().gap_2();
         if let Some(host) = &surface.top_bar.host {
             top_bar = top_bar.child(Self::render_status_link(cx, "host", host));
@@ -293,24 +448,14 @@ impl NativeNextTaskCockpit {
             top_bar = top_bar.child(Self::render_quota(cx, index, quota));
         }
 
-        let mut header = div().flex().flex_col().gap_2();
-        if let Some(task_header) = &surface.header {
-            header = header.child(SharedString::from(task_header.title.clone()));
-            header = header.child(Self::render_projected_button(
-                cx,
-                "native-next-task-status",
-                task_header.status.label.clone(),
-                task_header.status.tooltip.clone(),
-                task_header.status.action.clone(),
-            ));
-            if let super::PrimaryAgentProjection::Present(agent) = &task_header.primary {
-                header = header.child(Self::render_agent(cx, 0, agent));
+        let mut header_element = div().flex().items_center().gap_2();
+        if let (Some(header), Some(layout)) = (&surface.header, &surface.header_layout) {
+            for field in &layout.inline {
+                header_element =
+                    header_element.child(Self::render_header_field(cx, header, layout, *field));
             }
-            for (index, agent) in task_header.specialists.iter().enumerate() {
-                header = header.child(Self::render_agent(cx, index + 1, agent));
-            }
-            if let Some(control) = &surface.overflow_control {
-                header = header.child(Self::render_overflow(cx, control));
+            if let Some(menu) = &surface.overflow_menu {
+                header_element = header_element.child(Self::render_overflow_menu(cx, menu));
             }
         }
 
@@ -325,7 +470,7 @@ impl NativeNextTaskCockpit {
                 }
             }))
             .child(top_bar)
-            .child(header)
+            .child(header_element)
     }
 }
 
@@ -335,10 +480,108 @@ impl Render for NativeNextTaskCockpit {
     }
 }
 
-/// Start the actual native-next GPUI shell.  Host/client synchronization is a
+fn build_header_menu(
+    header: &TaskHeaderModel,
+    layout: &HeaderLayout,
+) -> Option<NativeNextHeaderMenu> {
+    if layout.overflow.is_empty() {
+        return None;
+    }
+    let items = layout
+        .overflow
+        .iter()
+        .map(|field| {
+            let label = header_field_label(header, *field);
+            let description = header_field_description(*field);
+            NativeNextHeaderMenuItem {
+                field: *field,
+                label: label.clone(),
+                description: description.clone(),
+                tooltip: description,
+                role: AccessibleRole::Button,
+                focusable: true,
+                action: header.status.action.clone(),
+            }
+        })
+        .collect();
+    Some(NativeNextHeaderMenu {
+        label: layout
+            .overflow_control
+            .as_ref()
+            .map(|control| control.label.clone())
+            .unwrap_or_else(|| "More task details".to_string()),
+        description: "Open additional task header details.".to_string(),
+        tooltip: layout
+            .overflow_control
+            .as_ref()
+            .map(|control| control.tooltip.clone())
+            .unwrap_or_else(|| "Open More task details".to_string()),
+        accessible_description: layout.accessible_description.clone(),
+        role: AccessibleRole::Menu,
+        focusable: true,
+        items,
+    })
+}
+
+fn header_field_label(header: &TaskHeaderModel, field: HeaderField) -> String {
+    match field {
+        HeaderField::Title => format!("Title: {}", header.title),
+        HeaderField::Project => format!("Project: {}", header.project.label),
+        HeaderField::Workspace => format!("Workspace: {}", workspace_label(&header.workspace)),
+        HeaderField::Primary => match &header.primary {
+            PrimaryAgentProjection::Present(agent) => format!("Primary agent: {}", agent.label),
+            PrimaryAgentProjection::Unavailable { label, .. } => {
+                format!("Primary agent: {label}")
+            }
+        },
+        HeaderField::Specialists => format!(
+            "Specialists: {} shown, {} hidden",
+            header.specialists.len(),
+            header.specialist_hidden_count
+        ),
+        HeaderField::TurnStatus => format!("Status: {}", header.status.label),
+    }
+}
+
+fn header_field_description(field: HeaderField) -> String {
+    match field {
+        HeaderField::Title => "Task title.".to_string(),
+        HeaderField::Project => "Project identity for this task.".to_string(),
+        HeaderField::Workspace => "Workspace and branch for this task.".to_string(),
+        HeaderField::Primary => "Primary agent and provider for this task.".to_string(),
+        HeaderField::Specialists => "Specialist agents attached to this task.".to_string(),
+        HeaderField::TurnStatus => "Current task turn status.".to_string(),
+    }
+}
+
+fn workspace_label(workspace: &WorkspaceProjection) -> String {
+    match workspace {
+        WorkspaceProjection::Main => "main workspace".to_string(),
+        WorkspaceProjection::Worktree { branch, .. } => format!("worktree {branch}"),
+        WorkspaceProjection::External { .. } => "external workspace".to_string(),
+    }
+}
+
+fn title_text(layout: &TitleLayout) -> String {
+    match layout {
+        TitleLayout::SingleLine(value) | TitleLayout::Truncated(value) => value.clone(),
+        TitleLayout::Wrapped(lines) => lines.join(" "),
+    }
+}
+
+fn window_width_px(window: &Window) -> u16 {
+    window
+        .bounds()
+        .size
+        .width
+        .to_f64()
+        .round()
+        .clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+/// Start the actual native-next GPUI shell. Host/client synchronization is a
 /// caller-owned seam; until the Phase 4 transport is attached, the shell
-/// renders an explicit unavailable state rather than fabricating quota or
-/// task facts.
+/// renders an explicit unavailable state rather than fabricating facts.
 pub fn run_native_next() {
     Application::new()
         .with_assets(AppAssets::new())
@@ -352,9 +595,6 @@ pub fn run_native_next() {
         });
 }
 
-/// Return whether an action targets the details surface.  Keeping this small
-/// helper in the renderer makes the GPUI callback's intent explicit while the
-/// projected action remains opaque outside the action boundary.
 pub fn is_task_details_action(action: &ProjectedAction) -> bool {
     action.id() == crate::client::action::ACTION_TASK_SHOW
         && matches!(action.target(), ActionTarget::Task(_))

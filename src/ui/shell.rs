@@ -3,6 +3,7 @@
 //! The shell owns only local interaction state. It never emits terminal input
 //! and never calls a host, terminal, provider, or component callback.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::client::ClientModel;
@@ -85,6 +86,60 @@ pub enum InvalidationReason {
     Resync,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellAttachmentError {
+    Unavailable,
+    ZeroEpoch(&'static str),
+}
+
+/// Host-issued initial epochs required before the shell can project or
+/// dispatch a task action.  The fields stay private so callers cannot mutate
+/// one dimension after the host has issued the attachment.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct HostEpochSnapshot {
+    resource_generation: NonZeroU64,
+    connection_epoch: NonZeroU64,
+    focus_epoch: NonZeroU64,
+    client_epoch: NonZeroU64,
+    navigation_epoch: NonZeroU64,
+}
+
+impl std::fmt::Debug for HostEpochSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostEpochSnapshot")
+            .field("resource_generation", &self.resource_generation)
+            .field("connection_epoch", &self.connection_epoch)
+            .field("focus_epoch", &self.focus_epoch)
+            .field("client_epoch", &self.client_epoch)
+            .field("navigation_epoch", &self.navigation_epoch)
+            .finish()
+    }
+}
+
+impl HostEpochSnapshot {
+    pub fn try_from_host(
+        resource_generation: u64,
+        connection_epoch: u64,
+        focus_epoch: u64,
+        client_epoch: u64,
+        navigation_epoch: u64,
+    ) -> Result<Self, ShellAttachmentError> {
+        Ok(Self {
+            resource_generation: NonZeroU64::new(resource_generation)
+                .ok_or(ShellAttachmentError::ZeroEpoch("resource_generation"))?,
+            connection_epoch: NonZeroU64::new(connection_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("connection_epoch"))?,
+            focus_epoch: NonZeroU64::new(focus_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("focus_epoch"))?,
+            client_epoch: NonZeroU64::new(client_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("client_epoch"))?,
+            navigation_epoch: NonZeroU64::new(navigation_epoch)
+                .ok_or(ShellAttachmentError::ZeroEpoch("navigation_epoch"))?,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PointerOwner {
     identity: Arc<()>,
@@ -147,18 +202,32 @@ pub struct Shell {
 pub type TaskCockpitShell = Shell;
 
 impl Shell {
-    pub fn new(selected_task: Option<TaskId>) -> Self {
-        Self {
+    /// Attach the shell to a current host snapshot.  No detached or
+    /// zero-epoch shell can project a task or authorize an action.
+    pub fn attach(
+        selected_task: Option<TaskId>,
+        epochs: Option<HostEpochSnapshot>,
+    ) -> Result<Self, ShellAttachmentError> {
+        let Some(epochs) = epochs else {
+            return Err(ShellAttachmentError::Unavailable);
+        };
+        Ok(Self {
             selected_task,
-            resource_generation: 0,
-            connection_epoch: 0,
-            focus_epoch: 0,
-            client_epoch: 0,
-            navigation_epoch: 0,
+            resource_generation: epochs.resource_generation.get(),
+            connection_epoch: epochs.connection_epoch.get(),
+            focus_epoch: epochs.focus_epoch.get(),
+            client_epoch: epochs.client_epoch.get(),
+            navigation_epoch: epochs.navigation_epoch.get(),
             transient_priority: None,
             pointer_owner: None,
             generation: 0,
-        }
+        })
+    }
+
+    /// Convenience constructor for callers that already hold a validated
+    /// host-issued snapshot.
+    pub fn new(selected_task: Option<TaskId>, epochs: HostEpochSnapshot) -> Self {
+        Self::attach(selected_task, Some(epochs)).expect("validated host epochs must attach")
     }
 
     pub fn selected_task(&self) -> Option<TaskId> {
@@ -222,6 +291,9 @@ impl Shell {
     /// Observe the current client subscription high-water. Older updates are
     /// ignored, so a stale subscription cannot revive an older projected row.
     pub fn sync_client_epoch(&mut self, client_epoch: u64) -> bool {
+        if client_epoch == 0 {
+            return false;
+        }
         if client_epoch < self.client_epoch {
             return false;
         }

@@ -29,6 +29,8 @@ pub const MAX_OBSERVATION_AGE_MS: i64 = PROVIDER_QUOTA_MAX_AGE_MS;
 pub const MAX_HEADER_SPECIALISTS: usize = 32;
 /// Keep the top bar bounded if a caller has not already provider-deduplicated.
 pub const MAX_TOP_BAR_QUOTAS: usize = 8;
+/// Bound retained provider observations before projection truncation.
+pub const MAX_TOP_BAR_QUOTA_CACHE: usize = 64;
 /// Width at which the title becomes a deterministic single-line ellipsis.
 pub const COMPACT_HEADER_WIDTH_PX: u16 = 320;
 /// Width at which the title becomes a deterministic two-line projection.
@@ -1340,13 +1342,17 @@ impl TopBarProjectionController {
             generation,
         };
         let observations = controller.input.quotas.clone();
-        controller.admit_quota_observations(&observations, generation, true);
+        controller.admit_quota_observations(&observations, generation);
         controller.sync_cached_quotas();
         Ok(controller)
     }
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn cached_quota_count(&self) -> usize {
+        self.quota_cache.len()
     }
 
     pub fn model(&self) -> TopBarModel {
@@ -1379,8 +1385,7 @@ impl TopBarProjectionController {
             || self.input.connect != input.connect
             || self.input.update != input.update
             || self.input.resources != input.resources;
-        changed |=
-            self.admit_quota_observations(&input.quotas, input.generation, generation_changed);
+        changed |= self.admit_quota_observations(&input.quotas, input.generation);
 
         self.input.now_ms = input.now_ms;
         self.input.generation = self.generation;
@@ -1396,7 +1401,6 @@ impl TopBarProjectionController {
         &mut self,
         observations: &[QuotaObservation],
         generation: u64,
-        allow_session_replacement: bool,
     ) -> bool {
         let mut changed = false;
         for observation in observations {
@@ -1406,14 +1410,31 @@ impl TopBarProjectionController {
             let key = provider_key(&observation.identity.provider);
             let replace = match self.quota_cache.get(&key) {
                 None => true,
-                Some(current) if allow_session_replacement => {
-                    quota_authority(observation) > quota_authority(current)
-                }
-                Some(current) => {
-                    current.identity.provider_session_id == observation.identity.provider_session_id
-                        && quota_authority(observation) > quota_authority(current)
-                }
+                Some(current) => quota_authority(observation) > quota_authority(current),
             };
+            if replace && !self.quota_cache.contains_key(&key) {
+                if self.quota_cache.len() >= MAX_TOP_BAR_QUOTA_CACHE {
+                    let Some(eviction_key) = self
+                        .quota_cache
+                        .iter()
+                        .min_by(|(left_key, left), (right_key, right)| {
+                            quota_authority(left)
+                                .cmp(&quota_authority(right))
+                                .then_with(|| left_key.cmp(right_key))
+                        })
+                        .map(|(key, _)| key.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(eviction) = self.quota_cache.get(&eviction_key) else {
+                        continue;
+                    };
+                    if quota_authority(observation) <= quota_authority(eviction) {
+                        continue;
+                    }
+                    self.quota_cache.remove(&eviction_key);
+                }
+            }
             if replace {
                 self.quota_cache.insert(key, observation.clone());
                 changed = true;
