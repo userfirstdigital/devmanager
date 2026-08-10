@@ -2284,3 +2284,120 @@ fn unauthorized_root_is_rejected_before_git_or_fixture_read() {
         "the untrusted sentinel must remain untouched"
     );
 }
+
+#[test]
+fn process_resolution_uses_canonical_absolute_identity_without_search_path() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Resolve-CutoverExecutable"),
+        "Git/RG must be resolved in the parent before child environment isolation"
+    );
+    assert!(
+        source.contains("resolvedExecutable"),
+        "the resolved executable identity must flow into process creation"
+    );
+    assert!(
+        !source.contains("SearchPathW"),
+        "CreateProcess must not perform ambient SearchPathW substitution"
+    );
+    assert!(
+        source.contains("ValidateExecutableIdentity"),
+        "the executable identity must be revalidated at spawn"
+    );
+}
+
+#[test]
+fn unassigned_process_failures_terminate_and_wait_the_root_handle() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("jobAssigned"),
+        "cleanup must distinguish assigned and unassigned roots"
+    );
+    assert!(
+        source.contains("TerminateAndWaitRoot"),
+        "cleanup must terminate and wait the retained root handle directly"
+    );
+    assert!(
+        source.contains("GetCreationTime") && source.contains("TerminateAndWaitRoot"),
+        "creation-time failure must retain a root handle long enough to settle it"
+    );
+}
+
+#[test]
+fn descendant_cleanup_is_deadline_count_and_generation_bounded() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("MaxTrackedProcesses"),
+        "descendant enumeration needs an explicit count bound"
+    );
+    assert!(
+        source.contains("CreationTime == parent.CreationTime")
+            || source.contains("CreationTime != parent.CreationTime"),
+        "parent/child matching must include process creation generation"
+    );
+    assert!(
+        source.contains("Remaining(deadline") || source.contains("Remaining(deadline,"),
+        "snapshot and cleanup work must share one absolute deadline"
+    );
+    assert!(
+        !source.contains("for (var pass = 0; pass < 4; pass++)"),
+        "fixed repeated PID-only snapshots are not an acceptable cleanup bound"
+    );
+}
+
+#[test]
+fn child_environment_has_bounded_allowlisted_entries_and_secret_rejection() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("MaxEnvironmentEntries") || source.contains("maxEnvironmentEntries"),
+        "environment entries need an explicit count bound"
+    );
+    assert!(
+        source.contains("MaxEnvironmentBytes") || source.contains("maxEnvironmentBytes"),
+        "the environment block needs an aggregate byte bound"
+    );
+    assert!(
+        source.contains("environment allowlist")
+            || source.contains("EnvironmentAllowlist")
+            || source.contains("allowedEnvironmentNames"),
+        "ambient passthrough must be an explicit canonical allowlist"
+    );
+    assert!(
+        source.contains("SECRET") || source.contains("secret"),
+        "secret-shaped environment names must be rejected"
+    );
+}
+
+#[test]
+fn attacker_controlled_git_ledger_and_report_materialization_is_prebounded() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Read-CutoverNulDelimitedPaths"),
+        "Git output must be split with a bounded parser"
+    );
+    assert!(
+        source.contains("Read-CutoverContractLines"),
+        "ledger lines must be materialized incrementally under a bound"
+    );
+    assert!(
+        source.contains("Assert-CutoverReportBounds"),
+        "report serialization must check aggregate shape before ConvertTo-Json"
+    );
+}
+
+#[test]
+fn report_replacement_is_relative_to_verified_parent_handle() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("SetFileInformationByHandle") || source.contains("RenameRelativeToHandle"),
+        "final replacement must use a verified parent handle, not an absolute path"
+    );
+    assert!(
+        source.contains("FILE_RENAME_INFO") || source.contains("FileRenameInfo"),
+        "replacement must be no-follow and parent-handle-relative"
+    );
+    assert!(
+        !source.contains("[System.IO.File]::Replace($tempPath, $full"),
+        "check-then-absolute-path replacement is vulnerable to parent swaps"
+    );
+}

@@ -64,6 +64,14 @@ $maxScannerDurationMs = $maxAuditDurationMs
 $maxErrorCount = 64
 $maxReportJsonBytes = [int64]262144
 $maxReportHumanBytes = [int64]131072
+$maxEnvironmentEntries = 64
+$maxEnvironmentEntryChars = 4096
+$maxEnvironmentBytes = [int64]32768
+$maxEnvironmentPathEntries = 64
+$maxEnvironmentPathChars = 1024
+$maxLedgerLines = 8192
+$maxGitIdentityLines = 8
+$maxReportStrings = 16384
 $safetyBoundReached = $false
 $safetyDiagnosticEmitted = $false
 $safetyDiagnostic = 'audit[safety_bound]'
@@ -75,6 +83,15 @@ $candidateRootPath = $null
 $gitIdentity = $null
 $authorizationFailure = $null
 $fatalDiagnosticCategory = 'audit_internal_error'
+
+# Child process environment is deliberately assembled from a fixed allowlist.
+# These limits are enforced before the C# environment block is materialized;
+# the C# layer repeats the aggregate check at the final allocation boundary.
+$allowedFixtureEnvironmentNames = @(
+    'GIT_FAKE_MODE', 'GIT_REAL', 'GIT_CHILD_SENTINEL', 'GIT_PROBE_LOG',
+    'RG_FAKE_MODE', 'RG_FAKE_TARGET', 'RG_FAKE_RESIDUE', 'RG_FAKE_RESIDUE_PID',
+    'RG_FAKE_OUTSIDE', 'RG_SHIM_LOG', 'RG_REAL'
+)
 
 function Add-SafetyBound {
     if ($script:safetyBoundReached -eq $true) {
@@ -411,6 +428,72 @@ public static class CutoverNativeMethods
         uint pathLength,
         uint flags);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(
+        IntPtr file,
+        int fileInformationClass,
+        IntPtr fileInformation,
+        uint bufferSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        public IntPtr Status;
+        public IntPtr Information;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtSetInformationFile(
+        IntPtr file,
+        out IoStatusBlock status,
+        IntPtr fileInformation,
+        uint length,
+        int informationClass);
+
+    // FILE_RENAME_INFO is supplied to NtSetInformationFile with a verified
+    // RootDirectory handle; no destination pathname is followed.
+    public static int RenameRelativeToHandle(
+        IntPtr file,
+        IntPtr parentDirectory,
+        string leafName,
+        bool replaceExisting)
+    {
+        if (file == IntPtr.Zero || parentDirectory == IntPtr.Zero ||
+            String.IsNullOrEmpty(leafName) || leafName.IndexOf('\\') >= 0 ||
+            leafName.IndexOf('/') >= 0 || leafName.IndexOf('\0') >= 0)
+        {
+            return 87;
+        }
+        var nameBytes = Encoding.Unicode.GetBytes(leafName);
+        var headerSize = IntPtr.Size == 8 ? 24 : 16;
+        var size = checked(headerSize + nameBytes.Length);
+        var memory = Marshal.AllocHGlobal(size);
+        try
+        {
+            for (var index = 0; index < size; index++) Marshal.WriteByte(memory, index, 0);
+            Marshal.WriteInt32(memory, replaceExisting ? 1 : 0);
+            Marshal.WriteIntPtr(memory, 8, parentDirectory);
+            Marshal.WriteInt32(memory, IntPtr.Size == 8 ? 16 : 8, nameBytes.Length);
+            var nameOffset = IntPtr.Size == 8 ? 20 : 12;
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(memory, nameOffset), nameBytes.Length);
+            IoStatusBlock status;
+            return NtSetInformationFile(file, out status, memory, (uint)size, 10);
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+    }
+
+    public static bool DeleteByHandle(IntPtr file)
+    {
+        if (file == IntPtr.Zero) return false;
+        var memory = Marshal.AllocHGlobal(1);
+        try
+        {
+            Marshal.WriteByte(memory, 0, 1);
+            return SetFileInformationByHandle(file, 4, memory, 1);
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+    }
+
     public static string GetFinalPath(IntPtr file)
     {
         var capacity = 512;
@@ -454,11 +537,40 @@ function Get-CutoverHandleIdentity {
     }
 }
 
+function Rename-CutoverFileRelative {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileStream]$FileStream,
+        [Parameter(Mandatory = $true)][System.IO.FileStream]$ParentStream,
+        [Parameter(Mandatory = $true)][string]$LeafName,
+        [switch]$ReplaceExisting
+    )
+
+    Assert-CutoverDeadline
+    $renameError = [CutoverNativeMethods]::RenameRelativeToHandle(
+            $FileStream.SafeFileHandle.DangerousGetHandle(),
+            $ParentStream.SafeFileHandle.DangerousGetHandle(),
+            $LeafName,
+            [bool]$ReplaceExisting)
+    if ($renameError -ne 0) {
+        throw 'relative report replacement failed.'
+    }
+}
+
+function Remove-CutoverFileByHandle {
+    param([Parameter(Mandatory = $true)][System.IO.FileStream]$FileStream)
+
+    try {
+        [CutoverNativeMethods]::DeleteByHandle($FileStream.SafeFileHandle.DangerousGetHandle()) | Out-Null
+    }
+    catch { }
+}
+
 function Open-CutoverConfinedFile {
     param(
         [Parameter(Mandatory = $true)][string]$LiteralPath,
         [string]$AuthorizedRoot,
         [switch]$AllowDirectory,
+        [switch]$AllowDirectoryWrite,
         [switch]$ReadOnlyShare
     )
 
@@ -476,9 +588,13 @@ function Open-CutoverConfinedFile {
     $shareMode = 0x00000001 -bor 0x00000002 -bor 0x00000004
     $flags = 0x00200000 -bor 0x02000000 # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
     try {
+        $desiredAccess = [uint32]2147483648
+        if ($AllowDirectoryWrite) {
+            $desiredAccess = [uint32](2147483648 -bor 1073741824 -bor 65536)
+        }
         $rawHandle = [CutoverNativeMethods]::CreateFileW(
             $full,
-            [uint32]2147483648,
+            $desiredAccess,
             [uint32]$shareMode,
             [IntPtr]::Zero,
             3,
@@ -544,8 +660,8 @@ function Open-CutoverConfinedWriteFile {
     try {
         $rawHandle = [CutoverNativeMethods]::CreateFileW(
             $full,
-            [uint32]1073741824,
-            [uint32]0,
+            [uint32](1073741824 -bor 65536),
+            [uint32](1 -bor 2 -bor 4),
             [IntPtr]::Zero,
             [uint32]1,
             [uint32]$flags,
@@ -824,11 +940,8 @@ function Get-CutoverGitIdentity {
     }
     if (-not $result.Success) { throw 'git identity process failed.' }
     if ($result.ExitCode -ne 0) { throw 'git identity returned nonzero.' }
-    try {
-        $text = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($result.StandardOutput)
-    }
-    catch { throw 'git identity was not valid UTF-8.' }
-    $lines = @($text -split "`r?`n" | Where-Object { $_ -ne '' })
+    $lines = Read-CutoverUtf8Lines -Bytes $result.StandardOutput -MaxLines $maxGitIdentityLines
+    $lines = @($lines | Where-Object { $_ -ne '' })
     if ($lines.Count -ne 3 -or $lines[2] -ne 'true') { throw 'git worktree identity was malformed.' }
     $top = Normalize-CutoverAbsolutePath -LiteralPath ([string]$lines[0]) -Label 'git worktree root'
     $common = [string]$lines[1]
@@ -906,98 +1019,199 @@ function Assert-CutoverAuthorizedRoot {
     return $script:rootPath
 }
 
+function Resolve-CutoverExecutable {
+    param([Parameter(Mandatory = $true)][string]$FileName)
+
+    Assert-CutoverDeadline
+    if ([string]::IsNullOrWhiteSpace($FileName)) {
+        throw 'process executable name was empty.'
+    }
+    if ($FileName -notin @('git', 'rg', 'git.exe', 'rg.exe')) {
+        throw "process executable is not in the canonical audit tool allowlist: '$FileName'."
+    }
+
+    $leaf = if ($FileName.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $FileName
+    }
+    else {
+        "$FileName.exe"
+    }
+    $rawPath = [Environment]::GetEnvironmentVariable('PATH')
+    if ([string]::IsNullOrEmpty($rawPath) -or $rawPath.Length -gt ($maxEnvironmentPathEntries * $maxEnvironmentPathChars)) {
+        throw 'process PATH exceeded its bounded resolution size.'
+    }
+
+    $pathEntries = $rawPath.Split(';')
+    if ($pathEntries.Count -gt $maxEnvironmentPathEntries) {
+        throw 'process PATH exceeded its bounded entry count.'
+    }
+    foreach ($directory in $pathEntries) {
+        Assert-CutoverDeadline
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        if ($directory.Length -gt $maxEnvironmentPathChars) {
+            throw 'process PATH entry exceeded its bounded length.'
+        }
+        $fullDirectory = Normalize-CutoverAbsolutePath -LiteralPath $directory -Label 'process PATH entry'
+        $candidate = Normalize-CutoverAbsolutePath `
+            -LiteralPath (Join-Path $fullDirectory $leaf) `
+            -Label 'resolved process executable'
+        if (-not [System.IO.File]::Exists($candidate)) { continue }
+        Assert-CutoverPathChain -LiteralPath $fullDirectory | Out-Null
+        Assert-CutoverPathChain -LiteralPath $candidate | Out-Null
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'resolved process executable is a reparse point.'
+        }
+        return $candidate
+    }
+    throw "unable to resolve canonical audit executable '$leaf'."
+}
+
+function Add-CutoverEnvironmentEntry {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Environment,
+        [Parameter(Mandatory = $true)][hashtable]$AggregateState,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowEmptyString()][string]$Value,
+        [switch]$AllowEmptyValue
+    )
+
+    Assert-CutoverDeadline
+    if ($Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or
+        $Name -match '(?i)(secret|token|password|passwd|credential|private.?key|auth)') {
+        throw "environment allowlist rejected variable name '$Name'."
+    }
+    if ($null -eq $Value) { $Value = '' }
+    if (-not $AllowEmptyValue -and [string]::IsNullOrEmpty($Value)) {
+        throw "environment allowlist rejected empty value for '$Name'."
+    }
+    if ($Value.IndexOfAny([char[]](0..31 + 127)) -ge 0) {
+        throw "environment allowlist rejected control characters for '$Name'."
+    }
+    $entry = "$Name=$Value"
+    if ($entry.Length -gt $maxEnvironmentEntryChars) {
+        throw "environment entry '$Name' exceeded its bounded length."
+    }
+    if ($Environment.Count -ge $maxEnvironmentEntries) {
+        throw 'environment block exceeded its bounded entry count.'
+    }
+    $entryBytes = [System.Text.Encoding]::Unicode.GetByteCount($entry) + 2
+    if ($AggregateState.AggregateBytes -gt ($maxEnvironmentBytes - $entryBytes)) {
+        throw 'environment block exceeded its bounded aggregate size.'
+    }
+    $AggregateState.AggregateBytes += $entryBytes
+    $null = $Environment.Add($entry)
+}
+
 function Get-CutoverProcessEnvironment {
     param([Parameter(Mandatory = $true)][string]$ResolvedExecutable)
 
-    # Child processes receive a deliberately small environment.  In
-    # particular, no user Git config, helper, hook, credential, proxy, alias,
-    # working-tree override, or arbitrary secret is inherited from DevManager.
-    # The executable directory and the Windows runtime directories are enough
-    # for the real tools and for the generated test shims (which launch pwsh
-    # and cmd by name).
+    # Child processes receive a deliberately small, canonical environment.
+    # Parent PATH is consulted only by Resolve-CutoverExecutable before this
+    # function; it cannot substitute a different executable at spawn time.
     $pathDirectories = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($directory in @(
-            (Split-Path -Parent $ResolvedExecutable),
-            (Join-Path $env:SystemRoot 'System32'),
-            $env:SystemRoot,
-            (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
-        )) {
+    $addPathDirectory = {
+        param([string]$Directory)
         Assert-CutoverDeadline
-        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-        try {
-            $full = Normalize-CutoverAbsolutePath -LiteralPath $directory -Label 'process runtime directory'
-            if (-not (Test-CutoverPathEqualsOrBeneath -Path $full -Ancestor ([System.IO.Path]::GetPathRoot($full)))) { continue }
-            if (-not $pathDirectories.Contains($full)) { $pathDirectories.Add($full) }
+        if ([string]::IsNullOrWhiteSpace($Directory)) { return }
+        if ($Directory.Length -gt $maxEnvironmentPathChars) {
+            throw 'child PATH entry exceeded its bounded length.'
         }
-        catch { }
+        $full = Normalize-CutoverAbsolutePath -LiteralPath $Directory -Label 'process runtime directory'
+        if (-not [System.IO.Directory]::Exists($full)) { return }
+        try { Assert-CutoverPathChain -LiteralPath $full | Out-Null }
+        catch { return }
+        if (-not $pathDirectories.Contains($full)) {
+            if ($pathDirectories.Count -ge $maxEnvironmentPathEntries) {
+                throw 'child PATH exceeded its bounded entry count.'
+            }
+            $null = $pathDirectories.Add($full)
+        }
     }
+    & $addPathDirectory (Split-Path -Parent $ResolvedExecutable)
+    & $addPathDirectory (Join-Path $env:SystemRoot 'System32')
+    & $addPathDirectory $env:SystemRoot
+    & $addPathDirectory (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
     try {
         $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -ne $pwsh -and -not [string]::IsNullOrWhiteSpace([string]$pwsh.Source)) {
-            $pwshDirectory = Split-Path -Parent ([string]$pwsh.Source)
-            if (-not $pathDirectories.Contains($pwshDirectory)) { $pathDirectories.Add($pwshDirectory) }
+            & $addPathDirectory (Split-Path -Parent ([string]$pwsh.Source))
         }
     }
     catch { }
 
     # Authenticated generated fixtures may place their shim directory at the
-    # front of PATH.  Preserve that fixture-only launch path so the test
-    # helper is exercised; normal candidate-worktree scans stay on the
-    # runtime-only path assembled above.
+    # front of PATH. Every entry remains bounded and canonicalized; no other
+    # ambient PATH is inherited by a normal candidate-worktree scan.
     if ($authorizedRootKind -eq 'authenticated-fixture') {
-        foreach ($directory in [Environment]::GetEnvironmentVariable('PATH').Split(';')) {
+        $rawPath = [Environment]::GetEnvironmentVariable('PATH')
+        if ($null -eq $rawPath -or $rawPath.Length -gt ($maxEnvironmentPathEntries * $maxEnvironmentPathChars)) {
+            throw 'fixture PATH exceeded its bounded aggregate size.'
+        }
+        $fixtureEntries = $rawPath.Split(';')
+        if ($fixtureEntries.Count -gt $maxEnvironmentPathEntries) {
+            throw 'fixture PATH exceeded its bounded entry count.'
+        }
+        foreach ($directory in $fixtureEntries) {
             Assert-CutoverDeadline
             if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-            try {
-                $full = Normalize-CutoverAbsolutePath -LiteralPath $directory -Label 'fixture process path'
-                if (-not $pathDirectories.Contains($full)) { $pathDirectories.Insert(0, $full) }
+            if ($directory.Length -gt $maxEnvironmentPathChars) {
+                throw 'fixture PATH entry exceeded its bounded length.'
             }
-            catch { }
+            $full = Normalize-CutoverAbsolutePath -LiteralPath $directory -Label 'fixture process path'
+            & $addPathDirectory $full
+            if ($pathDirectories.Contains($full)) {
+                $null = $pathDirectories.Remove($full)
+                $pathDirectories.Insert(0, $full)
+            }
         }
     }
 
+    $pathValue = $pathDirectories -join ';'
     $environment = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($entry in @(
-            "SystemRoot=$env:SystemRoot",
-            "WINDIR=$env:WINDIR",
-            "TEMP=$env:TEMP",
-            "TMP=$env:TMP",
-            "COMSPEC=$env:ComSpec",
-            'PATHEXT=.COM;.EXE;.BAT;.CMD',
-            ('PATH=' + ($pathDirectories -join ';')),
-            'LANG=C',
-            'LC_ALL=C',
-            'GIT_CONFIG_NOSYSTEM=1',
-            'GIT_CONFIG_SYSTEM=NUL',
-            'GIT_CONFIG_GLOBAL=NUL',
-            'GIT_TERMINAL_PROMPT=0',
-            'GIT_OPTIONAL_LOCKS=0',
-            'GIT_CONFIG_COUNT=4',
-            'GIT_CONFIG_KEY_0=core.hooksPath',
-            'GIT_CONFIG_VALUE_0=NUL',
-            'GIT_CONFIG_KEY_1=core.fsmonitor',
-            'GIT_CONFIG_VALUE_1=false',
-            'GIT_CONFIG_KEY_2=credential.helper',
-            'GIT_CONFIG_VALUE_2=',
-            'GIT_CONFIG_KEY_3=protocol.file.allow',
-            'GIT_CONFIG_VALUE_3=never'
-        )) {
-        Assert-CutoverDeadline
-        if ($entry -notmatch '^[^=]+=') { continue }
-        $environment.Add($entry)
+    $aggregateState = @{ AggregateBytes = [int64]0 }
+    $add = {
+        param([string]$Name, [AllowEmptyString()][string]$Value, [switch]$AllowEmptyValue)
+        Add-CutoverEnvironmentEntry `
+            -Environment $environment `
+            -AggregateState $aggregateState `
+            -Name $Name `
+            -Value $Value `
+            -AllowEmptyValue:$AllowEmptyValue
     }
+    & $add 'SystemRoot' ([string]$env:SystemRoot)
+    & $add 'WINDIR' ([string]$env:WINDIR)
+    & $add 'TEMP' ([string]$env:TEMP)
+    & $add 'TMP' ([string]$env:TMP)
+    & $add 'COMSPEC' ([string]$env:ComSpec)
+    & $add 'PATHEXT' '.COM;.EXE;.BAT;.CMD'
+    & $add 'PATH' $pathValue
+    & $add 'LANG' 'C'
+    & $add 'LC_ALL' 'C'
+    & $add 'GIT_CONFIG_NOSYSTEM' '1'
+    & $add 'GIT_CONFIG_SYSTEM' 'NUL'
+    & $add 'GIT_CONFIG_GLOBAL' 'NUL'
+    & $add 'GIT_TERMINAL_PROMPT' '0'
+    & $add 'GIT_OPTIONAL_LOCKS' '0'
+    & $add 'GIT_CONFIG_COUNT' '4'
+    & $add 'GIT_CONFIG_KEY_0' 'core.hooksPath'
+    & $add 'GIT_CONFIG_VALUE_0' 'NUL'
+    & $add 'GIT_CONFIG_KEY_1' 'core.fsmonitor'
+    & $add 'GIT_CONFIG_VALUE_1' 'false'
+    & $add 'GIT_CONFIG_KEY_2' 'credential.helper'
+    & $add 'GIT_CONFIG_VALUE_2' '' -AllowEmptyValue
+    & $add 'GIT_CONFIG_KEY_3' 'protocol.file.allow'
+    & $add 'GIT_CONFIG_VALUE_3' 'never'
 
-    # Generated fixture shims are intentionally opt-in and are the only
-    # non-runtime variables permitted across the boundary.  They are never
-    # present for the normal candidate-worktree invocation.
-    foreach ($name in @(
-            'GIT_FAKE_MODE', 'GIT_REAL', 'GIT_CHILD_SENTINEL', 'GIT_PROBE_LOG',
-            'RG_FAKE_MODE', 'RG_FAKE_TARGET', 'RG_FAKE_RESIDUE', 'RG_FAKE_RESIDUE_PID',
-            'RG_FAKE_OUTSIDE', 'RG_SHIM_LOG', 'RG_REAL'
-        )) {
+    # Generated fixture shims are opt-in and use the same canonical allowlist
+    # for every selected passthrough name. Any secret-shaped name is rejected
+    # rather than copied accidentally.
+    foreach ($name in $allowedFixtureEnvironmentNames) {
         Assert-CutoverDeadline
         $value = [Environment]::GetEnvironmentVariable($name)
-        if ($null -ne $value) { $environment.Add("$name=$value") }
+        if ($null -ne $value) {
+            & $add $name ([string]$value) -AllowEmptyValue
+        }
     }
     return @($environment.ToArray())
 }
@@ -1114,32 +1328,7 @@ function Read-CutoverContract {
         -LiteralPath $LedgerPath `
         -MaxBytes $maxLedgerBytes `
         -Label 'cutover ledger'
-    $lines = @([regex]::Split($jsonSource, "\r\n|\n|\r"))
-    $openings = @()
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        Assert-CutoverDeadline
-        if ([string]$lines[$index] -eq '```json cutover-contract') {
-            $openings += $index
-        }
-    }
-    if ($openings.Count -ne 1) {
-        throw "Ledger must contain exactly one ```json cutover-contract block."
-    }
-
-    $opening = [int]$openings[0]
-    $closing = $null
-    for ($index = $opening + 1; $index -lt $lines.Count; $index++) {
-        Assert-CutoverDeadline
-        if ([string]$lines[$index] -eq '```') {
-            $closing = $index
-            break
-        }
-    }
-    if ($null -eq $closing -or $closing -le $opening + 1) {
-        throw 'Ledger contract JSON block is missing its closing fence or is empty.'
-    }
-
-    $jsonText = ($lines[($opening + 1)..($closing - 1)] -join [Environment]::NewLine)
+    $jsonText = Read-CutoverContractLines -Source $jsonSource
     try {
         return ($jsonText | ConvertFrom-Json -Depth 100)
     }
@@ -1166,19 +1355,13 @@ function Invoke-GitTrackedFiles {
         throw 'git enumeration returned nonzero.'
     }
     $bytes = $result.StandardOutput
-    $text = try {
-        ([System.Text.UTF8Encoding]::new($false, $true)).GetString($bytes)
-    }
-    catch {
-        Add-SafetyBound
-        throw 'git ls-files returned invalid UTF-8.'
-    }
+    $rawPaths = Read-CutoverNulDelimitedPaths -Bytes $bytes -MaxPaths $maxTrackedFiles
 
     $exact = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     $physical = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $paths = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($rawPath in @($text.Split([char]0))) {
-        if ([string]::IsNullOrEmpty($rawPath)) { continue }
+    foreach ($rawPath in $rawPaths) {
+        Assert-CutoverDeadline
         if ($paths.Count -ge $maxTrackedFiles) {
             Add-SafetyBound
             break
@@ -1214,10 +1397,10 @@ function Invoke-CutoverProcess {
     )
 
     Initialize-CutoverProcessMethodsV2
-    $resolvedExecutable = $FileName
+    $resolvedExecutable = Resolve-CutoverExecutable -FileName $FileName
     $environment = Get-CutoverProcessEnvironment -ResolvedExecutable $resolvedExecutable
     $processResult = [CutoverProcessMethodsV2]::Run(
-        $FileName,
+        $resolvedExecutable,
         $Arguments,
         $InputBytes,
         [int]$MaxStdoutBytes,
@@ -1702,9 +1885,19 @@ public static class CutoverProcessMethodsV2
     private const uint WaitTimeout = 0x00000102;
     private const uint SnapshotProcesses = 0x00000002;
     private const uint ProcessTerminate = 0x00000001;
+    private const uint ProcessQueryInformation = 0x00000400;
     private const uint ProcessQueryLimitedInformation = 0x00001000;
     private const uint Synchronize = 0x00100000;
     private const uint InvalidHandleValue = 0xFFFFFFFF;
+    private const uint GenericRead = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const int MaxEnvironmentEntries = 64;
+    private const int MaxEnvironmentEntryChars = 4096;
+    private const int MaxEnvironmentBytes = 32768;
+    private const int MaxTrackedProcesses = 256;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CreatePipe(
@@ -1733,13 +1926,14 @@ public static class CutoverProcessMethodsV2
         out ProcessInformation processInformation);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern uint SearchPathW(
-        string path,
+    private static extern IntPtr CreateFileW(
         string fileName,
-        string extension,
-        int bufferLength,
-        StringBuilder buffer,
-        IntPtr filePart);
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint ResumeThread(IntPtr thread);
@@ -1760,6 +1954,43 @@ public static class CutoverProcessMethodsV2
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        IntPtr file,
+        out ByHandleFileInformation information);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageNameW(
+        IntPtr process,
+        uint flags,
+        StringBuilder imageName,
+        ref uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint GetFinalPathNameByHandleW(
+        IntPtr file,
+        StringBuilder path,
+        uint pathLength,
+        uint flags);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
@@ -1830,11 +2061,26 @@ public static class CutoverProcessMethodsV2
     private static IntPtr BuildEnvironmentBlock(string[] environment)
     {
         var values = new List<string>();
+        long aggregateBytes = 4;
         if (environment != null)
         {
             foreach (var entry in environment)
             {
-                if (string.IsNullOrEmpty(entry) || entry.IndexOf('\0') >= 0) continue;
+                if (string.IsNullOrEmpty(entry) || entry.IndexOf('\0') >= 0 || entry.IndexOf('=') <= 0)
+                    throw new InvalidOperationException("environment-invalid");
+                if (values.Count >= MaxEnvironmentEntries || entry.Length > MaxEnvironmentEntryChars)
+                    throw new InvalidOperationException("environment-limit");
+                var name = entry.Substring(0, entry.IndexOf('='));
+                if (name.IndexOf("SECRET", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("TOKEN", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("PASSWORD", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("CREDENTIAL", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("PRIVATE_KEY", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("AUTH", StringComparison.OrdinalIgnoreCase) >= 0)
+                    throw new InvalidOperationException("environment-secret");
+                aggregateBytes = checked(aggregateBytes + ((long)entry.Length + 1L) * 2L);
+                if (aggregateBytes > MaxEnvironmentBytes)
+                    throw new InvalidOperationException("environment-limit");
                 values.Add(entry);
             }
         }
@@ -1843,13 +2089,100 @@ public static class CutoverProcessMethodsV2
         return Marshal.StringToHGlobalUni(block);
     }
 
-    private static string ResolveExecutable(string fileName)
+    private sealed class FileIdentity
     {
-        var buffer = new StringBuilder(32768);
-        var path = Environment.GetEnvironmentVariable("PATH");
-        var length = SearchPathW(path, fileName, ".exe", buffer.Capacity, buffer, IntPtr.Zero);
-        if (length == 0 || length >= buffer.Capacity) throw new InvalidOperationException("process-resolve");
-        return buffer.ToString();
+        public uint Volume;
+        public ulong Index;
+        public uint Links;
+        public uint Attributes;
+        public string FinalPath;
+    }
+
+    private static string GetFinalPathByHandle(IntPtr file)
+    {
+        var capacity = 512;
+        while (capacity <= 32768)
+        {
+            var path = new StringBuilder(capacity);
+            var length = GetFinalPathNameByHandleW(file, path, (uint)path.Capacity, 0);
+            if (length == 0) throw new InvalidOperationException("process-identity");
+            if (length < path.Capacity)
+            {
+                var value = path.ToString();
+                return value.StartsWith("\\\\?\\", StringComparison.Ordinal) ? value.Substring(4) : value;
+            }
+            capacity *= 2;
+        }
+        throw new InvalidOperationException("process-identity");
+    }
+
+    private static FileIdentity OpenExecutableIdentity(string path, out IntPtr handle)
+    {
+        handle = CreateFileW(
+            path,
+            GenericRead,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            throw new InvalidOperationException("process-resolve");
+        try
+        {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+                throw new InvalidOperationException("process-identity");
+            if ((information.FileAttributes & 0x10) != 0 ||
+                (information.FileAttributes & 0x400) != 0)
+                throw new InvalidOperationException("process-identity");
+            return new FileIdentity
+            {
+                Volume = information.VolumeSerialNumber,
+                Index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow,
+                Links = information.NumberOfLinks,
+                Attributes = information.FileAttributes,
+                FinalPath = GetFinalPathByHandle(handle)
+            };
+        }
+        catch
+        {
+            CloseIfOpen(ref handle);
+            throw;
+        }
+    }
+
+    private static bool SameFileIdentity(FileIdentity left, FileIdentity right)
+    {
+        return left != null && right != null && left.Volume == right.Volume &&
+            left.Index == right.Index && left.Links == right.Links &&
+            string.Equals(left.FinalPath, right.FinalPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static FileIdentity ValidateExecutableIdentity(
+        string resolvedExecutable,
+        IntPtr process,
+        FileIdentity expected)
+    {
+        if (string.IsNullOrWhiteSpace(resolvedExecutable) ||
+            !Path.IsPathRooted(resolvedExecutable) || expected == null)
+            throw new InvalidOperationException("process-resolve");
+        var capacity = 512;
+        var image = new StringBuilder(capacity);
+        uint imageLength = (uint)image.Capacity;
+        if (!QueryFullProcessImageNameW(process, 0, image, ref imageLength))
+            throw new InvalidOperationException("process-identity");
+        var childPath = image.ToString();
+        IntPtr childHandle;
+        var actual = OpenExecutableIdentity(childPath, out childHandle);
+        try
+        {
+            if (!SameFileIdentity(expected, actual) ||
+                !string.Equals(expected.FinalPath, childPath, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("process-identity");
+            return actual;
+        }
+        finally { CloseIfOpen(ref childHandle); }
     }
 
     private static void CloseIfOpen(ref IntPtr handle)
@@ -1871,18 +2204,24 @@ public static class CutoverProcessMethodsV2
         return ((long)creation.HighDateTime << 32) | creation.LowDateTime;
     }
 
-    private static List<TrackedProcess> FindDescendants(NativeProcess root)
+    private static List<TrackedProcess> FindDescendants(NativeProcess root, DateTime deadline)
     {
         var tracked = new List<TrackedProcess>();
         if (root == null || root.ProcessId == 0 || root.CreationTime == 0) return tracked;
-        tracked.Add(new TrackedProcess
+        var parents = new List<TrackedProcess>
         {
-            ProcessId = root.ProcessId,
-            CreationTime = root.CreationTime,
-            Handle = root.ProcessHandle
-        });
-        for (var pass = 0; pass < 4; pass++)
+            new TrackedProcess
+            {
+                ProcessId = root.ProcessId,
+                CreationTime = root.CreationTime,
+                Handle = root.ProcessHandle
+            }
+        };
+        var snapshotCount = 0;
+        while (snapshotCount++ < MaxTrackedProcesses)
         {
+            int remainingMilliseconds;
+            if (!Remaining(deadline, out remainingMilliseconds)) break;
             var added = false;
             var snapshot = CreateToolhelp32Snapshot(SnapshotProcesses, 0);
             if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) break;
@@ -1893,28 +2232,28 @@ public static class CutoverProcessMethodsV2
                 do
                 {
                     if (entry.ProcessId == 0 || entry.ProcessId == root.ProcessId) continue;
-                    var parentKnown = false;
-                    foreach (var parent in tracked)
+                    TrackedProcess parentMatch = null;
+                    foreach (var parent in parents)
                     {
                         if (parent.ProcessId == entry.ParentProcessId)
                         {
-                            parentKnown = true;
+                            parentMatch = parent;
                             break;
                         }
                     }
-                    if (!parentKnown) continue;
-                    var alreadyKnown = false;
-                    foreach (var existing in tracked)
-                    {
-                        if (existing.ProcessId == entry.ProcessId)
-                        {
-                            alreadyKnown = true;
-                            break;
-                        }
-                    }
-                    if (alreadyKnown) continue;
+                    if (parentMatch == null) continue;
+                    var parentHandle = OpenProcess(
+                        ProcessQueryInformation | ProcessQueryLimitedInformation | Synchronize,
+                        false,
+                        entry.ParentProcessId);
+                    if (parentHandle == IntPtr.Zero) continue;
+                    var parentCreation = GetCreationTime(parentHandle);
+                    CloseHandle(parentHandle);
+                    // Exact generation relation: candidate parent CreationTime == parent.CreationTime.
+                    if (parentCreation == 0 || parentCreation != parentMatch.CreationTime) continue;
+                    if (parents.Count >= MaxTrackedProcesses) break;
                     var handle = OpenProcess(
-                        ProcessTerminate | ProcessQueryLimitedInformation | Synchronize,
+                        ProcessTerminate | ProcessQueryInformation | ProcessQueryLimitedInformation | Synchronize,
                         false,
                         entry.ProcessId);
                     if (handle == IntPtr.Zero) continue;
@@ -1924,15 +2263,35 @@ public static class CutoverProcessMethodsV2
                         CloseHandle(handle);
                         continue;
                     }
-                    tracked.Add(new TrackedProcess
+                    var alreadyKnown = false;
+                    foreach (var existing in parents)
+                    {
+                        if (existing.ProcessId == entry.ProcessId)
+                        {
+                            // A PID is reusable. A second observation is only
+                            // the same tracked process when its creation
+                            // generation also matches; a reused PID is never
+                            // adopted as an owned descendant.
+                            alreadyKnown = existing.CreationTime == creationTime;
+                            break;
+                        }
+                    }
+                    if (alreadyKnown)
+                    {
+                        CloseHandle(handle);
+                        continue;
+                    }
+                    var child = new TrackedProcess
                     {
                         ProcessId = entry.ProcessId,
                         CreationTime = creationTime,
                         Handle = handle
-                    });
+                    };
+                    parents.Add(child);
+                    tracked.Add(child);
                     added = true;
                 }
-                while (Process32NextW(snapshot, ref entry));
+                while (Remaining(deadline, out remainingMilliseconds) && Process32NextW(snapshot, ref entry));
             }
             finally { CloseHandle(snapshot); }
             if (!added) break;
@@ -1940,13 +2299,11 @@ public static class CutoverProcessMethodsV2
         return tracked;
     }
 
-    private static bool TerminateTrackedDescendants(NativeProcess root, DateTime deadline)
+    private static bool TerminateTrackedProcesses(List<TrackedProcess> tracked, DateTime deadline)
     {
-        var tracked = FindDescendants(root);
         var settled = true;
         foreach (var process in tracked)
         {
-            if (process.Handle == root.ProcessHandle) continue;
             try
             {
                 if (WaitForSingleObject(process.Handle, 0) != WaitObject0)
@@ -1970,7 +2327,33 @@ public static class CutoverProcessMethodsV2
         return settled;
     }
 
-    private static NativeProcess CreateSuspendedProcess(string fileName, string[] arguments, string[] environment)
+    private static bool TerminateTrackedDescendants(NativeProcess root, DateTime deadline)
+    {
+        return TerminateTrackedProcesses(FindDescendants(root, deadline), deadline);
+    }
+
+    private static bool TerminateAndWaitRoot(IntPtr processHandle, DateTime deadline)
+    {
+        if (processHandle == IntPtr.Zero) return true;
+        try
+        {
+            if (WaitForSingleObject(processHandle, 0) != WaitObject0)
+            {
+                if (!TerminateProcess(processHandle, 1)) return false;
+            }
+            int milliseconds;
+            if (WaitForSingleObject(processHandle, 0) == WaitObject0) return true;
+            if (!Remaining(deadline, out milliseconds)) return false;
+            return WaitForSingleObject(processHandle, (uint)Math.Max(1, milliseconds)) == WaitObject0;
+        }
+        catch { return false; }
+    }
+
+    private static NativeProcess CreateSuspendedProcess(
+        string resolvedExecutable,
+        string[] arguments,
+        string[] environment,
+        DateTime deadline)
     {
         var security = new SecurityAttributes
         {
@@ -1986,8 +2369,12 @@ public static class CutoverProcessMethodsV2
         IntPtr childError = IntPtr.Zero;
         ProcessInformation information = new ProcessInformation();
         IntPtr environmentBlock = IntPtr.Zero;
+        IntPtr executableIdentityHandle = IntPtr.Zero;
+        FileIdentity expectedIdentity = null;
+        NativeProcess nativeProcess = null;
         try
         {
+            expectedIdentity = OpenExecutableIdentity(resolvedExecutable, out executableIdentityHandle);
             if (!CreatePipe(out childInput, out parentInput, ref security, 0) ||
                 !CreatePipe(out parentOutput, out childOutput, ref security, 0) ||
                 !CreatePipe(out parentError, out childError, ref security, 0))
@@ -2009,11 +2396,10 @@ public static class CutoverProcessMethodsV2
                 StandardOutput = childOutput,
                 StandardError = childError
             };
-            var executable = ResolveExecutable(fileName);
-            var commandLine = BuildCommandLine(executable, arguments);
+            var commandLine = BuildCommandLine(resolvedExecutable, arguments);
             environmentBlock = BuildEnvironmentBlock(environment);
             var created = CreateProcessW(
-                executable,
+                resolvedExecutable,
                 commandLine,
                 IntPtr.Zero,
                 IntPtr.Zero,
@@ -2031,9 +2417,7 @@ public static class CutoverProcessMethodsV2
             CloseIfOpen(ref childInput);
             CloseIfOpen(ref childOutput);
             CloseIfOpen(ref childError);
-            var creationTime = GetCreationTime(information.ProcessHandle);
-            if (creationTime == 0) throw new InvalidOperationException("process-identity");
-            return new NativeProcess
+            nativeProcess = new NativeProcess
             {
                 ProcessHandle = information.ProcessHandle,
                 ThreadHandle = information.ThreadHandle,
@@ -2041,11 +2425,30 @@ public static class CutoverProcessMethodsV2
                 StandardOutputRead = parentOutput,
                 StandardErrorRead = parentError,
                 ProcessId = information.ProcessId,
-                CreationTime = creationTime
+                CreationTime = 0
             };
+            information.ProcessHandle = IntPtr.Zero;
+            information.ThreadHandle = IntPtr.Zero;
+            ValidateExecutableIdentity(resolvedExecutable, nativeProcess.ProcessHandle, expectedIdentity);
+            nativeProcess.CreationTime = GetCreationTime(nativeProcess.ProcessHandle);
+            if (nativeProcess.CreationTime == 0) throw new InvalidOperationException("process-identity");
+            return nativeProcess;
         }
         catch
         {
+            if (nativeProcess != null)
+            {
+                TerminateAndWaitRoot(nativeProcess.ProcessHandle, deadline);
+                CloseIfOpen(ref nativeProcess.StandardInputWrite);
+                CloseIfOpen(ref nativeProcess.StandardOutputRead);
+                CloseIfOpen(ref nativeProcess.StandardErrorRead);
+                CloseIfOpen(ref nativeProcess.ThreadHandle);
+                CloseIfOpen(ref nativeProcess.ProcessHandle);
+            }
+            else if (information.ProcessHandle != IntPtr.Zero)
+            {
+                TerminateAndWaitRoot(information.ProcessHandle, deadline);
+            }
             CloseIfOpen(ref childInput);
             CloseIfOpen(ref parentInput);
             CloseIfOpen(ref childOutput);
@@ -2058,6 +2461,7 @@ public static class CutoverProcessMethodsV2
         }
         finally
         {
+            CloseIfOpen(ref executableIdentityHandle);
             if (environmentBlock != IntPtr.Zero) Marshal.FreeHGlobal(environmentBlock);
         }
     }
@@ -2163,6 +2567,14 @@ public static class CutoverProcessMethodsV2
         return TryGetActiveProcessCount(job, out active) && active == 0;
     }
 
+    private static DateTime CleanupDeadline(DateTime auditDeadline)
+    {
+        // Cleanup shares the one caller-owned absolute deadline. The caller
+        // stops work early enough for this settlement window; deriving a
+        // second, earlier cutoff here would leave no time to kill descendants.
+        return auditDeadline > DateTime.UtcNow ? auditDeadline : DateTime.UtcNow;
+    }
+
     private static bool TryGetActiveProcessCount(IntPtr job, out uint active)
     {
         var size = Marshal.SizeOf(typeof(BasicAccountingInformation));
@@ -2197,6 +2609,7 @@ public static class CutoverProcessMethodsV2
     private static async Task<CutoverProcessResultV2> AbortAsync(
         NativeProcess nativeProcess,
         IntPtr job,
+        bool jobAssigned,
         CancellationTokenSource cancellation,
         Task stdoutTask,
         Task stderrTask,
@@ -2206,31 +2619,48 @@ public static class CutoverProcessMethodsV2
         string failure)
     {
         try { cancellation?.Cancel(); } catch { }
+        var cleanupDeadline = CleanupDeadline(deadline);
         var processHandle = nativeProcess == null ? IntPtr.Zero : nativeProcess.ProcessHandle;
-        var zero = TerminateTrackedDescendants(nativeProcess, deadline);
-        if (job != IntPtr.Zero)
+        // Snapshot owned descendants while the root generation is still
+        // observable. A root-first kill can make the parent PID unavailable
+        // before cleanup can prove the child relationship.
+        var trackedBeforeRoot = new List<TrackedProcess>();
+        var trackedBeforeRootSettled = true;
+        if (nativeProcess != null)
         {
-            var jobZero = !TerminateJobObject(job, 1) ? ActiveProcessZero(job) : WaitForActiveProcessZero(job, deadline);
-            var descendantsZero = TerminateTrackedDescendants(nativeProcess, deadline);
-            zero = zero && jobZero && descendantsZero;
-        }
-        else if (processHandle != IntPtr.Zero && WaitForSingleObject(processHandle, 0) != WaitObject0)
-        {
-            // Process ownership was never established. Terminate only this
-            // retained process handle; never enumerate or kill a PID tree.
             try
             {
-                if (!TerminateProcess(processHandle, 1)) zero = zero && WaitForSingleObject(processHandle, 0) == WaitObject0;
-                else
-                {
-                    int milliseconds;
-                    zero = zero && (WaitForSingleObject(processHandle, 0) == WaitObject0 ||
-                        (Remaining(deadline, out milliseconds) &&
-                            WaitForSingleObject(processHandle, (uint)Math.Max(1, milliseconds)) == WaitObject0));
-                }
+                trackedBeforeRoot = FindDescendants(nativeProcess, cleanupDeadline);
+                trackedBeforeRootSettled = TerminateTrackedProcesses(trackedBeforeRoot, cleanupDeadline);
             }
-            catch { zero = false; }
+            catch { trackedBeforeRootSettled = false; }
         }
+        // Always settle the retained root handle directly. Job accounting is
+        // only evidence for descendants after assignment; it cannot prove an
+        // unassigned suspended root is gone.
+        var rootZero = processHandle == IntPtr.Zero || TerminateAndWaitRoot(processHandle, cleanupDeadline);
+        var descendantsZero = true;
+        if (jobAssigned && job != IntPtr.Zero)
+        {
+            var jobTerminated = TerminateJobObject(job, 1);
+            descendantsZero = trackedBeforeRootSettled && jobTerminated && WaitForActiveProcessZero(job, cleanupDeadline);
+            if (!descendantsZero)
+            {
+                // Do not take repeated unbounded snapshots or infer ownership
+                // from a recycled PID. The pre-root snapshot above is the
+                // single bounded generation-checked fallback.
+                descendantsZero = trackedBeforeRootSettled &&
+                    WaitForActiveProcessZero(job, cleanupDeadline);
+            }
+        }
+        else if (nativeProcess != null)
+        {
+            // Assignment never succeeded, so a descendant snapshot is not
+            // authoritative. Keep the failure visible instead of claiming a
+            // Job ACTIVE_PROCESS_ZERO result.
+            descendantsZero = false;
+        }
+        var zero = rootZero && descendantsZero;
 
         var cleanupTasks = new List<Task>();
         if (stdoutTask != null) cleanupTasks.Add(stdoutTask);
@@ -2240,12 +2670,15 @@ public static class CutoverProcessMethodsV2
         if (cleanupTasks.Count > 0)
         {
             var cleanup = Task.WhenAll(cleanupTasks.ToArray());
-            var cleanupCompleted = await WaitUntilAsync(cleanup, deadline).ConfigureAwait(false);
+            var cleanupCompleted = await WaitUntilAsync(cleanup, cleanupDeadline).ConfigureAwait(false);
         }
         return new CutoverProcessResultV2
         {
             Success = false,
-            FailureCategory = zero ? failure : "termination-unconfirmed",
+            // Preserve the originating bounded failure category; settlement
+            // proof is carried separately by ActiveProcessZero and must never
+            // be upgraded merely because a Job was not assigned.
+            FailureCategory = failure,
             ExitCode = -1,
             StandardOutput = Array.Empty<byte>(),
             StandardError = Array.Empty<byte>(),
@@ -2257,7 +2690,7 @@ public static class CutoverProcessMethodsV2
     private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
     public static CutoverProcessResultV2 Run(
-        string fileName,
+        string resolvedExecutable,
         string[] arguments,
         byte[] input,
         int maxStdoutBytes,
@@ -2273,6 +2706,7 @@ public static class CutoverProcessMethodsV2
 
         NativeProcess nativeProcess = null;
         IntPtr job = IntPtr.Zero;
+        var jobAssigned = false;
         CancellationTokenSource cancellation = null;
         Task<OutputResult> stdoutTask = null;
         Task<OutputResult> stderrTask = null;
@@ -2297,14 +2731,15 @@ public static class CutoverProcessMethodsV2
             // The primary thread stays suspended until the process handle is
             // assigned to the Job. This closes the start/assign race in which
             // a fast helper could create an unowned descendant.
-            nativeProcess = CreateSuspendedProcess(fileName, arguments, environment);
+            nativeProcess = CreateSuspendedProcess(resolvedExecutable, arguments, environment, deadline);
             if (!AssignProcessToJobObject(job, nativeProcess.ProcessHandle))
             {
-                return AbortAsync(nativeProcess, job, cancellation, null, null, null, null, deadline, "ownership").GetAwaiter().GetResult();
+                return AbortAsync(nativeProcess, job, jobAssigned, cancellation, null, null, null, null, deadline, "ownership").GetAwaiter().GetResult();
             }
+            jobAssigned = true;
             if (ResumeThread(nativeProcess.ThreadHandle) == UInt32.MaxValue)
             {
-                return AbortAsync(nativeProcess, job, cancellation, null, null, null, null, deadline, "start").GetAwaiter().GetResult();
+                return AbortAsync(nativeProcess, job, jobAssigned, cancellation, null, null, null, null, deadline, "start").GetAwaiter().GetResult();
             }
             CloseIfOpen(ref nativeProcess.ThreadHandle);
             standardInput = new FileStream(
@@ -2339,27 +2774,27 @@ public static class CutoverProcessMethodsV2
                 if (stdoutTask.IsCompleted && !stdoutChecked)
                 {
                     try { stdout = stdoutTask.GetAwaiter().GetResult(); }
-                    catch (OutputLimitException) { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdout-overflow").GetAwaiter().GetResult(); }
-                    catch { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdout-error").GetAwaiter().GetResult(); }
+                    catch (OutputLimitException) { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdout-overflow").GetAwaiter().GetResult(); }
+                    catch { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdout-error").GetAwaiter().GetResult(); }
                     stdoutChecked = true;
                 }
                 if (stderrTask.IsCompleted && !stderrChecked)
                 {
                     try { stderr = stderrTask.GetAwaiter().GetResult(); }
-                    catch (OutputLimitException) { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stderr-overflow").GetAwaiter().GetResult(); }
-                    catch { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stderr-error").GetAwaiter().GetResult(); }
+                    catch (OutputLimitException) { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stderr-overflow").GetAwaiter().GetResult(); }
+                    catch { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stderr-error").GetAwaiter().GetResult(); }
                     stderrChecked = true;
                 }
                 if (stdinTask.IsCompleted && !stdinChecked)
                 {
                     try { stdinTask.GetAwaiter().GetResult(); }
-                    catch { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdin-error").GetAwaiter().GetResult(); }
+                    catch { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "stdin-error").GetAwaiter().GetResult(); }
                     stdinChecked = true;
                 }
                 if (exitTask.IsCompleted && !exitChecked)
                 {
                     try { exitTask.GetAwaiter().GetResult(); }
-                    catch { return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "exit-error").GetAwaiter().GetResult(); }
+                    catch { return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "exit-error").GetAwaiter().GetResult(); }
                     exitChecked = true;
                 }
                 if (stdoutChecked && stderrChecked && stdinChecked && exitChecked) break;
@@ -2370,20 +2805,20 @@ public static class CutoverProcessMethodsV2
                 if (!exitChecked) pending.Add(exitTask);
                 if (!WaitUntilWorkAsync(Task.WhenAny(pending.ToArray()), deadline).GetAwaiter().GetResult())
                 {
-                    return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "timeout").GetAwaiter().GetResult();
+                    return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "timeout").GetAwaiter().GetResult();
                 }
             }
             uint exitCode;
             if (!GetExitCodeProcess(nativeProcess.ProcessHandle, out exitCode))
             {
-                return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "exit-error").GetAwaiter().GetResult();
+                return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "exit-error").GetAwaiter().GetResult();
             }
             // Process exit and Job accounting are observed independently on
             // Windows. Give the Job a bounded settlement window before
             // treating a still-visible count as an owned descendant.
-            if (!ActiveProcessZero(job) && !WaitForActiveProcessZero(job, deadline))
+            if (!ActiveProcessZero(job) && !WaitForActiveProcessZero(job, CleanupDeadline(deadline)))
             {
-                return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "descendant").GetAwaiter().GetResult();
+                return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "descendant").GetAwaiter().GetResult();
             }
             return new CutoverProcessResultV2
             {
@@ -2397,7 +2832,7 @@ public static class CutoverProcessMethodsV2
         }
         catch
         {
-            return AbortAsync(nativeProcess, job, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "process-error").GetAwaiter().GetResult();
+            return AbortAsync(nativeProcess, job, jobAssigned, cancellation, stdoutTask, stderrTask, stdinTask, exitTask, deadline, "process-error").GetAwaiter().GetResult();
         }
         finally
         {
@@ -2421,6 +2856,127 @@ public static class CutoverProcessMethodsV2
     }
 }
 
+function Read-CutoverNulDelimitedPaths {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][int]$MaxPaths
+    )
+
+    if ($Bytes.LongLength -gt $maxTrackedBytes) {
+        throw 'Git output exceeded its bounded aggregate size.'
+    }
+    $decoder = [System.Text.UTF8Encoding]::new($false, $true)
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    $start = 0
+    for ($index = 0; $index -lt $Bytes.Length; $index++) {
+        Assert-CutoverDeadline
+        if ($Bytes[$index] -ne 0) { continue }
+        if ($paths.Count -ge $MaxPaths) {
+            throw 'Git path count exceeded its bounded limit.'
+        }
+        $length = $index - $start
+        if ($length -le 0 -or $length -gt ($maxEnvironmentEntryChars * 4)) {
+            throw 'Git path entry exceeded its bounded length.'
+        }
+        try {
+            $path = $decoder.GetString($Bytes, $start, $length)
+        }
+        catch { throw 'git ls-files returned invalid UTF-8.' }
+        if ($path.Length -gt $maxEnvironmentEntryChars) {
+            throw 'Git path entry exceeded its bounded character length.'
+        }
+        $paths.Add($path)
+        $start = $index + 1
+    }
+    if ($start -ne $Bytes.Length) {
+        throw 'git ls-files output was not NUL terminated.'
+    }
+    return @($paths.ToArray())
+}
+
+function Read-CutoverUtf8Lines {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][int]$MaxLines
+    )
+
+    if ($Bytes.LongLength -gt $maxTrackedBytes) {
+        throw 'process text exceeded its bounded aggregate size.'
+    }
+    try {
+        $text = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($Bytes)
+    }
+    catch { throw 'process output was not valid UTF-8.' }
+    $reader = [System.IO.StringReader]::new($text)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            Assert-CutoverDeadline
+            if ($lines.Count -ge $MaxLines) {
+                throw 'process line count exceeded its bounded limit.'
+            }
+            if ($line.Length -gt $maxEnvironmentEntryChars) {
+                throw 'process line exceeded its bounded length.'
+            }
+            $lines.Add($line)
+        }
+    }
+    finally { $reader.Dispose() }
+    return @($lines.ToArray())
+}
+
+function Read-CutoverContractLines {
+    param([Parameter(Mandatory = $true)][string]$Source)
+
+    $reader = [System.IO.StringReader]::new($Source)
+    $builder = [System.Text.StringBuilder]::new()
+    $openingCount = 0
+    $inside = $false
+    $closed = $false
+    $lineCount = 0
+    $bodyLineCount = 0
+    $bodyBytes = [int64]0
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            Assert-CutoverDeadline
+            $lineCount++
+            if ($lineCount -gt $maxLedgerLines) {
+                throw 'ledger line count exceeded its bounded limit.'
+            }
+            if (-not $inside -and -not $closed -and $line -eq '```json cutover-contract') {
+                $openingCount++
+                $inside = $true
+                continue
+            }
+            if (-not $inside -and $line -eq '```json cutover-contract') {
+                $openingCount++
+                continue
+            }
+            if ($inside -and $line -eq '```') {
+                $inside = $false
+                $closed = $true
+                continue
+            }
+            if (-not $inside) { continue }
+            $bodyLineCount++
+            $nextBytes = [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
+            if ($bodyBytes -gt ($maxLedgerBytes - $nextBytes)) {
+                throw 'ledger contract body exceeded its bounded aggregate size.'
+            }
+            $bodyBytes += $nextBytes
+            $null = $builder.AppendLine($line)
+        }
+    }
+    finally { $reader.Dispose() }
+    if ($openingCount -ne 1) {
+        throw "Ledger must contain exactly one ```json cutover-contract block."
+    }
+    if ($inside -or -not $closed -or $bodyLineCount -eq 0) {
+        throw 'Ledger contract JSON block is missing its closing fence or is empty.'
+    }
+    return $builder.ToString().TrimEnd([char[]]@("`r", "`n"))
+}
+
 function Invoke-CutoverProcessLines {
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
@@ -2430,10 +2986,10 @@ function Invoke-CutoverProcessLines {
     )
 
     Initialize-CutoverProcessMethodsV2
-    $resolvedExecutable = $FileName
+    $resolvedExecutable = Resolve-CutoverExecutable -FileName $FileName
     $environment = Get-CutoverProcessEnvironment -ResolvedExecutable $resolvedExecutable
     $result = [CutoverProcessMethodsV2]::Run(
-        $FileName,
+        $resolvedExecutable,
         $Arguments,
         $InputBytes,
         [int]$MaxBytes,
@@ -2543,9 +3099,9 @@ function Write-CutoverAtomicUtf8 {
     }
     $full = Assert-CutoverConfinedPath -LiteralPath $LiteralPath -AncestorPath $EvidenceRoot -AllowMissingLeaf
     $parent = Split-Path -Parent $full
-    $parentHandle = Open-CutoverConfinedFile -LiteralPath $parent -AllowDirectory
+    $parentHandle = Open-CutoverConfinedFile -LiteralPath $parent -AllowDirectory -AllowDirectoryWrite
     $tempPath = Join-Path $parent ('.pending-{0}.tmp' -f ([guid]::NewGuid().ToString('N')))
-    $backupPath = $null
+    $tempHandle = $null
     $encoding = [System.Text.UTF8Encoding]::new($false)
     $bytes = $encoding.GetBytes($Text)
     try {
@@ -2570,66 +3126,36 @@ function Write-CutoverAtomicUtf8 {
                 throw 'audit deadline exceeded while flushing a report.'
             }
         }
-        finally {
-            $temp.Dispose()
-        }
+        finally { }
 
         $parentAfter = Get-CutoverHandleIdentity -Stream $parentHandle.stream
         if (-not (Compare-CutoverIdentity -Before $parentHandle.identity -After $parentAfter)) {
             throw 'report parent changed before atomic replacement.'
         }
-        $tempCheck = Open-CutoverConfinedFile -LiteralPath $tempPath
-        $tempIdentity = $tempCheck.identity
-        $tempCheck.stream.Dispose()
         Assert-CutoverDeadline
-        $destination = $null
-        $exists = $false
-        try {
-            $destination = Open-CutoverConfinedFile -LiteralPath $full
-            $exists = $true
+        if (-not (Test-CutoverCurrentReportPath -LiteralPath $full -EvidenceRoot $EvidenceRoot)) {
+            throw "Refusing to overwrite a non-current report path: '$full'."
         }
-        catch {
-            $exists = $false
+        # Mutation is relative to the already verified, no-follow parent
+        # handle. A concurrent pathname/junction swap cannot redirect this
+        # rename outside the directory represented by that handle.
+        Rename-CutoverFileRelative `
+            -FileStream $tempHandle.stream `
+            -ParentStream $parentHandle.stream `
+            -LeafName ([System.IO.Path]::GetFileName($full)) `
+            -ReplaceExisting
+        $finalIdentity = Get-CutoverHandleIdentity -Stream $tempHandle.stream
+        if (-not (Test-CutoverPathEqualsOrBeneath -Path $finalIdentity.finalPath -Ancestor $EvidenceRoot) -or
+            -not [string]::Equals($finalIdentity.finalPath, $full, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'report replacement handle escaped its verified destination.'
         }
-        if ($exists) {
-            $destinationIdentity = $destination.identity
-            $destination.stream.Dispose()
-            if (-not (Test-CutoverCurrentReportPath -LiteralPath $full -EvidenceRoot $EvidenceRoot)) {
-                throw "Refusing to overwrite a non-current report path: '$full'."
-            }
-            $destinationCheck = Open-CutoverConfinedFile -LiteralPath $full
-            $destinationCheck.stream.Dispose()
-            if (-not (Compare-CutoverIdentity -Before $destinationIdentity -After $destinationCheck.identity)) {
-                throw "report destination changed before atomic replacement: '$full'."
-            }
-            $backupPath = Join-Path $parent ('.backup-{0}.tmp' -f ([guid]::NewGuid().ToString('N')))
-            Assert-CutoverConfinedPath -LiteralPath $backupPath -AncestorPath $EvidenceRoot -AllowMissingLeaf | Out-Null
-            Assert-CutoverDeadline
-            [System.IO.File]::Replace($tempPath, $full, $backupPath, $true)
-            if ([System.IO.File]::Exists($backupPath)) { [System.IO.File]::Delete($backupPath) }
-        }
-        else {
-            Assert-CutoverDeadline
-            [System.IO.File]::Move($tempPath, $full)
-        }
-        Assert-CutoverPathChain -LiteralPath $full | Out-Null
-        $final = Open-CutoverConfinedFile -LiteralPath $full
-        $final.stream.Dispose()
     }
     catch {
-        try {
-            Assert-CutoverPathChain -LiteralPath $tempPath -AllowMissingLeaf | Out-Null
-            if ([System.IO.File]::Exists($tempPath)) { [System.IO.File]::Delete($tempPath) }
-        } catch { }
-        if ($null -ne $backupPath) {
-            try {
-                Assert-CutoverPathChain -LiteralPath $backupPath -AllowMissingLeaf | Out-Null
-                if ([System.IO.File]::Exists($backupPath)) { [System.IO.File]::Delete($backupPath) }
-            } catch { }
-        }
+        if ($null -ne $tempHandle) { Remove-CutoverFileByHandle -FileStream $tempHandle.stream }
         throw
     }
     finally {
+        if ($null -ne $tempHandle) { $tempHandle.stream.Dispose() }
         $parentHandle.stream.Dispose()
     }
 }
@@ -2682,6 +3208,55 @@ function New-BoundedAuditReport {
         })
 }
 
+function Assert-CutoverReportBounds {
+    param([Parameter(Mandatory = $true)][object]$Report)
+
+    $stringState = [pscustomobject]@{ bytes = [int64]0; count = 0 }
+    $addString = {
+        param([AllowEmptyString()][string]$Value)
+        Assert-CutoverDeadline
+        if ($null -eq $Value) { return }
+        $stringState.count++
+        if ($stringState.count -gt $maxReportStrings -or $Value.Length -gt $maxEnvironmentEntryChars) {
+            throw 'report string shape exceeded its bounded limit.'
+        }
+        $bytes = [System.Text.Encoding]::UTF8.GetByteCount($Value)
+        if ($stringState.bytes -gt ($maxReportJsonBytes - $bytes)) {
+            throw 'report aggregate string shape exceeded its bounded limit.'
+        }
+        $stringState.bytes += $bytes
+    }
+    & $addString ([string]$Report.contractId)
+    & $addString ([string]$Report.mode)
+    foreach ($value in @($Report.contractErrors) + @($Report.blockers) + @($Report.entrypointFindings) + @($Report.protectedFilesSkipped)) {
+        & $addString ([string]$value)
+    }
+    $nodes = @($Report.prerequisiteNodes)
+    $rows = @($Report.rows)
+    if ($nodes.Count -gt $maxNodes -or $rows.Count -gt $maxRows) {
+        throw 'report collection shape exceeded its bounded count.'
+    }
+    foreach ($node in $nodes) {
+        & $addString ([string]$node.id)
+        & $addString ([string]$node.kind)
+        & $addString ([string]$node.status)
+        foreach ($dependency in @($node.dependsOn)) { & $addString ([string]$dependency) }
+        foreach ($artifact in @($node.evidence)) { & $addString ([string]$artifact.path) }
+    }
+    foreach ($row in $rows) {
+        & $addString ([string]$row.id)
+        & $addString ([string]$row.status)
+        & $addString ([string]$row.legacy.path)
+        & $addString ([string]$row.replacementOwner.path)
+        foreach ($prerequisite in @($row.prerequisites)) { & $addString ([string]$prerequisite) }
+        foreach ($kind in @('path', 'symbol', 'token')) {
+            foreach ($reference in @($row.references[$kind])) { & $addString ([string]$reference) }
+        }
+        foreach ($artifact in @($row.evidence.artifacts)) { & $addString ([string]$artifact.path) }
+        foreach ($blocker in @($row.blockers)) { & $addString ([string]$blocker) }
+    }
+}
+
 function Write-AuditReports {
     param(
         [Parameter(Mandatory = $true)][object]$Report,
@@ -2691,11 +3266,13 @@ function Write-AuditReports {
         [Parameter(Mandatory = $true)][ref]$ContractStatus
     )
 
+    Assert-CutoverReportBounds -Report $Report
     $json = $Report | ConvertTo-Json -Depth 50
     $jsonBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($json)
     if ($jsonBytes -gt $maxReportJsonBytes) {
         $Report = New-BoundedAuditReport -Report $Report
         $ContractStatus.Value = 'HOLD'
+        Assert-CutoverReportBounds -Report $Report
         $json = $Report | ConvertTo-Json -Depth 50
     }
 
@@ -2734,9 +3311,11 @@ function Write-AuditReports {
     if ([System.Text.UTF8Encoding]::new($false).GetByteCount($human) -gt $maxReportHumanBytes) {
         $Report.contractStatus = 'HOLD'
         $ContractStatus.Value = 'HOLD'
+        Assert-CutoverReportBounds -Report $Report
         $json = $Report | ConvertTo-Json -Depth 50
         if ([System.Text.UTF8Encoding]::new($false).GetByteCount($json) -gt $maxReportJsonBytes) {
             $Report = New-BoundedAuditReport -Report $Report
+            Assert-CutoverReportBounds -Report $Report
             $json = $Report | ConvertTo-Json -Depth 50
         }
         $human = "Phase 11.1 cutover audit`nstatus: HOLD`n- $safetyDiagnostic`n"
