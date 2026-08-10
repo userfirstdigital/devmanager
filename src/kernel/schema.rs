@@ -451,9 +451,52 @@ CREATE TABLE prompt_lineage_quarantine_ledger (
   command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
   quarantined_at_ms INTEGER NOT NULL
 );\n\
+-- This immutable copy binds every initial quarantine row to the migration
+-- boundary. It detects partial/raw corruption and trigger-bypass recreation;
+-- it is not a cryptographic trust root against an attacker who rewrites every
+-- database fact without an external authority.
+CREATE TABLE prompt_lineage_quarantine_creation (
+  quarantine_id INTEGER PRIMARY KEY,
+  source_kind TEXT NOT NULL,
+  command_id BLOB NOT NULL CHECK(length(command_id) = 16),
+  event_id BLOB CHECK(event_id IS NULL OR length(event_id) = 16),
+  reason TEXT NOT NULL,
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
+  quarantined_at_ms INTEGER NOT NULL
+);\n\
+-- A repair ledger row is only authoritative after the quarantine row was
+-- actually deleted through the audited transition below. Canonical receipt /
+-- event proof is still checked by PromptStore::open.
+CREATE TABLE prompt_lineage_quarantine_repair_audit (
+  repair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  quarantine_id INTEGER NOT NULL,
+  source_kind TEXT NOT NULL,
+  command_id BLOB NOT NULL CHECK(length(command_id) = 16),
+  event_id BLOB CHECK(event_id IS NULL OR length(event_id) = 16),
+  reason TEXT NOT NULL,
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
+  quarantined_at_ms INTEGER NOT NULL,
+  origin TEXT NOT NULL CHECK(origin = 'quarantine_delete'),
+  UNIQUE(quarantine_id)
+);\n\
 CREATE TABLE prompt_lineage_migration_state (
   singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+  creation_token BLOB NOT NULL CHECK(length(creation_token) = 32),
   blocked INTEGER NOT NULL CHECK(blocked IN (0, 1))
+);\n\
+-- Counts and the state token are an internal creation commitment. The
+-- immutable row copy above supplies canonical provenance; this singleton
+-- catches deletion/recreation of either authority table even when triggers
+-- are bypassed. It intentionally does not claim cryptographic tamper proofing
+-- without an external trust root.
+CREATE TABLE prompt_lineage_migration_commitment (
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+  migration_version INTEGER NOT NULL CHECK(migration_version = 9),
+  initial_quarantine_count INTEGER NOT NULL CHECK(initial_quarantine_count >= 0),
+  initial_ledger_count INTEGER NOT NULL CHECK(initial_ledger_count >= 0),
+  initial_creation_count INTEGER NOT NULL CHECK(initial_creation_count >= 0),
+  initial_blocked INTEGER NOT NULL CHECK(initial_blocked IN (0, 1)),
+  state_creation_token BLOB NOT NULL CHECK(length(state_creation_token) = 32)
 );\n\
 INSERT INTO prompt_lineage_quarantine(
   source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
@@ -500,10 +543,30 @@ INSERT INTO prompt_lineage_quarantine_ledger(
 SELECT quarantine_id, source_kind, command_id, event_id, reason,
        command_sha256, quarantined_at_ms
 FROM prompt_lineage_quarantine;\n\
-INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
-VALUES (1, EXISTS(
+INSERT INTO prompt_lineage_quarantine_creation(
+  quarantine_id, source_kind, command_id, event_id, reason,
+  command_sha256, quarantined_at_ms
+)
+SELECT quarantine_id, source_kind, command_id, event_id, reason,
+       command_sha256, quarantined_at_ms
+FROM prompt_lineage_quarantine;\n\
+INSERT INTO prompt_lineage_migration_state(singleton_key, creation_token, blocked)
+VALUES (1, randomblob(32), EXISTS(
   SELECT 1 FROM prompt_lineage_quarantine
 ));\n\
+INSERT INTO prompt_lineage_migration_commitment(
+  singleton_key, migration_version, initial_quarantine_count,
+  initial_ledger_count, initial_creation_count, initial_blocked,
+  state_creation_token
+)
+SELECT 1, 9,
+       (SELECT COUNT(*) FROM prompt_lineage_quarantine),
+       (SELECT COUNT(*) FROM prompt_lineage_quarantine_ledger),
+       (SELECT COUNT(*) FROM prompt_lineage_quarantine_creation),
+       state.blocked,
+       state.creation_token
+FROM prompt_lineage_migration_state AS state
+WHERE state.singleton_key = 1;\n\
 DROP TRIGGER prompt_command_receipts_immutable_update;
 CREATE TRIGGER prompt_command_receipts_immutable_update
   BEFORE UPDATE ON prompt_command_receipts
@@ -563,6 +626,85 @@ CREATE TRIGGER prompt_chain_command_receipts_command_payload_required_update
   WHEN NEW.command_payload IS NULL OR length(NEW.command_payload) = 0\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt chain command receipt payload is required');
+END;\n\
+-- Keep the durable wire budget enforced by SQLite as well as Rust. These
+-- triggers are added by V9 to existing V8 databases before any store read can
+-- materialize an unbounded command, receipt, or event blob.
+CREATE TRIGGER prompt_command_receipts_command_payload_size_insert
+  BEFORE INSERT ON prompt_command_receipts
+  WHEN NEW.command_payload IS NOT NULL
+    AND length(CAST(NEW.command_payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt command payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_command_payload_size_update
+  BEFORE UPDATE OF command_payload ON prompt_command_receipts
+  WHEN NEW.command_payload IS NOT NULL
+    AND length(CAST(NEW.command_payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt command payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_command_payload_size_insert
+  BEFORE INSERT ON prompt_chain_command_receipts
+  WHEN NEW.command_payload IS NOT NULL
+    AND length(CAST(NEW.command_payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt command payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_command_payload_size_update
+  BEFORE UPDATE OF command_payload ON prompt_chain_command_receipts
+  WHEN NEW.command_payload IS NOT NULL
+    AND length(CAST(NEW.command_payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt command payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_receipt_size_insert
+  BEFORE INSERT ON prompt_command_receipts
+  WHEN length(CAST(NEW.receipt AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_receipt_size_update
+  BEFORE UPDATE OF receipt ON prompt_command_receipts
+  WHEN length(CAST(NEW.receipt AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_receipt_size_insert
+  BEFORE INSERT ON prompt_chain_command_receipts
+  WHEN length(CAST(NEW.receipt AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_receipt_size_update
+  BEFORE UPDATE OF receipt ON prompt_chain_command_receipts
+  WHEN length(CAST(NEW.receipt AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_events_payload_size_insert
+  BEFORE INSERT ON prompt_events
+  WHEN length(CAST(NEW.payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt event payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_events_payload_size_update
+  BEFORE UPDATE OF payload ON prompt_events
+  WHEN length(CAST(NEW.payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt event payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_events_payload_size_insert
+  BEFORE INSERT ON prompt_chain_events
+  WHEN length(CAST(NEW.payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain event payload exceeds durable maximum');
+END;\n\
+CREATE TRIGGER prompt_chain_events_payload_size_update
+  BEFORE UPDATE OF payload ON prompt_chain_events
+  WHEN length(CAST(NEW.payload AS BLOB)) > 524288\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain event payload exceeds durable maximum');
 END;\n\
 CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair
   BEFORE UPDATE OF blocked ON prompt_lineage_migration_state
@@ -654,6 +796,11 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage requires ledger-backed exact repair before unblock');
 END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_append_only_insert
+  BEFORE INSERT ON prompt_lineage_migration_state
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration state is migration-owned');
+END;\n\
 CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair_insert
   BEFORE INSERT ON prompt_lineage_migration_state
   WHEN NEW.blocked = 0 AND (
@@ -698,6 +845,7 @@ CREATE TRIGGER prompt_lineage_migration_state_immutable_update
   WHEN NOT (
     OLD.singleton_key = 1
     AND NEW.singleton_key = 1
+    AND NEW.creation_token = OLD.creation_token
     AND (
       OLD.blocked = NEW.blocked
       OR (
@@ -733,6 +881,36 @@ CREATE TRIGGER prompt_lineage_migration_state_immutable_update
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage migration state requires exact repair');
 END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_creation_append_only_insert
+  BEFORE INSERT ON prompt_lineage_quarantine_creation
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine creation is migration-owned');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_creation_immutable_update
+  BEFORE UPDATE ON prompt_lineage_quarantine_creation
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine creation is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_creation_immutable_delete
+  BEFORE DELETE ON prompt_lineage_quarantine_creation
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine creation is append-only');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_commitment_append_only_insert
+  BEFORE INSERT ON prompt_lineage_migration_commitment
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration commitment is migration-owned');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_commitment_immutable_update
+  BEFORE UPDATE ON prompt_lineage_migration_commitment
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration commitment is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_commitment_immutable_delete
+  BEFORE DELETE ON prompt_lineage_migration_commitment
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration commitment is append-only');
+END;\n\
 CREATE TRIGGER prompt_lineage_quarantine_append_only_insert
   BEFORE INSERT ON prompt_lineage_quarantine
 BEGIN
@@ -758,6 +936,33 @@ CREATE TRIGGER prompt_lineage_quarantine_immutable_delete
   )\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage quarantine deletion lacks repair provenance');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_repair_audit_after_delete
+  AFTER DELETE ON prompt_lineage_quarantine
+BEGIN
+  INSERT INTO prompt_lineage_quarantine_repair_audit(
+    quarantine_id, source_kind, command_id, event_id, reason,
+    command_sha256, quarantined_at_ms, origin
+  ) VALUES (
+    OLD.quarantine_id, OLD.source_kind, OLD.command_id, OLD.event_id, OLD.reason,
+    OLD.command_sha256, OLD.quarantined_at_ms, 'quarantine_delete'
+  );
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_repair_audit_append_only_insert
+  BEFORE INSERT ON prompt_lineage_quarantine_repair_audit
+  WHEN NEW.origin <> 'quarantine_delete'
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine repair audit is migration-owned');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_repair_audit_immutable_update
+  BEFORE UPDATE ON prompt_lineage_quarantine_repair_audit
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine repair audit is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_repair_audit_immutable_delete
+  BEFORE DELETE ON prompt_lineage_quarantine_repair_audit
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine repair audit is append-only');
 END;\n\
 CREATE TRIGGER prompt_lineage_quarantine_ledger_immutable_insert
   BEFORE INSERT ON prompt_lineage_quarantine_ledger

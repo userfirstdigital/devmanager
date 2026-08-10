@@ -15,6 +15,10 @@ pub const MAX_PROMPT_VARIABLE_NAME_SCALARS: usize = 64;
 pub const MAX_PROMPT_CHAIN_TITLE_SCALARS: usize = MAX_PROMPT_TITLE_SCALARS;
 pub const MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS: usize = MAX_PROMPT_DESCRIPTION_SCALARS;
 pub const MAX_PROMPT_CHAIN_LINKS: usize = 2_000;
+/// Public codec budget. The durable SQLite journal intentionally uses the
+/// smaller 512 KiB bound; the codec/privacy union will enforce this contract
+/// when its separate branch is merged.
+pub const MAX_PROMPT_PUBLIC_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PROMPT_PAGE_SIZE: usize = 100;
 pub const MAX_PROMPT_PAGE_SIZE: usize = 1_000;
 pub const PROMPT_WIRE_SCHEMA_VERSION: u32 = 1;

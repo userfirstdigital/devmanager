@@ -8,9 +8,15 @@ use devmanager::prompts::{
     RenamePrompt, RenamePromptChain, RestorePrompt, RestorePromptChain, SetPromptTags,
     UpdatePromptChainLinkVersion, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS,
     MAX_PROMPT_CHAIN_LINKS, MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS,
-    MAX_PROMPT_TAGS, MAX_PROMPT_TAG_SCALARS, MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES,
-    MAX_PROMPT_VARIABLE_NAME_SCALARS,
+    MAX_PROMPT_PUBLIC_WIRE_BYTES, MAX_PROMPT_TAGS, MAX_PROMPT_TAG_SCALARS,
+    MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES, MAX_PROMPT_VARIABLE_NAME_SCALARS,
 };
+
+#[test]
+fn public_and_durable_wire_contracts_are_named_separately() {
+    assert_eq!(MAX_PROMPT_PUBLIC_WIRE_BYTES, 4 * 1024 * 1024);
+    assert_eq!(MAX_PROMPT_CHAIN_LINKS, 2_000);
+}
 
 #[test]
 fn prompt_ids_are_not_interchangeable() {

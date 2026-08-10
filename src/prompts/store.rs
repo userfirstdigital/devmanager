@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,12 @@ use super::model::{
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION: u32 = 2;
 const MAX_PROMPT_JOURNAL_ROWS: usize = 10_000;
-const MAX_PROMPT_WIRE_BYTES: usize = 512 * 1024;
+/// Maximum bytes retained in the durable prompt command/event journal.
+///
+/// The public codec contract intentionally has a larger 4 MiB budget; the
+/// codec union will make that boundary explicit when its privacy branch is
+/// merged. Durable SQLite rows remain bounded to 512 KiB here.
+const MAX_PROMPT_DURABLE_WIRE_BYTES: usize = 512 * 1024;
 const CURRENT_VERSION_LATEST_TRIGGER_SQL: &str =
     "CREATE TRIGGER saved_prompts_current_version_is_latest\n\
   BEFORE UPDATE OF current_version_id ON saved_prompts\n\
@@ -197,7 +202,11 @@ impl PromptStore {
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
-        let blocked: Option<i64> = conn
+        // Begin the validation snapshot before reading any state, quarantine,
+        // journal, payload, or projection rows. IMMEDIATE prevents a writer
+        // from changing the facts between a check and the lineage replay.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let blocked: Option<i64> = tx
             .query_row(
                 "SELECT blocked FROM prompt_lineage_migration_state
                  WHERE singleton_key = 1",
@@ -210,13 +219,16 @@ impl PromptStore {
                 "prompt lineage migration state is missing; exact repair is required".into(),
             ));
         };
-        validate_prompt_lineage_quarantine_ledger(&conn)?;
-        let quarantine_count: i64 = conn.query_row(
+        // Preflight all durable blobs before the quarantine repair proof can
+        // materialize any command payload from SQLite.
+        validate_prompt_wire_lengths(&tx)?;
+        validate_prompt_lineage_quarantine_ledger(&tx)?;
+        let quarantine_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM prompt_lineage_quarantine",
             [],
             |row| row.get(0),
         )?;
-        let missing_payload_count: i64 = conn.query_row(
+        let missing_payload_count: i64 = tx.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM prompt_command_receipts
                  WHERE command_payload IS NULL OR length(command_payload) = 0)
@@ -245,9 +257,8 @@ impl PromptStore {
                 "prompt lineage has unrepaired quarantine or missing command payloads".into(),
             ));
         }
-        validate_prompt_journal_bounds(&conn)?;
-        validate_prompt_command_payloads(&conn)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prompt_journal_bounds(&tx)?;
+        validate_prompt_command_payloads(&tx)?;
         validate_prompt_lineage(&tx)?;
         tx.rollback()?;
         Ok(Self { conn })
@@ -651,6 +662,7 @@ impl PromptStore {
                 "prompt journal exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
             )));
         }
+        validate_prompt_wire_lengths(&tx)?;
         validate_current_version_projection(&tx)?;
         validate_event_sequence_domain(&tx, "prompt_events")?;
         validate_event_sequence_domain(&tx, "prompt_chain_events")?;
@@ -671,6 +683,8 @@ impl PromptStore {
         let mut expected_sequence = 1i64;
         let mut event_version_ids =
             HashSet::with_capacity(prompt_event_count.min(MAX_PROMPT_JOURNAL_ROWS));
+        let mut prompt_version_cursors =
+            HashMap::with_capacity(prompt_event_count.min(MAX_PROMPT_JOURNAL_ROWS));
         while let Some((
             sequence,
             event_id,
@@ -706,7 +720,12 @@ impl PromptStore {
                 }
                 _ => {}
             }
-            validate_prompt_event_temporal_lineage(&tx, &event, receipt_version_id)?;
+            validate_prompt_event_temporal_lineage(
+                &tx,
+                &event,
+                receipt_version_id,
+                &mut prompt_version_cursors,
+            )?;
             apply_event(&tx, &event, occurred_at_ms)?;
             prompt_events_replayed = prompt_events_replayed.checked_add(1).ok_or_else(|| {
                 PromptStoreError::Corruption("prompt event count overflow".into())
@@ -825,8 +844,8 @@ fn validate_current_version_projection(tx: &Transaction<'_>) -> Result<(), Promp
     Ok(())
 }
 
-fn validate_prompt_command_payloads(conn: &Connection) -> Result<(), PromptStoreError> {
-    let mut statement = conn.prepare(
+fn validate_prompt_command_payloads(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    let mut statement = tx.prepare(
         "SELECT command_sha256, command_payload
          FROM prompt_command_receipts
          ORDER BY command_id ASC",
@@ -860,7 +879,7 @@ fn validate_prompt_command_payloads(conn: &Connection) -> Result<(), PromptStore
         }
     }
 
-    let mut statement = conn.prepare(
+    let mut statement = tx.prepare(
         "SELECT command_sha256, command_payload
          FROM prompt_chain_command_receipts
          ORDER BY command_id ASC",
@@ -891,7 +910,7 @@ fn validate_prompt_command_payloads(conn: &Connection) -> Result<(), PromptStore
     Ok(())
 }
 
-fn validate_prompt_journal_bounds(conn: &Connection) -> Result<(), PromptStoreError> {
+fn validate_prompt_journal_bounds(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
     let mut journal_rows = 0usize;
     for table in [
         "prompt_events",
@@ -900,7 +919,7 @@ fn validate_prompt_journal_bounds(conn: &Connection) -> Result<(), PromptStoreEr
         "prompt_chain_command_receipts",
         "prompt_versions",
     ] {
-        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })?;
         let count = usize::try_from(count)
@@ -917,10 +936,386 @@ fn validate_prompt_journal_bounds(conn: &Connection) -> Result<(), PromptStoreEr
     Ok(())
 }
 
+/// Check blob lengths in SQL before any receipt/event query can allocate a
+/// `Vec<u8>`. This is deliberately run inside the same IMMEDIATE snapshot as
+/// all later lineage checks; a trigger protects new writes while this catches
+/// oversized rows already present in a migrated database.
+fn validate_prompt_wire_lengths(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    for (table, column, kind) in [
+        (
+            "prompt_command_receipts",
+            "command_payload",
+            "prompt receipt command payload",
+        ),
+        (
+            "prompt_chain_command_receipts",
+            "command_payload",
+            "prompt chain receipt command payload",
+        ),
+        ("prompt_command_receipts", "receipt", "prompt receipt"),
+        (
+            "prompt_chain_command_receipts",
+            "receipt",
+            "prompt chain receipt",
+        ),
+        ("prompt_events", "payload", "prompt event"),
+        ("prompt_chain_events", "payload", "prompt chain event"),
+    ] {
+        let oversized: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {table}
+                 WHERE {column} IS NOT NULL
+                   AND length(CAST({column} AS BLOB)) > {MAX_PROMPT_DURABLE_WIRE_BYTES}"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if oversized < 0 {
+            return Err(PromptStoreError::Corruption(
+                "negative oversized prompt payload count".into(),
+            ));
+        }
+        if oversized > 0 {
+            return Err(PromptStoreError::Corruption(format!(
+                "{kind} payload exceeds maximum durable size of {MAX_PROMPT_DURABLE_WIRE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 type QuarantineLedgerRow = (i64, String, Vec<u8>, Option<Vec<u8>>, String, Vec<u8>, i64);
 
-fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), PromptStoreError> {
-    let ledger_count: i64 = conn.query_row(
+fn validate_prompt_lineage_repair_audit(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    let audit_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_lineage_quarantine_repair_audit",
+        [],
+        |row| row.get(0),
+    )?;
+    let audit_count = usize::try_from(audit_count)
+        .map_err(|_| PromptStoreError::Corruption("negative lineage repair audit count".into()))?;
+    if audit_count > MAX_PROMPT_JOURNAL_ROWS {
+        return Err(PromptStoreError::Corruption(format!(
+            "prompt lineage repair audit exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
+        )));
+    }
+    let mut statement = tx.prepare(
+        "SELECT repair_id, quarantine_id, source_kind, command_id, event_id,
+                reason, command_sha256, quarantined_at_ms, origin
+         FROM prompt_lineage_quarantine_repair_audit
+         ORDER BY repair_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    for (index, row) in rows.enumerate() {
+        let (
+            repair_id,
+            quarantine_id,
+            source_kind,
+            command_id,
+            event_id,
+            reason,
+            command_sha256,
+            quarantined_at_ms,
+            origin,
+        ) = row?;
+        let expected_repair_id = i64::try_from(index + 1)
+            .map_err(|_| PromptStoreError::Corruption("lineage repair audit overflow".into()))?;
+        if repair_id != expected_repair_id
+            || origin != "quarantine_delete"
+            || quarantine_id <= 0
+            || command_id.len() != 16
+            || event_id.as_ref().is_some_and(|id| id.len() != 16)
+            || command_sha256.len() != 32
+        {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage repair audit provenance is invalid".into(),
+            ));
+        }
+        let ledger = (
+            quarantine_id,
+            source_kind,
+            command_id,
+            event_id,
+            reason,
+            command_sha256,
+            quarantined_at_ms,
+        );
+        let current_quarantine: Option<i64> = tx
+            .query_row(
+                "SELECT quarantine_id FROM prompt_lineage_quarantine
+                 WHERE quarantine_id = ?1",
+                [quarantine_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_quarantine.is_some() {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage repair audit records a non-deleted quarantine row".into(),
+            ));
+        }
+        let current_ledger: Option<QuarantineLedgerRow> = tx
+            .query_row(
+                "SELECT quarantine_id, source_kind, command_id, event_id, reason,
+                        command_sha256, quarantined_at_ms
+                 FROM prompt_lineage_quarantine_ledger
+                 WHERE quarantine_id = ?1",
+                [quarantine_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if current_ledger.as_ref() != Some(&ledger) || !quarantine_repair_proof_exists(tx, &ledger)?
+        {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage repair audit lacks canonical receipt/event proof".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_repair_audit_exists(
+    tx: &Transaction<'_>,
+    ledger: &QuarantineLedgerRow,
+) -> Result<bool, PromptStoreError> {
+    let (
+        quarantine_id,
+        source_kind,
+        command_id,
+        event_id,
+        reason,
+        command_sha256,
+        quarantined_at_ms,
+    ) = ledger;
+    let origin: Option<String> = tx
+        .query_row(
+            "SELECT origin FROM prompt_lineage_quarantine_repair_audit
+             WHERE quarantine_id = ?1
+               AND source_kind = ?2
+               AND command_id = ?3
+               AND (event_id IS ?4)
+               AND reason = ?5
+               AND command_sha256 = ?6
+               AND quarantined_at_ms = ?7",
+            rusqlite::params![
+                quarantine_id,
+                source_kind,
+                command_id,
+                event_id,
+                reason,
+                command_sha256,
+                quarantined_at_ms,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(origin.as_deref() == Some("quarantine_delete"))
+}
+
+fn validate_prompt_lineage_creation_commitment(
+    tx: &Transaction<'_>,
+) -> Result<(), PromptStoreError> {
+    let commitment: Option<(i64, i64, i64, i64, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT migration_version, initial_quarantine_count,
+                    initial_ledger_count, initial_creation_count, initial_blocked,
+                    state_creation_token
+             FROM prompt_lineage_migration_commitment
+             WHERE singleton_key = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        migration_version,
+        initial_quarantine_count,
+        initial_ledger_count,
+        initial_creation_count,
+        initial_blocked,
+        committed_token,
+    )) = commitment
+    else {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage migration creation commitment is missing".into(),
+        ));
+    };
+    if migration_version != 9 || !(0..=1).contains(&initial_blocked) || committed_token.len() != 32
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage migration creation commitment is invalid".into(),
+        ));
+    }
+    let initial_quarantine_count = usize::try_from(initial_quarantine_count)
+        .map_err(|_| PromptStoreError::Corruption("negative initial quarantine count".into()))?;
+    let initial_ledger_count = usize::try_from(initial_ledger_count)
+        .map_err(|_| PromptStoreError::Corruption("negative initial ledger count".into()))?;
+    let initial_creation_count = usize::try_from(initial_creation_count).map_err(|_| {
+        PromptStoreError::Corruption("negative initial quarantine creation count".into())
+    })?;
+    if initial_quarantine_count > MAX_PROMPT_JOURNAL_ROWS
+        || initial_ledger_count > MAX_PROMPT_JOURNAL_ROWS
+        || initial_creation_count > MAX_PROMPT_JOURNAL_ROWS
+        || initial_quarantine_count != initial_ledger_count
+        || initial_ledger_count != initial_creation_count
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage migration creation counts are invalid".into(),
+        ));
+    }
+
+    let state: Option<(Vec<u8>, i64)> = tx
+        .query_row(
+            "SELECT creation_token, blocked
+             FROM prompt_lineage_migration_state
+             WHERE singleton_key = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((state_token, state_blocked)) = state else {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage migration state is missing its creation commitment".into(),
+        ));
+    };
+    if state_token.len() != 32
+        || state_token != committed_token
+        || !(0..=1).contains(&state_blocked)
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage migration state creation commitment is invalid".into(),
+        ));
+    }
+
+    let current_quarantine_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_lineage_quarantine",
+        [],
+        |row| row.get(0),
+    )?;
+    let current_quarantine_count = usize::try_from(current_quarantine_count)
+        .map_err(|_| PromptStoreError::Corruption("negative quarantine count".into()))?;
+    if current_quarantine_count > MAX_PROMPT_JOURNAL_ROWS {
+        return Err(PromptStoreError::Corruption(format!(
+            "prompt lineage quarantine exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
+        )));
+    }
+
+    let current_ledger_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_lineage_quarantine_ledger",
+        [],
+        |row| row.get(0),
+    )?;
+    let current_ledger_count = usize::try_from(current_ledger_count)
+        .map_err(|_| PromptStoreError::Corruption("negative lineage ledger count".into()))?;
+    if current_ledger_count < initial_ledger_count || current_ledger_count > MAX_PROMPT_JOURNAL_ROWS
+    {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage ledger count disagrees with its creation commitment".into(),
+        ));
+    }
+    let current_creation_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_lineage_quarantine_creation",
+        [],
+        |row| row.get(0),
+    )?;
+    let current_creation_count = usize::try_from(current_creation_count)
+        .map_err(|_| PromptStoreError::Corruption("negative quarantine creation count".into()))?;
+    if current_creation_count != initial_creation_count {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage quarantine creation ledger was deleted or recreated".into(),
+        ));
+    }
+
+    let mut creation_statement = tx.prepare(
+        "SELECT quarantine_id, source_kind, command_id, event_id, reason,
+                command_sha256, quarantined_at_ms
+         FROM prompt_lineage_quarantine_creation
+         ORDER BY quarantine_id",
+    )?;
+    let creation_rows =
+        creation_statement.query_map([], |row| -> rusqlite::Result<QuarantineLedgerRow> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?;
+    let mut creation_rows_vec = Vec::with_capacity(current_creation_count);
+    for row in creation_rows {
+        creation_rows_vec.push(row?);
+    }
+    let mut ledger_statement = tx.prepare(
+        "SELECT quarantine_id, source_kind, command_id, event_id, reason,
+                command_sha256, quarantined_at_ms
+         FROM prompt_lineage_quarantine_ledger
+         ORDER BY quarantine_id
+         LIMIT ?1",
+    )?;
+    let ledger_rows = ledger_statement.query_map(
+        [i64::try_from(initial_ledger_count).map_err(|_| {
+            PromptStoreError::Corruption("initial ledger count is out of range".into())
+        })?],
+        |row| -> rusqlite::Result<QuarantineLedgerRow> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    let mut ledger_rows_vec = Vec::with_capacity(initial_ledger_count);
+    for row in ledger_rows {
+        ledger_rows_vec.push(row?);
+    }
+    if creation_rows_vec != ledger_rows_vec {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage ledger creation provenance was deleted, replaced, or forged".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prompt_lineage_quarantine_ledger(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    validate_prompt_lineage_repair_audit(tx)?;
+    validate_prompt_lineage_creation_commitment(tx)?;
+    let ledger_count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM prompt_lineage_quarantine_ledger",
         [],
         |row| row.get(0),
@@ -933,7 +1328,7 @@ fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), Pr
         )));
     }
 
-    let mut statement = conn.prepare(
+    let mut statement = tx.prepare(
         "SELECT quarantine_id, source_kind, command_id, event_id, reason,
                 command_sha256, quarantined_at_ms
          FROM prompt_lineage_quarantine_ledger
@@ -950,9 +1345,16 @@ fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), Pr
             row.get(6)?,
         ))
     })?;
-    for row in rows {
+    for (index, row) in rows.enumerate() {
         let ledger: QuarantineLedgerRow = row?;
-        let current: Option<QuarantineLedgerRow> = conn
+        let expected_id = i64::try_from(index + 1)
+            .map_err(|_| PromptStoreError::Corruption("lineage ledger sequence overflow".into()))?;
+        if ledger.0 != expected_id {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage ledger ids are not a contiguous migration sequence".into(),
+            ));
+        }
+        let current: Option<QuarantineLedgerRow> = tx
             .query_row(
                 "SELECT quarantine_id, source_kind, command_id, event_id, reason,
                         command_sha256, quarantined_at_ms
@@ -979,7 +1381,8 @@ fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), Pr
                 ));
             }
             Some(_) => {}
-            None if quarantine_repair_proof_exists(conn, &ledger)? => {}
+            None if quarantine_repair_audit_exists(tx, &ledger)?
+                && quarantine_repair_proof_exists(tx, &ledger)? => {}
             None => {
                 return Err(PromptStoreError::Corruption(
                     "prompt lineage quarantine deletion lacks canonical repair proof".into(),
@@ -988,7 +1391,7 @@ fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), Pr
         }
     }
 
-    let unknown_quarantine: Option<i64> = conn
+    let unknown_quarantine: Option<i64> = tx
         .query_row(
             "SELECT quarantine.quarantine_id
              FROM prompt_lineage_quarantine AS quarantine
@@ -1009,7 +1412,7 @@ fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), Pr
 }
 
 fn quarantine_repair_proof_exists(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     ledger: &QuarantineLedgerRow,
 ) -> Result<bool, PromptStoreError> {
     let (quarantine_id, source_kind, command_id, event_id, _reason, command_sha256, _at) = ledger;
@@ -1019,7 +1422,7 @@ fn quarantine_repair_proof_exists(
     let hash_is_unknown = command_sha256.iter().all(|byte| *byte == 0);
     match source_kind.as_str() {
         "prompt_receipt" if event_id.is_none() => {
-            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
                     "SELECT command_sha256, command_payload
                      FROM prompt_command_receipts WHERE command_id = ?1",
@@ -1035,7 +1438,7 @@ fn quarantine_repair_proof_exists(
             }))
         }
         "prompt_chain_receipt" if event_id.is_none() => {
-            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
                     "SELECT command_sha256, command_payload
                      FROM prompt_chain_command_receipts WHERE command_id = ?1",
@@ -1054,7 +1457,7 @@ fn quarantine_repair_proof_exists(
             let Some(event_id) = event_id.as_deref() else {
                 return Ok(false);
             };
-            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = conn
+            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
                     "SELECT event.command_id, receipt.command_sha256, receipt.command_payload
                      FROM prompt_events AS event
@@ -1077,7 +1480,7 @@ fn quarantine_repair_proof_exists(
             let Some(event_id) = event_id.as_deref() else {
                 return Ok(false);
             };
-            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = conn
+            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
                     "SELECT event.command_id, receipt.command_sha256, receipt.command_payload
                      FROM prompt_chain_events AS event
@@ -1134,6 +1537,7 @@ fn validate_prompt_lineage(tx: &Transaction<'_>) -> Result<(), PromptStoreError>
     let mut last_sequence = 0_i64;
     let mut expected_sequence = 1_i64;
     let mut event_version_ids = HashSet::new();
+    let mut prompt_version_cursors = HashMap::new();
     while let Some((
         sequence,
         event_id,
@@ -1169,7 +1573,12 @@ fn validate_prompt_lineage(tx: &Transaction<'_>) -> Result<(), PromptStoreError>
             }
             _ => {}
         }
-        validate_prompt_event_temporal_lineage(tx, &event, receipt_version_id)?;
+        validate_prompt_event_temporal_lineage(
+            tx,
+            &event,
+            receipt_version_id,
+            &mut prompt_version_cursors,
+        )?;
     }
     validate_prompt_version_event_coverage(tx, &event_version_ids)?;
 
@@ -1599,9 +2008,9 @@ fn validate_sql_tags(tags: &[String]) -> Result<(), PromptStoreError> {
 }
 
 fn validate_wire_size(kind: &str, payload: &[u8]) -> Result<(), PromptStoreError> {
-    if payload.len() > MAX_PROMPT_WIRE_BYTES {
+    if payload.len() > MAX_PROMPT_DURABLE_WIRE_BYTES {
         return Err(PromptStoreError::Corruption(format!(
-            "{kind} payload exceeds maximum of {MAX_PROMPT_WIRE_BYTES} bytes"
+            "{kind} payload exceeds maximum durable size of {MAX_PROMPT_DURABLE_WIRE_BYTES} bytes"
         )));
     }
     Ok(())
@@ -3825,27 +4234,68 @@ fn validate_prompt_event_temporal_lineage(
     tx: &Transaction<'_>,
     event: &PromptEvent,
     receipt_version_id: PromptVersionId,
+    prompt_version_cursors: &mut HashMap<PromptId, PromptVersionId>,
 ) -> Result<(), PromptStoreError> {
     match event {
-        PromptEvent::PromptCreated { version, .. }
-        | PromptEvent::PromptVersionCreated { version, .. }
-            if version.id != receipt_version_id =>
-        {
-            return Err(PromptStoreError::Corruption(
-                "prompt event version receipt lineage is invalid".into(),
-            ));
+        PromptEvent::PromptCreated { prompt, version } => {
+            if version.id != receipt_version_id
+                || version.prompt_id != prompt.id
+                || prompt_version_cursors
+                    .insert(prompt.id, version.id)
+                    .is_some()
+            {
+                return Err(PromptStoreError::Corruption(
+                    "prompt event version receipt lineage is invalid".into(),
+                ));
+            }
         }
-        PromptEvent::PromptCreated { .. } | PromptEvent::PromptVersionCreated { .. } => {}
+        PromptEvent::PromptVersionCreated {
+            prompt_id, version, ..
+        } => {
+            if version.id != receipt_version_id || version.prompt_id != *prompt_id {
+                return Err(PromptStoreError::Corruption(
+                    "prompt event version receipt lineage is invalid".into(),
+                ));
+            }
+            let Some(previous_version_id) = prompt_version_cursors.get(prompt_id).copied() else {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version event has no replay-time predecessor".into(),
+                ));
+            };
+            let Some(previous_version_number) = version.version.checked_sub(1) else {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version event sequence is invalid".into(),
+                ));
+            };
+            let durable_previous_id: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT prompt_version_id
+                     FROM prompt_versions
+                     WHERE prompt_id = ?1 AND version = ?2",
+                    rusqlite::params![
+                        prompt_id.as_bytes().as_slice(),
+                        i64::from(previous_version_number),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(durable_previous_id) = durable_previous_id else {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version event predecessor is missing".into(),
+                ));
+            };
+            if durable_previous_id.as_slice() != previous_version_id.as_bytes() {
+                return Err(PromptStoreError::Corruption(
+                    "prompt version event predecessor disagrees with replay cursor".into(),
+                ));
+            }
+            prompt_version_cursors.insert(*prompt_id, version.id);
+        }
         PromptEvent::PromptRenamed { prompt_id, .. }
         | PromptEvent::PromptTagsSet { prompt_id, .. }
         | PromptEvent::PromptArchived { prompt_id, .. }
         | PromptEvent::PromptRestored { prompt_id, .. } => {
-            let prompt = load_prompt(tx, *prompt_id)?.ok_or_else(|| {
-                PromptStoreError::Corruption(
-                    "prompt event version lineage references a missing prompt".into(),
-                )
-            })?;
-            if prompt.current_version_id != receipt_version_id {
+            if prompt_version_cursors.get(prompt_id).copied() != Some(receipt_version_id) {
                 return Err(PromptStoreError::Corruption(
                     "prompt event version receipt lineage is invalid".into(),
                 ));

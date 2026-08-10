@@ -3719,6 +3719,189 @@ fn lineage_quarantine_repair_marker_can_be_cleared_idempotently() {
 }
 
 #[test]
+fn lineage_creation_commitment_rejects_a_forged_canonical_ledger() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(252);
+    let version = version_id(253);
+    let receipt_command = command_id(254);
+    let mut store = open_store(&path);
+    store
+        .execute(receipt_command, create_prompt(prompt, version))
+        .expect("create canonical receipt for forged ledger fixture");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let command_sha256: Vec<u8> = conn
+        .query_row(
+            "SELECT command_sha256 FROM prompt_command_receipts WHERE command_id = ?1",
+            [receipt_command.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read canonical receipt digest");
+    conn.execute_batch("DROP TRIGGER prompt_lineage_quarantine_ledger_immutable_insert")
+        .expect("disable ledger insert trigger for forged-ledger fixture");
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine_ledger(
+            quarantine_id, source_kind, command_id, event_id, reason,
+            command_sha256, quarantined_at_ms
+         ) VALUES (1, 'prompt_receipt', ?1, NULL, 'forged ledger', ?2, 1)",
+        rusqlite::params![receipt_command.as_bytes().as_slice(), &command_sha256],
+    )
+    .expect("seed forged ledger with a currently canonical receipt proof");
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("a ledger row without immutable migration provenance must fail at open");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn lineage_creation_commitment_rejects_state_delete_and_recreate_bypass() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    drop(open_store(&path));
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let state_columns: Vec<String> = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(prompt_lineage_migration_state)")
+            .expect("inspect lineage state schema");
+        statement
+            .query_map([], |row| row.get(1))
+            .expect("query lineage state columns")
+            .map(|row| row.expect("lineage state column"))
+            .collect()
+    };
+    assert!(
+        state_columns
+            .iter()
+            .any(|column| column == "creation_token"),
+        "lineage state must be bound to its immutable creation commitment"
+    );
+    let creation_token: Vec<u8> = conn
+        .query_row(
+            "SELECT creation_token FROM prompt_lineage_migration_state
+             WHERE singleton_key = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read lineage state creation token");
+    conn.execute_batch(
+        "DROP TRIGGER prompt_lineage_migration_state_immutable_delete;
+         DROP TRIGGER prompt_lineage_migration_state_append_only_insert;",
+    )
+    .expect("disable state delete and recreation guards for bypass fixture");
+    conn.execute(
+        "DELETE FROM prompt_lineage_migration_state WHERE singleton_key = 1",
+        [],
+    )
+    .expect("delete state through disabled trigger");
+    conn.execute(
+        "INSERT INTO prompt_lineage_migration_state(singleton_key, creation_token, blocked)
+         VALUES (1, zeroblob(32), 0)",
+        [],
+    )
+    .expect("recreate state with a forged creation token");
+    assert_ne!(creation_token, vec![0; 32]);
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("state deletion and forged recreation must fail at open");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_historical_metadata_receipt_forged_to_a_later_version() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(255);
+    let version_one = version_id(1);
+    let version_two = version_id(2);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(3), create_prompt(prompt, version_one))
+        .expect("create version one");
+    store
+        .execute(
+            command_id(4),
+            PromptCommand::RenamePrompt(RenamePrompt {
+                prompt_id: prompt,
+                title: "Renamed at version one".into(),
+                expected_revision: 1,
+            }),
+        )
+        .expect("rename at version one");
+    store
+        .execute(
+            command_id(5),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: version_two,
+                variables: Vec::new(),
+                body: "version two".into(),
+                created_at_ms: 1_725_000_000_002,
+                expected_revision: 2,
+            }),
+        )
+        .expect("create version two");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_immutable_update")
+        .expect("disable receipt immutability for historical-version fixture");
+    conn.execute(
+        "UPDATE prompt_command_receipts SET prompt_version_id = ?1
+         WHERE command_id = ?2",
+        rusqlite::params![
+            version_two.as_bytes().as_slice(),
+            command_id(4).as_bytes().as_slice()
+        ],
+    )
+    .expect("forge metadata receipt to the later version");
+    drop(conn);
+
+    let error = PromptStore::open(&path).expect_err(
+        "historical metadata receipt version must match the replay-time version cursor",
+    );
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn sqlite_rejects_oversized_prompt_receipt_and_event_payloads_before_store_reads() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(6);
+    let version = version_id(7);
+    let command = command_id(8);
+    let mut store = open_store(&path);
+    store
+        .execute(command, create_prompt(prompt, version))
+        .expect("create prompt");
+    drop(store);
+
+    let oversized = vec![0_u8; 512 * 1024 + 1];
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let receipt_insert = conn.execute(
+        "UPDATE prompt_command_receipts SET receipt = ?1 WHERE command_id = ?2",
+        rusqlite::params![&oversized, command.as_bytes().as_slice()],
+    );
+    assert!(
+        receipt_insert.is_err(),
+        "SQLite must reject oversized prompt receipt payloads"
+    );
+
+    let event_insert = conn.execute(
+        "UPDATE prompt_events SET payload = ?1 WHERE command_id = ?2",
+        rusqlite::params![&oversized, command.as_bytes().as_slice()],
+    );
+    assert!(
+        event_insert.is_err(),
+        "SQLite must reject oversized prompt event payloads"
+    );
+}
+
+#[test]
 fn projection_rebuild_rejects_oversized_command_payload_before_decode() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
@@ -3739,6 +3922,11 @@ fn projection_rebuild_rejects_oversized_command_payload_before_decode() {
         revision: 1,
     };
     let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute_batch(
+        "DROP TRIGGER prompt_command_receipts_command_payload_size_insert;
+         DROP TRIGGER prompt_command_receipts_command_payload_size_update;",
+    )
+    .expect("disable payload size guards for pre-existing-row fixture");
     conn.execute(
         "INSERT INTO prompt_command_receipts(
             command_id, command_sha256, command_payload, prompt_id,
