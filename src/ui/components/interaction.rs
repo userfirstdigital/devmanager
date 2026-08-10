@@ -89,6 +89,7 @@ pub enum ComponentError {
         actual: usize,
     },
     InvalidCombination(&'static str),
+    InvalidIconId,
     MissingTooltip,
     TooManyRecoveryActions {
         max: usize,
@@ -121,6 +122,9 @@ impl Display for ComponentError {
             }
             Self::InvalidCombination(reason) => {
                 write!(formatter, "invalid interaction state: {reason}")
+            }
+            Self::InvalidIconId => {
+                write!(formatter, "icon id is not in the approved icon catalog")
             }
             Self::MissingTooltip => write!(formatter, "icon-only controls require a tooltip"),
             Self::TooManyRecoveryActions { max, actual } => {
@@ -183,7 +187,46 @@ pub(crate) fn redacted_bounded_text(
 
 pub(crate) fn redact_sensitive_text(value: &str) -> String {
     let value = crate::diagnostics::runner::redact_secrets(value);
-    redact_ui_credential_lines(&value)
+    strip_terminal_control_sequences(&redact_ui_credential_lines(&value))
+}
+
+fn strip_terminal_control_sequences(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut escape = false;
+    let mut csi = false;
+    let mut osc = false;
+    for character in value.chars() {
+        if osc {
+            if character == '\u{7}' {
+                osc = false;
+            }
+            continue;
+        }
+        if csi {
+            if ('@'..='~').contains(&character) {
+                csi = false;
+            }
+            continue;
+        }
+        if escape {
+            escape = false;
+            match character {
+                '[' => csi = true,
+                ']' => osc = true,
+                '\\' => {}
+                _ => {}
+            }
+            continue;
+        }
+        if character == '\u{1b}' {
+            escape = true;
+            continue;
+        }
+        if !character.is_control() {
+            sanitized.push(character);
+        }
+    }
+    sanitized
 }
 
 fn redact_ui_credential_lines(value: &str) -> String {
@@ -341,16 +384,16 @@ pub enum AccessibleRole {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessibilityMetadata {
-    pub role: AccessibleRole,
-    pub name: String,
-    pub description: String,
-    pub error: Option<String>,
-    pub disabled: bool,
-    pub busy: bool,
-    pub focused: bool,
-    pub invalid: bool,
-    pub read_only: bool,
-    pub value: Option<String>,
+    role: AccessibleRole,
+    name: String,
+    description: String,
+    error: Option<String>,
+    disabled: bool,
+    busy: bool,
+    focused: bool,
+    invalid: bool,
+    read_only: bool,
+    value: Option<String>,
 }
 
 impl AccessibilityMetadata {
@@ -389,6 +432,70 @@ impl AccessibilityMetadata {
 
     pub fn clear_description(&mut self) {
         self.description.clear();
+    }
+
+    pub fn role(&self) -> AccessibleRole {
+        self.role
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn disabled(&self) -> bool {
+        self.disabled
+    }
+
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    pub fn invalid(&self) -> bool {
+        self.invalid
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    pub(crate) fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
+
+    pub(crate) fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    pub(crate) fn set_invalid(&mut self, invalid: bool) {
+        self.invalid = invalid;
+    }
+
+    pub(crate) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub(crate) fn set_value(&mut self, value: Option<String>) {
+        self.value = value;
     }
 
     pub fn set_optional_description(
@@ -447,12 +554,12 @@ pub enum InteractionTransition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InteractionState {
-    pub hovered: bool,
-    pub pressed: bool,
-    pub focused: bool,
-    pub disabled: bool,
-    pub loading: bool,
-    pub destructive: bool,
+    hovered: bool,
+    pressed: bool,
+    focused: bool,
+    disabled: bool,
+    loading: bool,
+    destructive: bool,
 }
 
 impl Default for InteractionState {
@@ -469,6 +576,59 @@ impl Default for InteractionState {
 }
 
 impl InteractionState {
+    pub fn try_new(
+        hovered: bool,
+        pressed: bool,
+        focused: bool,
+        disabled: bool,
+        loading: bool,
+        destructive: bool,
+    ) -> Result<Self, ComponentError> {
+        let state = Self {
+            hovered,
+            pressed,
+            focused,
+            disabled,
+            loading,
+            destructive,
+        };
+        if disabled && (hovered || pressed || focused || loading) {
+            return Err(ComponentError::InvalidCombination(
+                "disabled controls cannot carry active interaction flags",
+            ));
+        }
+        if loading && (hovered || pressed) {
+            return Err(ComponentError::InvalidCombination(
+                "loading controls cannot carry pointer interaction flags",
+            ));
+        }
+        Ok(state)
+    }
+
+    pub const fn hovered(self) -> bool {
+        self.hovered
+    }
+
+    pub const fn pressed(self) -> bool {
+        self.pressed
+    }
+
+    pub const fn focused(self) -> bool {
+        self.focused
+    }
+
+    pub const fn is_disabled(self) -> bool {
+        self.disabled
+    }
+
+    pub const fn is_loading(self) -> bool {
+        self.loading
+    }
+
+    pub const fn destructive(self) -> bool {
+        self.destructive
+    }
+
     pub const fn disabled() -> Self {
         Self {
             hovered: false,
@@ -543,17 +703,14 @@ impl InteractionState {
             InteractionTransition::Destructive(destructive) => next.destructive = destructive,
         }
 
-        if next.disabled && (next.hovered || next.pressed || next.focused || next.loading) {
-            return Err(ComponentError::InvalidCombination(
-                "disabled controls cannot carry active interaction flags",
-            ));
-        }
-        if next.loading && (next.hovered || next.pressed) {
-            return Err(ComponentError::InvalidCombination(
-                "loading controls cannot carry pointer interaction flags",
-            ));
-        }
-        Ok(next)
+        Self::try_new(
+            next.hovered,
+            next.pressed,
+            next.focused,
+            next.disabled,
+            next.loading,
+            next.destructive,
+        )
     }
 
     pub fn fail_closed(self) -> Self {

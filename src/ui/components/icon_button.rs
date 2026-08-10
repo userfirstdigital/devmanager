@@ -7,6 +7,102 @@ use super::interaction::{
 };
 use crate::ui::tokens::ThemeTokens;
 
+/// Stable icon vocabulary used by native controls.  Keeping the identifier
+/// typed prevents a fixture, remote client, or caller from smuggling an
+/// arbitrary asset path into the renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IconId {
+    Activity,
+    Bot,
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+    ChevronUp,
+    FileText,
+    Folder,
+    GitBranch,
+    Globe,
+    MoreHorizontal,
+    Play,
+    Plus,
+    Refresh,
+    Server,
+    Settings,
+    Sparkles,
+    Square,
+    Terminal,
+    X,
+    Warning,
+    OpenInNew,
+}
+
+impl IconId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Activity => "activity",
+            Self::Bot => "bot",
+            Self::ChevronDown => "chevron-down",
+            Self::ChevronLeft => "chevron-left",
+            Self::ChevronRight => "chevron-right",
+            Self::ChevronUp => "chevron-up",
+            Self::FileText => "file-text",
+            Self::Folder => "folder",
+            Self::GitBranch => "git-branch",
+            Self::Globe => "globe",
+            Self::MoreHorizontal => "more-horizontal",
+            Self::Play => "play",
+            Self::Plus => "plus",
+            Self::Refresh => "refresh-cw",
+            Self::Server => "server",
+            Self::Settings => "settings",
+            Self::Sparkles => "sparkles",
+            Self::Square => "square",
+            Self::Terminal => "terminal",
+            Self::X => "x",
+            Self::Warning => "warning",
+            Self::OpenInNew => "open-in-new",
+        }
+    }
+}
+
+impl AsRef<str> for IconId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<&str> for IconId {
+    type Error = ComponentError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "activity" => Ok(Self::Activity),
+            "bot" => Ok(Self::Bot),
+            "chevron-down" => Ok(Self::ChevronDown),
+            "chevron-left" => Ok(Self::ChevronLeft),
+            "chevron-right" => Ok(Self::ChevronRight),
+            "chevron-up" => Ok(Self::ChevronUp),
+            "file-text" => Ok(Self::FileText),
+            "folder" => Ok(Self::Folder),
+            "git-branch" => Ok(Self::GitBranch),
+            "globe" => Ok(Self::Globe),
+            "more-horizontal" => Ok(Self::MoreHorizontal),
+            "play" => Ok(Self::Play),
+            "plus" => Ok(Self::Plus),
+            "refresh-cw" => Ok(Self::Refresh),
+            "server" => Ok(Self::Server),
+            "settings" => Ok(Self::Settings),
+            "sparkles" => Ok(Self::Sparkles),
+            "square" => Ok(Self::Square),
+            "terminal" => Ok(Self::Terminal),
+            "x" => Ok(Self::X),
+            "warning" => Ok(Self::Warning),
+            "open-in-new" => Ok(Self::OpenInNew),
+            _ => Err(ComponentError::InvalidIconId),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TooltipContract {
     pub label: String,
@@ -38,19 +134,19 @@ fn normalize_tooltip(tooltip: TooltipContract) -> Result<TooltipContract, Compon
 }
 
 pub struct IconButton {
-    icon: String,
+    icon: IconId,
     button: Button,
     tooltip: TooltipContract,
 }
 
 impl IconButton {
     pub fn new(
-        icon: impl Into<String>,
+        icon: impl AsRef<str>,
         accessible_label: impl Into<String>,
         tooltip: TooltipContract,
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
-        let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
+        let icon = IconId::try_from(icon.as_ref())?;
         let tooltip = normalize_tooltip(tooltip)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
@@ -65,13 +161,13 @@ impl IconButton {
     }
 
     pub fn new_variant(
-        icon: impl Into<String>,
+        icon: impl AsRef<str>,
         accessible_label: impl Into<String>,
         tooltip: TooltipContract,
         variant: ButtonVariant,
         action_request: ActionRequest,
     ) -> Result<Self, ComponentError> {
-        let icon = super::interaction::bounded_text("icon name", icon, 96, 384)?;
+        let icon = IconId::try_from(icon.as_ref())?;
         let tooltip = normalize_tooltip(tooltip)?;
         if tooltip.label.trim().is_empty() {
             return Err(ComponentError::MissingTooltip);
@@ -85,8 +181,12 @@ impl IconButton {
         })
     }
 
-    pub fn icon(&self) -> &str {
-        &self.icon
+    pub fn icon(&self) -> IconId {
+        self.icon
+    }
+
+    pub fn icon_id(&self) -> IconId {
+        self.icon
     }
 
     pub fn tooltip(&self) -> &TooltipContract {

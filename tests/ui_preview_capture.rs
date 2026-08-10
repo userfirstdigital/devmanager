@@ -4,15 +4,15 @@ use devmanager::ui::preview::{
 };
 use devmanager::ui::preview_capture::{
     active_capture_thread_count, capture_contract, cleanup_output_after_deadline,
-    encode_bgra_png_atomic, receive_first_frame, settle_capture_result,
+    encode_bgra_png_atomic, receive_first_frame, run_cancellable_stage, settle_capture_result,
     settle_capture_with_cleanup, CaptureCleanupOperation, CaptureColorFormat, CaptureDeadline,
-    CaptureReport, CaptureSetting, PreviewCaptureError, CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER,
-    FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
+    CaptureGeneration, CaptureReport, CaptureSetting, PreviewCaptureError,
+    CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER, FIRST_FRAME_DEADLINE, MAX_CLEANUP_DIAGNOSTIC_BYTES,
 };
 use image::GenericImageView;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
@@ -54,6 +54,31 @@ fn valid_request(policy: &PreviewPathPolicy, name: &str) -> PreviewRequest {
         policy,
     )
     .expect("valid preview request")
+}
+
+#[cfg(windows)]
+fn create_directory_junction(target: &std::path::Path, link: &std::path::Path) {
+    let link = link.to_string_lossy().replace('/', "\\");
+    let target = target.to_string_lossy().replace('/', "\\");
+    let output = Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn mklink /J");
+    assert!(
+        output.status.success(),
+        "create preview output junction (exit {:?}): {} {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(windows)]
+fn remove_directory_junction(link: &std::path::Path) {
+    fs::remove_dir(link).expect("remove preview output junction");
 }
 
 fn composed_cleanup_error(
@@ -377,6 +402,51 @@ fn invalid_output_extension_diagnostic_omits_the_source_path() {
     assert!(rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
 }
 
+#[cfg(windows)]
+#[test]
+fn preview_rejects_junction_ancestors_before_fixture_or_output_io() {
+    let (_root, policy) = temporary_policy();
+    let redirect_target = policy
+        .output_root()
+        .parent()
+        .expect("output parent")
+        .join("redirect-target");
+    fs::create_dir(&redirect_target).expect("redirect target");
+    let redirect = policy.output_root().join("redirect");
+    create_directory_junction(&redirect_target, &redirect);
+
+    let error = PreviewRequest::validate(
+        write_fixture(&policy),
+        redirect.join("blocked.png"),
+        &policy,
+    )
+    .expect_err("reparse ancestors must be rejected before output access");
+    assert!(matches!(error, PreviewError::UnsafePath { .. }));
+
+    remove_directory_junction(&redirect);
+}
+
+#[cfg(windows)]
+#[test]
+fn trusted_output_root_identity_blocks_a_junction_swap_after_validation() {
+    let (_root, policy) = temporary_policy();
+    let request = valid_request(&policy, "swap.png");
+    let original_root = policy.output_root().to_path_buf();
+    let moved_root = original_root.with_file_name("output-root-before-swap");
+    fs::rename(&original_root, &moved_root).expect("move trusted output root");
+    create_directory_junction(&moved_root, &original_root);
+
+    let result = request.write_bgra_png_atomic(1, 1, &[0x1e, 0x14, 0x0a, 0xff]);
+    assert!(matches!(
+        result,
+        Err(PreviewCaptureError::OutputFailed(message))
+            if message.contains("trusted preview output root changed")
+    ));
+
+    remove_directory_junction(&original_root);
+    fs::rename(&moved_root, &original_root).expect("restore trusted output root");
+}
+
 #[test]
 fn diagnostics_redact_a_complete_secret_bearing_line_before_bounding() {
     const SECRET: &str = "UI_PREVIEW_CAPTURE_PREFIX_SECRET_SENTINEL";
@@ -389,6 +459,58 @@ fn diagnostics_redact_a_complete_secret_bearing_line_before_bounding() {
 
     assert!(!rendered.contains(SECRET));
     assert!(rendered.len() <= MAX_CLEANUP_DIAGNOSTIC_BYTES);
+}
+
+#[test]
+fn cancelled_capture_generation_cannot_publish_after_a_replacement_attempt() {
+    let generations = CaptureGeneration::new();
+    let stale = generations.begin();
+    stale.cancel();
+    assert!(!stale.is_active());
+
+    let current = generations.begin();
+    assert!(current.is_active());
+    assert!(!stale.is_active());
+    current.cancel();
+    assert!(!current.is_active());
+}
+
+#[test]
+fn injected_blocking_capture_stage_returns_at_the_shared_deadline_and_keeps_ownership() {
+    let lease = CaptureGeneration::new().begin();
+    let error = run_cancellable_stage(
+        CaptureDeadline::from_now(Duration::from_millis(10)),
+        lease.clone(),
+        |_, worker_lease| {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!worker_lease.is_active());
+            Ok::<_, PreviewCaptureError>(())
+        },
+    )
+    .expect_err("a stalled stage must return without waiting for its worker");
+    assert!(matches!(error, PreviewCaptureError::DeadlineExceeded));
+    assert!(!lease.is_active());
+}
+
+#[test]
+fn capture_error_display_and_debug_redact_control_sequences_and_window_handles() {
+    let error = PreviewCaptureError::CaptureFailed(
+        "\u{1b}[31mapi_key=UI_CAPTURE_DEBUG_SECRET\u{1b}[0m hwnd=0x1234\u{7}".into(),
+    );
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for rendered in [display, debug] {
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains("UI_CAPTURE_DEBUG_SECRET"));
+        assert!(!rendered.contains('\u{7}'));
+    }
+
+    let foreground = PreviewCaptureError::ForegroundChanged {
+        before: 0x1234,
+        after: 0x5678,
+    };
+    assert!(!foreground.to_string().contains("1234"));
+    assert!(!format!("{foreground:?}").contains("5678"));
 }
 
 #[test]

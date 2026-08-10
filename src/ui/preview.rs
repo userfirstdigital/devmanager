@@ -16,7 +16,11 @@ use std::rc::Rc;
 use crate::assets::AppAssets;
 use crate::client::action;
 use crate::terminal::terminal_font;
+use crate::ui::components::{
+    Button, ButtonVariant, IconButton, IconId, StatusLight, TooltipContract,
+};
 use crate::ui::preview_capture;
+use crate::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
 
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
@@ -259,6 +263,90 @@ impl PreviewPathPolicy {
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
+    trusted_output_root: PathBuf,
+    trusted_output_root_identity: RootIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootIdentity {
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(not(windows))]
+    modified_nanos: u128,
+    #[cfg(not(windows))]
+    length: u64,
+}
+
+impl RootIdentity {
+    fn capture(path: &Path) -> Result<Self, PreviewError> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::Storage::FileSystem::{
+                CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            };
+
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let handle = unsafe {
+                CreateFileW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    FILE_GENERIC_READ.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    None,
+                )
+            }
+            .map_err(|error| PreviewError::FixtureIo {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle.0 as *mut std::ffi::c_void) };
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(HANDLE(handle.as_raw_handle()), &mut information) }
+                .map_err(|error| PreviewError::FixtureIo {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                })?;
+            Ok(Self {
+                volume_serial: information.dwVolumeSerialNumber,
+                file_index: (u64::from(information.nFileIndexHigh) << 32)
+                    | u64::from(information.nFileIndexLow),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let metadata = fs::metadata(path).map_err(|error| PreviewError::FixtureIo {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+            let modified_nanos = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            Ok(Self {
+                modified_nanos,
+                length: metadata.len(),
+            })
+        }
+    }
+
+    fn matches(self, path: &Path) -> bool {
+        Self::capture(path).is_ok_and(|current| current == self)
+    }
 }
 
 impl PreviewRequest {
@@ -276,8 +364,17 @@ impl PreviewRequest {
         height: u32,
         bgra: &[u8],
     ) -> Result<(), preview_capture::PreviewCaptureError> {
-        preview_capture::encode_bgra_png_atomic(
+        if !self
+            .trusted_output_root_identity
+            .matches(&self.trusted_output_root)
+        {
+            return Err(preview_capture::PreviewCaptureError::OutputFailed(
+                "trusted preview output root changed during validation".into(),
+            ));
+        }
+        preview_capture::encode_bgra_png_atomic_with_root(
             &self.output_path,
+            &self.trusted_output_root,
             width,
             height,
             bgra,
@@ -292,6 +389,11 @@ impl PreviewRequest {
     ) -> Result<Self, PreviewError> {
         let fixture_path = absolute_path(fixture_path.as_ref())?;
         let output_path = absolute_path(output_path.as_ref())?;
+        reject_reparse_ancestors(&fixture_path, "fixture")?;
+        reject_reparse_ancestors(&output_path, "output")?;
+        reject_reparse_ancestors(policy.fixture_root(), "fixture")?;
+        reject_reparse_ancestors(policy.output_root(), "output")?;
+        reject_reparse_ancestors(policy.temp_root(), "output")?;
         let fixture_check = checked_path(&fixture_path)?;
         let fixture_root = checked_path(policy.fixture_root())?;
 
@@ -339,6 +441,11 @@ impl PreviewRequest {
         let temp_root = checked_path(policy.temp_root())?;
         let output_is_approved =
             is_within(&output_check, &output_root) || is_within(&output_check, &temp_root);
+        let trusted_output_root = if is_within(&output_check, &output_root) {
+            output_root.clone()
+        } else {
+            temp_root.clone()
+        };
         if is_sensitive_path(&output_check) {
             return Err(PreviewError::SensitivePath { path: output_path });
         }
@@ -358,9 +465,12 @@ impl PreviewRequest {
             return Err(PreviewError::OutputAlreadyExists { path: output_path });
         }
 
+        let trusted_output_root_identity = RootIdentity::capture(&trusted_output_root)?;
         Ok(Self {
             fixture_path,
             output_path,
+            trusted_output_root,
+            trusted_output_root_identity,
         })
     }
 }
@@ -709,7 +819,12 @@ impl PreviewRoot {
     }
 
     pub fn element(&self) -> impl IntoElement {
-        div()
+        let gallery = self
+            .snapshot
+            .component_gallery
+            .as_ref()
+            .map(render_component_gallery);
+        let mut root = div()
             .size_full()
             .p(px(16.0))
             .bg(gpui::rgb(crate::ui::tokens::PREVIEW_BACKGROUND.to_u32()))
@@ -721,8 +836,104 @@ impl PreviewRoot {
                     .size(px(PREVIEW_SENTINEL_SIZE))
                     .bg(gpui::rgb(PREVIEW_SENTINEL_RGB)),
             )
-            .child(self.snapshot.body.clone())
+            .child(self.snapshot.body.clone());
+        if let Some(gallery) = gallery {
+            root = root.child(gallery);
+        }
+        root
     }
+}
+
+fn render_component_gallery(gallery: &ComponentGalleryFixture) -> gpui::AnyElement {
+    // The fixture is validated before this method is reached.  These are the
+    // same native models used by the production shell; the preview only adds
+    // a small GPUI projection so WGC captures the actual token/component path.
+    let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+    let button = Button::new_variant(
+        "Inspect task",
+        ButtonVariant::Primary,
+        action::ActionRequest::TaskList,
+    )
+    .expect("validated gallery button");
+    let button_style = button.presentation(tokens);
+    let icon_button = IconButton::new(
+        IconId::Sparkles,
+        "Open provider",
+        TooltipContract::new("Open provider", 500).expect("validated gallery tooltip"),
+        action::ActionRequest::TaskList,
+    )
+    .expect("validated gallery icon button");
+    let icon_style = icon_button.presentation(tokens);
+    let status = StatusLight::new(
+        StatusMeaning::Success,
+        "Worker ready",
+        "The worker is ready for a task",
+    )
+    .expect("validated gallery status light");
+    let status_style = status.presentation(tokens);
+    let sample = gallery.samples.unicode.clone();
+
+    div()
+        .mt(px(12.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .text_sm()
+                .text_color(gpui::rgb(tokens.text.secondary.to_u32()))
+                .child(format!(
+                    "Component gallery · {} themes · {} states",
+                    gallery.themes.len(),
+                    gallery.states.len()
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(gpui::rgb(button_style.border.to_u32()))
+                        .bg(gpui::rgb(button_style.background.to_u32()))
+                        .text_color(gpui::rgb(button_style.foreground.to_u32()))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .child(button.label().to_string()),
+                )
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(gpui::rgb(icon_style.border.to_u32()))
+                        .bg(gpui::rgb(icon_style.background.to_u32()))
+                        .text_color(gpui::rgb(icon_style.foreground.to_u32()))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .child(format!(
+                            "{} {}",
+                            icon_button.icon().as_str(),
+                            icon_button.tooltip().label
+                        )),
+                )
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(gpui::rgb(status_style.indicator.to_u32()))
+                        .bg(gpui::rgb(status_style.surface.to_u32()))
+                        .text_color(gpui::rgb(status_style.foreground.to_u32()))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .child(status.label().to_string()),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(gpui::rgb(tokens.text.muted.to_u32()))
+                .child(sample),
+        )
+        .into_any_element()
 }
 
 impl Render for PreviewRoot {
@@ -751,6 +962,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, PreviewError> {
 }
 
 fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
+    reject_reparse_ancestors(path, "fixture")?;
     let metadata = fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             PreviewError::FixtureMissing {
@@ -788,6 +1000,48 @@ fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
         });
     }
     Ok(bytes)
+}
+
+fn reject_reparse_ancestors(path: &Path, root_kind: &'static str) -> Result<(), PreviewError> {
+    let absolute = absolute_path(path)?;
+    let mut current = absolute.clone();
+    loop {
+        if current.exists() {
+            let metadata =
+                fs::symlink_metadata(&current).map_err(|error| PreviewError::FixtureIo {
+                    path: absolute.clone(),
+                    message: error.to_string(),
+                })?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes()
+                    & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                    != 0
+                {
+                    return Err(PreviewError::UnsafePath {
+                        path: absolute,
+                        root_kind,
+                    });
+                }
+            }
+            #[cfg(not(windows))]
+            if metadata.file_type().is_symlink() {
+                return Err(PreviewError::UnsafePath {
+                    path: absolute,
+                    root_kind,
+                });
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 fn checked_path(path: &Path) -> Result<PathBuf, PreviewError> {
@@ -896,7 +1150,7 @@ pub enum CaptureUnavailableKind {
     CaptureClosed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PreviewError {
     Usage(String),
     InvalidArgument(String),
@@ -906,6 +1160,10 @@ pub enum PreviewError {
     },
     SensitivePath {
         path: PathBuf,
+    },
+    UnsafePath {
+        path: PathBuf,
+        root_kind: &'static str,
     },
     FixtureMissing {
         path: PathBuf,
@@ -1008,6 +1266,12 @@ impl PreviewError {
                     reason,
                 }
             }
+            preview_capture::PreviewCaptureError::CaptureCancelled => {
+                Self::VisibleWindowsCaptureUnavailable {
+                    kind: CaptureUnavailableKind::CaptureClosed,
+                    reason,
+                }
+            }
             preview_capture::PreviewCaptureError::CaptureClosed => {
                 Self::VisibleWindowsCaptureUnavailable {
                     kind: CaptureUnavailableKind::CaptureClosed,
@@ -1076,6 +1340,10 @@ impl Display for PreviewError {
                 "sensitive production path refused: {}",
                 safe_preview_path(path)
             ))),
+            Self::UnsafePath { path, root_kind } => f.write_str(&bounded_preview_error(format!(
+                "{root_kind} path contains a reparse or symbolic-link ancestor: {}",
+                safe_preview_path(path)
+            ))),
             Self::FixtureMissing { path } => f.write_str(&bounded_preview_error(format!(
                 "fixture does not exist: {}",
                 safe_preview_path(path)
@@ -1126,9 +1394,10 @@ impl Display for PreviewError {
                 "PNG output failed: {reason}"
             ))),
             Self::ForegroundChanged { before, after } => {
-                f.write_str(&bounded_preview_error(format!(
-                    "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
-                )))
+                let _ = (before, after);
+                f.write_str(&bounded_preview_error(
+                    "foreground window changed during capture".into(),
+                ))
             }
             Self::ApplicationFailed { reason } => f.write_str(&bounded_preview_error(format!(
                 "GPUI preview application failed: {reason}"
@@ -1145,6 +1414,15 @@ impl Display for PreviewError {
                 reason
             ))),
         }
+    }
+}
+
+impl std::fmt::Debug for PreviewError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewError")
+            .field("message", &self.to_string())
+            .finish()
     }
 }
 

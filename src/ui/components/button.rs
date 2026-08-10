@@ -182,17 +182,17 @@ impl Button {
     }
 
     pub fn disabled(&self) -> bool {
-        self.interaction.state().disabled
+        self.interaction.state().is_disabled()
     }
 
     pub fn loading(&self) -> bool {
-        self.interaction.state().loading
+        self.interaction.state().is_loading()
     }
 
     fn sync_accessibility(&mut self) {
         let state = self.interaction.state();
-        self.accessibility.disabled = state.disabled;
-        self.accessibility.busy = state.loading;
-        self.accessibility.focused = state.focused;
+        self.accessibility.set_disabled(state.is_disabled());
+        self.accessibility.set_busy(state.is_loading());
+        self.accessibility.set_focused(state.focused());
     }
 }

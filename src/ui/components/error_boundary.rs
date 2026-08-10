@@ -71,7 +71,7 @@ impl ErrorBoundary {
         let mut accessibility =
             AccessibilityMetadata::new(AccessibleRole::Alert, projection.title.clone())?;
         accessibility.set_description(projection.message.clone())?;
-        accessibility.invalid = true;
+        accessibility.set_invalid(true);
         Ok(Self {
             projection,
             recovery_actions: Vec::new(),

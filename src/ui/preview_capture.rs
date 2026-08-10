@@ -8,9 +8,9 @@ use image::ImageEncoder;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,130 @@ pub const MAX_CLEANUP_DIAGNOSTIC_BYTES: usize = 4096;
 pub const CLEANUP_DIAGNOSTIC_TRUNCATION_MARKER: &str = "... [truncated]";
 /// Maximum recursive cleanup depth inspected while producing a diagnostic.
 pub const MAX_CLEANUP_DIAGNOSTIC_DEPTH: usize = 16;
+
+/// A monotonically fenced capture generation.  A caller that times out or
+/// closes its preview cancels its lease; late WGC/PNG work may finish for
+/// cleanup, but it can no longer publish a frame or result for that attempt.
+#[derive(Clone, Default)]
+pub struct CaptureGeneration {
+    next: Arc<AtomicU64>,
+}
+
+/// Coordinates the one irreversible boundary in a capture attempt: moving a
+/// fully encoded temporary file into its requested output name.  Cancellation
+/// is intentionally non-blocking, so a caller that has reached its deadline
+/// never waits on filesystem work.  A publisher that won the boundary still
+/// has to observe a cancellation request before it can mark the output as
+/// committed; its temporary-output guard then removes the late file.
+struct PublicationState {
+    state: AtomicU8,
+    cancellation_requested: AtomicBool,
+}
+
+const PUBLICATION_IDLE: u8 = 0;
+const PUBLICATION_IN_FLIGHT: u8 = 1;
+const PUBLICATION_COMMITTED: u8 = 2;
+
+impl CaptureGeneration {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn begin(&self) -> CaptureLease {
+        let id = self.next.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        CaptureLease {
+            generation: Arc::clone(&self.next),
+            id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            publication: Arc::new(PublicationState {
+                state: AtomicU8::new(PUBLICATION_IDLE),
+                cancellation_requested: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CaptureLease {
+    generation: Arc<AtomicU64>,
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+    publication: Arc<PublicationState>,
+}
+
+impl std::fmt::Debug for CaptureLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureLease")
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+impl CaptureLease {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if self.publication.state.load(Ordering::Acquire) == PUBLICATION_IN_FLIGHT {
+            self.publication
+                .cancellation_requested
+                .store(true, Ordering::Release);
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire) == self.id
+    }
+
+    fn check(&self, deadline: CaptureDeadline) -> Result<(), PreviewCaptureError> {
+        deadline.remaining()?;
+        if self.is_active() {
+            Ok(())
+        } else {
+            Err(PreviewCaptureError::CaptureCancelled)
+        }
+    }
+
+    fn begin_publication(&self, deadline: CaptureDeadline) -> Result<(), PreviewCaptureError> {
+        self.check(deadline)?;
+        self.publication
+            .state
+            .compare_exchange(
+                PUBLICATION_IDLE,
+                PUBLICATION_IN_FLIGHT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| PreviewCaptureError::CaptureCancelled)?;
+        if !self.is_active() {
+            self.publication
+                .cancellation_requested
+                .store(true, Ordering::Release);
+            return Err(PreviewCaptureError::CaptureCancelled);
+        }
+        Ok(())
+    }
+
+    fn finish_publication(&self) -> bool {
+        if self
+            .publication
+            .cancellation_requested
+            .load(Ordering::Acquire)
+            || !self.is_active()
+        {
+            return false;
+        }
+        self.publication
+            .state
+            .compare_exchange(
+                PUBLICATION_IN_FLIGHT,
+                PUBLICATION_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 /// One absolute capture deadline. Every blocking capture phase consumes the
 /// remaining time from this same instant; callers must not create phase-local
@@ -229,6 +353,53 @@ where
     }
 }
 
+fn wait_for_capture_worker_result<T>(
+    waiter: JoinHandle<()>,
+    result_receiver: Receiver<Result<T, PreviewCaptureError>>,
+    deadline: CaptureDeadline,
+    lease: &CaptureLease,
+) -> Result<T, PreviewCaptureError>
+where
+    T: Send + 'static,
+{
+    match wait_for_worker_result(waiter, result_receiver, deadline) {
+        Err(PreviewCaptureError::DeadlineExceeded) => {
+            lease.cancel();
+            Err(PreviewCaptureError::DeadlineExceeded)
+        }
+        Ok(value) if lease.is_active() => Ok(value),
+        Ok(_) | Err(PreviewCaptureError::CaptureCancelled) => {
+            Err(PreviewCaptureError::CaptureCancelled)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Execute one potentially blocking capture stage behind the same deadline
+/// and generation fence used by the visible application.  Tests and platform
+/// adapters use this seam to inject startup, frame, encode, and filesystem
+/// stalls without ever blocking the caller or losing cleanup ownership.
+#[doc(hidden)]
+pub fn run_cancellable_stage<T, F>(
+    deadline: CaptureDeadline,
+    lease: CaptureLease,
+    stage: F,
+) -> Result<T, PreviewCaptureError>
+where
+    T: Send + 'static,
+    F: FnOnce(CaptureDeadline, CaptureLease) -> Result<T, PreviewCaptureError> + Send + 'static,
+{
+    lease.check(deadline)?;
+    let worker_lease = lease.clone();
+    let (waiter, result_receiver) = spawn_cleanup_worker(move || {
+        if !worker_lease.is_active() {
+            return Err(PreviewCaptureError::CaptureCancelled);
+        }
+        stage(deadline, worker_lease)
+    });
+    wait_for_capture_worker_result(waiter, result_receiver, deadline, &lease)
+}
+
 fn run_bounded_cleanup<F>(deadline: CaptureDeadline, cleanup: F)
 where
     F: FnOnce() -> Result<(), PreviewCaptureError> + Send + 'static,
@@ -304,13 +475,14 @@ pub fn settle_capture_result(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PreviewCaptureError {
     UnsupportedPlatform,
     InvalidHwnd,
     ForeignHwnd,
     InvalidWindowState { reason: &'static str },
     DeadlineExceeded,
+    CaptureCancelled,
     CaptureClosed,
     CaptureFailed(String),
     ApplicationFailed(String),
@@ -323,7 +495,7 @@ pub enum PreviewCaptureError {
 
 /// Opaque evidence that a capture failure and its cleanup failure were
 /// observed by the same bounded settlement operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CleanupFailureContext {
     primary: Box<PreviewCaptureError>,
     operation: &'static str,
@@ -353,6 +525,21 @@ impl CleanupFailureContext {
 
     pub fn secondary(&self) -> &PreviewCaptureError {
         &self.secondary
+    }
+}
+
+impl std::fmt::Debug for CleanupFailureContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CleanupFailureContext")
+            .field(
+                "message",
+                &bounded_redacted_diagnostic(&format!(
+                    "{}; cleanup {} failed: {}",
+                    self.primary, self.operation, self.secondary
+                )),
+            )
+            .finish()
     }
 }
 
@@ -462,6 +649,9 @@ fn render_capture_error(
         PreviewCaptureError::DeadlineExceeded => {
             let _ = diagnostic.write_str("no valid frame arrived before the fixed deadline");
         }
+        PreviewCaptureError::CaptureCancelled => {
+            let _ = diagnostic.write_str("the preview capture was cancelled before publication");
+        }
         PreviewCaptureError::CaptureClosed => {
             let _ = diagnostic.write_str("the preview capture item closed before a frame arrived");
         }
@@ -485,10 +675,8 @@ fn render_capture_error(
             diagnostic.write_bounded_text(message);
         }
         PreviewCaptureError::ForegroundChanged { before, after } => {
-            let _ = write!(
-                diagnostic,
-                "foreground HWND changed during capture (before {before:#x}, after {after:#x})"
-            );
+            let _ = (before, after);
+            let _ = diagnostic.write_str("foreground window changed during capture");
         }
         PreviewCaptureError::CleanupFailed(context) => {
             render_capture_error(context.primary(), diagnostic, depth + 1);
@@ -503,6 +691,15 @@ impl std::fmt::Display for PreviewCaptureError {
         let mut diagnostic = BoundedDiagnostic::new();
         render_capture_error(self, &mut diagnostic, 0);
         f.write_str(&diagnostic.rendered)
+    }
+}
+
+impl std::fmt::Debug for PreviewCaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewCaptureError")
+            .field("message", &self.to_string())
+            .finish()
     }
 }
 
@@ -523,6 +720,18 @@ pub fn receive_first_frame<T>(
 }
 
 #[doc(hidden)]
+pub fn receive_first_frame_with_lease<T>(
+    receiver: Receiver<T>,
+    deadline: CaptureDeadline,
+    lease: &CaptureLease,
+) -> Result<T, PreviewCaptureError> {
+    lease.check(deadline)?;
+    let frame = receive_first_frame(receiver, deadline)?;
+    lease.check(deadline)?;
+    Ok(frame)
+}
+
+#[doc(hidden)]
 pub fn encode_bgra_png_atomic(
     output: &Path,
     width: u32,
@@ -530,10 +739,76 @@ pub fn encode_bgra_png_atomic(
     bgra: &[u8],
     deadline: CaptureDeadline,
 ) -> Result<(), PreviewCaptureError> {
+    let lease = CaptureGeneration::new().begin();
+    encode_bgra_png_atomic_with_lease(output, width, height, bgra, deadline, &lease)
+}
+
+#[doc(hidden)]
+pub fn encode_bgra_png_atomic_with_root(
+    output: &Path,
+    trusted_root: &Path,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    deadline: CaptureDeadline,
+) -> Result<(), PreviewCaptureError> {
+    let checked_output = output
+        .parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .map(|parent| parent.join(output.file_name().unwrap_or_default()))
+        .unwrap_or_else(|| output.to_path_buf());
+    let checked_root = fs::canonicalize(trusted_root).map_err(|_| {
+        PreviewCaptureError::OutputFailed("trusted preview output root is unavailable".into())
+    })?;
+    if !is_within_capture_path(&checked_output, &checked_root) {
+        return Err(PreviewCaptureError::OutputFailed(
+            "preview output moved outside its trusted root".into(),
+        ));
+    }
+    encode_bgra_png_atomic(output, width, height, bgra, deadline)
+}
+
+fn is_within_capture_path(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        let root = root.to_string_lossy().to_ascii_lowercase();
+        let root = root.trim_end_matches(['\\', '/']);
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with(['\\', '/']))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[doc(hidden)]
+pub fn encode_bgra_png_atomic_with_lease(
+    output: &Path,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    deadline: CaptureDeadline,
+    lease: &CaptureLease,
+) -> Result<(), PreviewCaptureError> {
+    lease.check(deadline)?;
     deadline.remaining()?;
     let bgra = bgra.to_vec();
-    deadline.remaining()?;
-    encode_bgra_png_atomic_owned(output.to_path_buf(), width, height, bgra, deadline)
+    lease.check(deadline)?;
+    encode_bgra_png_atomic_owned(
+        output.to_path_buf(),
+        width,
+        height,
+        bgra,
+        deadline,
+        lease.clone(),
+    )
 }
 
 fn encode_bgra_png_atomic_owned(
@@ -542,12 +817,14 @@ fn encode_bgra_png_atomic_owned(
     height: u32,
     bgra: Vec<u8>,
     deadline: CaptureDeadline,
+    lease: CaptureLease,
 ) -> Result<(), PreviewCaptureError> {
-    deadline.remaining()?;
+    lease.check(deadline)?;
+    let lease_for_worker = lease.clone();
     let (waiter, result_receiver) = spawn_cleanup_worker(move || {
-        encode_bgra_png_atomic_sync(&output, width, height, &bgra, deadline)
+        encode_bgra_png_atomic_sync(&output, width, height, &bgra, deadline, &lease_for_worker)
     });
-    wait_for_worker_result(waiter, result_receiver, deadline)
+    wait_for_capture_worker_result(waiter, result_receiver, deadline, &lease)
 }
 
 fn encode_bgra_png_atomic_sync(
@@ -556,8 +833,10 @@ fn encode_bgra_png_atomic_sync(
     height: u32,
     bgra: &[u8],
     deadline: CaptureDeadline,
+    lease: &CaptureLease,
 ) -> Result<(), PreviewCaptureError> {
-    deadline.remaining()?;
+    lease.check(deadline)?;
+    reject_reparse_ancestors(output)?;
     let expected_bytes = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -581,46 +860,276 @@ fn encode_bgra_png_atomic_sync(
         .ok_or_else(|| {
             PreviewCaptureError::OutputFailed("PNG output has no parent directory".into())
         })?;
+    reject_reparse_ancestors(parent)?;
     fs::create_dir_all(parent)
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
-    deadline.remaining()?;
+    lease.check(deadline)?;
 
-    let temp_path = next_temp_path(output, parent, deadline)?;
+    let temp_path = next_temp_path(output, parent, deadline, lease)?;
+    reject_reparse_ancestors(&temp_path)?;
     let mut temp = TempOutput::new(temp_path.clone(), output.to_path_buf());
-    deadline.remaining()?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+    lease.check(deadline)?;
+    let mut file = open_temp_output(&temp_path).map_err(|error| {
+        PreviewCaptureError::OutputFailed(format!("preview temp open failed: {error}"))
+    })?;
 
     let mut rgba = Vec::with_capacity(expected_bytes);
     for pixel in bgra.chunks_exact(4) {
-        deadline.remaining()?;
+        lease.check(deadline)?;
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
 
     {
-        deadline.remaining()?;
+        lease.check(deadline)?;
         let encoder = image::codecs::png::PngEncoder::new(&mut file);
         encoder
             .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
             .map_err(|error| PreviewCaptureError::PngFailed(error.to_string()))?;
     }
 
-    deadline.remaining()?;
+    lease.check(deadline)?;
     file.sync_all()
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
-    deadline.remaining()?;
-    drop(file);
+    lease.check(deadline)?;
+    lease.check(deadline)?;
     if output.exists() {
         return Err(PreviewCaptureError::OutputAlreadyExists);
     }
-    fs::rename(&temp_path, output)
+    lease.begin_publication(deadline)?;
+    atomic_publish_temp(&temp_path, output, &file)
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
     temp.renamed = true;
-    deadline.remaining()?;
+    drop(file);
+    if deadline.remaining().is_err() {
+        lease.cancel();
+        return Err(PreviewCaptureError::DeadlineExceeded);
+    }
+    if !lease.finish_publication() {
+        return Err(PreviewCaptureError::CaptureCancelled);
+    }
     temp.committed = true;
+    Ok(())
+}
+
+fn open_temp_output(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.access_mode(
+            windows::Win32::Storage::FileSystem::FILE_GENERIC_READ.0
+                | windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE.0
+                | windows::Win32::Storage::FileSystem::DELETE.0,
+        );
+        options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    options.open(path)
+}
+
+/// Publish a fully synced temporary PNG without following a reparse point at
+/// the final file boundary.  Windows uses the open temporary-file handle and
+/// a no-follow parent handle for the rename; this avoids resolving a swapped
+/// destination path after the validation pass.  Other platforms retain the
+/// native atomic same-directory rename.
+fn atomic_publish_temp(temp: &Path, output: &Path, file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        return atomic_publish_temp_windows(temp, output, file);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        fs::rename(temp, output)
+    }
+}
+
+#[cfg(windows)]
+fn atomic_publish_temp_windows(
+    temp: &Path,
+    output: &Path,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileRenameInfo, GetFileInformationByHandle, SetFileInformationByHandle,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let parent = output.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PNG output has no parent directory",
+        )
+    })?;
+    let file_name = output.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PNG output has no file name",
+        )
+    })?;
+    let file_name: Vec<u16> = file_name.encode_wide().collect();
+    let parent_wide: Vec<u16> = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let parent_handle = unsafe {
+        windows::Win32::Storage::FileSystem::CreateFileW(
+            windows::core::PCWSTR(parent_wide.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|error| windows_io_error("preview parent open", error))?;
+    let parent_handle =
+        unsafe { OwnedHandle::from_raw_handle(parent_handle.0 as *mut std::ffi::c_void) };
+
+    let mut parent_information =
+        windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(
+            HANDLE(parent_handle.as_raw_handle()),
+            &mut parent_information,
+        )
+    }
+    .map_err(|error| windows_io_error("preview parent identity", error))?;
+    if parent_information.dwFileAttributes
+        & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+        != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "PNG output parent is a reparse point",
+        ));
+    }
+
+    let file_handle = HANDLE(file.as_raw_handle());
+
+    let bytes = file_name.len().checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name too long")
+    })?;
+    let header = std::mem::size_of::<windows::Win32::Storage::FileSystem::FILE_RENAME_INFO>();
+    let total = header.checked_add(bytes).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name too long")
+    })?;
+    let word_count = total
+        .checked_add(std::mem::align_of::<u64>() - 1)
+        .map(|size| size / std::mem::align_of::<u64>())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name too long")
+        })?;
+    let mut rename = vec![0_u64; word_count];
+    let info = rename.as_mut_ptr() as *mut windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE(parent_handle.as_raw_handle());
+        (*info).FileNameLength = u32::try_from(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name too long")
+        })?;
+        std::ptr::copy_nonoverlapping(
+            file_name.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            file_name.len(),
+        );
+        let result = SetFileInformationByHandle(
+            file_handle,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(total).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name too long")
+            })?,
+        );
+        if let Err(error) = result {
+            // A small set of older Windows filesystems reject a relative
+            // FILE_RENAME_INFO even when the handles are valid.  Preserve the
+            // no-overwrite contract with MoveFileExW (without
+            // MOVEFILE_REPLACE_EXISTING) rather than falling back to a
+            // replacing std::fs::rename.  The parent was already opened
+            // with OPEN_REPARSE_POINT and checked above.
+            if error.code().0 == -2_147_024_809 {
+                return atomic_publish_temp_windows_fallback(temp, output);
+            }
+            return Err(windows_io_error("preview relative rename", error));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_publish_temp_windows_fallback(temp: &Path, output: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let temp_wide: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let output_wide: Vec<u16> = output
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(temp_wide.as_ptr()),
+            windows::core::PCWSTR(output_wide.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| windows_io_error("preview fallback rename", error))
+}
+
+#[cfg(windows)]
+fn windows_io_error(stage: &str, error: windows::core::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("{stage} failed ({})", error.code().0),
+    )
+}
+
+fn reject_reparse_ancestors(path: &Path) -> Result<(), PreviewCaptureError> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            let metadata = fs::symlink_metadata(&current).map_err(|_error| {
+                PreviewCaptureError::OutputFailed("output path could not be inspected".into())
+            })?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes()
+                    & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                    != 0
+                {
+                    return Err(PreviewCaptureError::OutputFailed(
+                        "output path contains a reparse-point ancestor".into(),
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            if metadata.file_type().is_symlink() {
+                return Err(PreviewCaptureError::OutputFailed(
+                    "output path contains a symbolic-link ancestor".into(),
+                ));
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
     Ok(())
 }
 
@@ -628,13 +1137,14 @@ fn next_temp_path(
     output: &Path,
     parent: &Path,
     deadline: CaptureDeadline,
+    lease: &CaptureLease,
 ) -> Result<PathBuf, PreviewCaptureError> {
     let stem = output
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("preview");
     for _ in 0..32 {
-        deadline.remaining()?;
+        lease.check(deadline)?;
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{stem}.{counter}.tmp"));
         if !candidate.exists() {
@@ -683,10 +1193,8 @@ mod windows_capture_impl {
         WindowOptions,
     };
     use raw_window_handle::RawWindowHandle;
-    use std::cell::RefCell;
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::rc::Rc;
     use std::sync::mpsc::{self, SyncSender};
     use std::sync::Arc;
     use windows::Win32::Foundation::{HWND, RECT};
@@ -732,11 +1240,14 @@ mod windows_capture_impl {
     struct FirstFrameHandler {
         sender: SyncSender<Result<CapturedFrame, HandlerError>>,
         hwnd: NativeHwnd,
+        lease: CaptureLease,
     }
 
     impl FirstFrameHandler {
         fn send_error(&self, error: PreviewCaptureError, capture_control: InternalCaptureControl) {
-            let _ = self.sender.try_send(Err(HandlerError(error)));
+            if self.lease.is_active() {
+                let _ = self.sender.try_send(Err(HandlerError(error)));
+            }
             capture_control.stop();
         }
     }
@@ -753,8 +1264,12 @@ mod windows_capture_impl {
 
     fn store_capture_result(
         slot: &Arc<Mutex<Option<Result<CaptureReport, PreviewCaptureError>>>>,
+        lease: &CaptureLease,
         result: Result<CaptureReport, PreviewCaptureError>,
     ) {
+        if !lease.is_active() {
+            return;
+        }
         let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.is_none() {
             *slot = Some(result);
@@ -762,13 +1277,18 @@ mod windows_capture_impl {
     }
 
     impl GraphicsCaptureApiHandler for FirstFrameHandler {
-        type Flags = (SyncSender<Result<CapturedFrame, HandlerError>>, NativeHwnd);
+        type Flags = (
+            SyncSender<Result<CapturedFrame, HandlerError>>,
+            NativeHwnd,
+            CaptureLease,
+        );
         type Error = HandlerError;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
             Ok(Self {
                 sender: ctx.flags.0,
                 hwnd: ctx.flags.1,
+                lease: ctx.flags.2,
             })
         }
 
@@ -777,6 +1297,10 @@ mod windows_capture_impl {
             frame: &mut Frame,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
+            if !self.lease.is_active() {
+                capture_control.stop();
+                return Ok(());
+            }
             if let Err(error) = validate_native_window(self.hwnd) {
                 self.send_error(error, capture_control);
                 return Ok(());
@@ -814,6 +1338,10 @@ mod windows_capture_impl {
                 return Ok(());
             }
 
+            if !self.lease.is_active() {
+                capture_control.stop();
+                return Ok(());
+            }
             let _ = self.sender.try_send(Ok(CapturedFrame {
                 width,
                 height,
@@ -824,9 +1352,11 @@ mod windows_capture_impl {
         }
 
         fn on_closed(&mut self) -> Result<(), Self::Error> {
-            let _ = self
-                .sender
-                .try_send(Err(HandlerError(PreviewCaptureError::CaptureClosed)));
+            if self.lease.is_active() {
+                let _ = self
+                    .sender
+                    .try_send(Err(HandlerError(PreviewCaptureError::CaptureClosed)));
+            }
             Ok(())
         }
     }
@@ -934,23 +1464,40 @@ mod windows_capture_impl {
     }
 
     type CaptureSettings = Settings<
-        (SyncSender<Result<CapturedFrame, HandlerError>>, NativeHwnd),
+        (
+            SyncSender<Result<CapturedFrame, HandlerError>>,
+            NativeHwnd,
+            CaptureLease,
+        ),
         windows_capture::window::Window,
     >;
 
     fn start_capture(
         settings: CaptureSettings,
         deadline: CaptureDeadline,
+        lease: &CaptureLease,
     ) -> Result<StartedCapture, PreviewCaptureError> {
+        lease.check(deadline)?;
+        let lease_for_worker = lease.clone();
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::Builder::new()
             .name("devmanager-capture-start".into())
             .spawn(move || {
+                if !lease_for_worker.is_active() {
+                    let _ = result_sender.send(Err(PreviewCaptureError::CaptureCancelled));
+                    return;
+                }
                 let active = ActiveCaptureGuard::new();
                 let result = FirstFrameHandler::start_free_threaded(settings)
                     .map_err(map_graphics_capture_error);
                 match result {
                     Ok(control) => {
+                        if !lease_for_worker.is_active() {
+                            drop(CaptureControlGuard::new(control, deadline));
+                            drop(active);
+                            let _ = result_sender.send(Err(PreviewCaptureError::CaptureCancelled));
+                            return;
+                        }
                         let started = StartedCapture {
                             control: CaptureControlGuard::new(control, deadline),
                             active,
@@ -983,6 +1530,7 @@ mod windows_capture_impl {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    lease.cancel();
                     retain_cleanup_reaper(waiter);
                     Err(PreviewCaptureError::DeadlineExceeded)
                 }
@@ -994,6 +1542,7 @@ mod windows_capture_impl {
                 }
             },
             Err(error) => {
+                lease.cancel();
                 retain_cleanup_reaper(waiter);
                 Err(error)
             }
@@ -1071,8 +1620,9 @@ mod windows_capture_impl {
         hwnd: NativeHwnd,
         expected_foreground: isize,
         deadline: CaptureDeadline,
+        lease: &CaptureLease,
     ) -> Result<ValidatedWindow, PreviewCaptureError> {
-        deadline.remaining()?;
+        lease.check(deadline)?;
         let hwnd = hwnd.as_hwnd();
         let existing_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
         let requested_style = existing_style | WS_EX_NOACTIVATE.0 as isize;
@@ -1117,7 +1667,7 @@ mod windows_capture_impl {
             ));
         }
         let validated = validate_native_window(NativeHwnd(hwnd.0 as isize))?;
-        deadline.remaining()?;
+        lease.check(deadline)?;
         Ok(validated)
     }
 
@@ -1139,9 +1689,10 @@ mod windows_capture_impl {
         output: PathBuf,
         expected_foreground: isize,
         deadline: CaptureDeadline,
+        lease: CaptureLease,
     ) -> Result<CaptureReport, PreviewCaptureError> {
         let _validated = validate_native_window(hwnd)?;
-        deadline.remaining()?;
+        lease.check(deadline)?;
         let contract = capture_contract();
         let (sender, receiver) = mpsc::sync_channel(1);
         let settings = Settings::new(
@@ -1160,13 +1711,13 @@ mod windows_capture_impl {
             match contract.color_format {
                 CaptureColorFormat::Bgra8 => ColorFormat::Bgra8,
             },
-            (sender, hwnd),
+            (sender, hwnd, lease.clone()),
         );
 
-        let started = start_capture(settings, deadline)?;
+        let started = start_capture(settings, deadline, &lease)?;
         let frame = settle_capture(
             started,
-            match receive_first_frame(receiver, deadline) {
+            match receive_first_frame_with_lease(receiver, deadline, &lease) {
                 Ok(Ok(frame)) => Ok(frame),
                 Ok(Err(error)) => Err(error.into_capture_error()),
                 Err(error) => Err(error),
@@ -1174,7 +1725,7 @@ mod windows_capture_impl {
             deadline,
         )?;
 
-        deadline.remaining()?;
+        lease.check(deadline)?;
         let after = foreground_hwnd();
         if after != expected_foreground {
             return Err(PreviewCaptureError::ForegroundChanged {
@@ -1182,17 +1733,16 @@ mod windows_capture_impl {
                 after,
             });
         }
-        deadline.remaining()?;
+        lease.check(deadline)?;
         encode_bgra_png_atomic_owned(
             output.clone(),
             frame.width,
             frame.height,
             frame.bgra,
             deadline,
+            lease.clone(),
         )?;
-        if let Err(error) = deadline.remaining() {
-            return Err(cleanup_output_after_deadline(&output, error, deadline));
-        }
+        lease.check(deadline)?;
         Ok(CaptureReport {
             width: frame.width,
             height: frame.height,
@@ -1209,152 +1759,218 @@ mod windows_capture_impl {
         let deadline = CaptureDeadline::from_now(FIRST_FRAME_DEADLINE);
         deadline.remaining()?;
         let foreground_before = foreground_hwnd();
-        let result_slot = Arc::new(std::sync::Mutex::new(None));
-        let result_for_app = Arc::clone(&result_slot);
-        let hwnd_slot = Rc::new(RefCell::new(None));
-        let hwnd_for_window = Rc::clone(&hwnd_slot);
-        let result_for_window = Arc::clone(&result_for_app);
-        let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
-        deadline.remaining()?;
-        let output_for_cleanup = output.clone();
-
-        let run_result = catch_unwind(AssertUnwindSafe(|| {
-            application.run(move |cx| {
-                crate::ui::preview::register_preview_environment(cx);
-                let result_for_supervisor = Arc::clone(&result_for_app);
-                let supervisor_executor = cx.background_executor().clone();
-                let supervision_task = cx.spawn(async move |cx| {
-                    supervisor_executor
-                        .timer(deadline.remaining().unwrap_or_default())
-                        .await;
-                    let should_quit = {
-                        let mut result = result_for_supervisor
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if result.is_none() {
-                            *result = Some(Err(PreviewCaptureError::DeadlineExceeded));
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if should_quit {
-                        let _ = cx.update(|cx| cx.quit());
-                    }
+        let generation = CaptureGeneration::new();
+        let lease = generation.begin();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker_lease = lease.clone();
+        let worker = std::thread::Builder::new()
+            .name("devmanager-preview-application".into())
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    run_preview_application(
+                        root,
+                        output,
+                        foreground_before,
+                        deadline,
+                        worker_lease.clone(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(PreviewCaptureError::ApplicationFailed(
+                        "the visible GPUI preview could not start on this desktop".into(),
+                    ))
                 });
-                cx.set_global(CaptureDeadlineTask(supervision_task));
-                let root_entity = cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                            None,
-                            size(
-                                px(PREVIEW_WINDOW_WIDTH as f32),
-                                px(PREVIEW_WINDOW_HEIGHT as f32),
-                            ),
-                            cx,
-                        ))),
-                        titlebar: None,
-                        focus: false,
-                        show: false,
-                        kind: WindowKind::PopUp,
-                        is_movable: false,
-                        is_resizable: false,
-                        is_minimizable: false,
-                        window_background: WindowBackgroundAppearance::Opaque,
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        match hwnd_from_gpui_window(window) {
-                            Ok(hwnd) => *hwnd_for_window.borrow_mut() = Some(hwnd),
-                            Err(error) => {
-                                store_capture_result(&result_for_window, Err(error));
-                            }
-                        }
-                        cx.new(|_| root)
-                    },
-                );
+                let _ = result_sender.send(result);
+            })
+            .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
 
-                let hwnd = match root_entity {
-                    Ok(_) => match *hwnd_slot.borrow() {
-                        Some(hwnd) => hwnd,
-                        None => {
-                            store_capture_result(
-                                &result_for_app,
-                                Err(PreviewCaptureError::ApplicationFailed(
-                                    "GPUI did not expose a Windows HWND".into(),
-                                )),
-                            );
-                            cx.quit();
-                            return;
+        match result_receiver.recv_timeout(deadline.remaining()?) {
+            Ok(result) if lease.is_active() => {
+                retain_or_join_cleanup_worker(worker);
+                settle_capture_result(request.output_path(), result, deadline)
+            }
+            Ok(result) => {
+                lease.cancel();
+                retain_or_join_cleanup_worker(worker);
+                let _ = result;
+                let _ = cleanup_output_after_deadline(
+                    request.output_path(),
+                    PreviewCaptureError::CaptureCancelled,
+                    deadline,
+                );
+                Err(PreviewCaptureError::CaptureCancelled)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                lease.cancel();
+                retain_cleanup_reaper(worker);
+                let _ = cleanup_output_after_deadline(
+                    request.output_path(),
+                    PreviewCaptureError::DeadlineExceeded,
+                    deadline,
+                );
+                Err(PreviewCaptureError::DeadlineExceeded)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                lease.cancel();
+                retain_or_join_cleanup_worker(worker);
+                let _ = cleanup_output_after_deadline(
+                    request.output_path(),
+                    PreviewCaptureError::CaptureClosed,
+                    deadline,
+                );
+                Err(PreviewCaptureError::CaptureFailed(
+                    "preview application worker stopped without reporting a result".into(),
+                ))
+            }
+        }
+    }
+
+    fn run_preview_application(
+        root: PreviewRoot,
+        output: PathBuf,
+        foreground_before: isize,
+        deadline: CaptureDeadline,
+        lease: CaptureLease,
+    ) -> Result<CaptureReport, PreviewCaptureError> {
+        lease.check(deadline)?;
+        let result_slot = Arc::new(Mutex::new(None));
+        let result_for_app = Arc::clone(&result_slot);
+        let hwnd_slot = Arc::new(Mutex::new(None));
+        let hwnd_for_window = Arc::clone(&hwnd_slot);
+        let result_for_window = Arc::clone(&result_for_app);
+        let lease_for_app = lease.clone();
+        let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
+        application.run(move |cx| {
+            crate::ui::preview::register_preview_environment(cx);
+            let result_for_supervisor = Arc::clone(&result_for_app);
+            let supervisor_lease = lease_for_app.clone();
+            let supervisor_executor = cx.background_executor().clone();
+            let supervision_task = cx.spawn(async move |cx| {
+                supervisor_executor
+                    .timer(deadline.remaining().unwrap_or_default())
+                    .await;
+                supervisor_lease.cancel();
+                let should_quit = {
+                    let mut result = result_for_supervisor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if result.is_none() {
+                        *result = Some(Err(PreviewCaptureError::DeadlineExceeded));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_quit {
+                    let _ = cx.update(|cx| cx.quit());
+                }
+            });
+            cx.set_global(CaptureDeadlineTask(supervision_task));
+            let window_lease = lease_for_app.clone();
+            let root_entity = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(
+                            px(PREVIEW_WINDOW_WIDTH as f32),
+                            px(PREVIEW_WINDOW_HEIGHT as f32),
+                        ),
+                        cx,
+                    ))),
+                    titlebar: None,
+                    focus: false,
+                    show: false,
+                    kind: WindowKind::PopUp,
+                    is_movable: false,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    window_background: WindowBackgroundAppearance::Opaque,
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    match hwnd_from_gpui_window(window) {
+                        Ok(hwnd) => {
+                            *hwnd_for_window
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hwnd)
                         }
-                    },
-                    Err(error) => {
+                        Err(error) => {
+                            store_capture_result(&result_for_window, &window_lease, Err(error));
+                        }
+                    }
+                    cx.new(|_| root)
+                },
+            );
+
+            let hwnd = match root_entity {
+                Ok(_) => match *hwnd_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                {
+                    Some(hwnd) => hwnd,
+                    None => {
                         store_capture_result(
                             &result_for_app,
-                            Err(PreviewCaptureError::ApplicationFailed(error.to_string())),
+                            &lease_for_app,
+                            Err(PreviewCaptureError::ApplicationFailed(
+                                "GPUI did not expose a Windows HWND".into(),
+                            )),
                         );
                         cx.quit();
                         return;
                     }
-                };
-                if result_for_app.lock().unwrap().is_some() {
+                },
+                Err(error) => {
+                    store_capture_result(
+                        &result_for_app,
+                        &lease_for_app,
+                        Err(PreviewCaptureError::ApplicationFailed(error.to_string())),
+                    );
                     cx.quit();
                     return;
                 }
-
-                if let Err(error) = configure_native_window(hwnd, foreground_before, deadline) {
-                    store_capture_result(&result_for_app, Err(error));
-                    cx.quit();
-                    return;
-                }
-
-                let result_for_task = Arc::clone(&result_for_app);
-                let output_for_late_cleanup = output.clone();
-                let capture_task = cx.background_executor().spawn(async move {
-                    capture_window_once(hwnd, output, foreground_before, deadline)
-                });
-                let notification_task = cx.spawn(async move |cx| {
-                    let result = capture_task.await;
-                    let result = if deadline.remaining().is_err() {
-                        Err(cleanup_output_after_deadline(
-                            &output_for_late_cleanup,
-                            PreviewCaptureError::DeadlineExceeded,
-                            deadline,
-                        ))
-                    } else {
-                        result
-                    };
-                    store_capture_result(&result_for_task, result);
-                    let _ = cx.update(|cx| cx.quit());
-                });
-                cx.set_global(CaptureNotificationTask(notification_task));
-            });
-        }));
-
-        if run_result.is_err() {
-            let error = if deadline.remaining().is_err() {
-                PreviewCaptureError::DeadlineExceeded
-            } else {
-                PreviewCaptureError::ApplicationFailed(
-                    "the visible GPUI preview could not start on this desktop".into(),
-                )
             };
-            return Err(cleanup_output_after_deadline(
-                &output_for_cleanup,
-                error,
-                deadline,
-            ));
-        }
-        let result = match result_slot.lock().unwrap().take() {
-            Some(result) => result,
-            None => match deadline.remaining() {
-                Ok(_) => Err(PreviewCaptureError::ApplicationFailed(
-                    "the GPUI preview application stopped without a capture result".into(),
-                )),
-                Err(error) => Err(error),
-            },
-        };
-        settle_capture_result(&output_for_cleanup, result, deadline)
+            if !lease_for_app.is_active() {
+                cx.quit();
+                return;
+            }
+
+            if let Err(error) =
+                configure_native_window(hwnd, foreground_before, deadline, &lease_for_app)
+            {
+                store_capture_result(&result_for_app, &lease_for_app, Err(error));
+                cx.quit();
+                return;
+            }
+
+            let result_for_task = Arc::clone(&result_for_app);
+            let capture_lease = lease_for_app.clone();
+            let capture_task = cx.background_executor().spawn(async move {
+                capture_window_once(hwnd, output, foreground_before, deadline, capture_lease)
+            });
+            let notification_lease = lease_for_app.clone();
+            let notification_task = cx.spawn(async move |cx| {
+                let result = capture_task.await;
+                store_capture_result(&result_for_task, &notification_lease, result);
+                let _ = cx.update(|cx| cx.quit());
+            });
+            cx.set_global(CaptureNotificationTask(notification_task));
+        });
+
+        let result = result_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| {
+                if lease.is_active() {
+                    Err(PreviewCaptureError::ApplicationFailed(
+                        "the GPUI preview application stopped without a capture result".into(),
+                    ))
+                } else {
+                    Err(PreviewCaptureError::CaptureCancelled)
+                }
+            });
+        result
     }
 
     trait NativeHwndExt {
