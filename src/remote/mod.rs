@@ -1316,6 +1316,7 @@ pub(crate) fn mutate_host_config_if<T>(
         return Ok(None);
     };
 
+    flush_host_config_persistence(inner);
     if let Err(error) = persist_host_config_snapshot(&snapshot) {
         if let Ok(mut config) = inner.config.write() {
             *config = previous;
@@ -1344,6 +1345,7 @@ pub(crate) fn mutate_host_config<T>(
         (result, config.clone(), previous)
     };
 
+    flush_host_config_persistence(inner);
     if let Err(error) = persist_host_config_snapshot(&snapshot) {
         if let Ok(mut config) = inner.config.write() {
             *config = previous;
@@ -1353,6 +1355,84 @@ pub(crate) fn mutate_host_config<T>(
 
     bump_host_config_revision(inner);
     Ok(result)
+}
+
+fn flush_pending_host_config_snapshots(pending: &Arc<Mutex<Option<RemoteHostConfig>>>) {
+    loop {
+        let snapshot = pending.lock().ok().and_then(|mut pending| pending.take());
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        if let Err(error) = persist_host_config_snapshot(&snapshot) {
+            eprintln!("[remote] failed to persist host config snapshot: {error}");
+        }
+    }
+}
+
+fn queue_host_config_snapshot(inner: &Arc<RemoteHostInner>, snapshot: RemoteHostConfig) {
+    if let Ok(worker) = inner.host_persistence_worker.lock() {
+        if let Some(worker) = worker.as_ref() {
+            worker.queue(snapshot);
+        }
+    }
+}
+
+fn flush_host_config_persistence(inner: &Arc<RemoteHostInner>) {
+    if let Ok(worker) = inner.host_persistence_worker.lock() {
+        if let Some(worker) = worker.as_ref() {
+            worker.flush();
+        }
+    }
+}
+
+fn record_native_connection_activity(
+    inner: &Arc<RemoteHostInner>,
+    client_id: String,
+    label: String,
+    ip_address: Option<String>,
+) -> Result<(), String> {
+    let _update_guard = inner
+        .config_update_lock
+        .lock()
+        .map_err(|_| "host config update unavailable".to_string())?;
+    let snapshot = {
+        let mut config = inner
+            .config
+            .write()
+            .map_err(|_| "host config unavailable".to_string())?;
+        let had_previous_connect = config.web.activity_log.iter().any(|event| {
+            event.source == RemoteAccessSource::NativeApp
+                && event.client_id == client_id
+                && matches!(
+                    event.event_kind,
+                    RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
+                )
+        });
+        append_remote_access_activity_event(
+            &mut config,
+            RemoteAccessActivityEvent {
+                client_id,
+                source: RemoteAccessSource::NativeApp,
+                event_kind: if had_previous_connect {
+                    RemoteAccessActivityKind::Reconnected
+                } else {
+                    RemoteAccessActivityKind::Connected
+                },
+                label,
+                ip_address,
+                event_at_epoch_ms: Some(now_epoch_ms()),
+                browser_family: None,
+                browser_version: None,
+                os_family: None,
+                device_class: Some("desktop".to_string()),
+            },
+        );
+        let snapshot = config.clone();
+        bump_host_config_revision(inner);
+        snapshot
+    };
+    queue_host_config_snapshot(inner, snapshot);
+    Ok(())
 }
 
 pub(crate) fn append_remote_access_activity_event(
@@ -1453,12 +1533,96 @@ pub struct RemoteHostService {
     _lifetime_owner: Option<RemoteHostServiceOwner>,
 }
 
+struct NativeConnectionWorker {
+    done: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+struct NativeConnectionWorkerDone(Arc<AtomicBool>);
+
+impl Drop for NativeConnectionWorkerDone {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+enum HostPersistenceWake {
+    Work,
+    Flush(mpsc::SyncSender<()>),
+    Stop,
+}
+
+struct HostPersistenceWorker {
+    wake_tx: mpsc::SyncSender<HostPersistenceWake>,
+    pending: Arc<Mutex<Option<RemoteHostConfig>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HostPersistenceWorker {
+    fn new() -> Self {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let pending = Arc::new(Mutex::new(None));
+        let worker_pending = pending.clone();
+        let handle = thread::spawn(move || {
+            while let Ok(wake) = wake_rx.recv() {
+                let should_stop = matches!(&wake, HostPersistenceWake::Stop);
+                let flush_ack = match wake {
+                    HostPersistenceWake::Flush(ack) => Some(ack),
+                    HostPersistenceWake::Work | HostPersistenceWake::Stop => None,
+                };
+                flush_pending_host_config_snapshots(&worker_pending);
+                if let Some(ack) = flush_ack {
+                    let _ = ack.send(());
+                }
+                if should_stop {
+                    break;
+                }
+            }
+        });
+        Self {
+            wake_tx,
+            pending,
+            handle: Some(handle),
+        }
+    }
+
+    fn queue(&self, snapshot: RemoteHostConfig) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = Some(snapshot);
+        }
+        let _ = self.wake_tx.try_send(HostPersistenceWake::Work);
+    }
+
+    fn flush(&self) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        if self
+            .wake_tx
+            .send(HostPersistenceWake::Flush(ack_tx))
+            .is_ok()
+        {
+            let _ = ack_rx.recv();
+        }
+    }
+
+    fn shutdown(mut self) {
+        let _ = self.wake_tx.send(HostPersistenceWake::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct RemoteHostServiceOwner {
     inner: Arc<RemoteHostInner>,
 }
 
 impl Drop for RemoteHostServiceOwner {
     fn drop(&mut self) {
+        let _lifecycle_guard = self
+            .inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner
             .native_runtime_generation
             .fetch_add(1, Ordering::SeqCst);
@@ -1531,6 +1695,16 @@ impl Drop for RemoteHostServiceOwner {
         }
         if let Some(thread) = broadcaster_thread {
             let _ = thread.join();
+        }
+        join_all_native_connection_workers(&self.inner);
+        if let Some(worker) = self
+            .inner
+            .host_persistence_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            worker.shutdown();
         }
     }
 }
@@ -1630,6 +1804,10 @@ struct ReconciledCodexProviderKey {
 pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
     config_update_lock: Mutex<()>,
+    /// Serializes listener/runtime restarts without holding the config update
+    /// lock across worker joins. Native workers may need that config lock while
+    /// completing their disconnect cleanup.
+    lifecycle_lock: Mutex<()>,
     config_revision: AtomicU64,
     /// Coordinates publication of workspace state with browser snapshot
     /// capture so a revision always describes the state sent with it.
@@ -1687,6 +1865,8 @@ pub(crate) struct RemoteHostInner {
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
     broadcaster_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    native_connection_workers: Mutex<HashMap<u64, NativeConnectionWorker>>,
+    host_persistence_worker: Mutex<Option<HostPersistenceWorker>>,
     // Both fields are written on lifecycle transitions and (Phase 1b+)
     // surfaced through the settings panel; suppress the transient warning.
     #[allow(dead_code)]
@@ -1865,6 +2045,7 @@ impl RemoteHostService {
         let inner = Arc::new(RemoteHostInner {
             config: RwLock::new(config.clone()),
             config_update_lock: Mutex::new(()),
+            lifecycle_lock: Mutex::new(()),
             config_revision: AtomicU64::new(1),
             snapshot_state_lock: Mutex::new(()),
             snapshot_revision: AtomicU64::new(1),
@@ -1908,6 +2089,8 @@ impl RemoteHostService {
             stop_flag: AtomicBool::new(false),
             listener_thread: Mutex::new(None),
             broadcaster_thread: Mutex::new(None),
+            native_connection_workers: Mutex::new(HashMap::new()),
+            host_persistence_worker: Mutex::new(Some(HostPersistenceWorker::new())),
             web_listener: Mutex::new(None),
             web_listener_error: RwLock::new(None),
         });
@@ -1943,13 +2126,16 @@ impl RemoteHostService {
         let mut config = config;
         config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
-        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
-            return;
-        };
-        if let Ok(mut slot) = self.inner.config.write() {
-            *slot = config;
+        {
+            let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
+                return;
+            };
+            flush_host_config_persistence(&self.inner);
+            if let Ok(mut slot) = self.inner.config.write() {
+                *slot = config;
+            }
+            self.bump_config_revision();
         }
-        self.bump_config_revision();
         self.restart_threads();
     }
 
@@ -3493,6 +3679,11 @@ impl RemoteHostService {
     }
 
     fn restart_threads(&self) {
+        let _lifecycle_guard = self
+            .inner
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner
             .native_runtime_generation
             .fetch_add(1, Ordering::SeqCst);
@@ -3517,6 +3708,7 @@ impl RemoteHostService {
                 let _ = thread.join();
             }
         }
+        join_all_native_connection_workers(&self.inner);
         // Stop accepting browser connections first. Tokio shutdown may cancel
         // WebSocket tasks before their async unregister tail runs, so drain
         // any records left behind immediately afterwards. This ordering also
@@ -4326,6 +4518,69 @@ fn native_connection_should_stop(inner: &RemoteHostInner, native_runtime_generat
         || inner.native_runtime_generation.load(Ordering::Acquire) != native_runtime_generation
 }
 
+fn spawn_native_connection_worker(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    stream: TcpStream,
+    native_runtime_generation: u64,
+) {
+    let done = Arc::new(AtomicBool::new(false));
+    let worker_done = done.clone();
+    let thread_inner = inner.clone();
+    let handle = thread::spawn(move || {
+        let _done = NativeConnectionWorkerDone(worker_done);
+        handle_client_connection(
+            thread_inner,
+            connection_id,
+            stream,
+            native_runtime_generation,
+        );
+    });
+    let mut workers = inner
+        .native_connection_workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    workers.insert(connection_id, NativeConnectionWorker { done, handle });
+}
+
+fn reap_completed_native_connection_workers(inner: &Arc<RemoteHostInner>) {
+    let completed = {
+        let mut workers = inner
+            .native_connection_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let completed_ids = workers
+            .iter()
+            .filter_map(|(connection_id, worker)| {
+                worker
+                    .done
+                    .load(Ordering::Acquire)
+                    .then_some(*connection_id)
+            })
+            .collect::<Vec<_>>();
+        completed_ids
+            .into_iter()
+            .filter_map(|connection_id| workers.remove(&connection_id))
+            .collect::<Vec<_>>()
+    };
+    for worker in completed {
+        let _ = worker.handle.join();
+    }
+}
+
+fn join_all_native_connection_workers(inner: &Arc<RemoteHostInner>) {
+    let workers = inner
+        .native_connection_workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .map(|(_, worker)| worker)
+        .collect::<Vec<_>>();
+    for worker in workers {
+        let _ = worker.handle.join();
+    }
+}
+
 fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
     let config = inner
         .config
@@ -4356,18 +4611,16 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
     let _ = listener.set_nonblocking(true);
 
     while !native_connection_should_stop(&inner, native_runtime_generation) {
+        reap_completed_native_connection_workers(&inner);
         match listener.accept() {
             Ok((stream, _)) => {
                 let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
-                let thread_inner = inner.clone();
-                thread::spawn(move || {
-                    handle_client_connection(
-                        thread_inner,
-                        connection_id,
-                        stream,
-                        native_runtime_generation,
-                    )
-                });
+                spawn_native_connection_worker(
+                    &inner,
+                    connection_id,
+                    stream,
+                    native_runtime_generation,
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -4385,6 +4638,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
     let mut last_bootstrap_retry_at: HashMap<String, Instant> = HashMap::new();
 
     while !inner.stop_flag.load(Ordering::Relaxed) {
+        reap_completed_native_connection_workers(&inner);
         let connected_clients = inner
             .clients
             .lock()
@@ -4767,35 +5021,12 @@ fn handle_client_connection(
         }
         return;
     }
-    if let Err(error) = mutate_host_config(&inner, |config| {
-        let had_previous_connect = config.web.activity_log.iter().any(|event| {
-            event.source == RemoteAccessSource::NativeApp
-                && event.client_id == client_id
-                && matches!(
-                    event.event_kind,
-                    RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
-                )
-        });
-        append_remote_access_activity_event(
-            config,
-            RemoteAccessActivityEvent {
-                client_id: client_id.clone(),
-                source: RemoteAccessSource::NativeApp,
-                event_kind: if had_previous_connect {
-                    RemoteAccessActivityKind::Reconnected
-                } else {
-                    RemoteAccessActivityKind::Connected
-                },
-                label: client_label.clone(),
-                ip_address: peer_ip.clone(),
-                event_at_epoch_ms: Some(now_epoch_ms()),
-                browser_family: None,
-                browser_version: None,
-                os_family: None,
-                device_class: Some("desktop".to_string()),
-            },
-        );
-    }) {
+    if let Err(error) = record_native_connection_activity(
+        &inner,
+        client_id.clone(),
+        client_label.clone(),
+        peer_ip.clone(),
+    ) {
         eprintln!(
             "[remote] failed to persist native access log for {client_id} from {peer_label}: {error}"
         );
@@ -8942,6 +9173,7 @@ mod tests {
 
     #[test]
     fn loopback_host_and_client_complete_remote_handshake() {
+        let _profile = TestProfileGuard::new("loopback-handshake");
         let port = reserve_free_tcp_port();
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -8995,6 +9227,7 @@ mod tests {
 
     #[test]
     fn native_client_receives_output_while_bootstrap_lookup_blocks() {
+        let _profile = TestProfileGuard::new("native-bootstrap-output");
         let port = reserve_free_tcp_port();
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -9337,6 +9570,7 @@ mod tests {
 
     #[test]
     fn port_forward_tunnels_bytes_to_a_live_managed_server_port() {
+        let _profile = TestProfileGuard::new("live-port-forward");
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
 
@@ -9393,6 +9627,7 @@ mod tests {
 
     #[test]
     fn dropping_root_service_stops_an_active_native_port_forward() {
+        let _profile = TestProfileGuard::new("drop-native-port-forward");
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
 
@@ -9442,12 +9677,132 @@ mod tests {
 
         drop(root);
 
-        wait_for(
-            || inner.upgrade().is_none(),
-            Duration::from_secs(2),
-            "active native port forward retained the stopped host runtime",
+        let teardown_deadline = Instant::now() + Duration::from_secs(2);
+        while inner.upgrade().is_some() && Instant::now() < teardown_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let diagnostics = inner.upgrade().map(|inner| {
+            let service = RemoteHostService::borrowed(inner.clone());
+            (
+                Arc::strong_count(&inner),
+                service.status().connected_clients,
+                service.status().last_connection_note,
+            )
+        });
+        assert!(
+            diagnostics.is_none(),
+            "active native port forward retained the stopped host runtime: {diagnostics:?}"
         );
         client.client.disconnect();
+    }
+
+    #[test]
+    fn serial_native_lifecycle_settles_before_next_handshake() {
+        let _profile = TestProfileGuard::new("serial-native-lifecycle");
+
+        let first_port = reserve_free_tcp_port();
+        let first_config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: first_port,
+            ..RemoteHostConfig::default()
+        };
+        let first_pair_token = first_config.pairing_token.clone();
+        let first_root = RemoteHostService::new(first_config);
+        let first_server_port = reserve_free_tcp_port();
+        first_root.update_snapshot(
+            managed_server_state(first_server_port),
+            managed_server_runtime("first-server", 4242),
+            HashMap::from([(
+                first_server_port,
+                PortStatus {
+                    port: first_server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )]),
+        );
+        wait_for(
+            || first_root.status().listening,
+            Duration::from_secs(3),
+            "first remote host never started listening",
+        );
+        let first_client = RemoteClientHandle::connect(
+            "127.0.0.1",
+            first_port,
+            "First client",
+            ClientAuth::PairToken {
+                token: first_pair_token,
+            },
+            None,
+        )
+        .expect("first remote client should connect");
+        let first_error = first_client
+            .client
+            .open_port_forward(first_server_port)
+            .expect_err("legacy PID-only status must not authorize a port forward");
+        assert!(first_error.contains("not a live DevManager server port"));
+        wait_for(
+            || first_root.status().connected_clients == 1,
+            Duration::from_secs(3),
+            "first remote host never registered its client",
+        );
+        let first_inner = Arc::downgrade(&first_root.inner);
+
+        drop(first_root);
+
+        wait_for(
+            || first_inner.upgrade().is_none(),
+            Duration::from_secs(2),
+            "first native connection worker survived root teardown",
+        );
+        first_client.client.disconnect();
+
+        let second_port = reserve_free_tcp_port();
+        let mut second_config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: second_port,
+            ..RemoteHostConfig::default()
+        };
+        let second_pair_token = second_config.pairing_token.clone();
+        let second_root = RemoteHostService::new(second_config.clone());
+        wait_for(
+            || second_root.status().listening,
+            Duration::from_secs(3),
+            "second remote host never started listening",
+        );
+        let second_client = RemoteClientHandle::connect(
+            "127.0.0.1",
+            second_port,
+            "Second client",
+            ClientAuth::PairToken {
+                token: second_pair_token,
+            },
+            None,
+        )
+        .expect("second remote client should connect");
+        wait_for(
+            || second_root.status().connected_clients == 1,
+            Duration::from_secs(3),
+            "second remote host never registered its client",
+        );
+        second_client.client.disconnect();
+        let disconnect_deadline = Instant::now() + Duration::from_secs(3);
+        while second_root.status().connected_clients != 0 && Instant::now() < disconnect_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let second_status = second_root.status();
+        assert_eq!(
+            second_status.connected_clients,
+            0,
+            "second remote host never observed client disconnect; last_note={:?}, client_state={:?}",
+            second_status.last_connection_note,
+            second_client.client.disconnected_message(),
+        );
+        second_config.enabled = false;
+        second_root.apply_config(second_config);
     }
 
     #[test]
