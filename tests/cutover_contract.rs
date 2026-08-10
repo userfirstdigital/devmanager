@@ -18,6 +18,7 @@ const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/cutover-contract"
 );
+const FIXTURE_AUTH_TOKEN: &str = "phase-11.1a-generated-fixture-v1";
 
 struct FixtureRepo {
     _temp: TempDir,
@@ -112,6 +113,12 @@ fn fixture_repo(document: Value, extra_files: &[(&str, &[u8])]) -> FixtureRepo {
     let root = temp.path().to_path_buf();
     fs::create_dir_all(root.join("docs")).expect("fixture docs");
     fs::create_dir_all(root.join("src")).expect("fixture src");
+    fs::create_dir_all(root.join(".devmanager-next")).expect("fixture audit auth directory");
+    fs::write(
+        root.join(".devmanager-next/audit-fixture.auth"),
+        format!("{FIXTURE_AUTH_TOKEN}\n"),
+    )
+    .expect("fixture audit auth marker");
     write_ledger(&root, &document);
 
     for name in ["legacy.rs", "replacement.rs", "reference.rs", "README.md"] {
@@ -168,8 +175,149 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", root.join("protected-appdata"))
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
         .output()
         .expect("spawn cutover audit")
+}
+
+fn write_git_probe_shim(shim_root: &Path, _log_path: &Path) -> PathBuf {
+    fs::create_dir_all(shim_root).expect("git probe shim directory");
+    let source_path = shim_root.join("git-probe.cs");
+    let executable_path = shim_root.join("git.exe");
+    fs::write(
+        &source_path,
+        r#"using System;
+using System.IO;
+
+public static class Program
+{
+    public static int Main()
+    {
+        File.AppendAllText(Environment.GetEnvironmentVariable("GIT_PROBE_LOG"), "called\n");
+        return 0;
+    }
+}
+"#,
+    )
+    .expect("git probe shim source");
+    let compile = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$source = Get-Content -Raw -LiteralPath $env:GIT_PROBE_SOURCE; Add-Type -TypeDefinition $source -OutputAssembly $env:GIT_PROBE_EXE -OutputType ConsoleApplication",
+        ])
+        .env("GIT_PROBE_SOURCE", &source_path)
+        .env("GIT_PROBE_EXE", &executable_path)
+        .output()
+        .expect("compile git probe shim");
+    assert!(
+        compile.status.success(),
+        "compile git probe shim failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    executable_path
+}
+
+fn write_git_mode_shim(shim_root: &Path) -> PathBuf {
+    fs::create_dir_all(shim_root).expect("git mode shim directory");
+    let source_path = shim_root.join("git-mode.cs");
+    let executable_path = shim_root.join("git.exe");
+    fs::write(
+        &source_path,
+        r#"using System;
+using System.Diagnostics;
+using System.IO;
+
+public static class Program
+{
+    private static void Emit(Stream stream, byte value, int count)
+    {
+        var buffer = new byte[8192];
+        for (var index = 0; index < buffer.Length; index++) buffer[index] = value;
+        var remaining = count;
+        while (remaining > 0)
+        {
+            var size = Math.Min(remaining, buffer.Length);
+            stream.Write(buffer, 0, size);
+            stream.Flush();
+            remaining -= size;
+        }
+    }
+
+    public static int Main(string[] args)
+    {
+        var isEnumeration = Array.IndexOf(args, "ls-files") >= 0;
+        var mode = Environment.GetEnvironmentVariable("GIT_FAKE_MODE");
+        if (isEnumeration && !string.IsNullOrEmpty(mode))
+        {
+            if (mode == "hang")
+            {
+                System.Threading.Thread.Sleep(30000);
+                return 0;
+            }
+            if (mode == "stdout-overflow")
+            {
+                Emit(Console.OpenStandardOutput(), (byte)'x', 5000000);
+                System.Threading.Thread.Sleep(30000);
+                return 0;
+            }
+            if (mode == "stderr-overflow")
+            {
+                Emit(Console.OpenStandardError(), (byte)'x', 5000000);
+                System.Threading.Thread.Sleep(30000);
+                return 0;
+            }
+            if (mode == "nonzero")
+            {
+                Console.Error.Write("GIT_CHILD_SENTINEL");
+                return 17;
+            }
+        }
+
+        var quoted = string.Join(" ", Array.ConvertAll(args, value => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""));
+        var startInfo = new ProcessStartInfo(Environment.GetEnvironmentVariable("GIT_REAL"), quoted);
+        startInfo.UseShellExecute = false;
+        using (var process = Process.Start(startInfo))
+        {
+            process.WaitForExit();
+            return process.ExitCode;
+        }
+    }
+}
+"#,
+    )
+    .expect("git mode shim source");
+    let compile = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$source = Get-Content -Raw -LiteralPath $env:GIT_MODE_SOURCE; Add-Type -TypeDefinition $source -OutputAssembly $env:GIT_MODE_EXE -OutputType ConsoleApplication",
+        ])
+        .env("GIT_MODE_SOURCE", &source_path)
+        .env("GIT_MODE_EXE", &executable_path)
+        .output()
+        .expect("compile git mode shim");
+    assert!(
+        compile.status.success(),
+        "compile git mode shim failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    executable_path
+}
+
+fn real_git_executable() -> PathBuf {
+    let output = Command::new("where")
+        .arg("git.exe")
+        .output()
+        .expect("find git executable");
+    assert!(output.status.success(), "where git.exe failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("git.exe path")
 }
 
 fn write_rg_shim(shim_root: &Path) -> PathBuf {
@@ -210,8 +358,10 @@ public static class Program
     {
         var startInfo = new ProcessStartInfo("pwsh");
         startInfo.UseShellExecute = false;
-        startInfo.Arguments = "-NoProfile -Command \"Start-Sleep -Seconds 2; [IO.File]::WriteAllText($env:RG_FAKE_RESIDUE, 'residue')\"";
-        Process.Start(startInfo);
+        startInfo.Arguments = "-NoProfile -Command \"Start-Sleep -Milliseconds 60000; [IO.File]::WriteAllText($env:RG_FAKE_RESIDUE, 'residue')\"";
+        var residue = Process.Start(startInfo);
+        var pidPath = Environment.GetEnvironmentVariable("RG_FAKE_RESIDUE_PID");
+        if (!string.IsNullOrEmpty(pidPath)) File.WriteAllText(pidPath, residue.Id.ToString());
     }
 
     private static void Emit(Stream stream, byte value, int count)
@@ -265,6 +415,19 @@ public static class Program
 
         var path = Environment.GetEnvironmentVariable("RG_FAKE_TARGET");
         if (string.IsNullOrEmpty(path)) throw new InvalidOperationException("missing fake target");
+        if (mode == "junction-swap")
+        {
+            var outside = Environment.GetEnvironmentVariable("RG_FAKE_OUTSIDE");
+            if (string.IsNullOrEmpty(outside)) throw new InvalidOperationException("missing junction target");
+            var parent = Path.GetDirectoryName(path);
+            var moved = parent + ".cutover-junction-original";
+            if (Directory.Exists(moved)) Directory.Delete(moved, true);
+            Directory.Move(parent, moved);
+            var linkStart = new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + parent + "\" \"" + outside + "\"");
+            linkStart.UseShellExecute = false;
+            using (var link = Process.Start(linkStart)) link.WaitForExit();
+            return;
+        }
         var bytes = File.ReadAllBytes(path);
         var before = Encoding.UTF8.GetString(bytes);
         var after = before.Replace("original-only", "replaced-only");
@@ -369,12 +532,14 @@ fn spawn_fake_audit(
     log: &Path,
     residue: &Path,
     shim_root: &Path,
+    outside: Option<&Path>,
 ) -> (Output, Duration) {
     let original_path = std::env::var_os("PATH").expect("PATH");
     let mut path_entries = vec![shim_root.to_path_buf()];
     path_entries.extend(std::env::split_paths(&original_path));
     let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
-    let mut child = Command::new("pwsh")
+    let mut command = Command::new("pwsh");
+    command
         .args([
             "-NoProfile",
             "-File",
@@ -387,11 +552,17 @@ fn spawn_fake_audit(
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", root.join("protected-appdata"))
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
         .env("RG_FAKE_MODE", mode)
         .env("RG_FAKE_TARGET", target)
         .env("RG_FAKE_RESIDUE", residue)
+        .env("RG_FAKE_RESIDUE_PID", residue.with_extension("pid"))
         .env("RG_SHIM_LOG", log)
-        .env("PATH", isolated_path)
+        .env("PATH", isolated_path);
+    if let Some(outside_path) = outside {
+        command.env("RG_FAKE_OUTSIDE", outside_path);
+    }
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -407,13 +578,13 @@ fn spawn_fake_audit(
                 elapsed,
             );
         }
-        if started.elapsed() > Duration::from_secs(15) {
+        if started.elapsed() > Duration::from_secs(17) {
             let _ = child.kill();
             let output = child
                 .wait_with_output()
                 .expect("collect timed out fake audit");
             panic!(
-                "fake scanner mode {mode} exceeded the 15 second audit deadline\nstdout={}\nstderr={}",
+                "fake scanner mode {mode} exceeded the bounded audit deadline\nstdout={}\nstderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -458,6 +629,15 @@ fn create_junction(link: &Path, target: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn process_exists(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let output = Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .expect("query process residue");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
 }
 
 fn run_audit_with_setup<F>(document: Value, extra_files: &[(&str, &[u8])], setup: F) -> AuditRun
@@ -562,7 +742,7 @@ fn ledger_parser_rejects_missing_and_duplicate_legacy_paths() {
     assert!(!missing.output.status.success());
     assert!(strings_at(&missing.report, &["contractErrors"])
         .iter()
-        .any(|error| error.contains("legacy path")));
+        .any(|error| *error == "audit[contract_invalid]"));
 
     let duplicate = run_audit(
         contract(
@@ -591,7 +771,7 @@ fn ledger_parser_rejects_missing_and_duplicate_legacy_paths() {
     assert!(!duplicate.output.status.success());
     assert!(strings_at(&duplicate.report, &["contractErrors"])
         .iter()
-        .any(|error| error.contains("duplicate legacy path")));
+        .any(|error| *error == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -611,9 +791,13 @@ fn prerequisite_graph_rejects_unknown_and_circular_nodes() {
         &[],
     );
     assert!(!unknown.output.status.success());
-    assert!(strings_at(&unknown.report, &["contractErrors"])
-        .iter()
-        .any(|error| error.contains("unknown prerequisite")));
+    assert!(
+        strings_at(&unknown.report, &["contractErrors"])
+            .iter()
+            .any(|error| *error == "audit[contract_invalid]"),
+        "unknown report: {}",
+        unknown.report
+    );
 
     let mut first = base_node("gate-a", "gate", "READY");
     first["dependsOn"] = json!(["gate-b"]);
@@ -634,9 +818,13 @@ fn prerequisite_graph_rejects_unknown_and_circular_nodes() {
         &[],
     );
     assert!(!circular.output.status.success());
-    assert!(strings_at(&circular.report, &["contractErrors"])
-        .iter()
-        .any(|error| error.contains("circular prerequisite")));
+    assert!(
+        strings_at(&circular.report, &["contractErrors"])
+            .iter()
+            .any(|error| *error == "audit[contract_invalid]"),
+        "circular report: {}",
+        circular.report
+    );
 }
 
 #[test]
@@ -663,7 +851,7 @@ fn prerequisite_graph_visits_case_distinct_ids_with_ordinal_state() {
 
     assert!(strings_at(&run.report, &["contractErrors"])
         .iter()
-        .any(|error| error.contains("unknown prerequisite node 'gate-missing'")));
+        .any(|error| *error == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -687,10 +875,10 @@ fn ready_row_requires_all_prerequisites_and_evidence() {
     assert_eq!(report_row["status"], "READY");
     assert!(strings_at(report_row, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("prerequisite")));
+        .any(|blocker| *blocker == "audit[prerequisite_invalid]"));
     assert!(strings_at(report_row, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("evidence")));
+        .any(|blocker| *blocker == "audit[evidence_invalid]"));
 }
 
 #[test]
@@ -712,7 +900,7 @@ fn ready_prerequisite_requires_its_evidence_artifact() {
     assert!(!run.output.status.success());
     assert!(strings_at(&run.report, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("gate-ready") && blocker.contains("evidence artifact")));
+        .any(|blocker| *blocker == "audit[evidence_invalid]"));
     assert_eq!(
         row(&run.report, "ready-row")["status"],
         "READY",
@@ -743,7 +931,7 @@ fn deleted_row_fails_when_legacy_path_is_still_present() {
     assert!(!run.output.status.success());
     assert!(strings_at(report_row, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("still present")));
+        .any(|blocker| *blocker == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -829,7 +1017,7 @@ fn tracked_path_presence_requires_the_exact_requested_path() {
     );
     assert!(strings_at(&run.report, &["contractErrors"])
         .iter()
-        .any(|error| error.contains("exact tracked path")));
+        .any(|error| *error == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -856,12 +1044,10 @@ fn ledger_paths_reject_trailing_separators_without_trimming() {
     );
 
     let errors = strings_at(&run.report, &["contractErrors"]);
-    assert!(errors.iter().any(|error| error.contains("trailing-slash")
-        && error.contains("exact repository-relative spelling")));
     assert!(errors
         .iter()
-        .any(|error| error.contains("trailing-backslash")
-            && error.contains("exact repository-relative spelling")));
+        .all(|error| *error == "audit[contract_invalid]"));
+    assert!(!errors.is_empty());
     assert!(row(&run.report, "trailing-slash")["legacy"]["path"].is_null());
 }
 
@@ -955,8 +1141,7 @@ fn oversized_contract_id_keeps_bounded_sanitized_fallback_json() {
     let contract_id = run.report["contractId"]
         .as_str()
         .expect("fallback contractId");
-    assert!(contract_id.len() <= 256);
-    assert!(!contract_id.chars().any(char::is_control));
+    assert_eq!(contract_id, "untrusted-contract-id");
 }
 
 #[test]
@@ -991,10 +1176,7 @@ fn normal_report_sanitizes_and_bounds_contract_id_without_fallback() {
     let contract_id = run.report["contractId"]
         .as_str()
         .expect("normal contractId");
-    assert_eq!(contract_id.len(), 256);
-    assert!(!contract_id.chars().any(char::is_control));
-    assert!(contract_id.starts_with("contract-?"));
-    assert!(contract_id.ends_with("..."));
+    assert_eq!(contract_id, "untrusted-contract-id");
 }
 
 #[test]
@@ -1066,7 +1248,7 @@ fn exact_session_json_output_is_rejected_before_any_publish() {
         .expect("valid fallback JSON");
     assert!(strings_at(&report, &["blockers"])
         .iter()
-        .any(|blocker| blocker.contains("output path") || blocker.contains("session.json")));
+        .any(|blocker| *blocker == "audit[output_path_rejected]"));
 }
 
 #[test]
@@ -1253,7 +1435,7 @@ fn tracked_path_ownership_is_ordinal_and_rejects_case_aliases() {
     );
     assert!(strings_at(&run.report, &["contractErrors"])
         .iter()
-        .any(|error| error.contains("exact tracked path") || error.contains("case")));
+        .any(|error| *error == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -1285,7 +1467,14 @@ fn ledger_alias_ads_control_and_trailing_space_paths_are_rejected() {
     );
     let errors = strings_at(&run.report, &["contractErrors"]);
     assert!(!run.output.status.success());
-    assert!(errors.len() >= invalid.len());
+    assert!(
+        errors.len() >= invalid.len(),
+        "alias errors: {}",
+        run.report
+    );
+    assert!(errors
+        .iter()
+        .all(|error| *error == "audit[contract_invalid]"));
 }
 
 #[test]
@@ -1469,7 +1658,7 @@ fn ledger_and_report_bounds_stop_collection_with_one_bounded_hold_diagnostic() {
     let blockers = strings_at(&run.report, &["blockers"]);
     let hold_diagnostics = blockers
         .iter()
-        .filter(|blocker| blocker.contains("audit safety bound"))
+        .filter(|blocker| **blocker == "audit[safety_bound]")
         .count();
     assert_eq!(hold_diagnostics, 1);
     assert!(run.report.to_string().len() <= 200_000);
@@ -1582,6 +1771,7 @@ fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", fixture.root.join("protected-appdata"))
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
         .env("RG_FAKE_MODE", "stdin-match")
         .env("RG_SHIM_LOG", &log_path)
         .env("PATH", isolated_path)
@@ -1680,9 +1870,10 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
             &log_path,
             &residue,
             &shim_root,
+            None,
         );
         assert!(
-            elapsed < Duration::from_secs(15),
+            elapsed <= Duration::from_millis(16_000),
             "fake scanner mode {mode} took {elapsed:?}\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -1690,25 +1881,26 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
         assert!(output_path.is_file(), "mode {mode} must publish a report");
         let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("audit JSON"))
             .expect("valid audit JSON");
+        assert_eq!(report["scanner"]["deadlineMilliseconds"], 15_000);
         assert!(!output.status.success(), "mode {mode} must fail closed");
         let blockers = strings_at(&report, &["blockers"]);
         match mode {
             "mutate" => assert!(
                 blockers
                     .iter()
-                    .any(|blocker| blocker.contains("content") || blocker.contains("changed")),
+                    .any(|blocker| *blocker == "audit[file_identity_changed]"),
                 "same-length in-place mutation was not rejected: {report}"
             ),
             "swap" => assert!(
                 blockers
                     .iter()
-                    .any(|blocker| blocker.contains("identity") || blocker.contains("changed")),
+                    .any(|blocker| *blocker == "audit[file_identity_changed]"),
                 "atomic pathname swap was not rejected: {report}"
             ),
             _ => assert!(
-                blockers
-                    .iter()
-                    .any(|blocker| blocker.contains("scanner") || blocker.contains("safety")),
+                blockers.iter().any(|blocker| {
+                    blocker.starts_with("audit[process_") || *blocker == "audit[safety_bound]"
+                }),
                 "bounded scanner failure was not reported: {report}"
             ),
         }
@@ -1722,6 +1914,18 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
                 .all(|line| !line.contains(&fixture.root.to_string_lossy().to_ascii_lowercase())),
             "mode {mode} received a fixture path in its arguments: {log}"
         );
+        let residue_pid_path = shim_root.join("residue.pid");
+        if residue_pid_path.is_file() {
+            let residue_pid = fs::read_to_string(&residue_pid_path)
+                .expect("residue pid")
+                .trim()
+                .parse::<u32>()
+                .expect("numeric residue pid");
+            assert!(
+                !process_exists(residue_pid),
+                "owned descendant survived: {residue_pid}"
+            );
+        }
         residue_paths.push(residue);
         fixtures.push(fixture);
     }
@@ -1734,4 +1938,349 @@ fn scanner_modes_are_bounded_and_revalidate_content_and_path_identity() {
             residue.display()
         );
     }
+}
+
+#[test]
+fn concurrent_junction_path_swap_stays_confined_and_does_not_read_outside() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "junction-safety",
+                "src/legacy.rs",
+                &["original-only"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let outside = fixture._temp.path().join("outside-junction-target");
+    fs::create_dir_all(&outside).expect("outside junction target");
+    let outside_sentinel = "JUNCTION_OUTSIDE_SENTINEL";
+    fs::write(outside.join("legacy.rs"), outside_sentinel).expect("outside sentinel");
+
+    let shim_root = fixture._temp.path().join("junction-rg-shim");
+    let shim = write_rg_shim(&shim_root);
+    assert!(shim.is_file());
+    let log_path = shim_root.join("rg-shim.jsonl");
+    let residue = shim_root.join("residue.txt");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let (output, elapsed) = spawn_fake_audit(
+        &fixture.root,
+        &output_path,
+        "junction-swap",
+        &fixture.root.join("src/legacy.rs"),
+        &log_path,
+        &residue,
+        &shim_root,
+        Some(&outside),
+    );
+    assert!(elapsed <= Duration::from_millis(16_000));
+    assert!(output_path.is_file(), "junction swap must publish a report");
+    let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("junction JSON"))
+        .expect("valid junction JSON");
+    assert!(!output.status.success());
+    assert!(strings_at(&report, &["blockers"])
+        .iter()
+        .any(|blocker| *blocker == "audit[path_reparse_rejected]"));
+    let human = fs::read_to_string(output_path.with_extension("txt")).expect("junction human");
+    for channel in [
+        report.to_string(),
+        human,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ] {
+        assert!(
+            !channel.contains(outside_sentinel),
+            "outside content leaked: {channel}"
+        );
+    }
+}
+
+#[test]
+fn job_owned_descendant_dies_without_touching_unrelated_sentinel() {
+    let fixture = fixture_repo(
+        contract(
+            vec![base_row(
+                "job-safety",
+                "src/legacy.rs",
+                &["original-only"],
+                "src/replacement.rs",
+                &["gate-parity"],
+                "HOLD",
+            )],
+            vec![base_node("gate-parity", "gate", "HOLD")],
+        ),
+        &[],
+    );
+    let shim_root = fixture._temp.path().join("job-rg-shim");
+    let shim = write_rg_shim(&shim_root);
+    assert!(shim.is_file());
+    let log_path = shim_root.join("rg-shim.jsonl");
+    let residue = shim_root.join("residue.txt");
+    let output_path = fixture
+        .root
+        .join(".devmanager-next/evidence/current/cutover-audit.json");
+    let sentinel = fixture._temp.path().join("unrelated-sentinel.txt");
+    let mut unrelated = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Milliseconds 750; [IO.File]::WriteAllText($env:UNRELATED_SENTINEL_PATH, 'UNRELATED_SENTINEL')",
+        ])
+        .env("UNRELATED_SENTINEL_PATH", &sentinel)
+        .spawn()
+        .expect("spawn unrelated sentinel");
+    let (output, elapsed) = spawn_fake_audit(
+        &fixture.root,
+        &output_path,
+        "hang",
+        &fixture.root.join("README.md"),
+        &log_path,
+        &residue,
+        &shim_root,
+        None,
+    );
+    unrelated.wait().expect("wait unrelated sentinel");
+    assert!(elapsed <= Duration::from_millis(16_000));
+    assert!(output_path.is_file(), "job timeout must publish a report");
+    assert_eq!(
+        fs::read_to_string(&sentinel).expect("unrelated sentinel"),
+        "UNRELATED_SENTINEL"
+    );
+    let residue_pid_path = residue.with_extension("pid");
+    let residue_pid = fs::read_to_string(&residue_pid_path)
+        .expect("recorded descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("descendant pid");
+    assert!(
+        !process_exists(residue_pid),
+        "job descendant survived: {residue_pid}"
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn git_enumeration_uses_the_bounded_wrapper_for_all_failure_modes() {
+    let real_git = real_git_executable();
+    for mode in ["hang", "stdout-overflow", "stderr-overflow", "nonzero"] {
+        let fixture = fixture_repo(
+            contract(
+                vec![base_row(
+                    "git-safety",
+                    "src/legacy.rs",
+                    &["LegacyFixture"],
+                    "src/replacement.rs",
+                    &["gate-parity"],
+                    "HOLD",
+                )],
+                vec![base_node("gate-parity", "gate", "HOLD")],
+            ),
+            &[],
+        );
+        let shim_root = fixture._temp.path().join("git-mode-shim");
+        let shim = write_git_mode_shim(&shim_root);
+        assert!(shim.is_file());
+        let output_path = fixture
+            .root
+            .join(".devmanager-next/evidence/current/cutover-audit.json");
+        let original_path = std::env::var_os("PATH").expect("PATH");
+        let mut path_entries = vec![shim_root.clone()];
+        path_entries.extend(std::env::split_paths(&original_path));
+        let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+        let started = Instant::now();
+        let output = Command::new("pwsh")
+            .args([
+                "-NoProfile",
+                "-File",
+                AUDIT_SCRIPT,
+                "-Mode",
+                "Parity",
+                "-Root",
+                fixture.root.to_str().expect("fixture root utf8"),
+                "-OutputPath",
+                output_path.to_str().expect("output path utf8"),
+            ])
+            .env("APPDATA", fixture.root.join("protected-appdata"))
+            .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
+            .env("GIT_FAKE_MODE", mode)
+            .env("GIT_REAL", &real_git)
+            .env("GIT_CHILD_SENTINEL", "GIT_CHILD_SENTINEL")
+            .env("PATH", isolated_path)
+            .output()
+            .expect("spawn git failure audit");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(16_000),
+            "git mode {mode} exceeded deadline: {elapsed:?}\\nstdout={}\\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output_path.is_file(),
+            "git mode {mode} must publish a report\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&fs::read(&output_path).expect("git JSON"))
+            .expect("valid git JSON");
+        let human = fs::read_to_string(output_path.with_extension("txt")).expect("git human");
+        let expected = match mode {
+            "hang" => "audit[process_deadline_exceeded]",
+            "stdout-overflow" => "audit[process_stdout_overflow]",
+            "stderr-overflow" => "audit[process_stderr_overflow]",
+            "nonzero" => "audit[process_nonzero]",
+            _ => unreachable!(),
+        };
+        assert!(
+            strings_at(&report, &["contractErrors"])
+                .iter()
+                .chain(strings_at(&report, &["blockers"]).iter())
+                .any(|diagnostic| *diagnostic == expected),
+            "git mode {mode}: {report}"
+        );
+        for channel in [
+            report.to_string(),
+            human,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ] {
+            assert!(
+                !channel.contains("GIT_CHILD_SENTINEL"),
+                "Git output leaked: {channel}"
+            );
+        }
+    }
+}
+
+#[test]
+fn diagnostics_redact_ledger_values_and_absolute_fixture_details_everywhere() {
+    let sentinel = "LEDGER_SECRET_SENTINEL";
+    let mut document = contract(
+        vec![base_row(
+            "redaction-row",
+            "src/legacy.rs",
+            &[sentinel],
+            "src/replacement.rs",
+            &["gate-parity"],
+            "HOLD",
+        )],
+        vec![base_node("gate-parity", "gate", "HOLD")],
+    );
+    document["contractId"] = Value::String(sentinel.into());
+    document["rows"][0]["legacy"]["tokens"] = json!([sentinel]);
+    document["rows"][0]["evidence"]["commands"] = json!([sentinel]);
+    document["forbiddenEntrypoints"][0]["tokens"] = json!([sentinel]);
+    let run = run_audit(document, &[("src/redaction.rs", sentinel.as_bytes())]);
+    let json_text = run.report.to_string();
+    let human_text = run.human.clone();
+    let stdout = String::from_utf8_lossy(&run.output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.output.stderr).into_owned();
+    let absolute = run.fixture.root.to_string_lossy().to_string();
+    for channel in [json_text, human_text, stdout, stderr] {
+        assert!(!channel.contains(sentinel), "sentinel leaked: {channel}");
+        assert!(
+            !channel.contains(&absolute),
+            "absolute fixture path leaked: {channel}"
+        );
+    }
+}
+
+#[test]
+fn windows_powershell_is_rejected_before_root_access() {
+    let temp = tempfile::tempdir().expect("runtime fixture tempdir");
+    let root = temp.path().join("runtime-untrusted");
+    fs::create_dir_all(&root).expect("runtime fixture root");
+    let sentinel = root.join("runtime-sentinel.txt");
+    fs::write(&sentinel, "RUNTIME_SENTINEL").expect("runtime sentinel");
+    let output_path = root.join(".devmanager-next/evidence/current/report.json");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            root.to_str().expect("runtime root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("runtime output utf8"),
+        ])
+        .output()
+        .expect("spawn Windows PowerShell boundary test");
+    assert!(!output.status.success());
+    assert!(!output_path.exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported_runtime"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(!stdout.contains("RUNTIME_SENTINEL"));
+    assert!(!stderr.contains("RUNTIME_SENTINEL"));
+    assert!(sentinel.is_file());
+}
+
+#[test]
+fn unauthorized_root_is_rejected_before_git_or_fixture_read() {
+    let temp = tempfile::tempdir().expect("untrusted temp root");
+    let root = temp.path().join("untrusted-repository");
+    fs::create_dir_all(&root).expect("untrusted root");
+    let sentinel = root.join("source-sentinel.txt");
+    let sentinel_text = "UNAUTHORIZED_ROOT_SENTINEL";
+    fs::write(&sentinel, sentinel_text).expect("untrusted sentinel");
+
+    let shim_root = temp.path().join("git-probe");
+    let probe_log = temp.path().join("git-probe.log");
+    let shim = write_git_probe_shim(&shim_root, &probe_log);
+    assert!(shim.is_file(), "git probe shim must compile");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let mut path_entries = vec![shim_root];
+    path_entries.extend(std::env::split_paths(&original_path));
+    let isolated_path = std::env::join_paths(path_entries).expect("isolated PATH");
+    let output_path = root.join(".devmanager-next/evidence/current/report.json");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            AUDIT_SCRIPT,
+            "-Mode",
+            "Parity",
+            "-Root",
+            root.to_str().expect("untrusted root utf8"),
+            "-OutputPath",
+            output_path.to_str().expect("output path utf8"),
+        ])
+        .env("PATH", isolated_path)
+        .env("GIT_PROBE_LOG", &probe_log)
+        .output()
+        .expect("spawn unauthorized-root audit");
+
+    assert!(!output.status.success());
+    assert!(
+        !output_path.exists(),
+        "unauthorized root must not receive output"
+    );
+    assert!(
+        !probe_log.exists(),
+        "Git must not be started for an unauthorized root"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("root_unauthorized"),
+        "missing fixed authorization diagnostic: stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(!stdout.contains(sentinel_text));
+    assert!(!stderr.contains(sentinel_text));
+    assert!(
+        sentinel.is_file(),
+        "the untrusted sentinel must remain untouched"
+    );
 }
