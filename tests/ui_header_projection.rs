@@ -10,13 +10,10 @@ use devmanager::domain::task::{TaskActivity, VisibleTaskStatus};
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{PointerButton, Shell};
-use devmanager::ui::task_cockpit::header::{
-    ActionTarget, AgentRoleProjection, CpuInputUnit, ProjectedAction, TaskActionContext,
-    TitleLayout,
-};
+use devmanager::ui::task_cockpit::header::{AgentRoleProjection, CpuInputUnit, TitleLayout};
 use devmanager::ui::task_cockpit::{
-    HeaderAction, HeaderField, PrimaryAgentProjection, TaskHeaderModel, TopBarModel,
-    TopBarProjectionInput, WorkspaceProjection, MAX_HEADER_SPECIALISTS, PROVIDER_QUOTA_MAX_AGE_MS,
+    HeaderField, PrimaryAgentProjection, TaskHeaderModel, TopBarModel, TopBarProjectionInput,
+    WorkspaceProjection, MAX_HEADER_SPECIALISTS, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 use serde::Deserialize;
 
@@ -43,7 +40,10 @@ fn model_from_pages(pages: &[SnapshotPage]) -> ClientModel {
 }
 
 fn project_header(model: &ClientModel, task_id: TaskId) -> TaskHeaderModel {
-    TaskHeaderModel::from_model(model, task_id, TaskActionContext::default())
+    let mut shell = Shell::new(Some(task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    shell
+        .task_header(model)
         .expect("selected task must project")
 }
 
@@ -95,13 +95,14 @@ fn header_projects_task_context_and_stable_agent_status_links() {
 
     assert_eq!(header.turn.activity, TaskActivity::Working);
     assert_eq!(header.turn.status, VisibleTaskStatus::Working);
-    assert_eq!(
-        header.status.action,
-        HeaderAction::new(
-            action::ACTION_TASK_SHOW,
-            ActionTarget::Task(header.identity),
-        )
-    );
+    assert_eq!(header.status.action.id(), action::ACTION_TASK_SHOW);
+    assert_eq!(header.status.role, AccessibleRole::Button);
+    assert!(header.status.focusable);
+    assert!(!header.status.tooltip.is_empty());
+    assert!(matches!(
+        header.status.action.target(),
+        devmanager::ui::task_cockpit::header::ActionTarget::Task(_)
+    ));
     assert!(header.status.description.contains("working"));
     assert!(header
         .accessible_description
@@ -112,11 +113,10 @@ fn header_projects_task_context_and_stable_agent_status_links() {
 fn shell_projects_only_its_captured_selected_task() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = Shell::new(Some(fixture.selected_task_id));
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
 
-    let header = shell
-        .task_header(&model, TaskActionContext::default())
-        .expect("selected task header");
+    let header = shell.task_header(&model).expect("selected task header");
     assert_eq!(header.identity.task_id, fixture.selected_task_id);
 }
 
@@ -128,6 +128,15 @@ fn top_bar_keeps_global_facts_hides_stale_quota_and_labels_cpu_diagnostics() {
     assert_eq!(top_bar.quotas.len(), 1);
     assert_eq!(top_bar.quotas[0].provider, "Claude");
     assert_eq!(top_bar.quotas[0].detail, "72% remaining");
+    assert_eq!(top_bar.quotas[0].role, AccessibleRole::Button);
+    assert!(top_bar.quotas[0].focusable);
+    assert!(!top_bar.quotas[0].tooltip.is_empty());
+    assert_eq!(top_bar.host.as_ref().unwrap().role, AccessibleRole::Button);
+    assert!(top_bar.host.as_ref().unwrap().focusable);
+    assert_eq!(
+        top_bar.update.as_ref().unwrap().role,
+        AccessibleRole::Button
+    );
     assert_eq!(
         top_bar.resources.as_ref().unwrap().memory_bytes,
         Some(12_345_678)
@@ -170,6 +179,11 @@ fn narrow_header_uses_priority_overflow_with_accessible_text() {
         overflow.keyboard,
         KeyboardShortcut::ctrl(ShortcutKey::Character('m'))
     );
+    assert_eq!(
+        overflow.keyboard_action,
+        devmanager::ui::actions::KeyboardAction::OpenTaskDetails
+    );
+    assert!(!overflow.tooltip.is_empty());
     assert_eq!(overflow.action.descriptor().id, action::ACTION_TASK_SHOW);
     assert!(layout.accessible_description.contains("More task details"));
 }
@@ -323,7 +337,7 @@ fn cpu_projection_rejects_invalid_nonfinite_overflow_and_zero_core_inputs() {
 }
 
 #[test]
-fn quota_projection_rejects_future_observations_and_accepts_exact_one_hour_boundary() {
+fn quota_projection_rejects_future_and_exact_one_hour_boundary_observations() {
     let mut input = fixture().top_bar;
     let now = input.now_ms;
     input.quotas = vec![
@@ -354,7 +368,19 @@ fn quota_projection_rejects_future_observations_and_accepts_exact_one_hour_bound
     assert_eq!(model.quotas.len(), 1);
     assert_eq!(model.quotas[0].provider, "Claude");
     assert_eq!(model.quotas[0].detail, "72% remaining");
+    assert!(model
+        .quotas
+        .iter()
+        .all(|quota| quota.detail != "11% remaining"));
     assert!(model.quotas.iter().all(|quota| quota.age_ms >= 0));
+
+    input.quotas = input
+        .quotas
+        .into_iter()
+        .filter(|quota| quota.detail.as_deref() != Some("72% remaining"))
+        .collect();
+    let boundary_only = TopBarModel::from_input(&input);
+    assert!(boundary_only.quotas.is_empty());
 
     input.quotas = vec![
         devmanager::ui::task_cockpit::QuotaObservation {
@@ -449,24 +475,6 @@ fn header_and_top_bar_actions_share_one_descriptor_and_reject_stale_identity() {
     assert!(header.accepts_action(&primary.action));
     assert!(top_bar.accepts_action(&top_bar.quotas[0].action));
 
-    let stale_task = ProjectedAction::new(
-        action::ACTION_TASK_SHOW,
-        ActionTarget::Task(devmanager::ui::task_cockpit::TaskIdentity {
-            revision: header.identity.revision + 1,
-            ..header.identity
-        }),
-    );
-    assert!(!header.accepts_action(&stale_task));
-
-    let ActionTarget::Agent(mut stale_agent) = primary.action.target().clone() else {
-        panic!("primary action target");
-    };
-    stale_agent.resource_generation += 1;
-    assert!(!header.accepts_action(&ProjectedAction::new(
-        action::ACTION_TASK_SHOW,
-        ActionTarget::Agent(stale_agent),
-    )));
-
     let mut stale_top_bar = fixture.top_bar.clone();
     stale_top_bar.host.as_mut().unwrap().identity.revision += 1;
     let current_top_bar = TopBarModel::from_input(&fixture.top_bar);
@@ -532,36 +540,6 @@ fn presentation_is_bounded_redacted_and_does_not_leak_sensitive_labels() {
         .unwrap()
         .label
         .contains("UPDATE_SECRET_SENTINEL"));
-}
-
-#[test]
-fn task_actions_capture_all_context_epochs_and_reject_stale_context() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let context = TaskActionContext {
-        resource_generation: 12,
-        connection_epoch: 4,
-        focus_epoch: 8,
-    };
-    let header =
-        TaskHeaderModel::from_model_with_context(&model, fixture.selected_task_id, context)
-            .expect("selected task must project");
-
-    assert_eq!(header.identity.task_id, fixture.selected_task_id);
-    assert_eq!(header.identity.revision, 9);
-    assert_eq!(header.identity.resource_generation, 12);
-    assert_eq!(header.identity.connection_epoch, 4);
-    assert_eq!(header.identity.focus_epoch, 8);
-    assert_eq!(header.identity.action_epoch, 4);
-
-    let stale = ProjectedAction::new(
-        action::ACTION_TASK_SHOW,
-        ActionTarget::Task(devmanager::ui::task_cockpit::TaskIdentity {
-            focus_epoch: 9,
-            ..header.identity
-        }),
-    );
-    assert!(!header.accepts_action(&stale));
 }
 
 #[test]
@@ -778,65 +756,6 @@ fn title_layout_is_deterministic_at_320_and_360_pixels() {
 }
 
 #[test]
-fn shell_header_dispatch_rejects_each_stale_action_context_epoch() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = Shell::new(Some(fixture.selected_task_id));
-    let context = TaskActionContext {
-        resource_generation: 12,
-        connection_epoch: 4,
-        focus_epoch: 8,
-    };
-    let header = shell
-        .task_header(&model, context)
-        .expect("selected task header");
-    let action = header.status.action.clone();
-    assert_eq!(header.identity.resource_generation, 12);
-    assert_eq!(header.identity.connection_epoch, 4);
-    assert_eq!(header.identity.focus_epoch, 8);
-    assert_eq!(header.identity.client_epoch, model.last_applied_sequence());
-    assert_eq!(header.identity.navigation_epoch, shell.navigation_epoch());
-    assert!(shell.dispatch_task_action(&model, context, &action));
-
-    for stale in [
-        TaskActionContext {
-            resource_generation: 13,
-            ..context
-        },
-        TaskActionContext {
-            connection_epoch: 5,
-            ..context
-        },
-        TaskActionContext {
-            focus_epoch: 9,
-            ..context
-        },
-    ] {
-        assert!(
-            !shell.dispatch_task_action(&model, stale, &action),
-            "stale external context must be rejected"
-        );
-    }
-
-    let mut advanced_pages = fixture.snapshot_pages.clone();
-    for page in &mut advanced_pages {
-        page.through_sequence += 1;
-    }
-    let advanced_model = model_from_pages(&advanced_pages);
-    assert!(
-        !shell.dispatch_task_action(&advanced_model, context, &action),
-        "stale client snapshot must be rejected"
-    );
-
-    let mut invalidated_shell = shell;
-    assert!(invalidated_shell.on_resync());
-    assert!(
-        !invalidated_shell.dispatch_task_action(&model, context, &action),
-        "stale navigation epoch must be rejected"
-    );
-}
-
-#[test]
 fn quota_projection_canonicalizes_claude_provider_aliases_to_one_summary() {
     let fixture = fixture();
     let mut input = fixture.top_bar;
@@ -882,12 +801,7 @@ fn visible_and_accessible_text_redacts_key_name_separator_variants() {
         }
     }
 
-    let header = TaskHeaderModel::from_model(
-        &model_from_pages(&pages),
-        fixture.selected_task_id,
-        TaskActionContext::default(),
-    )
-    .expect("selected task header");
+    let header = project_header(&model_from_pages(&pages), fixture.selected_task_id);
     for output in [&header.title, &header.accessible_description] {
         assert!(!output.contains("API_KEY"));
         assert!(!output.contains("ACCESS-KEY"));
@@ -911,12 +825,7 @@ fn agent_projection_exposes_only_a_bounded_sanitized_role() {
         }
     }
 
-    let header = TaskHeaderModel::from_model(
-        &model_from_pages(&pages),
-        fixture.selected_task_id,
-        TaskActionContext::default(),
-    )
-    .expect("selected task header");
+    let header = project_header(&model_from_pages(&pages), fixture.selected_task_id);
     let role = &header.specialists[0].role;
     let AgentRoleProjection::Specialist { label } = role else {
         panic!("expected specialist role projection");
@@ -924,4 +833,115 @@ fn agent_projection_exposes_only_a_bounded_sanitized_role() {
     assert!(label.chars().count() <= 64);
     assert!(!label.contains("API_KEY"));
     assert!(!format!("{role:?}").contains("SPECIALIST_API_KEY"));
+}
+
+#[test]
+fn shell_owned_epochs_fence_a_projected_action_without_caller_context() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+
+    let header = shell.task_header(&model).expect("selected task header");
+    let action = header.status.action.clone();
+    assert!(shell.dispatch_task_action(&model, &action));
+
+    let cases: [(&str, fn(&mut Shell) -> bool); 5] = [
+        ("resource", |shell: &mut Shell| {
+            shell.advance_resource_generation()
+        }),
+        ("connection", |shell: &mut Shell| {
+            shell.advance_connection_epoch()
+        }),
+        ("focus", |shell: &mut Shell| shell.advance_focus_epoch()),
+        ("client", |shell: &mut Shell| shell.advance_client_epoch()),
+        ("navigation", |shell: &mut Shell| shell.on_view_switch()),
+    ];
+    for (name, advance) in cases {
+        let mut current = Shell::new(Some(fixture.selected_task_id));
+        assert!(current.sync_client_epoch(model.last_applied_sequence()));
+        let projected = current
+            .task_header(&model)
+            .expect("selected task header")
+            .status
+            .action
+            .clone();
+        assert!(current.dispatch_task_action(&model, &projected));
+        assert!(advance(&mut current), "advance {name} epoch");
+        assert!(
+            !current.dispatch_task_action(&model, &projected),
+            "stale {name} epoch must be rejected by the Shell-owned dispatcher"
+        );
+    }
+}
+
+#[test]
+fn separated_secret_key_values_are_redacted_from_public_projection_text() {
+    let fixture = fixture();
+    let mut pages = fixture.snapshot_pages.clone();
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let SnapshotItem::Task(task) = item {
+                task.task.title = [
+                    "API KEY ordinary_value",
+                    "access-key ordinary_value_two",
+                    "PRIVATE KEY ordinary_value_three",
+                    "ToKeN ordinary_value_four",
+                ]
+                .join(" | ");
+            }
+        }
+    }
+
+    let model = model_from_pages(&pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    let header = shell.task_header(&model).expect("selected task header");
+    for output in [&header.title, &header.accessible_description] {
+        for secret in [
+            "ordinary_value",
+            "ordinary_value_two",
+            "ordinary_value_three",
+            "ordinary_value_four",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "secret value leaked in {output:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_identity_input_and_action_debug_display_are_opaque() {
+    let fixture = fixture();
+    let mut input = fixture.top_bar.clone();
+    input.host.as_mut().unwrap().identity.host_id = "HOST_SECRET_SENTINEL".into();
+    input.update.as_mut().unwrap().identity.current_version = "UPDATE_SECRET_SENTINEL".into();
+    input.quotas[0].identity.provider_session_id = "PROVIDER_SESSION_SECRET_SENTINEL".into();
+    input.quotas[0].detail = Some("QUOTA_SECRET_SENTINEL".into());
+
+    let debug = format!("{input:?}");
+    let display = format!("{input}");
+    for output in [&debug, &display] {
+        assert!(!output.contains("HOST_SECRET_SENTINEL"), "{output}");
+        assert!(!output.contains("UPDATE_SECRET_SENTINEL"), "{output}");
+        assert!(
+            !output.contains("PROVIDER_SESSION_SECRET_SENTINEL"),
+            "{output}"
+        );
+        assert!(!output.contains("QUOTA_SECRET_SENTINEL"), "{output}");
+    }
+
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let mut shell = Shell::new(Some(fixture.selected_task_id));
+    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
+    let action = shell
+        .task_header(&model)
+        .expect("selected task header")
+        .status
+        .action
+        .clone();
+    assert!(!format!("{action:?}").contains(action.id()));
+    assert!(!format!("{action}").contains(action.id()));
 }

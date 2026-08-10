@@ -5,6 +5,7 @@
 //! filesystem, network, provider sessions, or process state.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -46,22 +47,32 @@ const COMPACT_TITLE_SCALARS: usize = 28;
 const WRAPPED_TITLE_LINE_SCALARS: usize = 28;
 const MAX_MACHINE_CPU_INPUT_PERCENT: f64 = 1_000_000.0;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskActionContext {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct TaskActionContext {
     /// Host/resource generation captured when the row was rendered.
-    pub resource_generation: u64,
+    resource_generation: u64,
     /// Connection epoch captured when the row was rendered.
-    pub connection_epoch: u64,
+    connection_epoch: u64,
     /// Focus epoch captured when the row was rendered.
-    pub focus_epoch: u64,
+    focus_epoch: u64,
+    pub(crate) client_epoch: u64,
+    pub(crate) navigation_epoch: u64,
 }
 
-impl Default for TaskActionContext {
-    fn default() -> Self {
+impl TaskActionContext {
+    pub(crate) const fn new(
+        resource_generation: u64,
+        connection_epoch: u64,
+        focus_epoch: u64,
+        client_epoch: u64,
+        navigation_epoch: u64,
+    ) -> Self {
         Self {
-            resource_generation: 0,
-            connection_epoch: 0,
-            focus_epoch: 0,
+            resource_generation,
+            connection_epoch,
+            focus_epoch,
+            client_epoch,
+            navigation_epoch,
         }
     }
 }
@@ -78,7 +89,7 @@ pub struct TaskIdentity {
     pub action_epoch: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AgentIdentity {
     pub task: TaskIdentity,
     pub agent_id: AgentSessionId,
@@ -96,7 +107,7 @@ pub struct ObservationStamp {
 /// The target payload is intentionally separate from the catalog descriptor.
 /// It captures the exact current fact needed to reject a stale click while
 /// keeping the action id owned by `client::action`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ActionTarget {
     Task(TaskIdentity),
     Agent(AgentIdentity),
@@ -121,14 +132,14 @@ pub enum ActionTarget {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProjectedAction {
     descriptor: &'static ActionDescriptor,
     target: ActionTarget,
 }
 
 impl ProjectedAction {
-    pub fn new(id: &str, target: ActionTarget) -> Self {
+    pub(crate) fn new(id: &str, target: ActionTarget) -> Self {
         let descriptor = action::descriptor(id)
             .unwrap_or_else(|| panic!("projected action id is not in the shared catalog: {id}"));
         Self { descriptor, target }
@@ -152,11 +163,97 @@ impl ProjectedAction {
 pub type HeaderAction = ProjectedAction;
 pub type TopBarAction = ProjectedAction;
 
+impl fmt::Debug for AgentIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentIdentity")
+            .field("task", &self.task)
+            .field("agent_id", &self.agent_id)
+            .field("revision", &self.revision)
+            .field("resource_generation", &self.resource_generation)
+            .field(
+                "provider_session_id",
+                &self.provider_session_id.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for AgentIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("agent-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for ActionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task(identity) => formatter.debug_tuple("Task").field(identity).finish(),
+            Self::Agent(identity) => formatter.debug_tuple("Agent").field(identity).finish(),
+            Self::Host { identity, stamp } => formatter
+                .debug_struct("Host")
+                .field("identity", identity)
+                .field("stamp", stamp)
+                .finish(),
+            Self::Connect { identity, stamp } => formatter
+                .debug_struct("Connect")
+                .field("identity", identity)
+                .field("stamp", stamp)
+                .finish(),
+            Self::Update { identity, stamp } => formatter
+                .debug_struct("Update")
+                .field("identity", identity)
+                .field("stamp", stamp)
+                .finish(),
+            Self::QuotaSummary { stamp } => formatter
+                .debug_struct("QuotaSummary")
+                .field("stamp", stamp)
+                .finish(),
+            Self::Quota { identity, stamp } => formatter
+                .debug_struct("Quota")
+                .field("identity", identity)
+                .field("stamp", stamp)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Display for ActionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("action-target[redacted]")
+    }
+}
+
+impl fmt::Debug for ProjectedAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectedAction")
+            .field("descriptor", &"[redacted]")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl fmt::Display for ProjectedAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("projected-action[redacted]")
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusLink {
     pub label: String,
     pub description: String,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub tooltip: String,
     pub action: HeaderAction,
+}
+
+impl fmt::Display for StatusLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("status-link[redacted]")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,12 +275,21 @@ pub enum WorkspaceProjection {
 pub struct AgentProjection {
     pub identity: AgentIdentity,
     pub role: AgentRoleProjection,
+    pub accessibility_role: AccessibleRole,
+    pub focusable: bool,
+    pub tooltip: String,
     /// This is a safe display label, not the provider's raw identity.
     pub provider: String,
     pub lifecycle: AgentSessionLifecycle,
     pub label: String,
     pub accessible_description: String,
     pub action: HeaderAction,
+}
+
+impl fmt::Display for AgentProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("agent-projection[redacted]")
+    }
 }
 
 /// Bounded public role data. The provider/domain role remains private to the
@@ -203,6 +309,12 @@ pub enum PrimaryAgentProjection {
         label: String,
         description: String,
     },
+}
+
+impl fmt::Display for PrimaryAgentProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("primary-agent[redacted]")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,63 +342,49 @@ pub struct TaskHeaderModel {
     pub accessible_description: String,
 }
 
+impl fmt::Display for TaskHeaderModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("task-header[redacted]")
+    }
+}
+
 impl TaskHeaderModel {
-    /// Project a task with the caller's current host/resource, connection,
-    /// and focus context. Context is mandatory so actions cannot silently
-    /// fall back to an all-zero fence.
-    pub fn from_model(
+    /// Project a task from a host-issued context. This constructor stays
+    /// crate-private so callers cannot mint an arbitrary action fence.
+    pub(crate) fn from_model(
         model: &ClientModel,
         task_id: TaskId,
         context: TaskActionContext,
     ) -> Option<Self> {
-        Self::from_model_with_epochs(model, task_id, context, model.last_applied_sequence(), 0)
+        Self::from_model_with_context(model, task_id, context)
     }
 
-    /// Compatibility name for callers that already use the explicit context
-    /// constructor. New callers should use [`Self::from_model`].
-    pub fn from_model_with_context(
+    pub(crate) fn from_model_with_context(
         model: &ClientModel,
         task_id: TaskId,
         context: TaskActionContext,
     ) -> Option<Self> {
-        Self::from_model(model, task_id, context)
+        Self::from_model_with_epochs(model, task_id, context)
     }
 
-    /// Project a task while capturing all current action-fence epochs. The
-    /// client and navigation epochs are supplied by the live Shell rather
-    /// than guessed by a pure model projection.
-    pub fn from_model_with_epochs(
+    pub(crate) fn from_model_with_epochs(
         model: &ClientModel,
         task_id: TaskId,
         context: TaskActionContext,
-        client_epoch: u64,
-        navigation_epoch: u64,
     ) -> Option<Self> {
         let task = model.task(task_id)?;
-        Some(Self::from_snapshot(
-            task_id,
-            task,
-            context,
-            client_epoch,
-            navigation_epoch,
-        ))
+        Some(Self::from_snapshot(task_id, task, context))
     }
 
-    fn from_snapshot(
-        task_id: TaskId,
-        task: &TaskSnapshot,
-        context: TaskActionContext,
-        client_epoch: u64,
-        navigation_epoch: u64,
-    ) -> Self {
+    fn from_snapshot(task_id: TaskId, task: &TaskSnapshot, context: TaskActionContext) -> Self {
         let identity = TaskIdentity {
             task_id,
             revision: task.task.revision,
             resource_generation: context.resource_generation,
             connection_epoch: context.connection_epoch,
             focus_epoch: context.focus_epoch,
-            client_epoch,
-            navigation_epoch,
+            client_epoch: context.client_epoch,
+            navigation_epoch: context.navigation_epoch,
             action_epoch: task.task.action_epoch,
         };
         let visible_status = task.visible_status();
@@ -294,6 +392,9 @@ impl TaskHeaderModel {
         let status = StatusLink {
             label: status_label.to_string(),
             description: status_description.to_string(),
+            role: AccessibleRole::Button,
+            focusable: true,
+            tooltip: status_description.to_string(),
             action: task_action(identity),
         };
         let turn = TurnProjection {
@@ -422,11 +523,13 @@ impl TaskHeaderModel {
         let overflow_control = (!overflow.is_empty()).then(|| OverflowControl {
             label: "More task details".to_string(),
             description: "Open More task details to read additional task information.".to_string(),
+            tooltip: "Open More task details".to_string(),
             action: task_action(self.identity),
             role: AccessibleRole::Button,
             focusable: true,
             pointer: PointerButton::Primary,
             keyboard: KeyboardShortcut::ctrl(ShortcutKey::Character('m')),
+            keyboard_action: crate::ui::actions::KeyboardAction::OpenTaskDetails,
         });
         let accessible_description = match &overflow_control {
             Some(control) => presentation_text(
@@ -467,11 +570,19 @@ pub enum TitleLayout {
 pub struct OverflowControl {
     pub label: String,
     pub description: String,
+    pub tooltip: String,
     pub action: ProjectedAction,
     pub role: AccessibleRole,
     pub focusable: bool,
     pub pointer: PointerButton,
     pub keyboard: KeyboardShortcut,
+    pub keyboard_action: crate::ui::actions::KeyboardAction,
+}
+
+impl fmt::Display for OverflowControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("overflow-control[redacted]")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,14 +635,14 @@ pub enum CpuInputUnit {
     MachinePercent,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostObservationIdentity {
     pub host_id: String,
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostObservation {
     pub identity: HostObservationIdentity,
@@ -540,14 +651,14 @@ pub struct HostObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectObservationIdentity {
     pub host_id: String,
     pub connection_epoch: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectObservation {
     pub identity: ConnectObservationIdentity,
@@ -556,14 +667,14 @@ pub struct ConnectObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateObservationIdentity {
     pub current_version: String,
     pub target_version: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateObservation {
     pub identity: UpdateObservationIdentity,
@@ -572,7 +683,7 @@ pub struct UpdateObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaObservationIdentity {
     pub provider: String,
@@ -580,7 +691,7 @@ pub struct QuotaObservationIdentity {
     pub observation_id: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaObservation {
     pub identity: QuotaObservationIdentity,
@@ -604,7 +715,7 @@ pub struct HostResourceObservation {
     pub generation: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopBarProjectionInput {
     pub now_ms: i64,
@@ -616,6 +727,167 @@ pub struct TopBarProjectionInput {
     pub resources: Option<HostResourceObservation>,
 }
 
+impl fmt::Debug for HostObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostObservationIdentity")
+            .field("host_id", &"[redacted]")
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl fmt::Display for HostObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("host-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for HostObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostObservation")
+            .field("identity", &self.identity)
+            .field("health", &self.health)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for HostObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("host-observation[redacted]")
+    }
+}
+
+impl fmt::Debug for ConnectObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectObservationIdentity")
+            .field("host_id", &"[redacted]")
+            .field("connection_epoch", &self.connection_epoch)
+            .finish()
+    }
+}
+
+impl fmt::Display for ConnectObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("connection-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for ConnectObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectObservation")
+            .field("identity", &self.identity)
+            .field("state", &self.state)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for ConnectObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("connection-observation[redacted]")
+    }
+}
+
+impl fmt::Debug for UpdateObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpdateObservationIdentity")
+            .field("current_version", &"[redacted]")
+            .field(
+                "target_version",
+                &self.target_version.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for UpdateObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("update-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for UpdateObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpdateObservation")
+            .field("identity", &self.identity)
+            .field("state", &self.state)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for UpdateObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("update-observation[redacted]")
+    }
+}
+
+impl fmt::Debug for QuotaObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuotaObservationIdentity")
+            .field("provider", &"[redacted]")
+            .field("provider_session_id", &"[redacted]")
+            .field("observation_id", &self.observation_id)
+            .finish()
+    }
+}
+
+impl fmt::Display for QuotaObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("quota-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for QuotaObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuotaObservation")
+            .field("identity", &self.identity)
+            .field("detail", &self.detail.as_ref().map(|_| "[redacted]"))
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for QuotaObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("quota-observation[redacted]")
+    }
+}
+
+impl fmt::Debug for TopBarProjectionInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TopBarProjectionInput")
+            .field("now_ms", &self.now_ms)
+            .field("generation", &self.generation)
+            .field("host_present", &self.host.is_some())
+            .field("connect_present", &self.connect.is_some())
+            .field("update_present", &self.update.is_some())
+            .field("quota_count", &self.quotas.len())
+            .field("resources_present", &self.resources.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for TopBarProjectionInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("top-bar-input[redacted]")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopBarStatus {
     Host(HostHealth),
@@ -623,20 +895,26 @@ pub enum TopBarStatus {
     Update(UpdateState),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TopBarStatusLink {
     pub status: TopBarStatus,
     pub label: String,
     pub description: String,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub tooltip: String,
     pub action: TopBarAction,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct QuotaProjection {
     pub identity: QuotaObservationIdentity,
     pub provider: String,
     pub detail: String,
     pub age_ms: i64,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub tooltip: String,
     pub action: TopBarAction,
 }
 
@@ -674,7 +952,7 @@ pub enum TopBarUnavailable {
     Quota,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct TopBarModel {
     pub host: Option<TopBarStatusLink>,
     pub connect: Option<TopBarStatusLink>,
@@ -840,6 +1118,72 @@ impl TopBarModel {
     }
 }
 
+impl fmt::Debug for TopBarStatusLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TopBarStatusLink")
+            .field("status", &self.status)
+            .field("label", &"[redacted]")
+            .field("description", &"[redacted]")
+            .field("role", &self.role)
+            .field("focusable", &self.focusable)
+            .field("tooltip", &"[redacted]")
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
+impl fmt::Display for TopBarStatusLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("top-bar-status[redacted]")
+    }
+}
+
+impl fmt::Debug for QuotaProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuotaProjection")
+            .field("identity", &self.identity)
+            .field("provider", &"[redacted]")
+            .field("detail", &"[redacted]")
+            .field("age_ms", &self.age_ms)
+            .field("role", &self.role)
+            .field("focusable", &self.focusable)
+            .field("tooltip", &"[redacted]")
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
+impl fmt::Display for QuotaProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("quota-projection[redacted]")
+    }
+}
+
+impl fmt::Debug for TopBarModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TopBarModel")
+            .field("host_present", &self.host.is_some())
+            .field("connect_present", &self.connect.is_some())
+            .field("update_present", &self.update.is_some())
+            .field("quota_count", &self.quotas.len())
+            .field("quota_hidden_count", &self.quota_hidden_count)
+            .field("quotas_truncated", &self.quotas_truncated)
+            .field("resources_present", &self.resources.is_some())
+            .field("unavailable", &self.unavailable)
+            .field("accessible_description", &"[redacted]")
+            .finish()
+    }
+}
+
+impl fmt::Display for TopBarModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("top-bar-model[redacted]")
+    }
+}
+
 fn task_action(identity: TaskIdentity) -> ProjectedAction {
     ProjectedAction::new(ACTION_TASK_SHOW, ActionTarget::Task(identity))
 }
@@ -872,6 +1216,9 @@ fn agent_projection(task: TaskIdentity, agent: &AgentSessionFacts) -> AgentProje
     AgentProjection {
         identity: identity.clone(),
         role,
+        accessibility_role: AccessibleRole::Button,
+        focusable: true,
+        tooltip: accessible_description.clone(),
         provider,
         lifecycle: agent.lifecycle,
         label,
@@ -994,6 +1341,9 @@ fn host_status_link(observation: &HostObservation, stamp: ObservationStamp) -> T
         status: TopBarStatus::Host(observation.health),
         label: label.to_string(),
         description: description.to_string(),
+        role: AccessibleRole::Button,
+        focusable: true,
+        tooltip: description.to_string(),
         action: ProjectedAction::new(
             ACTION_HOST_STATUS,
             ActionTarget::Host {
@@ -1030,6 +1380,9 @@ fn connect_status_link(
         status: TopBarStatus::Connect(observation.state),
         label: label.to_string(),
         description: description.to_string(),
+        role: AccessibleRole::Button,
+        focusable: true,
+        tooltip: description.to_string(),
         action: ProjectedAction::new(
             ACTION_HOST_STATUS,
             ActionTarget::Connect {
@@ -1060,7 +1413,10 @@ fn update_status_link(
     TopBarStatusLink {
         status: TopBarStatus::Update(observation.state),
         label,
+        tooltip: description.clone(),
         description,
+        role: AccessibleRole::Button,
+        focusable: true,
         action: ProjectedAction::new(
             ACTION_HOST_STATUS,
             ActionTarget::Update {
@@ -1113,6 +1469,9 @@ fn fresh_quotas<'a>(
             provider: provider_label(&observation.identity.provider),
             detail,
             age_ms,
+            role: AccessibleRole::Button,
+            focusable: true,
+            tooltip: "Open host status for quota details".to_string(),
             action: ProjectedAction::new(
                 ACTION_HOST_STATUS,
                 ActionTarget::Quota {
@@ -1243,7 +1602,7 @@ fn fresh_stamp(
         return None;
     }
     let age_ms = input.now_ms.checked_sub(observed_at_ms)?;
-    (0..=MAX_OBSERVATION_AGE_MS)
+    (0..MAX_OBSERVATION_AGE_MS)
         .contains(&age_ms)
         .then_some(ObservationStamp {
             observed_at_ms,
@@ -1311,6 +1670,12 @@ fn presentation_text(value: &str, max_scalars: usize) -> String {
         if is_sensitive_presentation_word(word) {
             words.push("[redacted]");
             index += 1;
+            if input_words
+                .get(index)
+                .is_some_and(|next| is_secret_value_candidate(next))
+            {
+                index += 1;
+            }
             continue;
         }
         if is_key_prefix_word(word)
@@ -1320,6 +1685,12 @@ fn presentation_text(value: &str, max_scalars: usize) -> String {
         {
             words.push("[redacted]");
             index += 2;
+            if input_words
+                .get(index)
+                .is_some_and(|next| is_secret_value_candidate(next))
+            {
+                index += 1;
+            }
             continue;
         }
         words.push(word);
@@ -1365,6 +1736,11 @@ fn is_key_suffix_word(word: &str) -> bool {
     word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
         .to_ascii_lowercase()
         .starts_with("key")
+}
+
+fn is_secret_value_candidate(word: &str) -> bool {
+    let trimmed = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    !trimmed.is_empty() && !is_key_prefix_word(word) && !is_key_suffix_word(word)
 }
 
 fn shorten_path(path: &PathBuf) -> String {

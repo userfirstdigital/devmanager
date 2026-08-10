@@ -9,10 +9,10 @@ pub use header::{
     HeaderAction, HeaderField, HeaderLayout, HostHealth, HostObservation, HostObservationIdentity,
     HostResourceObservation, HostResourceProjection, OverflowControl, PrimaryAgentProjection,
     ProjectProjection, ProjectedAction, QuotaObservation, QuotaObservationIdentity,
-    QuotaProjection, StatusLink, TaskActionContext, TaskHeaderModel, TaskIdentity, TopBarAction,
-    TopBarModel, TopBarProjectionInput, TopBarStatus, TopBarStatusLink, TurnProjection,
-    UpdateObservation, UpdateObservationIdentity, UpdateState, WorkspaceProjection,
-    MAX_HEADER_SPECIALISTS, MAX_TOP_BAR_QUOTAS, NARROW_HEADER_WIDTH_PX, PROVIDER_QUOTA_MAX_AGE_MS,
+    QuotaProjection, StatusLink, TaskHeaderModel, TaskIdentity, TopBarAction, TopBarModel,
+    TopBarProjectionInput, TopBarStatus, TopBarStatusLink, TurnProjection, UpdateObservation,
+    UpdateObservationIdentity, UpdateState, WorkspaceProjection, MAX_HEADER_SPECIALISTS,
+    MAX_TOP_BAR_QUOTAS, NARROW_HEADER_WIDTH_PX, PROVIDER_QUOTA_MAX_AGE_MS,
     STANDARD_HEADER_WIDTH_PX,
 };
 

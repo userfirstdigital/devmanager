@@ -42,6 +42,9 @@ use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
 use crate::terminal::{self, view};
+use crate::ui::task_cockpit::{
+    QuotaObservation, QuotaObservationIdentity, TopBarModel, TopBarProjectionInput,
+};
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, apply_browser_enabled_preference, CommandDraft, DiagnosticsDraft, EditorAction,
@@ -4957,40 +4960,36 @@ impl NativeShell {
         changed
     }
 
-    fn ai_quota_statuses(&self) -> Vec<chrome::QuotaStatus> {
+    fn ai_top_bar_model(&self) -> TopBarModel {
         let now_epoch_ms = Self::app_now_epoch_ms();
-        let mut latest_by_provider = HashMap::<&'static str, (String, u64)>::new();
-
-        for state in self.ai_quota_states.values() {
-            if Self::is_ai_quota_stale(state, now_epoch_ms) {
-                continue;
-            }
-            let Some(usage) = &state.latest_usage else {
-                continue;
-            };
-            let provider = Self::ai_provider_name(&state.tab_type).expect("only ai tabs");
-            let replace = latest_by_provider
-                .get(provider)
-                .is_none_or(|(_, seen_at)| state.latest_usage_seen_at_epoch_ms > *seen_at);
-            if replace {
-                latest_by_provider.insert(
-                    provider,
-                    (usage.clone(), state.latest_usage_seen_at_epoch_ms),
-                );
-            }
-        }
-
-        ["Claude", "Codex"]
-            .into_iter()
-            .filter_map(|provider| {
-                latest_by_provider
-                    .get(provider)
-                    .map(|(detail, _)| chrome::QuotaStatus {
-                        provider,
-                        detail: detail.clone(),
-                    })
+        let now_ms = i64::try_from(now_epoch_ms).unwrap_or(i64::MAX);
+        let quotas = self
+            .ai_quota_states
+            .values()
+            .filter_map(|state| {
+                let provider = Self::ai_provider_name(&state.tab_type)?;
+                Some(QuotaObservation {
+                    identity: QuotaObservationIdentity {
+                        provider: provider.to_string(),
+                        provider_session_id: state.provider_session_id.clone(),
+                        observation_id: state.cursor,
+                    },
+                    detail: state.latest_usage.clone(),
+                    observed_at_ms: i64::try_from(state.latest_usage_seen_at_epoch_ms).ok(),
+                    generation: Some(0),
+                })
             })
-            .collect()
+            .collect();
+
+        TopBarModel::from_input(&TopBarProjectionInput {
+            now_ms,
+            generation: 0,
+            host: None,
+            connect: None,
+            update: None,
+            quotas,
+            resources: None,
+        })
     }
 
     fn ai_provider_name(tab_type: &TabType) -> Option<&'static str> {
@@ -5027,9 +5026,10 @@ impl NativeShell {
 
     fn is_ai_quota_stale(entry: &AiQuotaState, now_epoch_ms: u64) -> bool {
         entry.latest_usage.is_some()
-            && entry.latest_usage_seen_at_epoch_ms != 0
-            && now_epoch_ms.saturating_sub(entry.latest_usage_seen_at_epoch_ms)
-                > AI_QUOTA_VISIBILITY_TTL.as_millis() as u64
+            && (entry.latest_usage_seen_at_epoch_ms == 0
+                || now_epoch_ms < entry.latest_usage_seen_at_epoch_ms
+                || now_epoch_ms.saturating_sub(entry.latest_usage_seen_at_epoch_ms)
+                    >= AI_QUOTA_VISIBILITY_TTL.as_millis() as u64)
     }
 
     fn pause_for_native_dialog(&self) -> NativeDialogPauseGuard {
@@ -14765,7 +14765,7 @@ impl Render for NativeShell {
             &self.current_port_statuses(),
         );
         let updater_snapshot = self.updater.snapshot();
-        let quota_statuses = self.ai_quota_statuses();
+        let top_bar = self.ai_top_bar_model();
         let remote_status_bar = self.remote_status_bar_state();
         self.sync_settings_remote_draft();
         let allow_editor_mutation = self.remote_mode.is_none() || self.remote_has_control();
@@ -15849,7 +15849,7 @@ impl Render for NativeShell {
                         &runtime_snapshot,
                         &updater_snapshot,
                         Some(&remote_status_bar.model),
-                        &quota_statuses,
+                        &top_bar,
                         chrome::StatusBarActions {
                             on_open_process_monitor: &make_open_process_monitor_handler,
                             on_install_update: &make_install_update_handler,
@@ -18416,6 +18416,35 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_ai_quota_visibility_is_strictly_younger_than_one_hour() {
+        let state = AiQuotaState {
+            tab_id: "tab".to_string(),
+            tab_type: TabType::Claude,
+            provider_session_id: "provider-session".to_string(),
+            cursor: 0,
+            latest_usage: Some("72% remaining".to_string()),
+            latest_usage_seen_at_epoch_ms: 1_000,
+        };
+
+        assert!(!NativeShell::is_ai_quota_stale(
+            &state,
+            1_000 + 60 * 60 * 1_000 - 1
+        ));
+        assert!(NativeShell::is_ai_quota_stale(
+            &state,
+            1_000 + 60 * 60 * 1_000
+        ));
+        assert!(NativeShell::is_ai_quota_stale(&state, 999));
+
+        let mut legacy_without_timestamp = state;
+        legacy_without_timestamp.latest_usage_seen_at_epoch_ms = 0;
+        assert!(NativeShell::is_ai_quota_stale(
+            &legacy_without_timestamp,
+            1_000
+        ));
+    }
 
     #[test]
     fn remote_state_load_failure_disables_remote_and_surfaces_diagnostic() {

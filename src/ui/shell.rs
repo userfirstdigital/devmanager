@@ -134,6 +134,10 @@ pub type TerminalPointerOwner = PointerOwner;
 #[derive(Debug, Eq, PartialEq)]
 pub struct Shell {
     selected_task: Option<TaskId>,
+    resource_generation: u64,
+    connection_epoch: u64,
+    focus_epoch: u64,
+    client_epoch: u64,
     navigation_epoch: u64,
     transient_priority: Option<TransientPriority>,
     pointer_owner: Option<PointerCapture>,
@@ -146,6 +150,10 @@ impl Shell {
     pub fn new(selected_task: Option<TaskId>) -> Self {
         Self {
             selected_task,
+            resource_generation: 0,
+            connection_epoch: 0,
+            focus_epoch: 0,
+            client_epoch: 0,
             navigation_epoch: 0,
             transient_priority: None,
             pointer_owner: None,
@@ -161,25 +169,44 @@ impl Shell {
         self.navigation_epoch
     }
 
+    pub fn resource_generation(&self) -> u64 {
+        self.resource_generation
+    }
+
+    pub fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+
+    pub fn focus_epoch(&self) -> u64 {
+        self.focus_epoch
+    }
+
+    pub fn client_epoch(&self) -> u64 {
+        self.client_epoch
+    }
+
     pub fn transient_priority(&self) -> Option<TransientPriority> {
         self.transient_priority
     }
 
-    /// Project the selected task from the current client snapshot and the
-    /// caller's current host/resource, connection, and focus context. Client
-    /// and navigation epochs are captured from this exact model and shell.
-    pub fn task_header(
-        &self,
-        model: &ClientModel,
-        context: TaskActionContext,
-    ) -> Option<TaskHeaderModel> {
+    /// Project the selected task from the immutable client snapshot and the
+    /// epochs currently owned by this shell. No caller-supplied context can
+    /// mint or replace the action fence.
+    pub fn task_header(&self, model: &ClientModel) -> Option<TaskHeaderModel> {
+        if model.last_applied_sequence() != self.client_epoch {
+            return None;
+        }
         self.selected_task.and_then(|task_id| {
-            TaskHeaderModel::from_model_with_epochs(
+            TaskHeaderModel::from_model(
                 model,
                 task_id,
-                context,
-                model.last_applied_sequence(),
-                self.navigation_epoch,
+                TaskActionContext::new(
+                    self.resource_generation,
+                    self.connection_epoch,
+                    self.focus_epoch,
+                    self.client_epoch,
+                    self.navigation_epoch,
+                ),
             )
         })
     }
@@ -187,14 +214,35 @@ impl Shell {
     /// Dispatch only a projected action carrying the current task and all
     /// action-fence epochs. The shell performs no side effect; a true result
     /// authorizes the caller's downstream action dispatcher to proceed.
-    pub fn dispatch_task_action(
-        &self,
-        model: &ClientModel,
-        context: TaskActionContext,
-        action: &HeaderAction,
-    ) -> bool {
-        self.task_header(model, context)
+    pub fn dispatch_task_action(&self, model: &ClientModel, action: &HeaderAction) -> bool {
+        self.task_header(model)
             .is_some_and(|header| header.accepts_action(action))
+    }
+
+    /// Observe the current client subscription high-water. Older updates are
+    /// ignored, so a stale subscription cannot revive an older projected row.
+    pub fn sync_client_epoch(&mut self, client_epoch: u64) -> bool {
+        if client_epoch < self.client_epoch {
+            return false;
+        }
+        self.client_epoch = client_epoch;
+        true
+    }
+
+    pub fn advance_resource_generation(&mut self) -> bool {
+        advance_epoch(&mut self.resource_generation)
+    }
+
+    pub fn advance_connection_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.connection_epoch)
+    }
+
+    pub fn advance_focus_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.focus_epoch)
+    }
+
+    pub fn advance_client_epoch(&mut self) -> bool {
+        advance_epoch(&mut self.client_epoch)
     }
 
     pub fn set_transient_priority(&mut self, priority: Option<TransientPriority>) {
@@ -312,6 +360,9 @@ impl Shell {
     }
 
     pub fn on_focus_loss(&mut self) -> bool {
+        if !self.advance_focus_epoch() {
+            return false;
+        }
         self.invalidate(InvalidationReason::FocusLoss)
     }
 
@@ -327,4 +378,12 @@ impl Shell {
         self.pointer_owner = None;
         self.generation = self.generation.saturating_add(1);
     }
+}
+
+fn advance_epoch(epoch: &mut u64) -> bool {
+    let Some(next) = epoch.checked_add(1) else {
+        return false;
+    };
+    *epoch = next;
+    true
 }
