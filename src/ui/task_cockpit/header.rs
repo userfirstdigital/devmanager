@@ -40,6 +40,7 @@ const MAX_PROJECT_SCALARS: usize = 64;
 const MAX_PATH_SCALARS: usize = 64;
 const MAX_BRANCH_SCALARS: usize = 48;
 const MAX_QUOTA_DETAIL_SCALARS: usize = 64;
+const MAX_ROLE_SCALARS: usize = 64;
 const MAX_ACCESSIBLE_SCALARS: usize = 512;
 const COMPACT_TITLE_SCALARS: usize = 28;
 const WRAPPED_TITLE_LINE_SCALARS: usize = 28;
@@ -72,6 +73,8 @@ pub struct TaskIdentity {
     pub resource_generation: u64,
     pub connection_epoch: u64,
     pub focus_epoch: u64,
+    pub client_epoch: u64,
+    pub navigation_epoch: u64,
     pub action_epoch: u64,
 }
 
@@ -174,13 +177,22 @@ pub enum WorkspaceProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProjection {
     pub identity: AgentIdentity,
-    pub role: AgentRole,
+    pub role: AgentRoleProjection,
     /// This is a safe display label, not the provider's raw identity.
     pub provider: String,
     pub lifecycle: AgentSessionLifecycle,
     pub label: String,
     pub accessible_description: String,
     pub action: HeaderAction,
+}
+
+/// Bounded public role data. The provider/domain role remains private to the
+/// projection boundary; specialist names are sanitized before they can leave
+/// this module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentRoleProjection {
+    Primary,
+    Specialist { label: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,28 +231,62 @@ pub struct TaskHeaderModel {
 }
 
 impl TaskHeaderModel {
-    pub fn from_model(model: &ClientModel, task_id: TaskId) -> Option<Self> {
-        Self::from_model_with_context(model, task_id, TaskActionContext::default())
+    /// Project a task with the caller's current host/resource, connection,
+    /// and focus context. Context is mandatory so actions cannot silently
+    /// fall back to an all-zero fence.
+    pub fn from_model(
+        model: &ClientModel,
+        task_id: TaskId,
+        context: TaskActionContext,
+    ) -> Option<Self> {
+        Self::from_model_with_epochs(model, task_id, context, model.last_applied_sequence(), 0)
     }
 
-    /// Project a task while capturing the host, connection, and focus epochs
-    /// owned by the caller. Every task action carries this complete fence.
+    /// Compatibility name for callers that already use the explicit context
+    /// constructor. New callers should use [`Self::from_model`].
     pub fn from_model_with_context(
         model: &ClientModel,
         task_id: TaskId,
         context: TaskActionContext,
     ) -> Option<Self> {
-        let task = model.task(task_id)?;
-        Some(Self::from_snapshot(task_id, task, context))
+        Self::from_model(model, task_id, context)
     }
 
-    fn from_snapshot(task_id: TaskId, task: &TaskSnapshot, context: TaskActionContext) -> Self {
+    /// Project a task while capturing all current action-fence epochs. The
+    /// client and navigation epochs are supplied by the live Shell rather
+    /// than guessed by a pure model projection.
+    pub fn from_model_with_epochs(
+        model: &ClientModel,
+        task_id: TaskId,
+        context: TaskActionContext,
+        client_epoch: u64,
+        navigation_epoch: u64,
+    ) -> Option<Self> {
+        let task = model.task(task_id)?;
+        Some(Self::from_snapshot(
+            task_id,
+            task,
+            context,
+            client_epoch,
+            navigation_epoch,
+        ))
+    }
+
+    fn from_snapshot(
+        task_id: TaskId,
+        task: &TaskSnapshot,
+        context: TaskActionContext,
+        client_epoch: u64,
+        navigation_epoch: u64,
+    ) -> Self {
         let identity = TaskIdentity {
             task_id,
             revision: task.task.revision,
             resource_generation: context.resource_generation,
             connection_epoch: context.connection_epoch,
             focus_epoch: context.focus_epoch,
+            client_epoch,
+            navigation_epoch,
             action_epoch: task.task.action_epoch,
         };
         let visible_status = task.visible_status();
@@ -806,9 +852,17 @@ fn agent_projection(task: TaskIdentity, agent: &AgentSessionFacts) -> AgentProje
         resource_generation: agent.runtime_generation,
         provider_session_id: agent.provider_session_id.clone(),
     };
-    let label = match &agent.role {
-        AgentRole::Primary => "Primary".to_string(),
-        AgentRole::Specialist { name } => presentation_text(name, MAX_TITLE_SCALARS),
+    let (role, label) = match &agent.role {
+        AgentRole::Primary => (AgentRoleProjection::Primary, "Primary".to_string()),
+        AgentRole::Specialist { name } => {
+            let label = presentation_text(name, MAX_ROLE_SCALARS);
+            (
+                AgentRoleProjection::Specialist {
+                    label: label.clone(),
+                },
+                label,
+            )
+        }
     };
     let provider = provider_label(&agent.provider_kind);
     let accessible_description = presentation_text(
@@ -817,7 +871,7 @@ fn agent_projection(task: TaskIdentity, agent: &AgentSessionFacts) -> AgentProje
     );
     AgentProjection {
         identity: identity.clone(),
-        role: agent.role.clone(),
+        role,
         provider,
         lifecycle: agent.lifecycle,
         label,
@@ -1206,7 +1260,11 @@ fn provider_label(provider: &str) -> String {
 }
 
 fn provider_key(provider: &str) -> String {
-    provider.trim().to_ascii_lowercase()
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude_code" => "claude".to_string(),
+        "codex" => "codex".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn safe_quota_detail(detail: &str) -> Option<String> {
@@ -1245,32 +1303,68 @@ fn presentation_text(value: &str, max_scalars: usize) -> String {
         })
         .collect::<String>();
     let redacted = redact_secrets(&controls_removed);
-    let mut words = Vec::new();
-    for word in redacted.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        if [
-            "secret",
-            "token",
-            "password",
-            "credential",
-            "apikey",
-            "accesskey",
-            "privatekey",
-            "authorization",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    let input_words = redacted.split_whitespace().collect::<Vec<_>>();
+    let mut words = Vec::with_capacity(input_words.len());
+    let mut index = 0;
+    while index < input_words.len() {
+        let word = input_words[index];
+        if is_sensitive_presentation_word(word) {
+            words.push("[redacted]");
+            index += 1;
+            continue;
+        }
+        if is_key_prefix_word(word)
+            && input_words
+                .get(index + 1)
+                .is_some_and(|next| is_key_suffix_word(next))
         {
             words.push("[redacted]");
-        } else {
-            words.push(word);
+            index += 2;
+            continue;
         }
+        words.push(word);
+        index += 1;
     }
     let value = words.join(" ");
     if value.is_empty() {
         return "Unavailable".to_string();
     }
     truncate_scalars(&value, max_scalars)
+}
+
+fn is_sensitive_presentation_word(word: &str) -> bool {
+    let compact = word
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect::<String>();
+    [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "authorization",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
+fn is_key_prefix_word(word: &str) -> bool {
+    matches!(
+        word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+            .as_str(),
+        "api" | "access" | "private"
+    )
+}
+
+fn is_key_suffix_word(word: &str) -> bool {
+    word.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+        .to_ascii_lowercase()
+        .starts_with("key")
 }
 
 fn shorten_path(path: &PathBuf) -> String {

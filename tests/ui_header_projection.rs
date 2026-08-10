@@ -11,7 +11,8 @@ use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{PointerButton, Shell};
 use devmanager::ui::task_cockpit::header::{
-    ActionTarget, CpuInputUnit, ProjectedAction, TaskActionContext, TitleLayout,
+    ActionTarget, AgentRoleProjection, CpuInputUnit, ProjectedAction, TaskActionContext,
+    TitleLayout,
 };
 use devmanager::ui::task_cockpit::{
     HeaderAction, HeaderField, PrimaryAgentProjection, TaskHeaderModel, TopBarModel,
@@ -41,13 +42,17 @@ fn model_from_pages(pages: &[SnapshotPage]) -> ClientModel {
     builder.finish().expect("fixture snapshot must finish")
 }
 
+fn project_header(model: &ClientModel, task_id: TaskId) -> TaskHeaderModel {
+    TaskHeaderModel::from_model(model, task_id, TaskActionContext::default())
+        .expect("selected task must project")
+}
+
 #[test]
 fn header_projects_task_context_and_stable_agent_status_links() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
 
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id)
-        .expect("selected task must project");
+    let header = project_header(&model, fixture.selected_task_id);
 
     assert_eq!(header.identity.task_id, fixture.selected_task_id);
     assert_eq!(header.identity.revision, 9);
@@ -109,7 +114,9 @@ fn shell_projects_only_its_captured_selected_task() {
     let model = model_from_pages(&fixture.snapshot_pages);
     let shell = Shell::new(Some(fixture.selected_task_id));
 
-    let header = shell.task_header(&model).expect("selected task header");
+    let header = shell
+        .task_header(&model, TaskActionContext::default())
+        .expect("selected task header");
     assert_eq!(header.identity.task_id, fixture.selected_task_id);
 }
 
@@ -144,8 +151,7 @@ fn top_bar_keeps_global_facts_hides_stale_quota_and_labels_cpu_diagnostics() {
 fn narrow_header_uses_priority_overflow_with_accessible_text() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id)
-        .expect("selected task must project");
+    let header = project_header(&model, fixture.selected_task_id);
 
     let layout = header.responsive_layout(360);
 
@@ -181,8 +187,7 @@ fn header_does_not_invent_a_primary_provider_when_the_reference_is_missing() {
     }
     let model = model_from_pages(&pages);
 
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id)
-        .expect("selected task must project");
+    let header = project_header(&model, fixture.selected_task_id);
 
     assert!(matches!(
         header.primary,
@@ -409,7 +414,7 @@ fn top_bar_suppresses_missing_stale_future_and_wrong_generation_facts() {
 fn header_and_top_bar_actions_share_one_descriptor_and_reject_stale_identity() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id).unwrap();
+    let header = project_header(&model, fixture.selected_task_id);
     let primary = match &header.primary {
         PrimaryAgentProjection::Present(primary) => primary,
         _ => panic!("primary agent"),
@@ -492,7 +497,7 @@ fn presentation_is_bounded_redacted_and_does_not_leak_sensitive_labels() {
         }
     }
     let model = model_from_pages(&pages);
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id).unwrap();
+    let header = project_header(&model, fixture.selected_task_id);
     assert!(header.title.chars().count() <= 160);
     assert!(header
         .title
@@ -609,7 +614,7 @@ fn workspace_projection_does_not_retain_raw_path_or_branch_text() {
     }
 
     let model = model_from_pages(&pages);
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id).unwrap();
+    let header = project_header(&model, fixture.selected_task_id);
     let WorkspaceProjection::Worktree { path, branch } = header.workspace else {
         panic!("expected worktree projection");
     };
@@ -719,7 +724,7 @@ fn specialist_cap_announces_total_hidden_count_and_orders_by_agent_id() {
     }
 
     let model = model_from_pages(&pages);
-    let header = TaskHeaderModel::from_model(&model, task_id).unwrap();
+    let header = project_header(&model, task_id);
     assert_eq!(header.specialist_total, 34);
     assert_eq!(header.specialists.len(), MAX_HEADER_SPECIALISTS);
     assert_eq!(header.specialist_hidden_count, 2);
@@ -753,7 +758,7 @@ fn title_layout_is_deterministic_at_320_and_360_pixels() {
         }
     }
     let model = model_from_pages(&pages);
-    let header = TaskHeaderModel::from_model(&model, fixture.selected_task_id).unwrap();
+    let header = project_header(&model, fixture.selected_task_id);
 
     let compact = header.responsive_layout(320);
     let narrow = header.responsive_layout(360);
@@ -770,4 +775,153 @@ fn title_layout_is_deterministic_at_320_and_360_pixels() {
     assert_eq!(lines.len(), 2);
     assert!(lines.iter().all(|line| line.chars().count() <= 28));
     assert_ne!(compact_title, lines.join(" "));
+}
+
+#[test]
+fn shell_header_dispatch_rejects_each_stale_action_context_epoch() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = Shell::new(Some(fixture.selected_task_id));
+    let context = TaskActionContext {
+        resource_generation: 12,
+        connection_epoch: 4,
+        focus_epoch: 8,
+    };
+    let header = shell
+        .task_header(&model, context)
+        .expect("selected task header");
+    let action = header.status.action.clone();
+    assert_eq!(header.identity.resource_generation, 12);
+    assert_eq!(header.identity.connection_epoch, 4);
+    assert_eq!(header.identity.focus_epoch, 8);
+    assert_eq!(header.identity.client_epoch, model.last_applied_sequence());
+    assert_eq!(header.identity.navigation_epoch, shell.navigation_epoch());
+    assert!(shell.dispatch_task_action(&model, context, &action));
+
+    for stale in [
+        TaskActionContext {
+            resource_generation: 13,
+            ..context
+        },
+        TaskActionContext {
+            connection_epoch: 5,
+            ..context
+        },
+        TaskActionContext {
+            focus_epoch: 9,
+            ..context
+        },
+    ] {
+        assert!(
+            !shell.dispatch_task_action(&model, stale, &action),
+            "stale external context must be rejected"
+        );
+    }
+
+    let mut advanced_pages = fixture.snapshot_pages.clone();
+    for page in &mut advanced_pages {
+        page.through_sequence += 1;
+    }
+    let advanced_model = model_from_pages(&advanced_pages);
+    assert!(
+        !shell.dispatch_task_action(&advanced_model, context, &action),
+        "stale client snapshot must be rejected"
+    );
+
+    let mut invalidated_shell = shell;
+    assert!(invalidated_shell.on_resync());
+    assert!(
+        !invalidated_shell.dispatch_task_action(&model, context, &action),
+        "stale navigation epoch must be rejected"
+    );
+}
+
+#[test]
+fn quota_projection_canonicalizes_claude_provider_aliases_to_one_summary() {
+    let fixture = fixture();
+    let mut input = fixture.top_bar;
+    input.quotas = vec![
+        devmanager::ui::task_cockpit::QuotaObservation {
+            identity: devmanager::ui::task_cockpit::QuotaObservationIdentity {
+                provider: "Claude".into(),
+                provider_session_id: "claude-a".into(),
+                observation_id: 1,
+            },
+            detail: Some("10% remaining".into()),
+            observed_at_ms: Some(input.now_ms - 20),
+            generation: Some(input.generation),
+        },
+        devmanager::ui::task_cockpit::QuotaObservation {
+            identity: devmanager::ui::task_cockpit::QuotaObservationIdentity {
+                provider: "claude_code".into(),
+                provider_session_id: "claude-b".into(),
+                observation_id: 2,
+            },
+            detail: Some("20% remaining".into()),
+            observed_at_ms: Some(input.now_ms - 10),
+            generation: Some(input.generation),
+        },
+    ];
+
+    let model = TopBarModel::from_input(&input);
+    assert_eq!(model.quotas.len(), 1);
+    assert_eq!(model.quotas[0].provider, "Claude");
+    assert_eq!(model.quotas[0].detail, "20% remaining");
+}
+
+#[test]
+fn visible_and_accessible_text_redacts_key_name_separator_variants() {
+    let fixture = fixture();
+    let mut pages = fixture.snapshot_pages.clone();
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let SnapshotItem::Task(task) = item {
+                task.task.title =
+                    "API_KEY=ordinary ACCESS-KEY:ordinary Private.Key ordinary".into();
+            }
+        }
+    }
+
+    let header = TaskHeaderModel::from_model(
+        &model_from_pages(&pages),
+        fixture.selected_task_id,
+        TaskActionContext::default(),
+    )
+    .expect("selected task header");
+    for output in [&header.title, &header.accessible_description] {
+        assert!(!output.contains("API_KEY"));
+        assert!(!output.contains("ACCESS-KEY"));
+        assert!(!output.contains("Private.Key"));
+    }
+}
+
+#[test]
+fn agent_projection_exposes_only_a_bounded_sanitized_role() {
+    let fixture = fixture();
+    let mut pages = fixture.snapshot_pages.clone();
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let SnapshotItem::AgentSession(agent) = item {
+                if matches!(agent.role, AgentRole::Specialist { .. }) {
+                    agent.role = AgentRole::Specialist {
+                        name: format!("SPECIALIST_API_KEY={}", "x".repeat(300)),
+                    };
+                }
+            }
+        }
+    }
+
+    let header = TaskHeaderModel::from_model(
+        &model_from_pages(&pages),
+        fixture.selected_task_id,
+        TaskActionContext::default(),
+    )
+    .expect("selected task header");
+    let role = &header.specialists[0].role;
+    let AgentRoleProjection::Specialist { label } = role else {
+        panic!("expected specialist role projection");
+    };
+    assert!(label.chars().count() <= 64);
+    assert!(!label.contains("API_KEY"));
+    assert!(!format!("{role:?}").contains("SPECIALIST_API_KEY"));
 }

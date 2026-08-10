@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::client::ClientModel;
 use crate::domain::id::TaskId;
+use crate::ui::task_cockpit::header::{HeaderAction, TaskActionContext};
 use crate::ui::task_cockpit::{TaskHeaderModel, TaskList};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,11 +165,36 @@ impl Shell {
         self.transient_priority
     }
 
-    /// Project the selected task from the current client snapshot. The shell
-    /// captures only the selected TaskId; all task facts remain in ClientModel.
-    pub fn task_header(&self, model: &ClientModel) -> Option<TaskHeaderModel> {
-        self.selected_task
-            .and_then(|task_id| TaskHeaderModel::from_model(model, task_id))
+    /// Project the selected task from the current client snapshot and the
+    /// caller's current host/resource, connection, and focus context. Client
+    /// and navigation epochs are captured from this exact model and shell.
+    pub fn task_header(
+        &self,
+        model: &ClientModel,
+        context: TaskActionContext,
+    ) -> Option<TaskHeaderModel> {
+        self.selected_task.and_then(|task_id| {
+            TaskHeaderModel::from_model_with_epochs(
+                model,
+                task_id,
+                context,
+                model.last_applied_sequence(),
+                self.navigation_epoch,
+            )
+        })
+    }
+
+    /// Dispatch only a projected action carrying the current task and all
+    /// action-fence epochs. The shell performs no side effect; a true result
+    /// authorizes the caller's downstream action dispatcher to proceed.
+    pub fn dispatch_task_action(
+        &self,
+        model: &ClientModel,
+        context: TaskActionContext,
+        action: &HeaderAction,
+    ) -> bool {
+        self.task_header(model, context)
+            .is_some_and(|header| header.accepts_action(action))
     }
 
     pub fn set_transient_priority(&mut self, priority: Option<TransientPriority>) {

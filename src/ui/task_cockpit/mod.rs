@@ -4,13 +4,14 @@ pub mod header;
 pub mod inbox;
 
 pub use header::{
-    AgentIdentity, AgentProjection, ConnectObservation, ConnectObservationIdentity, ConnectState,
-    CpuDiagnostic, CpuProjection, HeaderAction, HeaderField, HeaderLayout, HostHealth,
-    HostObservation, HostObservationIdentity, HostResourceObservation, HostResourceProjection,
-    OverflowControl, PrimaryAgentProjection, ProjectProjection, QuotaObservation,
-    QuotaObservationIdentity, QuotaProjection, StatusLink, TaskHeaderModel, TaskIdentity,
-    TopBarAction, TopBarModel, TopBarProjectionInput, TopBarStatus, TopBarStatusLink,
-    TurnProjection, UpdateObservation, UpdateObservationIdentity, UpdateState, WorkspaceProjection,
+    ActionTarget, AgentIdentity, AgentProjection, AgentRoleProjection, ConnectObservation,
+    ConnectObservationIdentity, ConnectState, CpuDiagnostic, CpuInputUnit, CpuProjection,
+    HeaderAction, HeaderField, HeaderLayout, HostHealth, HostObservation, HostObservationIdentity,
+    HostResourceObservation, HostResourceProjection, OverflowControl, PrimaryAgentProjection,
+    ProjectProjection, ProjectedAction, QuotaObservation, QuotaObservationIdentity,
+    QuotaProjection, StatusLink, TaskActionContext, TaskHeaderModel, TaskIdentity, TopBarAction,
+    TopBarModel, TopBarProjectionInput, TopBarStatus, TopBarStatusLink, TurnProjection,
+    UpdateObservation, UpdateObservationIdentity, UpdateState, WorkspaceProjection,
     MAX_HEADER_SPECIALISTS, MAX_TOP_BAR_QUOTAS, NARROW_HEADER_WIDTH_PX, PROVIDER_QUOTA_MAX_AGE_MS,
     STANDARD_HEADER_WIDTH_PX,
 };
