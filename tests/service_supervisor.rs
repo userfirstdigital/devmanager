@@ -14,7 +14,8 @@ use devmanager::services::health::{
 use devmanager::services::model::{
     CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, PortProtocol, ServiceCatalog,
     ServiceDefinition, ServiceId, ServiceScope, StartupPolicy, StopPolicy, ValidationError,
-    MAX_ARGUMENT_COUNT, MAX_DEPENDENCY_COUNT, MAX_SERVICE_COUNT,
+    MAX_ARGUMENT_COUNT, MAX_DEPENDENCY_COUNT, MAX_SERVICE_CATALOG_FRAME_BYTES,
+    MAX_SERVICE_CATALOG_JSON_DEPTH, MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES, MAX_SERVICE_COUNT,
 };
 
 fn id(value: &str) -> ServiceId {
@@ -272,10 +273,16 @@ fn secret_flags_and_assignments_are_rejected_structurally_but_name_only_refs_are
         vec!["--secret", "raw-secret"],
         vec!["--password=raw-secret"],
         vec!["--private-key", "raw-secret"],
+        vec!["--env=API_TOKEN=raw-secret"],
+        vec!["--env", "API_TOKEN=raw-secret"],
+        vec!["--set-env=TOKEN=raw-secret"],
+        vec!["--set-env", "TOKEN=raw-secret"],
     ] {
         let mut definition = fixture_definition(0);
         definition["command"]["args"] = serde_json::json!(args);
-        assert!(serde_json::from_value::<ServiceDefinition>(definition).is_err());
+        let error = serde_json::from_value::<ServiceDefinition>(definition)
+            .expect_err("raw secret argument must be rejected");
+        assert!(!error.to_string().contains("raw-secret"));
     }
 
     let mut assignment = fixture_definition(0);
@@ -560,4 +567,45 @@ fn catalog_wire_is_strict_and_fingerprint_is_order_independent() {
         r#"{"schema_version":1,"schema_version":1,"services":[]}"#
     )
     .is_err());
+}
+
+#[test]
+fn catalog_decode_rejects_oversized_frames_and_escaped_strings_before_serde() {
+    let oversized_frame = vec![b' '; MAX_SERVICE_CATALOG_FRAME_BYTES + 1];
+    assert!(ServiceCatalog::decode_json(&oversized_frame).is_err());
+
+    let escaped = r#"\u0061"#.repeat(2_000);
+    let input = format!(
+        r#"{{"schema_version":1,"services":[{{"id":"api","scope":"Host","command":{{"program":"node","args":["{escaped}"],"cwd":null,"env":[]}},"dependencies":[],"health":"None","startup":{{"mode":"manual","startup_deadline_ms":1000}},"stop":{{"graceful_timeout_ms":1000,"kill_after_ms":10000}},"expected_port":null}}]}}"#
+    );
+    let error =
+        ServiceCatalog::decode_json(input.as_bytes()).expect_err("escaped oversized string");
+    assert!(!format!("{error:?}").contains("aaaa"));
+}
+
+#[test]
+fn catalog_decode_accepts_the_versioned_valid_fixture() {
+    let decoded = ServiceCatalog::decode_json(include_bytes!("fixtures/services/valid.json"))
+        .expect("valid catalog fixture should cross the production decode boundary");
+    assert_eq!(decoded.definitions().count(), 2);
+}
+
+#[test]
+fn catalog_decode_preflights_malicious_field_names_arrays_and_depth() {
+    let field_name = "x".repeat(MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES + 1);
+    let malicious_field = format!(r#"{{"schema_version":1,"services":[],"{field_name}":null}}"#);
+    assert!(ServiceCatalog::decode_json(malicious_field.as_bytes()).is_err());
+
+    let too_many_services = format!(
+        r#"{{"schema_version":1,"services":[{}]}}"#,
+        std::iter::repeat_n("null", 129)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(ServiceCatalog::decode_json(too_many_services.as_bytes()).is_err());
+
+    let nested = "[".repeat(MAX_SERVICE_CATALOG_JSON_DEPTH + 1)
+        + "null"
+        + &"]".repeat(MAX_SERVICE_CATALOG_JSON_DEPTH + 1);
+    assert!(ServiceCatalog::decode_json(nested.as_bytes()).is_err());
 }

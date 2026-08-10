@@ -26,6 +26,18 @@ pub const MAX_STARTUP_DEADLINE_MS: u64 = 3_600_000;
 pub const MAX_PROBE_INTERVAL_MS: u64 = 60_000;
 pub const MAX_STOP_TIMEOUT_MS: u64 = 120_000;
 pub const SERVICE_CATALOG_SCHEMA_VERSION: u16 = 1;
+/// Maximum encoded JSON frame accepted by the service-catalog boundary.
+///
+/// Callers that receive catalog bytes must use [`ServiceCatalog::decode_json`]
+/// rather than handing untrusted input directly to `serde_json`. The decoder
+/// performs a bounded lexical pass before serde is allowed to allocate any
+/// catalog values.
+pub const MAX_SERVICE_CATALOG_FRAME_BYTES: usize = 256 * 1024;
+pub const MAX_SERVICE_CATALOG_JSON_STRING_BYTES: usize = 4096;
+pub const MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES: usize = 128;
+pub const MAX_SERVICE_CATALOG_JSON_ARRAY_ITEMS: usize = 128;
+pub const MAX_SERVICE_CATALOG_JSON_OBJECT_FIELDS: usize = 32;
+pub const MAX_SERVICE_CATALOG_JSON_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ServiceId(String);
@@ -422,6 +434,10 @@ impl CommandSpec {
             });
         }
         self.args.push(CommandArgument::new(arg)?);
+        if let Err(error) = validate_command_arguments(&self.args) {
+            self.args.pop();
+            return Err(error);
+        }
         Ok(self)
     }
 
@@ -980,6 +996,32 @@ pub struct ServiceCatalog {
     services: BTreeMap<ServiceId, ServiceDefinition>,
 }
 
+/// Errors returned by the bounded service-catalog JSON boundary.
+///
+/// The variants intentionally do not carry parser text or input fragments:
+/// catalog bytes can contain command arguments and must never be copied into
+/// diagnostics while rejecting malformed or hostile input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceCatalogDecodeError {
+    FrameTooLarge,
+    JsonLimitExceeded,
+    MalformedJson,
+    InvalidCatalog,
+}
+
+impl fmt::Display for ServiceCatalogDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FrameTooLarge => "service catalog frame exceeds the maximum size",
+            Self::JsonLimitExceeded => "service catalog JSON exceeds a bounded limit",
+            Self::MalformedJson => "service catalog JSON is malformed",
+            Self::InvalidCatalog => "service catalog is invalid",
+        })
+    }
+}
+
+impl std::error::Error for ServiceCatalogDecodeError {}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceCatalogWire {
@@ -1018,6 +1060,20 @@ impl Serialize for ServiceCatalog {
 
 #[allow(dead_code)]
 impl ServiceCatalog {
+    /// Decode one untrusted JSON service-catalog frame.
+    ///
+    /// The raw frame and its JSON containers are bounded before serde parses
+    /// any strings into owned values. This is important for escaped strings:
+    /// serde_json must otherwise materialize the unescaped scratch string
+    /// before a field-level validator can reject it.
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, ServiceCatalogDecodeError> {
+        if bytes.len() > MAX_SERVICE_CATALOG_FRAME_BYTES {
+            return Err(ServiceCatalogDecodeError::FrameTooLarge);
+        }
+        preflight_service_catalog_json(bytes)?;
+        serde_json::from_slice(bytes).map_err(|_| ServiceCatalogDecodeError::InvalidCatalog)
+    }
+
     pub fn new(definitions: Vec<ServiceDefinition>) -> Result<Self, ValidationError> {
         if definitions.len() > MAX_SERVICE_COUNT {
             return Err(ValidationError::TooMany {
@@ -1161,6 +1217,7 @@ impl ServiceCatalog {
                 received: epoch,
             });
         }
+        validate_task_close_snapshot_resources(self, task_id, snapshot)?;
 
         let mut selected = BTreeSet::new();
         for definition in self.services.values() {
@@ -1993,6 +2050,14 @@ pub(crate) enum AdmissionRejection {
         expected: Option<ActionEpoch>,
         received: ActionEpoch,
     },
+    TaskOwnedResourceNotInCatalog {
+        service: ServiceId,
+        task_id: TaskId,
+    },
+    TaskOwnedResourceOutsideScope {
+        service: ServiceId,
+        task_id: TaskId,
+    },
     OwnershipMismatch {
         service: ServiceId,
         expected: RuntimeOwnership,
@@ -2219,6 +2284,7 @@ impl TaskClosePlan {
                 received: self.epoch,
             });
         }
+        validate_task_close_snapshot_resources(catalog, self.task_id, snapshot)?;
         for item in &self.ordered {
             if item.scope
                 != (ServiceScope::Task {
@@ -2372,9 +2438,7 @@ fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
             limit: MAX_ARGUMENT_COUNT,
         });
     }
-    for argument in &command.args {
-        CommandArgument::new(argument.as_str().to_owned())?;
-    }
+    validate_command_arguments(&command.args)?;
     if let Some(cwd) = &command.cwd {
         WorkspacePath::new(cwd.as_str().to_owned())?;
     }
@@ -2386,6 +2450,23 @@ fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
     }
     for reference in &command.env {
         validate_env_reference(reference)?;
+    }
+    Ok(())
+}
+
+fn validate_command_arguments(arguments: &[CommandArgument]) -> Result<(), ValidationError> {
+    for (index, argument) in arguments.iter().enumerate() {
+        CommandArgument::new(argument.as_str().to_owned())?;
+        if is_secret_option(argument.as_str())
+            && arguments
+                .get(index + 1)
+                .is_some_and(|next| is_secret_name(next.as_str()))
+            && arguments.get(index + 2).is_some()
+        {
+            return Err(ValidationError::RawSecret {
+                field: ValidationField::Argument,
+            });
+        }
     }
     Ok(())
 }
@@ -2429,6 +2510,194 @@ fn validate_env_name(value: &str) -> Result<(), ValidationError> {
         });
     }
     Ok(())
+}
+
+fn preflight_service_catalog_json(bytes: &[u8]) -> Result<(), ServiceCatalogDecodeError> {
+    let mut scanner = JsonPreflight { bytes, position: 0 };
+    scanner.skip_whitespace();
+    scanner.parse_value(0)?;
+    scanner.skip_whitespace();
+    if scanner.position != bytes.len() {
+        return Err(ServiceCatalogDecodeError::MalformedJson);
+    }
+    Ok(())
+}
+
+struct JsonPreflight<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> JsonPreflight<'a> {
+    fn parse_value(&mut self, depth: usize) -> Result<(), ServiceCatalogDecodeError> {
+        if depth > MAX_SERVICE_CATALOG_JSON_DEPTH {
+            return Err(ServiceCatalogDecodeError::JsonLimitExceeded);
+        }
+        match self.peek() {
+            Some(b'"') => self.parse_string(false),
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => Err(ServiceCatalogDecodeError::MalformedJson),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<(), ServiceCatalogDecodeError> {
+        self.expect_byte(b'{')?;
+        self.skip_whitespace();
+        if self.consume_byte(b'}') {
+            return Ok(());
+        }
+
+        let mut fields = 0;
+        loop {
+            if fields >= MAX_SERVICE_CATALOG_JSON_OBJECT_FIELDS {
+                return Err(ServiceCatalogDecodeError::JsonLimitExceeded);
+            }
+            self.parse_string(true)?;
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            self.skip_whitespace();
+            self.parse_value(depth + 1)?;
+            fields += 1;
+            self.skip_whitespace();
+            if self.consume_byte(b'}') {
+                return Ok(());
+            }
+            self.expect_byte(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<(), ServiceCatalogDecodeError> {
+        self.expect_byte(b'[')?;
+        self.skip_whitespace();
+        if self.consume_byte(b']') {
+            return Ok(());
+        }
+
+        let mut items = 0;
+        loop {
+            if items >= MAX_SERVICE_CATALOG_JSON_ARRAY_ITEMS {
+                return Err(ServiceCatalogDecodeError::JsonLimitExceeded);
+            }
+            self.parse_value(depth + 1)?;
+            items += 1;
+            self.skip_whitespace();
+            if self.consume_byte(b']') {
+                return Ok(());
+            }
+            self.expect_byte(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_string(&mut self, field_name: bool) -> Result<(), ServiceCatalogDecodeError> {
+        self.expect_byte(b'"')?;
+        let limit = if field_name {
+            MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES
+        } else {
+            MAX_SERVICE_CATALOG_JSON_STRING_BYTES
+        };
+        let mut raw_length = 0usize;
+        loop {
+            let Some(byte) = self.next_byte() else {
+                return Err(ServiceCatalogDecodeError::MalformedJson);
+            };
+            match byte {
+                b'"' => return Ok(()),
+                b'\\' => {
+                    raw_length = raw_length.saturating_add(2);
+                    let Some(escape) = self.next_byte() else {
+                        return Err(ServiceCatalogDecodeError::MalformedJson);
+                    };
+                    if escape == b'u' {
+                        raw_length = raw_length.saturating_add(4);
+                        for _ in 0..4 {
+                            let Some(hex) = self.next_byte() else {
+                                return Err(ServiceCatalogDecodeError::MalformedJson);
+                            };
+                            if !hex.is_ascii_hexdigit() {
+                                return Err(ServiceCatalogDecodeError::MalformedJson);
+                            }
+                        }
+                    } else if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return Err(ServiceCatalogDecodeError::MalformedJson);
+                    }
+                }
+                byte if byte < 0x20 => {
+                    return Err(ServiceCatalogDecodeError::MalformedJson);
+                }
+                _ => raw_length = raw_length.saturating_add(1),
+            }
+            if raw_length > limit {
+                return Err(ServiceCatalogDecodeError::JsonLimitExceeded);
+            }
+        }
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), ServiceCatalogDecodeError> {
+        if self.bytes.get(self.position..self.position + literal.len()) == Some(literal) {
+            self.position += literal.len();
+            Ok(())
+        } else {
+            Err(ServiceCatalogDecodeError::MalformedJson)
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<(), ServiceCatalogDecodeError> {
+        let start = self.position;
+        while matches!(
+            self.peek(),
+            Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+        ) {
+            self.position += 1;
+        }
+        if self.position == start {
+            Err(ServiceCatalogDecodeError::MalformedJson)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.position += 1;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), ServiceCatalogDecodeError> {
+        if self.consume_byte(expected) {
+            Ok(())
+        } else {
+            Err(ServiceCatalogDecodeError::MalformedJson)
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let byte = self.bytes.get(self.position).copied()?;
+        self.position += 1;
+        Some(byte)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
 }
 
 fn deserialize_bounded_string<'de, D, const MAX: usize>(deserializer: D) -> Result<String, D::Error>
@@ -2719,14 +2988,27 @@ fn is_secret_argument(value: &str) -> bool {
             | "--private-key"
             | "--private_key"
     ) || is_secret_assignment(value)
+        || value.split_once('=').is_some_and(|(name, assigned)| {
+            is_secret_option(name)
+                && assigned
+                    .split_once('=')
+                    .is_some_and(|(name, _)| is_secret_name(name))
+        })
 }
 
 fn is_secret_assignment(value: &str) -> bool {
+    if value.starts_with("-----BEGIN ") {
+        return true;
+    }
     let Some((name, _)) = value.split_once('=') else {
         return false;
     };
+    is_secret_name(name)
+}
+
+fn is_secret_name(name: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        name.trim_start_matches('-').to_ascii_lowercase().as_str(),
         "token"
             | "api-token"
             | "api_token"
@@ -2740,7 +3022,14 @@ fn is_secret_assignment(value: &str) -> bool {
             | "password"
             | "private-key"
             | "private_key"
-    ) || value.starts_with("-----BEGIN ")
+    )
+}
+
+fn is_secret_option(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "--env" | "--set-env" | "--env-var" | "--set-env-var"
+    )
 }
 
 #[allow(dead_code)]
@@ -2973,6 +3262,31 @@ fn validate_close_plan(
         {
             return Err(AdmissionRejection::PlanStale {
                 service: item.service_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_close_snapshot_resources(
+    catalog: &ServiceCatalog,
+    task_id: TaskId,
+    snapshot: &AdmissionSnapshot,
+) -> Result<(), AdmissionRejection> {
+    for (service_id, runtime) in &snapshot.services {
+        if runtime.ownership != (RuntimeOwnership::Task { task_id }) {
+            continue;
+        }
+        let Some(definition) = catalog.definition(service_id) else {
+            return Err(AdmissionRejection::TaskOwnedResourceNotInCatalog {
+                service: service_id.clone(),
+                task_id,
+            });
+        };
+        if definition.scope.task_id() != Some(&task_id) {
+            return Err(AdmissionRejection::TaskOwnedResourceOutsideScope {
+                service: service_id.clone(),
+                task_id,
             });
         }
     }
@@ -3669,5 +3983,99 @@ mod tests {
             catalog.admit_task_close(task_a(), ActionEpoch::new(9), &snapshot),
             Err(AdmissionRejection::OwnershipMismatch { service, .. }) if service == id("api")
         ));
+    }
+
+    #[test]
+    fn task_close_rejects_task_owned_snapshot_resources_missing_from_catalog() {
+        let catalog = ServiceCatalog::new(vec![service(
+            "api",
+            ServiceScope::task(task_a()),
+            vec![],
+            8080,
+        )])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_task_epoch(task_a(), ActionEpoch::new(9));
+        snapshot.mark_task_closing(task_a());
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+        snapshot.set_service(
+            id("removed-service"),
+            record(
+                ServiceState::Stopped,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &snapshot),
+            Err(AdmissionRejection::TaskOwnedResourceNotInCatalog { service, task_id })
+                if service == id("removed-service") && task_id == task_a()
+        ));
+    }
+
+    #[test]
+    fn task_close_rejects_task_ownership_on_host_scoped_snapshot_resources() {
+        let catalog = ServiceCatalog::new(vec![
+            service("api", ServiceScope::task(task_a()), vec![], 8080),
+            service("host-db", ServiceScope::Host, vec![], 5432),
+        ])
+        .unwrap();
+        let fence = AdmissionFence::new(4, 3, 9);
+        let mut snapshot = AdmissionSnapshot::default();
+        snapshot.set_task_epoch(task_a(), ActionEpoch::new(9));
+        snapshot.mark_task_closing(task_a());
+        snapshot.set_service(
+            id("api"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+        snapshot.set_service(
+            id("host-db"),
+            record(
+                ServiceState::Healthy,
+                fence,
+                RuntimeOwnership::Task { task_id: task_a() },
+                None,
+            ),
+        );
+
+        assert!(matches!(
+            catalog.admit_task_close(task_a(), ActionEpoch::new(9), &snapshot),
+            Err(AdmissionRejection::TaskOwnedResourceOutsideScope { service, task_id })
+                if service == id("host-db") && task_id == task_a()
+        ));
+    }
+
+    #[test]
+    fn command_arguments_reject_secret_assignment_options_without_exposing_values() {
+        let secret = "raw-secret-value";
+        for args in [
+            vec![format!("--env=API_TOKEN={secret}")],
+            vec!["--env".to_string(), format!("API_TOKEN={secret}")],
+            vec![format!("--set-env=TOKEN={secret}")],
+            vec!["--set-env".to_string(), format!("TOKEN={secret}")],
+        ] {
+            let error = CommandSpec::new("node")
+                .expect("valid command")
+                .with_args(args)
+                .expect_err("raw assignment must be rejected");
+            assert!(!format!("{error:?}").contains(secret));
+            assert!(!error.to_string().contains(secret));
+        }
     }
 }
