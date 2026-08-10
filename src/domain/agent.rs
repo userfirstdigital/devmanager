@@ -38,8 +38,17 @@ impl std::error::Error for ProviderSessionIdError {}
 /// This type intentionally does not trim, normalize, parse, or infer the
 /// value. The provider's bytes remain the resume key; only safety bounds are
 /// enforced at the boundary.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ProviderSessionId(String);
+
+impl std::fmt::Debug for ProviderSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderSessionId")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
 
 impl ProviderSessionId {
     pub fn new(value: impl Into<String>) -> Result<Self, ProviderSessionIdError> {
@@ -161,6 +170,8 @@ fn is_unsafe_provider_session_character(character: char) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentValidationError {
     EmptyProviderKind,
+    UnsupportedProviderKind,
+    NonCanonicalProviderKind,
     EmptyProviderSessionId,
     EmptySpecialistName,
     InvalidRegistrationState,
@@ -170,6 +181,8 @@ impl std::fmt::Display for AgentValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyProviderKind => write!(f, "provider kind must be non-empty"),
+            Self::UnsupportedProviderKind => write!(f, "provider kind is not supported"),
+            Self::NonCanonicalProviderKind => write!(f, "provider kind is not canonical"),
             Self::EmptyProviderSessionId => {
                 write!(f, "provider session id must be non-empty when present")
             }
@@ -274,7 +287,12 @@ impl AgentSessionFacts {
     pub fn canonicalize_provider_kind(
         value: impl Into<String>,
     ) -> Result<String, AgentValidationError> {
-        canonical::canonicalize(value.into()).ok_or(AgentValidationError::EmptyProviderKind)
+        let value =
+            canonical::canonicalize(value.into()).ok_or(AgentValidationError::EmptyProviderKind)?;
+        match value.as_str() {
+            "claude" | "claude_code" | "codex" | "cursor" => Ok(value),
+            _ => Err(AgentValidationError::UnsupportedProviderKind),
+        }
     }
 
     pub fn canonicalize_provider_session_id(
@@ -291,8 +309,9 @@ impl AgentSessionFacts {
 
     pub fn validate(&self) -> Result<(), AgentValidationError> {
         self.role.validate()?;
-        if !canonical::is_canonical(&self.provider_kind) {
-            return Err(AgentValidationError::EmptyProviderKind);
+        let canonical = Self::canonicalize_provider_kind(self.provider_kind.clone())?;
+        if canonical != self.provider_kind {
+            return Err(AgentValidationError::NonCanonicalProviderKind);
         }
         if let Some(session) = &self.provider_session_id {
             if !canonical::is_canonical(session) {

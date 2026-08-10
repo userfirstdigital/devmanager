@@ -5,9 +5,9 @@
 
 use crate::domain::ProviderSessionId;
 use crate::providers::capabilities::{
-    ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability, ProviderExecutable,
-    ProviderExecutableError, ProviderExecutablePolicy, ProviderExecutablePolicyError, ProviderKind,
-    ProviderVersion, ProviderVersionError,
+    ProviderAuthEvidenceError, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
+    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutablePolicy,
+    ProviderExecutablePolicyError, ProviderKind, ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -86,8 +86,17 @@ impl fmt::Debug for ProviderInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderArgument(String);
+
+impl fmt::Debug for ProviderArgument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderArgument")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
 
 impl ProviderArgument {
     pub fn new(value: impl Into<String>) -> Result<Self, ProviderInputError> {
@@ -271,12 +280,24 @@ impl fmt::Display for ProviderProbeRequestError {
 
 impl std::error::Error for ProviderProbeRequestError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderProbeRequest {
     executable: PathBuf,
     kind: ProviderProbeKind,
     timeout: Duration,
     max_output_bytes: usize,
+}
+
+impl fmt::Debug for ProviderProbeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderProbeRequest")
+            .field("executable_bound", &true)
+            .field("kind", &self.kind)
+            .field("timeout", &self.timeout)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .finish()
+    }
 }
 
 impl ProviderProbeRequest {
@@ -906,7 +927,7 @@ fn receive_probe_reader(receiver: mpsc::Receiver<()>) -> Result<(), ProviderProb
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderError {
     DuplicateProviderKind(ProviderKind),
     ProviderNotRegistered(ProviderKind),
@@ -939,6 +960,37 @@ pub enum ProviderError {
     InvalidCapabilities(ProviderCapabilitiesError),
     InvalidExecutablePolicy(ProviderExecutablePolicyError),
     UnsupportedCapability(ProviderCapability),
+    Discovery(ProviderDiscoveryError),
+    AuthEvidence(ProviderAuthEvidenceError),
+    UntrustedAuthenticationEvidence,
+}
+
+impl fmt::Debug for ProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::DuplicateProviderKind(_) => "duplicate_provider_kind",
+            Self::ProviderNotRegistered(_) => "provider_not_registered",
+            Self::MissingCli { .. } => "missing_cli",
+            Self::WrapperCommandNotAllowed { .. } => "wrapper_command_not_allowed",
+            Self::ExecutableNotAllowed { .. } => "executable_not_allowed",
+            Self::Executable(_) => "executable",
+            Self::ExecutableChanged { .. } => "executable_changed",
+            Self::Probe(_) => "probe",
+            Self::MalformedVersion(_) => "malformed_version",
+            Self::CapabilityKindMismatch { .. } => "capability_kind_mismatch",
+            Self::CapabilityVersionMismatch { .. } => "capability_version_mismatch",
+            Self::InvalidCapabilities(_) => "invalid_capabilities",
+            Self::InvalidExecutablePolicy(_) => "invalid_executable_policy",
+            Self::UnsupportedCapability(_) => "unsupported_capability",
+            Self::Discovery(_) => "discovery",
+            Self::AuthEvidence(_) => "auth_evidence",
+            Self::UntrustedAuthenticationEvidence => "untrusted_authentication_evidence",
+        };
+        formatter
+            .debug_struct("ProviderError")
+            .field("code", &code)
+            .finish()
+    }
 }
 
 impl fmt::Display for ProviderError {
@@ -950,20 +1002,15 @@ impl fmt::Display for ProviderError {
             Self::ProviderNotRegistered(kind) => {
                 write!(f, "provider kind is not registered: {kind:?}")
             }
-            Self::MissingCli { kind, requested } => {
-                write!(f, "missing {kind:?} CLI: {requested:?}")
-            }
-            Self::WrapperCommandNotAllowed { path } => write!(
-                f,
-                "wrapper commands and package runners are not provider executables: {}",
-                path.display()
-            ),
-            Self::ExecutableNotAllowed { kind, path } => {
+            Self::MissingCli { kind, .. } => write!(f, "missing {kind:?} CLI"),
+            Self::WrapperCommandNotAllowed { .. } => {
                 write!(
                     f,
-                    "{kind:?} does not declare executable: {}",
-                    path.display()
+                    "wrapper commands and package runners are not provider executables"
                 )
+            }
+            Self::ExecutableNotAllowed { kind, .. } => {
+                write!(f, "{kind:?} does not declare the requested executable")
             }
             Self::Executable(error) => error.fmt(f),
             Self::ExecutableChanged { .. } => {
@@ -990,6 +1037,14 @@ impl fmt::Display for ProviderError {
             Self::UnsupportedCapability(capability) => {
                 write!(f, "provider capability is unsupported: {capability:?}")
             }
+            Self::Discovery(error) => error.fmt(f),
+            Self::AuthEvidence(error) => error.fmt(f),
+            Self::UntrustedAuthenticationEvidence => {
+                write!(
+                    f,
+                    "provider adapter returned untrusted authentication evidence"
+                )
+            }
         }
     }
 }
@@ -1014,14 +1069,28 @@ impl From<ProviderCapabilitiesError> for ProviderError {
     }
 }
 
+impl From<ProviderDiscoveryError> for ProviderError {
+    fn from(error: ProviderDiscoveryError) -> Self {
+        Self::Discovery(error)
+    }
+}
+
+impl From<ProviderAuthEvidenceError> for ProviderError {
+    fn from(error: ProviderAuthEvidenceError) -> Self {
+        Self::AuthEvidence(error)
+    }
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    /// Probe all Task 4.1 capabilities, including a fresh auth-status probe.
-    /// Authenticated and auth-required results are valid only when the
-    /// returned capabilities carry matching `AuthStatusProbe` evidence.
-    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError>;
+    /// Probe non-authentication capabilities for an already validated
+    /// executable. Authentication is a registry-owned receipt flow.
+    async fn probe(
+        &self,
+        executable: &ProviderExecutable,
+    ) -> Result<ProviderCapabilities, ProviderError>;
 
     fn build_launch(
         &self,
@@ -1034,6 +1103,6 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn observe_quota(
         &self,
-        executable: &Path,
+        executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError>;
 }

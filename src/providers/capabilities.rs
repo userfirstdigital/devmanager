@@ -2,7 +2,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -18,9 +18,17 @@ pub const MAX_EXECUTABLE_ENTRYPOINT_BYTES: usize = 128;
 pub const MAX_PROVIDER_PATH_BYTES: usize = 4096;
 pub const PROVIDER_AUTH_NONCE_BYTES: usize = 32;
 pub const MAX_PROVIDER_SHIM_BYTES: usize = 16 * 1024;
+pub const MAX_PROVIDER_PATH_ENTRIES: usize = 256;
+pub const MAX_PROVIDER_PATH_VALUE_BYTES: usize = 32 * 1024;
+pub const MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES: usize = 64;
+pub const MAX_PROVIDER_AUTH_PENDING_ENTRIES: usize = 64;
+pub const MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES: usize = 64;
 pub const PROVIDER_CAPABILITY_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EXECUTABLE_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_FILE_IDENTITY_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_OBSERVATION_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_CACHE_KEY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,11 +323,21 @@ pub enum EvidenceDiagnosticCode {
     VersionMalformed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceDiagnostic {
     code: EvidenceDiagnosticCode,
     digest: Option<[u8; 32]>,
+}
+
+impl fmt::Debug for EvidenceDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EvidenceDiagnostic")
+            .field("code", &self.code)
+            .field("digest_present", &self.digest.is_some())
+            .finish()
+    }
 }
 
 impl EvidenceDiagnostic {
@@ -340,6 +358,7 @@ impl EvidenceDiagnostic {
 pub enum CapabilityEvidenceError {
     ObservedAtZero,
     ExpiryNotAfterObserved,
+    AuthEvidenceRequiresReceipt,
     UnsupportedSchemaVersion(u16),
 }
 
@@ -349,6 +368,12 @@ impl fmt::Display for CapabilityEvidenceError {
             Self::ObservedAtZero => write!(f, "capability evidence observed_at must be non-zero"),
             Self::ExpiryNotAfterObserved => {
                 write!(f, "capability evidence expiry must follow observed_at")
+            }
+            Self::AuthEvidenceRequiresReceipt => {
+                write!(
+                    f,
+                    "subscription authentication evidence requires a registry receipt"
+                )
             }
             Self::UnsupportedSchemaVersion(version) => {
                 write!(
@@ -371,6 +396,7 @@ pub struct CapabilityEvidence {
     auth_source: Option<ProviderAuthEvidenceSource>,
     expires_at: Option<u64>,
     confidence: EvidenceConfidence,
+    auth_authority: bool,
 }
 
 impl CapabilityEvidence {
@@ -388,12 +414,13 @@ impl CapabilityEvidence {
             auth_source: None,
             expires_at: None,
             confidence: EvidenceConfidence::Unknown,
+            auth_authority: false,
         };
         evidence.validate()?;
         Ok(evidence)
     }
 
-    pub fn new_with_lifecycle(
+    fn new_with_lifecycle(
         source: EvidenceSourceId,
         observed_at: u64,
         expires_at: Option<u64>,
@@ -410,28 +437,10 @@ impl CapabilityEvidence {
             auth_source,
             expires_at,
             confidence,
+            auth_authority: false,
         };
         evidence.validate()?;
         Ok(evidence)
-    }
-
-    pub fn new_auth_status(
-        kind: ProviderKind,
-        observed_at: u64,
-        expires_at: u64,
-        confidence: EvidenceConfidence,
-        status: EvidenceStatus,
-        diagnostic: Option<EvidenceDiagnostic>,
-    ) -> Result<Self, CapabilityEvidenceError> {
-        Self::new_with_lifecycle(
-            EvidenceSourceId::AuthStatusProbe,
-            observed_at,
-            Some(expires_at),
-            confidence,
-            Some(ProviderAuthEvidenceSource::for_kind(kind)),
-            status,
-            diagnostic,
-        )
     }
 
     pub const fn source(&self) -> EvidenceSourceId {
@@ -472,7 +481,41 @@ impl CapabilityEvidence {
         {
             return Err(CapabilityEvidenceError::ExpiryNotAfterObserved);
         }
+        let is_authentication_evidence = self.source == EvidenceSourceId::AuthStatusProbe
+            || self.auth_source.is_some()
+            || matches!(
+                self.status,
+                EvidenceStatus::Authenticated | EvidenceStatus::AuthRequired
+            );
+        if is_authentication_evidence && !self.is_registry_authorized_auth() {
+            return Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt);
+        }
         Ok(())
+    }
+
+    fn from_auth_receipt(receipt: &ProviderAuthEvidenceReceipt) -> Self {
+        let status = match receipt.result {
+            ProviderAuthProbeResult::AuthenticatedSubscription => EvidenceStatus::Authenticated,
+            ProviderAuthProbeResult::AuthRequired => EvidenceStatus::AuthRequired,
+            ProviderAuthProbeResult::ApiKeyDetected | ProviderAuthProbeResult::Unknown => {
+                EvidenceStatus::Unknown
+            }
+        };
+        let observed_at = receipt.generation;
+        Self {
+            source: EvidenceSourceId::AuthStatusProbe,
+            observed_at,
+            status,
+            diagnostic: None,
+            auth_source: Some(receipt.source),
+            expires_at: Some(observed_at.saturating_add(1)),
+            confidence: receipt.confidence,
+            auth_authority: true,
+        }
+    }
+
+    fn is_registry_authorized_auth(&self) -> bool {
+        self.auth_authority
     }
 }
 
@@ -496,15 +539,11 @@ impl<'de> Deserialize<'de> for CapabilityEvidence {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            #[serde(default = "default_evidence_schema_version")]
             schema_version: u16,
             source: EvidenceSourceId,
             observed_at: u64,
-            #[serde(default)]
             expires_at: Option<u64>,
-            #[serde(default)]
             confidence: EvidenceConfidence,
-            #[serde(default)]
             auth_source: Option<ProviderAuthEvidenceSource>,
             status: EvidenceStatus,
             diagnostic: Option<EvidenceDiagnostic>,
@@ -527,10 +566,6 @@ impl<'de> Deserialize<'de> for CapabilityEvidence {
         )
         .map_err(de::Error::custom)
     }
-}
-
-const fn default_evidence_schema_version() -> u16 {
-    PROVIDER_EVIDENCE_SCHEMA_VERSION
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -638,8 +673,7 @@ impl std::error::Error for ProviderExecutableError {}
 /// The identity is deliberately retained in addition to the canonical path
 /// and content hash. A path and a timestamp are not sufficient to identify a
 /// runnable provider after replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "platform", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderFileIdentity {
     Windows {
         volume_serial: u32,
@@ -655,6 +689,113 @@ pub enum ProviderFileIdentity {
         stable_id: [u8; 16],
         link_count: u64,
     },
+}
+
+impl Serialize for ProviderFileIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Windows {
+                volume_serial,
+                file_index,
+                link_count,
+            } => {
+                let mut state = serializer.serialize_struct("ProviderFileIdentity", 5)?;
+                state.serialize_field("schema_version", &PROVIDER_FILE_IDENTITY_SCHEMA_VERSION)?;
+                state.serialize_field("platform", "windows")?;
+                state.serialize_field("volume_serial", volume_serial)?;
+                state.serialize_field("file_index", file_index)?;
+                state.serialize_field("link_count", link_count)?;
+                state.end()
+            }
+            Self::Unix {
+                device,
+                inode,
+                link_count,
+            } => {
+                let mut state = serializer.serialize_struct("ProviderFileIdentity", 5)?;
+                state.serialize_field("schema_version", &PROVIDER_FILE_IDENTITY_SCHEMA_VERSION)?;
+                state.serialize_field("platform", "unix")?;
+                state.serialize_field("device", device)?;
+                state.serialize_field("inode", inode)?;
+                state.serialize_field("link_count", link_count)?;
+                state.end()
+            }
+            Self::Other {
+                stable_id,
+                link_count,
+            } => {
+                let mut state = serializer.serialize_struct("ProviderFileIdentity", 4)?;
+                state.serialize_field("schema_version", &PROVIDER_FILE_IDENTITY_SCHEMA_VERSION)?;
+                state.serialize_field("platform", "other")?;
+                state.serialize_field("stable_id", stable_id)?;
+                state.serialize_field("link_count", link_count)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderFileIdentity {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "platform", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Windows {
+                schema_version: u16,
+                volume_serial: u32,
+                file_index: [u8; 16],
+                link_count: u32,
+            },
+            Unix {
+                schema_version: u16,
+                device: u64,
+                inode: u64,
+                link_count: u64,
+            },
+            Other {
+                schema_version: u16,
+                stable_id: [u8; 16],
+                link_count: u64,
+            },
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match wire {
+            Wire::Windows {
+                schema_version,
+                volume_serial,
+                file_index,
+                link_count,
+            } if schema_version == PROVIDER_FILE_IDENTITY_SCHEMA_VERSION => Ok(Self::Windows {
+                volume_serial,
+                file_index,
+                link_count,
+            }),
+            Wire::Unix {
+                schema_version,
+                device,
+                inode,
+                link_count,
+            } if schema_version == PROVIDER_FILE_IDENTITY_SCHEMA_VERSION => Ok(Self::Unix {
+                device,
+                inode,
+                link_count,
+            }),
+            Wire::Other {
+                schema_version,
+                stable_id,
+                link_count,
+            } if schema_version == PROVIDER_FILE_IDENTITY_SCHEMA_VERSION => Ok(Self::Other {
+                stable_id,
+                link_count,
+            }),
+            Wire::Windows { schema_version, .. }
+            | Wire::Unix { schema_version, .. }
+            | Wire::Other { schema_version, .. } => Err(de::Error::custom(
+                ProviderExecutableError::UnsupportedSchemaVersion(schema_version),
+            )),
+        }
+    }
 }
 
 impl ProviderFileIdentity {
@@ -743,6 +884,7 @@ pub enum ProviderAuthEvidenceError {
     FutureTimestamp,
     Reordered,
     NonMonotonicTimestamp,
+    AlreadyConsumed,
     ExecutableChanged(ProviderExecutableError),
 }
 
@@ -766,6 +908,7 @@ impl fmt::Display for ProviderAuthEvidenceError {
             Self::NonMonotonicTimestamp => {
                 write!(f, "auth evidence timestamp is not strictly increasing")
             }
+            Self::AlreadyConsumed => write!(f, "auth evidence receipt was already consumed"),
             Self::ExecutableChanged(error) => error.fmt(f),
         }
     }
@@ -778,6 +921,14 @@ struct ProviderAuthInvocationKey {
     kind: ProviderKind,
     executable: ProviderExecutable,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProviderAuthReceiptKey {
+    kind: ProviderKind,
+    executable: ProviderExecutable,
+    nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -844,7 +995,7 @@ impl ProviderAuthProbeInvocation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAuthEvidenceReceipt {
     kind: ProviderKind,
     source: ProviderAuthEvidenceSource,
@@ -922,12 +1073,24 @@ impl ProviderAuthEvidenceReceipt {
     pub fn is_fresh_at(&self, now: Instant) -> bool {
         now >= self.observed_at && now <= self.deadline
     }
+
+    fn key(&self) -> ProviderAuthReceiptKey {
+        ProviderAuthReceiptKey {
+            kind: self.kind,
+            executable: self.executable.clone(),
+            nonce: self.nonce,
+            generation: self.generation,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct ProviderAuthEvidenceRegistry {
     next_generation: u64,
     pending: HashMap<ProviderAuthInvocationKey, ProviderAuthProbeInvocation>,
+    pending_order: VecDeque<ProviderAuthInvocationKey>,
+    accepted: HashMap<ProviderAuthReceiptKey, (ProviderAuthEvidenceReceipt, bool)>,
+    accepted_order: VecDeque<ProviderAuthReceiptKey>,
     last_accepted: HashMap<(ProviderKind, ProviderExecutable), (u64, Instant)>,
 }
 
@@ -1013,7 +1176,10 @@ impl ProviderAuthEvidenceRegistry {
             issued_at,
             deadline,
         };
-        self.pending.insert(invocation.key(), invocation.clone());
+        let key = invocation.key();
+        self.evict_oldest_pending();
+        self.pending.insert(key.clone(), invocation.clone());
+        self.pending_order.push_back(key);
         Ok(invocation)
     }
 
@@ -1035,7 +1201,7 @@ impl ProviderAuthEvidenceRegistry {
         )
     }
 
-    pub fn accept_at_for_with_confidence(
+    pub(crate) fn accept_at_for_with_confidence(
         &mut self,
         expected_kind: ProviderKind,
         expected_executable: &ProviderExecutable,
@@ -1060,14 +1226,15 @@ impl ProviderAuthEvidenceRegistry {
         expected_executable
             .validate_current()
             .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
-        if observed_at > Instant::now() {
+        let now = Instant::now();
+        if observed_at > now {
             return Err(ProviderAuthEvidenceError::FutureTimestamp);
         }
         if observed_at < invocation.issued_at || observed_at > invocation.deadline {
-            self.pending.remove(&key);
+            self.remove_pending(&key);
             return Err(ProviderAuthEvidenceError::Expired);
         }
-        self.pending.remove(&key);
+        self.remove_pending(&key);
 
         let identity_key = (invocation.kind, invocation.executable.clone());
         if let Some((last_generation, last_observed_at)) = self.last_accepted.get(&identity_key) {
@@ -1078,9 +1245,7 @@ impl ProviderAuthEvidenceRegistry {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
         }
-        self.last_accepted
-            .insert(identity_key, (invocation.generation, observed_at));
-        Ok(ProviderAuthEvidenceReceipt {
+        let receipt = ProviderAuthEvidenceReceipt {
             kind: invocation.kind,
             source: invocation.source,
             executable: invocation.executable,
@@ -1090,7 +1255,14 @@ impl ProviderAuthEvidenceRegistry {
             observed_at,
             deadline: invocation.deadline,
             confidence,
-        })
+        };
+        self.last_accepted
+            .insert(identity_key, (invocation.generation, observed_at));
+        self.evict_oldest_accepted();
+        let receipt_key = receipt.key();
+        self.accepted_order.push_back(receipt_key.clone());
+        self.accepted.insert(receipt_key, (receipt.clone(), false));
+        Ok(receipt)
     }
 
     pub fn accept_at(
@@ -1111,6 +1283,91 @@ impl ProviderAuthEvidenceRegistry {
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         self.accept_at(invocation, result, Instant::now())
     }
+
+    pub fn consume_at_for(
+        &mut self,
+        expected_kind: ProviderKind,
+        expected_executable: &ProviderExecutable,
+        receipt: ProviderAuthEvidenceReceipt,
+        now: Instant,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        if receipt.kind != expected_kind {
+            return Err(ProviderAuthEvidenceError::WrongProvider);
+        }
+        if receipt.source.provider_kind() != expected_kind {
+            return Err(ProviderAuthEvidenceError::WrongAuthSource);
+        }
+        if &receipt.executable != expected_executable {
+            return Err(ProviderAuthEvidenceError::WrongExecutable);
+        }
+        expected_executable
+            .validate_current()
+            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        if !receipt.is_fresh_at(now) {
+            return Err(ProviderAuthEvidenceError::Expired);
+        }
+        if self
+            .last_accepted
+            .get(&(receipt.kind, receipt.executable.clone()))
+            .map_or(true, |(generation, _)| *generation != receipt.generation)
+        {
+            return Err(ProviderAuthEvidenceError::Reordered);
+        }
+        let key = receipt.key();
+        let Some((stored, consumed)) = self.accepted.get_mut(&key) else {
+            return Err(ProviderAuthEvidenceError::UnknownInvocation);
+        };
+        if *consumed {
+            return Err(ProviderAuthEvidenceError::AlreadyConsumed);
+        }
+        if stored != &receipt {
+            return Err(ProviderAuthEvidenceError::UnknownInvocation);
+        }
+        *consumed = true;
+        Ok(receipt)
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn accepted_len(&self) -> usize {
+        self.accepted.len()
+    }
+
+    fn evict_oldest_pending(&mut self) {
+        while self.pending.len() >= MAX_PROVIDER_AUTH_PENDING_ENTRIES {
+            let Some(key) = self.pending_order.pop_front() else {
+                break;
+            };
+            self.pending.remove(&key);
+        }
+    }
+
+    fn remove_pending(&mut self, key: &ProviderAuthInvocationKey) {
+        self.pending.remove(key);
+        if let Some(position) = self.pending_order.iter().position(|current| current == key) {
+            self.pending_order.remove(position);
+        }
+    }
+
+    fn evict_oldest_accepted(&mut self) {
+        while self.accepted.len() >= MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES {
+            let Some(key) = self.accepted_order.pop_front() else {
+                break;
+            };
+            if let Some((receipt, _)) = self.accepted.remove(&key) {
+                let identity_key = (receipt.kind, receipt.executable.clone());
+                if self
+                    .last_accepted
+                    .get(&identity_key)
+                    .is_some_and(|(generation, _)| *generation == receipt.generation)
+                {
+                    self.last_accepted.remove(&identity_key);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1126,9 +1383,7 @@ impl fmt::Debug for ProviderExecutable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderExecutable")
-            .field("canonical_path", &"<redacted>")
-            .field("file_identity", &self.file_identity)
-            .field("sha256", &self.sha256)
+            .field("identity_bound", &true)
             .field("is_native", &self.is_native)
             .finish()
     }
@@ -1221,7 +1476,9 @@ impl ProviderExecutable {
         Self::inspect_blocking_with_mode(path, true)
     }
 
-    fn inspect_non_native_blocking(path: &Path) -> Result<Self, ProviderExecutableError> {
+    pub(crate) fn inspect_non_native_blocking(
+        path: &Path,
+    ) -> Result<Self, ProviderExecutableError> {
         Self::inspect_blocking_with_mode(path, false)
     }
 
@@ -1362,6 +1619,10 @@ impl ProviderExecutable {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    pub const fn is_native(&self) -> bool {
+        self.is_native
+    }
 }
 
 impl ProviderExecutableHandle {
@@ -1393,11 +1654,12 @@ impl ProviderExecutableHandle {
 
 impl Serialize for ProviderExecutable {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("ProviderExecutable", 4)?;
+        let mut state = serializer.serialize_struct("ProviderExecutable", 5)?;
         state.serialize_field("schema_version", &PROVIDER_EXECUTABLE_SCHEMA_VERSION)?;
         state.serialize_field("canonical_path", &self.canonical_path)?;
         state.serialize_field("file_identity", &self.file_identity)?;
         state.serialize_field("sha256", &self.sha256)?;
+        state.serialize_field("is_native", &self.is_native)?;
         state.end()
     }
 }
@@ -1454,11 +1716,11 @@ impl<'de> Deserialize<'de> for ProviderExecutable {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            #[serde(default = "default_executable_schema_version")]
             schema_version: u16,
             canonical_path: BoundedPathBuf,
             file_identity: ProviderFileIdentity,
             sha256: [u8; 32],
+            is_native: bool,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -1467,8 +1729,13 @@ impl<'de> Deserialize<'de> for ProviderExecutable {
                 ProviderExecutableError::UnsupportedSchemaVersion(wire.schema_version),
             ));
         }
-        let inspected =
-            Self::new(wire.canonical_path.0.clone(), wire.sha256).map_err(de::Error::custom)?;
+        let inspected = Self::inspect_blocking_with_mode(&wire.canonical_path.0, wire.is_native)
+            .map_err(de::Error::custom)?;
+        if inspected.sha256 != wire.sha256 {
+            return Err(de::Error::custom(ProviderExecutableError::HashMismatch(
+                wire.canonical_path.0,
+            )));
+        }
         if inspected.file_identity != wire.file_identity {
             return Err(de::Error::custom(
                 ProviderExecutableError::InvalidFileIdentity(wire.canonical_path.0),
@@ -1476,10 +1743,6 @@ impl<'de> Deserialize<'de> for ProviderExecutable {
         }
         Ok(inspected)
     }
-}
-
-const fn default_executable_schema_version() -> u16 {
-    PROVIDER_EXECUTABLE_SCHEMA_VERSION
 }
 
 struct OpenedExecutable {
@@ -1742,6 +2005,75 @@ fn path_bytes(path: &Path) -> usize {
     }
 }
 
+fn os_str_bytes(value: &OsStr) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return value.as_bytes().len();
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        return value.encode_wide().count().saturating_mul(2);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        value.to_string_lossy().len()
+    }
+}
+
+fn directory_identity(path: &Path) -> Result<u128, ProviderDiscoveryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+            path.to_path_buf(),
+        ));
+    }
+
+    let _ = metadata;
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(no_follow) = unix_open_no_follow_flag() else {
+            return Err(ProviderDiscoveryError::UnsupportedPlatform);
+        };
+        options.custom_flags(no_follow);
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        return Err(ProviderDiscoveryError::UnsupportedPlatform);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    let identity = file_identity(&file, path)
+        .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
+    let stable_id = identity.stable_id();
+    if stable_id == 0 {
+        return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(stable_id)
+}
+
 fn reject_reparse_components(path: &Path) -> Result<(), ProviderExecutableError> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -1982,14 +2314,26 @@ impl fmt::Debug for ProviderPathSnapshot {
 struct ProviderPathSnapshotEntry {
     index: usize,
     directory: PathBuf,
+    identity: u128,
 }
 
 impl ProviderPathSnapshot {
     pub fn capture(path: impl AsRef<OsStr>) -> Result<Self, ProviderDiscoveryError> {
-        let mut directories = Vec::new();
-        for (index, directory) in std::env::split_paths(path.as_ref()).enumerate() {
-            if directory.as_os_str().is_empty() {
-                continue;
+        let path = path.as_ref();
+        if os_str_bytes(path) > MAX_PROVIDER_PATH_VALUE_BYTES {
+            return Err(ProviderDiscoveryError::InvalidPathSnapshot(PathBuf::from(
+                path,
+            )));
+        }
+        let mut directories = Vec::with_capacity(MAX_PROVIDER_PATH_ENTRIES.min(8));
+        for (index, directory) in std::env::split_paths(path).enumerate() {
+            if index >= MAX_PROVIDER_PATH_ENTRIES {
+                return Err(ProviderDiscoveryError::InvalidPathSnapshot(PathBuf::from(
+                    path,
+                )));
+            }
+            if directory.as_os_str().is_empty() || !directory.is_absolute() {
+                return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
             }
             if path_bytes(&directory) > MAX_PROVIDER_PATH_BYTES {
                 return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
@@ -2013,9 +2357,11 @@ impl ProviderPathSnapshot {
             }
             reject_reparse_components(&canonical)
                 .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(canonical.clone()))?;
+            let identity = directory_identity(&canonical)?;
             directories.push(ProviderPathSnapshotEntry {
                 index,
                 directory: canonical,
+                identity,
             });
         }
         Ok(Self { directories })
@@ -2036,8 +2382,27 @@ impl ProviderPathSnapshot {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+impl ProviderPathSnapshotEntry {
+    fn validate_current(&self) -> Result<(), ProviderDiscoveryError> {
+        reject_reparse_components(&self.directory)
+            .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(self.directory.clone()))?;
+        let canonical = fs::canonicalize(&self.directory)
+            .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(self.directory.clone()))?;
+        if canonical != self.directory || !canonical.is_dir() {
+            return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+                self.directory.clone(),
+            ));
+        }
+        if directory_identity(&canonical)? != self.identity {
+            return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+                self.directory.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderDiscoveryOrigin {
     ConfiguredOverride,
     PathEntry { index: usize, directory: PathBuf },
@@ -2064,6 +2429,7 @@ pub enum ProviderExecutableForm {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderDiscoveryCandidate {
+    kind: ProviderKind,
     origin: ProviderDiscoveryOrigin,
     requested_path: PathBuf,
     executable: ProviderExecutable,
@@ -2083,6 +2449,10 @@ impl fmt::Debug for ProviderDiscoveryCandidate {
 }
 
 impl ProviderDiscoveryCandidate {
+    pub const fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
     pub fn origin(&self) -> &ProviderDiscoveryOrigin {
         &self.origin
     }
@@ -2158,6 +2528,7 @@ pub enum ProviderDiscoveryError {
     NoCandidate(ProviderKind),
     InvalidPathSnapshot(PathBuf),
     OriginNotAllowed(PathBuf),
+    ForbiddenRunner(PathBuf),
     WrongEntrypoint(PathBuf),
     WrongFileType(PathBuf),
     ShimProofInvalid(PathBuf),
@@ -2171,6 +2542,7 @@ impl fmt::Debug for ProviderDiscoveryError {
             Self::NoCandidate(_) => "no_candidate",
             Self::InvalidPathSnapshot(_) => "invalid_path_snapshot",
             Self::OriginNotAllowed(_) => "origin_not_allowed",
+            Self::ForbiddenRunner(_) => "forbidden_runner",
             Self::WrongEntrypoint(_) => "wrong_entrypoint",
             Self::WrongFileType(_) => "wrong_file_type",
             Self::ShimProofInvalid(_) => "shim_proof_invalid",
@@ -2195,6 +2567,9 @@ impl fmt::Display for ProviderDiscoveryError {
             }
             Self::OriginNotAllowed(_) => {
                 write!(f, "provider executable origin is not allowlisted")
+            }
+            Self::ForbiddenRunner(_) => {
+                write!(f, "shell and package runners are not provider executables")
             }
             Self::WrongEntrypoint(_) => {
                 write!(f, "provider executable is not an allowlisted entrypoint")
@@ -2276,6 +2651,7 @@ impl ProviderDiscoveryContract {
     ) -> Result<Vec<ProviderDiscoveryCandidate>, ProviderDiscoveryError> {
         let mut candidates = Vec::new();
         for entry in &snapshot.directories {
+            entry.validate_current()?;
             let origin = ProviderDiscoveryOrigin::PathEntry {
                 index: entry.index,
                 directory: entry.directory.clone(),
@@ -2285,6 +2661,7 @@ impl ProviderDiscoveryContract {
                 Ok(executable) => {
                     self.validate_native_path(&executable)?;
                     candidates.push(ProviderDiscoveryCandidate {
+                        kind: self.kind,
                         origin: origin.clone(),
                         requested_path: native_path.clone(),
                         executable,
@@ -2331,6 +2708,7 @@ impl ProviderDiscoveryContract {
                 self.validate_origin(&executable, &origin)?;
                 self.validate_native_path(&executable)?;
                 Ok(ProviderDiscoveryCandidate {
+                    kind: self.kind,
                     origin,
                     requested_path: path,
                     executable,
@@ -2358,6 +2736,18 @@ impl ProviderDiscoveryContract {
             .collect()
     }
 
+    pub fn validate_executable(
+        &self,
+        executable: &ProviderExecutable,
+    ) -> Result<(), ProviderDiscoveryError> {
+        if !executable.is_native() {
+            return Err(ProviderDiscoveryError::WrongFileType(
+                executable.canonical_path().to_path_buf(),
+            ));
+        }
+        self.validate_native_path(executable)
+    }
+
     fn validate_native_path(
         &self,
         executable: &ProviderExecutable,
@@ -2369,6 +2759,11 @@ impl ProviderDiscoveryContract {
             .ok_or_else(|| {
                 ProviderDiscoveryError::WrongEntrypoint(executable.canonical_path().to_path_buf())
             })?;
+        if is_forbidden_runner_name(file_name) {
+            return Err(ProviderDiscoveryError::ForbiddenRunner(
+                executable.canonical_path().to_path_buf(),
+            ));
+        }
         if !same_entrypoint(file_name, &self.native_entrypoint) {
             return Err(ProviderDiscoveryError::WrongEntrypoint(
                 executable.canonical_path().to_path_buf(),
@@ -2464,6 +2859,7 @@ impl ProviderDiscoveryContract {
                 return Err(ProviderDiscoveryError::ShimProofInvalid(shim_path));
             }
             Ok(ProviderDiscoveryCandidate {
+                kind: self.kind,
                 origin,
                 requested_path: shim_path,
                 executable: shim,
@@ -2575,6 +2971,7 @@ impl std::error::Error for ProviderCapabilitiesError {}
 
 impl Serialize for ProviderCapabilities {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
         let mut state = serializer.serialize_struct("ProviderCapabilities", 12)?;
         state.serialize_field("schema_version", &PROVIDER_CAPABILITY_SCHEMA_VERSION)?;
         state.serialize_field("kind", &self.kind)?;
@@ -2609,14 +3006,23 @@ impl<'de> Deserialize<'de> for BoundedCapabilityEvidence {
             where
                 A: SeqAccess<'de>,
             {
-                let mut evidence = Vec::with_capacity(MAX_CAPABILITY_EVIDENCE_ITEMS);
-                while let Some(item) = sequence.next_element::<CapabilityEvidence>()? {
-                    if evidence.len() >= MAX_CAPABILITY_EVIDENCE_ITEMS {
-                        return Err(de::Error::custom(
-                            ProviderCapabilitiesError::TooManyEvidenceItems,
-                        ));
-                    }
+                let size_hint = sequence.size_hint().unwrap_or_default();
+                if size_hint > MAX_CAPABILITY_EVIDENCE_ITEMS {
+                    return Err(de::Error::custom(
+                        ProviderCapabilitiesError::TooManyEvidenceItems,
+                    ));
+                }
+                let mut evidence = Vec::with_capacity(size_hint.min(MAX_CAPABILITY_EVIDENCE_ITEMS));
+                while evidence.len() < MAX_CAPABILITY_EVIDENCE_ITEMS {
+                    let Some(item) = sequence.next_element::<CapabilityEvidence>()? else {
+                        return Ok(BoundedCapabilityEvidence(evidence));
+                    };
                     evidence.push(item);
+                }
+                if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        ProviderCapabilitiesError::TooManyEvidenceItems,
+                    ));
                 }
                 Ok(BoundedCapabilityEvidence(evidence))
             }
@@ -2631,7 +3037,6 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            #[serde(default = "default_capability_schema_version")]
             schema_version: u16,
             kind: ProviderKind,
             version: ProviderVersion,
@@ -2639,13 +3044,9 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
             exact_resume: CapabilitySupport,
             semantic_events: CapabilitySupport,
             provider_session_id: CapabilitySupport,
-            #[serde(default)]
             build_launch: CapabilitySupport,
-            #[serde(default)]
             parse_signal: CapabilitySupport,
-            #[serde(default)]
             cooperative_stop: CapabilitySupport,
-            #[serde(default)]
             observe_quota: CapabilitySupport,
             evidence: BoundedCapabilityEvidence,
         }
@@ -2672,10 +3073,6 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
         capabilities.validate().map_err(de::Error::custom)?;
         Ok(capabilities)
     }
-}
-
-const fn default_capability_schema_version() -> u16 {
-    PROVIDER_CAPABILITY_SCHEMA_VERSION
 }
 
 impl ProviderCapabilities {
@@ -2744,10 +3141,6 @@ impl ProviderCapabilities {
         stable
     }
 
-    pub(crate) fn without_auth_status(&self) -> Self {
-        self.stable_projection()
-    }
-
     pub const fn auth_state(&self) -> ProviderAuthState {
         self.auth_state
     }
@@ -2756,32 +3149,20 @@ impl ProviderCapabilities {
         &self.evidence
     }
 
-    pub(crate) fn with_fresh_auth_status(
+    pub(crate) fn with_auth_receipt(
         &self,
-        fresh: &Self,
+        receipt: &ProviderAuthEvidenceReceipt,
     ) -> Result<Self, ProviderCapabilitiesError> {
-        let mut merged = self.clone();
-        merged.auth_state = fresh.auth_state;
+        let mut merged = self.stable_projection();
+        merged.auth_state = receipt
+            .result()
+            .as_stable_state()
+            .unwrap_or(ProviderAuthState::Unknown);
         merged
             .evidence
-            .retain(|evidence| evidence.source() != EvidenceSourceId::AuthStatusProbe);
-        merged.evidence.extend(
-            fresh
-                .evidence
-                .iter()
-                .filter(|evidence| evidence.source() == EvidenceSourceId::AuthStatusProbe)
-                .cloned(),
-        );
+            .push(CapabilityEvidence::from_auth_receipt(receipt));
         merged.validate()?;
         Ok(merged)
-    }
-
-    pub(crate) fn auth_status_observed_at(&self) -> Option<u64> {
-        self.evidence
-            .iter()
-            .filter(|evidence| evidence.source() == EvidenceSourceId::AuthStatusProbe)
-            .map(CapabilityEvidence::observed_at)
-            .max()
     }
 
     pub const fn support_for(&self, capability: ProviderCapability) -> CapabilitySupport {

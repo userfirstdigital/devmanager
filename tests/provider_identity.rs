@@ -4,10 +4,12 @@ use devmanager::domain::agent::{
 };
 use devmanager::domain::id::TaskId;
 use devmanager::providers::{
-    EvidenceConfidence, ProviderAuthEvidenceRegistry, ProviderAuthEvidenceSource,
-    ProviderAuthProbeResult, ProviderCapabilities, ProviderDiscoveryCandidateInput,
-    ProviderDiscoveryContract, ProviderDiscoveryError, ProviderDiscoveryOrigin, ProviderExecutable,
-    ProviderExecutableError, ProviderExecutableForm, ProviderKind, ProviderPathSnapshot,
+    CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceConfidence,
+    EvidenceSourceId, EvidenceStatus, ProviderAuthEvidenceRegistry, ProviderAuthEvidenceSource,
+    ProviderAuthProbeResult, ProviderAuthState, ProviderCapabilities,
+    ProviderDiscoveryCandidateInput, ProviderDiscoveryContract, ProviderDiscoveryError,
+    ProviderDiscoveryOrigin, ProviderExecutable, ProviderExecutableError, ProviderExecutableForm,
+    ProviderKind, ProviderPathSnapshot,
 };
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,8 @@ fn fixture_file(root: &Path, name: &str, contents: &[u8]) -> PathBuf {
 }
 
 fn native_fixture(root: &Path, name: &str, marker: &[u8]) -> PathBuf {
+    // Test-only identity material; this is never treated as a stock provider
+    // executable or granted production launch/auth authority.
     let path = root.join(name);
     fs::copy(
         std::env::current_exe().expect("current test executable"),
@@ -59,6 +63,28 @@ fn file_hash(path: &Path) -> [u8; 32] {
 
 fn executable(path: &Path) -> ProviderExecutable {
     ProviderExecutable::from_path(path).expect("strict executable identity")
+}
+
+fn stable_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        kind: ProviderKind::ClaudeCode,
+        version: devmanager::providers::ProviderVersion::new("fixture-1").unwrap(),
+        auth_state: ProviderAuthState::Unknown,
+        exact_resume: CapabilitySupport::Supported,
+        semantic_events: CapabilitySupport::Unknown,
+        provider_session_id: CapabilitySupport::Supported,
+        build_launch: CapabilitySupport::Unknown,
+        parse_signal: CapabilitySupport::Unknown,
+        cooperative_stop: CapabilitySupport::Unknown,
+        observe_quota: CapabilitySupport::Unknown,
+        evidence: vec![CapabilityEvidence::new(
+            EvidenceSourceId::Registry,
+            1,
+            EvidenceStatus::Unknown,
+            None,
+        )
+        .unwrap()],
+    }
 }
 
 #[test]
@@ -594,14 +620,238 @@ fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
 }
 
 #[test]
+fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
+    let replacement_path = native_fixture(temp.path(), "provider-other.exe", b"provider-b");
+    let identity = executable(&path);
+    let other_identity = executable(&replacement_path);
+
+    let mut evidence = ProviderAuthEvidenceRegistry::new();
+    let issued_at = Instant::now() - Duration::from_secs(1);
+    let invocation = evidence
+        .begin_at(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            issued_at,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+    let receipt = evidence
+        .accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            invocation,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(evidence
+        .consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            receipt.clone(),
+            Instant::now(),
+        )
+        .is_ok());
+    assert!(matches!(
+        evidence.consume_at_for(ProviderKind::ClaudeCode, &identity, receipt, Instant::now(),),
+        Err(devmanager::providers::ProviderAuthEvidenceError::AlreadyConsumed)
+    ));
+
+    let mut stale_registry = ProviderAuthEvidenceRegistry::new();
+    let stale_invocation = stale_registry
+        .begin_at(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            Instant::now() - Duration::from_secs(1),
+            Instant::now() + Duration::from_millis(10),
+        )
+        .unwrap();
+    let stale_receipt = stale_registry
+        .accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            stale_invocation,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(matches!(
+        stale_registry.consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            stale_receipt,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::Expired)
+    ));
+
+    let mut future_registry = ProviderAuthEvidenceRegistry::new();
+    let future_issued_at = Instant::now();
+    let future_invocation = future_registry
+        .begin_at(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            future_issued_at,
+            future_issued_at + Duration::from_secs(30),
+        )
+        .unwrap();
+    assert!(matches!(
+        future_registry.accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            future_invocation,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+            future_issued_at + Duration::from_secs(1),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::FutureTimestamp)
+    ));
+
+    let mut ordering_registry = ProviderAuthEvidenceRegistry::new();
+    let first = ordering_registry
+        .begin_at(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            issued_at,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+    let first_receipt = ordering_registry
+        .accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            first,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+            Instant::now(),
+        )
+        .unwrap();
+    let second = ordering_registry
+        .begin_at(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            issued_at,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+    let second_receipt = ordering_registry
+        .accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            second,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+            first_receipt.observed_at() + Duration::from_nanos(1),
+        )
+        .unwrap();
+    assert!(matches!(
+        ordering_registry.consume_at_for(
+            ProviderKind::Codex,
+            &identity,
+            first_receipt.clone(),
+            Instant::now(),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::WrongProvider)
+    ));
+    assert!(matches!(
+        ordering_registry.consume_at_for(
+            ProviderKind::ClaudeCode,
+            &other_identity,
+            first_receipt.clone(),
+            Instant::now(),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::WrongExecutable)
+    ));
+    assert!(matches!(
+        ordering_registry.consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            first_receipt,
+            Instant::now(),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::Reordered)
+    ));
+    assert!(ordering_registry
+        .consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            second_receipt,
+            Instant::now(),
+        )
+        .is_ok());
+
+    let mut replacement_registry = ProviderAuthEvidenceRegistry::new();
+    let replacement_invocation = replacement_registry
+        .begin(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let replacement_receipt = replacement_registry
+        .accept_now(
+            replacement_invocation,
+            ProviderAuthProbeResult::AuthenticatedSubscription,
+        )
+        .unwrap();
+    replace_with_native_fixture(&path, b"provider-replaced");
+    assert!(matches!(
+        replacement_registry.consume_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            replacement_receipt,
+            Instant::now(),
+        ),
+        Err(devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(_))
+    ));
+}
+
+#[test]
+fn auth_pending_and_accepted_receipts_have_deterministic_bounds() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
+    let identity = executable(&path);
+
+    let mut pending = ProviderAuthEvidenceRegistry::new();
+    for _ in 0..(devmanager::providers::MAX_PROVIDER_AUTH_PENDING_ENTRIES + 16) {
+        pending
+            .begin(
+                ProviderKind::ClaudeCode,
+                identity.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        pending.pending_len(),
+        devmanager::providers::MAX_PROVIDER_AUTH_PENDING_ENTRIES
+    );
+
+    let mut accepted = ProviderAuthEvidenceRegistry::new();
+    for _ in 0..(devmanager::providers::MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES + 16) {
+        let invocation = accepted
+            .begin(
+                ProviderKind::ClaudeCode,
+                identity.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        accepted
+            .accept_now(invocation, ProviderAuthProbeResult::Unknown)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        accepted.accepted_len(),
+        devmanager::providers::MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES
+    );
+}
+
+#[test]
 fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_cache() {
     let temp = tempdir().unwrap();
     let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
     let identity = executable(&path);
-    let capabilities: ProviderCapabilities = serde_json::from_str(include_str!(
-        "fixtures/providers/registry/authenticated_subscription.json"
-    ))
-    .unwrap();
+    let capabilities = stable_capabilities();
     let stable = capabilities.stable_projection();
     let mut evidence = ProviderAuthEvidenceRegistry::new();
     let first = evidence
@@ -632,13 +882,15 @@ fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_ca
         stable.auth_state(),
         devmanager::providers::ProviderAuthState::Unknown
     );
-    assert!(stable.evidence().is_empty());
+    assert!(stable
+        .evidence()
+        .iter()
+        .all(|evidence| evidence.source() != EvidenceSourceId::AuthStatusProbe));
 }
 
 #[test]
 fn stable_capabilities_projection_does_not_retain_auth_evidence() {
-    let fixture = include_str!("fixtures/providers/registry/authenticated_subscription.json");
-    let capabilities: ProviderCapabilities = serde_json::from_str(fixture).unwrap();
+    let capabilities = stable_capabilities();
     let stable = capabilities.stable_projection();
 
     assert_eq!(
@@ -653,7 +905,7 @@ fn stable_capabilities_projection_does_not_retain_auth_evidence() {
 }
 
 #[test]
-fn provider_capability_wire_is_versioned_and_keeps_auth_lifecycle_metadata() {
+fn provider_capability_wire_rejects_forged_auth_and_requires_all_fields() {
     let mut wire: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/providers/registry/authenticated_subscription.json"
     ))
@@ -663,20 +915,19 @@ fn provider_capability_wire_is_versioned_and_keeps_auth_lifecycle_metadata() {
     wire["evidence"][0]["expires_at"] = serde_json::json!(1_700_000_036_000_u64);
     wire["evidence"][0]["confidence"] = serde_json::json!("high");
 
-    let capabilities: ProviderCapabilities = serde_json::from_value(wire).unwrap();
-    let encoded = serde_json::to_value(capabilities).unwrap();
+    assert!(serde_json::from_value::<ProviderCapabilities>(wire).is_err());
+
+    let encoded = serde_json::to_value(stable_capabilities()).unwrap();
 
     assert_eq!(encoded["schema_version"], 1);
-    assert_eq!(
-        encoded["evidence"][0]["auth_source"],
-        "claude_code_subscription_login"
-    );
-    assert_eq!(encoded["evidence"][0]["expires_at"], 1_700_000_036_000_u64);
-    assert_eq!(encoded["evidence"][0]["confidence"], "high");
+    assert_eq!(encoded["evidence"][0]["source"], "registry");
 
-    let mut wrong_source = encoded.clone();
-    wrong_source["evidence"][0]["auth_source"] = serde_json::json!("codex_subscription_login");
-    assert!(serde_json::from_value::<ProviderCapabilities>(wrong_source).is_err());
+    let mut missing_required = encoded.clone();
+    missing_required
+        .as_object_mut()
+        .unwrap()
+        .remove("build_launch");
+    assert!(serde_json::from_value::<ProviderCapabilities>(missing_required).is_err());
 
     let mut future = encoded.clone();
     future["schema_version"] = serde_json::json!(2);
@@ -685,6 +936,15 @@ fn provider_capability_wire_is_versioned_and_keeps_auth_lifecycle_metadata() {
     let mut unknown = encoded;
     unknown["unrecognized"] = serde_json::json!(true);
     assert!(serde_json::from_value::<ProviderCapabilities>(unknown).is_err());
+
+    let duplicate = r#"{
+        "schema_version":1,"kind":"claude_code","version":"fixture-1",
+        "auth_state":"unknown","exact_resume":"supported","semantic_events":"unknown",
+        "provider_session_id":"supported","build_launch":"unknown","build_launch":"unknown",
+        "parse_signal":"unknown","cooperative_stop":"unknown","observe_quota":"unknown",
+        "evidence":[]
+    }"#;
+    assert!(serde_json::from_str::<ProviderCapabilities>(duplicate).is_err());
 }
 
 #[test]
@@ -797,4 +1057,154 @@ fn provider_discovery_debug_and_errors_redact_paths() {
     let explicit = ProviderDiscoveryError::WrongEntrypoint(root.join("raw-secret.exe"));
     assert!(!format!("{explicit:?}").contains(secret));
     assert!(!explicit.to_string().contains(secret));
+}
+
+#[test]
+fn generic_capability_evidence_cannot_authorize_subscription_auth() {
+    assert!(matches!(
+        CapabilityEvidence::new(
+            EvidenceSourceId::AuthStatusProbe,
+            1_700_000_000_000,
+            EvidenceStatus::Authenticated,
+            None,
+        ),
+        Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt)
+    ));
+    assert!(matches!(
+        CapabilityEvidence::new(
+            EvidenceSourceId::Registry,
+            1_700_000_000_000,
+            EvidenceStatus::Authenticated,
+            None,
+        ),
+        Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt)
+    ));
+
+    let forged_wire = serde_json::json!({
+        "schema_version": 1,
+        "source": "auth_status_probe",
+        "observed_at": 1_700_000_000_000u64,
+        "expires_at": 1_700_000_000_100u64,
+        "confidence": "high",
+        "auth_source": "claude_code_subscription_login",
+        "status": "authenticated",
+        "diagnostic": null
+    });
+    assert!(serde_json::from_value::<CapabilityEvidence>(forged_wire).is_err());
+}
+
+#[test]
+fn provider_wires_require_explicit_schema_and_reject_nested_unknown_fields() {
+    let capability_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/providers/registry/authenticated_subscription.json"
+    ))
+    .unwrap();
+    assert!(serde_json::from_value::<ProviderCapabilities>(capability_fixture.clone()).is_err());
+
+    let mut missing_capability_field = capability_fixture.clone();
+    missing_capability_field["schema_version"] = serde_json::json!(1);
+    missing_capability_field
+        .as_object_mut()
+        .unwrap()
+        .remove("build_launch");
+    assert!(serde_json::from_value::<ProviderCapabilities>(missing_capability_field).is_err());
+
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"wire");
+    let identity = executable(&path);
+    let encoded_identity = serde_json::to_value(&identity).unwrap();
+
+    let mut missing_executable_schema = encoded_identity.clone();
+    missing_executable_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert!(serde_json::from_value::<ProviderExecutable>(missing_executable_schema).is_err());
+
+    let mut unknown_nested_identity = encoded_identity;
+    unknown_nested_identity["file_identity"]["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ProviderExecutable>(unknown_nested_identity).is_err());
+
+    let evidence =
+        CapabilityEvidence::new(EvidenceSourceId::Registry, 1, EvidenceStatus::Unknown, None)
+            .unwrap();
+    let mut missing_evidence_schema = serde_json::to_value(evidence).unwrap();
+    missing_evidence_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert!(serde_json::from_value::<CapabilityEvidence>(missing_evidence_schema).is_err());
+}
+
+#[test]
+fn executable_wire_preserves_native_form_and_requires_it_on_decode() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"native-form");
+    let identity = executable(&path);
+    let encoded = serde_json::to_value(&identity).unwrap();
+
+    assert_eq!(encoded["is_native"], serde_json::json!(true));
+
+    let mut missing_form = encoded;
+    missing_form.as_object_mut().unwrap().remove("is_native");
+    assert!(serde_json::from_value::<ProviderExecutable>(missing_form).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn executable_wire_preserves_windows_shim_form() {
+    let temp = tempdir().unwrap();
+    let target = native_fixture(temp.path(), "claude.exe", b"shim-target");
+    let shim = temp.path().join("claude.cmd");
+    let fixture_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/providers/registry");
+    fs::copy(fixture_root.join("identity_claude.cmd"), &shim).unwrap();
+    let contract = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode);
+    let candidate = contract
+        .validate(ProviderDiscoveryCandidateInput::windows_shim(
+            &shim,
+            &target,
+            ProviderDiscoveryOrigin::ConfiguredOverride,
+        ))
+        .unwrap();
+    let encoded = serde_json::to_value(candidate.executable()).unwrap();
+    let decoded: ProviderExecutable = serde_json::from_value(encoded).unwrap();
+    assert!(!decoded.is_native());
+    assert_eq!(decoded, *candidate.executable());
+}
+
+#[test]
+fn agent_session_facts_accept_only_stock_provider_kinds() {
+    let invalid = AgentSessionFacts::new(
+        TaskId::new(),
+        AgentRole::Primary,
+        "arbitrary-provider",
+        None,
+    );
+    assert!(invalid.is_err());
+
+    let wire = serde_json::json!({
+        "id": devmanager::domain::AgentSessionId::new(),
+        "task_id": TaskId::new(),
+        "role": "primary",
+        "provider_kind": "arbitrary-provider",
+        "provider_session_id": null,
+        "lifecycle": "open",
+        "runtime_generation": 0,
+        "revision": 0
+    });
+    assert!(serde_json::from_value::<AgentSessionFacts>(wire).is_err());
+}
+
+#[test]
+fn provider_executable_debug_redacts_path_file_name_and_content_hash() {
+    let temp = tempdir().unwrap();
+    let secret = "provider-secret-name";
+    let path = native_fixture(temp.path(), format!("{secret}.exe").as_str(), &[0x5a; 32]);
+    let identity = executable(&path);
+    let rendered = format!("{identity:?}");
+
+    assert!(!rendered.contains(secret));
+    assert!(!rendered.contains(&identity.sha256_hex()));
+    assert!(!rendered.contains("canonical_path"));
 }

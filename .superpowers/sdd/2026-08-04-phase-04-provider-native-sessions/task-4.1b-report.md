@@ -1,135 +1,144 @@
 # Phase 4 Task 4.1 Batch B report
 
-Status: COMPLETE 4.1b boundary — typed provider identity, strict executable
-identity/discovery validation, bounded versioned capability/auth evidence, and
-the registry-owned fresh-auth evidence seam. Adapter/process integration
-remains intentionally deferred.
+Status: COMPLETE 4.1b provider identity/capability boundary correction from
+candidate `0bab620`. The boundary is fail-closed for authentication authority,
+custom wires, executable discovery, cache freshness, redaction, and provider
+kind validation. Provider-specific auth command/process integration remains
+owned by corrected Task 3.7/4.1a.
 
 ## Scope
 
-This batch changes only the owned provider/domain boundary. It does not modify
-the Batch A registry or adapter implementation, legacy session/runtime fields,
-packaging, callsites, the installed DevManager, or any real provider tool.
+Only the Task 4.1b owned paths were changed: provider adapter/capability/
+registry modules, the strict `AgentSessionFacts` validation in
+`src/domain/agent.rs`, focused provider tests and fixtures, and this report.
+No production profiles, session data, installed app, stock provider CLI,
+merge/rebase/push/tag/publish/install, or unrelated repository path was
+touched.
 
 ## TDD evidence
 
 ### RED
 
-The saved dirty diff was continued from its furthest point. Focused red checks
-then exposed the remaining boundary gaps: versioned lifecycle fields were not
-decoded, executable/debug paths were visible, provider-mismatched auth sources
-were accepted, and discovery debug/errors leaked paths. A registry assertion
-also still expected the pre-lifecycle four-field evidence wire shape.
+Focused tests were added before the production corrections. The first identity
+build exposed the missing receipt-only error API. The first registry run
+exposed the independent failures for adapter-provided auth, strict wire
+requirements, PATH bounds/provenance, bounded caches, and redacted errors.
+Those failures were addressed separately before the final green runs.
+
+The existing Windows process-tree fixture also failed reproducibly because its
+100ms timeout could kill the parent before the child PID marker was published.
+The owned test timeout is now a still-bounded 1s; the production tree-kill
+assertion is unchanged and the isolated test is green.
 
 ### GREEN
 
-The final focused identity run passed:
+All commands below used the exact isolated target and single Cargo build job:
 
 ```text
-CARGO_TARGET_DIR=C:\Temp\devmanager-phase41b-final cargo test --test provider_identity -- --nocapture
-19 passed; 0 failed
+CARGO_TARGET_DIR=C:\Temp\devmanager-phase41b-correction2
+CARGO_BUILD_JOBS=1
+
+cargo test --test provider_identity -- --nocapture
+27 passed; 0 failed
+
+cargo test --test provider_registry -- --nocapture
+44 passed; 0 failed
 ```
 
-The selected identity/cache/auth registry cases passed individually:
+The focused runs compile the generated Rust test harnesses under the exact
+target only; they do not launch the installed DevManager.
+
+Final gates:
 
 ```text
-CARGO_TARGET_DIR=C:\Temp\devmanager-phase41b-final cargo test --test provider_registry <selected identity test> -- --exact
-26 selected tests; 26 passed; 0 failed
-```
-
-Final gates passed:
-
-```text
-CARGO_TARGET_DIR=C:\Temp\devmanager-phase41b-final cargo check --lib
 cargo fmt --all -- --check
+CARGO_TARGET_DIR=C:\Temp\devmanager-phase41b-correction2 CARGO_BUILD_JOBS=1 cargo check --lib
 git diff --check
 ```
 
-No broad suite was run. No targeted Cargo, rustc, or test-harness process
-remained after verification. Existing unrelated compiler warnings remain; they
-do not fail these gates.
+The library check passed with pre-existing unrelated warnings only. No broad
+suite was run.
 
 ## Delivered
 
-- `ProviderSessionId` preserves exact provider-issued bytes, rejects empty,
-  bounded/unsafe values, and has checked serde plus SQLite `ToSql`/`FromSql`.
-  `AgentSessionFacts` remains typed without migrating legacy UI/runtime string
-  fields.
-- `ProviderExecutable` now carries canonical path, platform file identity, and
-  SHA-256 evidence. Construction, serde, and current-file validation fail
-  closed for non-files, symlink/reparse paths, ambiguous hardlinks where the
-  platform exposes link counts, forged metadata, path replacement, and
-  same-path replacement between validation snapshots.
-- `ProviderDiscoveryContract` preserves candidate order and provenance,
-  resolves PATH candidates before trust, enforces provider entrypoint/type
-  allowlists, rejects the desktop Cursor executable for Cursor Agent, and
-  accepts Windows `.cmd` only through an explicit, bounded, exact controlled
-  shim proof targeting the validated native executable.
-- Provider versions, executable identities, capability evidence, and capability
-  wires are bounded and schema-versioned. Unknown fields/versions fail closed,
-  evidence collections are bounded before growth, and Debug/errors redact paths,
-  nonces, and raw provider details.
-- `ProviderPathSnapshot` owns PATH order/provenance, rejects reparse entries
-  before canonicalization, and never accepts a caller-forged `PathEntry`.
-  Checked-in foreign `.exe` fixture material was removed; tests use a
-  test-created copy of the current native test executable as metadata only and
-  never execute it.
-- `ProviderCapabilities::stable_projection` removes authentication from the
-  stable cache projection. Existing registry identity/cache tests cover exact
-  provider+executable/version/revision keys, fresh auth refresh, generation
-  ordering, and replacement/version invalidation.
-- `ProviderAuthEvidenceRegistry` issues provider-specific subscription-login,
-  nonce/generation-bound invocations and accepts only fresh receipts tied to the
-  expected provider kind and exact executable identity. Receipts expose source,
-  observed/expiry time, and confidence. Replay, wrong identity/provider/source,
-  expired, future, reordered, same-timestamp, and fabricated evidence fail
-  closed. API-key detection is explicit and never treated as authenticated
-  subscription.
+- Generic `CapabilityEvidence` constructors and serde cannot create
+  authenticated-subscription or auth-required authority. Only a private
+  registry-receipt conversion can create auth evidence. `ProviderRegistry`
+  rejects adapter-returned auth state/evidence, consumes only its correlated
+  nonce/generation/provider/source/executable receipt, and keeps replay,
+  stale/future, reordered, replacement, wrong-kind, wrong-executable, and
+  API-key results fail-closed.
+- Auth pending/accepted state and capability projections are bounded with
+  deterministic oldest eviction. Receipt consumption revalidates the current
+  exact executable identity and generation under one monotonic `Instant`
+  freshness boundary. Caller-selected confidence is not part of the public
+  receipt authority API.
+- Capability, evidence, executable, nested file identity, observation, and
+  cache-key wires require schema version `1`, reject omitted/duplicate/
+  unknown fields, and validate cross-fields. Evidence collection admission and
+  path decoding are bounded before normal object growth; native/shim
+  `is_native` form is preserved through strict executable serialization.
+- Production registry discovery now captures PATH once through the bounded
+  `ProviderPathSnapshot` and resolves only through `ProviderDiscoveryContract`.
+  Empty/relative/oversized entries, reparse ambiguity, directory replacement,
+  provenance forgery, forbidden runners, wrong provider names, and wrong
+  Windows `.exe`/`.cmd` forms fail closed. Controlled `.cmd` candidates require
+  the exact bounded shim proof targeting the validated native identity.
+- `ProviderExecutable`, provider errors, discovery errors, probe requests and
+  arguments, auth invocation/receipt diagnostics, raw input, and probe results
+  have redacted Debug/Display surfaces. Path, hash, nonce, token, environment,
+  and raw-output sentinel coverage is exhaustive in the focused tests.
+- `AgentSessionFacts` constructors, deserialization, and validation accept
+  only the finite canonical provider-kind set; arbitrary strings and forged
+  noncanonical public values cannot become validated session facts. Provider
+  observations validate provider-kind, version, capabilities, and current
+  executable identity together. Adapter capability/quota boundaries receive
+  validated executable identities rather than raw paths.
+- Test-only executable candidates copy the current test harness and are marked
+  as metadata fixtures; they are never asserted to be stock provider tools or
+  used as production authority.
 
 ## Integration seam and deferred work
 
-Batch A can consume the narrow typed seam by owning one
-`ProviderAuthEvidenceRegistry`: begin an invocation for the exact discovered
-identity, let the provider-specific adapter choose its supported status
-command, and accept the result only through the issued invocation. Cache only
-the stable projection; auth must be refreshed through a correlated receipt,
-including on cache hits. The existing provider-neutral `[auth,status]` adapter
-path remains outside this batch and must be replaced/retired during the Batch A
-integration in its owned files.
+The registry exposes the narrow correlated seam: begin an auth invocation for
+the exact discovered identity, let the later provider-specific implementation
+produce its result, accept it against that invocation, then consume the
+receipt while observing (including cache hits). The generic adapter cannot
+promote authentication from a capability observation.
 
 Corrected Task 3.7/4.1a owns the provider-specific subscription-login command,
 probe process lifecycle, timeout/output scrubbing, process-tree containment,
-and wiring the typed receipt into the active registry. Those files were not
-changed here, and no provider CLI, process probe, terminal, launcher, or app
-was run. The existing provider-neutral `[auth,status]` adapter path remains
-outside this boundary and must be replaced/retired there.
+and wiring this receipt seam into the active runtime. The generic
+`ProviderProbeKind::AuthStatus` transport primitive remains non-authoritative
+until that integration replaces it with provider-specific validated evidence.
+This task therefore fails closed with an explicit untrusted-auth error rather
+than adding a permissive placeholder.
 
-Batch C packaging and the required callsite/legacy compile migration are also
-deferred. No `providerSessionId` is inferred here, and no transcript or rollout
-parsing is introduced. Exact resume must continue to use only correlated
-current-generation provider session identity and must not fall back to a fresh
-conversation after an exact-resume failure.
+Batch C packaging and legacy UI/runtime string migration remain deferred. No
+provider session identity is inferred here; exact resume must continue to use
+only correlated current-generation provider session identity and must not fall
+back to a fresh conversation after an exact-resume failure.
 
-## Review and commit
+## Review and handoff
 
-The complete owned diff was reviewed after the final gates. The correction
-batch added bounded/versioned lifecycle wires, provider-source validation,
-redacted discovery diagnostics, pre-canonicalization reparse rejection, and
-bounded shim reads. No review subagent was used because the task explicitly
-prohibited agents. The handoff commit contains only the allowed source, test,
-fixture deletion, and report paths.
-
-Commit: final coherent 4.1b boundary commit containing this report; its SHA is
-reported in the handoff below.
+The complete owned diff was reviewed after the final focused runs and gates.
+The final commit is the precise Task 4.1b correction commit reported in the
+handoff. No review subagent or external provider process was used.
 
 ## Sharpening the Axe
 
-Worked: preserving the saved dirty diff and keeping the final verification on
-the identity/cache/auth surface isolated from concurrent Batch A work. Wasted
-time: host-wide `C:` pressure caused repeated cold rebuilds; cleaning only the
-task target reclaimed 9.9 GiB. Earlier improvement: check free space before a
-cold Cargo run while preserving the single-build/no-duplicate rule. No
-persistent guidance update is warranted: the existing project instructions
-already cover the 600-second cold build, process-tree checks, typed provider
-identity, and exact-resume/no-fallback invariants; the disk pressure was
-environment-specific.
+Worked: separating generic capability projection, receipt issuance,
+identity-bound receipt consumption, and wire serialization into independently
+tested authority boundaries. Wasted time: shared host Cargo activity made the
+cold target build and the deliberately slow cache-bound test look stalled;
+the exact target/process check prevented duplicate builds. Earlier improvement:
+the existing 100ms process-tree fixture timeout was scheduler-sensitive and
+should have been isolated before treating its failure as a code regression.
+
+Authority updated: this Task 4.1b report now records the consolidated rule
+that stable cache state is never authentication authority; authority requires
+an issued, correlated, current-identity receipt and a one-shot fail-closed
+consumption path, with strict versioned wires around both sides. No AGENTS,
+global memory, or separate persistent guidance update was warranted because
+the project instructions already cover typed identity, redaction, cold-build
+isolation, and verification requirements.

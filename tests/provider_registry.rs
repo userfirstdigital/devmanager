@@ -4,20 +4,21 @@ use devmanager::domain::{
     MAX_PROVIDER_SESSION_ID_BYTES,
 };
 use devmanager::providers::adapter::{
-    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderError, ProviderLaunchSpec,
-    ProviderProbeError, ProviderProbeRequest, ProviderProbeResult, ProviderProbeRunner,
-    ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy,
+    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderArgument, ProviderError,
+    ProviderInput, ProviderLaunchSpec, ProviderProbeError, ProviderProbeRequest,
+    ProviderProbeResult, ProviderProbeRunner, ProviderRuntime, ProviderSignal, QuotaObservation,
+    StopStrategy,
 };
 use devmanager::providers::capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport,
     EvidenceDiagnostic, EvidenceDiagnosticCode, EvidenceSourceId, EvidenceStatus,
     ProviderAuthState, ProviderCapabilities, ProviderCapability, ProviderExecutable,
-    ProviderExecutablePolicy, ProviderKind, ProviderVersion, ProviderVersionError,
-    SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
+    ProviderExecutableError, ProviderExecutablePolicy, ProviderKind, ProviderVersion,
+    ProviderVersionError, SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
 };
 use devmanager::providers::registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
-    ProviderDiscoveryConfig, ProviderRegistry,
+    ProviderDiscoveryConfig, ProviderObservation, ProviderRegistry,
 };
 use serde_json::Value;
 use std::ffi::OsString;
@@ -25,7 +26,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[cfg(windows)]
@@ -73,12 +74,6 @@ impl FakeAdapter {
         self.capabilities.lock().unwrap().version = version;
     }
 
-    fn set_auth_state(&self, auth_state: ProviderAuthState) {
-        let mut capabilities = self.capabilities.lock().unwrap();
-        capabilities.auth_state = auth_state;
-        capabilities.evidence = auth_evidence(auth_state, 1_700_000_000_100);
-    }
-
     fn set_probe_delay(&self, delay: Duration) {
         *self.probe_delay.lock().unwrap() = Some(delay);
     }
@@ -94,7 +89,10 @@ impl ProviderAdapter for FakeAdapter {
         self.kind
     }
 
-    async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        executable: &ProviderExecutable,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         self.capability_probes.fetch_add(1, Ordering::Relaxed);
         let delay = *self.probe_delay.lock().unwrap();
         if let Some(delay) = delay {
@@ -102,7 +100,11 @@ impl ProviderAdapter for FakeAdapter {
         }
         let path_delay = self.path_delay.lock().unwrap().clone();
         if let Some((marker, delay)) = path_delay {
-            if executable.to_string_lossy().contains(&marker) {
+            if executable
+                .canonical_path()
+                .to_string_lossy()
+                .contains(&marker)
+            {
                 tokio::time::sleep(delay).await;
             }
         }
@@ -128,7 +130,7 @@ impl ProviderAdapter for FakeAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -145,7 +147,10 @@ impl ProviderAdapter for ProbeOnlyAdapter {
         self.capabilities.kind
     }
 
-    async fn probe(&self, _executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutable,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         self.probes.fetch_add(1, Ordering::Relaxed);
         Ok(self.capabilities.clone())
     }
@@ -169,7 +174,7 @@ impl ProviderAdapter for ProbeOnlyAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -183,10 +188,11 @@ fn capabilities(
     semantic_events: CapabilitySupport,
     provider_session_id: CapabilitySupport,
 ) -> ProviderCapabilities {
+    let _ = auth_state;
     ProviderCapabilities {
         kind,
         version: ProviderVersion::new(version).unwrap(),
-        auth_state,
+        auth_state: ProviderAuthState::Unknown,
         exact_resume,
         semantic_events,
         provider_session_id,
@@ -199,19 +205,25 @@ fn capabilities(
 }
 
 fn auth_evidence(auth_state: ProviderAuthState, observed_at: u64) -> Vec<CapabilityEvidence> {
-    let status = match auth_state {
-        ProviderAuthState::AuthenticatedSubscription => EvidenceStatus::Authenticated,
-        ProviderAuthState::AuthRequired => EvidenceStatus::AuthRequired,
-        ProviderAuthState::Unknown => EvidenceStatus::Unknown,
-    };
-    vec![
-        CapabilityEvidence::new(EvidenceSourceId::AuthStatusProbe, observed_at, status, None)
-            .unwrap(),
-    ]
+    let _ = auth_state;
+    vec![CapabilityEvidence::new(
+        EvidenceSourceId::Registry,
+        observed_at,
+        EvidenceStatus::Unknown,
+        None,
+    )
+    .unwrap()]
 }
 
 fn executable_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-    let path = root.join(name);
+    // Test-only candidate material; the copied harness is metadata input for
+    // registry contract tests, not a real stock provider executable.
+    let file_name = if cfg!(windows) && Path::new(name).extension().is_none() {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    let path = root.join(file_name);
     std::fs::copy(
         std::env::current_exe().expect("current test executable"),
         &path,
@@ -310,7 +322,12 @@ async fn canonical_aliases_have_one_executable_identity() {
     let bin = temp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let executable = executable_file(&bin, "codex", b"same-binary");
-    let alias = temp.path().join("bin").join("..").join("bin").join("codex");
+    let alias = temp
+        .path()
+        .join("bin")
+        .join("..")
+        .join("bin")
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
 
     let inspector = FileSystemExecutableInspector;
     let canonical = inspector.inspect(&executable).await.unwrap();
@@ -438,27 +455,171 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
         .observe(ProviderKind::ClaudeCode, &config)
         .await
         .unwrap();
-    adapter.set_auth_state(ProviderAuthState::AuthRequired);
+    let identity = registry
+        .resolve_executable(ProviderKind::ClaudeCode, &config)
+        .await
+        .unwrap();
+    let first_invocation = registry
+        .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let first_receipt = registry
+        .accept_auth_probe(
+            ProviderKind::ClaudeCode,
+            &identity,
+            first_invocation,
+            devmanager::providers::ProviderAuthProbeResult::AuthenticatedSubscription,
+            Instant::now(),
+        )
+        .unwrap();
+    let authenticated = registry
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, first_receipt)
+        .await
+        .unwrap();
+
+    let second_invocation = registry
+        .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let second_receipt = registry
+        .accept_auth_probe(
+            ProviderKind::ClaudeCode,
+            &identity,
+            second_invocation,
+            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
+            Instant::now(),
+        )
+        .unwrap();
     let second = registry
-        .observe(ProviderKind::ClaudeCode, &config)
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, second_receipt)
         .await
         .unwrap();
 
     assert_eq!(first.cache_status, CacheStatus::Miss);
+    assert_eq!(first.capabilities.auth_state, ProviderAuthState::Unknown);
+    assert_eq!(authenticated.cache_status, CacheStatus::Hit);
     assert_eq!(
-        first.capabilities.auth_state,
+        authenticated.capabilities.auth_state,
         ProviderAuthState::AuthenticatedSubscription
     );
+    assert!(authenticated
+        .capabilities
+        .evidence
+        .iter()
+        .any(|evidence| evidence.source() == EvidenceSourceId::AuthStatusProbe));
     assert_eq!(second.cache_status, CacheStatus::Hit);
     assert_eq!(
         second.capabilities.auth_state,
         ProviderAuthState::AuthRequired
     );
+    assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"receipt-boundary");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Supported,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+    let config = discovery(Some(executable), None);
+    let identity = registry
+        .resolve_executable(ProviderKind::ClaudeCode, &config)
+        .await
+        .unwrap();
+
+    let invocation = registry
+        .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let receipt = registry
+        .accept_auth_probe(
+            ProviderKind::ClaudeCode,
+            &identity,
+            invocation,
+            devmanager::providers::ProviderAuthProbeResult::AuthenticatedSubscription,
+            Instant::now(),
+        )
+        .unwrap();
+    let observation = registry
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, receipt.clone())
+        .await
+        .unwrap();
     assert_eq!(
-        second.capabilities.evidence[0].source(),
-        EvidenceSourceId::AuthStatusProbe
+        observation.capabilities.auth_state,
+        ProviderAuthState::AuthenticatedSubscription
     );
-    assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 2);
+
+    let replay = registry
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, receipt)
+        .await;
+    assert!(matches!(
+        replay,
+        Err(ProviderError::AuthEvidence(
+            devmanager::providers::ProviderAuthEvidenceError::AlreadyConsumed
+        ))
+    ));
+
+    let api_key_invocation = registry
+        .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let api_key_receipt = registry
+        .accept_auth_probe(
+            ProviderKind::ClaudeCode,
+            &identity,
+            api_key_invocation,
+            devmanager::providers::ProviderAuthProbeResult::ApiKeyDetected,
+            Instant::now(),
+        )
+        .unwrap();
+    let api_key_observation = registry
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, api_key_receipt)
+        .await
+        .unwrap();
+    assert_eq!(
+        api_key_observation.capabilities.auth_state,
+        ProviderAuthState::Unknown
+    );
+    assert!(api_key_observation
+        .capabilities
+        .evidence
+        .iter()
+        .any(|evidence| {
+            evidence.source() == EvidenceSourceId::AuthStatusProbe
+                && evidence.status() == EvidenceStatus::Unknown
+        }));
+}
+
+#[tokio::test]
+async fn registry_does_not_accept_adapter_auth_without_a_registry_receipt() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"forged-auth");
+    let mut forged = capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Supported,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    );
+    forged.auth_state = ProviderAuthState::AuthenticatedSubscription;
+    let adapter = FakeAdapter::new(forged);
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+
+    let result = registry
+        .observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None))
+        .await;
+
+    assert!(result.is_err(), "adapter-returned auth must fail closed");
 }
 
 #[tokio::test]
@@ -624,55 +785,65 @@ async fn provider_version_change_invalidates_capability_cache() {
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 2);
 }
 
-#[test]
-fn authenticated_subscription_fixture_is_explicit_provider_observation() {
-    let raw = include_str!("fixtures/providers/registry/authenticated_subscription.json");
-    let capabilities: ProviderCapabilities = serde_json::from_str(raw).unwrap();
+#[tokio::test]
+async fn capability_cache_has_a_deterministic_bound_and_evicts_oldest_versions() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"bounded-cache");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-0",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter.clone()).unwrap();
+    let config = discovery(Some(executable), None);
 
-    assert_eq!(
-        capabilities.auth_state,
-        ProviderAuthState::AuthenticatedSubscription
-    );
-    assert_eq!(capabilities.kind, ProviderKind::ClaudeCode);
-    assert!(capabilities
-        .evidence
-        .iter()
-        .all(|evidence| evidence.source() == EvidenceSourceId::AuthStatusProbe));
+    for index in 0..80_u32 {
+        adapter.set_version(ProviderVersion::new(format!("fixture-{index}")).unwrap());
+        registry
+            .observe(ProviderKind::ClaudeCode, &config)
+            .await
+            .unwrap();
+    }
+
+    assert!(registry.cache_len() <= 64);
+
+    adapter.set_version(ProviderVersion::new("fixture-0").unwrap());
+    let oldest = registry
+        .observe(ProviderKind::ClaudeCode, &config)
+        .await
+        .unwrap();
+    assert_eq!(oldest.cache_status, CacheStatus::Miss);
+}
+
+#[test]
+fn authenticated_subscription_fixture_is_rejected_without_a_registry_receipt() {
+    let raw = include_str!("fixtures/providers/registry/authenticated_subscription.json");
+    assert!(serde_json::from_str::<ProviderCapabilities>(raw).is_err());
 }
 
 #[test]
 fn authenticated_states_require_matching_auth_status_evidence() {
-    let mut capabilities = capabilities(
-        ProviderKind::ClaudeCode,
-        "fixture-1",
-        ProviderAuthState::AuthRequired,
-        CapabilitySupport::Unknown,
-        CapabilitySupport::Unknown,
-        CapabilitySupport::Unknown,
-    );
-    capabilities.evidence = vec![CapabilityEvidence::new(
+    let forged = CapabilityEvidence::new(
         EvidenceSourceId::AuthStatusProbe,
         1_700_000_000_001,
         EvidenceStatus::Authenticated,
         None,
-    )
-    .unwrap()];
+    );
 
     assert!(matches!(
-        capabilities.validate(),
-        Err(devmanager::providers::ProviderCapabilitiesError::MismatchedAuthStatusEvidence { .. })
+        forged,
+        Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt)
     ));
 }
 
 #[test]
 fn auth_required_observation_contains_no_credentials_or_raw_output() {
     let raw = include_str!("fixtures/providers/registry/auth_required.json");
-    let capabilities: ProviderCapabilities = serde_json::from_str(raw).unwrap();
-    let encoded = serde_json::to_string(&capabilities).unwrap();
-
-    assert_eq!(capabilities.auth_state, ProviderAuthState::AuthRequired);
-    assert!(!encoded.contains("sk-") && !encoded.contains("OPENAI_API_KEY"));
-    assert!(!encoded.contains("raw provider output"));
+    assert!(serde_json::from_str::<ProviderCapabilities>(raw).is_err());
 }
 
 #[test]
@@ -810,6 +981,20 @@ fn capability_evidence_has_only_bounded_sanitized_metadata() {
             EvidenceDiagnosticCode::AuthenticationRequired,
             Some([0xabu8; 32]),
         )),
+    );
+    assert!(matches!(
+        evidence,
+        Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt)
+    ));
+
+    let evidence = CapabilityEvidence::new(
+        EvidenceSourceId::Registry,
+        1_700_000_000_000,
+        EvidenceStatus::Unknown,
+        Some(EvidenceDiagnostic::new(
+            EvidenceDiagnosticCode::ProbeFailed,
+            Some([0xabu8; 32]),
+        )),
     )
     .unwrap();
     let encoded: Value = serde_json::to_value(&evidence).unwrap();
@@ -825,8 +1010,8 @@ fn capability_evidence_has_only_bounded_sanitized_metadata() {
     assert!(object.contains_key("status"));
     assert!(object.contains_key("diagnostic"));
     assert!(!object.contains_key("detail"));
-    assert_eq!(evidence.source(), EvidenceSourceId::AuthStatusProbe);
-    assert_eq!(evidence.status(), EvidenceStatus::AuthRequired);
+    assert_eq!(evidence.source(), EvidenceSourceId::Registry);
+    assert_eq!(evidence.status(), EvidenceStatus::Unknown);
 }
 
 #[test]
@@ -952,6 +1137,71 @@ async fn observation_metadata_is_serializable_without_probe_payloads() {
     assert!(!encoded.contains("stderr"));
 }
 
+#[tokio::test]
+async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"observation-wire");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+    let observation = registry
+        .observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None))
+        .await
+        .unwrap();
+    let encoded = serde_json::to_value(&observation).unwrap();
+
+    assert_eq!(encoded["schema_version"], serde_json::json!(1));
+
+    let mut missing_schema = encoded.clone();
+    missing_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert!(serde_json::from_value::<ProviderObservation>(missing_schema).is_err());
+
+    let mut mismatched_kind = encoded;
+    mismatched_kind["kind"] = serde_json::json!("codex");
+    assert!(serde_json::from_value::<ProviderObservation>(mismatched_kind).is_err());
+
+    let mut unknown = serde_json::to_value(&observation).unwrap();
+    unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ProviderObservation>(unknown).is_err());
+
+    let raw = serde_json::to_string(&serde_json::to_value(&observation).unwrap()).unwrap();
+    let duplicate = raw.replacen(
+        "\"schema_version\":1,",
+        "\"schema_version\":1,\"schema_version\":1,",
+        1,
+    );
+    assert!(serde_json::from_str::<ProviderObservation>(&duplicate).is_err());
+
+    let cache_key = CapabilityCacheKey::new(
+        observation.kind,
+        observation.executable.clone(),
+        observation.version.clone(),
+        observation.adapter_revision,
+        observation.semantic_schema_version,
+    );
+    let cache_value = serde_json::to_value(&cache_key).unwrap();
+    assert_eq!(cache_value["schema_version"], serde_json::json!(1));
+    let mut cache_missing_schema = cache_value.clone();
+    cache_missing_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert!(serde_json::from_value::<CapabilityCacheKey>(cache_missing_schema).is_err());
+    let mut cache_unknown = cache_value;
+    cache_unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CapabilityCacheKey>(cache_unknown).is_err());
+}
+
 #[test]
 fn agent_session_facts_deserialization_preserves_exact_opaque_provider_id() {
     let exact = "  opaque\u{00e9}-provider-id  ";
@@ -1003,13 +1253,26 @@ fn capability_evidence_persists_only_typed_non_sensitive_metadata() {
             EvidenceDiagnosticCode::AuthenticationRequired,
             Some([0xabu8; 32]),
         )),
+    );
+    assert!(matches!(
+        evidence,
+        Err(CapabilityEvidenceError::AuthEvidenceRequiresReceipt)
+    ));
+
+    let stable = CapabilityEvidence::new(
+        EvidenceSourceId::Registry,
+        1_700_000_000_000,
+        EvidenceStatus::Unknown,
+        Some(EvidenceDiagnostic::new(
+            EvidenceDiagnosticCode::ProbeFailed,
+            Some([0xabu8; 32]),
+        )),
     )
     .unwrap();
-    let encoded: Value = serde_json::to_value(&evidence).unwrap();
+    let encoded: Value = serde_json::to_value(&stable).unwrap();
     let object = encoded.as_object().unwrap();
-
-    assert_eq!(object["source"], "auth_status_probe");
-    assert_eq!(object["status"], "auth_required");
+    assert_eq!(object["source"], "registry");
+    assert_eq!(object["status"], "unknown");
     assert!(object.contains_key("observed_at"));
     assert!(object.contains_key("diagnostic"));
     assert!(!object.contains_key("detail"));
@@ -1017,9 +1280,14 @@ fn capability_evidence_persists_only_typed_non_sensitive_metadata() {
     assert!(!object.contains_key("path"));
     assert!(
         serde_json::from_value::<CapabilityEvidence>(serde_json::json!({
-            "source": "auth_status_probe",
+            "schema_version": 1,
+            "source": "registry",
             "observed_at": 1_700_000_000_000u64,
-            "status": "auth_required",
+            "expires_at": null,
+            "confidence": "unknown",
+            "auth_source": null,
+            "status": "unknown",
+            "diagnostic": null,
             "detail": "raw stdout OPENAI_API_KEY=secret"
         }))
         .is_err()
@@ -1050,7 +1318,10 @@ impl ProviderAdapter for BoundaryAdapter {
         ProviderKind::ClaudeCode
     }
 
-    async fn probe(&self, _executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutable,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(capabilities(
             ProviderKind::ClaudeCode,
             "fixture-1",
@@ -1080,7 +1351,7 @@ impl ProviderAdapter for BoundaryAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -1092,7 +1363,7 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
     let temp = tempdir().unwrap();
     let executable_path = executable_file(temp.path(), "claude", b"adapter");
     let executable = ProviderExecutable::from_path(executable_path).unwrap();
-    let launch = adapter.build_launch(LaunchProviderRequest::new(executable, None, None));
+    let launch = adapter.build_launch(LaunchProviderRequest::new(executable.clone(), None, None));
     assert!(matches!(
         launch,
         Err(ProviderError::UnsupportedCapability(
@@ -1106,10 +1377,7 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
     let stop = adapter.cooperative_stop(&ProviderRuntime);
     assert_eq!(stop, StopStrategy::Unsupported);
 
-    let quota = adapter
-        .observe_quota(Path::new("C:/bin/claude"))
-        .await
-        .unwrap();
+    let quota = adapter.observe_quota(&executable).await.unwrap();
     assert!(quota.is_none());
 }
 
@@ -1129,6 +1397,153 @@ fn provider_probe_result_has_bounded_structured_status() {
     );
     assert_eq!(result.stdout_bytes(), 12);
     assert_eq!(result.stderr_bytes(), 4);
+}
+
+#[test]
+fn provider_errors_and_probe_arguments_redact_sensitive_paths_and_tokens() {
+    let secret = "provider-secret-token";
+    let secret_path = PathBuf::from(format!("C:/private/{secret}/claude.exe"));
+    let errors = vec![
+        ProviderError::MissingCli {
+            kind: ProviderKind::ClaudeCode,
+            requested: Some(secret_path.clone()),
+        },
+        ProviderError::WrapperCommandNotAllowed {
+            path: secret_path.clone(),
+        },
+        ProviderError::ExecutableNotAllowed {
+            kind: ProviderKind::ClaudeCode,
+            path: secret_path.clone(),
+        },
+        ProviderError::Executable(ProviderExecutableError::Missing(secret_path.clone())),
+    ];
+    for error in errors {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    let executable_errors = vec![
+        ProviderExecutableError::EmptyPath,
+        ProviderExecutableError::PathTooLong,
+        ProviderExecutableError::Missing(secret_path.clone()),
+        ProviderExecutableError::NotAFile(secret_path.clone()),
+        ProviderExecutableError::NotNativeExecutable(secret_path.clone()),
+        ProviderExecutableError::SymlinkOrReparse(secret_path.clone()),
+        ProviderExecutableError::HardlinkAmbiguous(secret_path.clone()),
+        ProviderExecutableError::ChangedDuringValidation(secret_path.clone()),
+        ProviderExecutableError::InvalidFileIdentity(secret_path.clone()),
+        ProviderExecutableError::UnsupportedPlatform(secret_path.clone()),
+        ProviderExecutableError::NotCanonical {
+            requested: secret_path.clone(),
+            canonical: secret_path.clone(),
+        },
+        ProviderExecutableError::HashMismatch(secret_path.clone()),
+        ProviderExecutableError::UnsupportedSchemaVersion(2),
+        ProviderExecutableError::Io {
+            path: secret_path.clone(),
+            kind: std::io::ErrorKind::Other,
+        },
+        ProviderExecutableError::BackgroundTask,
+    ];
+    for error in executable_errors {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    let discovery_errors = vec![
+        devmanager::providers::ProviderDiscoveryError::UnsupportedPlatform,
+        devmanager::providers::ProviderDiscoveryError::NoCandidate(ProviderKind::ClaudeCode),
+        devmanager::providers::ProviderDiscoveryError::InvalidPathSnapshot(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::OriginNotAllowed(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::ForbiddenRunner(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::WrongEntrypoint(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::WrongFileType(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::ShimProofInvalid(secret_path.clone()),
+        devmanager::providers::ProviderDiscoveryError::Executable(
+            ProviderExecutableError::Missing(secret_path.clone()),
+        ),
+    ];
+    for error in discovery_errors {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    let wrapped_errors = vec![
+        ProviderError::Discovery(devmanager::providers::ProviderDiscoveryError::Executable(
+            ProviderExecutableError::Missing(secret_path.clone()),
+        )),
+        ProviderError::AuthEvidence(
+            devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(
+                ProviderExecutableError::Missing(secret_path.clone()),
+            ),
+        ),
+        ProviderError::UntrustedAuthenticationEvidence,
+    ];
+    for error in wrapped_errors {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    let request = ProviderProbeRequest::help(secret_path).unwrap();
+    assert!(!format!("{request:?}").contains(secret));
+
+    let argument = ProviderArgument::new(secret).unwrap();
+    assert!(!format!("{argument:?}").contains(secret));
+
+    let input = ProviderInput::new(secret.as_bytes().to_vec()).unwrap();
+    assert!(!format!("{input:?}").contains(secret));
+
+    let result = ProviderProbeResult::completed(&request, 0, 0, 0).unwrap();
+    assert!(!format!("{result:?}").contains(secret));
+}
+
+#[tokio::test]
+async fn registry_rejects_relative_and_oversized_path_entries_before_fallback() {
+    let temp = tempdir().unwrap();
+    let path_root = temp.path().join("fallback");
+    std::fs::create_dir_all(&path_root).unwrap();
+    let executable = executable_file(&path_root, "claude", b"path-boundary");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let relative_path = OsString::from(format!(".{separator}{}", path_root.display()));
+    let relative_result = registry
+        .resolve_executable(
+            ProviderKind::ClaudeCode,
+            &ProviderDiscoveryConfig {
+                executable_override: None,
+                path: Some(relative_path),
+            },
+        )
+        .await;
+    assert!(relative_result.is_err());
+
+    let oversized_entry = "x".repeat(16 * 1024);
+    let oversized_path = OsString::from(format!(
+        "{oversized_entry}{separator}{}",
+        path_root.display()
+    ));
+    let oversized_result = registry
+        .resolve_executable(
+            ProviderKind::ClaudeCode,
+            &ProviderDiscoveryConfig {
+                executable_override: None,
+                path: Some(oversized_path),
+            },
+        )
+        .await;
+    assert!(oversized_result.is_err());
+
+    assert!(executable.exists());
 }
 
 #[test]
@@ -1210,7 +1625,10 @@ impl ProviderAdapter for OrderedAdapter {
         ProviderKind::ClaudeCode
     }
 
-    async fn probe(&self, _executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutable,
+    ) -> Result<ProviderCapabilities, ProviderError> {
         self.events.lock().unwrap().push("probe-capabilities");
         Ok(capabilities(
             ProviderKind::ClaudeCode,
@@ -1241,7 +1659,7 @@ impl ProviderAdapter for OrderedAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &Path,
+        _executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -1273,7 +1691,7 @@ async fn observe_rejects_identity_replacement_between_capability_probe_and_after
     let result = registry
         .observe(
             ProviderKind::ClaudeCode,
-            &discovery(Some(PathBuf::from("C:/bin/claude")), None),
+            &discovery(Some(identity_path), None),
         )
         .await;
 
@@ -1349,7 +1767,7 @@ async fn windows_probe_runner_timeout_kills_the_entire_probe_tree() {
     let request = ProviderProbeRequest::with_limits(
         executable,
         devmanager::providers::ProviderProbeKind::Help,
-        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(1),
         4096,
     )
     .unwrap();
