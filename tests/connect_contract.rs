@@ -7,8 +7,8 @@ use uuid::Uuid;
 use devmanager::connect::{
     payload_catalog, ChannelBinding, ChannelId, ChannelKind, ChunkFrame, ConnectEnvelope,
     ConnectLimits, ConnectPayload, ConnectPrivacyClass, ConnectTransport, ConnectTransportError,
-    ConnectionId, EnvelopeError, FramedConnectTransport, GenericExtensionPayload, PayloadError,
-    PayloadKind, SessionId, UnknownPayload,
+    ConnectionId, EnvelopeError, ErrorPayload, FramedConnectTransport, GenericExtensionPayload,
+    PayloadError, PayloadKind, SessionId, UnknownPayload,
 };
 use devmanager::domain::command::CommandReceipt;
 use devmanager::domain::event::DomainEvent;
@@ -564,7 +564,7 @@ struct RawChunkPayload {
     chunk: ChunkFrame,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RawSnapshotPage {
     snapshot_id: SnapshotId,
     through_sequence: u64,
@@ -589,18 +589,6 @@ struct RawEventPage {
 }
 
 #[derive(Serialize)]
-struct RawArtifactContentPage {
-    artifact_id: ArtifactId,
-    offset: u64,
-    total_bytes: u64,
-    sha256: [u8; 32],
-    #[serde(with = "test_binary")]
-    payload: Vec<u8>,
-    encoded_bytes: u32,
-    next_cursor: Option<Vec<u8>>,
-}
-
-#[derive(Serialize)]
 struct RawPageResult<P> {
     page: P,
 }
@@ -619,11 +607,6 @@ struct RawEventReplayPageResult {
 #[derive(Serialize)]
 struct RawEventQueryResult {
     event_replay_page: RawEventReplayPageResult,
-}
-
-#[derive(Serialize)]
-struct RawArtifactQueryResult {
-    artifact_content_page: RawPageResult<RawArtifactContentPage>,
 }
 
 #[derive(Serialize)]
@@ -911,30 +894,6 @@ fn assert_page_items_rejection(frame: Vec<u8>, limits: ConnectLimits) {
     ));
 }
 
-fn assert_page_bytes_rejection(frame: Vec<u8>, limits: ConnectLimits) {
-    let mut receiver =
-        FramedConnectTransport::with_negotiated_limits(LoopbackIo::with_bytes(frame), limits)
-            .expect("page-byte-limit receiver");
-    let result = receiver.receive();
-    let result_debug = format!("{result:?}");
-    assert!(
-        matches!(
-            result,
-            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
-                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageBytesExceeded {
-                    maximum: 1,
-                    ..
-                })
-            )))
-        ),
-        "unexpected page byte result: {result_debug}"
-    );
-    assert!(matches!(
-        receiver.receive(),
-        Err(ConnectTransportError::Closed)
-    ));
-}
-
 #[test]
 fn production_transport_applies_one_negotiated_limit_set_on_send_and_receive() {
     let local = ConnectLimits::try_new(4096, 8192, 10, 2048, 4, 8, 2).expect("local limits");
@@ -1175,11 +1134,29 @@ fn short_write_then_error_permanently_closes_transport() {
         transport.send(envelope),
         Err(ConnectTransportError::Closed)
     ));
+    assert!(matches!(
+        transport.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
     assert_eq!(
         transport.into_inner().bytes.len(),
         1,
         "the writer must have successfully short-written before failing"
     );
+}
+
+#[test]
+fn error_payload_debug_is_opaque_and_bounded() {
+    let sentinel = "connect-error-debug-secret-sentinel";
+    let payload = ErrorPayload::new(17, sentinel).expect("error payload");
+    let debug = format!("{payload:?}");
+
+    assert!(!debug.contains(sentinel), "error text must not enter Debug");
+    assert!(
+        debug.contains("message_len"),
+        "Debug should retain safe metadata"
+    );
+    assert!(debug.len() <= 128, "Debug output must remain bounded");
 }
 
 #[test]
@@ -1400,52 +1377,81 @@ fn query_reply_snapshot_and_event_page_item_limits_preflight_through_transport()
 }
 
 #[test]
-fn query_reply_snapshot_event_and_artifact_page_bytes_preflight_through_transport() {
-    let limits =
-        ConnectLimits::try_new(4096, 8192, 8, 1, 4, 8, 128).expect("query page byte limits");
-
-    let snapshot_envelope = query_reply_envelope(91, limits);
-    let snapshot = RawMessagePayload {
+fn nested_query_page_at_canonical_body_limit_is_accepted_by_raw_transport() {
+    let typed_page = empty_snapshot_page(91);
+    let canonical = canonical_snapshot_page_size(&typed_page).expect("canonical snapshot page");
+    let limits = ConnectLimits::try_new(4096, 8192, 8, canonical, 4, 8, 128).expect("page limits");
+    let raw_page = RawSnapshotPage {
+        snapshot_id: domain_id(91),
+        through_sequence: 4,
+        section: SnapshotSection::Tasks,
+        after_item: None,
+        items: Vec::new(),
+        encoded_bytes: canonical,
+        next_cursor: None,
+    };
+    let page_wrapper = RawPageResult {
+        page: raw_page.clone(),
+    };
+    assert!(
+        rmp_serde::to_vec_named(&page_wrapper)
+            .expect("page wrapper")
+            .len()
+            > usize::try_from(canonical).expect("canonical size fits"),
+        "the nested QueryReply wrapper must be larger than its page body"
+    );
+    let envelope = query_reply_envelope(91, limits);
+    let raw = RawMessagePayload {
         message: RawQueryReplyMessage {
             query_reply: RawQueryReply {
                 request_id: domain_id(91),
                 outcome: RawQueryOutcome {
                     ok: RawSnapshotQueryResult {
-                        snapshot_page: RawPageResult {
-                            page: RawSnapshotPage {
-                                snapshot_id: domain_id(91),
-                                through_sequence: 4,
-                                section: SnapshotSection::Tasks,
-                                after_item: None,
-                                items: Vec::new(),
-                                encoded_bytes: 0,
-                                next_cursor: None,
-                            },
-                        },
+                        snapshot_page: page_wrapper,
                     },
                 },
             },
         },
     };
-    assert_page_bytes_rejection(
-        framed_raw(&wire_with_payload(&snapshot_envelope, snapshot), limits),
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&wire_with_payload(&envelope, raw), limits)),
         limits,
-    );
+    )
+    .expect("page-boundary receiver");
 
-    let event_envelope = query_reply_envelope(92, limits);
-    let event = RawMessagePayload {
+    let received = receiver
+        .receive()
+        .expect("canonical page body should cross transport")
+        .expect("one query reply");
+    assert!(matches!(
+        received.payload(),
+        ConnectPayload::Message(ServerMessage::QueryReply(_))
+    ));
+}
+
+#[test]
+fn nested_query_page_over_limit_reports_inner_page_body_at_raw_transport_boundary() {
+    let mut typed_page = empty_snapshot_page(92);
+    typed_page.next_cursor = Some(vec![0; 8]);
+    let canonical = canonical_snapshot_page_size(&typed_page).expect("canonical snapshot page");
+    let maximum = canonical - 1;
+    let limits = ConnectLimits::try_new(4096, 8192, 8, maximum, 4, 8, 128).expect("page limits");
+    let envelope = query_reply_envelope(92, limits);
+    let raw = RawMessagePayload {
         message: RawQueryReplyMessage {
             query_reply: RawQueryReply {
                 request_id: domain_id(92),
                 outcome: RawQueryOutcome {
-                    ok: RawEventQueryResult {
-                        event_replay_page: RawEventReplayPageResult {
-                            subscription_id: domain_id(93),
-                            page: RawEventPage {
-                                after_sequence: 0,
+                    ok: RawSnapshotQueryResult {
+                        snapshot_page: RawPageResult {
+                            page: RawSnapshotPage {
+                                snapshot_id: domain_id(92),
                                 through_sequence: 4,
-                                events: Vec::new(),
-                                next_cursor: None,
+                                section: SnapshotSection::Tasks,
+                                after_item: None,
+                                items: Vec::new(),
+                                encoded_bytes: canonical,
+                                next_cursor: Some(vec![0; 8]),
                             },
                         },
                     },
@@ -1453,38 +1459,30 @@ fn query_reply_snapshot_event_and_artifact_page_bytes_preflight_through_transpor
             },
         },
     };
-    assert_page_bytes_rejection(
-        framed_raw(&wire_with_payload(&event_envelope, event), limits),
+    let mut receiver = FramedConnectTransport::with_negotiated_limits(
+        LoopbackIo::with_bytes(framed_raw(&wire_with_payload(&envelope, raw), limits)),
         limits,
-    );
+    )
+    .expect("page-boundary receiver");
 
-    let artifact_envelope = query_reply_envelope(94, limits);
-    let artifact = RawMessagePayload {
-        message: RawQueryReplyMessage {
-            query_reply: RawQueryReply {
-                request_id: domain_id(94),
-                outcome: RawQueryOutcome {
-                    ok: RawArtifactQueryResult {
-                        artifact_content_page: RawPageResult {
-                            page: RawArtifactContentPage {
-                                artifact_id: domain_id(95),
-                                offset: 0,
-                                total_bytes: 1,
-                                sha256: [7; 32],
-                                payload: vec![8],
-                                encoded_bytes: 0,
-                                next_cursor: None,
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    };
-    assert_page_bytes_rejection(
-        framed_raw(&wire_with_payload(&artifact_envelope, artifact), limits),
-        limits,
+    let result = receiver.receive();
+    let result_debug = format!("{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(ConnectTransportError::Envelope(EnvelopeError::Payload(
+                PayloadError::Limits(devmanager::connect::ConnectLimitError::PageBytesExceeded {
+                    declared,
+                    maximum: actual_maximum,
+                })
+            ))) if declared == u64::from(canonical) && actual_maximum == maximum
+        ),
+        "unexpected inner page byte result: {result_debug}"
     );
+    assert!(matches!(
+        receiver.receive(),
+        Err(ConnectTransportError::Closed)
+    ));
 }
 
 #[test]

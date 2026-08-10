@@ -313,11 +313,21 @@ impl OperationSettlementPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorPayload {
     pub code: u16,
     pub message: String,
+}
+
+impl fmt::Debug for ErrorPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ErrorPayload")
+            .field("code", &self.code)
+            .field("message_len", &self.message.len())
+            .finish()
+    }
 }
 
 impl ErrorPayload {
@@ -1255,14 +1265,22 @@ impl<'a> ConnectWireScanner<'a> {
     ) -> Result<(), MessagePackError> {
         self.check_depth(depth)?;
         self.check_collection(MessagePackLengthKind::Map, length)?;
+        let mut has_nested_page_wrapper = false;
         for _ in 0..length {
             let field_context = {
                 let field = self.read_field_name()?;
+                if context.is_page() && field == b"page" {
+                    has_nested_page_wrapper = true;
+                }
                 context.child_for_field(field)
             };
             self.scan_value(field_context, depth + 1)?;
         }
-        if context.is_page() {
+        // QueryReply page results wrap the canonical page body in a one-field
+        // `{ page: ... }` map. The negotiated page byte limit belongs to the
+        // body itself, not to that protocol wrapper. Direct page payloads have
+        // no nested `page` field and are checked here as before.
+        if context.is_page() && !has_nested_page_wrapper {
             let declared = u64::try_from(self.offset - value_start).unwrap_or(u64::MAX);
             if declared > u64::from(self.limits.max_page_encoded_bytes) {
                 self.limit_error = Some(ConnectLimitError::PageBytesExceeded {
