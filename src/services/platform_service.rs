@@ -9,7 +9,7 @@ use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
 
-pub use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
+pub(crate) use crate::process::job::{attach_process_to_managed_job, ManagedProcessJob};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -360,7 +360,7 @@ where
 /// Claims a process created with [`MANAGED_PROCESS_CREATION_FLAGS`] before
 /// allowing any of its code to execute. On Windows the returned job must stay
 /// alive for as long as the process tree is owned.
-pub fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+pub(crate) fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
     #[cfg(windows)]
     {
         claim_suspended_process_with(pid, attach_process_to_managed_job, resume_suspended_process)

@@ -1,6 +1,6 @@
 pub mod identity;
-pub mod job;
-pub mod launcher;
+pub(crate) mod job;
+pub(crate) mod launcher;
 pub mod registry;
 pub mod teardown;
 
@@ -19,3 +19,15 @@ mod registry_acceptance;
 #[cfg(test)]
 #[path = "../../tests/process_supervisor/teardown.rs"]
 mod teardown_acceptance;
+
+#[cfg(test)]
+#[path = "../../tests/process_supervisor/job.rs"]
+mod job_acceptance;
+
+#[cfg(test)]
+#[path = "../../tests/process_supervisor/launcher.rs"]
+mod launcher_acceptance;
+
+#[cfg(all(test, windows))]
+#[path = "../../tests/process_supervisor/teardown_windows.rs"]
+mod teardown_windows_acceptance;

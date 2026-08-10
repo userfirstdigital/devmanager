@@ -269,7 +269,7 @@ pub struct RegisteredProcess<J> {
 }
 
 impl<J> RegisteredProcess<J> {
-    pub fn new(
+    pub(crate) fn new(
         fence: ResourceFence,
         owner: ProcessOwner,
         root: ManagedProcessIdentity,
@@ -310,7 +310,7 @@ impl<J> RegisteredProcess<J> {
         self.display_label.as_str()
     }
 
-    pub fn job(&self) -> &J {
+    pub(crate) fn job(&self) -> &J {
         &self.job
     }
 

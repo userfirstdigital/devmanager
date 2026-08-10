@@ -4,6 +4,7 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::process::teardown::ManagedTerminalTeardown;
 use devmanager::domain::id::{OperationId, ResourceId};
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::ProcessOwner;
@@ -416,6 +417,44 @@ fn windows_managed_job_teardown_reaches_receiver_zero_before_registry_release() 
         .0
         .as_mut()
         .expect("child guard")
+        .try_wait()
+        .expect("wait for terminated Windows helper")
+        .is_some());
+}
+
+#[test]
+fn windows_terminal_teardown_bridge_closes_from_native_session_authority() {
+    let child = Command::new("cmd.exe")
+        .args(["/C", "ping", "127.0.0.1", "-n", "30"])
+        .spawn()
+        .expect("spawn Windows terminal bridge helper");
+    let mut child_guard = ChildGuard(Some(child));
+    let pid = child_guard.0.as_ref().expect("child guard").id();
+    let job = attach_process_to_managed_job(pid)
+        .expect("attach process to managed Job")
+        .expect("Windows managed Job");
+
+    let teardown = ManagedTerminalTeardown::new(pid, job, "native terminal bridge")
+        .expect("construct native terminal teardown authority");
+    let report = teardown
+        .close()
+        .expect("close through coordinator authority");
+
+    assert_eq!(
+        report.outcome(),
+        devmanager::process::teardown::TeardownOutcome::Closed,
+        "native terminal teardown errors: {:?}; residue: {:?}",
+        report.errors(),
+        report.residue()
+    );
+    assert!(teardown
+        .active_process_ids()
+        .expect("query native terminal Job")
+        .is_empty());
+    assert!(child_guard
+        .0
+        .as_mut()
+        .expect("wait for terminated Windows helper")
         .try_wait()
         .expect("wait for terminated Windows helper")
         .is_some());

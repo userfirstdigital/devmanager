@@ -246,7 +246,7 @@ struct JobObjectExtendedLimitInformation {
 /// Dropping the last owner closes the Job Object and terminates its members.
 #[cfg(windows)]
 #[derive(Debug)]
-pub struct ManagedProcessJob {
+pub(crate) struct ManagedProcessJob {
     handle: Option<OwnedHandle>,
     completion_port: Option<OwnedHandle>,
     completion_key: usize,
@@ -259,14 +259,14 @@ pub struct ManagedProcessJob {
 /// Non-Windows marker type returned only behind `Option::None`.
 #[cfg(not(windows))]
 #[derive(Debug)]
-pub struct ManagedProcessJob {
+pub(crate) struct ManagedProcessJob {
     _unsupported: (),
 }
 
 impl ManagedProcessJob {
     /// Creates an empty, non-inheritable Job Object whose final handle closes
     /// every process in the tree.
-    pub fn create() -> Result<Option<Self>, String> {
+    pub(crate) fn create() -> Result<Option<Self>, String> {
         #[cfg(windows)]
         {
             create_windows_job().map(Some)
@@ -281,7 +281,7 @@ impl ManagedProcessJob {
     /// Returns the active process IDs currently assigned to this Job Object.
     ///
     /// On non-Windows platforms this always returns an empty list.
-    pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+    pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         #[cfg(windows)]
         {
             query_job_active_process_ids(self.raw_job_handle())
@@ -299,7 +299,7 @@ impl ManagedProcessJob {
     /// completion port, and listener remain owned by this value until the
     /// caller has observed the exact completion fence and authoritative empty
     /// membership before releasing it.
-    pub fn terminate_tree(&self) -> Result<(), String> {
+    pub(crate) fn terminate_tree(&self) -> Result<(), String> {
         #[cfg(windows)]
         {
             if unsafe { TerminateJobObject(self.raw_job_handle(), 1) } == 0 {
@@ -317,7 +317,7 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+    pub(crate) fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         #[cfg(windows)]
         {
             inspect_windows_process(self.raw_job_handle(), pid)
@@ -330,7 +330,10 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
+    pub(crate) fn bind_completion_fence(
+        &mut self,
+        fence: ManagedProcessFence,
+    ) -> Result<(), String> {
         #[cfg(windows)]
         {
             self.bind_windows_completion_fence(fence)
@@ -349,7 +352,7 @@ impl ManagedProcessJob {
     /// completion mailbox. Joining it is therefore part of the release
     /// boundary: once this method returns, no receiver thread can outlive the
     /// Job or mutate its mailbox.
-    pub fn shutdown_for_release(&mut self) -> Result<(), String> {
+    pub(crate) fn shutdown_for_release(&mut self) -> Result<(), String> {
         #[cfg(windows)]
         {
             self.shutdown_listener()
@@ -361,7 +364,7 @@ impl ManagedProcessJob {
         }
     }
 
-    pub fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
+    pub(crate) fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
         #[cfg(windows)]
         {
             self.completion_mailbox
@@ -495,7 +498,7 @@ impl Drop for ManagedProcessJob {
 /// New managed launchers must still create the process suspended before calling
 /// this compatibility boundary. The Phase 3 launcher slice will replace PID
 /// reopening with the primary process handle returned by process creation.
-pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+pub(crate) fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
     #[cfg(windows)]
     {
         attach_process_to_windows_job(pid).map(Some)

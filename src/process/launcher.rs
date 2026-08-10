@@ -58,11 +58,11 @@ impl ManagedLaunchError {
         }
     }
 
-    pub fn stage(&self) -> ManagedLaunchStage {
+    pub(crate) fn stage(&self) -> ManagedLaunchStage {
         self.stage
     }
 
-    pub fn registry_error(&self) -> Option<&ProcessRegistryError> {
+    pub(crate) fn registry_error(&self) -> Option<&ProcessRegistryError> {
         self.registry_error.as_ref()
     }
 }
@@ -158,7 +158,7 @@ impl LaunchIntent {
     }
 }
 
-pub fn is_supported() -> Result<(), ManagedLaunchError> {
+pub(crate) fn is_supported() -> Result<(), ManagedLaunchError> {
     if cfg!(windows) {
         Ok(())
     } else {
@@ -186,19 +186,19 @@ pub struct PendingManagedLaunch {
 
 #[cfg(windows)]
 impl PendingManagedLaunch {
-    pub fn process_id(&self) -> u32 {
+    pub(crate) fn process_id(&self) -> u32 {
         self.root.id().pid()
     }
 
-    pub fn root_identity(&self) -> &ManagedProcessIdentity {
+    pub(crate) fn root_identity(&self) -> &ManagedProcessIdentity {
         &self.root
     }
 
-    pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+    pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.job.active_process_ids()
     }
 
-    pub fn register_and_resume(
+    pub(crate) fn register_and_resume(
         self,
         registry: &mut ProcessRegistry<ManagedProcessJob>,
     ) -> Result<ManagedPtyChild, ManagedLaunchError> {
@@ -266,35 +266,35 @@ pub struct ManagedPtyChild {
 
 #[cfg(windows)]
 impl ManagedPtyChild {
-    pub fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
+    pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
         &self.fence
     }
 
-    pub fn process_id(&self) -> u32 {
+    pub(crate) fn process_id(&self) -> u32 {
         self.child
             .process_id()
             .expect("managed Windows PTY child must expose its PID")
     }
 
-    pub fn kind(&self) -> ResourceKind {
+    pub(crate) fn kind(&self) -> ResourceKind {
         self.kind
     }
 
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait()
     }
 
-    pub fn into_child(self) -> Box<dyn Child + Send + Sync> {
+    pub(crate) fn into_child(self) -> Box<dyn Child + Send + Sync> {
         self.child
     }
 }
 
 #[cfg(windows)]
-pub fn prepare_suspended_pty(
+pub(crate) fn prepare_suspended_pty(
     slave: &dyn SlavePty,
     intent: LaunchIntent,
 ) -> Result<PendingManagedLaunch, ManagedLaunchError> {

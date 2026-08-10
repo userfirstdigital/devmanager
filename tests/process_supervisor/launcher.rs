@@ -38,7 +38,24 @@ mod windows {
     }
 
     fn helper() -> PathBuf {
-        PathBuf::from(env!("CARGO_BIN_EXE_devmanager-process-test-helper"))
+        if let Some(path) = std::env::var_os("CARGO_BIN_EXE_devmanager-process-test-helper") {
+            return PathBuf::from(path);
+        }
+        let current = std::env::current_exe().expect("test executable path");
+        let target = current
+            .parent()
+            .and_then(Path::parent)
+            .expect("target directory beside test executable");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let helper = format!("devmanager-process-test-helper{suffix}");
+        let candidate = target.join(&helper);
+        if candidate.is_file() {
+            return candidate;
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join(helper)
     }
 
     fn intent(resource_id: ResourceId, generation: u64, args: Vec<OsString>) -> LaunchIntent {
