@@ -12,7 +12,7 @@ use devmanager::process::sampler::{
     require_exact_process_identity, AccessibleProcess, InaccessibleProcess,
     ProcessMemberObservation, ProcessSampler, SamplerError, SamplingBudget,
 };
-use devmanager::state::ResourceSnapshot;
+use devmanager::state::{ResourceMetricValueState, ResourceSnapshot};
 
 const LOGICAL_PROCESSORS: u32 = 8;
 const WALL_TICKS: u64 = 1_000_000;
@@ -185,6 +185,23 @@ fn inaccessible_job_members_are_counted_and_mark_metrics_partial() {
 }
 
 #[test]
+fn partial_sampler_diagnostic_is_a_fixed_opaque_code() {
+    let mut sampler = ProcessSampler::new();
+    let inaccessible = ProcessMemberObservation::Inaccessible(
+        InaccessibleProcess::new(107, Some(1))
+            .with_reason(r"access denied at C:\private\project --token=secret"),
+    );
+
+    let snapshot = sample(&mut sampler, Duration::ZERO, [inaccessible]);
+
+    assert_eq!(snapshot.status, ProcessMetricStatus::Partial);
+    assert_eq!(
+        snapshot.error.as_deref(),
+        Some("member_metrics_unavailable")
+    );
+}
+
+#[test]
 fn bounded_job_observation_never_materializes_more_than_the_tick_cap() {
     let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 512);
     let process_ids = (1..=513).collect::<Vec<_>>();
@@ -215,7 +232,7 @@ fn one_tick_budget_caps_job_members_across_multiple_jobs() {
     )
     .expect("first Job remains bounded");
     assert_eq!(first.len(), 400);
-    assert_eq!(budget.reserved_members(), 400);
+    assert_eq!(budget.claimed_members(), 400);
 
     let result = collect_exact_job_observations_with_budget(
         Ok((401..=601).collect::<Vec<_>>()),
@@ -227,7 +244,75 @@ fn one_tick_budget_caps_job_members_across_multiple_jobs() {
         error.contains("112"),
         "unexpected shared-cap error: {error}"
     );
-    assert_eq!(budget.reserved_members(), 400);
+    assert_eq!(budget.claimed_members(), 400);
+}
+
+#[test]
+fn one_tick_budget_deduplicates_the_same_exact_job_identity_before_the_cap() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 1);
+    let first = collect_exact_job_observations_with_budget(
+        Ok(vec![611]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 7), None)),
+        &mut budget,
+    )
+    .expect("first exact Job identity");
+    let duplicate = collect_exact_job_observations_with_budget(
+        Ok(vec![611]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 7), None)),
+        &mut budget,
+    )
+    .expect("the same exact identity must not consume a second member slot");
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(duplicate.len(), 1);
+    assert_eq!(budget.claimed_members(), 1);
+    assert_eq!(budget.remaining_members(), 0);
+    let work = budget.work_counters();
+    assert_eq!(work.job_queries, 2);
+    assert_eq!(work.job_candidates, 2);
+    assert_eq!(work.identity_inspections, 2);
+}
+
+#[test]
+fn one_tick_budget_rejects_conflicting_job_identity_for_the_same_pid() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 2);
+    collect_exact_job_observations_with_budget(
+        Ok(vec![612]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 7), None)),
+        &mut budget,
+    )
+    .expect("first exact Job identity");
+
+    let conflict = collect_exact_job_observations_with_budget(
+        Ok(vec![612]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 8), None)),
+        &mut budget,
+    )
+    .expect_err("PID reuse during one tick must fail closed");
+
+    assert!(conflict.contains("conflicting process identities"));
+    assert_eq!(budget.claimed_members(), 1);
+}
+
+#[test]
+fn unknown_inaccessible_generation_cannot_merge_with_an_exact_job_identity() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 2);
+    collect_exact_job_observations_with_budget(
+        Ok(vec![613]),
+        |_| Err("access denied".to_string()),
+        &mut budget,
+    )
+    .expect("inaccessible Job member remains authoritative membership");
+
+    let conflict = collect_exact_job_observations_with_budget(
+        Ok(vec![613]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 9), None)),
+        &mut budget,
+    )
+    .expect_err("an inaccessible unknown generation must not grant a later exact identity");
+
+    assert!(conflict.contains("conflicting process identities"));
+    assert_eq!(budget.claimed_members(), 1);
 }
 
 #[test]
@@ -247,7 +332,7 @@ fn job_member_inspection_stops_when_the_shared_deadline_expires() {
     let error = result.expect_err("expired member inspection must fail closed");
     assert!(error.contains("sampling work budget exceeded"));
     assert_eq!(inspected, 1, "the second member must not be inspected");
-    assert_eq!(budget.reserved_members(), 0);
+    assert_eq!(budget.claimed_members(), 0);
 }
 
 #[test]
@@ -271,7 +356,7 @@ fn accounting_projection_redacts_executable_identity() {
 }
 
 #[test]
-fn duplicate_job_and_ancestry_observations_are_counted_once() {
+fn duplicate_exact_member_observations_are_counted_once() {
     let mut sampler = ProcessSampler::new();
     sample(
         &mut sampler,
@@ -461,6 +546,30 @@ fn runtime_resource_snapshot_retains_partial_metrics_and_io_deltas() {
     assert!(decoded.metrics_unavailable);
     assert_eq!(decoded.io_read_bytes, Some(75));
     assert_eq!(decoded.io_write_bytes, Some(60));
+}
+
+#[test]
+fn resource_snapshot_tracks_cpu_and_memory_confidence_independently() {
+    let snapshot = ResourceSnapshot {
+        cpu_percent: 0.0,
+        memory_bytes: 4_096,
+        cpu_value_state: ResourceMetricValueState::Unavailable,
+        memory_value_state: ResourceMetricValueState::Observed,
+        metric_values: ResourceMetricValueState::Partial,
+        ..ResourceSnapshot::default()
+    };
+
+    let encoded = serde_json::to_string(&snapshot).expect("resource snapshot JSON");
+    let decoded: ResourceSnapshot = serde_json::from_str(&encoded).expect("resource snapshot");
+    assert_eq!(
+        decoded.cpu_value_state,
+        ResourceMetricValueState::Unavailable
+    );
+    assert_eq!(
+        decoded.memory_value_state,
+        ResourceMetricValueState::Observed
+    );
+    assert_eq!(decoded.metric_values, ResourceMetricValueState::Partial);
 }
 
 #[test]

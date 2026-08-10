@@ -17,7 +17,7 @@ Raw Windows process names are not useful for Node-heavy trees. Windows Task Mana
 ## 2. Goals
 
 - Include active Windows Job Object members in every session resource sample.
-- Keep previously verified descendants in the sample and PID ledger after a parent link breaks.
+- Keep descendants visible after a parent link breaks when the current Job still reports their exact identity.
 - Keep parent-walk and ledger data as bounded metadata only; they never replace a failed Job query as ownership truth.
 - Ensure process-monitor kill authorization and cleanup use the same owned PID truth as reporting.
 - Store and display CPU as a whole-machine percentage in the `0..=100` Task Manager convention.
@@ -44,7 +44,7 @@ granting monitor or kill authority.
 
 Every monitor tick starts one bounded deadline and member cap before Job
 enumeration. The same budget fences Job inspection, selected process metadata,
-ancestry enrichment, and projection. A Job query failure publishes the
+parent/label enrichment, and projection. A Job query failure publishes the
 immutable prior snapshot as stale/unknown (or an empty unknown snapshot when
 there is no prior); it never resamples cached members as current.
 
@@ -61,7 +61,9 @@ The existing `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` behavior remains unchanged. Qu
 
 ## 6. CPU contract
 
-For each sampled process:
+For each sampled process, DevManager subtracts the prior cumulative
+kernel-plus-user CPU counter from the current counter, divides that delta by
+the wall-clock interval, and then normalizes it by the logical processor count:
 
 ```text
 system_cpu_percent = core_scaled_cpu_percent / logical_cpu_count
@@ -113,7 +115,7 @@ Initial classifications:
 ## 9. Verification
 
 - Pure tests prove CPU normalization, clamping, and equivalent-core derivation.
-- Pure tests prove PID union keeps Job members and verified detached ledger members without accepting stale identities.
+- Pure tests prove only exact current Job members enter accounting, including detached members, and conflicting PID generations fail closed.
 - PID-ledger tests prove a sync cannot erase a still-running detached descendant.
 - Classifier tests prove known labels and confirm that arbitrary command arguments never become display labels.
 - Windows integration tests prove a managed Job reports an assigned process and a spawned child.

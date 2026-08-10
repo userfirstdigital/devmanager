@@ -54,7 +54,7 @@ pub(crate) const AI_SESSION_ATTACH_GRACE_WINDOW: Duration = Duration::from_secs(
 /// Resource collection is a background projection, but it still needs a hard
 /// per-tick ceiling so a large Job cannot monopolize the process worker.
 const RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK: usize = 512;
-const RESOURCE_SAMPLE_TICK_BUDGET: Duration = Duration::from_millis(250);
+const RESOURCE_SAMPLE_TICK_BUDGET: Duration = Duration::from_millis(40);
 
 #[derive(Debug, Default)]
 struct ManagedJobObservationSnapshot {
@@ -3438,6 +3438,9 @@ impl ProcessManager {
                     lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                     metric_values: crate::state::ResourceMetricValueState::Unavailable,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                    memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                    sampling_generation: 0,
                 });
                 for descendant in platform_service::collect_descendant_process_identities(entry.pid)
                 {
@@ -3465,6 +3468,9 @@ impl ProcessManager {
                             lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                             metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                             metric_values: crate::state::ResourceMetricValueState::Unavailable,
+                            cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                            memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                            sampling_generation: 0,
                         });
                     }
                 }
@@ -3499,6 +3505,9 @@ impl ProcessManager {
                             lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                             metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                             metric_values: crate::state::ResourceMetricValueState::Unavailable,
+                            cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                            memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                            sampling_generation: 0,
                         });
                     }
                 }
@@ -3529,6 +3538,9 @@ impl ProcessManager {
                     lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                     metric_values: crate::state::ResourceMetricValueState::Unavailable,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                    memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                    sampling_generation: 0,
                 });
             }
             for descendant in platform_service::collect_descendant_process_identities(root_pid) {
@@ -3556,6 +3568,9 @@ impl ProcessManager {
                         lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                         metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                         metric_values: crate::state::ResourceMetricValueState::Unavailable,
+                        cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                        memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+                        sampling_generation: 0,
                     });
                 }
             }
@@ -3836,45 +3851,56 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
 }
 
 fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo::System) {
-    let sessions: Vec<(String, u32, bool, SessionKind, SessionStatus)> = inner
+    // The production deadline starts before any runtime/session enumeration.
+    // Accounting never reads the legacy PID ledger: only the current
+    // teardown-owned Job can grant membership.
+    let sampled_at = Instant::now();
+    let mut tick_budget = SamplingBudget::new(
+        sampled_at + RESOURCE_SAMPLE_TICK_BUDGET,
+        RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK,
+    );
+    let sessions: Vec<(
+        String,
+        u32,
+        bool,
+        SessionKind,
+        SessionStatus,
+        ResourceSnapshot,
+    )> = inner
         .runtime_state
         .read()
         .map(|runtime| {
-            runtime
-                .sessions
-                .iter()
-                .filter_map(|(id, session)| {
-                    if session.status.is_live() {
-                        return session.pid.map(|pid| {
-                            (
-                                id.clone(),
-                                pid,
-                                session.session_kind.is_ai(),
-                                session.session_kind,
-                                session.status,
-                            )
-                        });
-                    }
-                    if session.reap_incomplete {
-                        let ledger_pid = pid_file::active_tracked_processes_for_session(id)
-                            .into_iter()
-                            .next()
-                            .map(|entry| entry.pid);
-                        let pid =
-                            ledger_pid.or_else(|| session.resources.process_ids.first().copied());
-                        return pid.map(|pid| {
-                            (
-                                id.clone(),
-                                pid,
-                                false,
-                                session.session_kind,
-                                SessionStatus::Failed,
-                            )
-                        });
-                    }
-                    None
-                })
-                .collect()
+            let mut selected = Vec::new();
+            for (id, session) in &runtime.sessions {
+                if tick_budget.work_counters().runtime_sessions
+                    >= RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK
+                    || tick_budget.checkpoint().is_err()
+                {
+                    break;
+                }
+                tick_budget.note_runtime_session();
+                let (pid, status) = if session.status.is_live() {
+                    (session.pid, session.status)
+                } else if session.reap_incomplete {
+                    (
+                        session.resources.process_ids.first().copied(),
+                        SessionStatus::Failed,
+                    )
+                } else {
+                    continue;
+                };
+                if let Some(pid) = pid {
+                    selected.push((
+                        id.clone(),
+                        pid,
+                        session.session_kind.is_ai(),
+                        session.session_kind,
+                        status,
+                        bounded_previous_snapshot(&session.resources, &mut tick_budget),
+                    ));
+                }
+            }
+            selected
         })
         .unwrap_or_default();
 
@@ -3885,117 +3911,79 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         return;
     }
 
-    let sampled_at = Instant::now();
-    let mut tick_budget = SamplingBudget::new(
-        sampled_at + RESOURCE_SAMPLE_TICK_BUDGET,
-        RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK,
-    );
-    let previous_resource_snapshots: HashMap<String, ResourceSnapshot> = inner
-        .runtime_state
-        .read()
-        .map(|runtime| {
-            sessions
-                .iter()
-                .filter_map(|(session_id, _, _, _, _)| {
-                    runtime
-                        .sessions
-                        .get(session_id)
-                        .map(|session| (session_id.clone(), session.resources.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     // Snapshot TerminalSession Arcs without holding the sessions lock across OS queries.
-    let terminal_sessions: HashMap<String, Arc<TerminalSession>> = inner
-        .sessions
-        .lock()
-        .ok()
-        .map(|guard| {
-            sessions
-                .iter()
-                .filter_map(|(session_id, _, _, _, _)| {
-                    guard
-                        .get(session_id)
-                        .cloned()
-                        .map(|session| (session_id.clone(), session))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut terminal_sessions = HashMap::with_capacity(sessions.len());
+    if let Ok(guard) = inner.sessions.lock() {
+        for (session_id, _, _, _, _, _) in &sessions {
+            if tick_budget.checkpoint().is_err() {
+                break;
+            }
+            if let Some(session) = guard.get(session_id) {
+                terminal_sessions.insert(session_id.clone(), session.clone());
+            }
+        }
+    }
 
     let mut job_member_observations: HashMap<String, ManagedJobObservationSnapshot> =
         HashMap::new();
-    for (session_id, session) in &terminal_sessions {
-        let observation = match session.managed_process_observations_with_budget(&mut tick_budget) {
-            Ok(Some(members)) => ManagedJobObservationSnapshot {
-                members: Some(members),
-                error: None,
-            },
-            Ok(None) => ManagedJobObservationSnapshot {
+    for (session_id, _, _, _, _, _) in &sessions {
+        if tick_budget.checkpoint().is_err() {
+            break;
+        }
+        tick_budget.note_session_authority_read();
+        let observation = match terminal_sessions.get(session_id) {
+            Some(session) => {
+                match session.managed_process_observations_with_budget(&mut tick_budget) {
+                    Ok(Some(members)) => ManagedJobObservationSnapshot {
+                        members: Some(members),
+                        error: None,
+                    },
+                    Ok(None) => ManagedJobObservationSnapshot {
+                        members: None,
+                        error: Some("job_authority_unavailable".to_string()),
+                    },
+                    Err(error) => ManagedJobObservationSnapshot {
+                        members: None,
+                        error: Some(job_query_diagnostic_code(&error).to_string()),
+                    },
+                }
+            }
+            None => ManagedJobObservationSnapshot {
                 members: None,
-                error: Some("managed Job is unavailable".to_string()),
-            },
-            Err(error) => ManagedJobObservationSnapshot {
-                members: None,
-                error: Some(error),
+                error: Some("job_authority_unavailable".to_string()),
             },
         };
         job_member_observations.insert(session_id.clone(), observation);
     }
     drop(terminal_sessions);
 
-    let tracked_processes: HashMap<String, pid_file::ManagedProcessRecord> =
-        pid_file::tracked_processes()
-            .into_iter()
-            .map(|entry| (entry.session_id.clone(), entry))
-            .collect();
-    // Start the budget before the process-list refresh so a slow OS query
-    // consumes this tick's allowance instead of delaying the next one. The
-    // sampler will publish a typed failed snapshot when the deadline is
-    // already exhausted.
-    // Refresh only the bounded Job/runtime member set. A full process-list
-    // refresh is both unnecessary for ownership (the Job is authoritative)
-    // and capable of blowing the tick deadline before projection starts.
-    let process_ids = sessions
-        .iter()
-        .flat_map(|(_, runtime_pid, _, _, _)| {
-            std::iter::once(*runtime_pid).chain(
-                job_member_observations
-                    .values()
-                    .flat_map(|observation| observation.members.iter().flatten())
-                    .filter_map(|member| match member {
-                        JobMemberObservation::Accessible { identity } => Some(identity.id().pid()),
-                        JobMemberObservation::Inaccessible { pid, .. } => Some(*pid),
-                    }),
-            )
-        })
-        .take(tick_budget.max_members())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(sysinfo::Pid::from_u32)
-        .collect::<Vec<_>>();
-    if !process_ids.is_empty() && tick_budget.checkpoint().is_ok() {
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&process_ids),
-            true,
-            sysinfo::ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
-        );
+    // Deduplicate all authoritative PIDs before building the one selected OS
+    // metadata snapshot. Runtime roots never consume a slot unless the Job
+    // itself reports that exact member.
+    let mut process_ids = BTreeSet::new();
+    'members: for observation in job_member_observations.values() {
+        for member in observation.members.iter().flatten() {
+            if tick_budget.checkpoint().is_err() {
+                break 'members;
+            }
+            let pid = match member {
+                JobMemberObservation::Accessible { identity } => identity.id().pid(),
+                JobMemberObservation::Inaccessible { pid, .. } => *pid,
+            };
+            if process_ids.len() >= RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK
+                && !process_ids.contains(&pid)
+            {
+                break 'members;
+            }
+            process_ids.insert(pid);
+        }
     }
-    // The bounded Job vectors above are now the immutable ownership input for
-    // this tick. Release their enumeration reservations so the sampler can
-    // spend the same cap on the observations it actually computes; the Job
-    // vectors themselves remain globally bounded while they are retained.
-    let reserved_members = tick_budget.reserved_members();
-    tick_budget.release_reserved_members(reserved_members);
+    let process_metadata = capture_process_metadata(system, &process_ids, &mut tick_budget);
     let logical_cpu_count = resolve_logical_cpu_count();
     let mut snapshots = Vec::with_capacity(sessions.len());
     let active_sampler_ids: BTreeSet<String> = sessions
         .iter()
-        .map(|(session_id, _, _, _, _)| session_id.clone())
+        .map(|(session_id, _, _, _, _, _)| session_id.clone())
         .collect();
     let mut resource_samplers = inner
         .resource_samplers
@@ -4003,7 +3991,19 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     resource_samplers.retain(|session_id, _| active_sampler_ids.contains(session_id));
 
-    for (session_id, runtime_pid, is_ai_session, resource_kind, lifecycle_status) in sessions {
+    for (
+        session_id,
+        _runtime_pid,
+        is_ai_session,
+        resource_kind,
+        lifecycle_status,
+        previous_snapshot,
+    ) in sessions
+    {
+        let tick_expired = tick_budget.checkpoint().is_err();
+        if tick_budget.work_counters().projected_snapshots < RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK {
+            tick_budget.note_projected_snapshot();
+        }
         let job_observation = job_member_observations
             .remove(&session_id)
             .unwrap_or_else(|| ManagedJobObservationSnapshot {
@@ -4017,43 +4017,39 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
             resource_kind,
             lifecycle: process_lifecycle_from_status(lifecycle_status),
         };
-        let sampled = if let Some(job_members) = job_observation.members.as_deref() {
+        let sampled = if tick_expired {
+            Some((
+                stale_resource_snapshot(
+                    system,
+                    &session_id,
+                    Some(&previous_snapshot),
+                    sample_ctx,
+                    Some("sampling_deadline_exceeded"),
+                    &mut tick_budget,
+                ),
+                false,
+            ))
+        } else if let Some(job_members) = job_observation.members.as_deref() {
             let sampler = resource_samplers
                 .entry(session_id.clone())
                 .or_insert_with(ProcessSampler::new);
-            tracked_processes
-                .get(&session_id)
-                .filter(|entry| ledger_compatible_with_runtime(system, entry, runtime_pid))
-                .and_then(|entry| {
-                    sample_session_resources(
-                        system,
-                        &session_id,
-                        entry,
-                        runtime_pid,
-                        job_members,
-                        sample_ctx,
-                        sampler,
-                        &mut tick_budget,
-                    )
-                })
-                .or_else(|| {
-                    sample_runtime_only_resources(
-                        system,
-                        runtime_pid,
-                        job_members,
-                        sample_ctx,
-                        sampler,
-                        &mut tick_budget,
-                    )
-                })
+            Some(sample_job_resources(
+                &session_id,
+                job_members,
+                &process_metadata,
+                sample_ctx,
+                sampler,
+                &mut tick_budget,
+            ))
         } else {
             Some((
                 stale_resource_snapshot(
                     system,
                     &session_id,
-                    previous_resource_snapshots.get(&session_id),
+                    Some(&previous_snapshot),
                     sample_ctx,
                     job_observation.error.as_deref(),
+                    &mut tick_budget,
                 ),
                 false,
             ))
@@ -4065,8 +4061,10 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                     metrics_unavailable: true,
                     metrics_status: ProcessMetricStatus::Unknown,
                     metric_values: ResourceMetricValueState::Unavailable,
+                    cpu_value_state: ResourceMetricValueState::Unavailable,
+                    memory_value_state: ResourceMetricValueState::Unavailable,
                     metrics_stale: false,
-                    metrics_error: Some("no authoritative Job members were observed".to_string()),
+                    metrics_error: Some("job_authority_unavailable".to_string()),
                     last_sample_at: Some(sampled_at),
                     ..ResourceSnapshot::default()
                 },
@@ -4112,157 +4110,53 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     }
 }
 
-fn sample_session_resources(
-    system: &mut sysinfo::System,
+#[derive(Debug, Clone, Default)]
+struct ProcessProjectionMetadata {
+    parent_pid: Option<u32>,
+    display_name: String,
+    command_label: String,
+    command_arg_count: u16,
+    command_arg_bytes: u32,
+    blocking_external_editor: bool,
+}
+
+fn sample_job_resources(
     session_id: &str,
-    entry: &pid_file::ManagedProcessRecord,
-    runtime_pid: u32,
     job_members: &[JobMemberObservation],
+    metadata: &HashMap<u32, ProcessProjectionMetadata>,
     ctx: ResourceSampleContext,
     sampler: &mut ProcessSampler,
     budget: &mut SamplingBudget,
-) -> Option<(ResourceSnapshot, bool)> {
-    let root_verified = platform_service::process_matches_identity_with_system(
-        system,
-        entry.pid,
-        entry.started_at_unix_secs,
-        entry.process_name.as_deref(),
-    );
-    let ledger_pids = verified_ledger_descendant_pids(system, entry, budget);
-
-    // Never include or walk from entry.pid unless its stored identity still matches.
-    // A different runtime_pid may anchor ancestry only when it is a verified ledger
-    // descendant. Job-only matches fall through to sample_runtime_only_resources.
-    let sample_root = if root_verified {
-        Some(entry.pid)
-    } else if runtime_pid != entry.pid
-        && ledger_pids.contains(&runtime_pid)
-        && system
-            .process(sysinfo::Pid::from_u32(runtime_pid))
-            .is_some()
-    {
-        Some(runtime_pid)
-    } else {
-        None
-    };
-
-    let ancestry_pids = sample_root
-        .map(|root| collect_ancestry_pids(system, root, budget))
-        .unwrap_or_default();
-    // A successful managed Job query, including an empty member set, is
-    // ownership truth. Ancestry and the ledger are retained below only for
-    // labels/parent metadata and never grant ownership.
+) -> (ResourceSnapshot, bool) {
     let current_members = match observe_job_members_with_budget(job_members, budget) {
         Ok(members) => members,
         Err(error) => {
-            return Some((
+            return (
                 budget_failed_resource_snapshot(session_id, job_members, ctx, error),
                 false,
-            ));
+            );
         }
     };
-    sampler.remember_authoritative_members(&current_members);
-    // A successful Job query is the sole ownership truth. Ancestry and the
-    // ledger remain labels/parent metadata only.
-    let owned_pids =
-        select_owned_process_ids(Some(job_members), sample_root, &ancestry_pids, &ledger_pids);
-    if owned_pids.is_empty() {
-        let snapshot = build_resource_snapshot(
-            system,
-            session_id,
-            &[],
-            ctx.logical_cpu_count,
-            ctx.sampled_at,
-            current_members.as_slice(),
-            sampler,
-            ctx,
-            budget,
-        );
-        return Some((snapshot, false));
-    }
-
-    refresh_command_metadata_for_pids(system, &owned_pids, budget);
-
-    let descendant_identities = owned_pids
-        .iter()
-        .copied()
-        .filter(|pid| Some(*pid) != sample_root)
-        .filter_map(|pid| platform_service::process_identity_with_system(system, pid))
-        .collect::<Vec<_>>();
-    let awaiting_external_editor =
-        ctx.is_ai_session && is_blocking_external_editor(&descendant_identities);
-
-    if root_verified {
-        let _ = pid_file::sync_session_descendant_processes_with_system(
-            session_id,
-            entry.pid,
-            descendant_identities,
-            system,
-        );
-    }
-
+    let owned_pids = unique_job_member_pids(job_members);
+    let awaiting_external_editor = ctx.is_ai_session
+        && owned_pids.iter().any(|pid| {
+            metadata
+                .get(pid)
+                .is_some_and(|row| row.blocking_external_editor)
+        });
     let snapshot = build_resource_snapshot(
-        system,
+        metadata,
         session_id,
         &owned_pids,
         ctx.logical_cpu_count,
         ctx.sampled_at,
+        job_members,
         current_members.as_slice(),
         sampler,
         ctx,
         budget,
     );
-    Some((snapshot, awaiting_external_editor))
-}
-
-fn sample_runtime_only_resources(
-    system: &mut sysinfo::System,
-    runtime_pid: u32,
-    job_members: &[JobMemberObservation],
-    ctx: ResourceSampleContext,
-    sampler: &mut ProcessSampler,
-    budget: &mut SamplingBudget,
-) -> Option<(ResourceSnapshot, bool)> {
-    let ancestry_pids = collect_ancestry_pids(system, runtime_pid, budget);
-    let current_members = match observe_job_members_with_budget(job_members, budget) {
-        Ok(members) => members,
-        Err(error) => {
-            return Some((
-                budget_failed_resource_snapshot("runtime-only", job_members, ctx, error),
-                false,
-            ));
-        }
-    };
-    sampler.remember_authoritative_members(&current_members);
-    let owned_pids =
-        select_owned_process_ids(Some(job_members), Some(runtime_pid), &ancestry_pids, &[]);
-    if owned_pids.is_empty() {
-        let snapshot = build_resource_snapshot(
-            system,
-            "runtime-only",
-            &[],
-            ctx.logical_cpu_count,
-            ctx.sampled_at,
-            current_members.as_slice(),
-            sampler,
-            ctx,
-            budget,
-        );
-        return Some((snapshot, false));
-    }
-    refresh_command_metadata_for_pids(system, &owned_pids, budget);
-    let snapshot = build_resource_snapshot(
-        system,
-        "runtime-only",
-        &owned_pids,
-        ctx.logical_cpu_count,
-        ctx.sampled_at,
-        current_members.as_slice(),
-        sampler,
-        ctx,
-        budget,
-    );
-    Some((snapshot, false))
+    (snapshot, awaiting_external_editor)
 }
 
 fn stale_resource_snapshot(
@@ -4271,18 +4165,19 @@ fn stale_resource_snapshot(
     previous: Option<&ResourceSnapshot>,
     ctx: ResourceSampleContext,
     job_error: Option<&str>,
+    budget: &mut SamplingBudget,
 ) -> ResourceSnapshot {
-    let mut snapshot = previous.cloned().unwrap_or_default();
-    snapshot
-        .processes
-        .truncate(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK);
-    snapshot
-        .process_ids
-        .truncate(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK);
-    snapshot.process_count = snapshot
-        .process_count
-        .min(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK as u32);
-    for process in &mut snapshot.processes {
+    let mut snapshot = previous
+        .map(|previous| bounded_previous_snapshot(previous, budget))
+        .unwrap_or_default();
+    let mut safe_processes = Vec::with_capacity(snapshot.processes.len());
+    for mut process in snapshot.processes {
+        if budget.work_counters().projected_rows >= budget.max_members()
+            || budget.checkpoint().is_err()
+        {
+            break;
+        }
+        budget.note_projected_row();
         let safe_label = classify_process_display_name(&process.name, &[]);
         process.name = format!("{safe_label} (metrics unavailable)");
         process.executable = process
@@ -4300,29 +4195,100 @@ fn stale_resource_snapshot(
         // the safe Unknown state rather than copying session lifecycle.
         process.lifecycle = ProcessResourceLifecycle::Unknown;
         process.metrics_status = ProcessMetricStatus::Unknown;
-        if process.metric_values != ResourceMetricValueState::Unavailable {
-            process.metric_values = ResourceMetricValueState::LastKnown;
-        }
+        process.cpu_value_state = last_known_metric_state(process.cpu_value_state);
+        process.memory_value_state = last_known_metric_state(process.memory_value_state);
+        process.metric_values =
+            combined_metric_state(process.cpu_value_state, process.memory_value_state);
+        safe_processes.push(process);
     }
+    snapshot.processes = safe_processes;
+    snapshot.process_ids = snapshot
+        .processes
+        .iter()
+        .map(|process| process.pid)
+        .collect();
+    snapshot.process_count = snapshot.process_ids.len() as u32;
     snapshot.logical_cpu_count = ctx.logical_cpu_count.max(1);
     snapshot.metrics_unavailable = true;
     snapshot.metrics_status = ProcessMetricStatus::Unknown;
-    snapshot.metric_values = if snapshot
-        .processes
-        .iter()
-        .any(|process| process.metric_values != ResourceMetricValueState::Unavailable)
-    {
-        ResourceMetricValueState::LastKnown
-    } else {
-        ResourceMetricValueState::Unavailable
-    };
+    snapshot.cpu_value_state = last_known_metric_state(snapshot.cpu_value_state);
+    snapshot.memory_value_state = last_known_metric_state(snapshot.memory_value_state);
+    snapshot.metric_values =
+        combined_metric_state(snapshot.cpu_value_state, snapshot.memory_value_state);
     snapshot.metrics_stale = true;
-    snapshot.metrics_error = Some(format!(
-        "job-members unavailable: {}",
-        bounded_diagnostic(job_error.unwrap_or("query failed"))
-    ));
+    snapshot.metrics_error = Some(fixed_job_failure_code(job_error).to_string());
     snapshot.last_sample_at = Some(ctx.sampled_at);
     snapshot
+}
+
+fn bounded_previous_snapshot(
+    previous: &ResourceSnapshot,
+    budget: &mut SamplingBudget,
+) -> ResourceSnapshot {
+    let mut process_ids = Vec::with_capacity(
+        previous
+            .process_ids
+            .len()
+            .min(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK),
+    );
+    for pid in previous
+        .process_ids
+        .iter()
+        .copied()
+        .take(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK)
+    {
+        if budget.work_counters().cached_process_ids >= budget.max_members()
+            || budget.checkpoint().is_err()
+        {
+            break;
+        }
+        budget.note_cached_process_id();
+        process_ids.push(pid);
+    }
+    let mut processes = Vec::with_capacity(
+        previous
+            .processes
+            .len()
+            .min(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK),
+    );
+    for process in previous
+        .processes
+        .iter()
+        .take(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK)
+    {
+        if budget.work_counters().cached_process_rows >= budget.max_members()
+            || budget.checkpoint().is_err()
+        {
+            break;
+        }
+        budget.note_cached_process_row();
+        processes.push(process.clone());
+    }
+    ResourceSnapshot {
+        cpu_percent: previous.cpu_percent,
+        core_equivalent_percent: previous.core_equivalent_percent,
+        memory_bytes: previous.memory_bytes,
+        memory_metric: previous.memory_metric,
+        process_count: previous
+            .process_count
+            .min(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK as u32),
+        process_ids,
+        metrics_unavailable: previous.metrics_unavailable,
+        metrics_status: previous.metrics_status,
+        metric_values: previous.metric_values,
+        cpu_value_state: previous.cpu_value_state,
+        memory_value_state: previous.memory_value_state,
+        metrics_stale: previous.metrics_stale,
+        // Diagnostics are reconstructed from fixed codes at the current
+        // projection boundary; never clone arbitrary prior text.
+        metrics_error: None,
+        sampling_generation: previous.sampling_generation,
+        io_read_bytes: previous.io_read_bytes,
+        io_write_bytes: previous.io_write_bytes,
+        processes,
+        logical_cpu_count: previous.logical_cpu_count.max(1),
+        last_sample_at: previous.last_sample_at,
+    }
 }
 
 fn observe_job_members_with_budget(
@@ -4332,13 +4298,15 @@ fn observe_job_members_with_budget(
     let mut observations = Vec::with_capacity(job_members.len().min(budget.max_members()));
     for member in job_members.iter().take(budget.max_members()) {
         budget.checkpoint()?;
+        budget.note_metric_observation();
         observations.push(job_member_to_process_observation(member));
+        budget.checkpoint()?;
     }
     Ok(observations)
 }
 
 fn budget_failed_resource_snapshot(
-    resource_id: &str,
+    _resource_id: &str,
     job_members: &[JobMemberObservation],
     ctx: ResourceSampleContext,
     error: SamplerError,
@@ -4354,12 +4322,10 @@ fn budget_failed_resource_snapshot(
         metrics_unavailable: true,
         metrics_status: ProcessMetricStatus::Failed,
         metric_values: ResourceMetricValueState::Unavailable,
+        cpu_value_state: ResourceMetricValueState::Unavailable,
+        memory_value_state: ResourceMetricValueState::Unavailable,
         metrics_stale: false,
-        metrics_error: Some(format!(
-            "resource {}: {}",
-            opaque_resource_id(resource_id),
-            bounded_sampler_error(&error),
-        )),
+        metrics_error: Some(fixed_sampler_error_code(&error).to_string()),
         logical_cpu_count: ctx.logical_cpu_count.max(1),
         last_sample_at: Some(ctx.sampled_at),
         ..ResourceSnapshot::default()
@@ -4398,111 +4364,14 @@ fn process_lifecycle_from_status(status: SessionStatus) -> ProcessResourceLifecy
     }
 }
 
-fn ledger_compatible_with_runtime(
-    system: &sysinfo::System,
-    entry: &pid_file::ManagedProcessRecord,
-    runtime_pid: u32,
-) -> bool {
-    if entry.pid == runtime_pid {
-        // Allow the sampler to see a reused/dead ledger root so it can omit that
-        // PID while still retaining verified detached descendants.
-        return true;
-    }
-    entry.descendant_processes.iter().any(|descendant| {
-        descendant.pid == runtime_pid
-            && platform_service::process_matches_identity_with_system(
-                system,
-                descendant.pid,
-                descendant.started_at_unix_secs,
-                descendant.process_name.as_deref(),
-            )
-    })
-}
-
-fn collect_ancestry_pids(
-    system: &sysinfo::System,
-    root_pid: u32,
-    budget: &SamplingBudget,
-) -> Vec<u32> {
-    if budget.checkpoint().is_err() {
-        return Vec::new();
-    }
-    let root = sysinfo::Pid::from_u32(root_pid);
-    if system.process(root).is_none() {
-        return vec![root_pid];
-    }
-    collect_process_tree_ids_bounded(system, root, budget.max_members(), budget)
-        .into_iter()
-        .map(|pid| pid.as_u32())
-        .collect()
-}
-
-fn collect_process_tree_ids_bounded(
-    system: &sysinfo::System,
-    root_pid: sysinfo::Pid,
-    max_members: usize,
-    budget: &SamplingBudget,
-) -> Vec<sysinfo::Pid> {
-    let max_members = max_members.max(1);
-    let mut process_ids = vec![root_pid];
-    let mut cursor = 0;
-
-    while cursor < process_ids.len()
-        && process_ids.len() < max_members
-        && budget.checkpoint().is_ok()
-    {
-        let parent_pid = process_ids[cursor];
-        cursor += 1;
-
-        for (candidate_pid, process) in system.processes() {
-            if budget.checkpoint().is_err() {
-                break;
-            }
-            if process.parent() == Some(parent_pid) && !process_ids.contains(candidate_pid) {
-                process_ids.push(*candidate_pid);
-                if process_ids.len() >= max_members {
-                    break;
-                }
-            }
-        }
-    }
-    process_ids
-}
-
-fn verified_ledger_descendant_pids(
-    system: &sysinfo::System,
-    entry: &pid_file::ManagedProcessRecord,
-    budget: &SamplingBudget,
-) -> Vec<u32> {
-    entry
-        .descendant_processes
-        .iter()
-        .take(budget.max_members())
-        .filter(|identity| {
-            if budget.checkpoint().is_err() {
-                return false;
-            }
-            platform_service::process_matches_identity_with_system(
-                system,
-                identity.pid,
-                identity.started_at_unix_secs,
-                identity.process_name.as_deref(),
-            )
-        })
-        .map(|identity| identity.pid)
-        .collect()
-}
-
-fn refresh_command_metadata_for_pids(
+fn capture_process_metadata(
     system: &mut sysinfo::System,
-    process_ids: &[u32],
-    budget: &SamplingBudget,
-) {
-    if process_ids.is_empty() {
-        return;
-    }
-    if budget.checkpoint().is_err() {
-        return;
+    process_ids: &BTreeSet<u32>,
+    budget: &mut SamplingBudget,
+) -> HashMap<u32, ProcessProjectionMetadata> {
+    budget.note_metadata_snapshot();
+    if process_ids.is_empty() || budget.checkpoint().is_err() {
+        return HashMap::new();
     }
     let pids: Vec<sysinfo::Pid> = process_ids
         .iter()
@@ -4513,16 +4382,59 @@ fn refresh_command_metadata_for_pids(
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&pids),
         true,
-        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
     );
+    if budget.checkpoint().is_err() {
+        return HashMap::new();
+    }
+
+    let mut metadata = HashMap::with_capacity(pids.len());
+    for pid in process_ids.iter().copied().take(budget.max_members()) {
+        if budget.checkpoint().is_err() {
+            break;
+        }
+        budget.note_metadata_row();
+        let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) else {
+            continue;
+        };
+        let os_name = process.name().to_string_lossy();
+        let (command, command_arg_count, command_arg_bytes) = bounded_command_shape(process);
+        let command_label = classify_process_display_name(&os_name, &command);
+        let blocking_external_editor = matches!(
+            normalize_process_name_for_detection(&os_name).as_str(),
+            "code"
+                | "code-insiders"
+                | "cursor"
+                | "windsurf"
+                | "notepad"
+                | "notepad++"
+                | "sublime_text"
+                | "devenv"
+                | "gvim"
+                | "nvim-qt"
+        );
+        metadata.insert(
+            pid,
+            ProcessProjectionMetadata {
+                parent_pid: process.parent().map(|parent| parent.as_u32()),
+                display_name: command_label.clone(),
+                command_label,
+                command_arg_count,
+                command_arg_bytes,
+                blocking_external_editor,
+            },
+        );
+    }
+    metadata
 }
 
 fn build_resource_snapshot(
-    system: &sysinfo::System,
+    metadata: &HashMap<u32, ProcessProjectionMetadata>,
     resource_id: &str,
     owned_pids: &[u32],
     logical_cpu_count: u32,
     sampled_at: Instant,
+    authoritative_job_members: &[JobMemberObservation],
     member_observations: &[ProcessMemberObservation],
     sampler: &mut ProcessSampler,
     ctx: ResourceSampleContext,
@@ -4534,7 +4446,9 @@ fn build_resource_snapshot(
             metrics_unavailable: true,
             metrics_status: ProcessMetricStatus::Failed,
             metric_values: ResourceMetricValueState::Unavailable,
-            metrics_error: Some("resource projection budget exhausted".to_string()),
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
+            metrics_error: Some("sampling_deadline_exceeded".to_string()),
             last_sample_at: Some(sampled_at),
             ..ResourceSnapshot::default()
         };
@@ -4549,11 +4463,12 @@ fn build_resource_snapshot(
     let accounting_error = accounting_result
         .as_ref()
         .err()
-        .map(|error| bounded_sampler_error(error));
+        .map(fixed_sampler_error_code)
+        .map(str::to_string);
     let accounting_diagnostic = accounting
         .as_ref()
         .and_then(|snapshot| snapshot.error.as_deref())
-        .map(bounded_diagnostic);
+        .map(|_| "member_metrics_partial".to_string());
     let member_by_pid: HashMap<u32, &ProcessAccountingMemberSnapshot> = accounting
         .as_ref()
         .map(|snapshot| {
@@ -4564,29 +4479,49 @@ fn build_resource_snapshot(
                 .collect()
         })
         .unwrap_or_default();
+    let job_member_by_pid: HashMap<u32, &JobMemberObservation> = authoritative_job_members
+        .iter()
+        .map(|member| {
+            let pid = match member {
+                JobMemberObservation::Accessible { identity } => identity.id().pid(),
+                JobMemberObservation::Inaccessible { pid, .. } => *pid,
+            };
+            (pid, member)
+        })
+        .collect();
     let mut processes = Vec::with_capacity(owned_pids.len().min(budget.max_members()));
 
     for pid in owned_pids.iter().take(budget.max_members()) {
-        if budget.checkpoint().is_err() {
+        if budget.work_counters().projected_rows >= budget.max_members()
+            || budget.checkpoint().is_err()
+        {
             break;
         }
-        let process = system.process(sysinfo::Pid::from_u32(*pid));
+        budget.note_projected_row();
+        let metadata = metadata.get(pid);
         let member = member_by_pid.get(pid).copied();
+        let job_member = job_member_by_pid.get(pid).copied();
         let process_cpu = member
             .and_then(|member| member.machine_cpu_percent)
             .unwrap_or(0.0) as f32;
         let process_memory = member
             .and_then(|member| member.private_memory_bytes)
             .unwrap_or(0);
-        let os_name = process
-            .and_then(|_| {
-                platform_service::process_identity_with_system(system, *pid)
-                    .and_then(|identity| identity.process_name)
+        let name = metadata
+            .map(|metadata| metadata.display_name.clone())
+            .or_else(|| match job_member {
+                Some(JobMemberObservation::Accessible { identity }) => {
+                    Some(allowlisted_process_label(
+                        identity
+                            .canonical_executable()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown"),
+                    ))
+                }
+                _ => None,
             })
-            .unwrap_or_else(|| "unknown".to_string());
-        let (cmd, command_arg_count, command_arg_bytes) =
-            process.map(bounded_command_shape).unwrap_or_default();
-        let name = classify_process_display_name(&os_name, &cmd);
+            .unwrap_or_else(|| "Other process".to_string());
         let name = if member.is_some_and(|member| member.metrics_unavailable) {
             format!("{name} (metrics unavailable)")
         } else {
@@ -4611,10 +4546,44 @@ fn build_resource_snapshot(
                     }
                     _ => None,
                 })
+            })
+            .or_else(|| match job_member {
+                Some(JobMemberObservation::Accessible { identity }) => {
+                    redacted_executable_basename(identity.canonical_executable())
+                }
+                _ => None,
             });
+        let creation_time_100ns = member
+            .and_then(|member| member.creation_time_100ns)
+            .or_else(|| match job_member {
+                Some(JobMemberObservation::Accessible { identity }) => {
+                    Some(identity.id().creation_time_100ns())
+                }
+                Some(JobMemberObservation::Inaccessible {
+                    creation_time_100ns,
+                    ..
+                }) => *creation_time_100ns,
+                None => None,
+            });
+        let cpu_value_state = if member
+            .and_then(|member| member.machine_cpu_percent)
+            .is_some()
+        {
+            ResourceMetricValueState::Observed
+        } else {
+            ResourceMetricValueState::Unavailable
+        };
+        let memory_value_state = if member
+            .and_then(|member| member.private_memory_bytes)
+            .is_some()
+        {
+            ResourceMetricValueState::Observed
+        } else {
+            ResourceMetricValueState::Unavailable
+        };
         processes.push(crate::state::ProcessResourceNode {
             pid: *pid,
-            parent_pid: process.and_then(|process| process.parent().map(|parent| parent.as_u32())),
+            parent_pid: metadata.and_then(|metadata| metadata.parent_pid),
             name,
             cpu_percent: process_cpu,
             core_equivalent_percent: member
@@ -4622,36 +4591,31 @@ fn build_resource_snapshot(
                 .unwrap_or(0.0) as f32,
             memory_bytes: process_memory,
             memory_metric: resource_memory_metric(),
-            creation_time_100ns: member.and_then(|member| member.creation_time_100ns),
+            creation_time_100ns,
             executable: exact_executable,
-            command_label: Some(classify_process_display_name(
-                process
-                    .and_then(|_| {
-                        platform_service::process_identity_with_system(system, *pid)
-                            .and_then(|identity| identity.process_name)
-                    })
-                    .as_deref()
-                    .unwrap_or("unknown"),
-                &cmd,
-            )),
-            command_arg_count,
-            command_arg_bytes,
+            command_label: Some(
+                metadata
+                    .map(|metadata| metadata.command_label.clone())
+                    .unwrap_or_else(|| "Other process".to_string()),
+            ),
+            command_arg_count: metadata
+                .map(|metadata| metadata.command_arg_count)
+                .unwrap_or_default(),
+            command_arg_bytes: metadata
+                .map(|metadata| metadata.command_arg_bytes)
+                .unwrap_or_default(),
             resource_id: Some(opaque_resource_id(resource_id)),
             resource_kind: Some(resource_kind_label(ctx.resource_kind).to_string()),
             child_count: 0,
-            lifecycle: process_resource_lifecycle(
-                system,
-                *pid,
-                ctx.lifecycle,
-                member,
-                accounting_error.is_some(),
-            ),
+            lifecycle: process_resource_lifecycle(ctx.lifecycle, job_member),
             metrics_status,
-            metric_values: if member.is_some_and(|member| !member.metrics_unavailable) {
-                ResourceMetricValueState::Observed
-            } else {
-                ResourceMetricValueState::Unavailable
-            },
+            metric_values: combined_metric_state(cpu_value_state, memory_value_state),
+            cpu_value_state,
+            memory_value_state,
+            sampling_generation: member
+                .map(|member| member.generation)
+                .or_else(|| accounting.as_ref().map(|snapshot| snapshot.generation))
+                .unwrap_or_default(),
         });
     }
 
@@ -4690,6 +4654,22 @@ fn build_resource_snapshot(
             )
         })
         .unwrap_or((0.0, 0.0, 0, process_ids.len() as u32));
+    let cpu_value_state = accounting
+        .as_deref()
+        .map(|snapshot| {
+            current_metric_state(&snapshot.members, |member| {
+                member.machine_cpu_percent.is_some()
+            })
+        })
+        .unwrap_or(ResourceMetricValueState::Unavailable);
+    let memory_value_state = accounting
+        .as_deref()
+        .map(|snapshot| {
+            current_metric_state(&snapshot.members, |member| {
+                member.private_memory_bytes.is_some()
+            })
+        })
+        .unwrap_or(ResourceMetricValueState::Unavailable);
 
     ResourceSnapshot {
         cpu_percent: cpu_percent.clamp(0.0, 100.0),
@@ -4712,11 +4692,9 @@ fn build_resource_snapshot(
                     .map(|_| ProcessMetricStatus::Failed)
             })
             .unwrap_or(ProcessMetricStatus::Unknown),
-        metric_values: accounting
-            .as_ref()
-            .filter(|snapshot| snapshot.status == ProcessMetricStatus::Complete)
-            .map(|_| ResourceMetricValueState::Observed)
-            .unwrap_or(ResourceMetricValueState::Unavailable),
+        metric_values: combined_metric_state(cpu_value_state, memory_value_state),
+        cpu_value_state,
+        memory_value_state,
         metrics_stale: false,
         metrics_error: accounting_error.or(accounting_diagnostic),
         sampling_generation: accounting
@@ -4734,30 +4712,77 @@ fn build_resource_snapshot(
     }
 }
 
-fn bounded_sampler_error(error: &SamplerError) -> String {
-    bounded_diagnostic(&error.to_string())
+fn current_metric_state(
+    members: &[ProcessAccountingMemberSnapshot],
+    is_observed: impl Fn(&ProcessAccountingMemberSnapshot) -> bool,
+) -> ResourceMetricValueState {
+    if members.is_empty() {
+        return ResourceMetricValueState::Observed;
+    }
+    let observed = members.iter().filter(|member| is_observed(member)).count();
+    match observed {
+        0 => ResourceMetricValueState::Unavailable,
+        count if count == members.len() => ResourceMetricValueState::Observed,
+        _ => ResourceMetricValueState::Partial,
+    }
 }
 
-const MAX_DIAGNOSTIC_BYTES: usize = 160;
-
-/// Keep diagnostics useful without leaking canonical paths, raw command
-/// arguments, or arbitrary session-provided text into a remote projection.
-fn bounded_diagnostic(text: &str) -> String {
-    let mut output = String::with_capacity(text.len().min(MAX_DIAGNOSTIC_BYTES));
-    for character in text.chars() {
-        if output.len() >= MAX_DIAGNOSTIC_BYTES {
-            break;
+fn combined_metric_state(
+    cpu: ResourceMetricValueState,
+    memory: ResourceMetricValueState,
+) -> ResourceMetricValueState {
+    match (cpu, memory) {
+        (ResourceMetricValueState::Unavailable, ResourceMetricValueState::Unavailable) => {
+            ResourceMetricValueState::Unavailable
         }
-        output.push(
-            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | ':' | '.')
-            {
-                character
-            } else {
-                '_'
-            },
-        );
+        (ResourceMetricValueState::LastKnown, ResourceMetricValueState::LastKnown) => {
+            ResourceMetricValueState::LastKnown
+        }
+        (ResourceMetricValueState::Observed, ResourceMetricValueState::Observed) => {
+            ResourceMetricValueState::Observed
+        }
+        _ => ResourceMetricValueState::Partial,
     }
-    output
+}
+
+fn last_known_metric_state(state: ResourceMetricValueState) -> ResourceMetricValueState {
+    match state {
+        ResourceMetricValueState::Observed
+        | ResourceMetricValueState::Partial
+        | ResourceMetricValueState::LastKnown => ResourceMetricValueState::LastKnown,
+        ResourceMetricValueState::Unavailable => ResourceMetricValueState::Unavailable,
+    }
+}
+
+fn fixed_sampler_error_code(error: &SamplerError) -> &'static str {
+    match error {
+        SamplerError::InvalidLogicalProcessorCount => "sampler_invalid_cpu_count",
+        SamplerError::InvalidInterval => "sampler_invalid_interval",
+        SamplerError::CounterReset { .. } => "sampler_counter_reset",
+        SamplerError::ConflictingProcessIdentity { .. } => "sampler_identity_conflict",
+        SamplerError::WorkBudgetExceeded { .. } => "sampling_deadline_or_member_limit",
+        SamplerError::ObservationFailed { .. } => "sampler_observation_failed",
+    }
+}
+
+fn job_query_diagnostic_code(error: &str) -> &'static str {
+    if error.contains("budget") || error.contains("exceeds") {
+        "sampling_deadline_or_member_limit"
+    } else {
+        "job_query_unavailable"
+    }
+}
+
+fn fixed_job_failure_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some("job_authority_unavailable") => "job_authority_unavailable",
+        Some("sampling_deadline_or_member_limit") => "sampling_deadline_or_member_limit",
+        Some("sampling_deadline_exceeded") => "sampling_deadline_exceeded",
+        Some("job_query_unavailable") | None => "job_query_unavailable",
+        // All upstream errors are normalized before projection. An unknown
+        // value can only be internal drift and must not cross the boundary.
+        Some(_) => "job_query_unavailable",
+    }
 }
 
 const MAX_COMMAND_ARGUMENTS: usize = 64;
@@ -4818,19 +4843,16 @@ fn opaque_resource_id(resource_id: &str) -> String {
 }
 
 fn process_resource_lifecycle(
-    system: &sysinfo::System,
-    pid: u32,
     session_lifecycle: ProcessResourceLifecycle,
-    member: Option<&ProcessAccountingMemberSnapshot>,
-    accounting_failed: bool,
+    authoritative_member: Option<&JobMemberObservation>,
 ) -> ProcessResourceLifecycle {
-    if system.process(sysinfo::Pid::from_u32(pid)).is_none() {
-        return ProcessResourceLifecycle::Stopped;
+    match authoritative_member {
+        // Metric availability is independent from lifecycle. An exact current
+        // Job member keeps the owning session's Starting/Running/Stopping
+        // state through first-baseline, counter-reset, and metadata gaps.
+        Some(JobMemberObservation::Accessible { .. }) => session_lifecycle,
+        Some(JobMemberObservation::Inaccessible { .. }) | None => ProcessResourceLifecycle::Unknown,
     }
-    if accounting_failed || member.is_some_and(|member| member.metrics_unavailable) {
-        return ProcessResourceLifecycle::Unknown;
-    }
-    session_lifecycle
 }
 
 fn resource_kind_label(kind: SessionKind) -> &'static str {
@@ -4876,21 +4898,6 @@ fn unique_job_member_pids(job_members: &[JobMemberObservation]) -> Vec<u32> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn select_owned_process_ids(
-    job_members: Option<&[JobMemberObservation]>,
-    _root_pid: Option<u32>,
-    _ancestry_pids: &[u32],
-    _ledger_pids: &[u32],
-) -> Vec<u32> {
-    match job_members {
-        Some(job_members) => unique_job_member_pids(job_members),
-        // Ancestry and the legacy ledger are attribution hints only. They do
-        // not grant process ownership when the authoritative Job query is
-        // unavailable.
-        None => Vec::new(),
-    }
 }
 
 fn job_member_to_process_observation(member: &JobMemberObservation) -> ProcessMemberObservation {
@@ -4982,30 +4989,6 @@ fn allowlisted_process_label(process_name: &str) -> String {
         "devmanager" => "DevManager".to_string(),
         _ => "Other process".to_string(),
     }
-}
-
-fn is_blocking_external_editor(descendants: &[platform_service::ProcessIdentity]) -> bool {
-    descendants.iter().any(|identity| {
-        identity
-            .process_name
-            .as_deref()
-            .map(normalize_process_name_for_detection)
-            .is_some_and(|name| {
-                matches!(
-                    name.as_str(),
-                    "code"
-                        | "code-insiders"
-                        | "cursor"
-                        | "windsurf"
-                        | "notepad"
-                        | "notepad++"
-                        | "sublime_text"
-                        | "devenv"
-                        | "gvim"
-                        | "nvim-qt"
-                )
-            })
-    })
 }
 
 fn normalize_process_name_for_detection(name: &str) -> String {
@@ -10732,30 +10715,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_blocking_external_editor_children() {
-        let descendants = vec![
-            platform_service::ProcessIdentity {
-                pid: 11,
-                started_at_unix_secs: 1,
-                process_name: Some("node.exe".to_string()),
-            },
-            platform_service::ProcessIdentity {
-                pid: 12,
-                started_at_unix_secs: 1,
-                process_name: Some("Code.exe".to_string()),
-            },
-        ];
-        assert!(is_blocking_external_editor(&descendants));
-
-        let non_editor_descendants = vec![platform_service::ProcessIdentity {
-            pid: 21,
-            started_at_unix_secs: 1,
-            process_name: Some("node.exe".to_string()),
-        }];
-        assert!(!is_blocking_external_editor(&non_editor_descendants));
-    }
-
-    #[test]
     fn reaper_targets_tracked_descendant_when_root_is_gone() {
         let cwd = temp_test_dir("reaper-dead-root-descendant");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
@@ -11287,6 +11246,9 @@ mod tests {
                     lifecycle: crate::state::ProcessResourceLifecycle::Failed,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
                     metric_values: ResourceMetricValueState::Unavailable,
+                    cpu_value_state: ResourceMetricValueState::Unavailable,
+                    memory_value_state: ResourceMetricValueState::Unavailable,
+                    sampling_generation: 0,
                 }],
                 ..Default::default()
             };
@@ -11465,6 +11427,9 @@ mod tests {
                     lifecycle: crate::state::ProcessResourceLifecycle::Running,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                     metric_values: ResourceMetricValueState::Observed,
+                    cpu_value_state: ResourceMetricValueState::Observed,
+                    memory_value_state: ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
                 crate::state::ProcessResourceNode {
                     pid: 2,
@@ -11485,6 +11450,9 @@ mod tests {
                     lifecycle: crate::state::ProcessResourceLifecycle::Running,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                     metric_values: ResourceMetricValueState::Observed,
+                    cpu_value_state: ResourceMetricValueState::Observed,
+                    memory_value_state: ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
             ],
             last_sample_at: Some(Instant::now()),
@@ -11495,66 +11463,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_job_observation_forbids_legacy_ancestry_fallback() {
-        let process_ids = select_owned_process_ids(Some(&[]), Some(10), &[10, 11], &[12]);
-
-        assert!(process_ids.is_empty());
-    }
-
-    #[test]
-    fn unavailable_job_observation_does_not_turn_ancestry_into_ownership() {
-        let process_ids = select_owned_process_ids(None, Some(10), &[10, 11], &[12]);
-
-        assert!(process_ids.is_empty());
-    }
-
-    #[test]
-    fn ledger_compatibility_requires_a_verified_runtime_identity() {
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let runtime_identity =
-            platform_service::process_identity_with_system(&system, std::process::id())
-                .expect("test process identity");
-        let mut entry = pid_file::ManagedProcessRecord {
-            session_id: "session-1".to_string(),
-            pid: u32::MAX,
-            started_at_unix_secs: 100,
-            process_name: Some("old-shell".to_string()),
-            session_kind: "shell".to_string(),
-            program: "old-shell".to_string(),
-            project_id: None,
-            command_id: None,
-            tab_id: None,
-            descendant_processes: Vec::new(),
-        };
-
-        assert!(!ledger_compatible_with_runtime(
-            &system,
-            &entry,
-            runtime_identity.pid
-        ));
-
-        entry.descendant_processes = vec![pid_file::TrackedProcessIdentity {
-            pid: runtime_identity.pid,
-            started_at_unix_secs: runtime_identity.started_at_unix_secs,
-            process_name: runtime_identity.process_name.clone(),
-        }];
-        assert!(ledger_compatible_with_runtime(
-            &system,
-            &entry,
-            runtime_identity.pid
-        ));
-
-        entry.descendant_processes[0].started_at_unix_secs =
-            runtime_identity.started_at_unix_secs.saturating_add(1);
-        assert!(!ledger_compatible_with_runtime(
-            &system,
-            &entry,
-            runtime_identity.pid
-        ));
-    }
-
-    #[test]
     fn logical_cpu_count_uses_the_platform_machine_count() {
         let logical_cpu_count = resolve_logical_cpu_count();
 
@@ -11562,6 +11470,11 @@ mod tests {
             logical_cpu_count,
             platform_service::logical_processor_count()
         );
+    }
+
+    #[test]
+    fn production_accounting_tick_expires_after_forty_milliseconds() {
+        assert_eq!(RESOURCE_SAMPLE_TICK_BUDGET, Duration::from_millis(40));
     }
 
     #[test]
@@ -11649,10 +11562,16 @@ mod tests {
                 lifecycle: ProcessResourceLifecycle::Running,
                 metrics_status: ProcessMetricStatus::Complete,
                 metric_values: ResourceMetricValueState::Observed,
+                cpu_value_state: ResourceMetricValueState::Observed,
+                memory_value_state: ResourceMetricValueState::Observed,
+                sampling_generation: 7,
             }],
             metric_values: ResourceMetricValueState::Observed,
+            cpu_value_state: ResourceMetricValueState::Observed,
+            memory_value_state: ResourceMetricValueState::Observed,
             ..ResourceSnapshot::default()
         };
+        let mut budget = SamplingBudget::from_now(512, Duration::from_secs(1));
         let stale = stale_resource_snapshot(
             &system,
             "private-session-id",
@@ -11665,6 +11584,7 @@ mod tests {
                 lifecycle: ProcessResourceLifecycle::Running,
             },
             Some(r"QueryInformationJobObject failed: C:\secret\token"),
+            &mut budget,
         );
 
         assert!(stale.metrics_stale);
@@ -11675,14 +11595,21 @@ mod tests {
             ResourceMetricValueState::LastKnown
         );
         assert_eq!(
+            stale.processes[0].cpu_value_state,
+            ResourceMetricValueState::LastKnown
+        );
+        assert_eq!(
+            stale.processes[0].memory_value_state,
+            ResourceMetricValueState::LastKnown
+        );
+        assert_eq!(
             stale.processes[0].lifecycle,
             ProcessResourceLifecycle::Unknown
         );
-        assert!(stale.metrics_error.as_deref().is_some_and(|error| {
-            error.contains("job-members unavailable")
-                && !error.contains("C:\\secret")
-                && error.len() <= MAX_DIAGNOSTIC_BYTES + 24
-        }));
+        assert_eq!(
+            stale.metrics_error.as_deref(),
+            Some("job_query_unavailable")
+        );
         assert_eq!(stale.processes[0].executable.as_deref(), Some("node.exe"));
         assert_eq!(
             stale.processes[0].name,
@@ -11695,51 +11622,106 @@ mod tests {
     }
 
     #[test]
+    fn stale_aggregate_confidence_comes_from_the_prior_aggregate_not_rows() {
+        let prior = ResourceSnapshot {
+            cpu_percent: 7.5,
+            memory_bytes: 2_048,
+            processes: Vec::new(),
+            cpu_value_state: ResourceMetricValueState::Partial,
+            memory_value_state: ResourceMetricValueState::Partial,
+            metric_values: ResourceMetricValueState::Partial,
+            ..ResourceSnapshot::default()
+        };
+        let mut budget = SamplingBudget::from_now(512, Duration::from_secs(1));
+        let stale = stale_resource_snapshot(
+            &sysinfo::System::new(),
+            "session-with-aggregate-only",
+            Some(&prior),
+            ResourceSampleContext {
+                is_ai_session: false,
+                logical_cpu_count: 8,
+                sampled_at: Instant::now(),
+                resource_kind: SessionKind::Shell,
+                lifecycle: ProcessResourceLifecycle::Running,
+            },
+            Some("C:\\secret\\must-not-escape"),
+            &mut budget,
+        );
+
+        assert_eq!(stale.cpu_value_state, ResourceMetricValueState::LastKnown);
+        assert_eq!(
+            stale.memory_value_state,
+            ResourceMetricValueState::LastKnown
+        );
+        assert_eq!(stale.metric_values, ResourceMetricValueState::LastKnown);
+        assert_eq!(
+            stale.metrics_error.as_deref(),
+            Some("job_query_unavailable")
+        );
+    }
+
+    #[test]
+    fn cached_snapshot_copy_is_bounded_before_materialization() {
+        let prior = ResourceSnapshot {
+            process_count: 16_384,
+            process_ids: (1..=16_384).collect(),
+            ..ResourceSnapshot::default()
+        };
+        let mut budget = SamplingBudget::from_now(512, Duration::from_secs(1));
+
+        let bounded = bounded_previous_snapshot(&prior, &mut budget);
+
+        assert_eq!(bounded.process_ids.len(), 512);
+        assert_eq!(bounded.process_count, 512);
+        assert_eq!(budget.work_counters().cached_process_ids, 512);
+        assert_eq!(budget.work_counters().cached_process_rows, 0);
+    }
+
+    #[test]
+    fn expired_budget_does_not_copy_cached_process_vectors() {
+        let prior = ResourceSnapshot {
+            process_count: 2,
+            process_ids: vec![1, 2],
+            ..ResourceSnapshot::default()
+        };
+        let mut budget = SamplingBudget::new(Instant::now(), 512);
+
+        let bounded = bounded_previous_snapshot(&prior, &mut budget);
+
+        assert!(bounded.process_ids.is_empty());
+        assert!(bounded.processes.is_empty());
+        assert_eq!(budget.work_counters().cached_process_ids, 0);
+    }
+
+    #[test]
     fn inaccessible_or_vanished_members_have_truthful_lifecycle() {
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let inaccessible = ProcessAccountingMemberSnapshot {
+        let inaccessible = JobMemberObservation::Inaccessible {
             pid: std::process::id(),
             creation_time_100ns: None,
-            machine_cpu_percent: None,
-            core_equivalent_percent: None,
-            private_memory_bytes: None,
-            io_read_bytes: None,
-            io_write_bytes: None,
-            metrics_unavailable: true,
-            status: ProcessMetricStatus::Partial,
-            executable: None,
-            generation: 1,
+            reason: "access_denied".to_string(),
         };
         assert_eq!(
-            process_resource_lifecycle(
-                &system,
-                inaccessible.pid,
-                ProcessResourceLifecycle::Running,
-                Some(&inaccessible),
-                false,
-            ),
+            process_resource_lifecycle(ProcessResourceLifecycle::Running, Some(&inaccessible),),
             ProcessResourceLifecycle::Unknown
         );
+
+        let exact_identity = ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(std::process::id(), 1)
+                .expect("test process id"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("canonical test executable");
+        let accessible = JobMemberObservation::Accessible {
+            identity: exact_identity,
+        };
         assert_eq!(
-            process_resource_lifecycle(
-                &system,
-                std::process::id(),
-                ProcessResourceLifecycle::Running,
-                None,
-                true,
-            ),
-            ProcessResourceLifecycle::Unknown
+            process_resource_lifecycle(ProcessResourceLifecycle::Running, Some(&accessible),),
+            ProcessResourceLifecycle::Running,
+            "an exact current Job member retains session lifecycle even before a CPU baseline"
         );
         assert_eq!(
-            process_resource_lifecycle(
-                &system,
-                u32::MAX,
-                ProcessResourceLifecycle::Running,
-                None,
-                false,
-            ),
-            ProcessResourceLifecycle::Stopped
+            process_resource_lifecycle(ProcessResourceLifecycle::Running, None,),
+            ProcessResourceLifecycle::Unknown
         );
     }
 

@@ -171,6 +171,14 @@ pub struct ProcessResourceNode {
     pub metrics_status: ProcessMetricStatus,
     #[serde(default)]
     pub metric_values: ResourceMetricValueState,
+    #[serde(default)]
+    pub cpu_value_state: ResourceMetricValueState,
+    #[serde(default)]
+    pub memory_value_state: ResourceMetricValueState,
+    /// Monotonic sampler generation for the exact PID/creation/executable
+    /// observation represented by this row.
+    #[serde(default)]
+    pub sampling_generation: u64,
 }
 
 /// Describes whether the numeric fields in a resource projection are current
@@ -180,6 +188,9 @@ pub struct ProcessResourceNode {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceMetricValueState {
     Observed,
+    /// A current aggregate derived from the accessible subset while one or
+    /// more authoritative members could not provide this metric.
+    Partial,
     LastKnown,
     #[default]
     Unavailable,
@@ -203,6 +214,77 @@ impl ResourceMemoryMetric {
             Self::PrivateCommitted => "private committed",
             Self::PrivateResident => "private resident",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceMemoryTotal {
+    pub bytes: u64,
+    pub metric: ResourceMemoryMetric,
+    pub value_state: ResourceMetricValueState,
+}
+
+/// Aggregate memory without presenting cached or unavailable values as a
+/// current total. Current Observed/Partial values are summed together; stale
+/// values are used only when every available value is LastKnown.
+pub fn aggregate_memory_snapshots<'a>(
+    snapshots: impl IntoIterator<Item = &'a ResourceSnapshot>,
+) -> ResourceMemoryTotal {
+    let mut metric = None;
+    let mut current_bytes = 0u64;
+    let mut last_known_bytes = 0u64;
+    let mut saw_current = false;
+    let mut saw_last_known = false;
+    let mut degraded_current_total = false;
+
+    for snapshot in snapshots {
+        match metric {
+            Some(existing) if existing != snapshot.memory_metric => {
+                degraded_current_total = true;
+            }
+            None => metric = Some(snapshot.memory_metric),
+            _ => {}
+        }
+        match snapshot.memory_value_state {
+            ResourceMetricValueState::Observed => {
+                saw_current = true;
+                current_bytes = current_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::Partial => {
+                saw_current = true;
+                degraded_current_total = true;
+                current_bytes = current_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::LastKnown => {
+                saw_last_known = true;
+                degraded_current_total = true;
+                last_known_bytes = last_known_bytes.saturating_add(snapshot.memory_bytes);
+            }
+            ResourceMetricValueState::Unavailable => {
+                degraded_current_total = true;
+            }
+        }
+    }
+
+    let (bytes, value_state) = if saw_current {
+        (
+            current_bytes,
+            if degraded_current_total {
+                ResourceMetricValueState::Partial
+            } else {
+                ResourceMetricValueState::Observed
+            },
+        )
+    } else if saw_last_known {
+        (last_known_bytes, ResourceMetricValueState::LastKnown)
+    } else {
+        (0, ResourceMetricValueState::Unavailable)
+    };
+
+    ResourceMemoryTotal {
+        bytes,
+        metric: metric.unwrap_or_else(default_memory_metric),
+        value_state,
     }
 }
 
@@ -272,6 +354,14 @@ pub struct ResourceSnapshot {
     pub metrics_status: ProcessMetricStatus,
     #[serde(default)]
     pub metric_values: ResourceMetricValueState,
+    /// Confidence for `cpu_percent` and `core_equivalent_percent`. This is
+    /// separate from memory because a first CPU baseline can be unavailable
+    /// while the current private-memory counter is already observed.
+    #[serde(default)]
+    pub cpu_value_state: ResourceMetricValueState,
+    /// Confidence for `memory_bytes`.
+    #[serde(default)]
+    pub memory_value_state: ResourceMetricValueState,
     /// True when this projection intentionally carries an immutable prior
     /// sample because current Job membership could not be queried.
     #[serde(default)]
@@ -306,6 +396,8 @@ impl Default for ResourceSnapshot {
             metrics_unavailable: false,
             metrics_status: ProcessMetricStatus::Unknown,
             metric_values: ResourceMetricValueState::Unavailable,
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
             metrics_stale: false,
             metrics_error: None,
             sampling_generation: 0,
@@ -1024,6 +1116,55 @@ pub use SessionStatus as ProcessStatus;
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn memory_totals_never_mix_stale_or_unavailable_values_into_current_bytes() {
+        let snapshots = [
+            ResourceSnapshot {
+                memory_bytes: 100,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::Observed,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 200,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 300,
+                memory_metric: ResourceMemoryMetric::PrivateCommitted,
+                memory_value_state: ResourceMetricValueState::Unavailable,
+                ..ResourceSnapshot::default()
+            },
+        ];
+
+        let total = aggregate_memory_snapshots(snapshots.iter());
+        assert_eq!(total.bytes, 100);
+        assert_eq!(total.value_state, ResourceMetricValueState::Partial);
+        assert_eq!(total.metric, ResourceMemoryMetric::PrivateCommitted);
+    }
+
+    #[test]
+    fn all_last_known_memory_totals_remain_explicitly_last_known() {
+        let snapshots = [
+            ResourceSnapshot {
+                memory_bytes: 100,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+            ResourceSnapshot {
+                memory_bytes: 200,
+                memory_value_state: ResourceMetricValueState::LastKnown,
+                ..ResourceSnapshot::default()
+            },
+        ];
+
+        let total = aggregate_memory_snapshots(snapshots.iter());
+        assert_eq!(total.bytes, 300);
+        assert_eq!(total.value_state, ResourceMetricValueState::LastKnown);
+    }
 
     fn test_ai_session() -> SessionRuntimeState {
         let mut session = SessionRuntimeState::new(

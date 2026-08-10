@@ -62,34 +62,40 @@ pub fn collect_exact_job_observations_with_budget<F>(
 where
     F: FnMut(u32) -> Result<JobMemberInfo, String>,
 {
+    budget.note_job_query();
     let mut process_ids = BTreeSet::new();
+    let mut new_local_members = 0usize;
     for pid in active_process_ids? {
         budget.checkpoint().map_err(|error| error.to_string())?;
         if pid == 0 {
             continue;
         }
-        if process_ids.len() >= budget.remaining_capacity() && !process_ids.contains(&pid) {
+        budget.note_job_candidate();
+        let is_new_tick_member = !budget.contains_pid(pid);
+        let is_new_local_member = !process_ids.contains(&pid);
+        if is_new_local_member
+            && (process_ids.len() >= budget.max_members()
+                || (is_new_tick_member && new_local_members >= budget.remaining_capacity()))
+        {
             return Err(format!(
                 "managed Job process list exceeds {} members",
                 budget.remaining_capacity()
             ));
         }
-        process_ids.insert(pid);
+        if process_ids.insert(pid) && is_new_tick_member {
+            new_local_members = new_local_members.saturating_add(1);
+        }
     }
-    budget
-        .reserve_members(process_ids.len())
-        .map_err(|error| error.to_string())?;
 
-    let member_count = process_ids.len();
-    let mut observations = Vec::with_capacity(member_count);
+    let mut observations = Vec::with_capacity(process_ids.len());
     for pid in process_ids {
         // The identity/metrics inspector can perform several OS calls. Check
         // before every member so a slow first query cannot turn the bounded
         // tick into an unbounded Job walk.
         if let Err(error) = budget.checkpoint() {
-            budget.release_reserved_members(member_count);
             return Err(error.to_string());
         }
+        budget.note_identity_inspection();
         let observation = match inspect_process(pid) {
             Ok(member) if member.identity().id().pid() == pid => JobMemberObservation::Accessible {
                 identity: member.identity().clone(),
@@ -108,6 +114,23 @@ where
                 reason,
             },
         };
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        match &observation {
+            JobMemberObservation::Accessible { identity } => {
+                budget
+                    .admit_identity(identity)
+                    .map_err(|error| error.to_string())?;
+            }
+            JobMemberObservation::Inaccessible {
+                pid,
+                creation_time_100ns,
+                ..
+            } => {
+                budget
+                    .admit_inaccessible(*pid, *creation_time_100ns)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         observations.push(observation);
     }
     Ok(observations)
@@ -384,7 +407,12 @@ impl ManagedProcessJob {
         let active_process_ids = {
             #[cfg(windows)]
             {
-                query_job_active_process_ids(self.raw_job_handle(), budget.remaining_capacity())
+                // Each OS query is itself capped at the global maximum. The
+                // collector then deduplicates exact identities against the
+                // already-admitted tick members before consuming remaining
+                // capacity, so a repeated authoritative query can still be
+                // recognized when the tick is otherwise full.
+                query_job_active_process_ids(self.raw_job_handle(), budget.max_members())
             }
 
             #[cfg(not(windows))]

@@ -1,6 +1,7 @@
 use crate::state::{
-    AppState, ProcessResourceNode, ResourceMemoryMetric, ResourceMetricValueState, RuntimeState,
-    SessionKind, SessionRuntimeState, SessionStatus,
+    aggregate_memory_snapshots, AppState, ProcessResourceNode, ResourceMemoryMetric,
+    ResourceMemoryTotal, ResourceMetricValueState, RuntimeState, SessionKind, SessionRuntimeState,
+    SessionStatus,
 };
 use crate::{icons, theme};
 use gpui::{
@@ -36,13 +37,16 @@ pub fn render_process_monitor(
     runtime: &RuntimeState,
     actions: ProcessMonitorActions<'_>,
 ) -> AnyElement {
-    let (open_terminals, total_memory, memory_metric) = monitor_totals(runtime);
+    let (open_terminals, total_memory) = monitor_totals(runtime);
     let sessions = process_monitor_entries(app_state, runtime);
     let description = format!(
-        "{open_terminals} terminal{} · {} total {}",
+        "{open_terminals} terminal{} · {} total",
         if open_terminals == 1 { "" } else { "s" },
-        format_memory(total_memory),
-        memory_metric.label()
+        format_metric_memory(
+            total_memory.bytes,
+            total_memory.metric,
+            total_memory.value_state,
+        ),
     );
 
     let body = if sessions.is_empty() {
@@ -189,7 +193,8 @@ fn render_session_card(
     let process_count = entry.process_count;
     let metrics_unavailable = entry.metrics_unavailable;
     let metrics_status = entry.metrics_status;
-    let metric_values = entry.metric_values;
+    let cpu_value_state = entry.cpu_value_state;
+    let memory_value_state = entry.memory_value_state;
     let metrics_stale = entry.metrics_stale;
     let core_equivalent_percent = entry.core_equivalent_percent;
     let unreaped = entry.unreaped;
@@ -306,9 +311,13 @@ fn render_session_card(
                                                 cpu,
                                                 core_equivalent_percent,
                                                 logical_cpu_count,
-                                                metric_values,
+                                                cpu_value_state,
                                             ),
-                                            format_metric_memory(memory, memory_metric, metric_values),
+                                            format_metric_memory(
+                                                memory,
+                                                memory_metric,
+                                                memory_value_state,
+                                            ),
                                             if metrics_stale {
                                                 " · stale"
                                             } else if metrics_unavailable {
@@ -439,12 +448,12 @@ fn render_process_row(
                             node.cpu_percent,
                             node.core_equivalent_percent,
                             logical_cpu_count,
-                            node.metric_values,
+                            node.cpu_value_state,
                         ),
                         format_metric_memory(
                             node.memory_bytes,
                             node.memory_metric,
-                            node.metric_values,
+                            node.memory_value_state,
                         ),
                         resource_label,
                         command_label,
@@ -558,7 +567,8 @@ fn process_monitor_entries(
                 process_count,
                 metrics_unavailable: session.resources.metrics_unavailable,
                 metrics_status: session.resources.metrics_status,
-                metric_values: session.resources.metric_values,
+                cpu_value_state: session.resources.cpu_value_state,
+                memory_value_state: session.resources.memory_value_state,
                 metrics_stale: session.resources.metrics_stale,
                 unreaped: session.reap_incomplete,
                 logical_cpu_count: session.resources.logical_cpu_count.max(1),
@@ -655,32 +665,23 @@ fn ordered_process_nodes(session: &SessionRuntimeState) -> Vec<ProcessResourceNo
             lifecycle: crate::state::ProcessResourceLifecycle::Unknown,
             metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
             metric_values: crate::state::ResourceMetricValueState::Unavailable,
+            cpu_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            memory_value_state: crate::state::ResourceMetricValueState::Unavailable,
+            sampling_generation: 0,
         })
         .collect()
 }
 
-fn monitor_totals(runtime: &RuntimeState) -> (usize, u64, ResourceMemoryMetric) {
-    let memory_metric = runtime
-        .sessions
-        .values()
-        .find(|session| session.status.is_live() || session.reap_incomplete)
-        .map(|session| session.resources.memory_metric)
-        .unwrap_or(if cfg!(target_os = "windows") {
-            ResourceMemoryMetric::PrivateCommitted
-        } else {
-            ResourceMemoryMetric::PrivateResident
-        });
-    let (count, memory) = runtime
-        .sessions
-        .values()
-        .filter(|session| session.status.is_live() || session.reap_incomplete)
-        .fold((0usize, 0u64), |(count, memory), session| {
-            (
-                count + 1,
-                memory.saturating_add(session.resources.memory_bytes),
-            )
-        });
-    (count, memory, memory_metric)
+fn monitor_totals(runtime: &RuntimeState) -> (usize, ResourceMemoryTotal) {
+    let relevant = || {
+        runtime
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live() || session.reap_incomplete)
+    };
+    let count = relevant().count();
+    let memory = aggregate_memory_snapshots(relevant().map(|session| &session.resources));
+    (count, memory)
 }
 
 fn session_label(session: &SessionRuntimeState) -> String {
@@ -758,6 +759,14 @@ fn format_metric_cpu_detail(
             core_equivalent_percent,
             logical_cpu_count,
         ),
+        ResourceMetricValueState::Partial => format!(
+            "{} (partial)",
+            format_cpu_detail_with_core(
+                system_cpu_percent,
+                core_equivalent_percent,
+                logical_cpu_count,
+            )
+        ),
         ResourceMetricValueState::LastKnown => format!(
             "{} (last known)",
             format_cpu_detail_with_core(
@@ -779,6 +788,11 @@ fn format_metric_memory(
         ResourceMetricValueState::Observed => {
             format!("{} {}", memory_metric.label(), format_memory(memory_bytes))
         }
+        ResourceMetricValueState::Partial => format!(
+            "{} {} (partial)",
+            memory_metric.label(),
+            format_memory(memory_bytes)
+        ),
         ResourceMetricValueState::LastKnown => format!(
             "{} {} (last known)",
             memory_metric.label(),
@@ -794,8 +808,8 @@ fn format_metric_memory(
 mod tests {
     use super::{
         format_cpu_detail_with_core, format_metric_cpu_detail, format_metric_memory,
-        monitor_sessions, ordered_process_nodes, pointer_disposition, process_monitor_entries,
-        session_label, PointerDisposition, PointerTarget,
+        monitor_sessions, monitor_totals, ordered_process_nodes, pointer_disposition,
+        process_monitor_entries, session_label, PointerDisposition, PointerTarget,
     };
     use crate::models::Project;
     use crate::state::{
@@ -853,6 +867,42 @@ mod tests {
     }
 
     #[test]
+    fn monitor_total_excludes_stale_memory_and_marks_current_subset_partial() {
+        let mut runtime = RuntimeState::new(false);
+        for (id, bytes, state) in [
+            (
+                "current",
+                64,
+                crate::state::ResourceMetricValueState::Observed,
+            ),
+            (
+                "stale",
+                128,
+                crate::state::ResourceMetricValueState::LastKnown,
+            ),
+        ] {
+            let mut session = SessionRuntimeState::new(
+                id,
+                PathBuf::from("."),
+                SessionDimensions::default(),
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            );
+            session.status = SessionStatus::Running;
+            session.resources.memory_bytes = bytes;
+            session.resources.memory_value_state = state;
+            runtime.sessions.insert(id.to_string(), session);
+        }
+
+        let (count, total) = monitor_totals(&runtime);
+        assert_eq!(count, 2);
+        assert_eq!(total.bytes, 64);
+        assert_eq!(
+            total.value_state,
+            crate::state::ResourceMetricValueState::Partial
+        );
+    }
+
+    #[test]
     fn ordered_process_nodes_prefers_root_first() {
         let mut session = SessionRuntimeState::new(
             "session-1",
@@ -882,6 +932,9 @@ mod tests {
                     lifecycle: crate::state::ProcessResourceLifecycle::Running,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                     metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
                 ProcessResourceNode {
                     pid: 10,
@@ -902,6 +955,9 @@ mod tests {
                     lifecycle: crate::state::ProcessResourceLifecycle::Running,
                     metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                     metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    sampling_generation: 1,
                 },
             ],
             ..Default::default()
@@ -1055,6 +1111,19 @@ mod tests {
 
     #[test]
     fn unavailable_and_stale_metrics_never_render_as_idle() {
+        assert!(format_metric_cpu_detail(
+            6.25,
+            50.0,
+            8,
+            crate::state::ResourceMetricValueState::Partial,
+        )
+        .contains("partial"));
+        assert!(format_metric_memory(
+            4_096,
+            crate::state::ResourceMemoryMetric::PrivateCommitted,
+            crate::state::ResourceMetricValueState::Partial,
+        )
+        .contains("partial"));
         assert_eq!(
             format_metric_cpu_detail(
                 0.0,
@@ -1098,7 +1167,8 @@ struct ProcessMonitorEntry {
     process_count: u32,
     metrics_unavailable: bool,
     metrics_status: crate::domain::snapshot::ProcessMetricStatus,
-    metric_values: ResourceMetricValueState,
+    cpu_value_state: ResourceMetricValueState,
+    memory_value_state: ResourceMetricValueState,
     metrics_stale: bool,
     unreaped: bool,
     logical_cpu_count: u32,

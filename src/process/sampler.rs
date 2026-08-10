@@ -68,12 +68,40 @@ impl SamplerError {
 /// Hard limits for one background sampling tick. The process monitor never
 /// waits for an unbounded number of OS queries; callers choose a shorter
 /// deadline for production and a deterministic member cap in tests.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SamplingWorkCounters {
+    pub runtime_sessions: usize,
+    pub cached_process_ids: usize,
+    pub cached_process_rows: usize,
+    pub session_authority_reads: usize,
+    pub job_queries: usize,
+    pub job_candidates: usize,
+    pub identity_inspections: usize,
+    pub metric_observations: usize,
+    pub metadata_snapshots: usize,
+    pub metadata_rows: usize,
+    pub projected_rows: usize,
+    pub projected_snapshots: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SamplingMemberIdentity {
+    Observed {
+        creation_time_100ns: u64,
+        canonical_executable: PathBuf,
+    },
+    Inaccessible {
+        creation_time_100ns: Option<u64>,
+    },
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
 pub struct SamplingBudget {
     deadline: Instant,
     max_members: usize,
-    claimed_members: usize,
-    reserved_members: usize,
+    members: BTreeMap<u32, SamplingMemberIdentity>,
+    work: SamplingWorkCounters,
 }
 
 impl SamplingBudget {
@@ -81,8 +109,8 @@ impl SamplingBudget {
         Self {
             deadline,
             max_members,
-            claimed_members: 0,
-            reserved_members: 0,
+            members: BTreeMap::new(),
+            work: SamplingWorkCounters::default(),
         }
     }
 
@@ -95,24 +123,16 @@ impl SamplingBudget {
     }
 
     pub fn claimed_members(&self) -> usize {
-        self.claimed_members
+        self.members.len()
     }
 
     pub fn remaining_capacity(&self) -> usize {
-        self.max_members
-            .saturating_sub(self.claimed_members.saturating_add(self.reserved_members))
+        self.max_members.saturating_sub(self.claimed_members())
     }
 
-    /// Remaining member capacity after both sampled observations and Job
-    /// reservations. Callers must use this shared view before materializing
-    /// another member collection; counting only sampled members could let a
-    /// second Job exceed the tick cap while the first Job is still retained.
+    /// Remaining exact-member capacity across every Job queried in this tick.
     pub fn remaining_members(&self) -> usize {
         self.remaining_capacity()
-    }
-
-    pub fn reserved_members(&self) -> usize {
-        self.reserved_members
     }
 
     /// Check the common tick deadline without consuming a member slot. Job
@@ -121,54 +141,169 @@ impl SamplingBudget {
     pub fn checkpoint(&self) -> Result<(), SamplerError> {
         if Instant::now() >= self.deadline {
             return Err(SamplerError::WorkBudgetExceeded {
-                attempted: self.claimed_members.saturating_add(self.reserved_members),
+                attempted: self.claimed_members(),
                 max: self.max_members,
             });
         }
         Ok(())
     }
 
-    /// Validate a bounded member collection before it is inspected. This is
-    /// intentionally separate from `claim`: a Job query and the sampler share
-    /// one deadline/cap, but the same member should not consume two slots.
-    pub fn ensure_members(&self, count: usize) -> Result<(), SamplerError> {
+    pub fn contains_pid(&self, pid: u32) -> bool {
+        self.members.contains_key(&pid)
+    }
+
+    pub fn work_counters(&self) -> SamplingWorkCounters {
+        self.work
+    }
+
+    pub(crate) fn note_job_query(&mut self) {
+        self.work.job_queries = self.work.job_queries.saturating_add(1);
+    }
+
+    pub(crate) fn note_runtime_session(&mut self) {
+        self.work.runtime_sessions = self.work.runtime_sessions.saturating_add(1);
+    }
+
+    pub(crate) fn note_cached_process_id(&mut self) {
+        self.work.cached_process_ids = self.work.cached_process_ids.saturating_add(1);
+    }
+
+    pub(crate) fn note_cached_process_row(&mut self) {
+        self.work.cached_process_rows = self.work.cached_process_rows.saturating_add(1);
+    }
+
+    pub(crate) fn note_session_authority_read(&mut self) {
+        self.work.session_authority_reads = self.work.session_authority_reads.saturating_add(1);
+    }
+
+    pub(crate) fn note_job_candidate(&mut self) {
+        self.work.job_candidates = self.work.job_candidates.saturating_add(1);
+    }
+
+    pub(crate) fn note_identity_inspection(&mut self) {
+        self.work.identity_inspections = self.work.identity_inspections.saturating_add(1);
+    }
+
+    pub(crate) fn note_metric_observation(&mut self) {
+        self.work.metric_observations = self.work.metric_observations.saturating_add(1);
+    }
+
+    pub(crate) fn note_metadata_snapshot(&mut self) {
+        self.work.metadata_snapshots = self.work.metadata_snapshots.saturating_add(1);
+    }
+
+    pub(crate) fn note_metadata_row(&mut self) {
+        self.work.metadata_rows = self.work.metadata_rows.saturating_add(1);
+    }
+
+    pub(crate) fn note_projected_row(&mut self) {
+        self.work.projected_rows = self.work.projected_rows.saturating_add(1);
+    }
+
+    pub(crate) fn note_projected_snapshot(&mut self) {
+        self.work.projected_snapshots = self.work.projected_snapshots.saturating_add(1);
+    }
+
+    pub(crate) fn admit_identity(
+        &mut self,
+        identity: &ManagedProcessIdentity,
+    ) -> Result<bool, SamplerError> {
+        self.admit_member(
+            identity.id().pid(),
+            SamplingMemberIdentity::Observed {
+                creation_time_100ns: identity.id().creation_time_100ns(),
+                canonical_executable: identity.canonical_executable().to_path_buf(),
+            },
+        )
+    }
+
+    pub(crate) fn admit_inaccessible(
+        &mut self,
+        pid: u32,
+        creation_time_100ns: Option<u64>,
+    ) -> Result<bool, SamplerError> {
+        self.admit_member(
+            pid,
+            SamplingMemberIdentity::Inaccessible {
+                creation_time_100ns,
+            },
+        )
+    }
+
+    fn admit_member(
+        &mut self,
+        pid: u32,
+        observed: SamplingMemberIdentity,
+    ) -> Result<bool, SamplerError> {
         self.checkpoint()?;
-        if count > self.remaining_capacity() {
+        if let Some(existing) = self.members.get_mut(&pid) {
+            let compatible = match (&*existing, &observed) {
+                (
+                    SamplingMemberIdentity::Observed {
+                        creation_time_100ns: left_creation,
+                        canonical_executable: left_executable,
+                    },
+                    SamplingMemberIdentity::Observed {
+                        creation_time_100ns: right_creation,
+                        canonical_executable: right_executable,
+                    },
+                ) => left_creation == right_creation && left_executable == right_executable,
+                (
+                    SamplingMemberIdentity::Observed {
+                        creation_time_100ns,
+                        ..
+                    },
+                    SamplingMemberIdentity::Inaccessible {
+                        creation_time_100ns: inaccessible,
+                    },
+                )
+                | (
+                    SamplingMemberIdentity::Inaccessible {
+                        creation_time_100ns: inaccessible,
+                    },
+                    SamplingMemberIdentity::Observed {
+                        creation_time_100ns,
+                        ..
+                    },
+                ) => inaccessible == &Some(*creation_time_100ns),
+                (
+                    SamplingMemberIdentity::Inaccessible {
+                        creation_time_100ns: left,
+                    },
+                    SamplingMemberIdentity::Inaccessible {
+                        creation_time_100ns: right,
+                    },
+                ) => left == right,
+                (SamplingMemberIdentity::Conflict, _) | (_, SamplingMemberIdentity::Conflict) => {
+                    false
+                }
+            };
+            if !compatible {
+                *existing = SamplingMemberIdentity::Conflict;
+                return Err(SamplerError::ConflictingProcessIdentity { pid });
+            }
+            return Ok(false);
+        }
+        if self.members.len() >= self.max_members {
             return Err(SamplerError::WorkBudgetExceeded {
-                attempted: self
-                    .claimed_members
-                    .saturating_add(self.reserved_members)
-                    .saturating_add(count),
+                attempted: self.members.len().saturating_add(1),
                 max: self.max_members,
             });
         }
-        Ok(())
+        self.members.insert(pid, observed);
+        Ok(true)
     }
 
-    pub fn reserve_members(&mut self, count: usize) -> Result<(), SamplerError> {
-        self.ensure_members(count)?;
-        self.reserved_members = self.reserved_members.saturating_add(count);
-        Ok(())
-    }
-
-    pub fn release_reserved_members(&mut self, count: usize) {
-        self.reserved_members = self.reserved_members.saturating_sub(count);
-    }
-
-    pub(crate) fn claim(&mut self, count: usize) -> Result<(), SamplerError> {
-        self.checkpoint()?;
-        let attempted = self
-            .claimed_members
-            .saturating_add(self.reserved_members)
-            .saturating_add(count);
-        if attempted > self.max_members {
-            return Err(SamplerError::WorkBudgetExceeded {
-                attempted,
-                max: self.max_members,
-            });
+    fn admit_observation(
+        &mut self,
+        member: &ProcessMemberObservation,
+    ) -> Result<bool, SamplerError> {
+        match member {
+            ProcessMemberObservation::Accessible(member) => self.admit_identity(&member.identity),
+            ProcessMemberObservation::Inaccessible(member) => {
+                self.admit_inaccessible(member.pid, member.creation_time_100ns)
+            }
         }
-        self.claimed_members = self.claimed_members.saturating_add(count);
-        Ok(())
     }
 }
 
@@ -250,7 +385,6 @@ fn sanitize_core_percent(value: f64) -> f64 {
 }
 
 const MAX_REDACTED_EXECUTABLE_BYTES: usize = 96;
-const MAX_DIAGNOSTIC_BYTES: usize = 128;
 
 /// Convert an executable identity into the only form safe for a runtime
 /// projection: a short basename with a conservative character allowlist.
@@ -271,24 +405,6 @@ fn redacted_executable_basename(path: &Path) -> Option<String> {
         );
     }
     (!output.is_empty()).then_some(output)
-}
-
-fn sanitize_diagnostic_text(text: &str) -> String {
-    let mut output = String::with_capacity(text.len().min(MAX_DIAGNOSTIC_BYTES));
-    for character in text.chars() {
-        if output.len() >= MAX_DIAGNOSTIC_BYTES {
-            break;
-        }
-        output.push(
-            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | ':' | '.')
-            {
-                character
-            } else {
-                '_'
-            },
-        );
-    }
-    output
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -463,7 +579,6 @@ pub struct ProcessSampler {
     baselines: BTreeMap<ManagedProcessIdentityKey, CpuBaseline>,
     last_snapshot: Option<Arc<ProcessAccountingSnapshot>>,
     generation: u64,
-    last_authoritative_members: Vec<ProcessMemberObservation>,
 }
 
 impl Default for ProcessSampler {
@@ -474,7 +589,6 @@ impl Default for ProcessSampler {
             baselines: BTreeMap::new(),
             last_snapshot: None,
             generation: 0,
-            last_authoritative_members: Vec::new(),
         }
     }
 }
@@ -486,24 +600,6 @@ impl ProcessSampler {
 
     pub fn last_snapshot(&self) -> Option<Arc<ProcessAccountingSnapshot>> {
         self.last_snapshot.clone()
-    }
-
-    /// Cache the most recent successful Job query. This is a reporting
-    /// continuity aid only: a later query failure downgrades the snapshot to
-    /// `unknown` and never turns ancestry into new ownership.
-    pub fn remember_authoritative_members(&mut self, members: &[ProcessMemberObservation]) {
-        self.last_authoritative_members = unique_members(members.iter().cloned());
-    }
-
-    pub fn last_authoritative_members(&self) -> &[ProcessMemberObservation] {
-        &self.last_authoritative_members
-    }
-
-    pub fn last_authoritative_process_ids(&self) -> Vec<u32> {
-        self.last_authoritative_members
-            .iter()
-            .map(ProcessMemberObservation::pid)
-            .collect()
     }
 
     pub fn sample_now(
@@ -603,10 +699,7 @@ impl ProcessSampler {
                             metrics_unavailable = true;
                             has_partial_metrics = true;
                             status = ProcessMetricStatus::Partial;
-                            error = Some(format!(
-                                "CPU counter reset for PID {}",
-                                member.identity.id().pid()
-                            ));
+                            error = Some("member_cpu_counter_reset".to_string());
                             (None, ProcessMetricStatus::Partial)
                         }
                         (Some(baseline), Some(wall_delta)) => (
@@ -633,10 +726,7 @@ impl ProcessSampler {
                         has_partial_metrics = true;
                         status = ProcessMetricStatus::Partial;
                         if error.is_none() {
-                            error = Some(format!(
-                                "I/O counter reset for PID {}",
-                                member.identity.id().pid()
-                            ));
+                            error = Some("member_io_counter_reset".to_string());
                         }
                         member_status = ProcessMetricStatus::Partial;
                     }
@@ -691,16 +781,7 @@ impl ProcessSampler {
                     has_partial_metrics = true;
                     status = ProcessMetricStatus::Partial;
                     if error.is_none() {
-                        let reason = member
-                            .reason
-                            .as_deref()
-                            .map(sanitize_diagnostic_text)
-                            .filter(|reason| !reason.is_empty())
-                            .unwrap_or_else(|| "inaccessible".to_string());
-                        error = Some(format!(
-                            "metrics unavailable for PID {}: {reason}",
-                            member.pid
-                        ));
+                        error = Some("member_metrics_unavailable".to_string());
                     }
                     snapshots.push(ProcessAccountingMemberSnapshot {
                         pid: member.pid,
@@ -785,10 +866,34 @@ fn unique_members_with_budget(
     budget: &mut SamplingBudget,
 ) -> Result<Vec<ProcessMemberObservation>, SamplerError> {
     let mut unique = BTreeMap::<u32, ProcessMemberObservation>::new();
-    budget.claim(0)?;
+    let mut new_unique_members = 0usize;
+    budget.checkpoint()?;
     for member in members {
-        budget.claim(1)?;
+        budget.checkpoint()?;
+        let pid = member.pid();
+        let is_new_local = !unique.contains_key(&pid);
+        let is_new_global = !budget.contains_pid(pid);
+        if is_new_local && is_new_global && new_unique_members >= budget.remaining_capacity() {
+            return Err(SamplerError::WorkBudgetExceeded {
+                attempted: budget
+                    .claimed_members()
+                    .saturating_add(new_unique_members + 1),
+                max: budget.max_members(),
+            });
+        }
+        if is_new_local && is_new_global {
+            new_unique_members = new_unique_members.saturating_add(1);
+        }
         insert_unique_member(&mut unique, member);
+    }
+    for member in unique.values() {
+        // A Job collector has already admitted authoritative identities. A
+        // later metrics query may legitimately be inaccessible without
+        // revoking that ownership; only a fresh sampler-only budget needs to
+        // admit the deduplicated observation here.
+        if !budget.contains_pid(member.pid()) {
+            budget.admit_observation(member)?;
+        }
     }
     Ok(unique.into_values().collect())
 }
