@@ -10,14 +10,107 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::domain::snapshot::{ProcessAccountingMemberSnapshot, ProcessAccountingSnapshot};
+use crate::domain::snapshot::{
+    ProcessAccountingMemberSnapshot, ProcessAccountingSnapshot, ProcessMetricStatus,
+};
 use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SamplerError {
     InvalidLogicalProcessorCount,
     InvalidInterval,
+    CounterReset { pid: u32 },
+    ConflictingProcessIdentity { pid: u32 },
+    WorkBudgetExceeded { attempted: usize, max: usize },
+    ObservationFailed { pid: u32, reason: String },
 }
+
+impl std::fmt::Display for SamplerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLogicalProcessorCount => {
+                write!(f, "logical processor count was zero")
+            }
+            Self::InvalidInterval => write!(f, "sampling interval was zero or moved backwards"),
+            Self::CounterReset { pid } => write!(f, "CPU counter reset for PID {pid}"),
+            Self::ConflictingProcessIdentity { pid } => {
+                write!(f, "conflicting process identities for PID {pid}")
+            }
+            Self::WorkBudgetExceeded { attempted, max } => {
+                write!(
+                    f,
+                    "sampling work budget exceeded ({attempted} > {max} members)"
+                )
+            }
+            Self::ObservationFailed { pid, reason } => {
+                write!(f, "process observation failed for PID {pid}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SamplerError {}
+
+impl SamplerError {
+    pub fn status(&self) -> ProcessMetricStatus {
+        match self {
+            Self::CounterReset { .. } | Self::ConflictingProcessIdentity { .. } => {
+                ProcessMetricStatus::Partial
+            }
+            Self::InvalidLogicalProcessorCount
+            | Self::InvalidInterval
+            | Self::WorkBudgetExceeded { .. }
+            | Self::ObservationFailed { .. } => ProcessMetricStatus::Failed,
+        }
+    }
+}
+
+/// Hard limits for one background sampling tick. The process monitor never
+/// waits for an unbounded number of OS queries; callers choose a shorter
+/// deadline for production and a deterministic member cap in tests.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingBudget {
+    deadline: Instant,
+    max_members: usize,
+    claimed_members: usize,
+}
+
+impl SamplingBudget {
+    pub fn new(deadline: Instant, max_members: usize) -> Self {
+        Self {
+            deadline,
+            max_members,
+            claimed_members: 0,
+        }
+    }
+
+    pub fn from_now(max_members: usize, max_duration: Duration) -> Self {
+        Self::new(Instant::now() + max_duration, max_members)
+    }
+
+    pub fn max_members(&self) -> usize {
+        self.max_members
+    }
+
+    pub fn claimed_members(&self) -> usize {
+        self.claimed_members
+    }
+
+    fn claim(&mut self, count: usize) -> Result<(), SamplerError> {
+        let attempted = self.claimed_members.saturating_add(count);
+        if attempted > self.max_members || Instant::now() >= self.deadline {
+            return Err(SamplerError::WorkBudgetExceeded {
+                attempted,
+                max: self.max_members,
+            });
+        }
+        self.claimed_members = attempted;
+        Ok(())
+    }
+}
+
+const DEFAULT_SAMPLE_MEMBER_BUDGET: usize = 512;
+const DEFAULT_SAMPLE_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CpuMetrics {
@@ -167,18 +260,28 @@ impl ProcessMemberObservation {
         }
     }
 
-    fn member_key(&self) -> ProcessInstanceKey {
-        ProcessInstanceKey {
-            pid: self.pid(),
-            creation_time_100ns: self.creation_time_100ns().unwrap_or(0),
+    fn has_same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Accessible(left), Self::Accessible(right)) => {
+                left.identity.matches_root(&right.identity)
+            }
+            (Self::Inaccessible(left), Self::Inaccessible(right)) => {
+                left.pid == right.pid && left.creation_time_100ns == right.creation_time_100ns
+            }
+            _ => false,
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ProcessInstanceKey {
-    pid: u32,
-    creation_time_100ns: u64,
+    /// An inaccessible query may be a second view of an accessible Job
+    /// member, but only when it carries the same known process generation.
+    /// A missing generation is not evidence that a PID still refers to the
+    /// same process and therefore cannot be merged with an accessible row.
+    fn accessible_matches_inaccessible(
+        accessible: &AccessibleProcess,
+        inaccessible: &InaccessibleProcess,
+    ) -> bool {
+        inaccessible.creation_time_100ns == Some(accessible.identity.id().creation_time_100ns())
+    }
 }
 
 /// Return the one deterministic member set used for both totals and baselines.
@@ -188,19 +291,57 @@ struct ProcessInstanceKey {
 pub fn unique_members(
     members: impl IntoIterator<Item = ProcessMemberObservation>,
 ) -> Vec<ProcessMemberObservation> {
-    let mut unique = BTreeMap::<ProcessInstanceKey, ProcessMemberObservation>::new();
+    let mut unique = BTreeMap::<u32, ProcessMemberObservation>::new();
     for member in members {
-        let key = member.member_key();
-        match unique.get(&key) {
-            Some(ProcessMemberObservation::Accessible(_)) => {}
-            Some(ProcessMemberObservation::Inaccessible(_))
-                if matches!(member, ProcessMemberObservation::Inaccessible(_)) => {}
-            _ => {
-                unique.insert(key, member);
-            }
-        }
+        insert_unique_member(&mut unique, member);
     }
     unique.into_values().collect()
+}
+
+fn insert_unique_member(
+    unique: &mut BTreeMap<u32, ProcessMemberObservation>,
+    member: ProcessMemberObservation,
+) {
+    let pid = member.pid();
+    let Some(existing) = unique.remove(&pid) else {
+        unique.insert(pid, member);
+        return;
+    };
+
+    let replacement = match (&existing, &member) {
+        // A repeated observation of one exact process is harmless.
+        _ if existing.has_same_identity(&member) => existing,
+        // A successful identity wins over an inaccessible query only if the
+        // inaccessible query carries the same known generation. Otherwise
+        // this is a PID reuse/identity conflict.
+        (
+            ProcessMemberObservation::Inaccessible(inaccessible),
+            ProcessMemberObservation::Accessible(accessible),
+        ) if ProcessMemberObservation::accessible_matches_inaccessible(
+            accessible,
+            inaccessible,
+        ) =>
+        {
+            member
+        }
+        (
+            ProcessMemberObservation::Accessible(accessible),
+            ProcessMemberObservation::Inaccessible(inaccessible),
+        ) if ProcessMemberObservation::accessible_matches_inaccessible(
+            accessible,
+            inaccessible,
+        ) =>
+        {
+            existing
+        }
+        // Two different generations/executables for one PID are a PID
+        // reuse/conflict. Keep one explicit inaccessible row rather than
+        // silently selecting a generation and granting it a baseline.
+        _ => ProcessMemberObservation::Inaccessible(
+            InaccessibleProcess::new(pid, None).with_reason("conflicting process identities"),
+        ),
+    };
+    unique.insert(pid, replacement);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +357,8 @@ pub struct ProcessSampler {
     last_sample_at: Option<Duration>,
     baselines: BTreeMap<ManagedProcessIdentityKey, CpuBaseline>,
     last_snapshot: Option<Arc<ProcessAccountingSnapshot>>,
+    generation: u64,
+    last_authoritative_members: Vec<ProcessMemberObservation>,
 }
 
 impl Default for ProcessSampler {
@@ -225,6 +368,8 @@ impl Default for ProcessSampler {
             last_sample_at: None,
             baselines: BTreeMap::new(),
             last_snapshot: None,
+            generation: 0,
+            last_authoritative_members: Vec::new(),
         }
     }
 }
@@ -238,6 +383,24 @@ impl ProcessSampler {
         self.last_snapshot.clone()
     }
 
+    /// Cache the most recent successful Job query. This is a reporting
+    /// continuity aid only: a later query failure downgrades the snapshot to
+    /// `unknown` and never turns ancestry into new ownership.
+    pub fn remember_authoritative_members(&mut self, members: &[ProcessMemberObservation]) {
+        self.last_authoritative_members = unique_members(members.iter().cloned());
+    }
+
+    pub fn last_authoritative_members(&self) -> &[ProcessMemberObservation] {
+        &self.last_authoritative_members
+    }
+
+    pub fn last_authoritative_process_ids(&self) -> Vec<u32> {
+        self.last_authoritative_members
+            .iter()
+            .map(ProcessMemberObservation::pid)
+            .collect()
+    }
+
     pub fn sample_now(
         &mut self,
         logical_processors: u32,
@@ -246,11 +409,37 @@ impl ProcessSampler {
         self.sample_at(self.clock_start.elapsed(), logical_processors, members)
     }
 
+    pub fn sample_now_with_budget(
+        &mut self,
+        logical_processors: u32,
+        members: impl IntoIterator<Item = ProcessMemberObservation>,
+        budget: &mut SamplingBudget,
+    ) -> Result<Arc<ProcessAccountingSnapshot>, SamplerError> {
+        self.sample_at_with_budget(
+            self.clock_start.elapsed(),
+            logical_processors,
+            members,
+            budget,
+        )
+    }
+
     pub fn sample_at(
         &mut self,
         sampled_at: Duration,
         logical_processors: u32,
         members: impl IntoIterator<Item = ProcessMemberObservation>,
+    ) -> Result<Arc<ProcessAccountingSnapshot>, SamplerError> {
+        let mut budget =
+            SamplingBudget::from_now(DEFAULT_SAMPLE_MEMBER_BUDGET, DEFAULT_SAMPLE_DEADLINE);
+        self.sample_at_with_budget(sampled_at, logical_processors, members, &mut budget)
+    }
+
+    pub fn sample_at_with_budget(
+        &mut self,
+        sampled_at: Duration,
+        logical_processors: u32,
+        members: impl IntoIterator<Item = ProcessMemberObservation>,
+        budget: &mut SamplingBudget,
     ) -> Result<Arc<ProcessAccountingSnapshot>, SamplerError> {
         if logical_processors == 0 {
             return Err(SamplerError::InvalidLogicalProcessorCount);
@@ -268,7 +457,7 @@ impl ProcessSampler {
                 Some(interval)
             }
         };
-        let unique = unique_members(members);
+        let unique = unique_members_with_budget(members, budget)?;
         let wall_delta_100ns = interval.map(|interval| interval.as_nanos() / 100);
         let wall_delta_100ns = wall_delta_100ns
             .filter(|ticks| *ticks > 0 && *ticks <= u64::MAX as u128)
@@ -286,25 +475,44 @@ impl ProcessSampler {
         let mut has_io_read = false;
         let mut has_io_write = false;
         let mut metrics_unavailable = false;
+        let mut has_partial_metrics = false;
+        let mut error = None;
+        let mut status = if interval.is_some() {
+            ProcessMetricStatus::Complete
+        } else {
+            ProcessMetricStatus::Unknown
+        };
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
 
         for member in unique {
             match member {
                 ProcessMemberObservation::Accessible(member) => {
                     let key = ManagedProcessIdentityKey::from_identity(&member.identity);
                     let baseline = self.baselines.get(&key).copied();
-                    let cpu_delta = baseline
-                        .filter(|baseline| member.cpu_time_100ns >= baseline.cpu_time_100ns)
-                        .map(|baseline| member.cpu_time_100ns - baseline.cpu_time_100ns)
-                        .unwrap_or(0);
-                    let cpu_metrics = match wall_delta_100ns {
-                        Some(wall_delta) => {
-                            calculate_cpu_metrics(cpu_delta, wall_delta, logical_processors)?
+                    let (cpu_metrics, mut member_status) = match (baseline, wall_delta_100ns) {
+                        (None, _) => (None, ProcessMetricStatus::Unknown),
+                        (Some(baseline), Some(_wall_delta))
+                            if member.cpu_time_100ns < baseline.cpu_time_100ns =>
+                        {
+                            metrics_unavailable = true;
+                            has_partial_metrics = true;
+                            status = ProcessMetricStatus::Partial;
+                            error = Some(format!(
+                                "CPU counter reset for PID {}",
+                                member.identity.id().pid()
+                            ));
+                            (None, ProcessMetricStatus::Partial)
                         }
-                        None => CpuMetrics {
-                            raw_core_percent: 0.0,
-                            machine_cpu_percent: 0.0,
-                            core_equivalent_percent: 0.0,
-                        },
+                        (Some(baseline), Some(wall_delta)) => (
+                            Some(calculate_cpu_metrics(
+                                member.cpu_time_100ns - baseline.cpu_time_100ns,
+                                wall_delta,
+                                logical_processors,
+                            )?),
+                            ProcessMetricStatus::Complete,
+                        ),
+                        (Some(_), None) => (None, ProcessMetricStatus::Unknown),
                     };
                     let io_read_delta = baseline.and_then(|baseline| {
                         counter_delta(baseline.io_read_bytes, member.io_read_bytes)
@@ -312,6 +520,21 @@ impl ProcessSampler {
                     let io_write_delta = baseline.and_then(|baseline| {
                         counter_delta(baseline.io_write_bytes, member.io_write_bytes)
                     });
+                    if baseline.is_some_and(|baseline| {
+                        counter_reset(baseline.io_read_bytes, member.io_read_bytes)
+                            || counter_reset(baseline.io_write_bytes, member.io_write_bytes)
+                    }) {
+                        metrics_unavailable = true;
+                        has_partial_metrics = true;
+                        status = ProcessMetricStatus::Partial;
+                        if error.is_none() {
+                            error = Some(format!(
+                                "I/O counter reset for PID {}",
+                                member.identity.id().pid()
+                            ));
+                        }
+                        member_status = ProcessMetricStatus::Partial;
+                    }
                     if let Some(delta) = io_read_delta {
                         io_read_bytes = io_read_bytes.saturating_add(delta);
                         has_io_read = true;
@@ -320,17 +543,35 @@ impl ProcessSampler {
                         io_write_bytes = io_write_bytes.saturating_add(delta);
                         has_io_write = true;
                     }
-                    core_equivalent_percent += cpu_metrics.core_equivalent_percent;
+                    if let Some(cpu_metrics) = cpu_metrics {
+                        core_equivalent_percent += cpu_metrics.core_equivalent_percent;
+                    }
+                    if !member_status.is_complete() {
+                        metrics_unavailable = true;
+                        if status == ProcessMetricStatus::Complete {
+                            status = member_status;
+                        }
+                    }
                     memory_bytes = memory_bytes.saturating_add(member.private_memory_bytes);
                     snapshots.push(ProcessAccountingMemberSnapshot {
                         pid: member.identity.id().pid(),
                         creation_time_100ns: Some(member.identity.id().creation_time_100ns()),
-                        machine_cpu_percent: Some(cpu_metrics.machine_cpu_percent),
-                        core_equivalent_percent: Some(cpu_metrics.core_equivalent_percent),
+                        machine_cpu_percent: cpu_metrics.map(|metrics| metrics.machine_cpu_percent),
+                        core_equivalent_percent: cpu_metrics
+                            .map(|metrics| metrics.core_equivalent_percent),
                         private_memory_bytes: Some(member.private_memory_bytes),
                         io_read_bytes: io_read_delta,
                         io_write_bytes: io_write_delta,
-                        metrics_unavailable: false,
+                        metrics_unavailable: !member_status.is_complete(),
+                        status: member_status,
+                        executable: Some(
+                            member
+                                .identity
+                                .canonical_executable()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        generation,
                     });
                     next_baselines.insert(
                         key,
@@ -343,6 +584,11 @@ impl ProcessSampler {
                 }
                 ProcessMemberObservation::Inaccessible(member) => {
                     metrics_unavailable = true;
+                    has_partial_metrics = true;
+                    status = ProcessMetricStatus::Partial;
+                    if error.is_none() {
+                        error = Some(format!("metrics unavailable for PID {}", member.pid));
+                    }
                     snapshots.push(ProcessAccountingMemberSnapshot {
                         pid: member.pid,
                         creation_time_100ns: member.creation_time_100ns,
@@ -352,10 +598,19 @@ impl ProcessSampler {
                         io_read_bytes: None,
                         io_write_bytes: None,
                         metrics_unavailable: true,
+                        status: ProcessMetricStatus::Partial,
+                        executable: None,
+                        generation,
                     });
                 }
             }
         }
+
+        let status = if has_partial_metrics {
+            ProcessMetricStatus::Partial
+        } else {
+            status
+        };
 
         let snapshot = Arc::new(ProcessAccountingSnapshot {
             sampled_at,
@@ -366,6 +621,9 @@ impl ProcessSampler {
             memory_bytes,
             process_count: snapshots.len() as u32,
             metrics_unavailable,
+            status,
+            error,
+            generation,
             io_read_bytes: has_io_read.then_some(io_read_bytes),
             io_write_bytes: has_io_write.then_some(io_write_bytes),
             members: snapshots,
@@ -404,11 +662,33 @@ impl ProcessSampler {
     }
 }
 
+/// Deduplicate member observations without allowing an unbounded iterator to
+/// run past the per-tick accounting budget. The budget counts raw
+/// observations, not just unique PIDs, because every observation can carry an
+/// OS query result that must be inspected before it is known to be a
+/// duplicate.
+fn unique_members_with_budget(
+    members: impl IntoIterator<Item = ProcessMemberObservation>,
+    budget: &mut SamplingBudget,
+) -> Result<Vec<ProcessMemberObservation>, SamplerError> {
+    let mut unique = BTreeMap::<u32, ProcessMemberObservation>::new();
+    budget.claim(0)?;
+    for member in members {
+        budget.claim(1)?;
+        insert_unique_member(&mut unique, member);
+    }
+    Ok(unique.into_values().collect())
+}
+
 fn counter_delta(previous: Option<u64>, current: Option<u64>) -> Option<u64> {
     match (previous, current) {
         (Some(previous), Some(current)) if current >= previous => Some(current - previous),
         _ => None,
     }
+}
+
+fn counter_reset(previous: Option<u64>, current: Option<u64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

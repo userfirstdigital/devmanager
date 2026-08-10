@@ -1,12 +1,12 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use devmanager::domain::snapshot::ProcessAccountingSnapshot;
+use devmanager::domain::snapshot::{ProcessAccountingSnapshot, ProcessMetricStatus};
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity};
 use devmanager::process::job::{collect_exact_job_observations, JobMemberObservation};
 use devmanager::process::sampler::{
     require_exact_process_identity, AccessibleProcess, InaccessibleProcess,
-    ProcessMemberObservation, ProcessSampler, SamplerError,
+    ProcessMemberObservation, ProcessSampler, SamplerError, SamplingBudget,
 };
 use devmanager::state::ResourceSnapshot;
 
@@ -374,6 +374,22 @@ fn runtime_resource_snapshot_retains_partial_metrics_and_io_deltas() {
 }
 
 #[test]
+fn resource_snapshot_preserves_unclamped_core_equivalent_diagnostics() {
+    let snapshot = ResourceSnapshot {
+        cpu_percent: 100.0,
+        core_equivalent_percent: 1_600.0,
+        logical_cpu_count: 8,
+        ..ResourceSnapshot::default()
+    };
+
+    assert_eq!(snapshot.equivalent_cpu_cores(), 16.0);
+    let encoded = serde_json::to_string(&snapshot).expect("resource snapshot JSON");
+    let decoded: ResourceSnapshot = serde_json::from_str(&encoded).expect("resource snapshot");
+    assert_eq!(decoded.core_equivalent_percent, 1_600.0);
+    assert_eq!(decoded.equivalent_cpu_cores(), 16.0);
+}
+
+#[test]
 fn prior_snapshot_is_unchanged_after_the_sampler_advances() {
     let mut sampler = ProcessSampler::new();
     let first = sample(&mut sampler, Duration::ZERO, [accessible(112, 1, 0, 1_000)]);
@@ -388,4 +404,134 @@ fn prior_snapshot_is_unchanged_after_the_sampler_advances() {
     assert_eq!(first.memory_bytes, 1_000);
     assert_eq!(first.machine_cpu_percent, 0.0);
     assert!(Arc::ptr_eq(&first, &first_copy));
+}
+
+#[test]
+fn first_sample_does_not_report_zero_as_a_known_cpu_measurement() {
+    let mut sampler = ProcessSampler::new();
+    let snapshot = sample(
+        &mut sampler,
+        Duration::ZERO,
+        [accessible(117, 1, 10, 1_000)],
+    );
+
+    assert_eq!(snapshot.status, ProcessMetricStatus::Unknown);
+    assert_eq!(snapshot.members[0].machine_cpu_percent, None);
+    assert_eq!(snapshot.members[0].core_equivalent_percent, None);
+}
+
+#[test]
+fn a_counter_reset_is_partial_and_does_not_reuse_the_old_cpu_delta() {
+    let mut sampler = ProcessSampler::new();
+    sample(
+        &mut sampler,
+        Duration::ZERO,
+        [accessible(118, 1, 100, 1_000)],
+    );
+    sample(
+        &mut sampler,
+        Duration::from_millis(100),
+        [accessible(118, 1, 200, 1_000)],
+    );
+
+    let reset = sample(
+        &mut sampler,
+        Duration::from_millis(200),
+        [accessible(118, 1, 50, 1_000)],
+    );
+
+    assert_eq!(reset.status, ProcessMetricStatus::Partial);
+    assert_eq!(reset.machine_cpu_percent, 0.0);
+    assert_eq!(reset.members[0].machine_cpu_percent, None);
+
+    let after_reset = sample(
+        &mut sampler,
+        Duration::from_millis(300),
+        [accessible(118, 1, WALL_TICKS + 50, 1_000)],
+    );
+    assert_eq!(after_reset.status, ProcessMetricStatus::Complete);
+    assert_eq!(after_reset.members[0].core_equivalent_percent, Some(100.0));
+}
+
+#[test]
+fn conflicting_observations_for_one_pid_are_retained_as_one_inaccessible_member() {
+    let unique = devmanager::process::sampler::unique_members([
+        accessible(119, 1, 0, 1_000),
+        accessible(119, 2, 0, 2_000),
+    ]);
+
+    assert_eq!(unique.len(), 1);
+    assert!(matches!(
+        &unique[0],
+        ProcessMemberObservation::Inaccessible(member)
+            if member.pid == 119 && member.reason.as_deref() == Some("conflicting process identities")
+    ));
+}
+
+#[test]
+fn inaccessible_pid_with_a_different_generation_cannot_grant_accessible_identity() {
+    let unique = devmanager::process::sampler::unique_members([
+        inaccessible(121, 1),
+        accessible(121, 2, 0, 1_000),
+    ]);
+
+    assert!(matches!(
+        &unique[..],
+        [ProcessMemberObservation::Inaccessible(member)]
+            if member.pid == 121
+                && member.creation_time_100ns.is_none()
+                && member.reason.as_deref() == Some("conflicting process identities")
+    ));
+}
+
+#[test]
+fn inaccessible_duplicate_with_the_same_generation_is_replaced_by_accessible_identity() {
+    let unique = devmanager::process::sampler::unique_members([
+        inaccessible(122, 1),
+        accessible(122, 1, 0, 1_000),
+    ]);
+
+    assert!(matches!(
+        &unique[..],
+        [ProcessMemberObservation::Accessible(member)]
+            if member.identity.id().pid() == 122
+    ));
+}
+
+#[test]
+fn sampling_budget_fails_closed_before_unbounded_member_work() {
+    let mut sampler = ProcessSampler::new();
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 1);
+    let error = sampler
+        .sample_at_with_budget(
+            Duration::ZERO,
+            LOGICAL_PROCESSORS,
+            [accessible(120, 1, 0, 1_000), accessible(121, 1, 0, 1_000)],
+            &mut budget,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, SamplerError::WorkBudgetExceeded { .. }));
+}
+
+#[test]
+fn zero_member_budget_rejects_any_process_observation() {
+    let mut sampler = ProcessSampler::new();
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 0);
+    let error = sampler
+        .sample_at_with_budget(
+            Duration::ZERO,
+            LOGICAL_PROCESSORS,
+            [accessible(123, 1, 0, 1_000)],
+            &mut budget,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        SamplerError::WorkBudgetExceeded {
+            attempted: 1,
+            max: 0
+        }
+    );
 }

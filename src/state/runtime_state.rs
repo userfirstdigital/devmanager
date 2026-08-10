@@ -1,3 +1,4 @@
+pub use crate::domain::snapshot::ProcessMetricStatus;
 use crate::terminal::session::TerminalBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -129,7 +130,46 @@ pub struct ProcessResourceNode {
     pub parent_pid: Option<u32>,
     pub name: String,
     pub cpu_percent: f32,
+    /// Unclamped core-equivalent percentage retained for diagnostics. The
+    /// user-facing `cpu_percent` remains the whole-machine Task Manager
+    /// projection in `0..=100`.
+    #[serde(default)]
+    pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
+    /// Exact process generation when the operating system exposed it. A PID
+    /// without creation time is never sufficient for control decisions.
+    #[serde(default)]
+    pub creation_time_100ns: Option<u64>,
+    /// Canonical executable identity, kept separate from the friendly label.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Safe allowlisted command-shape label; raw command lines are never
+    /// retained in the runtime projection.
+    #[serde(default)]
+    pub command_label: Option<String>,
+    /// Durable resource/session association used by the process monitor.
+    #[serde(default)]
+    pub resource_id: Option<String>,
+    #[serde(default)]
+    pub resource_kind: Option<String>,
+    #[serde(default)]
+    pub child_count: u32,
+    #[serde(default)]
+    pub lifecycle: ProcessResourceLifecycle,
+    #[serde(default)]
+    pub metrics_status: ProcessMetricStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessResourceLifecycle {
+    Starting,
+    #[default]
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+    Unknown,
 }
 
 fn default_logical_cpu_count() -> u32 {
@@ -157,6 +197,11 @@ pub fn equivalent_cpu_cores(system_cpu_percent: f32, logical_cpu_count: u32) -> 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
+    /// Unclamped aggregate core-equivalent percentage retained for
+    /// diagnostics. The user-facing `cpu_percent` remains the whole-machine
+    /// Task Manager projection in `0..=100`.
+    #[serde(default)]
+    pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
     pub process_count: u32,
     pub process_ids: Vec<u32>,
@@ -164,6 +209,15 @@ pub struct ResourceSnapshot {
     /// explicitly partial rather than silently presented as complete.
     #[serde(default)]
     pub metrics_unavailable: bool,
+    /// Typed confidence for the entire resource sample. `cpu_percent == 0`
+    /// with `unknown` or `failed` is intentionally distinguishable from an
+    /// observed idle process.
+    #[serde(default)]
+    pub metrics_status: ProcessMetricStatus,
+    #[serde(default)]
+    pub metrics_error: Option<String>,
+    #[serde(default)]
+    pub sampling_generation: u64,
     #[serde(default)]
     pub io_read_bytes: Option<u64>,
     #[serde(default)]
@@ -182,10 +236,14 @@ impl Default for ResourceSnapshot {
     fn default() -> Self {
         Self {
             cpu_percent: 0.0,
+            core_equivalent_percent: 0.0,
             memory_bytes: 0,
             process_count: 0,
             process_ids: Vec::new(),
             metrics_unavailable: false,
+            metrics_status: ProcessMetricStatus::Unknown,
+            metrics_error: None,
+            sampling_generation: 0,
             io_read_bytes: None,
             io_write_bytes: None,
             processes: Vec::new(),
@@ -197,7 +255,13 @@ impl Default for ResourceSnapshot {
 
 impl ResourceSnapshot {
     pub fn equivalent_cpu_cores(&self) -> f32 {
-        equivalent_cpu_cores(self.cpu_percent, self.logical_cpu_count)
+        if (self.core_equivalent_percent.is_finite() && self.core_equivalent_percent > 0.0)
+            || self.cpu_percent == 0.0
+        {
+            self.core_equivalent_percent / 100.0
+        } else {
+            equivalent_cpu_cores(self.cpu_percent, self.logical_cpu_count)
+        }
     }
 }
 

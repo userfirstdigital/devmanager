@@ -8,6 +8,7 @@ use gpui::{
     Window,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMonitorState {
@@ -184,6 +185,8 @@ fn render_session_card(
     let memory = entry.memory_bytes;
     let process_count = entry.process_count;
     let metrics_unavailable = entry.metrics_unavailable;
+    let metrics_status = entry.metrics_status;
+    let core_equivalent_percent = entry.core_equivalent_percent;
     let unreaped = entry.unreaped;
     let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
@@ -273,7 +276,7 @@ fn render_session_card(
                                                 }))
                                                 .child(status_label),
                                         )
-                                        .children(metrics_unavailable.then(|| {
+                                        .children((metrics_unavailable || metrics_status != crate::domain::snapshot::ProcessMetricStatus::Complete).then(|| {
                                             div()
                                                 .px(px(5.0))
                                                 .py(px(1.0))
@@ -281,7 +284,7 @@ fn render_session_card(
                                                 .bg(rgb(theme::PRIMARY_MUTED))
                                                 .text_xs()
                                                 .text_color(rgb(theme::WARNING_TEXT))
-                                                .child("Partial metrics")
+                                                .child(SharedString::from(process_metrics_label(metrics_status)))
                                                 .into_any_element()
                                         })),
                                 )
@@ -290,15 +293,21 @@ fn render_session_card(
                                         .text_xs()
                                         .text_color(rgb(theme::TEXT_SUBTLE))
                                         .child(SharedString::from(format!(
-                                            "{project_name} · {} · {process_count} proc · {:.1}% machine CPU · private {}{}",
+                                            "{project_name} · {} · {process_count} proc · {} · private {}{}",
                                             root_pid
                                                 .map(|pid| format!("pid {pid}"))
                                                 .unwrap_or_else(|| "no root pid".to_string()),
-                                            cpu,
+                                            format_cpu_detail_with_core(
+                                                cpu,
+                                                core_equivalent_percent,
+                                                logical_cpu_count,
+                                            ),
                                             format_memory(memory),
-                                            metrics_unavailable
-                                                .then_some(" · partial")
-                                                .unwrap_or_default(),
+                                            if metrics_unavailable {
+                                                " · partial"
+                                            } else {
+                                                ""
+                                            },
                                         ))),
                                 ),
                         ),
@@ -368,6 +377,25 @@ fn render_process_row(
     let indent = if is_root { 0.0 } else { 16.0 };
     let session_id = session_id.to_string();
     let pid = node.pid;
+    let resource_label = node
+        .resource_kind
+        .clone()
+        .unwrap_or_else(|| "resource".to_string());
+    let command_label = node
+        .command_label
+        .clone()
+        .unwrap_or_else(|| node.name.clone());
+    let metrics_label = process_metrics_label(node.metrics_status);
+    let identity_label = node
+        .creation_time_100ns
+        .map(|creation| format!("pid {pid} · start {creation}"))
+        .unwrap_or_else(|| format!("pid {pid} · identity pending"));
+    let executable_label = node
+        .executable
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "executable unknown".to_string());
 
     div()
         .flex()
@@ -394,13 +422,26 @@ fn render_process_row(
                     div()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
-                        .child(SharedString::from(format!("pid {}", node.pid))),
+                        .child(SharedString::from(identity_label)),
                 )
                 .child(div().text_xs().text_color(rgb(theme::TEXT_SUBTLE)).child(
                     SharedString::from(format!(
-                        "{} · {}",
-                        format_cpu_detail(node.cpu_percent, logical_cpu_count),
-                        format_memory(node.memory_bytes)
+                        "{} · {} · {} · {} · {} child{}{}",
+                        format_cpu_detail_with_core(
+                            node.cpu_percent,
+                            node.core_equivalent_percent,
+                            logical_cpu_count,
+                        ),
+                        format_memory(node.memory_bytes),
+                        resource_label,
+                        command_label,
+                        executable_label,
+                        node.child_count,
+                        if metrics_label.is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(" · {metrics_label}")
+                        }
                     )),
                 )),
         )
@@ -423,6 +464,15 @@ fn render_process_row(
                     (actions.on_action)(ProcessMonitorAction::KillProcessTree { session_id, pid }),
                 )),
         )
+}
+
+fn process_metrics_label(status: crate::domain::snapshot::ProcessMetricStatus) -> &'static str {
+    match status {
+        crate::domain::snapshot::ProcessMetricStatus::Complete => "",
+        crate::domain::snapshot::ProcessMetricStatus::Partial => "partial metrics",
+        crate::domain::snapshot::ProcessMetricStatus::Unknown => "metrics unknown",
+        crate::domain::snapshot::ProcessMetricStatus::Failed => "metrics failed",
+    }
 }
 
 fn render_text_button(
@@ -489,9 +539,11 @@ fn process_monitor_entries(
                 status_label: session_status_label(&session),
                 pid: session.pid,
                 cpu_percent: session.resources.cpu_percent,
+                core_equivalent_percent: session.resources.core_equivalent_percent,
                 memory_bytes: session.resources.memory_bytes,
                 process_count,
                 metrics_unavailable: session.resources.metrics_unavailable,
+                metrics_status: session.resources.metrics_status,
                 unreaped: session.reap_incomplete,
                 logical_cpu_count: session.resources.logical_cpu_count.max(1),
                 processes: ordered_process_nodes(&session),
@@ -572,7 +624,16 @@ fn ordered_process_nodes(session: &SessionRuntimeState) -> Vec<ProcessResourceNo
             parent_pid: None,
             name: format!("pid-{pid} (compatibility-only observation)"),
             cpu_percent: 0.0,
+            core_equivalent_percent: 0.0,
             memory_bytes: 0,
+            creation_time_100ns: None,
+            executable: None,
+            command_label: None,
+            resource_id: None,
+            resource_kind: None,
+            child_count: 0,
+            lifecycle: crate::state::ProcessResourceLifecycle::Unknown,
+            metrics_status: crate::domain::snapshot::ProcessMetricStatus::Unknown,
         })
         .collect()
 }
@@ -640,15 +701,23 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-fn format_cpu_detail(system_cpu_percent: f32, logical_cpu_count: u32) -> String {
-    let cores = crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count);
+fn format_cpu_detail_with_core(
+    system_cpu_percent: f32,
+    core_equivalent_percent: f32,
+    logical_cpu_count: u32,
+) -> String {
+    let cores = if core_equivalent_percent.is_finite() && core_equivalent_percent > 0.0 {
+        core_equivalent_percent / 100.0
+    } else {
+        crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count)
+    };
     format!("{system_cpu_percent:.1}% machine · {cores:.2} cores")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_cpu_detail, monitor_sessions, ordered_process_nodes, pointer_disposition,
+        format_cpu_detail_with_core, monitor_sessions, ordered_process_nodes, pointer_disposition,
         process_monitor_entries, session_label, PointerDisposition, PointerTarget,
     };
     use crate::models::Project;
@@ -722,14 +791,32 @@ mod tests {
                     parent_pid: Some(10),
                     name: "node".to_string(),
                     cpu_percent: 1.0,
+                    core_equivalent_percent: 1.0,
                     memory_bytes: 100,
+                    creation_time_100ns: None,
+                    executable: None,
+                    command_label: Some("node".to_string()),
+                    resource_id: None,
+                    resource_kind: None,
+                    child_count: 0,
+                    lifecycle: crate::state::ProcessResourceLifecycle::Running,
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                 },
                 ProcessResourceNode {
                     pid: 10,
                     parent_pid: None,
                     name: "shell".to_string(),
                     cpu_percent: 0.1,
+                    core_equivalent_percent: 0.1,
                     memory_bytes: 50,
+                    creation_time_100ns: None,
+                    executable: None,
+                    command_label: Some("shell".to_string()),
+                    resource_id: None,
+                    resource_kind: None,
+                    child_count: 1,
+                    lifecycle: crate::state::ProcessResourceLifecycle::Running,
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
                 },
             ],
             ..Default::default()
@@ -864,10 +951,21 @@ mod tests {
     #[test]
     fn cpu_detail_explains_machine_percent_and_equivalent_cores() {
         assert_eq!(
-            format_cpu_detail(1.953_125, 64),
+            format_cpu_detail_with_core(1.953_125, 0.0, 64),
             "2.0% machine · 1.25 cores"
         );
-        assert_eq!(format_cpu_detail(0.0, 1), "0.0% machine · 0.00 cores");
+        assert_eq!(
+            format_cpu_detail_with_core(0.0, 0.0, 1),
+            "0.0% machine · 0.00 cores"
+        );
+        assert_eq!(
+            format_cpu_detail_with_core(100.0, 1_600.0, 8),
+            "100.0% machine · 16.00 cores"
+        );
+        assert_eq!(
+            format_cpu_detail_with_core(100.0, 1_600.0, 8),
+            "100.0% machine · 16.00 cores"
+        );
     }
 }
 
@@ -881,9 +979,11 @@ struct ProcessMonitorEntry {
     status_label: &'static str,
     pid: Option<u32>,
     cpu_percent: f32,
+    core_equivalent_percent: f32,
     memory_bytes: u64,
     process_count: u32,
     metrics_unavailable: bool,
+    metrics_status: crate::domain::snapshot::ProcessMetricStatus,
     unreaped: bool,
     logical_cpu_count: u32,
     processes: Vec<ProcessResourceNode>,

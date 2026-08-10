@@ -441,6 +441,31 @@ impl<'de> Deserialize<'de> for ArtifactContentPage {
     }
 }
 
+/// The confidence of a background-produced process accounting sample.
+///
+/// A numeric zero is not a substitute for a failed query or an unavailable
+/// first-sample baseline. Consumers must inspect this status before treating
+/// CPU/resource values as complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMetricStatus {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+    Failed,
+}
+
+impl ProcessMetricStatus {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    pub fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
 /// Immutable, background-produced accounting for one owned process tree.
 ///
 /// This is intentionally a runtime projection rather than a durable domain
@@ -457,6 +482,13 @@ pub struct ProcessAccountingSnapshot {
     pub memory_bytes: u64,
     pub process_count: u32,
     pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    /// A bounded, sanitized diagnostic for a failed/partial observation. Raw
+    /// command lines and environment values never enter this projection.
+    pub error: Option<String>,
+    /// Monotonic sampler generation. A new generation fences PID reuse and
+    /// counter baselines even when a PID number is recycled.
+    pub generation: u64,
     pub io_read_bytes: Option<u64>,
     pub io_write_bytes: Option<u64>,
     pub members: Vec<ProcessAccountingMemberSnapshot>,
@@ -475,4 +507,7 @@ pub struct ProcessAccountingMemberSnapshot {
     pub io_read_bytes: Option<u64>,
     pub io_write_bytes: Option<u64>,
     pub metrics_unavailable: bool,
+    pub status: ProcessMetricStatus,
+    pub executable: Option<String>,
+    pub generation: u64,
 }
