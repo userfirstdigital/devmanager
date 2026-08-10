@@ -282,6 +282,7 @@ thread_local! {
 /// owned by one of these workers until it observes cancellation and settles.
 pub const CAPTURE_EXECUTOR_WORKERS: usize = 4;
 const CAPTURE_EXECUTOR_QUEUE: usize = 32;
+const CAPTURE_EXECUTOR_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 type CaptureJobFn = Box<dyn FnOnce() + Send + 'static>;
 type PublicationCallback = Box<dyn FnOnce() + Send + 'static>;
 
@@ -305,6 +306,7 @@ fn run_in_capture_executor_worker<F: FnOnce()>(job: F) {
 struct CaptureExecutor {
     sender: SyncSender<CaptureJob>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 struct CaptureTask<T> {
@@ -327,6 +329,10 @@ pub struct CaptureOutputAuthority {
     root_handle: Arc<std::os::windows::io::OwnedHandle>,
     #[cfg(windows)]
     parent_handle: Arc<std::os::windows::io::OwnedHandle>,
+    #[cfg(unix)]
+    root_handle: Arc<std::os::fd::OwnedFd>,
+    #[cfg(unix)]
+    parent_handle: Arc<std::os::fd::OwnedFd>,
 }
 
 impl PartialEq for CaptureOutputAuthority {
@@ -397,15 +403,32 @@ impl CaptureOutputAuthority {
         }
         #[cfg(not(windows))]
         {
-            let root_identity = capture_file_identity(&root_path)?;
-            let parent_identity = capture_file_identity(&parent_path)?;
-            Ok(Self {
-                root_path,
-                parent_path,
-                output_name,
-                root_identity,
-                parent_identity,
-            })
+            #[cfg(unix)]
+            {
+                let (root_handle, root_identity) = open_directory_authority(&root_path)?;
+                let (parent_handle, parent_identity) = open_directory_authority(&parent_path)?;
+                return Ok(Self {
+                    root_path,
+                    parent_path,
+                    output_name,
+                    root_identity,
+                    parent_identity,
+                    root_handle: Arc::new(root_handle),
+                    parent_handle: Arc::new(parent_handle),
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                let root_identity = capture_file_identity(&root_path)?;
+                let parent_identity = capture_file_identity(&parent_path)?;
+                Ok(Self {
+                    root_path,
+                    parent_path,
+                    output_name,
+                    root_identity,
+                    parent_identity,
+                })
+            }
         }
     }
 
@@ -421,14 +444,22 @@ impl CaptureOutputAuthority {
         }
         #[cfg(not(windows))]
         {
-            if capture_file_identity(&self.root_path).ok() != Some(self.root_identity)
-                || capture_file_identity(&self.parent_path).ok() != Some(self.parent_identity)
+            #[cfg(unix)]
             {
-                return Err(PreviewCaptureError::OutputFailed(
-                    "trusted preview output authority changed during capture".into(),
-                ));
+                let _ = self.reopen_parent_for_publication()?;
+                return Ok(());
             }
-            Ok(())
+            #[cfg(not(unix))]
+            {
+                if capture_file_identity(&self.root_path).ok() != Some(self.root_identity)
+                    || capture_file_identity(&self.parent_path).ok() != Some(self.parent_identity)
+                {
+                    return Err(PreviewCaptureError::OutputFailed(
+                        "trusted preview output authority changed during capture".into(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -459,6 +490,36 @@ impl CaptureOutputAuthority {
                     "trusted preview output parent handle changed during capture".into(),
                 )
             })?;
+        if root_identity != self.root_identity || retained_root_identity != self.root_identity {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output root changed during capture".into(),
+            ));
+        }
+        if parent_identity != self.parent_identity
+            || retained_parent_identity != self.parent_identity
+        {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output parent changed during capture".into(),
+            ));
+        }
+        Ok(parent_handle)
+    }
+
+    #[cfg(unix)]
+    fn reopen_parent_for_publication(&self) -> Result<std::os::fd::OwnedFd, PreviewCaptureError> {
+        let (_, root_identity) = open_directory_authority(&self.root_path).map_err(|_| {
+            PreviewCaptureError::OutputFailed(
+                "trusted preview output root changed during capture".into(),
+            )
+        })?;
+        let retained_root_identity = directory_identity_from_handle(&self.root_handle)?;
+        let (parent_handle, parent_identity) = open_directory_authority(&self.parent_path)
+            .map_err(|_| {
+                PreviewCaptureError::OutputFailed(
+                    "trusted preview output parent changed during capture".into(),
+                )
+            })?;
+        let retained_parent_identity = directory_identity_from_handle(&self.parent_handle)?;
         if root_identity != self.root_identity || retained_root_identity != self.root_identity {
             return Err(PreviewCaptureError::OutputFailed(
                 "trusted preview output root changed during capture".into(),
@@ -592,6 +653,50 @@ fn open_directory_authority(
                 | u64::from(information.nFileIndexLow),
         },
     ))
+}
+
+#[cfg(unix)]
+fn directory_identity_from_handle(
+    handle: &std::os::fd::OwnedFd,
+) -> Result<CaptureFileIdentity, PreviewCaptureError> {
+    use std::os::fd::AsRawFd;
+    let mut information = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(handle.as_raw_fd(), information.as_mut_ptr()) };
+    if result != 0 {
+        return Err(PreviewCaptureError::OutputFailed(
+            "output authority identity failed".into(),
+        ));
+    }
+    let information = unsafe { information.assume_init() };
+    if information.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(PreviewCaptureError::OutputFailed(
+            "preview output authority is not a regular directory".into(),
+        ));
+    }
+    Ok(CaptureFileIdentity {
+        dev: information.st_dev as u64,
+        inode: information.st_ino as u64,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_authority(
+    path: &Path,
+) -> Result<(std::os::fd::OwnedFd, CaptureFileIdentity), PreviewCaptureError> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            PreviewCaptureError::OutputFailed(format!("output authority open failed ({})", error))
+        })?;
+    let raw = file.into_raw_fd();
+    let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let identity = directory_identity_from_handle(&handle)?;
+    Ok((handle, identity))
 }
 
 pub fn active_capture_thread_count() -> usize {
@@ -860,9 +965,11 @@ fn capture_executor() -> &'static CaptureExecutor {
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<CaptureJob>(CAPTURE_EXECUTOR_QUEUE);
         let receiver = Arc::new(Mutex::new(receiver));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(CAPTURE_EXECUTOR_WORKERS);
         for index in 0..CAPTURE_EXECUTOR_WORKERS {
             let receiver = Arc::clone(&receiver);
+            let shutdown_requested = Arc::clone(&shutdown_requested);
             let waiter = std::thread::Builder::new()
                 .name(format!("devmanager-capture-executor-{index}"))
                 .spawn(move || loop {
@@ -871,7 +978,11 @@ fn capture_executor() -> &'static CaptureExecutor {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .recv();
                     match job {
-                        Ok(CaptureJob::Run(job)) => run_in_capture_executor_worker(job),
+                        Ok(CaptureJob::Run(job)) => {
+                            if !shutdown_requested.load(Ordering::Acquire) {
+                                run_in_capture_executor_worker(job);
+                            }
+                        }
                         Ok(CaptureJob::Shutdown) => break,
                         Err(_) => break,
                     }
@@ -882,6 +993,7 @@ fn capture_executor() -> &'static CaptureExecutor {
         CaptureExecutor {
             sender,
             workers: Mutex::new(workers),
+            shutdown_requested,
         }
     })
 }
@@ -891,22 +1003,100 @@ fn capture_executor() -> &'static CaptureExecutor {
 /// independent preview requests; callers that own the process shutdown point
 /// can use this to join every worker and prove that no capture worker remains.
 #[doc(hidden)]
-pub fn shutdown_capture_executor() {
+pub fn shutdown_capture_executor() -> CaptureExecutorShutdownReport {
+    shutdown_capture_executor_with_deadline(CAPTURE_EXECUTOR_SHUTDOWN_BUDGET)
+}
+
+/// A bounded shutdown never drops a live `JoinHandle`: workers that do not
+/// observe cancellation before the deadline stay retained by the executor
+/// and are reported as visible leaks. A later shutdown call can join them
+/// after their blocking operation settles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CaptureExecutorShutdownReport {
+    pub workers_stopped: usize,
+    pub workers_leaked: usize,
+    pub shutdown_requested: bool,
+}
+
+impl std::fmt::Debug for CaptureExecutorShutdownReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureExecutorShutdownReport")
+            .field("workers_stopped", &self.workers_stopped)
+            .field("workers_leaked", &self.workers_leaked)
+            .field("shutdown_requested", &self.shutdown_requested)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for CaptureExecutorShutdownReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CaptureExecutorShutdownReport(stopped={}, leaked={}, requested={})",
+            self.workers_stopped, self.workers_leaked, self.shutdown_requested
+        )
+    }
+}
+
+#[doc(hidden)]
+pub fn shutdown_capture_executor_with_deadline(budget: Duration) -> CaptureExecutorShutdownReport {
     let Some(executor) = CAPTURE_EXECUTOR.get() else {
-        return;
+        return CaptureExecutorShutdownReport {
+            workers_stopped: 0,
+            workers_leaked: 0,
+            shutdown_requested: false,
+        };
     };
+    executor.shutdown_requested.store(true, Ordering::Release);
+    let shutdown_deadline = Instant::now() + budget;
     let mut workers = executor
         .workers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if workers.is_empty() {
-        return;
+        return CaptureExecutorShutdownReport {
+            workers_stopped: 0,
+            workers_leaked: 0,
+            shutdown_requested: true,
+        };
     }
-    for _ in 0..workers.len() {
-        let _ = executor.sender.send(CaptureJob::Shutdown);
+    // `send` could block behind the bounded queue. Try until the same
+    // shutdown deadline while workers discard queued work after cancellation.
+    let mut shutdown_messages = workers.len();
+    while shutdown_messages > 0 && Instant::now() < shutdown_deadline {
+        match executor.sender.try_send(CaptureJob::Shutdown) {
+            Ok(()) => shutdown_messages -= 1,
+            Err(TrySendError::Full(job)) => {
+                let _ = job;
+                std::thread::yield_now();
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+        }
     }
-    while let Some(worker) = workers.pop() {
-        let _ = worker.join();
+
+    while Instant::now() < shutdown_deadline && workers.iter().any(|worker| !worker.is_finished()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut retained = Vec::with_capacity(workers.len());
+    let mut workers_stopped = 0;
+    let mut workers_leaked = 0;
+    for worker in workers.drain(..) {
+        if worker.is_finished() {
+            let _ = worker.join();
+            workers_stopped += 1;
+        } else {
+            // Retaining the handle is the ownership boundary: dropping it
+            // would detach a worker that can still mutate capture state.
+            retained.push(worker);
+            workers_leaked += 1;
+        }
+    }
+    *workers = retained;
+    CaptureExecutorShutdownReport {
+        workers_stopped,
+        workers_leaked,
+        shutdown_requested: true,
     }
 }
 
@@ -934,6 +1124,14 @@ where
     F: FnOnce() -> Result<T, PreviewCaptureError> + Send + 'static,
     T: Send + 'static,
 {
+    if capture_executor()
+        .shutdown_requested
+        .load(Ordering::Acquire)
+    {
+        return Err(PreviewCaptureError::CaptureFailed(
+            "capture executor is shutting down".into(),
+        ));
+    }
     let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
     let job = CaptureJob::Run(Box::new(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup))
@@ -1677,10 +1875,11 @@ fn open_temp_output(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Publish a fully synced temporary PNG without following a reparse point at
-/// the final file boundary.  Windows uses the open temporary-file handle and
-/// a no-follow parent handle for the rename; this avoids resolving a swapped
-/// destination path after the validation pass.  Other platforms retain the
-/// native atomic same-directory rename.
+/// the final file boundary. Windows uses the open temporary-file handle and a
+/// no-follow parent handle. Linux uses the held parent descriptor plus the
+/// open inode (`linkat(AT_EMPTY_PATH)`) so a swapped temporary path cannot
+/// replace the source. Other Unix platforms fail closed rather than resolving
+/// an absolute parent path after validation.
 fn atomic_publish_temp(
     temp: &Path,
     authority: &CaptureOutputAuthority,
@@ -1692,8 +1891,82 @@ fn atomic_publish_temp(
     }
     #[cfg(not(windows))]
     {
-        let _ = file;
-        fs::rename(temp, authority.output_path())
+        #[cfg(unix)]
+        {
+            return atomic_publish_temp_unix(temp, authority, file);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (temp, authority, file);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "handle-relative preview publication is unsupported on this platform",
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn atomic_publish_temp_unix(
+    temp: &Path,
+    authority: &CaptureOutputAuthority,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = authority.reopen_parent_for_publication().map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+    })?;
+    let temp_name = temp.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temporary preview has no name",
+        )
+    })?;
+    let temp_name = CString::new(temp_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temporary preview name is invalid",
+        )
+    })?;
+    let output_name = CString::new(authority.output_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview output name is invalid",
+        )
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // Link the held inode directly into the held directory. This is the
+        // no-follow equivalent of renaming the open temp handle and refuses
+        // to replace a destination created after validation.
+        let empty = [0_i8];
+        let result = unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                parent.as_raw_fd(),
+                output_name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0) };
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (temp_name, file);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "handle-relative preview publication is unsupported on this Unix platform",
+        ))
     }
 }
 
@@ -2478,6 +2751,7 @@ mod windows_capture_impl {
         let lease = generation.begin();
         let worker_lease = lease.clone();
         let worker_authority = Arc::clone(&authority);
+        let window_hold_ms = request.window_hold_ms();
         let task = spawn_capture_worker(move || {
             catch_unwind(AssertUnwindSafe(|| {
                 run_preview_application(
@@ -2486,6 +2760,7 @@ mod windows_capture_impl {
                     foreground_before,
                     deadline,
                     worker_lease.clone(),
+                    window_hold_ms,
                 )
             }))
             .unwrap_or_else(|_| {
@@ -2534,6 +2809,7 @@ mod windows_capture_impl {
         foreground_before: isize,
         deadline: CaptureDeadline,
         lease: CaptureLease,
+        window_hold_ms: u32,
     ) -> Result<CaptureReport, PreviewCaptureError> {
         lease.check(deadline)?;
         let result_slot = Arc::new(Mutex::new(None));
@@ -2644,6 +2920,15 @@ mod windows_capture_impl {
                 store_capture_result(&result_for_app, &lease_for_app, Err(error));
                 cx.quit();
                 return;
+            }
+
+            if window_hold_ms > 0 {
+                std::thread::sleep(Duration::from_millis(u64::from(window_hold_ms)));
+                if let Err(error) = lease_for_app.check(deadline) {
+                    store_capture_result(&result_for_app, &lease_for_app, Err(error));
+                    cx.quit();
+                    return;
+                }
             }
 
             let result_for_task = Arc::clone(&result_for_app);

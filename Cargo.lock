@@ -1947,6 +1947,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "image",
+ "libc",
  "mime_guess",
  "portable-pty",
  "qrcode",

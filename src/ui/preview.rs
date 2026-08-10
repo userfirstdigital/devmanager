@@ -5,15 +5,17 @@ use gpui::{
     Styled, Window,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::assets::AppAssets;
@@ -132,6 +134,46 @@ pub enum GalleryState {
     Selected,
     Status,
 }
+
+/// One deterministic gallery capture page. A single page contains one
+/// theme/density/scale tuple and all reusable interaction states, so the
+/// 640x360 native surface never has to render sixteen wide rows at once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GalleryPage {
+    pub theme: GalleryTheme,
+    pub density: GalleryDensity,
+    pub scale: u16,
+    pub state_page: u8,
+    pub status_page: u8,
+    pub sample_page: u8,
+    pub section: GalleryPageSection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GalleryPageSection {
+    States,
+    Status,
+    Samples,
+}
+
+impl Default for GalleryPage {
+    fn default() -> Self {
+        Self {
+            theme: GalleryTheme::Dark,
+            density: GalleryDensity::Compact,
+            scale: 100,
+            state_page: 0,
+            status_page: 0,
+            sample_page: 0,
+            section: GalleryPageSection::States,
+        }
+    }
+}
+
+pub const GALLERY_PAGE_COLUMNS: u16 = 1;
+pub const GALLERY_PAGE_ROWS: u16 = 3;
+const GALLERY_PAGE_GAP_PX: f32 = 8.0;
+const GALLERY_CONTENT_WIDTH_PX: f32 = 608.0;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -300,6 +342,9 @@ impl PreviewPathPolicy {
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
+    gallery_page: Option<GalleryPage>,
+    window_hold_ms: u32,
+    fixture_authority: Arc<FixtureFileAuthority>,
     trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
 }
 
@@ -307,6 +352,8 @@ impl PartialEq for PreviewRequest {
     fn eq(&self, other: &Self) -> bool {
         self.fixture_path == other.fixture_path
             && self.output_path == other.output_path
+            && self.gallery_page == other.gallery_page
+            && self.window_hold_ms == other.window_hold_ms
             && self.trusted_output_authority == other.trusted_output_authority
     }
 }
@@ -320,6 +367,14 @@ impl PreviewRequest {
 
     pub fn output_path(&self) -> &Path {
         &self.output_path
+    }
+
+    pub fn gallery_page(&self) -> Option<GalleryPage> {
+        self.gallery_page
+    }
+
+    pub(crate) fn window_hold_ms(&self) -> u32 {
+        self.window_hold_ms
     }
 
     pub(crate) fn capture_authority(&self) -> &Arc<preview_capture::CaptureOutputAuthority> {
@@ -373,29 +428,7 @@ impl PreviewRequest {
                 safe_preview_path(&fixture_path)
             )));
         }
-        match fs::metadata(&fixture_path) {
-            Ok(metadata) if metadata.is_file() => {
-                if metadata.len() > MAX_FIXTURE_BYTES {
-                    return Err(PreviewError::FixtureTooLarge {
-                        path: fixture_path,
-                        bytes: metadata.len(),
-                        max_bytes: MAX_FIXTURE_BYTES,
-                    });
-                }
-            }
-            Ok(_) => {
-                return Err(PreviewError::FixtureNotRegular { path: fixture_path });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PreviewError::FixtureMissing { path: fixture_path });
-            }
-            Err(error) => {
-                return Err(PreviewError::FixtureIo {
-                    path: fixture_path,
-                    message: error.to_string(),
-                });
-            }
-        }
+        let fixture_authority = open_fixture_authority(&fixture_path)?;
 
         let output_check = checked_path(&output_path)?;
         let output_root = checked_path(policy.output_root())?;
@@ -444,6 +477,9 @@ impl PreviewRequest {
         Ok(Self {
             fixture_path,
             output_path,
+            gallery_page: None,
+            window_hold_ms: 0,
+            fixture_authority,
             trusted_output_authority: Arc::new(trusted_output_authority),
         })
     }
@@ -460,6 +496,14 @@ where
     let mut args = args.into_iter().map(Into::into);
     let mut fixture = None;
     let mut output = None;
+    let mut gallery_theme = None;
+    let mut gallery_density = None;
+    let mut gallery_scale = None;
+    let mut gallery_state_page = None;
+    let mut gallery_status_page = None;
+    let mut gallery_sample_page = None;
+    let mut gallery_section = None;
+    let mut window_hold_ms = None;
     let mut saw_argument = false;
 
     while let Some(argument) = args.next() {
@@ -485,6 +529,153 @@ where
                     PreviewError::Usage("--output requires a PNG path".to_string())
                 })?));
             }
+            "--theme" => {
+                if gallery_theme.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--theme may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--theme requires dark or light".to_string())
+                })?;
+                gallery_theme = Some(match value.to_string_lossy().as_ref() {
+                    "dark" => GalleryTheme::Dark,
+                    "light" => GalleryTheme::Light,
+                    _ => {
+                        return Err(PreviewError::Usage(
+                            "--theme requires dark or light".to_string(),
+                        ));
+                    }
+                });
+            }
+            "--density" => {
+                if gallery_density.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--density may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--density requires compact or comfortable".to_string())
+                })?;
+                gallery_density = Some(match value.to_string_lossy().as_ref() {
+                    "compact" => GalleryDensity::Compact,
+                    "comfortable" => GalleryDensity::Comfortable,
+                    _ => {
+                        return Err(PreviewError::Usage(
+                            "--density requires compact or comfortable".to_string(),
+                        ));
+                    }
+                });
+            }
+            "--scale" => {
+                if gallery_scale.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--scale may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--scale requires 100, 125, 150, or 200".to_string())
+                })?;
+                gallery_scale = Some(value.to_string_lossy().parse::<u16>().map_err(|_| {
+                    PreviewError::Usage("--scale requires 100, 125, 150, or 200".to_string())
+                })?);
+            }
+            "--state-page" => {
+                if gallery_state_page.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--state-page may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--state-page requires 0, 1, or 2".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u8>().map_err(|_| {
+                    PreviewError::Usage("--state-page requires 0, 1, or 2".to_string())
+                })?;
+                if value >= 3 {
+                    return Err(PreviewError::Usage(
+                        "--state-page requires 0, 1, or 2".to_string(),
+                    ));
+                }
+                gallery_state_page = Some(value);
+            }
+            "--status-page" => {
+                if gallery_status_page.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--status-page may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--status-page requires 0 or 1".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u8>().map_err(|_| {
+                    PreviewError::Usage("--status-page requires 0 or 1".to_string())
+                })?;
+                if value >= 2 {
+                    return Err(PreviewError::Usage(
+                        "--status-page requires 0 or 1".to_string(),
+                    ));
+                }
+                gallery_status_page = Some(value);
+            }
+            "--sample-page" => {
+                if gallery_sample_page.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--sample-page may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--sample-page requires 0 or 1".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u8>().map_err(|_| {
+                    PreviewError::Usage("--sample-page requires 0 or 1".to_string())
+                })?;
+                if value >= 2 {
+                    return Err(PreviewError::Usage(
+                        "--sample-page requires 0 or 1".to_string(),
+                    ));
+                }
+                gallery_sample_page = Some(value);
+            }
+            "--section" => {
+                if gallery_section.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--section may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--section requires states or samples".to_string())
+                })?;
+                gallery_section = Some(match value.to_string_lossy().as_ref() {
+                    "states" => GalleryPageSection::States,
+                    "status" => GalleryPageSection::Status,
+                    "samples" => GalleryPageSection::Samples,
+                    _ => {
+                        return Err(PreviewError::Usage(
+                            "--section requires states or samples".to_string(),
+                        ));
+                    }
+                });
+            }
+            "--hold-ms" => {
+                if window_hold_ms.is_some() {
+                    return Err(PreviewError::Usage(
+                        "--hold-ms may be supplied only once".to_string(),
+                    ));
+                }
+                let value = args.next().ok_or_else(|| {
+                    PreviewError::Usage("--hold-ms requires a bounded duration".to_string())
+                })?;
+                let value = value.to_string_lossy().parse::<u32>().map_err(|_| {
+                    PreviewError::Usage("--hold-ms requires a bounded duration".to_string())
+                })?;
+                if value > 2_000 {
+                    return Err(PreviewError::Usage(
+                        "--hold-ms must be at most 2000 milliseconds".to_string(),
+                    ));
+                }
+                window_hold_ms = Some(value);
+            }
             other => {
                 let _ = other;
                 return Err(PreviewError::Usage("unknown preview argument".to_string()));
@@ -498,7 +689,29 @@ where
 
     let fixture = fixture.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
     let output = output.ok_or_else(|| PreviewError::Usage(PREVIEW_USAGE.to_string()))?;
-    PreviewRequest::validate(fixture, output, policy)
+    let mut request = PreviewRequest::validate(fixture, output, policy)?;
+    match (gallery_theme, gallery_density, gallery_scale) {
+        (None, None, None) => {}
+        (Some(theme), Some(density), Some(scale)) if [100, 125, 150, 200].contains(&scale) => {
+            request.gallery_page = Some(GalleryPage {
+                theme,
+                density,
+                scale,
+                state_page: gallery_state_page.unwrap_or_default(),
+                status_page: gallery_status_page.unwrap_or_default(),
+                sample_page: gallery_sample_page.unwrap_or_default(),
+                section: gallery_section.unwrap_or(GalleryPageSection::States),
+            });
+        }
+        _ => {
+            return Err(PreviewError::Usage(
+                "--theme, --density, and --scale must be supplied together with a supported scale"
+                    .to_string(),
+            ));
+        }
+    }
+    request.window_hold_ms = window_hold_ms.unwrap_or_default();
+    Ok(request)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -528,6 +741,7 @@ pub struct PreviewRootSnapshot {
     pub title: String,
     pub body: String,
     pub component_gallery: Option<ComponentGalleryFixture>,
+    pub gallery_page: Option<GalleryPage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,12 +784,21 @@ pub struct PreviewApplication {
 
 impl PreviewApplication {
     pub fn load(request: PreviewRequest, policy: &PreviewPathPolicy) -> Result<Self, PreviewError> {
+        let gallery_page = request.gallery_page;
+        let window_hold_ms = request.window_hold_ms;
+        let fixture_authority = Arc::clone(&request.fixture_authority);
         let request = PreviewRequest::validate(
             request.fixture_path.clone(),
             request.output_path.clone(),
             policy,
-        )?;
-        let bytes = read_fixture_bytes(&request.fixture_path)?;
+        )
+        .map(|mut request| {
+            request.gallery_page = gallery_page;
+            request.window_hold_ms = window_hold_ms;
+            request.fixture_authority = Arc::clone(&fixture_authority);
+            request
+        })?;
+        let bytes = read_fixture_bytes(&request.fixture_authority)?;
         let fixture: PreviewFixture =
             serde_json::from_slice(&bytes).map_err(|error| PreviewError::MalformedFixture {
                 path: request.fixture_path.clone(),
@@ -667,6 +890,7 @@ impl PreviewApplication {
             body: format!("{root_label}: {title}"),
             title,
             component_gallery,
+            gallery_page,
         };
         Ok(Self {
             request,
@@ -801,11 +1025,9 @@ impl PreviewRoot {
     }
 
     pub fn element(&self) -> impl IntoElement {
-        let gallery = self
-            .snapshot
-            .component_gallery
-            .as_ref()
-            .map(render_component_gallery);
+        let gallery = self.snapshot.component_gallery.as_ref().map(|gallery| {
+            render_component_gallery(gallery, self.snapshot.gallery_page.unwrap_or_default())
+        });
         let mut root = div()
             .size_full()
             .p(px(16.0))
@@ -818,7 +1040,12 @@ impl PreviewRoot {
                     .size(px(PREVIEW_SENTINEL_SIZE))
                     .bg(gpui::rgb(PREVIEW_SENTINEL_RGB)),
             )
-            .child(self.snapshot.body.clone());
+            .child(
+                div()
+                    .w_full()
+                    .line_clamp(2)
+                    .child(self.snapshot.title.clone()),
+            );
         if let Some(gallery) = gallery {
             root = root.child(gallery);
         }
@@ -826,73 +1053,64 @@ impl PreviewRoot {
     }
 }
 
-fn render_component_gallery(gallery: &ComponentGalleryFixture) -> gpui::AnyElement {
+fn render_component_gallery(
+    gallery: &ComponentGalleryFixture,
+    page: GalleryPage,
+) -> gpui::AnyElement {
     // This projection deliberately calls the production component elements;
     // no gallery-only hand-styled controls are allowed to hide state drift.
-    let mut surface =
-        div()
-            .mt(px(12.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(div().text_sm().child(format!(
-                "Component gallery · {} themes · {} densities · {} scales",
-                gallery.themes.len(),
-                gallery.densities.len(),
-                gallery.scales.len()
-            )));
+    gallery_layout_assertion(gallery);
+    let Some(scale) = gallery_scale(page.scale) else {
+        return div().child("Unsupported gallery scale").into_any_element();
+    };
+    let tokens = theme(
+        match page.theme {
+            GalleryTheme::Dark => ThemeMode::Dark,
+            GalleryTheme::Light => ThemeMode::Light,
+        },
+        match page.density {
+            GalleryDensity::Compact => Density::Compact,
+            GalleryDensity::Comfortable => Density::Comfortable,
+        },
+        scale,
+    );
 
-    for &gallery_theme in &gallery.themes {
-        for &gallery_density in &gallery.densities {
-            for &percent in &gallery.scales {
-                let Some(scale) = gallery_scale(percent) else {
-                    continue;
-                };
-                let tokens = theme(
-                    match gallery_theme {
-                        GalleryTheme::Dark => ThemeMode::Dark,
-                        GalleryTheme::Light => ThemeMode::Light,
-                    },
-                    match gallery_density {
-                        GalleryDensity::Compact => Density::Compact,
-                        GalleryDensity::Comfortable => Density::Comfortable,
-                    },
-                    scale,
-                );
-                let mut row = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.xs))
-                    .child(div().text_xs().child(format!(
-                        "{} / {} / {}%",
-                        gallery_theme_name(gallery_theme),
-                        gallery_density_name(gallery_density),
-                        percent
-                    )));
-                for &state in &gallery.states {
-                    if state == GalleryState::Status {
-                        for meaning in [
-                            StatusMeaning::External,
-                            StatusMeaning::Attention,
-                            StatusMeaning::Success,
-                            StatusMeaning::Warning,
-                            StatusMeaning::Destructive,
-                            StatusMeaning::Inactive,
-                        ] {
-                            row = row.child(render_gallery_status(tokens, meaning));
-                        }
-                    } else {
-                        row = row
-                            .child(render_gallery_button(tokens, state))
-                            .child(render_gallery_icon_button(tokens, state));
-                    }
-                }
-                surface = surface.child(row);
-            }
-        }
+    let page_start = usize::from(page.state_page) * usize::from(GALLERY_PAGE_ROWS);
+    let mut state_grid = div().flex().flex_col().gap_y_2().w_full();
+    for &state in gallery
+        .states
+        .iter()
+        .filter(|&&state| state != GalleryState::Status)
+        .skip(page_start)
+        .take(usize::from(GALLERY_PAGE_ROWS))
+    {
+        let mut cell = div()
+            .flex()
+            .items_center()
+            .gap(px(tokens.density.spacing.xs))
+            .w_full()
+            .child(
+                div()
+                    .w(px(88.0))
+                    .flex_none()
+                    .text_xs()
+                    .child(gallery_state_name(state)),
+            );
+        cell = cell.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_x_1()
+                .gap_y_1()
+                .child(render_gallery_button(tokens, state))
+                .child(render_gallery_icon_button(tokens, state)),
+        );
+        state_grid = state_grid.child(cell);
     }
 
-    let sample_rows = [
+    let mut samples = div().flex().flex_col().gap_y_1().w_full();
+    let sample_start = usize::from(page.sample_page) * 4;
+    for (name, sample) in [
         ("unicode", gallery.samples.unicode.clone()),
         ("long text", gallery.samples.long_text.clone()),
         ("missing", gallery.samples.missing.clone()),
@@ -900,17 +1118,104 @@ fn render_component_gallery(gallery: &ComponentGalleryFixture) -> gpui::AnyEleme
         ("loading", gallery.samples.loading.clone()),
         ("empty", gallery.samples.empty.clone()),
         ("overflow", gallery.samples.overflow.clone()),
-    ];
-    for (name, sample) in sample_rows {
-        surface = surface.child(
+    ]
+    .into_iter()
+    .skip(sample_start)
+    .take(4)
+    {
+        samples = samples.child(
             div()
                 .flex()
+                .w_full()
                 .gap(px(4.0))
                 .child(div().text_xs().child(format!("{name}:")))
-                .child(div().text_xs().child(sample)),
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_xs()
+                        .child(bounded_gallery_sample(&sample)),
+                ),
         );
     }
-    surface.into_any_element()
+
+    let page_content = match page.section {
+        GalleryPageSection::States => div()
+            .child(div().text_xs().child(format!(
+                "States page {}/{}",
+                u16::from(page.state_page) + 1,
+                3
+            )))
+            .child(state_grid),
+        GalleryPageSection::Status => {
+            let meanings = [
+                StatusMeaning::External,
+                StatusMeaning::Attention,
+                StatusMeaning::Success,
+                StatusMeaning::Warning,
+                StatusMeaning::Destructive,
+                StatusMeaning::Inactive,
+            ];
+            let status_start = usize::from(page.status_page) * 3;
+            let mut status_grid = div().flex().flex_col().gap_y_2().w_full();
+            for meaning in meanings.iter().skip(status_start).take(3).copied() {
+                status_grid = status_grid.child(render_gallery_status(tokens, meaning));
+            }
+            div()
+                .child(div().text_xs().child(format!(
+                    "Status page {}/{}",
+                    u16::from(page.status_page) + 1,
+                    2
+                )))
+                .child(status_grid)
+        }
+        GalleryPageSection::Samples => div()
+            .child(div().text_xs().child(format!(
+                "Sanitized fixture samples page {}/{}",
+                u16::from(page.sample_page) + 1,
+                2
+            )))
+            .child(samples),
+    };
+
+    div()
+        .mt(px(12.0))
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(div().text_sm().child(format!(
+            "Component gallery · {} / {} / {}%",
+            gallery_theme_name(page.theme),
+            gallery_density_name(page.density),
+            page.scale
+        )))
+        .child(page_content)
+        .into_any_element()
+}
+
+fn bounded_gallery_sample(value: &str) -> String {
+    const MAX_VISIBLE_SCALARS: usize = 36;
+    let mut bounded: String = value.chars().take(MAX_VISIBLE_SCALARS).collect();
+    if value.chars().count() > MAX_VISIBLE_SCALARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn gallery_layout_assertion(gallery: &ComponentGalleryFixture) {
+    // The page contract is intentionally explicit: all nine states occupy a
+    // bounded pages, with each cell wrapping its production controls.
+    assert!(
+        gallery.states.len() <= 9,
+        "gallery page layout assertion: too many states for the bounded grid"
+    );
+    assert!(
+        (GALLERY_CONTENT_WIDTH_PX - (f32::from(GALLERY_PAGE_COLUMNS) - 1.0) * GALLERY_PAGE_GAP_PX)
+            / f32::from(GALLERY_PAGE_COLUMNS)
+            >= 180.0,
+        "gallery page layout assertion: columns exceed the 640px content width"
+    );
 }
 
 fn gallery_scale(percent: u16) -> Option<Scale> {
@@ -934,6 +1239,20 @@ fn gallery_density_name(density: GalleryDensity) -> &'static str {
     match density {
         GalleryDensity::Compact => "compact",
         GalleryDensity::Comfortable => "comfortable",
+    }
+}
+
+fn gallery_state_name(state: GalleryState) -> &'static str {
+    match state {
+        GalleryState::Default => "default",
+        GalleryState::Hover => "hover",
+        GalleryState::Pressed => "pressed",
+        GalleryState::Focused => "focused",
+        GalleryState::Disabled => "disabled",
+        GalleryState::Loading => "loading",
+        GalleryState::Destructive => "destructive",
+        GalleryState::Selected => "selected",
+        GalleryState::Status => "status",
     }
 }
 
@@ -1032,6 +1351,8 @@ opaque_preview_format!(PreviewFixture, "PreviewFixture(<opaque>)");
 opaque_preview_format!(PreviewRootFixture, "PreviewRootFixture(<opaque>)");
 opaque_preview_format!(ComponentGallerySamples, "ComponentGallerySamples(<opaque>)");
 opaque_preview_format!(ComponentGalleryFixture, "ComponentGalleryFixture(<opaque>)");
+opaque_preview_format!(FixtureFileAuthority, "FixtureFileAuthority(<opaque>)");
+opaque_preview_format!(GalleryPage, "GalleryPage(<opaque>)");
 opaque_preview_format!(PreviewPathPolicy, "PreviewPathPolicy(<opaque>)");
 opaque_preview_format!(PreviewRequest, "PreviewRequest(<opaque>)");
 opaque_preview_format!(PreviewResources, "PreviewResources(<opaque>)");
@@ -1065,9 +1386,15 @@ fn absolute_path(path: &Path) -> Result<PathBuf, PreviewError> {
         .map_err(|error| PreviewError::InvalidArgument(error.to_string()))
 }
 
-fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
-    reject_reparse_ancestors(path, "fixture")?;
-    let metadata = fs::metadata(path).map_err(|error| {
+struct FixtureFileAuthority {
+    path: PathBuf,
+    file: Mutex<fs::File>,
+    identity: FixtureFileIdentity,
+    size: u64,
+}
+
+fn open_fixture_authority(path: &Path) -> Result<Arc<FixtureFileAuthority>, PreviewError> {
+    let file = open_fixture_handle(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             PreviewError::FixtureMissing {
                 path: path.to_path_buf(),
@@ -1078,6 +1405,10 @@ fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
                 message: error.to_string(),
             }
         }
+    })?;
+    let metadata = file.metadata().map_err(|error| PreviewError::FixtureIo {
+        path: path.to_path_buf(),
+        message: error.to_string(),
     })?;
     if !metadata.is_file() {
         return Err(PreviewError::FixtureNotRegular {
@@ -1091,21 +1422,194 @@ fn read_fixture_bytes(path: &Path) -> Result<Vec<u8>, PreviewError> {
             max_bytes: MAX_FIXTURE_BYTES,
         });
     }
-
-    let bytes = fs::read(path).map_err(|error| PreviewError::FixtureIo {
+    let identity = fixture_file_identity(&file).map_err(|error| PreviewError::FixtureIo {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    if bytes.len() as u64 > MAX_FIXTURE_BYTES {
+    Ok(Arc::new(FixtureFileAuthority {
+        path: path.to_path_buf(),
+        file: Mutex::new(file),
+        identity,
+        size: metadata.len(),
+    }))
+}
+
+fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, PreviewError> {
+    let path = &authority.path;
+    let mut fixture_handle = authority
+        .file
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fixture_handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    let metadata_before = fixture_handle
+        .metadata()
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    let identity_before =
+        fixture_file_identity(&fixture_handle).map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    if !metadata_before.is_file() {
+        return Err(PreviewError::FixtureNotRegular { path: path.clone() });
+    }
+    if metadata_before.len() > MAX_FIXTURE_BYTES {
         return Err(PreviewError::FixtureTooLarge {
-            path: path.to_path_buf(),
-            bytes: bytes.len() as u64,
+            path: path.clone(),
+            bytes: metadata_before.len(),
             max_bytes: MAX_FIXTURE_BYTES,
         });
     }
-    Ok(bytes)
+    if identity_before != authority.identity || metadata_before.len() != authority.size {
+        return Err(PreviewError::FixtureIo {
+            path: path.clone(),
+            message: "fixture authority changed before it was read".into(),
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(metadata_before.len() as usize);
+    fixture_handle
+        .by_ref()
+        .take(MAX_FIXTURE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    let hash_before = Sha256::digest(&bytes);
+    fixture_handle
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| {
+            let mut verification = Vec::with_capacity(bytes.len());
+            fixture_handle.read_to_end(&mut verification)?;
+            Ok(verification)
+        })
+        .map(|verification| {
+            let hash_after = Sha256::digest(&verification);
+            (verification, hash_after)
+        })
+        .map_err(|error| PreviewError::FixtureIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })
+        .and_then(|(verification, hash_after)| {
+            let metadata_after =
+                fixture_handle
+                    .metadata()
+                    .map_err(|error| PreviewError::FixtureIo {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?;
+            let identity_after = fixture_file_identity(&fixture_handle).map_err(|error| {
+                PreviewError::FixtureIo {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if bytes.len() as u64 > MAX_FIXTURE_BYTES {
+                return Err(PreviewError::FixtureTooLarge {
+                    path: path.clone(),
+                    bytes: bytes.len() as u64,
+                    max_bytes: MAX_FIXTURE_BYTES,
+                });
+            }
+            if identity_before != authority.identity
+                || identity_before != identity_after
+                || metadata_before.len() != authority.size
+                || metadata_before.len() != metadata_after.len()
+                || bytes != verification
+                || hash_before != hash_after
+            {
+                return Err(PreviewError::FixtureIo {
+                    path: path.clone(),
+                    message: "fixture changed while it was read through its authority handle"
+                        .into(),
+                });
+            }
+            Ok(bytes)
+        })
 }
 
+fn open_fixture_handle(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FixtureFileIdentity {
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(all(not(windows), unix))]
+    dev: u64,
+    #[cfg(all(not(windows), unix))]
+    inode: u64,
+    #[cfg(all(not(windows), not(unix)))]
+    modified_nanos: u128,
+    #[cfg(all(not(windows), not(unix)))]
+    length: u64,
+}
+
+fn fixture_file_identity(file: &fs::File) -> std::io::Result<FixtureFileIdentity> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        return Ok(FixtureFileIdentity {
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        });
+    }
+    #[cfg(all(not(windows), unix))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        return Ok(FixtureFileIdentity {
+            dev: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[cfg(all(not(windows), not(unix)))]
+    {
+        let metadata = file.metadata()?;
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        return Ok(FixtureFileIdentity {
+            modified_nanos,
+            length: metadata.len(),
+        });
+    }
+}
 fn reject_reparse_ancestors(path: &Path, root_kind: &'static str) -> Result<(), PreviewError> {
     let absolute = absolute_path(path)?;
     let mut current = absolute.clone();

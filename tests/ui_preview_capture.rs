@@ -77,6 +77,133 @@ fn native_publication_has_no_path_based_fallback_or_re_resolved_rename() {
 }
 
 #[test]
+fn non_windows_publication_is_handle_relative_or_explicitly_fail_closed() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        source.contains("renameat") || source.contains("UnsupportedPlatform"),
+        "non-Windows publication must use a held directory descriptor or explicitly reject the platform"
+    );
+    assert!(
+        !source.contains("fs::rename(temp, authority.output_path())"),
+        "publication must not resolve the validated parent path again"
+    );
+}
+
+#[test]
+fn fixture_reads_are_bound_to_one_no_follow_handle_and_pre_post_hash() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    assert!(
+        source.contains("fixture_handle") || source.contains("FixtureAuthority"),
+        "fixture loading must retain one opened identity while reading"
+    );
+    assert!(
+        source.contains("Sha256")
+            && source.contains("hash_before")
+            && source.contains("hash_after"),
+        "fixture loading must bind both size and content to the held identity"
+    );
+    assert!(
+        !source.contains("let bytes = fs::read(path)"),
+        "fixture bytes must not be read through a second path resolution"
+    );
+    assert!(
+        !source.contains("fs::metadata(&fixture_path)"),
+        "fixture size validation must come from the same held handle as the read"
+    );
+}
+
+#[test]
+fn gallery_preview_is_paged_and_bounded_for_the_640_by_360_surface() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    assert!(
+        source.contains("GalleryPage")
+            && (source.contains("grid_cols") || source.contains("flex_wrap")),
+        "the gallery must render a selected bounded page rather than one clipped mega-row"
+    );
+    assert!(
+        source.contains("GALLERY_PAGE_COLUMNS") && source.contains("GALLERY_PAGE_ROWS"),
+        "gallery page dimensions must be explicit and testable"
+    );
+    assert!(
+        source.contains("layout_assertion") || source.contains("layout assertion"),
+        "gallery layout must carry a deterministic assertion for the capture surface"
+    );
+}
+
+#[test]
+fn preview_matrix_script_is_isolated_and_captures_every_gallery_page() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("the Phase 5 UI preview capture script must exist");
+    for parameter in ["AllFixtures", "AllThemes", "AllScales"] {
+        assert!(
+            script.contains(parameter),
+            "script must expose -{parameter}"
+        );
+    }
+    for value in [
+        "100",
+        "125",
+        "150",
+        "200",
+        "dark",
+        "light",
+        "compact",
+        "comfortable",
+    ] {
+        assert!(
+            script.contains(value),
+            "script must cover gallery value {value}"
+        );
+    }
+    assert!(
+        script.contains("CARGO_TARGET_DIR") && script.contains("CARGO_BUILD_JOBS"),
+        "script must use the isolated bounded target"
+    );
+    assert!(
+        script.contains("Guid") || script.contains("ProcessId"),
+        "script output must be process/run unique"
+    );
+    assert!(
+        !script.contains("DEVMANAGER_PROFILE") && !script.contains("session.json"),
+        "preview matrix must not touch a profile or session state"
+    );
+}
+
+#[test]
+fn executor_shutdown_reports_bounded_leaks_without_detaching_workers() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    for marker in [
+        "CaptureExecutorShutdownReport",
+        "shutdown_requested",
+        "shutdown_deadline",
+        "workers_leaked",
+        "is_finished",
+    ] {
+        assert!(
+            source.contains(marker),
+            "executor shutdown must expose {marker}"
+        );
+    }
+    assert!(
+        source.contains("retained") || source.contains("retain"),
+        "an uncooperative worker must remain owned and visible after a bounded shutdown"
+    );
+}
+
+#[test]
 fn capture_stages_use_a_fixed_executor_and_retain_no_detached_reaper_list() {
     let source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
@@ -1116,7 +1243,6 @@ fn visible_capture_uses_isolated_process_and_decodes_exact_sentinel() {
     let before = foreground_hwnd();
 
     let child = Command::new(env!("CARGO_BIN_EXE_devmanager-next"))
-        .env("DEVMANAGER_PROFILE", "native-next-dev")
         .env("DEVMANAGER_INSTANCE_LABEL", "Next")
         .env("DEVMANAGER_RUNTIME_KIND", "native-next")
         .args([
