@@ -1030,21 +1030,6 @@ struct ServiceCatalogWire {
     services: Vec<ServiceDefinition>,
 }
 
-impl<'de> Deserialize<'de> for ServiceCatalog {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = ServiceCatalogWire::deserialize(deserializer)?;
-        if wire.schema_version != SERVICE_CATALOG_SCHEMA_VERSION {
-            return Err(D::Error::custom(
-                "unsupported service catalog schema version",
-            ));
-        }
-        Self::new(wire.services).map_err(D::Error::custom)
-    }
-}
-
 impl Serialize for ServiceCatalog {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1071,7 +1056,12 @@ impl ServiceCatalog {
             return Err(ServiceCatalogDecodeError::FrameTooLarge);
         }
         preflight_service_catalog_json(bytes)?;
-        serde_json::from_slice(bytes).map_err(|_| ServiceCatalogDecodeError::InvalidCatalog)
+        let wire: ServiceCatalogWire =
+            serde_json::from_slice(bytes).map_err(|_| ServiceCatalogDecodeError::InvalidCatalog)?;
+        if wire.schema_version != SERVICE_CATALOG_SCHEMA_VERSION {
+            return Err(ServiceCatalogDecodeError::InvalidCatalog);
+        }
+        Self::new(wire.services).map_err(|_| ServiceCatalogDecodeError::InvalidCatalog)
     }
 
     pub fn new(definitions: Vec<ServiceDefinition>) -> Result<Self, ValidationError> {

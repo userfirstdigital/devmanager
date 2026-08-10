@@ -18,6 +18,8 @@ use devmanager::services::model::{
     MAX_SERVICE_CATALOG_JSON_DEPTH, MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES, MAX_SERVICE_COUNT,
 };
 
+static_assertions::assert_not_impl_any!(ServiceCatalog: serde::Deserialize<'static>);
+
 fn id(value: &str) -> ServiceId {
     ServiceId::new(value).expect("test service id")
 }
@@ -114,8 +116,8 @@ fn evidence(
 
 #[test]
 fn configured_launch_fixture_is_validated_and_launch_intent_is_bounded() {
-    let catalog: ServiceCatalog =
-        serde_json::from_str(include_str!("fixtures/services/valid.json")).unwrap();
+    let catalog = ServiceCatalog::decode_json(include_bytes!("fixtures/services/valid.json"))
+        .expect("valid catalog fixture");
 
     let intent = catalog
         .launch_intent(&id("api"))
@@ -130,10 +132,11 @@ fn configured_launch_fixture_is_validated_and_launch_intent_is_bounded() {
     assert_eq!(intent.command().env()[0].name(), "PORT");
     assert_eq!(intent.expected_port().unwrap().port, 8080);
 
-    let encoded = serde_json::to_value(&catalog).unwrap();
-    assert_eq!(encoded["schema_version"], serde_json::json!(1));
-    let decoded: ServiceCatalog = serde_json::from_value(encoded.clone()).unwrap();
-    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    let encoded = serde_json::to_vec(&catalog).unwrap();
+    let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(encoded_value["schema_version"], serde_json::json!(1));
+    let decoded = ServiceCatalog::decode_json(&encoded).expect("bounded catalog roundtrip");
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
 }
 
 #[test]
@@ -189,13 +192,13 @@ fn wire_deserializers_validate_ids_catalog_schema_and_definitions() {
         "services": [],
         "unexpected": true
     });
-    assert!(serde_json::from_value::<ServiceCatalog>(unknown_field).is_err());
+    assert!(ServiceCatalog::decode_json(&serde_json::to_vec(&unknown_field).unwrap()).is_err());
 
     unknown_field = serde_json::json!({
         "schema_version": 2,
         "services": []
     });
-    assert!(serde_json::from_value::<ServiceCatalog>(unknown_field).is_err());
+    assert!(ServiceCatalog::decode_json(&serde_json::to_vec(&unknown_field).unwrap()).is_err());
 
     let mut unbounded = fixture_definition(0);
     unbounded["command"]["program"] = serde_json::json!("x".repeat(257));
@@ -207,11 +210,11 @@ fn wire_deserializers_validate_ids_catalog_schema_and_definitions() {
     assert!(serde_json::from_value::<ServiceDefinition>(unbounded_dependencies).is_err());
 
     let services = vec![fixture_definition(0); MAX_SERVICE_COUNT + 1];
-    assert!(serde_json::from_value::<ServiceCatalog>(serde_json::json!({
+    let unbounded_catalog = serde_json::json!({
         "schema_version": 1,
         "services": services
-    }))
-    .is_err());
+    });
+    assert!(ServiceCatalog::decode_json(&serde_json::to_vec(&unbounded_catalog).unwrap()).is_err());
 }
 
 #[test]
@@ -562,9 +565,9 @@ fn catalog_wire_is_strict_and_fingerprint_is_order_independent() {
     assert_eq!(first.fingerprint(), second.fingerprint());
 
     let omitted = serde_json::json!({ "services": [] });
-    assert!(serde_json::from_value::<ServiceCatalog>(omitted).is_err());
-    assert!(serde_json::from_str::<ServiceCatalog>(
-        r#"{"schema_version":1,"schema_version":1,"services":[]}"#
+    assert!(ServiceCatalog::decode_json(&serde_json::to_vec(&omitted).unwrap()).is_err());
+    assert!(ServiceCatalog::decode_json(
+        br#"{"schema_version":1,"schema_version":1,"services":[]}"#
     )
     .is_err());
 }
