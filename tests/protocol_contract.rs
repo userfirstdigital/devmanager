@@ -21,6 +21,7 @@ use devmanager::protocol::{
     VersionNegotiationError, MAX_CLIENT_BUILD_BYTES, MAX_MESSAGEPACK_COLLECTION_ITEMS,
     MAX_MESSAGEPACK_DEPTH, MAX_MESSAGEPACK_VALUES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use devmanager::providers::ProviderKind;
 use uuid::Uuid;
 
 #[test]
@@ -4695,7 +4696,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
             task_id: protocol_task_id(0x11),
             task_title: "Quit blockers".into(),
             role: AgentRole::Primary,
-            provider_kind: "claude".into(),
+            provider_kind: ProviderKind::ClaudeCode,
             lifecycle: AgentSessionLifecycle::Open,
             runtime_generation: 0,
         }],

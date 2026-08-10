@@ -24,6 +24,7 @@ use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use crate::providers::ProviderKind;
 
 use super::{rebuild_projection_tables_tx, KernelStore, ProjectionRebuild, StoreError};
 
@@ -1393,8 +1394,8 @@ fn schema_rebuild_projections_is_deterministic_and_repairs_drift() {
             id: agent,
             task_id: task,
             role: AgentRole::Primary,
-            provider_kind: "claude".into(),
-            provider_session_id: Some("sess-1".into()),
+            provider_kind: ProviderKind::ClaudeCode,
+            provider_session_id: Some("sess-1".parse().expect("provider session")),
             lifecycle: AgentSessionLifecycle::Open,
             runtime_generation: 0,
             revision: 0,

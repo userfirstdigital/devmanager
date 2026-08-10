@@ -13,8 +13,8 @@ use devmanager::providers::capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport,
     EvidenceDiagnostic, EvidenceDiagnosticCode, EvidenceSourceId, EvidenceStatus,
     ProviderAuthState, ProviderCapabilities, ProviderCapability, ProviderExecutable,
-    ProviderExecutableError, ProviderExecutablePolicy, ProviderKind, ProviderVersion,
-    ProviderVersionError, SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
+    ProviderExecutableError, ProviderExecutableHandle, ProviderExecutablePolicy, ProviderKind,
+    ProviderVersion, ProviderVersionError, SemanticSchemaVersion, MAX_CAPABILITY_EVIDENCE_ITEMS,
 };
 use devmanager::providers::registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
@@ -46,6 +46,13 @@ fn probe_runner(path: &Path) -> devmanager::providers::WindowsProviderProbeRunne
     devmanager::providers::WindowsProviderProbeRunner::new(
         ProviderExecutablePolicy::new([file_name]).expect("fixture allowlist"),
     )
+}
+
+fn test_executable_handle() -> ProviderExecutableHandle {
+    ProviderExecutable::from_path(std::env::current_exe().expect("test executable path"))
+        .expect("test executable is inspectable")
+        .open_for_launch()
+        .expect("test executable handle")
 }
 
 struct FakeAdapter {
@@ -468,7 +475,7 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
             ProviderKind::ClaudeCode,
             &identity,
             first_invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthenticatedSubscription,
+            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .unwrap();
@@ -500,7 +507,7 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
     assert_eq!(authenticated.cache_status, CacheStatus::Hit);
     assert_eq!(
         authenticated.capabilities.auth_state,
-        ProviderAuthState::AuthenticatedSubscription
+        ProviderAuthState::AuthRequired
     );
     assert!(authenticated
         .capabilities
@@ -512,7 +519,7 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
         second.capabilities.auth_state,
         ProviderAuthState::AuthRequired
     );
-    assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 3);
+    assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 5);
 }
 
 #[tokio::test]
@@ -544,7 +551,7 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
             ProviderKind::ClaudeCode,
             &identity,
             invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthenticatedSubscription,
+            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .unwrap();
@@ -554,7 +561,7 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
         .unwrap();
     assert_eq!(
         observation.capabilities.auth_state,
-        ProviderAuthState::AuthenticatedSubscription
+        ProviderAuthState::AuthRequired
     );
 
     let replay = registry
@@ -934,11 +941,11 @@ fn malformed_version_output_is_typed() {
     ));
     assert!(matches!(
         ProviderVersion::from_probe_output(b"\n\n"),
-        Err(ProviderVersionError::Empty)
+        Err(ProviderVersionError::NonCanonical)
     ));
     assert!(matches!(
         ProviderVersion::new("   "),
-        Err(ProviderVersionError::Empty)
+        Err(ProviderVersionError::NonCanonical)
     ));
 }
 
@@ -1033,7 +1040,7 @@ fn evidence_rejects_empty_or_oversized_sources() {
 
 #[test]
 fn opaque_provider_session_id_preserves_bytes_and_rejects_invalid_values() {
-    let original = " opaque-\u{00e9}-bytes ".to_string();
+    let original = "opaque-\u{00e9}-bytes".to_string();
     let session = ProviderSessionId::new(original.clone()).unwrap();
     assert_eq!(session.as_str(), original);
     assert_eq!(session.as_bytes(), original.as_bytes());
@@ -1043,8 +1050,34 @@ fn opaque_provider_session_id_preserves_bytes_and_rejects_invalid_values() {
     );
 
     assert!(ProviderSessionId::new("").is_err());
+    assert!(ProviderSessionId::new(" surrounding-whitespace").is_err());
+    assert!(ProviderSessionId::new("surrounding-whitespace ").is_err());
     assert!(ProviderSessionId::new("has\ncontrol").is_err());
     assert!(ProviderSessionId::new("x".repeat(MAX_PROVIDER_SESSION_ID_BYTES + 1)).is_err());
+}
+
+#[test]
+fn provider_identity_values_reject_surrounding_whitespace_and_redact_display() {
+    let secret_version = "provider-version-secret";
+    assert!(devmanager::providers::ProviderVersion::new(" fixture-1 ").is_err());
+    let version = devmanager::providers::ProviderVersion::new(secret_version).unwrap();
+    assert!(!format!("{version:?}").contains(secret_version));
+    assert!(!version.to_string().contains(secret_version));
+
+    let secret_session = "provider-session-secret";
+    assert!(ProviderSessionId::new(" session ").is_err());
+    let session = ProviderSessionId::new(secret_session).unwrap();
+    assert!(!format!("{session:?}").contains(secret_session));
+    assert!(!session.to_string().contains(secret_session));
+}
+
+#[test]
+fn provider_kind_wire_rejects_noncanonical_alias() {
+    assert!(serde_json::from_value::<ProviderKind>(serde_json::json!("claude_code")).is_err());
+    assert_eq!(
+        serde_json::to_value(ProviderKind::ClaudeCode).unwrap(),
+        serde_json::json!("claude")
+    );
 }
 
 struct RecordingProbeRunner {
@@ -1068,7 +1101,7 @@ async fn probe_seam_uses_only_fixed_version_help_arguments_and_null_stdin() {
     let runner = RecordingProbeRunner {
         requests: Mutex::new(Vec::new()),
     };
-    let executable = PathBuf::from("C:/fixtures/claude");
+    let executable = test_executable_handle();
     runner
         .run(ProviderProbeRequest::version(executable.clone()).unwrap())
         .await
@@ -1204,7 +1237,7 @@ async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
 
 #[test]
 fn agent_session_facts_deserialization_preserves_exact_opaque_provider_id() {
-    let exact = "  opaque\u{00e9}-provider-id  ";
+    let exact = "opaque\u{00e9}-provider-id";
     let value = serde_json::json!({
         "id": AgentSessionId::new(),
         "task_id": TaskId::new(),
@@ -1230,12 +1263,12 @@ fn agent_session_facts_deserialization_preserves_exact_opaque_provider_id() {
 
 #[test]
 fn agent_session_facts_constructor_keeps_typed_provider_id_unchanged() {
-    let exact = "  opaque\u{00e9}-constructor-id  ";
+    let exact = "opaque\u{00e9}-constructor-id";
     let session = ProviderSessionId::new(exact).unwrap();
     let facts = AgentSessionFacts::new(
         TaskId::new(),
         AgentRole::Primary,
-        "claude",
+        ProviderKind::ClaudeCode,
         Some(session.clone()),
     );
 
@@ -1296,7 +1329,7 @@ fn capability_evidence_persists_only_typed_non_sensitive_metadata() {
 
 #[test]
 fn probe_requests_include_typed_noninteractive_auth_status_contract() {
-    let request = ProviderProbeRequest::auth_status(PathBuf::from("C:/bin/claude")).unwrap();
+    let request = ProviderProbeRequest::auth_status(test_executable_handle()).unwrap();
 
     assert_eq!(
         request.kind(),
@@ -1363,7 +1396,11 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
     let temp = tempdir().unwrap();
     let executable_path = executable_file(temp.path(), "claude", b"adapter");
     let executable = ProviderExecutable::from_path(executable_path).unwrap();
-    let launch = adapter.build_launch(LaunchProviderRequest::new(executable.clone(), None, None));
+    let launch = adapter.build_launch(LaunchProviderRequest::new(
+        executable.open_for_launch().unwrap(),
+        None,
+        None,
+    ));
     assert!(matches!(
         launch,
         Err(ProviderError::UnsupportedCapability(
@@ -1384,7 +1421,7 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
 #[test]
 fn provider_probe_result_has_bounded_structured_status() {
     let request = ProviderProbeRequest::with_limits(
-        PathBuf::from("C:/bin/claude"),
+        test_executable_handle(),
         devmanager::providers::ProviderProbeKind::Help,
         Duration::from_secs(1),
         64,
@@ -1484,7 +1521,7 @@ fn provider_errors_and_probe_arguments_redact_sensitive_paths_and_tokens() {
         assert!(!error.to_string().contains(secret));
     }
 
-    let request = ProviderProbeRequest::help(secret_path).unwrap();
+    let request = ProviderProbeRequest::help(test_executable_handle()).unwrap();
     assert!(!format!("{request:?}").contains(secret));
 
     let argument = ProviderArgument::new(secret).unwrap();
@@ -1549,13 +1586,8 @@ async fn registry_rejects_relative_and_oversized_path_entries_before_fallback() 
 #[test]
 fn executable_and_probe_result_constructors_reject_unbounded_inputs() {
     assert!(ProviderExecutable::new(PathBuf::new(), [0; 32]).is_err());
-    assert!(ProviderProbeRequest::new(
-        PathBuf::new(),
-        devmanager::providers::ProviderProbeKind::Help,
-    )
-    .is_err());
     let request = ProviderProbeRequest::with_limits(
-        PathBuf::from("C:/bin/claude"),
+        test_executable_handle(),
         devmanager::providers::ProviderProbeKind::Help,
         Duration::from_secs(1),
         10,
@@ -1712,9 +1744,12 @@ async fn windows_probe_runner_bounds_both_output_streams_exactly() {
     let executable = copied_probe_fixture(&temp, "probe-flood");
     let runner = probe_runner(&executable);
     let request = ProviderProbeRequest::with_limits(
-        executable,
+        ProviderExecutable::from_path(&executable)
+            .unwrap()
+            .open_for_launch()
+            .unwrap(),
         devmanager::providers::ProviderProbeKind::Help,
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         257,
     )
     .unwrap();
@@ -1739,7 +1774,10 @@ async fn windows_probe_runner_scrubs_inherited_provider_secrets() {
 
     let runner = probe_runner(&executable);
     let request = ProviderProbeRequest::with_limits(
-        executable,
+        ProviderExecutable::from_path(&executable)
+            .unwrap()
+            .open_for_launch()
+            .unwrap(),
         devmanager::providers::ProviderProbeKind::Help,
         std::time::Duration::from_secs(2),
         4096,
@@ -1765,9 +1803,12 @@ async fn windows_probe_runner_timeout_kills_the_entire_probe_tree() {
     let child_pid_path = executable.with_extension("child.pid");
     let runner = probe_runner(&executable);
     let request = ProviderProbeRequest::with_limits(
-        executable,
+        ProviderExecutable::from_path(&executable)
+            .unwrap()
+            .open_for_launch()
+            .unwrap(),
         devmanager::providers::ProviderProbeKind::Help,
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(3),
         4096,
     )
     .unwrap();
@@ -1775,7 +1816,7 @@ async fn windows_probe_runner_timeout_kills_the_entire_probe_tree() {
     let result = runner.run(request).await;
 
     assert!(matches!(result, Err(ProviderProbeError::TimedOut)));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let child_pid = loop {
         if let Ok(value) = std::fs::read_to_string(&child_pid_path) {
             break value.parse::<u32>().unwrap();

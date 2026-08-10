@@ -754,6 +754,7 @@ mod tests {
         WorkspaceRef,
     };
     use crate::kernel::dispatch::DispatchCompletion;
+    use crate::providers::ProviderKind;
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -838,8 +839,12 @@ mod tests {
             id: agent_session_id,
             task_id,
             role: AgentRole::Primary,
-            provider_kind: "codex".into(),
-            provider_session_id: Some(format!("session-{agent_session_id}")),
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: Some(
+                format!("session-{}", agent_session_id)
+                    .parse()
+                    .expect("provider session"),
+            ),
             lifecycle: AgentSessionLifecycle::Open,
             runtime_generation: 0,
             revision: 0,

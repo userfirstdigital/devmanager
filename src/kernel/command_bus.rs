@@ -56,6 +56,7 @@ use crate::kernel::store::{
     encode_event_payload, now_ms, u64_from_nonnegative_i64, u64_to_sqlite_i64, KernelStore,
     StoreError,
 };
+use crate::providers::ProviderKind;
 
 /// One advancement unit from the Closing host-cleanup journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6092,6 +6093,13 @@ fn decode_agent_projection(
     runtime_generation: i64,
     revision: i64,
 ) -> Result<AgentSessionFacts, StoreError> {
+    let provider_kind = ProviderKind::parse_wire(&provider_kind).ok_or_else(|| {
+        StoreError::Projection("agent_sessions.provider_kind is not canonical".to_string())
+    })?;
+    let provider_session_id = provider_session_id
+        .map(ProviderSessionId::new)
+        .transpose()
+        .map_err(|error| StoreError::Projection(error.to_string()))?;
     let agent = AgentSessionFacts {
         id,
         task_id,

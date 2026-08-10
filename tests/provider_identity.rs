@@ -89,7 +89,7 @@ fn stable_capabilities() -> ProviderCapabilities {
 
 #[test]
 fn provider_session_id_preserves_exact_bytes_through_serde_and_sql() {
-    let exact = "  Provider/Session+identity_日本  ";
+    let exact = "Provider/Session+identity_日本";
     let id = ProviderSessionId::new(exact.to_string()).expect("valid exact id");
 
     let encoded = serde_json::to_string(&id).expect("serialize provider id");
@@ -120,11 +120,11 @@ fn provider_session_id_preserves_exact_bytes_through_serde_and_sql() {
 
 #[test]
 fn agent_session_facts_keep_provider_identity_typed_and_exact() {
-    let exact = ProviderSessionId::new(" provider-id ".to_owned()).unwrap();
+    let exact = ProviderSessionId::new("provider-id".to_owned()).unwrap();
     let facts = AgentSessionFacts::new(
         TaskId::new(),
         AgentRole::Primary,
-        "claude_code",
+        ProviderKind::ClaudeCode,
         Some(exact.clone()),
     )
     .unwrap();
@@ -132,7 +132,7 @@ fn agent_session_facts_keep_provider_identity_typed_and_exact() {
     assert_eq!(facts.provider_session_id.as_ref(), Some(&exact));
     assert_eq!(
         facts.provider_session_id.unwrap().as_bytes(),
-        b" provider-id "
+        b"provider-id"
     );
 }
 
@@ -455,12 +455,12 @@ fn auth_evidence_is_registry_issued_fresh_and_bound_to_identity() {
             ProviderKind::ClaudeCode,
             &identity,
             invocation.clone(),
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             observed_at,
         )
         .unwrap();
     assert!(receipt.is_fresh_at(observed_at + Duration::from_secs(1)));
-    assert!(receipt.is_authenticated_subscription());
+    assert!(!receipt.is_authenticated_subscription());
     assert_eq!(
         receipt.source(),
         ProviderAuthEvidenceSource::ClaudeCodeSubscriptionLogin
@@ -472,7 +472,7 @@ fn auth_evidence_is_registry_issued_fresh_and_bound_to_identity() {
             ProviderKind::ClaudeCode,
             &identity,
             invocation.clone(),
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .is_err());
@@ -490,6 +490,31 @@ fn auth_evidence_is_registry_issued_fresh_and_bound_to_identity() {
             ProviderKind::Codex,
             &replacement,
             wrong_identity,
+            ProviderAuthProbeResult::AuthRequired,
+            Instant::now(),
+        )
+        .is_err());
+}
+
+#[test]
+fn public_auth_acceptance_cannot_forge_authenticated_subscription_or_extend_time() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
+    let identity = executable(&path);
+    let mut evidence = ProviderAuthEvidenceRegistry::new();
+    let invocation = evidence
+        .begin(
+            ProviderKind::ClaudeCode,
+            identity.clone(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+    assert!(evidence
+        .accept_at_for(
+            ProviderKind::ClaudeCode,
+            &identity,
+            invocation,
             ProviderAuthProbeResult::AuthenticatedSubscription,
             Instant::now(),
         )
@@ -505,13 +530,13 @@ fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
     let mut evidence = ProviderAuthEvidenceRegistry::new();
 
     let expired = evidence
-        .begin_at(
+        .begin(
             ProviderKind::ClaudeCode,
             identity.clone(),
-            now - Duration::from_secs(3),
-            now - Duration::from_secs(1),
+            Duration::from_millis(1),
         )
         .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
     assert!(evidence
         .accept_at_for(
             ProviderKind::ClaudeCode,
@@ -592,7 +617,7 @@ fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
             ProviderAuthProbeResult::Unknown,
             same_observed_at,
         )
-        .is_err());
+        .is_ok());
 
     let api_key = evidence
         .begin_at(
@@ -642,7 +667,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             ProviderKind::ClaudeCode,
             &identity,
             invocation,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .unwrap();
@@ -665,7 +690,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             ProviderKind::ClaudeCode,
             identity.clone(),
             Instant::now() - Duration::from_secs(1),
-            Instant::now() + Duration::from_millis(10),
+            Instant::now() + Duration::from_secs(2),
         )
         .unwrap();
     let stale_receipt = stale_registry
@@ -673,10 +698,11 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             ProviderKind::ClaudeCode,
             &identity,
             stale_invocation,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .unwrap();
+    std::thread::sleep(Duration::from_millis(2_100));
     assert!(matches!(
         stale_registry.consume_at_for(
             ProviderKind::ClaudeCode,
@@ -697,16 +723,16 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             future_issued_at + Duration::from_secs(30),
         )
         .unwrap();
-    assert!(matches!(
-        future_registry.accept_at_for(
+    let future_receipt = future_registry
+        .accept_at_for(
             ProviderKind::ClaudeCode,
             &identity,
             future_invocation,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             future_issued_at + Duration::from_secs(1),
-        ),
-        Err(devmanager::providers::ProviderAuthEvidenceError::FutureTimestamp)
-    ));
+        )
+        .unwrap();
+    assert!(future_receipt.observed_at() < future_issued_at + Duration::from_secs(1));
 
     let mut ordering_registry = ProviderAuthEvidenceRegistry::new();
     let first = ordering_registry
@@ -722,7 +748,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             ProviderKind::ClaudeCode,
             &identity,
             first,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             Instant::now(),
         )
         .unwrap();
@@ -739,7 +765,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             ProviderKind::ClaudeCode,
             &identity,
             second,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
             first_receipt.observed_at() + Duration::from_nanos(1),
         )
         .unwrap();
@@ -790,7 +816,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
     let replacement_receipt = replacement_registry
         .accept_now(
             replacement_invocation,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
+            ProviderAuthProbeResult::AuthRequired,
         )
         .unwrap();
     replace_with_native_fixture(&path, b"provider-replaced");
@@ -817,7 +843,7 @@ fn auth_pending_and_accepted_receipts_have_deterministic_bounds() {
             .begin(
                 ProviderKind::ClaudeCode,
                 identity.clone(),
-                Duration::from_secs(30),
+                Duration::from_secs(240),
             )
             .unwrap();
     }
@@ -832,7 +858,7 @@ fn auth_pending_and_accepted_receipts_have_deterministic_bounds() {
             .begin(
                 ProviderKind::ClaudeCode,
                 identity.clone(),
-                Duration::from_secs(30),
+                Duration::from_secs(240),
             )
             .unwrap();
         accepted
@@ -862,7 +888,7 @@ fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_ca
         )
         .unwrap();
     let first_receipt = evidence
-        .accept_now(first, ProviderAuthProbeResult::AuthenticatedSubscription)
+        .accept_now(first, ProviderAuthProbeResult::AuthRequired)
         .unwrap();
     let second = evidence
         .begin(
@@ -872,7 +898,7 @@ fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_ca
         )
         .unwrap();
     let second_receipt = evidence
-        .accept_now(second, ProviderAuthProbeResult::AuthenticatedSubscription)
+        .accept_now(second, ProviderAuthProbeResult::AuthRequired)
         .unwrap();
 
     assert!(second_receipt.generation() > first_receipt.generation());
@@ -991,10 +1017,7 @@ fn provider_identity_debug_and_errors_redact_paths_and_auth_nonces() {
     assert!(!invocation_debug.contains(&nonce_debug));
 
     let receipt = evidence
-        .accept_now(
-            invocation,
-            ProviderAuthProbeResult::AuthenticatedSubscription,
-        )
+        .accept_now(invocation, ProviderAuthProbeResult::AuthRequired)
         .unwrap();
     let receipt_debug = format!("{receipt:?}");
     assert!(!receipt_debug.contains(secret));
@@ -1175,13 +1198,7 @@ fn executable_wire_preserves_windows_shim_form() {
 
 #[test]
 fn agent_session_facts_accept_only_stock_provider_kinds() {
-    let invalid = AgentSessionFacts::new(
-        TaskId::new(),
-        AgentRole::Primary,
-        "arbitrary-provider",
-        None,
-    );
-    assert!(invalid.is_err());
+    assert!(ProviderKind::parse_wire("arbitrary-provider").is_none());
 
     let wire = serde_json::json!({
         "id": devmanager::domain::AgentSessionId::new(),

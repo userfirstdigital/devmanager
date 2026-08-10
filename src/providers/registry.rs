@@ -1,10 +1,12 @@
-use crate::providers::adapter::{ProviderAdapter, ProviderError};
+use crate::providers::adapter::{
+    ProviderAdapter, ProviderError, ProviderProbeRequest, ProviderProbeResult,
+};
 use crate::providers::capabilities::{
-    AdapterRevision, ProviderAuthEvidenceReceipt, ProviderAuthEvidenceRegistry,
-    ProviderAuthProbeInvocation, ProviderAuthProbeResult, ProviderCapabilities,
-    ProviderDiscoveryCandidateInput, ProviderDiscoveryContract, ProviderDiscoveryError,
-    ProviderExecutable, ProviderExecutableError, ProviderKind, ProviderVersion,
-    SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
+    AdapterRevision, ProviderAuthEvidenceError, ProviderAuthEvidenceReceipt,
+    ProviderAuthEvidenceRegistry, ProviderAuthProbeInvocation, ProviderAuthProbeResult,
+    ProviderCapabilities, ProviderDiscoveryCandidateInput, ProviderDiscoveryContract,
+    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderKind,
+    ProviderVersion, SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
 };
 use async_trait::async_trait;
 use serde::de;
@@ -14,11 +16,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 const TASK_4_1_ADAPTER_REVISION: AdapterRevision = AdapterRevision::new(1);
 const TASK_4_1_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion = SemanticSchemaVersion::new(1);
+const PROVIDER_CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_PROVIDER_IN_FLIGHT_ENTRIES: usize = 64;
+const PROVIDER_IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 pub struct ProviderDiscoveryConfig {
@@ -248,6 +253,7 @@ struct ProbeIdentityKey {
 struct ProbeFlight {
     result: Mutex<Option<Result<(ProviderCapabilities, ProviderExecutable), ProviderError>>>,
     completed: Notify,
+    started_at: Instant,
 }
 
 struct ProbeRun {
@@ -259,6 +265,7 @@ struct ProbeRun {
 struct CapabilityCacheEntry {
     capabilities: ProviderCapabilities,
     sequence: u64,
+    inserted_at: Instant,
 }
 
 #[derive(Default)]
@@ -269,6 +276,7 @@ struct CapabilityCache {
 
 impl CapabilityCache {
     fn get(&mut self, key: &CapabilityCacheKey) -> Option<ProviderCapabilities> {
+        self.evict_expired(Instant::now());
         let entry = self.entries.get_mut(key)?;
         self.next_sequence = self.next_sequence.saturating_add(1);
         entry.sequence = self.next_sequence;
@@ -276,10 +284,21 @@ impl CapabilityCache {
     }
 
     fn insert(&mut self, key: CapabilityCacheKey, capabilities: ProviderCapabilities) {
+        let now = Instant::now();
+        self.evict_expired(now);
+        self.entries.retain(|existing_key, _| {
+            !(existing_key.kind == key.kind
+                && existing_key.adapter_revision == key.adapter_revision
+                && existing_key.semantic_schema_version == key.semantic_schema_version
+                && existing_key.executable.canonical_path() == key.executable.canonical_path()
+                && (existing_key.executable != key.executable
+                    || existing_key.version != key.version))
+        });
         self.next_sequence = self.next_sequence.saturating_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.capabilities = capabilities;
             entry.sequence = self.next_sequence;
+            entry.inserted_at = now;
             return;
         }
         while self.entries.len() >= MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES {
@@ -298,6 +317,7 @@ impl CapabilityCache {
             CapabilityCacheEntry {
                 capabilities,
                 sequence: self.next_sequence,
+                inserted_at: now,
             },
         );
     }
@@ -306,6 +326,7 @@ impl CapabilityCache {
         &mut self,
         identity: &ProbeIdentityKey,
     ) -> Vec<(CapabilityCacheKey, ProviderCapabilities)> {
+        self.evict_expired(Instant::now());
         self.entries
             .iter()
             .filter(|(key, _)| {
@@ -318,12 +339,19 @@ impl CapabilityCache {
             .collect()
     }
 
-    fn len(&self) -> usize {
+    fn len(&mut self) -> usize {
+        self.evict_expired(Instant::now());
         self.entries.len()
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.inserted_at) <= PROVIDER_CAPABILITY_CACHE_TTL
+        });
     }
 }
 
@@ -394,11 +422,11 @@ impl ProviderRegistry {
         if !self.adapters.contains_key(&kind) {
             return Err(ProviderError::ProviderNotRegistered(kind));
         }
-        let (_, executable) = self.select_executable(kind, config).await?;
+        let observation = self.observe(kind, config).await?;
         self.auth_evidence
             .lock()
             .unwrap()
-            .begin(kind, executable, ttl)
+            .begin_with_version(kind, observation.executable, observation.version, ttl)
             .map_err(ProviderError::AuthEvidence)
     }
 
@@ -420,6 +448,32 @@ impl ProviderRegistry {
                 result,
                 observed_at,
             )
+            .map_err(ProviderError::AuthEvidence)
+    }
+
+    pub(crate) fn accept_auth_probe_observation(
+        &self,
+        invocation: ProviderAuthProbeInvocation,
+        request: &ProviderProbeRequest,
+        result: &ProviderProbeResult,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderError> {
+        if request.executable() != invocation.executable_handle() {
+            return Err(ProviderError::AuthEvidence(
+                ProviderAuthEvidenceError::WrongExecutable,
+            ));
+        }
+        let observation = result
+            .into_auth_observation(
+                invocation.provider_kind(),
+                request,
+                invocation.executable_handle().clone(),
+                invocation.version().clone(),
+            )
+            .map_err(ProviderError::AuthEvidence)?;
+        self.auth_evidence
+            .lock()
+            .unwrap()
+            .accept_observation(invocation, observation)
             .map_err(ProviderError::AuthEvidence)
     }
 
@@ -530,12 +584,61 @@ impl ProviderRegistry {
     ) -> Result<ProbeRun, ProviderError> {
         let (flight, leader) = {
             let mut in_flight = self.in_flight.lock().unwrap();
+            let now = Instant::now();
+            let expired: Vec<_> = in_flight
+                .iter()
+                .filter(|(_, flight)| {
+                    now.saturating_duration_since(flight.started_at) > PROVIDER_IN_FLIGHT_TTL
+                })
+                .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
+                .collect();
+            for (expired_key, expired_flight) in expired {
+                *expired_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
+                    crate::providers::adapter::ProviderProbeError::TimedOut,
+                )));
+                expired_flight.completed.notify_waiters();
+                in_flight.remove(&expired_key);
+            }
+            let replaced: Vec<_> = in_flight
+                .iter()
+                .filter(|(existing_key, _)| {
+                    existing_key.kind == key.kind
+                        && existing_key.adapter_revision == key.adapter_revision
+                        && existing_key.semantic_schema_version == key.semantic_schema_version
+                        && existing_key.executable.canonical_path()
+                            == key.executable.canonical_path()
+                        && existing_key.executable != key.executable
+                })
+                .map(|(existing_key, flight)| (existing_key.clone(), Arc::clone(flight)))
+                .collect();
+            for (replaced_key, replaced_flight) in replaced {
+                *replaced_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
+                    crate::providers::adapter::ProviderProbeError::TimedOut,
+                )));
+                replaced_flight.completed.notify_waiters();
+                in_flight.remove(&replaced_key);
+            }
             if let Some(flight) = in_flight.get(&key) {
                 (Arc::clone(flight), false)
             } else {
+                while in_flight.len() >= MAX_PROVIDER_IN_FLIGHT_ENTRIES {
+                    let Some((oldest_key, oldest_flight)) = in_flight
+                        .iter()
+                        .min_by_key(|(_, flight)| flight.started_at)
+                        .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
+                    else {
+                        break;
+                    };
+                    *oldest_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
+                        crate::providers::adapter::ProviderProbeError::TimedOut,
+                    )));
+                    oldest_flight.completed.notify_waiters();
+                    in_flight.remove(&oldest_key);
+                }
                 let flight = Arc::new(ProbeFlight {
                     result: Mutex::new(None),
                     completed: Notify::new(),
+                    started_at: now,
                 });
                 in_flight.insert(key.clone(), Arc::clone(&flight));
                 (flight, true)
@@ -569,7 +672,13 @@ impl ProviderRegistry {
                         leader: false,
                     });
                 }
-                flight.completed.notified().await;
+                tokio::time::timeout(PROVIDER_IN_FLIGHT_TTL, flight.completed.notified())
+                    .await
+                    .map_err(|_| {
+                        ProviderError::Probe(
+                            crate::providers::adapter::ProviderProbeError::TimedOut,
+                        )
+                    })?;
             }
         }
     }

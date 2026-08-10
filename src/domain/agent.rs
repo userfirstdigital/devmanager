@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::canonical;
 use crate::domain::id::{AgentSessionId, TaskId};
+use crate::providers::ProviderKind;
 
 /// Maximum UTF-8 byte length accepted for an opaque provider-issued session ID.
 pub const MAX_PROVIDER_SESSION_ID_BYTES: usize = 256;
@@ -14,6 +15,7 @@ pub enum ProviderSessionIdError {
     Empty,
     ContainsControlCharacter,
     TooLong,
+    NonCanonical,
 }
 
 impl std::fmt::Display for ProviderSessionIdError {
@@ -27,6 +29,12 @@ impl std::fmt::Display for ProviderSessionIdError {
                 f,
                 "provider session id exceeds {MAX_PROVIDER_SESSION_ID_BYTES} bytes"
             ),
+            Self::NonCanonical => {
+                write!(
+                    f,
+                    "provider session id must not have surrounding whitespace"
+                )
+            }
         }
     }
 }
@@ -55,6 +63,9 @@ impl ProviderSessionId {
         let value = value.into();
         if value.is_empty() {
             return Err(ProviderSessionIdError::Empty);
+        }
+        if value.trim() != value {
+            return Err(ProviderSessionIdError::NonCanonical);
         }
         if value.len() > MAX_PROVIDER_SESSION_ID_BYTES {
             return Err(ProviderSessionIdError::TooLong);
@@ -94,7 +105,7 @@ impl AsRef<str> for ProviderSessionId {
 
 impl std::fmt::Display for ProviderSessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "<provider-session:{}-bytes>", self.0.len())
     }
 }
 
@@ -253,8 +264,8 @@ pub struct AgentSessionFacts {
     pub id: AgentSessionId,
     pub task_id: TaskId,
     pub role: AgentRole,
-    pub provider_kind: String,
-    pub provider_session_id: Option<String>,
+    pub provider_kind: ProviderKind,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub lifecycle: AgentSessionLifecycle,
     pub runtime_generation: u64,
     pub revision: u64,
@@ -264,11 +275,10 @@ impl AgentSessionFacts {
     pub fn new(
         task_id: TaskId,
         role: AgentRole,
-        provider_kind: impl Into<String>,
-        provider_session_id: Option<String>,
+        provider_kind: ProviderKind,
+        provider_session_id: Option<ProviderSessionId>,
     ) -> Result<Self, AgentValidationError> {
-        let provider_kind = Self::canonicalize_provider_kind(provider_kind)?;
-        let provider_session_id = Self::canonicalize_provider_session_id(provider_session_id)?;
+        let provider_session_id = Self::validate_provider_session_id(provider_session_id)?;
         role.validate()?;
         let facts = Self {
             id: AgentSessionId::new(),
@@ -286,13 +296,18 @@ impl AgentSessionFacts {
 
     pub fn canonicalize_provider_kind(
         value: impl Into<String>,
-    ) -> Result<String, AgentValidationError> {
-        let value =
-            canonical::canonicalize(value.into()).ok_or(AgentValidationError::EmptyProviderKind)?;
-        match value.as_str() {
-            "claude" | "claude_code" | "codex" | "cursor" => Ok(value),
-            _ => Err(AgentValidationError::UnsupportedProviderKind),
+    ) -> Result<ProviderKind, AgentValidationError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(AgentValidationError::EmptyProviderKind);
         }
+        ProviderKind::parse_wire(&value).ok_or_else(|| {
+            if value == "claude_code" {
+                AgentValidationError::NonCanonicalProviderKind
+            } else {
+                AgentValidationError::UnsupportedProviderKind
+            }
+        })
     }
 
     pub fn canonicalize_provider_session_id(
@@ -309,10 +324,6 @@ impl AgentSessionFacts {
 
     pub fn validate(&self) -> Result<(), AgentValidationError> {
         self.role.validate()?;
-        let canonical = Self::canonicalize_provider_kind(self.provider_kind.clone())?;
-        if canonical != self.provider_kind {
-            return Err(AgentValidationError::NonCanonicalProviderKind);
-        }
         if let Some(session) = &self.provider_session_id {
             if !canonical::is_canonical(session) {
                 return Err(AgentValidationError::EmptyProviderSessionId);
@@ -338,8 +349,8 @@ impl<'de> Deserialize<'de> for AgentSessionFacts {
             id: AgentSessionId,
             task_id: TaskId,
             role: AgentRole,
-            provider_kind: String,
-            provider_session_id: Option<String>,
+            provider_kind: ProviderKind,
+            provider_session_id: Option<ProviderSessionId>,
             lifecycle: AgentSessionLifecycle,
             runtime_generation: u64,
             revision: u64,
@@ -350,9 +361,8 @@ impl<'de> Deserialize<'de> for AgentSessionFacts {
             id: wire.id,
             task_id: wire.task_id,
             role: wire.role,
-            provider_kind: Self::canonicalize_provider_kind(wire.provider_kind)
-                .map_err(de::Error::custom)?,
-            provider_session_id: Self::canonicalize_provider_session_id(wire.provider_session_id)
+            provider_kind: wire.provider_kind,
+            provider_session_id: Self::validate_provider_session_id(wire.provider_session_id)
                 .map_err(de::Error::custom)?,
             lifecycle: wire.lifecycle,
             runtime_generation: wire.runtime_generation,

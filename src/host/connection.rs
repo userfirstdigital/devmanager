@@ -4754,6 +4754,7 @@ mod output_tests {
             Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters,
             ProtocolVersion, ServerMessage,
         };
+        use crate::providers::ProviderKind;
         use uuid::Uuid;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4826,8 +4827,10 @@ mod output_tests {
                         .expect("agent"),
                         task_id: task,
                         role: AgentRole::Primary,
-                        provider_kind: "claude".into(),
-                        provider_session_id: Some("session-fanout".into()),
+                        provider_kind: ProviderKind::ClaudeCode,
+                        provider_session_id: Some(
+                            "session-fanout".parse().expect("provider session"),
+                        ),
                         lifecycle: AgentSessionLifecycle::Open,
                         runtime_generation: 0,
                         revision: 0,

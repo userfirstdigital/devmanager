@@ -23,6 +23,7 @@ pub const MAX_PROVIDER_PATH_VALUE_BYTES: usize = 32 * 1024;
 pub const MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES: usize = 64;
 pub const MAX_PROVIDER_AUTH_PENDING_ENTRIES: usize = 64;
 pub const MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES: usize = 64;
+pub const MAX_PROVIDER_AUTH_TTL: Duration = Duration::from_secs(5 * 60);
 pub const PROVIDER_CAPABILITY_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EXECUTABLE_SCHEMA_VERSION: u16 = 1;
@@ -30,8 +31,7 @@ pub const PROVIDER_FILE_IDENTITY_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_OBSERVATION_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_CACHE_KEY_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderKind {
     ClaudeCode,
     Codex,
@@ -40,6 +40,42 @@ pub enum ProviderKind {
 
 impl ProviderKind {
     pub const ALL: [Self; 3] = [Self::ClaudeCode, Self::Codex, Self::Cursor];
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    pub fn parse_wire(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "cursor" => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire_name())
+    }
+}
+
+impl Serialize for ProviderKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_wire(&value).ok_or_else(|| de::Error::custom("provider kind is not canonical"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,6 +138,7 @@ pub enum ProviderVersionError {
     ContainsControlCharacter,
     TooLong,
     MultipleLines,
+    NonCanonical,
 }
 
 impl fmt::Display for ProviderVersionError {
@@ -117,20 +154,35 @@ impl fmt::Display for ProviderVersionError {
                 "provider version exceeds {MAX_PROVIDER_VERSION_BYTES} bytes"
             ),
             Self::MultipleLines => write!(f, "provider version output contained multiple values"),
+            Self::NonCanonical => {
+                write!(f, "provider version must not have surrounding whitespace")
+            }
         }
     }
 }
 
 impl std::error::Error for ProviderVersionError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ProviderVersion(String);
+
+impl fmt::Debug for ProviderVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderVersion")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
 
 impl ProviderVersion {
     pub fn new(value: impl Into<String>) -> Result<Self, ProviderVersionError> {
         let value = value.into();
-        if value.is_empty() || value.trim().is_empty() {
+        if value.is_empty() {
             return Err(ProviderVersionError::Empty);
+        }
+        if value.trim() != value {
+            return Err(ProviderVersionError::NonCanonical);
         }
         if value.len() > MAX_PROVIDER_VERSION_BYTES {
             return Err(ProviderVersionError::TooLong);
@@ -143,12 +195,18 @@ impl ProviderVersion {
 
     pub fn from_probe_output(output: &[u8]) -> Result<Self, ProviderVersionError> {
         let output = std::str::from_utf8(output).map_err(|_| ProviderVersionError::InvalidUtf8)?;
-        let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+        if output.is_empty() {
+            return Err(ProviderVersionError::Empty);
+        }
+        let mut lines = output.lines();
         let first = lines.next().ok_or(ProviderVersionError::Empty)?;
+        if first.trim().is_empty() {
+            return Err(ProviderVersionError::NonCanonical);
+        }
         if lines.next().is_some() {
             return Err(ProviderVersionError::MultipleLines);
         }
-        Self::new(first.trim())
+        Self::new(first)
     }
 
     pub fn as_str(&self) -> &str {
@@ -166,7 +224,7 @@ impl ProviderVersion {
 
 impl fmt::Display for ProviderVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "<provider-version:{}-bytes>", self.0.len())
     }
 }
 
@@ -880,11 +938,13 @@ pub enum ProviderAuthEvidenceError {
     WrongProvider,
     WrongAuthSource,
     WrongExecutable,
+    WrongVersion,
     Expired,
     FutureTimestamp,
     Reordered,
     NonMonotonicTimestamp,
     AlreadyConsumed,
+    UntrustedAuthenticationEvidence,
     ExecutableChanged(ProviderExecutableError),
 }
 
@@ -899,6 +959,7 @@ impl fmt::Display for ProviderAuthEvidenceError {
             Self::WrongExecutable => {
                 write!(f, "auth evidence executable does not match invocation")
             }
+            Self::WrongVersion => write!(f, "auth evidence version does not match invocation"),
             Self::Expired => write!(f, "auth evidence invocation is expired"),
             Self::FutureTimestamp => write!(
                 f,
@@ -909,6 +970,10 @@ impl fmt::Display for ProviderAuthEvidenceError {
                 write!(f, "auth evidence timestamp is not strictly increasing")
             }
             Self::AlreadyConsumed => write!(f, "auth evidence receipt was already consumed"),
+            Self::UntrustedAuthenticationEvidence => write!(
+                f,
+                "authenticated subscription evidence must come from a bounded provider probe"
+            ),
             Self::ExecutableChanged(error) => error.fmt(f),
         }
     }
@@ -919,14 +984,16 @@ impl std::error::Error for ProviderAuthEvidenceError {}
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ProviderAuthInvocationKey {
     kind: ProviderKind,
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ProviderAuthReceiptKey {
     kind: ProviderKind,
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
 }
@@ -935,7 +1002,8 @@ struct ProviderAuthReceiptKey {
 pub struct ProviderAuthProbeInvocation {
     kind: ProviderKind,
     source: ProviderAuthEvidenceSource,
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
     issued_at: Instant,
@@ -949,6 +1017,7 @@ impl fmt::Debug for ProviderAuthProbeInvocation {
             .field("kind", &self.kind)
             .field("source", &self.source)
             .field("executable", &self.executable)
+            .field("version", &self.version)
             .field("nonce", &"<redacted>")
             .field("generation", &self.generation)
             .field("issued_at", &self.issued_at)
@@ -974,8 +1043,16 @@ impl ProviderAuthProbeInvocation {
         self.generation
     }
 
-    pub const fn executable(&self) -> &ProviderExecutable {
+    pub fn executable(&self) -> &ProviderExecutable {
+        self.executable.executable()
+    }
+
+    pub const fn executable_handle(&self) -> &ProviderExecutableHandle {
         &self.executable
+    }
+
+    pub const fn version(&self) -> &ProviderVersion {
+        &self.version
     }
 
     pub const fn issued_at(&self) -> Instant {
@@ -990,6 +1067,7 @@ impl ProviderAuthProbeInvocation {
         ProviderAuthInvocationKey {
             kind: self.kind,
             executable: self.executable.clone(),
+            version: self.version.clone(),
             nonce: self.nonce,
         }
     }
@@ -999,7 +1077,8 @@ impl ProviderAuthProbeInvocation {
 pub struct ProviderAuthEvidenceReceipt {
     kind: ProviderKind,
     source: ProviderAuthEvidenceSource,
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
     result: ProviderAuthProbeResult,
@@ -1015,6 +1094,7 @@ impl fmt::Debug for ProviderAuthEvidenceReceipt {
             .field("kind", &self.kind)
             .field("source", &self.source)
             .field("executable", &self.executable)
+            .field("version", &self.version)
             .field("nonce", &"<redacted>")
             .field("generation", &self.generation)
             .field("result", &self.result)
@@ -1034,8 +1114,16 @@ impl ProviderAuthEvidenceReceipt {
         self.source
     }
 
-    pub const fn executable(&self) -> &ProviderExecutable {
+    pub fn executable(&self) -> &ProviderExecutable {
+        self.executable.executable()
+    }
+
+    pub const fn executable_handle(&self) -> &ProviderExecutableHandle {
         &self.executable
+    }
+
+    pub const fn version(&self) -> &ProviderVersion {
+        &self.version
     }
 
     pub const fn nonce(&self) -> &[u8; PROVIDER_AUTH_NONCE_BYTES] {
@@ -1078,9 +1166,53 @@ impl ProviderAuthEvidenceReceipt {
         ProviderAuthReceiptKey {
             kind: self.kind,
             executable: self.executable.clone(),
+            version: self.version.clone(),
             nonce: self.nonce,
             generation: self.generation,
         }
+    }
+}
+
+/// Evidence produced only by the crate-owned bounded probe runner. The permit
+/// is deliberately private and consumed by the registry, so callers cannot
+/// construct a receipt by selecting an authenticated result or timestamp.
+pub(crate) struct ProviderAuthProbeObservation {
+    kind: ProviderKind,
+    source: ProviderAuthEvidenceSource,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
+    result: ProviderAuthProbeResult,
+    observed_at: Instant,
+    confidence: EvidenceConfidence,
+    permit: ProviderAuthObservationPermit,
+}
+
+struct ProviderAuthObservationPermit {
+    _opaque: (),
+}
+
+impl ProviderAuthProbeObservation {
+    pub(crate) fn from_bounded_probe(
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+        result: ProviderAuthProbeResult,
+        confidence: EvidenceConfidence,
+    ) -> Result<Self, ProviderAuthEvidenceError> {
+        if source.provider_kind() != kind {
+            return Err(ProviderAuthEvidenceError::WrongAuthSource);
+        }
+        Ok(Self {
+            kind,
+            source,
+            executable,
+            version,
+            result,
+            observed_at: Instant::now(),
+            confidence,
+            permit: ProviderAuthObservationPermit { _opaque: () },
+        })
     }
 }
 
@@ -1091,7 +1223,8 @@ pub struct ProviderAuthEvidenceRegistry {
     pending_order: VecDeque<ProviderAuthInvocationKey>,
     accepted: HashMap<ProviderAuthReceiptKey, (ProviderAuthEvidenceReceipt, bool)>,
     accepted_order: VecDeque<ProviderAuthReceiptKey>,
-    last_accepted: HashMap<(ProviderKind, ProviderExecutable), (u64, Instant)>,
+    last_accepted:
+        HashMap<(ProviderKind, ProviderExecutableHandle, ProviderVersion), (u64, Instant)>,
 }
 
 impl ProviderAuthEvidenceRegistry {
@@ -1105,10 +1238,26 @@ impl ProviderAuthEvidenceRegistry {
         executable: ProviderExecutable,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
-        self.begin_with_source(
+        self.begin_with_version(
+            kind,
+            executable,
+            ProviderVersion::new("unresolved").expect("static provider version"),
+            ttl,
+        )
+    }
+
+    pub fn begin_with_version(
+        &mut self,
+        kind: ProviderKind,
+        executable: ProviderExecutable,
+        version: ProviderVersion,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_with_source_and_version(
             kind,
             ProviderAuthEvidenceSource::for_kind(kind),
             executable,
+            version,
             ttl,
         )
     }
@@ -1120,11 +1269,30 @@ impl ProviderAuthEvidenceRegistry {
         executable: ProviderExecutable,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_with_source_and_version(
+            kind,
+            source,
+            executable,
+            ProviderVersion::new("unresolved").expect("static provider version"),
+            ttl,
+        )
+    }
+
+    pub fn begin_with_source_and_version(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutable,
+        version: ProviderVersion,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         let issued_at = Instant::now();
         let deadline = issued_at
-            .checked_add(ttl)
+            .checked_add(ttl.min(MAX_PROVIDER_AUTH_TTL))
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
-        self.begin_at_with_source(kind, source, executable, issued_at, deadline)
+        self.begin_at_with_source_and_version(
+            kind, source, executable, version, issued_at, deadline,
+        )
     }
 
     pub fn begin_at(
@@ -1134,10 +1302,29 @@ impl ProviderAuthEvidenceRegistry {
         issued_at: Instant,
         deadline: Instant,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
-        self.begin_at_with_source(
+        self.begin_at_with_source_and_version(
             kind,
             ProviderAuthEvidenceSource::for_kind(kind),
             executable,
+            ProviderVersion::new("unresolved").expect("static provider version"),
+            issued_at,
+            deadline,
+        )
+    }
+
+    pub fn begin_at_with_version(
+        &mut self,
+        kind: ProviderKind,
+        executable: ProviderExecutable,
+        version: ProviderVersion,
+        issued_at: Instant,
+        deadline: Instant,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_at_with_source_and_version(
+            kind,
+            ProviderAuthEvidenceSource::for_kind(kind),
+            executable,
+            version,
             issued_at,
             deadline,
         )
@@ -1151,12 +1338,47 @@ impl ProviderAuthEvidenceRegistry {
         issued_at: Instant,
         deadline: Instant,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_at_with_source_and_version(
+            kind,
+            source,
+            executable,
+            ProviderVersion::new("unresolved").expect("static provider version"),
+            issued_at,
+            deadline,
+        )
+    }
+
+    pub fn begin_at_with_source_and_version(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutable,
+        version: ProviderVersion,
+        issued_at: Instant,
+        deadline: Instant,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         if source.provider_kind() != kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
-        if deadline <= issued_at {
+        let now = Instant::now();
+        if deadline <= issued_at || deadline <= now {
             return Err(ProviderAuthEvidenceError::InvalidDeadline);
         }
+        let ttl = deadline
+            .saturating_duration_since(now)
+            .min(MAX_PROVIDER_AUTH_TTL);
+        if ttl.is_zero() {
+            return Err(ProviderAuthEvidenceError::InvalidDeadline);
+        }
+        let issued_at = now;
+        let deadline = issued_at
+            .checked_add(ttl)
+            .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
+        let executable = executable
+            .open_for_launch()
+            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        self.evict_expired(now);
+        self.invalidate_changed_identity(kind, &executable, &version);
         self.next_generation = self
             .next_generation
             .checked_add(1)
@@ -1171,6 +1393,7 @@ impl ProviderAuthEvidenceRegistry {
             kind,
             source,
             executable,
+            version,
             nonce,
             generation: self.next_generation,
             issued_at,
@@ -1189,19 +1412,80 @@ impl ProviderAuthEvidenceRegistry {
         expected_executable: &ProviderExecutable,
         invocation: ProviderAuthProbeInvocation,
         result: ProviderAuthProbeResult,
+        _observed_at: Instant,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        if result.is_authenticated_subscription() {
+            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
+        self.accept_untrusted_at_for(
+            expected_kind,
+            expected_executable,
+            invocation,
+            result,
+            Instant::now(),
+        )
+    }
+
+    fn accept_untrusted_at_for(
+        &mut self,
+        expected_kind: ProviderKind,
+        expected_executable: &ProviderExecutable,
+        invocation: ProviderAuthProbeInvocation,
+        result: ProviderAuthProbeResult,
         observed_at: Instant,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
-        self.accept_at_for_with_confidence(
+        self.accept_at_for_internal(
             expected_kind,
             expected_executable,
             invocation,
             result,
             observed_at,
             result.default_confidence(),
+            false,
         )
     }
 
-    pub(crate) fn accept_at_for_with_confidence(
+    pub(crate) fn accept_observation(
+        &mut self,
+        invocation: ProviderAuthProbeInvocation,
+        observation: ProviderAuthProbeObservation,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        let ProviderAuthProbeObservation {
+            kind,
+            source,
+            executable,
+            version,
+            result,
+            observed_at,
+            confidence,
+            permit,
+        } = observation;
+        let _permit = permit;
+        if kind != invocation.kind {
+            return Err(ProviderAuthEvidenceError::WrongProvider);
+        }
+        if source != invocation.source {
+            return Err(ProviderAuthEvidenceError::WrongAuthSource);
+        }
+        if executable != invocation.executable {
+            return Err(ProviderAuthEvidenceError::WrongExecutable);
+        }
+        if version != invocation.version {
+            return Err(ProviderAuthEvidenceError::WrongVersion);
+        }
+        let expected_executable = invocation.executable.executable().clone();
+        self.accept_at_for_internal(
+            invocation.kind,
+            &expected_executable,
+            invocation,
+            result,
+            observed_at,
+            confidence,
+            true,
+        )
+    }
+
+    fn accept_at_for_internal(
         &mut self,
         expected_kind: ProviderKind,
         expected_executable: &ProviderExecutable,
@@ -1209,23 +1493,29 @@ impl ProviderAuthEvidenceRegistry {
         result: ProviderAuthProbeResult,
         observed_at: Instant,
         confidence: EvidenceConfidence,
+        trusted_observation: bool,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        if result.is_authenticated_subscription() && !trusted_observation {
+            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
         if invocation.kind != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongProvider);
         }
         if invocation.source.provider_kind() != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
-        if &invocation.executable != expected_executable {
+        if invocation.executable.executable() != expected_executable {
             return Err(ProviderAuthEvidenceError::WrongExecutable);
         }
         let key = invocation.key();
+        self.evict_expired(Instant::now());
         if !self.pending.contains_key(&key) {
             return Err(ProviderAuthEvidenceError::UnknownInvocation);
         }
-        expected_executable
-            .validate_current()
-            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        if let Err(error) = invocation.executable.revalidate() {
+            self.remove_pending(&key);
+            return Err(ProviderAuthEvidenceError::ExecutableChanged(error));
+        }
         let now = Instant::now();
         if observed_at > now {
             return Err(ProviderAuthEvidenceError::FutureTimestamp);
@@ -1236,7 +1526,11 @@ impl ProviderAuthEvidenceRegistry {
         }
         self.remove_pending(&key);
 
-        let identity_key = (invocation.kind, invocation.executable.clone());
+        let identity_key = (
+            invocation.kind,
+            invocation.executable.clone(),
+            invocation.version.clone(),
+        );
         if let Some((last_generation, last_observed_at)) = self.last_accepted.get(&identity_key) {
             if invocation.generation <= *last_generation {
                 return Err(ProviderAuthEvidenceError::Reordered);
@@ -1249,6 +1543,7 @@ impl ProviderAuthEvidenceRegistry {
             kind: invocation.kind,
             source: invocation.source,
             executable: invocation.executable,
+            version: invocation.version,
             nonce: invocation.nonce,
             generation: invocation.generation,
             result,
@@ -1269,11 +1564,11 @@ impl ProviderAuthEvidenceRegistry {
         &mut self,
         invocation: ProviderAuthProbeInvocation,
         result: ProviderAuthProbeResult,
-        observed_at: Instant,
+        _observed_at: Instant,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         let kind = invocation.kind;
-        let executable = invocation.executable.clone();
-        self.accept_at_for(kind, &executable, invocation, result, observed_at)
+        let executable = invocation.executable.executable().clone();
+        self.accept_at_for(kind, &executable, invocation, result, Instant::now())
     }
 
     pub fn accept_now(
@@ -1289,7 +1584,7 @@ impl ProviderAuthEvidenceRegistry {
         expected_kind: ProviderKind,
         expected_executable: &ProviderExecutable,
         receipt: ProviderAuthEvidenceReceipt,
-        now: Instant,
+        _now: Instant,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         if receipt.kind != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongProvider);
@@ -1297,23 +1592,33 @@ impl ProviderAuthEvidenceRegistry {
         if receipt.source.provider_kind() != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
-        if &receipt.executable != expected_executable {
+        if receipt.executable.executable() != expected_executable {
             return Err(ProviderAuthEvidenceError::WrongExecutable);
         }
-        expected_executable
-            .validate_current()
-            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        let key = receipt.key();
+        if let Err(error) = receipt.executable.revalidate() {
+            self.remove_accepted(&key);
+            return Err(ProviderAuthEvidenceError::ExecutableChanged(error));
+        }
+        let now = Instant::now();
+        if receipt.deadline < now {
+            return Err(ProviderAuthEvidenceError::Expired);
+        }
+        self.evict_expired(now);
         if !receipt.is_fresh_at(now) {
             return Err(ProviderAuthEvidenceError::Expired);
         }
         if self
             .last_accepted
-            .get(&(receipt.kind, receipt.executable.clone()))
+            .get(&(
+                receipt.kind,
+                receipt.executable.clone(),
+                receipt.version.clone(),
+            ))
             .map_or(true, |(generation, _)| *generation != receipt.generation)
         {
             return Err(ProviderAuthEvidenceError::Reordered);
         }
-        let key = receipt.key();
         let Some((stored, consumed)) = self.accepted.get_mut(&key) else {
             return Err(ProviderAuthEvidenceError::UnknownInvocation);
         };
@@ -1327,12 +1632,69 @@ impl ProviderAuthEvidenceRegistry {
         Ok(receipt)
     }
 
-    pub fn pending_len(&self) -> usize {
+    pub fn pending_len(&mut self) -> usize {
+        self.evict_expired(Instant::now());
         self.pending.len()
     }
 
-    pub fn accepted_len(&self) -> usize {
+    pub fn accepted_len(&mut self) -> usize {
+        self.evict_expired(Instant::now());
         self.accepted.len()
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        let pending_keys: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, invocation)| invocation.deadline <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in pending_keys {
+            self.remove_pending(&key);
+        }
+        let accepted_keys: Vec<_> = self
+            .accepted
+            .iter()
+            .filter(|(_, (receipt, _))| receipt.deadline <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in accepted_keys {
+            self.remove_accepted(&key);
+        }
+    }
+
+    fn invalidate_changed_identity(
+        &mut self,
+        kind: ProviderKind,
+        executable: &ProviderExecutableHandle,
+        version: &ProviderVersion,
+    ) {
+        let pending_keys: Vec<_> = self
+            .pending
+            .keys()
+            .filter(|key| {
+                key.kind == kind
+                    && key.executable.canonical_path() == executable.canonical_path()
+                    && (key.executable != *executable || key.version != *version)
+            })
+            .cloned()
+            .collect();
+        for key in pending_keys {
+            self.remove_pending(&key);
+        }
+        let accepted_keys: Vec<_> = self
+            .accepted
+            .keys()
+            .filter(|key| {
+                key.kind == kind
+                    && key.executable.canonical_path() == executable.canonical_path()
+                    && (key.executable != *executable || key.version != *version)
+            })
+            .cloned()
+            .collect();
+        for key in accepted_keys {
+            self.remove_accepted(&key);
+        }
     }
 
     fn evict_oldest_pending(&mut self) {
@@ -1357,7 +1719,11 @@ impl ProviderAuthEvidenceRegistry {
                 break;
             };
             if let Some((receipt, _)) = self.accepted.remove(&key) {
-                let identity_key = (receipt.kind, receipt.executable.clone());
+                let identity_key = (
+                    receipt.kind,
+                    receipt.executable.clone(),
+                    receipt.version.clone(),
+                );
                 if self
                     .last_accepted
                     .get(&identity_key)
@@ -1365,6 +1731,30 @@ impl ProviderAuthEvidenceRegistry {
                 {
                     self.last_accepted.remove(&identity_key);
                 }
+            }
+        }
+    }
+
+    fn remove_accepted(&mut self, key: &ProviderAuthReceiptKey) {
+        if let Some((receipt, _)) = self.accepted.remove(key) {
+            if let Some(position) = self
+                .accepted_order
+                .iter()
+                .position(|current| current == key)
+            {
+                self.accepted_order.remove(position);
+            }
+            let identity_key = (
+                receipt.kind,
+                receipt.executable.clone(),
+                receipt.version.clone(),
+            );
+            if self
+                .last_accepted
+                .get(&identity_key)
+                .is_some_and(|(generation, _)| *generation == receipt.generation)
+            {
+                self.last_accepted.remove(&identity_key);
             }
         }
     }
@@ -1415,6 +1805,20 @@ impl Hash for ProviderExecutable {
 #[derive(Debug, Clone)]
 pub struct ProviderExecutableHandle {
     executable: ProviderExecutable,
+}
+
+impl PartialEq for ProviderExecutableHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.executable == other.executable
+    }
+}
+
+impl Eq for ProviderExecutableHandle {}
+
+impl Hash for ProviderExecutableHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.executable.hash(state);
+    }
 }
 
 impl ProviderExecutable {

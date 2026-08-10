@@ -202,7 +202,7 @@ pub(crate) fn apply_event(
                     agent.id.as_bytes().as_slice(),
                     agent.task_id.as_bytes().as_slice(),
                     pack(&agent.role)?,
-                    agent.provider_kind,
+                    agent.provider_kind.wire_name(),
                     agent.provider_session_id,
                     agent_lifecycle_text(agent.lifecycle),
                     u64_to_sqlite_i64(

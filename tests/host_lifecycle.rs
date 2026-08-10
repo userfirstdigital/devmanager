@@ -48,6 +48,7 @@ use devmanager::host::{
     HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
+use devmanager::providers::ProviderKind;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -2562,8 +2563,10 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
                 id: agent_session_id,
                 task_id,
                 role: AgentRole::Primary,
-                provider_kind: "claude".into(),
-                provider_session_id: Some(PRIVATE_PROVIDER_SESSION.into()),
+                provider_kind: ProviderKind::ClaudeCode,
+                provider_session_id: Some(
+                    PRIVATE_PROVIDER_SESSION.parse().expect("provider session"),
+                ),
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 0,
                 revision: 0,
@@ -2759,7 +2762,7 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
     assert_eq!(agent.task_id, task_id);
     assert_eq!(agent.task_title, TASK_TITLE);
     assert_eq!(agent.role, AgentRole::Primary);
-    assert_eq!(agent.provider_kind, "claude");
+    assert_eq!(agent.provider_kind, ProviderKind::ClaudeCode);
     assert_eq!(agent.lifecycle, AgentSessionLifecycle::Open);
     assert_eq!(agent.runtime_generation, 0);
 
@@ -3026,6 +3029,7 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
     use devmanager::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
     use devmanager::domain::id::AgentSessionId;
     use devmanager::domain::operation::OperationErrorCode;
+    use devmanager::providers::ProviderKind;
 
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();
@@ -3069,8 +3073,10 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
                 id: AgentSessionId::from_bytes(fixed_uuid_v7(0x56)).expect("agent"),
                 task_id,
                 role: AgentRole::Primary,
-                provider_kind: "claude".into(),
-                provider_session_id: Some("cleanup-failed-session".into()),
+                provider_kind: ProviderKind::ClaudeCode,
+                provider_session_id: Some(
+                    "cleanup-failed-session".parse().expect("provider session"),
+                ),
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 0,
                 revision: 0,

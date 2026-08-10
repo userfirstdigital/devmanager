@@ -5,17 +5,20 @@
 
 use crate::domain::ProviderSessionId;
 use crate::providers::capabilities::{
-    ProviderAuthEvidenceError, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
-    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutablePolicy,
-    ProviderExecutablePolicyError, ProviderKind, ProviderVersion, ProviderVersionError,
+    ProviderAuthEvidenceError, ProviderAuthEvidenceSource, ProviderAuthProbeObservation,
+    ProviderAuthProbeResult, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
+    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutableHandle,
+    ProviderExecutablePolicy, ProviderExecutablePolicyError, ProviderKind, ProviderVersion,
+    ProviderVersionError,
 };
 use async_trait::async_trait;
 use std::fmt;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -27,7 +30,7 @@ pub const MAX_PROVIDER_ARGUMENTS: usize = 32;
 pub const MAX_PROVIDER_ARGUMENT_BYTES: usize = 2048;
 pub const MAX_PROVIDER_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const PROVIDER_PROBE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const PROVIDER_PROBE_CLEANUP_RESERVE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderInputError {
@@ -117,14 +120,14 @@ impl ProviderArgument {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchProviderRequest {
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
     input: Option<ProviderInput>,
     provider_session_id: Option<ProviderSessionId>,
 }
 
 impl LaunchProviderRequest {
     pub const fn new(
-        executable: ProviderExecutable,
+        executable: ProviderExecutableHandle,
         input: Option<ProviderInput>,
         provider_session_id: Option<ProviderSessionId>,
     ) -> Self {
@@ -135,7 +138,7 @@ impl LaunchProviderRequest {
         }
     }
 
-    pub fn executable(&self) -> &ProviderExecutable {
+    pub fn executable(&self) -> &ProviderExecutableHandle {
         &self.executable
     }
 
@@ -150,13 +153,13 @@ impl LaunchProviderRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderLaunchSpec {
-    executable: ProviderExecutable,
+    executable: ProviderExecutableHandle,
     arguments: Vec<ProviderArgument>,
 }
 
 impl ProviderLaunchSpec {
     pub fn new(
-        executable: ProviderExecutable,
+        executable: ProviderExecutableHandle,
         arguments: Vec<ProviderArgument>,
     ) -> Result<Self, ProviderInputError> {
         if arguments.len() > MAX_PROVIDER_ARGUMENTS {
@@ -168,7 +171,7 @@ impl ProviderLaunchSpec {
         })
     }
 
-    pub fn executable(&self) -> &ProviderExecutable {
+    pub fn executable(&self) -> &ProviderExecutableHandle {
         &self.executable
     }
 
@@ -282,7 +285,7 @@ impl std::error::Error for ProviderProbeRequestError {}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderProbeRequest {
-    executable: PathBuf,
+    executable: ProviderExecutableHandle,
     kind: ProviderProbeKind,
     timeout: Duration,
     max_output_bytes: usize,
@@ -304,20 +307,24 @@ impl ProviderProbeRequest {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
     pub const DEFAULT_MAX_OUTPUT_BYTES: usize = MAX_PROVIDER_PROBE_OUTPUT_BYTES;
 
-    pub fn version(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
-        Self::new(executable.into(), ProviderProbeKind::Version)
+    pub fn version(
+        executable: ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable, ProviderProbeKind::Version)
     }
 
-    pub fn help(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
-        Self::new(executable.into(), ProviderProbeKind::Help)
+    pub fn help(executable: ProviderExecutableHandle) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable, ProviderProbeKind::Help)
     }
 
-    pub fn auth_status(executable: impl Into<PathBuf>) -> Result<Self, ProviderProbeRequestError> {
-        Self::new(executable.into(), ProviderProbeKind::AuthStatus)
+    pub fn auth_status(
+        executable: ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeRequestError> {
+        Self::new(executable, ProviderProbeKind::AuthStatus)
     }
 
     pub fn new(
-        executable: PathBuf,
+        executable: ProviderExecutableHandle,
         kind: ProviderProbeKind,
     ) -> Result<Self, ProviderProbeRequestError> {
         Self::with_limits(
@@ -329,14 +336,11 @@ impl ProviderProbeRequest {
     }
 
     pub fn with_limits(
-        executable: PathBuf,
+        executable: ProviderExecutableHandle,
         kind: ProviderProbeKind,
         timeout: Duration,
         max_output_bytes: usize,
     ) -> Result<Self, ProviderProbeRequestError> {
-        if executable.as_os_str().is_empty() {
-            return Err(ProviderProbeRequestError::EmptyExecutable);
-        }
         if timeout.is_zero() {
             return Err(ProviderProbeRequestError::ZeroTimeout);
         }
@@ -354,7 +358,7 @@ impl ProviderProbeRequest {
         })
     }
 
-    pub fn executable(&self) -> &Path {
+    pub fn executable(&self) -> &ProviderExecutableHandle {
         &self.executable
     }
 
@@ -573,6 +577,47 @@ impl ProviderProbeResult {
     pub(crate) fn output_for_adapter(&self) -> Option<&ProviderProbeOutput> {
         self.output.as_ref()
     }
+
+    pub(crate) fn into_auth_observation(
+        &self,
+        kind: ProviderKind,
+        request: &ProviderProbeRequest,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+    ) -> Result<ProviderAuthProbeObservation, ProviderAuthEvidenceError> {
+        if request.kind() != ProviderProbeKind::AuthStatus {
+            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
+        if self.status != ProviderProbeStatus::Completed {
+            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
+        let output = self
+            .output_for_adapter()
+            .ok_or(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence)?;
+        let mut text = String::with_capacity(output.stdout().len() + output.stderr().len());
+        text.push_str(&String::from_utf8_lossy(output.stdout()).to_ascii_lowercase());
+        text.push_str(&String::from_utf8_lossy(output.stderr()).to_ascii_lowercase());
+        let result = if text.contains("authenticated subscription")
+            || text.contains("subscription authenticated")
+            || text.contains("logged in")
+        {
+            ProviderAuthProbeResult::AuthenticatedSubscription
+        } else if text.contains("auth required") || text.contains("authentication required") {
+            ProviderAuthProbeResult::AuthRequired
+        } else if text.contains("api key") || text.contains("api_key") {
+            ProviderAuthProbeResult::ApiKeyDetected
+        } else {
+            ProviderAuthProbeResult::Unknown
+        };
+        ProviderAuthProbeObservation::from_bounded_probe(
+            kind,
+            ProviderAuthEvidenceSource::for_kind(kind),
+            executable,
+            version,
+            result,
+            result.default_confidence(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +681,7 @@ impl WindowsProviderProbeRunner {
         &self,
         request: ProviderProbeRequest,
     ) -> Result<ProviderProbeResult, ProviderProbeError> {
+        let deadline = std::time::Instant::now() + request.timeout();
         let executable = validate_probe_executable(&self.policy, request.executable())?;
         let mut command = std::process::Command::new(&executable);
         command
@@ -648,7 +694,16 @@ impl WindowsProviderProbeRunner {
         #[cfg(windows)]
         command.creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
 
-        let mut process = ProbeProcess::spawn(command)?;
+        let mut process = ProbeProcess::spawn(command, deadline)?;
+        // Standard Command cannot pass the opened executable handle through
+        // CreateProcess. Revalidate immediately after spawn so a same-path
+        // replacement cannot be mistaken for the requested identity.
+        if request.executable().revalidate().is_err() {
+            process.terminate_tree(deadline)?;
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
         let stdout = process
             .child_mut()
             .stdout
@@ -663,7 +718,6 @@ impl WindowsProviderProbeRunner {
         let stdout_reader = spawn_probe_reader(stdout, Arc::clone(&capture), true);
         let stderr_reader = spawn_probe_reader(stderr, Arc::clone(&capture), false);
 
-        let deadline = std::time::Instant::now() + request.timeout();
         let mut timed_out = false;
         let exit_code = loop {
             match process
@@ -672,19 +726,22 @@ impl WindowsProviderProbeRunner {
                 .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))?
             {
                 Some(status) => break status.code(),
-                None if std::time::Instant::now() < deadline => {
+                None if std::time::Instant::now()
+                    .checked_add(PROVIDER_PROBE_CLEANUP_RESERVE)
+                    .is_some_and(|cleanup_start| cleanup_start < deadline) =>
+                {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 None => {
                     timed_out = true;
-                    process.terminate_tree();
+                    process.terminate_tree(deadline)?;
                     break None;
                 }
             }
         };
 
         if !timed_out {
-            process.terminate_tree();
+            process.terminate_tree(deadline)?;
         }
         receive_probe_reader(stdout_reader)?;
         receive_probe_reader(stderr_reader)?;
@@ -718,27 +775,12 @@ impl ProviderProbeRunner for WindowsProviderProbeRunner {
 
 fn validate_probe_executable(
     policy: &ProviderExecutablePolicy,
-    requested: &Path,
+    requested: &ProviderExecutableHandle,
 ) -> Result<PathBuf, ProviderProbeError> {
-    if requested.as_os_str().is_empty() {
-        return Err(ProviderProbeError::InvalidRequest(
-            ProviderProbeRequestError::EmptyExecutable,
-        ));
-    }
-    let canonical = std::fs::canonicalize(requested).map_err(|error| {
-        ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
-            ProviderProbeIoError::ExecutableMissing
-        } else if error.kind() == std::io::ErrorKind::PermissionDenied {
-            ProviderProbeIoError::PermissionDenied
-        } else {
-            ProviderProbeIoError::SpawnFailed
-        })
-    })?;
-    if !canonical.is_file() {
-        return Err(ProviderProbeError::Io(
-            ProviderProbeIoError::ExecutableMissing,
-        ));
-    }
+    requested
+        .revalidate()
+        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+    let canonical = requested.canonical_path().to_path_buf();
     policy
         .validate_canonical_path(&canonical)
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
@@ -789,10 +831,14 @@ fn is_provider_secret_environment_key(key: &str) -> bool {
 struct ProbeProcess {
     child: Child,
     managed_job: Option<crate::process::job::ManagedProcessJob>,
+    deadline: std::time::Instant,
 }
 
 impl ProbeProcess {
-    fn spawn(mut command: std::process::Command) -> Result<Self, ProviderProbeError> {
+    fn spawn(
+        mut command: std::process::Command,
+        deadline: std::time::Instant,
+    ) -> Result<Self, ProviderProbeError> {
         let mut child = command.spawn().map_err(|error| {
             ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
                 ProviderProbeIoError::ExecutableMissing
@@ -807,33 +853,76 @@ impl ProbeProcess {
                 Ok(job) => job,
                 Err(_) => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    reap_child_until(&mut child, deadline);
                     return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
                 }
             };
         #[cfg(windows)]
         if managed_job.is_none() {
             let _ = child.kill();
-            let _ = child.wait();
+            reap_child_until(&mut child, deadline);
             return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
         }
-        Ok(Self { child, managed_job })
+        Ok(Self {
+            child,
+            managed_job,
+            deadline,
+        })
     }
 
     fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
 
-    fn terminate_tree(&mut self) {
+    fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
+        let mut job_empty = true;
+        if let Some(job) = self.managed_job.as_ref() {
+            let active_before = job.active_process_ids().map_err(|_| {
+                ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
+            })?;
+            if !active_before.is_empty() {
+                job.terminate_members().map_err(|_| {
+                    ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
+                })?;
+            }
+            job_empty = job.wait_for_active_process_zero(deadline).map_err(|_| {
+                ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
+            })?;
+        }
+        // Job ACTIVE_PROCESS_ZERO state is authoritative for the managed tree.
+        // The raw `Child` handle can lag that state on Windows, so do not
+        // spend the absolute deadline waiting for a second observation of the
+        // same process exit.
+        let child_exited = if self.managed_job.is_some() && job_empty {
+            true
+        } else {
+            reap_child_until(&mut self.child, deadline)
+        };
+        if !job_empty || !child_exited {
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::DescendantCleanupFailed,
+            ));
+        }
         drop(self.managed_job.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Ok(())
     }
 }
 
 impl Drop for ProbeProcess {
     fn drop(&mut self) {
-        self.terminate_tree();
+        let _ = self.terminate_tree(self.deadline);
+    }
+}
+
+fn reap_child_until(child: &mut Child, deadline: std::time::Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => return false,
+        }
     }
 }
 
@@ -906,8 +995,7 @@ fn spawn_probe_reader<R: Read + Send + 'static>(
     mut pipe: R,
     capture: Arc<BoundedProbeCapture>,
     stdout: bool,
-) -> mpsc::Receiver<()> {
-    let (sender, receiver) = mpsc::sync_channel(1);
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 8 * 1024];
         loop {
@@ -916,14 +1004,12 @@ fn spawn_probe_reader<R: Read + Send + 'static>(
                 Ok(read) => capture.append(stdout, &buffer[..read]),
             }
         }
-        let _ = sender.send(());
-    });
-    receiver
+    })
 }
 
-fn receive_probe_reader(receiver: mpsc::Receiver<()>) -> Result<(), ProviderProbeError> {
-    receiver
-        .recv_timeout(PROVIDER_PROBE_DRAIN_TIMEOUT)
+fn receive_probe_reader(reader: JoinHandle<()>) -> Result<(), ProviderProbeError> {
+    reader
+        .join()
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
 }
 

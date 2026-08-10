@@ -15,6 +15,7 @@ use devmanager::domain::resource::{
 use devmanager::domain::task::{
     TaskAssignment, TaskFacts, TaskLifecycle, TaskValidationError, WorkspaceRef,
 };
+use devmanager::providers::ProviderKind;
 use static_assertions::assert_not_impl_any;
 
 assert_not_impl_any!(TaskId: From<AgentSessionId>, From<ArtifactId>, From<ResourceId>);
@@ -408,8 +409,8 @@ fn agent_artifact_resource_and_operation_facts_bind_ownership() {
     let agent = AgentSessionFacts::new(
         task_id,
         AgentRole::Primary,
-        "claude",
-        Some("provider-session-1".into()),
+        ProviderKind::ClaudeCode,
+        Some("provider-session-1".parse().expect("provider session")),
     )
     .expect("agent facts");
     assert_eq!(agent.task_id.as_bytes(), task_id.as_bytes());
@@ -457,7 +458,9 @@ fn agent_artifact_resource_and_operation_facts_bind_ownership() {
 fn agent_artifact_resource_reject_invalid_labels_and_providers() {
     let task_id = TaskId::new();
 
-    assert!(AgentSessionFacts::new(task_id, AgentRole::Primary, "  ", None).is_err());
+    assert!(
+        AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::ClaudeCode, None).is_ok()
+    );
     assert!(ArtifactFacts::new(
         task_id,
         ArtifactKind::Finding,
@@ -550,17 +553,17 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
     let agent = AgentSessionFacts::new(
         task_id,
         AgentRole::Primary,
-        "  claude  ",
-        Some("  sess  ".into()),
+        ProviderKind::ClaudeCode,
+        Some("sess".parse().expect("provider session")),
     )
-    .expect("provider strings trim");
-    assert_eq!(agent.provider_kind, "claude");
+    .expect("typed provider identity");
+    assert_eq!(agent.provider_kind, ProviderKind::ClaudeCode);
     assert_eq!(agent.provider_session_id.as_deref(), Some("sess"));
     let forged_agent = AgentSessionFacts {
-        provider_kind: "  claude  ".into(),
+        provider_kind: ProviderKind::ClaudeCode,
         ..agent.clone()
     };
-    assert!(forged_agent.validate().is_err());
+    assert!(forged_agent.validate().is_ok());
 
     let artifact = ArtifactFacts::new(
         task_id,
