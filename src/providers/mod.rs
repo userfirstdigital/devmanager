@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod capabilities;
 pub mod registry;
+pub mod session;
 
 pub use adapter::{
     JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderArgument, ProviderError,
