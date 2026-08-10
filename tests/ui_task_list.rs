@@ -1,5 +1,6 @@
 use devmanager::client::{ClientModel, ClientModelBuilder};
-use devmanager::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+use devmanager::domain::command::Command;
+use devmanager::domain::id::{ClientId, CommandId, EnvironmentId, ProjectId, SnapshotId, TaskId};
 use devmanager::domain::snapshot::{SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
@@ -545,6 +546,32 @@ fn inbox_actions_revalidate_identity_focus_row_generation_and_read_only_state() 
         Err(InboxActionRejection::ReadOnly),
         "archived rows cannot be archived or activated again"
     );
+
+    let history_shell = Shell::new(None);
+    let history_epoch = history_shell.navigation_epoch();
+    let history_focus_epoch = history_shell.focus_navigation_epoch();
+    let unarchive = history_shell
+        .capture_inbox_row_action(
+            history.history_row(archived).expect("archived row"),
+            history_epoch,
+            history_focus_epoch,
+            InboxActionKind::Unarchive,
+        )
+        .expect("the explicit unarchive action is allowed for history rows");
+    assert!(unarchive.read_only());
+    assert_eq!(
+        history_shell.dispatch_inbox_action(unarchive, &history),
+        Ok(devmanager::ui::shell::InboxActionCommit {
+            task_id: archived,
+            action: InboxActionKind::Unarchive,
+        })
+    );
+    let envelope = unarchive
+        .host_command(CommandId::new(), ClientId::new(), 99)
+        .expect("unarchive is a real host command");
+    assert_eq!(envelope.task_id, Some(archived));
+    assert_eq!(envelope.expected_task_revision, Some(1));
+    assert_eq!(envelope.command, Command::ReopenTask);
 }
 
 #[test]

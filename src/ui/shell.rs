@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::domain::id::TaskId;
+use crate::domain::command::{Command, CommandEnvelope};
+use crate::domain::id::{ClientId, CommandId, TaskId};
 use crate::ui::task_cockpit::{
     Inbox, InboxPresentationWidth, InboxRenderModel, RuntimeSummary, TaskRowModel,
 };
@@ -47,6 +48,7 @@ pub enum InboxActionKind {
     Activate,
     MarkRead,
     Archive,
+    Unarchive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +108,31 @@ impl CapturedInboxAction {
 
     pub fn action(self) -> InboxActionKind {
         self.action
+    }
+
+    /// Build the typed host command for the two mutating lifecycle actions.
+    /// Selection and MarkRead remain client-local presentation changes; the
+    /// caller sends this envelope through the native-next HostClient
+    /// controller and preserves the captured row revision as its fence.
+    pub fn host_command(
+        self,
+        command_id: CommandId,
+        client_id: ClientId,
+        issued_at_ms: i64,
+    ) -> Option<CommandEnvelope> {
+        let command = match self.action {
+            InboxActionKind::Archive => Command::BeginCloseTask,
+            InboxActionKind::Unarchive => Command::ReopenTask,
+            InboxActionKind::Activate | InboxActionKind::MarkRead => return None,
+        };
+        Some(CommandEnvelope {
+            command_id,
+            client_id,
+            task_id: Some(self.task_id),
+            issued_at_ms,
+            expected_task_revision: Some(self.row_generation),
+            command,
+        })
     }
 }
 
@@ -289,7 +316,7 @@ impl Shell {
         if expected_focus_epoch != self.focus_epoch {
             return Err(InboxActionRejection::StaleFocusEpoch);
         }
-        if row.read_only {
+        if row.read_only && action != InboxActionKind::Unarchive {
             return Err(InboxActionRejection::ReadOnly);
         }
         let runtime_generation = match row.display.runtime {
@@ -321,10 +348,16 @@ impl Shell {
         if action.focus_epoch != self.focus_epoch {
             return Err(InboxActionRejection::StaleFocusEpoch);
         }
-        let Some(row) = inbox.active_row(action.task_id) else {
+        let row = match action.action {
+            InboxActionKind::Unarchive => inbox.history_row(action.task_id),
+            InboxActionKind::Activate | InboxActionKind::MarkRead | InboxActionKind::Archive => {
+                inbox.active_row(action.task_id)
+            }
+        };
+        let Some(row) = row else {
             return Err(InboxActionRejection::TaskNotInInbox);
         };
-        if action.read_only || row.read_only {
+        if (action.read_only || row.read_only) && action.action != InboxActionKind::Unarchive {
             return Err(InboxActionRejection::ReadOnly);
         }
         if row.revision != action.row_generation {
@@ -351,7 +384,13 @@ impl Shell {
         if action.navigation_epoch != self.navigation_epoch {
             return Err(NavigationRejection::StaleEpoch);
         }
-        if !inbox.contains_active_task(action.task_id) {
+        let present = match action.action {
+            InboxActionKind::Unarchive => inbox.history_row(action.task_id).is_some(),
+            InboxActionKind::Activate | InboxActionKind::MarkRead | InboxActionKind::Archive => {
+                inbox.contains_active_task(action.task_id)
+            }
+        };
+        if !present {
             return Err(NavigationRejection::TaskNotInInbox);
         }
         Ok(action.task_id)

@@ -1,8 +1,10 @@
-use devmanager::client::{ClientModel, ClientModelBuilder};
+use devmanager::client::{
+    ClientModel, ClientModelBuilder, HostClientConfig, InboxHostController, InboxPreferenceStore,
+};
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
-    AgentSessionId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
+    AgentSessionId, ClientId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -12,6 +14,7 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
+use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
@@ -19,8 +22,8 @@ use devmanager::ui::preview::{
 };
 use devmanager::ui::task_cockpit::{
     Inbox, InboxError, InboxFilter, InboxItemKey, InboxPresentationWidth, InboxRenderItem,
-    InboxSection, InboxState, PrimaryProviderIcon, PrimaryProviderState, RuntimeSummary,
-    UnreadCursor, DEFAULT_VISIBLE_ROWS,
+    InboxRuntime, InboxSection, InboxState, PrimaryProviderIcon, PrimaryProviderState,
+    RuntimeSummary, UnreadCursor, DEFAULT_VISIBLE_ROWS,
 };
 use devmanager::ui::{self, PreviewInitReport};
 use std::cell::Cell;
@@ -1326,6 +1329,61 @@ fn durable_unread_cursor_roundtrips_and_ignores_duplicate_out_of_order_and_forei
 }
 
 #[test]
+fn native_next_cursor_store_restores_into_runtime_without_legacy_session_state() {
+    let task = inbox_task_id(53);
+    let event = DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(0x54)).expect("event id"),
+        task_id: Some(task),
+        sequence: 12,
+        task_revision: None,
+        occurred_at_ms: 12,
+        payload: Event::TaskReopened,
+    };
+    let mut cursor = UnreadCursor::default();
+    assert!(cursor.observe_durable_event(&event));
+    let encoded = cursor.encode_durable().expect("cursor encoding");
+
+    let profile = tempdir().expect("isolated native-next profile");
+    let store = InboxPreferenceStore::at_profile_root(profile.path());
+    let controller = InboxHostController::new(
+        HostClientConfig {
+            named_profile: "native-next-inbox-test".to_string(),
+            client_build: "ui-projection-test".to_string(),
+            client_id: ClientId::new(),
+            requested: CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+            ]),
+            limits: FrameLimits::v1_default(),
+        },
+        store,
+    );
+    let mut runtime = InboxRuntime::new();
+    runtime.restore_unread_cursor(cursor.clone());
+    runtime
+        .persist_unread_cursor_to_controller(&controller)
+        .expect("atomic cursor save");
+    let mut restored_runtime = InboxRuntime::new();
+    restored_runtime
+        .restore_unread_cursor_from_controller(&controller)
+        .expect("versioned cursor restore");
+    assert_eq!(restored_runtime.unread_cursor(), &cursor);
+    assert_eq!(
+        runtime.encode_unread_cursor().expect("cursor encoding"),
+        encoded
+    );
+    assert_eq!(
+        controller
+            .preferences()
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("inbox-preferences.json")
+    );
+    assert!(!controller.preferences().path().ends_with("session.json"));
+}
+
+#[test]
 fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertions() {
     let items = (0..100_000)
         .map(|index| {
@@ -1351,6 +1409,50 @@ fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertio
     assert_eq!(first.len(), 5_000);
     assert_eq!(first.task_ids().count(), 5_000);
     assert_eq!(model.task_projection_index_rebuilds(), 1);
+}
+
+#[test]
+fn inbox_applies_one_100k_model_event_incrementally_and_keeps_indexed_search_truthful() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Task {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let mut model = inbox_model(items);
+    let mut inbox = Inbox::from_model(&model);
+    let target = inbox_task_id(99_999);
+    let event = DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(0x67)).expect("event id"),
+        task_id: Some(target),
+        sequence: 2,
+        task_revision: Some(100_000),
+        occurred_at_ms: 100_001,
+        payload: Event::TaskRenamed {
+            title: "Renamed 99999".to_string(),
+        },
+    };
+    model.apply_event(&event).expect("rename event applies");
+    let full_rebuilds = inbox.full_rebuilds();
+    inbox.apply_model_event(&model, Some(target));
+
+    assert_eq!(inbox.full_rebuilds(), full_rebuilds);
+    assert_eq!(inbox.incremental_updates(), 1);
+    assert_eq!(
+        inbox.row(target).expect("target retained").title,
+        "Renamed 99999"
+    );
+    let (matches, count) = model.search_task_ids("renamed 99999", false);
+    assert_eq!(count, 1);
+    assert_eq!(matches, vec![target]);
 }
 
 #[test]

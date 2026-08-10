@@ -25,6 +25,12 @@ pub const MAX_CLIENT_MODEL_CURSORS_PER_SECTION: usize = 1_024;
 pub const MAX_CLIENT_REPLAY_PAGES: usize = 1_024;
 /// Finite bound on distinct frozen replay continuation cursors.
 pub const MAX_CLIENT_REPLAY_CURSORS: usize = 1_024;
+/// Search input is client-local presentation data, not an unbounded query.
+pub const MAX_CLIENT_SEARCH_CHARS: usize = 160;
+const MAX_INDEXED_TITLE_CHARS: usize = 1_024;
+/// Maximum indexed search identities handed to one bounded UI projection.
+/// The index still reports the complete truthful match count separately.
+pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -139,6 +145,10 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
+    /// Bounded substring index. Each title contributes at most three
+    /// character grams per character position, so search candidates are
+    /// selected from the index instead of scanning the complete task map.
+    search: BTreeMap<String, BTreeSet<TaskOrderKey>>,
     full_rebuilds: u64,
     incremental_updates: u64,
 }
@@ -156,6 +166,7 @@ impl TaskProjectionIndex {
             .collect::<BTreeMap<_, _>>();
         let mut active_order = BTreeSet::new();
         let mut archived_order = BTreeSet::new();
+        let mut search = BTreeMap::<String, BTreeSet<TaskOrderKey>>::new();
         for (task_id, entry) in &entries {
             let key = TaskOrderKey::new(*task_id, entry);
             if entry.lifecycle == TaskLifecycle::Archived {
@@ -163,12 +174,19 @@ impl TaskProjectionIndex {
             } else {
                 active_order.insert(key);
             }
+            for token in search_tokens(&entry.lower_title) {
+                search
+                    .entry(token)
+                    .or_default()
+                    .insert(TaskOrderKey::new(*task_id, entry));
+            }
         }
         Self {
             revision,
             entries,
             active_order,
             archived_order,
+            search,
             full_rebuilds: 1,
             incremental_updates: 0,
         }
@@ -210,6 +228,71 @@ impl TaskProjectionIndex {
         self.archived_order.iter().map(|key| key.task_id).collect()
     }
 
+    /// Return exact substring matches from the bounded title index. Results
+    /// retain the same attention/occurred-time ordering as ordinary inbox
+    /// rows, and the returned count is the truthful number of matches before
+    /// the UI retention cap.
+    pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
+        let query = query
+            .chars()
+            .take(MAX_CLIENT_SEARCH_CHARS)
+            .collect::<String>()
+            .to_lowercase();
+        if query.trim().is_empty() {
+            let order = if archived {
+                &self.archived_order
+            } else {
+                &self.active_order
+            };
+            let count = order.len();
+            let ids = order
+                .iter()
+                .take(MAX_CLIENT_SEARCH_RESULTS)
+                .map(|key| key.task_id)
+                .collect();
+            return (ids, count);
+        }
+        let tokens = search_tokens(&query);
+        let Some(first) = tokens.first().and_then(|token| self.search.get(token)) else {
+            return (Vec::new(), 0);
+        };
+        let mut candidates = first.clone();
+        for token in tokens.iter().skip(1) {
+            let Some(ids) = self.search.get(token) else {
+                return (Vec::new(), 0);
+            };
+            candidates.retain(|key| ids.contains(key));
+            if candidates.is_empty() {
+                return (Vec::new(), 0);
+            }
+        }
+        let order = if archived {
+            &self.archived_order
+        } else {
+            &self.active_order
+        };
+        let mut ids = Vec::with_capacity(MAX_CLIENT_SEARCH_RESULTS.min(candidates.len()));
+        let mut count = 0;
+        for key in candidates {
+            if !order.contains(&key) {
+                continue;
+            }
+            // One-, two-, and three-character indexes are exact. Longer
+            // queries use intersected grams as candidates and need one title
+            // check, still without walking the full task map.
+            let matches = query.chars().count() <= 3 || key.lower_title.contains(&query);
+            if !matches {
+                continue;
+            }
+            count += 1;
+            if ids.len() < MAX_CLIENT_SEARCH_RESULTS {
+                ids.push(key.task_id);
+            }
+        }
+        ids.shrink_to_fit();
+        (ids, count)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -239,11 +322,15 @@ impl TaskProjectionIndex {
         let entry = TaskProjectionEntry::from_snapshot(snapshot, occurred_at_ms);
         let archived = entry.lifecycle == TaskLifecycle::Archived;
         let key = TaskOrderKey::new(task_id, &entry);
+        let search_title = entry.lower_title.clone();
         self.entries.insert(task_id, entry);
         if archived {
-            self.archived_order.insert(key);
+            self.archived_order.insert(key.clone());
         } else {
-            self.active_order.insert(key);
+            self.active_order.insert(key.clone());
+        }
+        for token in search_tokens(&search_title) {
+            self.search.entry(token).or_default().insert(key.clone());
         }
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
@@ -253,8 +340,36 @@ impl TaskProjectionIndex {
             let key = TaskOrderKey::new(task_id, &entry);
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
+            for token in search_tokens(&entry.lower_title) {
+                let mut remove_token = false;
+                if let Some(keys) = self.search.get_mut(&token) {
+                    keys.remove(&key);
+                    remove_token = keys.is_empty();
+                }
+                if remove_token {
+                    self.search.remove(&token);
+                }
+            }
         }
     }
+}
+
+fn search_tokens(value: &str) -> Vec<String> {
+    let chars = value
+        .chars()
+        .take(MAX_INDEXED_TITLE_CHARS)
+        .collect::<Vec<_>>();
+    let mut tokens = BTreeSet::new();
+    for index in 0..chars.len() {
+        tokens.insert(chars[index].to_string());
+        if let Some(next) = chars.get(index + 1) {
+            tokens.insert(format!("{}{}", chars[index], next));
+        }
+        if let (Some(next), Some(last)) = (chars.get(index + 1), chars.get(index + 2)) {
+            tokens.insert(format!("{}{}{}", chars[index], next, last));
+        }
+    }
+    tokens.into_iter().collect()
 }
 
 impl TaskProjectionEntry {
@@ -384,6 +499,10 @@ impl ClientModel {
             .entries
             .get(&task_id)
             .map(|entry| entry.occurred_at_ms)
+    }
+
+    pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
+        self.task_projection_index.search_task_ids(query, archived)
     }
 
     /// Shared bound check for frozen replay continuation cursors/pages.

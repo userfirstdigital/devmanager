@@ -20,6 +20,7 @@ const SNAPSHOT_SECTIONS: [SnapshotSection; 5] = [
     SnapshotSection::Operations,
 ];
 const MAX_SEEN_EVENT_IDS: usize = 8_192;
+const MAX_PENDING_REPLAY_EVENTS: usize = 8_192;
 
 /// Explicit subscription lifecycle visible to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,7 @@ pub struct ClientSubscription {
     snapshot_id: Option<SnapshotId>,
     seen_event_ids: HashSet<crate::domain::id::EventId>,
     seen_event_order: VecDeque<crate::domain::id::EventId>,
+    pending_replay_events: VecDeque<DomainEvent>,
 }
 
 impl Default for ClientSubscription {
@@ -114,6 +116,7 @@ impl ClientSubscription {
             snapshot_id: None,
             seen_event_ids: HashSet::new(),
             seen_event_order: VecDeque::new(),
+            pending_replay_events: VecDeque::new(),
         }
     }
 
@@ -129,13 +132,17 @@ impl ClientSubscription {
         self.model.as_ref()
     }
 
+    /// Drain events delivered by the snapshot race-closing replay. The caller
+    /// owns presentation semantics (for example, unread state) and therefore
+    /// must consume this bounded handoff after every successful synchronize.
+    pub fn take_replay_events(&mut self) -> Vec<DomainEvent> {
+        self.pending_replay_events.drain(..).collect()
+    }
+
     /// Snapshot through N → open replay after N → release snapshot → apply frozen
     /// replay → retain live subscription metadata. Caller-driven only.
     pub async fn synchronize(&mut self, client: &mut HostClient) -> Result<(), SubscriptionError> {
-        if matches!(
-            self.state,
-            ClientSubscriptionState::Ready | ClientSubscriptionState::NeedsResync
-        ) {
+        if self.state == ClientSubscriptionState::Ready {
             return Err(SubscriptionError::NotReady);
         }
         if self.state == ClientSubscriptionState::Released {
@@ -148,9 +155,25 @@ impl ClientSubscription {
             return Err(SubscriptionError::MissingCapabilities);
         }
 
+        // A transport failure or a server resync request leaves the prior
+        // subscription generation unusable. Re-open a fresh snapshot/replay
+        // pair, while preserving the caller-owned unread cursor outside this
+        // transport object. The old replay release is best effort because a
+        // disconnect may have already retired its server-side owner.
+        self.state = ClientSubscriptionState::Pending;
+        if let Some(subscription_id) = self.subscription_id.take() {
+            let _ = client.release_event_replay(subscription_id).await;
+        }
+        self.snapshot_id = None;
+        self.seen_event_ids.clear();
+        self.seen_event_order.clear();
+        self.pending_replay_events.clear();
+
         match self.synchronize_inner(client).await {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.state = ClientSubscriptionState::NeedsResync;
+                self.pending_replay_events.clear();
                 self.best_effort_cleanup(client).await;
                 Err(error)
             }
@@ -239,6 +262,10 @@ impl ClientSubscription {
             let next = batch.page.next_cursor.clone();
             for event in &batch.page.events {
                 self.remember_event_id(event.id);
+                if self.pending_replay_events.len() >= MAX_PENDING_REPLAY_EVENTS {
+                    self.pending_replay_events.pop_front();
+                }
+                self.pending_replay_events.push_back(event.clone());
             }
             model.apply_replay_page(&batch.page)?;
             let Some(cursor) = next else {
@@ -505,6 +532,7 @@ mod tests {
             snapshot_id: None,
             seen_event_ids: std::collections::HashSet::new(),
             seen_event_order: std::collections::VecDeque::new(),
+            pending_replay_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -641,6 +669,15 @@ mod tests {
             Some(1),
             "one durable event updates one keyed index entry"
         );
+        assert!(runtime.mark_read(task));
+        assert_eq!(runtime.unread_cursor().unread_count(task), 0);
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| row.unread_event_count),
+            Some(0)
+        );
 
         let duplicate = runtime
             .subscription_mut()
@@ -650,7 +687,11 @@ mod tests {
         assert!(!runtime
             .apply_subscription_update(duplicate)
             .expect("duplicate projection update"));
-        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert_eq!(
+            runtime.unread_cursor().unread_count(task),
+            0,
+            "a replayed event must not undo the local mark-read cursor"
+        );
         assert_eq!(runtime.projection_updates(), 2);
 
         let lower = DomainEvent {
@@ -699,5 +740,33 @@ mod tests {
             foreign_error,
             SubscriptionError::ForeignSubscription(_)
         ));
+    }
+
+    #[test]
+    fn inbox_runtime_consumes_snapshot_race_replay_for_unread_cursor_on_attach() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut subscription = ready_subscription();
+        let task = subscription
+            .model()
+            .and_then(|model| model.tasks().keys().next().copied())
+            .expect("ready task");
+        subscription.pending_replay_events.push_back(DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc6)).expect("replay event"),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 22,
+            payload: Event::TaskReopened,
+        });
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(subscription);
+        assert_eq!(runtime.unread_cursor().last_seen_sequence(), 2);
+        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert!(runtime
+            .projection()
+            .and_then(|projection| projection.row(task))
+            .is_some());
     }
 }

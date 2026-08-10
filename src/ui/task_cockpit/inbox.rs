@@ -1,9 +1,9 @@
 //! Pure, bounded projection for the Task Cockpit inbox.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
     div, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -12,7 +12,9 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::client::ClientModel;
-use crate::client::{ClientSubscription, SubscriptionError, SubscriptionUpdate};
+use crate::client::{
+    ClientSubscription, InboxHostController, SubscriptionError, SubscriptionUpdate,
+};
 use crate::domain::agent::AgentSessionLifecycle;
 use crate::domain::event::DomainEvent;
 use crate::domain::id::TaskId;
@@ -175,7 +177,8 @@ impl UnreadCursor {
             .unwrap_or(true)
     }
 
-    /// A compact, versioned durable representation suitable for session state.
+    /// A compact, versioned durable representation for the isolated client
+    /// preference store.
     /// Invalid/truncated data is rejected rather than silently resetting unread
     /// state, so reconnects cannot manufacture a false read cursor.
     pub fn encode_durable(&self) -> Result<Vec<u8>, String> {
@@ -555,6 +558,8 @@ pub struct InboxRenderModel {
 pub type InboxRowMouseDownHandler =
     Arc<dyn Fn(TaskId, &MouseDownEvent, &mut Window, &mut App) + 'static>;
 
+pub type LiveClientSubscription = Arc<Mutex<ClientSubscription>>;
+
 /// The production native-shell bridge. A shell owns one subscription and one
 /// projection; no legacy task-list cache is permitted beside it. Host IO is
 /// caller-driven, while this object keeps the durable cursor and performs the
@@ -562,6 +567,7 @@ pub type InboxRowMouseDownHandler =
 #[derive(Debug, Default)]
 pub struct InboxRuntime {
     subscription: Option<ClientSubscription>,
+    live_subscription: Option<LiveClientSubscription>,
     unread: UnreadCursor,
     filter: InboxFilter,
     projection: Option<Inbox>,
@@ -574,8 +580,26 @@ impl InboxRuntime {
     }
 
     pub fn attach_subscription(&mut self, subscription: ClientSubscription) {
+        self.live_subscription = None;
         self.subscription = Some(subscription);
         self.rebuild_projection();
+    }
+
+    /// Attach the caller-driven production subscription without cloning its
+    /// potentially large ClientModel. The pump owns the mutex while it awaits
+    /// HostClient IO; the UI only takes a short `try_lock` during update/render
+    /// handoff and therefore never waits on transport from paint/input.
+    pub fn attach_live_subscription(&mut self, subscription: LiveClientSubscription) {
+        self.subscription = None;
+        self.live_subscription = Some(subscription);
+        self.refresh_from_subscription();
+    }
+
+    /// Native-next attaches the one controller-owned subscription here. The
+    /// controller remains responsible for host I/O; this method only hands
+    /// the shared model projection to the caller's Inbox runtime.
+    pub fn attach_host_controller(&mut self, controller: &InboxHostController) {
+        self.attach_live_subscription(controller.subscription());
     }
 
     pub fn subscription(&self) -> Option<&ClientSubscription> {
@@ -584,6 +608,10 @@ impl InboxRuntime {
 
     pub fn subscription_mut(&mut self) -> Option<&mut ClientSubscription> {
         self.subscription.as_mut()
+    }
+
+    pub fn live_subscription(&self) -> Option<LiveClientSubscription> {
+        self.live_subscription.clone()
     }
 
     pub fn projection(&self) -> Option<&Inbox> {
@@ -605,11 +633,56 @@ impl InboxRuntime {
         Ok(())
     }
 
+    /// Restore the client-local cursor owned by the native-next controller.
+    /// Missing preferences are the backwards-compatible empty cursor; a
+    /// present but malformed/version-mismatched cursor fails closed.
+    pub fn restore_unread_cursor_from_controller(
+        &mut self,
+        controller: &InboxHostController,
+    ) -> Result<(), String> {
+        match controller
+            .restore_unread_cursor()
+            .map_err(|error| error.to_string())?
+        {
+            Some(bytes) => self.restore_unread_cursor_bytes(&bytes),
+            None => {
+                self.restore_unread_cursor(UnreadCursor::default());
+                Ok(())
+            }
+        }
+    }
+
+    /// Publish the current bounded cursor through the explicit native-next
+    /// preference authority. Legacy `SessionState` is never involved.
+    pub fn persist_unread_cursor_to_controller(
+        &self,
+        controller: &InboxHostController,
+    ) -> Result<(), String> {
+        let bytes = self.encode_unread_cursor()?;
+        controller
+            .persist_unread_cursor(Some(&bytes))
+            .map_err(|error| error.to_string())
+    }
+
     /// Refresh after the caller's async subscription pump has applied a live
     /// event. This keeps the GPUI render path deterministic and allocation-free
     /// with respect to transport state.
     pub fn refresh_from_subscription(&mut self) {
-        self.rebuild_projection();
+        if let Some(subscription) = self.live_subscription.clone() {
+            if let Ok(mut subscription) = subscription.try_lock() {
+                for event in subscription.take_replay_events() {
+                    let _ = self.unread.observe_durable_event(&event);
+                }
+                let filter = self.filter.clone();
+                let unread = self.unread.clone();
+                self.projection = subscription
+                    .model()
+                    .map(|model| Inbox::from_model_with_filter(model, &filter, &unread));
+                self.projection_updates = self.projection_updates.saturating_add(1);
+            }
+        } else {
+            self.rebuild_projection();
+        }
     }
 
     pub fn encode_unread_cursor(&self) -> Result<Vec<u8>, String> {
@@ -619,6 +692,42 @@ impl InboxRuntime {
     pub fn set_filter(&mut self, filter: InboxFilter) {
         self.filter = filter;
         self.rebuild_projection();
+    }
+
+    /// Mark one task read in the bounded client-local cursor and update only
+    /// retained rows. This never emits a host command: read state is a local
+    /// presentation preference, while task lifecycle remains host-owned.
+    pub fn mark_read(&mut self, task_id: TaskId) -> bool {
+        if self.unread.unread_count(task_id) == 0 {
+            return false;
+        }
+        self.unread.mark_read(task_id);
+        if let Some(projection) = self.projection.as_mut() {
+            projection.set_unread_cursor(self.unread.clone());
+        }
+        true
+    }
+
+    pub fn set_active_viewport(
+        &mut self,
+        first_visible: usize,
+        visible_rows: usize,
+    ) -> Result<(), ViewportError> {
+        self.projection
+            .as_mut()
+            .ok_or(ViewportError::ZeroVisibleRows)?
+            .set_active_viewport(first_visible, visible_rows)
+    }
+
+    pub fn set_archived_viewport(
+        &mut self,
+        first_visible: usize,
+        visible_rows: usize,
+    ) -> Result<(), ViewportError> {
+        self.projection
+            .as_mut()
+            .ok_or(ViewportError::ZeroVisibleRows)?
+            .set_archived_viewport(first_visible, visible_rows)
     }
 
     pub fn filter(&self) -> &InboxFilter {
@@ -643,14 +752,28 @@ impl InboxRuntime {
                     return Ok(false);
                 }
                 let unread = self.unread.clone();
-                if let (Some(subscription), Some(projection)) =
-                    (self.subscription.as_ref(), self.projection.as_mut())
-                {
-                    if let Some(model) = subscription.model() {
-                        projection.set_unread_cursor(unread);
-                        projection.apply_model_event(model, event.task_id);
-                        self.projection_updates = self.projection_updates.saturating_add(1);
+                let mut applied = false;
+                if let Some(subscription) = self.live_subscription.clone() {
+                    if let Ok(subscription) = subscription.try_lock() {
+                        if let Some(model) = subscription.model() {
+                            if let Some(projection) = self.projection.as_mut() {
+                                projection.set_unread_cursor(unread);
+                                projection.apply_model_event(model, event.task_id);
+                                applied = true;
+                            }
+                        }
                     }
+                } else if let Some(subscription) = self.subscription.as_ref() {
+                    if let Some(model) = subscription.model() {
+                        if let Some(projection) = self.projection.as_mut() {
+                            projection.set_unread_cursor(unread);
+                            projection.apply_model_event(model, event.task_id);
+                            applied = true;
+                        }
+                    }
+                }
+                if applied {
+                    self.projection_updates = self.projection_updates.saturating_add(1);
                 } else {
                     self.rebuild_projection();
                 }
@@ -674,11 +797,27 @@ impl InboxRuntime {
     }
 
     fn rebuild_projection(&mut self) {
-        self.projection = self.subscription.as_ref().and_then(|subscription| {
-            subscription
+        let filter = self.filter.clone();
+        if let Some(subscription) = self.subscription.as_mut() {
+            for event in subscription.take_replay_events() {
+                let _ = self.unread.observe_durable_event(&event);
+            }
+            let unread = self.unread.clone();
+            self.projection = subscription
                 .model()
-                .map(|model| Inbox::from_model_with_filter(model, &self.filter, &self.unread))
-        });
+                .map(|model| Inbox::from_model_with_filter(model, &filter, &unread));
+        } else {
+            self.projection = self.live_subscription.clone().and_then(|subscription| {
+                let mut subscription = subscription.try_lock().ok()?;
+                for event in subscription.take_replay_events() {
+                    let _ = self.unread.observe_durable_event(&event);
+                }
+                let unread = self.unread.clone();
+                subscription
+                    .model()
+                    .map(|model| Inbox::from_model_with_filter(model, &filter, &unread))
+            });
+        }
         self.projection_updates = self.projection_updates.saturating_add(1);
     }
 }
@@ -775,31 +914,6 @@ impl TaskRowModel {
     }
 }
 
-/// A max-heap whose head is the least valuable retained row. This keeps the
-/// projection bounded while still applying the complete attention ordering
-/// before the finite 5,000-row cap.
-struct RetainedRow(TaskRowModel);
-
-impl PartialEq for RetainedRow {
-    fn eq(&self, other: &Self) -> bool {
-        compare_rows(&self.0, &other.0) == Ordering::Equal
-    }
-}
-
-impl Eq for RetainedRow {}
-
-impl PartialOrd for RetainedRow {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RetainedRow {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_rows(&self.0, &other.0)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inbox {
     task_list: InboxList,
@@ -810,6 +924,8 @@ pub struct Inbox {
     section_ranges: [Range<usize>; 4],
     filter: InboxFilter,
     state: InboxState,
+    full_rebuilds: u64,
+    incremental_updates: u64,
 }
 
 impl Inbox {
@@ -838,12 +954,15 @@ impl Inbox {
             Ok(model) => model,
             Err(error) => return Self::empty(filter, InboxState::Error(error)),
         };
-        let active_ids = if filter.query().trim().is_empty() {
-            model
-                .task_projection_index()
-                .top_active_task_ids(MAX_TASK_LIST_ITEMS)
+        let (active_ids, active_total_count) = if filter.query().trim().is_empty() {
+            (
+                model
+                    .task_projection_index()
+                    .top_active_task_ids(MAX_TASK_LIST_ITEMS),
+                model.task_projection_index().active_count(),
+            )
         } else {
-            model.task_projection_index().active_task_ids()
+            model.search_task_ids(filter.query(), false)
         };
         let (rows, total_count) = project_rows(
             model,
@@ -851,15 +970,18 @@ impl Inbox {
             filter,
             unread,
             false,
-            model.task_projection_index().active_count(),
+            active_total_count,
         );
         let (history_rows, history_total_count) = if filter.includes_archived() {
-            let archived_ids = if filter.query().trim().is_empty() {
-                model
-                    .task_projection_index()
-                    .top_archived_task_ids(MAX_TASK_LIST_ITEMS)
+            let (archived_ids, archived_total_count) = if filter.query().trim().is_empty() {
+                (
+                    model
+                        .task_projection_index()
+                        .top_archived_task_ids(MAX_TASK_LIST_ITEMS),
+                    model.task_projection_index().archived_count(),
+                )
             } else {
-                model.task_projection_index().archived_task_ids()
+                model.search_task_ids(filter.query(), true)
             };
             project_rows(
                 model,
@@ -867,7 +989,7 @@ impl Inbox {
                 filter,
                 unread,
                 true,
-                model.task_projection_index().archived_count(),
+                archived_total_count,
             )
         } else {
             (Vec::new(), 0)
@@ -913,6 +1035,8 @@ impl Inbox {
             section_ranges,
             filter: filter.clone(),
             state,
+            full_rebuilds: 1,
+            incremental_updates: 0,
         }
     }
 
@@ -924,18 +1048,95 @@ impl Inbox {
         )
     }
 
-    /// Apply the bounded projection delta after `ClientModel` has accepted one
-    /// durable event. The keyed ClientModel index supplies only the retained
-    /// top window, so this work is bounded by the UI retention cap rather than
-    /// the total task count. A query filter may still require its explicit
-    /// search scan, but it never becomes the default hot path.
-    pub fn apply_model_event(&mut self, model: &ClientModel, _task_id: Option<TaskId>) {
-        let next = Self::from_model_with_filter(model, &self.filter, &self.unread);
-        *self = next;
+    /// Apply one task delta to the retained rows. The ClientModel index has
+    /// already updated the task's order/search/archive entry; this method
+    /// touches only the retained active/history windows and never rebuilds
+    /// the complete Inbox from the 100k-task model.
+    pub fn apply_model_event(&mut self, model: &ClientModel, task_id: Option<TaskId>) {
+        if task_id.is_none() {
+            return;
+        }
+        let (active_ids, active_total_count) = if self.filter.query().trim().is_empty() {
+            (
+                model
+                    .task_projection_index()
+                    .top_active_task_ids(MAX_TASK_LIST_ITEMS),
+                model.task_projection_index().active_count(),
+            )
+        } else {
+            model.search_task_ids(self.filter.query(), false)
+        };
+        let (archived_ids, archived_total_count) = if self.filter.includes_archived() {
+            if self.filter.query().trim().is_empty() {
+                (
+                    model
+                        .task_projection_index()
+                        .top_archived_task_ids(MAX_TASK_LIST_ITEMS),
+                    model.task_projection_index().archived_count(),
+                )
+            } else {
+                model.search_task_ids(self.filter.query(), true)
+            }
+        } else {
+            (Vec::new(), 0)
+        };
+        // Refill only the bounded pages affected by one index update. This
+        // handles a task entering/leaving the retained cap without rebuilding
+        // the complete model or scanning 100k tasks.
+        self.rows = project_indexed_page(model, &active_ids, &self.filter, &self.unread, false);
+        self.history_rows =
+            project_indexed_page(model, &archived_ids, &self.filter, &self.unread, true);
+        self.rebuild_section_ranges();
+        self.task_list = InboxList::from_ordered_ids(
+            self.rows.iter().map(|row| row.task_id).collect(),
+            active_total_count,
+        );
+        self.archived_list = InboxList::from_ordered_ids(
+            self.history_rows.iter().map(|row| row.task_id).collect(),
+            archived_total_count,
+        );
+        self.state = if self.rows.is_empty() && self.history_rows.is_empty() {
+            if self.filter.is_filtered() {
+                InboxState::FilteredEmpty
+            } else {
+                InboxState::Empty
+            }
+        } else {
+            InboxState::Ready
+        };
+        self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
     pub fn set_unread_cursor(&mut self, unread: UnreadCursor) {
         self.unread = unread;
+        for row in self.rows.iter_mut().chain(self.history_rows.iter_mut()) {
+            row.unread_event_count = self.unread.unread_count(row.task_id);
+        }
+    }
+
+    pub fn full_rebuilds(&self) -> u64 {
+        self.full_rebuilds
+    }
+
+    pub fn incremental_updates(&self) -> u64 {
+        self.incremental_updates
+    }
+
+    fn rebuild_section_ranges(&mut self) {
+        let mut grouped: [Vec<TaskRowModel>; 4] = std::array::from_fn(|_| Vec::new());
+        for row in self.rows.drain(..) {
+            grouped[row.section.index()].push(row);
+        }
+        let mut rows =
+            Vec::with_capacity(MAX_TASK_LIST_ITEMS.min(grouped.iter().map(Vec::len).sum()));
+        let mut section_ranges = [0..0, 0..0, 0..0, 0..0];
+        for section in InboxSection::ALL {
+            let start = rows.len();
+            rows.extend(grouped[section.index()].drain(..));
+            section_ranges[section.index()] = start..rows.len();
+        }
+        self.rows = rows;
+        self.section_ranges = section_ranges;
     }
 
     fn empty(filter: &InboxFilter, state: InboxState) -> Self {
@@ -948,6 +1149,8 @@ impl Inbox {
             section_ranges: [0..0, 0..0, 0..0, 0..0],
             filter: filter.clone(),
             state,
+            full_rebuilds: 1,
+            incremental_updates: 0,
         }
     }
 
@@ -1153,63 +1356,40 @@ fn project_rows(
     read_only: bool,
     indexed_total_count: usize,
 ) -> (Vec<TaskRowModel>, usize) {
-    if filter.query().trim().is_empty() {
-        let total_count = indexed_total_count;
-        let rows = task_ids
-            .iter()
-            .take(MAX_TASK_LIST_ITEMS)
-            .filter_map(|task_id| {
-                let snapshot = model.tasks().get(task_id)?;
-                if !filter.matches(&snapshot.task.title, snapshot.task.lifecycle) {
-                    return None;
-                }
-                Some(row_from_snapshot(
-                    snapshot,
-                    model
-                        .task_last_occurred_at_ms(*task_id)
-                        .unwrap_or(snapshot.task.created_at_ms),
-                    unread,
-                    read_only,
-                ))
-            })
-            .collect();
-        return (rows, total_count);
-    }
+    (
+        project_indexed_page(model, task_ids, filter, unread, read_only),
+        indexed_total_count,
+    )
+}
 
-    let mut retained = BinaryHeap::new();
-    let mut total_count = 0;
-    for task_id in task_ids {
-        let Some(snapshot) = model.tasks().get(task_id) else {
-            continue;
-        };
-        if !filter.matches(&snapshot.task.title, snapshot.task.lifecycle) {
-            continue;
-        }
-        total_count += 1;
-        let row = row_from_snapshot(
-            snapshot,
-            model
-                .task_last_occurred_at_ms(*task_id)
-                .unwrap_or(snapshot.task.created_at_ms),
-            unread,
-            read_only,
-        );
-        if retained.len() < MAX_TASK_LIST_ITEMS {
-            retained.push(RetainedRow(row));
-        } else if retained
-            .peek()
-            .is_some_and(|worst| compare_rows(&row, &worst.0).is_lt())
-        {
-            retained.pop();
-            retained.push(RetainedRow(row));
-        }
-    }
-    let mut rows = retained
-        .into_iter()
-        .map(|RetainedRow(row)| row)
-        .collect::<Vec<_>>();
-    rows.sort_by(compare_rows);
-    (rows, total_count)
+fn project_indexed_page(
+    model: &ClientModel,
+    task_ids: &[TaskId],
+    filter: &InboxFilter,
+    unread: &UnreadCursor,
+    read_only: bool,
+) -> Vec<TaskRowModel> {
+    // The index already resolved exact matches and provides deterministic
+    // ordering. Consume only its bounded first page; never walk the complete
+    // ClientModel from the render/search or incremental-update path.
+    task_ids
+        .iter()
+        .take(MAX_TASK_LIST_ITEMS)
+        .filter_map(|task_id| {
+            let snapshot = model.tasks().get(task_id)?;
+            if !filter.matches(&snapshot.task.title, snapshot.task.lifecycle) {
+                return None;
+            }
+            Some(row_from_snapshot(
+                snapshot,
+                model
+                    .task_last_occurred_at_ms(*task_id)
+                    .unwrap_or(snapshot.task.created_at_ms),
+                unread,
+                read_only,
+            ))
+        })
+        .collect()
 }
 
 fn row_from_snapshot(

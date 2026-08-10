@@ -204,6 +204,23 @@ impl HostClient {
         Ok(receipt)
     }
 
+    /// Execute a command while the caller-driven unsolicited receiver is
+    /// waiting on the same authenticated connection. The duplex transport
+    /// correlates command replies independently from unsolicited events, so a
+    /// shared immutable connection borrow is sufficient here. The ordinary
+    /// `execute_command` path remains the tracked-operation authority; this
+    /// concurrent lane returns the real receipt and lets its owner decide how
+    /// to fence/settle the UI action.
+    pub async fn execute_command_concurrent(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, IpcError> {
+        if envelope.client_id != self.config.client_id {
+            return Err(IpcError::Unauthorized);
+        }
+        self.live_connection()?.execute_command(envelope).await
+    }
+
     /// Read one Task snapshot through the shared `task.show` query factory.
     pub async fn task_snapshot(
         &mut self,
