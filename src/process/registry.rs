@@ -74,6 +74,13 @@ pub trait JobMembership {
         Ok(())
     }
 
+    /// Stops receiver-owned listeners before a stopped registry entry is
+    /// removed. Implementations that do not own a listener may accept the
+    /// default no-op.
+    fn shutdown_for_release(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Drains receiver-owned completion messages. External membership
     /// adapters cannot construct this type and therefore cannot mint proof.
     fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
@@ -96,6 +103,10 @@ impl JobMembership for crate::process::job::ManagedProcessJob {
 
     fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
         crate::process::job::ManagedProcessJob::bind_completion_fence(self, fence)
+    }
+
+    fn shutdown_for_release(&mut self) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::shutdown_for_release(self)
     }
 
     fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
@@ -400,6 +411,10 @@ pub enum ProcessRegistryError {
     TeardownReleaseAuthorityMismatch {
         resource_id: ResourceId,
     },
+    JobShutdownFailed {
+        resource_id: ResourceId,
+        detail: String,
+    },
     InvalidLifecycleState {
         resource_id: ResourceId,
         operation: ProcessLifecycleOperation,
@@ -466,6 +481,13 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "resource {resource_id} received a stale or mismatched teardown release authority"
             ),
+            Self::JobShutdownFailed {
+                resource_id,
+                detail,
+            } => write!(
+                f,
+                "resource {resource_id} could not stop its managed Job listener before release: {detail}"
+            ),
             Self::InvalidLifecycleState {
                 resource_id,
                 operation,
@@ -499,6 +521,7 @@ impl std::error::Error for ProcessRegistryError {
             | Self::ActiveProcessZeroUnproved { .. }
             | Self::ReleaseAuthorityRequired { .. }
             | Self::TeardownReleaseAuthorityMismatch { .. }
+            | Self::JobShutdownFailed { .. }
             | Self::InvalidLifecycleState { .. }
             | Self::StaleLifecycleFence { .. } => None,
         }
@@ -650,9 +673,12 @@ impl<J> ProcessRegistry<J> {
         &mut self,
         ticket: &TeardownTicket,
         authority: TeardownReleaseAuthority,
-    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError>
+    where
+        J: JobMembership,
+    {
         let resource_id = ticket.resource_id();
-        let Some(current) = self.current.get(&resource_id) else {
+        let Some(current) = self.current.get_mut(&resource_id) else {
             return Err(ProcessRegistryError::StaleLifecycleFence {
                 resource_id,
                 operation: ProcessLifecycleOperation::ReleaseStopped,
@@ -670,6 +696,12 @@ impl<J> ProcessRegistry<J> {
         };
         if !current.authoritative_zero_settled || !authority.matches(ticket, nonce) {
             return Err(ProcessRegistryError::TeardownReleaseAuthorityMismatch { resource_id });
+        }
+        if let Err(detail) = current.job.shutdown_for_release() {
+            return Err(ProcessRegistryError::JobShutdownFailed {
+                resource_id,
+                detail,
+            });
         }
         self.take_exact_in_state(
             ticket.fence(),

@@ -14,9 +14,9 @@ use devmanager::process::registry::{
 };
 use devmanager::process::teardown::{
     AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
-    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionKey,
-    TeardownCompletionStore, TeardownCoordinator, TeardownDeadline, TeardownEffects,
-    TeardownReleaseAuthority, TeardownReport, TeardownScope, TeardownTicket, WaitResult, WaitStage,
+    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionStore,
+    TeardownCoordinator, TeardownDeadline, TeardownEffects, TeardownReleaseAuthority,
+    TeardownScope, TeardownTicket, WaitResult, WaitStage,
 };
 
 fn resource_id() -> ResourceId {
@@ -91,6 +91,15 @@ impl JobMembership for RegistryJob {
             .ok_or_else(|| "managed Job handle was released before fence binding".to_string())?
             .bind_completion_fence(fence)
     }
+
+    fn shutdown_for_release(&mut self) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("Windows Job lock")
+            .as_mut()
+            .ok_or_else(|| "managed Job handle was released before listener shutdown".to_string())?
+            .shutdown_for_release()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +142,24 @@ impl TeardownAdmission for WindowsAdmission {
             })
             .collect())
     }
+
+    fn rollback_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+        receipts: &[AdmissionReceipt],
+    ) -> Result<(), TeardownAdmissionError> {
+        if tickets.len() != receipts.len()
+            || tickets.iter().zip(receipts).any(|(ticket, receipt)| {
+                receipt.state() != AdmissionState::Closing
+                    || receipt.scope() != ticket.scope()
+                    || receipt.action_epoch() != ticket.action_epoch()
+                    || receipt.fence() != ticket.fence()
+            })
+        {
+            return Err(TeardownAdmissionError::FenceMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -141,35 +168,6 @@ struct WindowsClock;
 impl TeardownClock for WindowsClock {
     fn deadline(&self, _timeout: Duration) -> TeardownDeadline {
         TeardownDeadline::new(1)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct WindowsStore {
-    report: Arc<Mutex<Option<(TeardownCompletionKey, TeardownReport)>>>,
-}
-
-impl TeardownCompletionStore for WindowsStore {
-    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String> {
-        Ok(self
-            .report
-            .lock()
-            .expect("Windows completion store")
-            .as_ref()
-            .filter(|(stored_key, _)| stored_key == key)
-            .map(|(_, report)| report.clone()))
-    }
-
-    fn persist<'a>(
-        &'a self,
-        key: &'a TeardownCompletionKey,
-        report: &'a TeardownReport,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            *self.report.lock().expect("Windows completion store") =
-                Some((key.clone(), report.clone()));
-            Ok(())
-        })
     }
 }
 
@@ -389,7 +387,7 @@ fn windows_managed_job_teardown_reaches_receiver_zero_before_registry_release() 
             Duration::from_millis(250),
             Duration::from_secs(5),
         ),
-        Arc::new(WindowsStore::default()),
+        TeardownCompletionStore::default(),
     );
 
     let report = tokio::runtime::Builder::new_current_thread()

@@ -9,12 +9,13 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::domain::id::{OperationId, ResourceId, TaskId};
 use crate::process::identity::ProcessOwner;
@@ -23,6 +24,9 @@ use crate::process::registry::ManagedProcessFence;
 pub const DEFAULT_CONFIGURED_CAPACITY: usize = 4;
 pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
 pub const DEFAULT_EXECUTOR_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_DISPATCH_WORKER_CAPACITY: usize = 4;
+const DEFAULT_DISPATCH_QUEUE_CAPACITY: usize = 256;
+const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A boxed asynchronous operation used by the pure runtime seams.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -207,6 +211,15 @@ pub trait TeardownAdmission: Send + Sync + 'static {
         &self,
         tickets: &[TeardownTicket],
     ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError>;
+
+    /// Reopens exactly the admissions returned by a successful batch when no
+    /// cleanup work could be submitted. Implementations must fence every
+    /// ticket/receipt pair and leave the whole batch unchanged on failure.
+    fn rollback_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+        receipts: &[AdmissionReceipt],
+    ) -> Result<(), TeardownAdmissionError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -275,6 +288,36 @@ impl TeardownBudgets {
             interrupt_grace,
             termination,
         }
+    }
+
+    fn total(self) -> Duration {
+        self.cooperative_grace
+            .saturating_add(self.interrupt_grace)
+            .saturating_add(self.termination)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupDeadline {
+    effect: TeardownDeadline,
+    absolute: Instant,
+}
+
+impl CleanupDeadline {
+    fn new(clock: &dyn TeardownClock, budgets: TeardownBudgets) -> Self {
+        let total = budgets.total();
+        Self {
+            effect: clock.deadline(total),
+            absolute: Instant::now() + total,
+        }
+    }
+
+    fn effect(self) -> TeardownDeadline {
+        self.effect
+    }
+
+    fn remaining(self) -> Duration {
+        self.absolute.saturating_duration_since(Instant::now())
     }
 }
 
@@ -683,19 +726,132 @@ impl TeardownCompletionKey {
     }
 }
 
-/// Durable idempotency seam for completed teardown operations.
+/// The concrete durable-idempotency boundary for completed teardown
+/// operations.
 ///
-/// The coordinator keeps only a bounded in-memory cache. When this seam is
-/// supplied, completed entries may be evicted from that cache because an
-/// exact retry can be recovered here without rerunning destructive effects.
-pub trait TeardownCompletionStore: Send + Sync + 'static {
-    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String>;
+/// The coordinator never accepts an arbitrary caller-provided blocking trait
+/// here. Both lookup and persistence are invoked only by its fixed-capacity
+/// dispatch boundary. The in-memory implementation is the current Phase 3.7
+/// store; a production durable backend can be added behind this module without
+/// widening the public seam to untracked blocking code.
+#[derive(Debug, Clone, Default)]
+pub struct TeardownCompletionStore {
+    inner: Arc<CompletionStoreInner>,
+}
 
-    fn persist<'a>(
-        &'a self,
-        key: &'a TeardownCompletionKey,
-        report: &'a TeardownReport,
-    ) -> BoxFuture<'a, Result<(), String>>;
+#[derive(Debug, Default)]
+struct CompletionStoreInner {
+    reports: Mutex<VecDeque<(TeardownCompletionKey, TeardownReport)>>,
+    persist_error: Mutex<Option<String>>,
+    lookup_blocked: AtomicBool,
+    lookup_started: AtomicUsize,
+    persist_blocked: AtomicBool,
+    persist_active: AtomicUsize,
+    persist_max_active: AtomicUsize,
+}
+
+impl TeardownCompletionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Test-only fault injection at the real store boundary. This is an
+    /// explicit bounded-store control, not an alternate production backend.
+    #[doc(hidden)]
+    pub fn fail_persist_for_test(&self, detail: impl Into<String>) {
+        *self
+            .inner
+            .persist_error
+            .lock()
+            .expect("completion store persist error") = Some(detail.into());
+    }
+
+    #[doc(hidden)]
+    pub fn block_lookup_for_test(&self) {
+        self.inner.lookup_blocked.store(true, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn release_lookup_for_test(&self) {
+        self.inner.lookup_blocked.store(false, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn lookup_started_for_test(&self) -> usize {
+        self.inner.lookup_started.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn block_persist_for_test(&self) {
+        self.inner.persist_blocked.store(true, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn release_persist_for_test(&self) {
+        self.inner.persist_blocked.store(false, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn persist_max_active_for_test(&self) -> usize {
+        self.inner.persist_max_active.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn retained_count_for_test(&self) -> usize {
+        self.inner
+            .reports
+            .lock()
+            .expect("completion store reports")
+            .len()
+    }
+
+    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String> {
+        self.inner.lookup_started.fetch_add(1, Ordering::SeqCst);
+        while self.inner.lookup_blocked.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(self
+            .inner
+            .reports
+            .lock()
+            .expect("completion store reports")
+            .iter()
+            .find(|(stored_key, _)| stored_key == key)
+            .map(|(_, report)| report.clone()))
+    }
+
+    fn persist(&self, key: &TeardownCompletionKey, report: &TeardownReport) -> Result<(), String> {
+        let active = self.inner.persist_active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner
+            .persist_max_active
+            .fetch_max(active, Ordering::SeqCst);
+        while self.inner.persist_blocked.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.inner.persist_active.fetch_sub(1, Ordering::SeqCst);
+
+        if let Some(detail) = self
+            .inner
+            .persist_error
+            .lock()
+            .expect("completion store persist error")
+            .clone()
+        {
+            return Err(detail);
+        }
+        let mut reports = self.inner.reports.lock().expect("completion store reports");
+        if let Some((_, stored_report)) =
+            reports.iter_mut().find(|(stored_key, _)| stored_key == key)
+        {
+            *stored_report = report.clone();
+        } else {
+            if reports.len() >= DEFAULT_COMPLETED_OPERATION_CAPACITY {
+                reports.pop_front();
+            }
+            reports.push_back((key.clone(), report.clone()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -804,9 +960,356 @@ impl TeardownBatchWaiter {
 }
 
 #[derive(Debug)]
+struct CancellationToken {
+    requested: AtomicBool,
+    changed: watch::Sender<bool>,
+}
+
+impl CancellationToken {
+    fn new() -> Arc<Self> {
+        let (changed, _receiver) = watch::channel(false);
+        Arc::new(Self {
+            requested: AtomicBool::new(false),
+            changed,
+        })
+    }
+
+    fn request(&self) {
+        if !self.requested.swap(true, Ordering::SeqCst) {
+            self.changed.send_replace(true);
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_requested() {
+            return;
+        }
+        let mut receiver = self.changed.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DispatchReject {
+    Closed,
+    QueueFull,
+}
+
+impl DispatchReject {
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::Closed => "bounded teardown dispatch is closed",
+            Self::QueueFull => "bounded teardown dispatch queue is full",
+        }
+    }
+}
+
+type DispatchOperation = Box<dyn FnOnce(Arc<CancellationToken>) -> BoxFuture<'static, ()> + Send>;
+
+struct DispatchTask {
+    cancellation: Arc<CancellationToken>,
+    operation: Option<DispatchOperation>,
+}
+
+struct DispatchQueueState {
+    queue: VecDeque<DispatchTask>,
+    active: usize,
+    closed: bool,
+}
+
+struct DispatchInner {
+    state: Mutex<DispatchQueueState>,
+    changed: Condvar,
+    queue_capacity: usize,
+}
+
+/// Fixed-capacity dispatch for every potentially blocking teardown boundary.
+///
+/// The worker owns future construction and polling. A timeout drops only the
+/// response wait and requests cancellation; arbitrary Rust code cannot be
+/// forcibly killed safely, so a stuck operation keeps its fixed worker slot
+/// and its `Arc`-retained dispatcher alive until it returns.
+struct BlockingDispatchPool {
+    inner: Arc<DispatchInner>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    worker_capacity: usize,
+}
+
+struct AsyncDispatch<T> {
+    receiver: oneshot::Receiver<Result<T, String>>,
+    cancellation: Arc<CancellationToken>,
+}
+
+struct SyncDispatch<T> {
+    receiver: mpsc::Receiver<Result<T, String>>,
+    cancellation: Arc<CancellationToken>,
+}
+
+impl BlockingDispatchPool {
+    fn new(worker_capacity: usize, queue_capacity: usize) -> Arc<Self> {
+        let inner = Arc::new(DispatchInner {
+            state: Mutex::new(DispatchQueueState {
+                queue: VecDeque::with_capacity(queue_capacity),
+                active: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+            queue_capacity,
+        });
+        let pool = Arc::new(Self {
+            inner: Arc::clone(&inner),
+            workers: Mutex::new(Vec::with_capacity(worker_capacity)),
+            worker_capacity,
+        });
+        let mut workers = pool
+            .workers
+            .lock()
+            .expect("dispatch workers mutex poisoned");
+        for index in 0..worker_capacity {
+            let worker_inner = Arc::clone(&inner);
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("devmanager-teardown-dispatch-{index}"))
+                    .spawn(move || dispatch_worker(worker_inner))
+                    .expect("spawn bounded teardown dispatch worker"),
+            );
+        }
+        drop(workers);
+        pool
+    }
+
+    fn enqueue(&self, task: DispatchTask) -> Result<(), DispatchReject> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("dispatch state mutex poisoned");
+        if state.closed {
+            return Err(DispatchReject::Closed);
+        }
+        if state.queue.len() >= self.inner.queue_capacity {
+            return Err(DispatchReject::QueueFull);
+        }
+        state.queue.push_back(task);
+        self.inner.changed.notify_all();
+        Ok(())
+    }
+
+    fn submit_async<T, F>(
+        self: &Arc<Self>,
+        operation: F,
+    ) -> Result<AsyncDispatch<T>, DispatchReject>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<CancellationToken>) -> BoxFuture<'static, Result<T, String>> + Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let keepalive = Arc::clone(self);
+        let task_cancellation = Arc::clone(&cancellation);
+        let task_operation: DispatchOperation = Box::new(move |dispatch_cancellation| {
+            let _keepalive = keepalive;
+            Box::pin(async move {
+                if dispatch_cancellation.is_requested() {
+                    let _ = sender.send(Err("bounded teardown dispatch cancelled".to_string()));
+                    return;
+                }
+                let result = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    operation(Arc::clone(&dispatch_cancellation))
+                })) {
+                    Ok(future) => match AssertUnwindSafe(future).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(payload) => Err(format!(
+                            "bounded teardown dispatch panicked: {}",
+                            panic_detail(payload)
+                        )),
+                    },
+                    Err(payload) => Err(format!(
+                        "bounded teardown dispatch panicked: {}",
+                        panic_detail(payload)
+                    )),
+                };
+                let _ = sender.send(result);
+            })
+        });
+        let task = DispatchTask {
+            cancellation: task_cancellation,
+            operation: Some(task_operation),
+        };
+        self.enqueue(task)?;
+        Ok(AsyncDispatch {
+            receiver,
+            cancellation,
+        })
+    }
+
+    fn submit_sync<T, F>(self: &Arc<Self>, operation: F) -> Result<SyncDispatch<T>, DispatchReject>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<CancellationToken>) -> Result<T, String> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancellation = CancellationToken::new();
+        let keepalive = Arc::clone(self);
+        let task_cancellation = Arc::clone(&cancellation);
+        let task_operation: DispatchOperation = Box::new(move |dispatch_cancellation| {
+            let _keepalive = keepalive;
+            Box::pin(async move {
+                if dispatch_cancellation.is_requested() {
+                    let _ = sender.send(Err("bounded teardown dispatch cancelled".to_string()));
+                    return;
+                }
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    operation(Arc::clone(&dispatch_cancellation))
+                }))
+                .map_err(|payload| {
+                    format!(
+                        "bounded teardown dispatch panicked: {}",
+                        panic_detail(payload)
+                    )
+                })
+                .and_then(|result| result);
+                let _ = sender.send(result);
+            })
+        });
+        let task = DispatchTask {
+            cancellation: task_cancellation,
+            operation: Some(task_operation),
+        };
+        self.enqueue(task)?;
+        Ok(SyncDispatch {
+            receiver,
+            cancellation,
+        })
+    }
+}
+
+impl<T> AsyncDispatch<T> {
+    async fn wait(self, budget: Duration, label: &str) -> Result<T, String> {
+        match tokio::time::timeout(budget, self.receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(format!("{label} dispatch response channel closed")),
+            Err(_) => {
+                self.cancellation.request();
+                Err(format!("{label} timeout after {budget:?}"))
+            }
+        }
+    }
+}
+
+impl<T> SyncDispatch<T> {
+    fn wait(self, budget: Duration, label: &str) -> Result<T, String> {
+        match self.receiver.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(format!("{label} dispatch response channel closed"))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.cancellation.request();
+                Err(format!("{label} timeout after {budget:?}"))
+            }
+        }
+    }
+}
+
+fn dispatch_worker(inner: Arc<DispatchInner>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("teardown dispatch runtime");
+    loop {
+        let task = {
+            let mut state = inner.state.lock().expect("dispatch state mutex poisoned");
+            loop {
+                if let Some(task) = state.queue.pop_front() {
+                    state.active += 1;
+                    break Some(task);
+                }
+                if state.closed {
+                    break None;
+                }
+                state = inner
+                    .changed
+                    .wait(state)
+                    .expect("dispatch state mutex poisoned");
+            }
+        };
+        let Some(mut task) = task else {
+            return;
+        };
+        if let Some(operation) = task.operation.take() {
+            runtime.block_on(operation(task.cancellation));
+        }
+        let mut state = inner.state.lock().expect("dispatch state mutex poisoned");
+        state.active = state.active.saturating_sub(1);
+        inner.changed.notify_all();
+    }
+}
+
+impl Drop for BlockingDispatchPool {
+    fn drop(&mut self) {
+        let queued = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("dispatch state mutex poisoned");
+            state.closed = true;
+            let queued: Vec<_> = state.queue.drain(..).collect();
+            self.inner.changed.notify_all();
+            queued
+        };
+        for task in queued {
+            task.cancellation.request();
+        }
+
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("dispatch workers mutex poisoned");
+        let handles = std::mem::take(&mut *workers);
+        drop(workers);
+        let current = thread::current().id();
+        let deadline = Instant::now() + DISPATCH_WORKER_SHUTDOWN_TIMEOUT;
+        for handle in handles {
+            if handle.thread().id() == current {
+                continue;
+            }
+            while !handle.is_finished() {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        debug_assert!(self.worker_capacity > 0);
+    }
+}
+
+#[derive(Debug)]
 struct ActiveCleanup {
     key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveExecution {
+    ticket: TeardownTicket,
+    key: TeardownCompletionKey,
+    cell: Arc<CleanupCell>,
+    cancellation: Arc<CancellationToken>,
+    coordinator_state: Arc<Mutex<CoordinatorState>>,
 }
 
 #[derive(Debug)]
@@ -825,11 +1328,15 @@ struct CleanupWork {
     ticket: TeardownTicket,
     key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
+    cancellation: Arc<CancellationToken>,
     effects: Arc<dyn TeardownEffects>,
     clock: Arc<dyn TeardownClock>,
     budgets: TeardownBudgets,
     state: Arc<Mutex<CoordinatorState>>,
-    completion_store: Arc<dyn TeardownCompletionStore>,
+    completion_store: TeardownCompletionStore,
+    dispatcher: Arc<BlockingDispatchPool>,
+    completion_dispatcher: Arc<BlockingDispatchPool>,
+    executor_keepalive: Arc<TeardownExecutorKeepalive>,
     completed_operation_capacity: usize,
 }
 
@@ -837,6 +1344,7 @@ struct ExecutorQueueState {
     queue: VecDeque<CleanupWork>,
     occupied: usize,
     closed: bool,
+    active: Vec<ActiveExecution>,
 }
 
 struct TeardownExecutorInner {
@@ -847,6 +1355,10 @@ struct TeardownExecutorInner {
 }
 
 struct TeardownExecutor {
+    keepalive: Arc<TeardownExecutorKeepalive>,
+}
+
+struct TeardownExecutorKeepalive {
     inner: Arc<TeardownExecutorInner>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -857,16 +1369,21 @@ struct ExecutorReservation {
 }
 
 impl TeardownExecutor {
-    fn new(worker_capacity: usize, queue_capacity: usize) -> Self {
+    fn new(worker_capacity: usize, queue_capacity: usize) -> Arc<Self> {
         let inner = Arc::new(TeardownExecutorInner {
             state: Mutex::new(ExecutorQueueState {
                 queue: VecDeque::with_capacity(queue_capacity),
                 occupied: 0,
                 closed: false,
+                active: Vec::new(),
             }),
             changed: Condvar::new(),
             worker_capacity,
             queue_capacity,
+        });
+        let keepalive = Arc::new(TeardownExecutorKeepalive {
+            inner: Arc::clone(&inner),
+            workers: Mutex::new(Vec::with_capacity(worker_capacity)),
         });
         let mut workers = Vec::with_capacity(worker_capacity);
         for index in 0..worker_capacity {
@@ -878,30 +1395,85 @@ impl TeardownExecutor {
                     .expect("spawn bounded teardown worker"),
             );
         }
-        Self {
-            inner,
-            workers: Mutex::new(workers),
+        *keepalive
+            .workers
+            .lock()
+            .expect("teardown worker handles mutex poisoned") = workers;
+        Arc::new(Self { keepalive })
+    }
+
+    fn inner(&self) -> &Arc<TeardownExecutorInner> {
+        &self.keepalive.inner
+    }
+
+    fn shutdown(&self) {
+        let (queued, active) = {
+            let mut state = self
+                .keepalive
+                .inner
+                .state
+                .lock()
+                .expect("teardown executor state mutex poisoned");
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            let queued: Vec<_> = state.queue.drain(..).collect();
+            let active = state.active.clone();
+            state.active.clear();
+            state.occupied = state.occupied.saturating_sub(queued.len());
+            self.keepalive.inner.changed.notify_all();
+            (queued, active)
+        };
+        for work in queued {
+            cancel_queued_cleanup(work);
         }
+        for execution in active {
+            execution.cancellation.request();
+            execution.cell.finish(waiter_failure_report(
+                execution.ticket.clone(),
+                "teardown coordinator dropped while cleanup was active; cancellation requested",
+            ));
+            execution
+                .coordinator_state
+                .lock()
+                .expect("teardown coordinator state mutex poisoned")
+                .active
+                .retain(|entry| entry.key != execution.key);
+            // The waiter is settled immediately, while the in-flight work
+            // remains owned by the worker and its retained dispatch boundary.
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.keepalive
+            .inner
+            .state
+            .lock()
+            .expect("teardown executor state mutex poisoned")
+            .closed
     }
 
     fn reserve_many(&self, count: usize) -> Result<ExecutorReservation, TeardownReject> {
         if count == 0 {
             return Ok(ExecutorReservation {
-                inner: Arc::clone(&self.inner),
+                inner: Arc::clone(self.inner()),
                 remaining: 0,
             });
         }
-        if count > self.inner.queue_capacity {
+        if count > self.inner().queue_capacity {
             return Err(TeardownReject::CompletionJournalFull);
         }
         let capacity = self
+            .keepalive
             .inner
             .worker_capacity
-            .saturating_add(self.inner.queue_capacity);
+            .saturating_add(self.inner().queue_capacity);
         if count > capacity {
             return Err(TeardownReject::CompletionJournalFull);
         }
         let mut state = self
+            .keepalive
             .inner
             .state
             .lock()
@@ -913,11 +1485,12 @@ impl TeardownExecutor {
             if count <= capacity.saturating_sub(state.occupied) {
                 state.occupied += count;
                 return Ok(ExecutorReservation {
-                    inner: Arc::clone(&self.inner),
+                    inner: Arc::clone(self.inner()),
                     remaining: count,
                 });
             }
             state = self
+                .keepalive
                 .inner
                 .changed
                 .wait(state)
@@ -928,31 +1501,25 @@ impl TeardownExecutor {
 
 impl Drop for TeardownExecutor {
     fn drop(&mut self) {
-        let queued = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("teardown executor state mutex poisoned");
-            state.closed = true;
-            let queued: Vec<_> = state.queue.drain(..).collect();
-            state.occupied = state.occupied.saturating_sub(queued.len());
-            self.inner.changed.notify_all();
-            queued
-        };
-        for work in queued {
-            cancel_queued_cleanup(work);
-        }
-        // A user-supplied effect or completion store can contain code that
-        // cannot be cancelled safely. Dropping the executor must therefore
-        // close admission and release queued work without joining worker
-        // threads indefinitely. Workers retain their bounded shared state and
-        // finish independently when their current operation returns.
+        self.shutdown();
+    }
+}
+
+impl Drop for TeardownExecutorKeepalive {
+    fn drop(&mut self) {
+        let current = thread::current().id();
         let mut workers = self
             .workers
             .lock()
             .expect("teardown worker handles mutex poisoned");
-        workers.clear();
+        let handles = std::mem::take(&mut *workers);
+        drop(workers);
+        for handle in handles {
+            if handle.thread().id() == current {
+                continue;
+            }
+            let _ = handle.join();
+        }
     }
 }
 
@@ -961,12 +1528,14 @@ fn cancel_queued_cleanup(work: CleanupWork) {
         ticket,
         key,
         cell,
+        cancellation,
         state,
         ..
     } = work;
+    cancellation.request();
     cell.finish(waiter_failure_report(
         ticket,
-        "teardown executor shut down before cleanup started",
+        "teardown executor shut down before cleanup started; cancellation requested",
     ));
     state
         .lock()
@@ -976,7 +1545,12 @@ fn cancel_queued_cleanup(work: CleanupWork) {
 }
 
 impl ExecutorReservation {
-    fn submit(&mut self, work: CleanupWork) -> Result<(), CleanupWork> {
+    fn submit_all(&mut self, works: Vec<CleanupWork>) -> Result<(), Vec<CleanupWork>> {
+        if works.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(works.len() <= self.remaining);
+        let count = works.len();
         let mut state = self
             .inner
             .state
@@ -984,11 +1558,11 @@ impl ExecutorReservation {
             .expect("teardown executor state mutex poisoned");
         loop {
             if state.closed {
-                return Err(work);
+                return Err(works);
             }
-            if state.queue.len() < self.inner.queue_capacity {
-                state.queue.push_back(work);
-                self.remaining = self.remaining.saturating_sub(1);
+            if count <= self.inner.queue_capacity.saturating_sub(state.queue.len()) {
+                state.queue.extend(works);
+                self.remaining = self.remaining.saturating_sub(count);
                 self.inner.changed.notify_all();
                 return Ok(());
             }
@@ -1029,6 +1603,13 @@ fn teardown_worker(inner: Arc<TeardownExecutorInner>) {
                 .expect("teardown executor state mutex poisoned");
             loop {
                 if let Some(work) = state.queue.pop_front() {
+                    state.active.push(ActiveExecution {
+                        ticket: work.ticket.clone(),
+                        key: work.key.clone(),
+                        cell: Arc::clone(&work.cell),
+                        cancellation: Arc::clone(&work.cancellation),
+                        coordinator_state: Arc::clone(&work.state),
+                    });
                     inner.changed.notify_all();
                     break Some(work);
                 }
@@ -1044,12 +1625,14 @@ fn teardown_worker(inner: Arc<TeardownExecutorInner>) {
         let Some(work) = work else {
             return;
         };
+        let completed_key = work.key.clone();
         runtime.block_on(run_cleanup(work));
         let mut state = inner
             .state
             .lock()
             .expect("teardown executor state mutex poisoned");
         state.occupied = state.occupied.saturating_sub(1);
+        state.active.retain(|active| active.key != completed_key);
         inner.changed.notify_all();
     }
 }
@@ -1061,10 +1644,13 @@ pub struct TeardownCoordinator {
     budgets: TeardownBudgets,
     configured_capacity: usize,
     completed_operation_capacity: usize,
-    completion_store: Arc<dyn TeardownCompletionStore>,
+    completion_store: TeardownCompletionStore,
+    dispatcher: Arc<BlockingDispatchPool>,
+    completion_dispatcher: Arc<BlockingDispatchPool>,
+    lookup_dispatcher: Arc<BlockingDispatchPool>,
     state: Arc<Mutex<CoordinatorState>>,
     admission_serial: Mutex<()>,
-    executor: TeardownExecutor,
+    executor: Arc<TeardownExecutor>,
 }
 
 impl TeardownCoordinator {
@@ -1072,7 +1658,7 @@ impl TeardownCoordinator {
         admission: Arc<dyn TeardownAdmission>,
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
-        completion_store: Arc<dyn TeardownCompletionStore>,
+        completion_store: TeardownCompletionStore,
     ) -> Self {
         Self::with_configuration(
             admission,
@@ -1089,7 +1675,7 @@ impl TeardownCoordinator {
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
         configured_capacity: usize,
-        completion_store: Arc<dyn TeardownCompletionStore>,
+        completion_store: TeardownCompletionStore,
     ) -> Self {
         Self::with_configuration(
             admission,
@@ -1107,7 +1693,7 @@ impl TeardownCoordinator {
         clock: Arc<dyn TeardownClock>,
         configured_capacity: usize,
         budgets: TeardownBudgets,
-        completion_store: Arc<dyn TeardownCompletionStore>,
+        completion_store: TeardownCompletionStore,
     ) -> Self {
         Self::with_configuration_and_completion_store(
             admission,
@@ -1127,7 +1713,7 @@ impl TeardownCoordinator {
         configured_capacity: usize,
         budgets: TeardownBudgets,
         completed_operation_capacity: usize,
-        completion_store: Arc<dyn TeardownCompletionStore>,
+        completion_store: TeardownCompletionStore,
     ) -> Self {
         let configured_capacity = configured_capacity.max(1);
         let completed_operation_capacity = completed_operation_capacity.max(1);
@@ -1139,10 +1725,27 @@ impl TeardownCoordinator {
             configured_capacity,
             completed_operation_capacity,
             completion_store,
+            dispatcher: BlockingDispatchPool::new(
+                DEFAULT_DISPATCH_WORKER_CAPACITY,
+                DEFAULT_DISPATCH_QUEUE_CAPACITY,
+            ),
+            completion_dispatcher: BlockingDispatchPool::new(
+                DEFAULT_DISPATCH_WORKER_CAPACITY,
+                DEFAULT_DISPATCH_QUEUE_CAPACITY,
+            ),
+            lookup_dispatcher: BlockingDispatchPool::new(1, DEFAULT_DISPATCH_QUEUE_CAPACITY),
             state: Arc::new(Mutex::new(CoordinatorState::default())),
             admission_serial: Mutex::new(()),
             executor: TeardownExecutor::new(configured_capacity, DEFAULT_EXECUTOR_QUEUE_CAPACITY),
         }
+    }
+
+    /// Closes fresh admission and settles every queued or active waiter with
+    /// a typed fail-closed report. In-flight effect/store code remains
+    /// retained by its fixed dispatch worker until it observes cancellation or
+    /// returns.
+    pub fn shutdown(&self) {
+        self.executor.shutdown();
     }
 
     pub fn configured_capacity(&self) -> usize {
@@ -1165,6 +1768,24 @@ impl TeardownCoordinator {
             .len()
     }
 
+    fn rollback_rejection(
+        &self,
+        tickets: &[TeardownTicket],
+        receipts: &[AdmissionReceipt],
+        rejection: TeardownReject,
+    ) -> TeardownReject {
+        if !receipts
+            .iter()
+            .any(|receipt| receipt.state() == AdmissionState::Closing)
+        {
+            return rejection;
+        }
+        match self.admission.rollback_admission_batch(tickets, receipts) {
+            Ok(()) => rejection,
+            Err(error) => TeardownReject::Admission(error),
+        }
+    }
+
     pub fn request(&self, ticket: TeardownTicket) -> Result<TeardownWaiter, TeardownReject> {
         let _admission_serial = self
             .admission_serial
@@ -1174,27 +1795,44 @@ impl TeardownCoordinator {
         if let Some(waiter) = self.find_existing_waiter(&key) {
             return Ok(waiter);
         }
+        if self.executor.is_closed() {
+            return Err(TeardownReject::ExecutorClosed);
+        }
         if let Some(waiter) = self.lookup_completed(&ticket, &key)? {
             return Ok(waiter);
         }
 
         let mut reservation = self.executor.reserve_many(1)?;
+        let rollback_tickets = [ticket.clone()];
         let receipts = self
             .admission
             .close_admission_batch(std::slice::from_ref(&ticket))
             .map_err(TeardownReject::from)?;
         if receipts.len() != 1 {
-            return Err(TeardownReject::Admission(TeardownAdmissionError::Other {
-                detail: "admission returned an invalid single-ticket receipt batch".to_string(),
-            }));
+            return Err(self.rollback_rejection(
+                &rollback_tickets,
+                &receipts,
+                TeardownReject::Admission(TeardownAdmissionError::Other {
+                    detail: "admission returned an invalid single-ticket receipt batch".to_string(),
+                }),
+            ));
         }
-        let receipt =
-            receipts
-                .first()
-                .ok_or(TeardownReject::Admission(TeardownAdmissionError::Other {
-                    detail: "admission returned no receipt".to_string(),
-                }))?;
-        validate_receipt(&ticket, receipt)?;
+        let receipt = match receipts.first() {
+            Some(receipt) => receipt,
+            None => {
+                return Err(self.rollback_rejection(
+                    &rollback_tickets,
+                    &receipts,
+                    TeardownReject::Admission(TeardownAdmissionError::Other {
+                        detail: "admission returned no receipt".to_string(),
+                    }),
+                ));
+            }
+        };
+        if let Err(rejection) = validate_receipt(&ticket, receipt) {
+            return Err(self.rollback_rejection(&rollback_tickets, &receipts, rejection));
+        }
+        let rollback_receipts = receipts.clone();
 
         let cell = Arc::new(CleanupCell::new(&ticket));
         self.state
@@ -1206,9 +1844,16 @@ impl TeardownCoordinator {
                 cell: Arc::clone(&cell),
             });
         let work = self.cleanup_work(ticket, key.clone(), Arc::clone(&cell));
-        if reservation.submit(work).is_err() {
+        if let Err(works) = reservation.submit_all(vec![work]) {
+            for work in works {
+                cancel_queued_cleanup(work);
+            }
             self.remove_active(&key);
-            return Err(TeardownReject::ExecutorClosed);
+            return Err(self.rollback_rejection(
+                &rollback_tickets,
+                &rollback_receipts,
+                TeardownReject::ExecutorClosed,
+            ));
         }
         Ok(TeardownWaiter { cell })
     }
@@ -1248,6 +1893,9 @@ impl TeardownCoordinator {
         let mut waiters = Vec::with_capacity(tickets.len());
         let mut fresh = Vec::new();
         let mut fresh_duplicates = Vec::new();
+        if self.executor.is_closed() {
+            return Err(TeardownReject::ExecutorClosed);
+        }
         for ticket in tickets {
             let key = completion_key(&ticket);
             if let Some(waiter) = self.find_existing_waiter(&key) {
@@ -1272,13 +1920,20 @@ impl TeardownCoordinator {
             .close_admission_batch(&fresh_tickets)
             .map_err(TeardownReject::from)?;
         if receipts.len() != fresh.len() {
-            return Err(TeardownReject::Admission(TeardownAdmissionError::Other {
-                detail: "admission returned an incomplete receipt batch".to_string(),
-            }));
+            return Err(self.rollback_rejection(
+                &fresh_tickets,
+                &receipts,
+                TeardownReject::Admission(TeardownAdmissionError::Other {
+                    detail: "admission returned an incomplete receipt batch".to_string(),
+                }),
+            ));
         }
         for ((_, ticket), receipt) in fresh.iter().zip(receipts.iter()) {
-            validate_receipt(ticket, receipt)?;
+            if let Err(rejection) = validate_receipt(ticket, receipt) {
+                return Err(self.rollback_rejection(&fresh_tickets, &receipts, rejection));
+            }
         }
+        let rollback_receipts = receipts.clone();
 
         let mut works = Vec::with_capacity(fresh.len());
         let mut created = Vec::with_capacity(fresh.len());
@@ -1305,10 +1960,18 @@ impl TeardownCoordinator {
                 });
             }
         }
-        for work in works {
-            if reservation.submit(work).is_err() {
-                return Err(TeardownReject::ExecutorClosed);
+        if let Err(works) = reservation.submit_all(works) {
+            for work in works {
+                cancel_queued_cleanup(work);
             }
+            for (key, _) in &created {
+                self.remove_active(key);
+            }
+            return Err(self.rollback_rejection(
+                &fresh_tickets,
+                &rollback_receipts,
+                TeardownReject::ExecutorClosed,
+            ));
         }
         Ok(TeardownBatchWaiter { waiters })
     }
@@ -1327,8 +1990,12 @@ impl TeardownCoordinator {
             clock: Arc::clone(&self.clock),
             budgets: self.budgets,
             state: Arc::clone(&self.state),
-            completion_store: Arc::clone(&self.completion_store),
+            completion_store: self.completion_store.clone(),
+            dispatcher: Arc::clone(&self.dispatcher),
+            completion_dispatcher: Arc::clone(&self.completion_dispatcher),
+            executor_keepalive: Arc::clone(&self.executor.keepalive),
             completed_operation_capacity: self.completed_operation_capacity,
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -1363,8 +2030,8 @@ impl TeardownCoordinator {
         &self,
         key: &TeardownCompletionKey,
     ) -> Result<Option<TeardownWaiter>, TeardownReject> {
-        match self.completion_store.lookup(key) {
-            Ok(Some(report)) => {
+        match self.lookup_report(key)? {
+            Some(report) => {
                 if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
                     return Err(TeardownReject::CompletionLookupFailed {
                         detail: "completion store returned a mismatched report".to_string(),
@@ -1374,8 +2041,7 @@ impl TeardownCoordinator {
                 cell.finish(report);
                 Ok(Some(TeardownWaiter { cell }))
             }
-            Ok(None) => Ok(None),
-            Err(detail) => Err(TeardownReject::CompletionLookupFailed { detail }),
+            None => Ok(None),
         }
     }
 
@@ -1384,8 +2050,8 @@ impl TeardownCoordinator {
         key: &TeardownCompletionKey,
         ticket: &TeardownTicket,
     ) -> Result<Option<TeardownWaiter>, TeardownReject> {
-        match self.completion_store.lookup(key) {
-            Ok(Some(report)) => {
+        match self.lookup_report(key)? {
+            Some(report) => {
                 if report.action_epoch() != key.action_epoch || report.fence() != key.fence() {
                     return Err(TeardownReject::CompletionLookupFailed {
                         detail: "completion store returned a mismatched report".to_string(),
@@ -1395,9 +2061,25 @@ impl TeardownCoordinator {
                 cell.finish(report);
                 Ok(Some(TeardownWaiter { cell }))
             }
-            Ok(None) => Ok(None),
-            Err(detail) => Err(TeardownReject::CompletionLookupFailed { detail }),
+            None => Ok(None),
         }
+    }
+
+    fn lookup_report(
+        &self,
+        key: &TeardownCompletionKey,
+    ) -> Result<Option<TeardownReport>, TeardownReject> {
+        let store = self.completion_store.clone();
+        let lookup_key = key.clone();
+        let dispatch = self
+            .lookup_dispatcher
+            .submit_sync(move |_dispatch_cancellation| store.lookup(&lookup_key))
+            .map_err(|error| TeardownReject::CompletionLookupFailed {
+                detail: error.detail().to_string(),
+            })?;
+        dispatch
+            .wait(self.budgets.termination, "completion lookup")
+            .map_err(|detail| TeardownReject::CompletionLookupFailed { detail })
     }
 
     fn remove_active(&self, key: &TeardownCompletionKey) {
@@ -1406,6 +2088,12 @@ impl TeardownCoordinator {
             .expect("teardown coordinator state mutex poisoned")
             .active
             .retain(|active| active.key != *key);
+    }
+}
+
+impl Drop for TeardownCoordinator {
+    fn drop(&mut self) {
+        self.executor.shutdown();
     }
 }
 
@@ -1418,17 +2106,29 @@ async fn run_cleanup(work: CleanupWork) {
         ticket,
         key,
         cell,
+        cancellation,
         effects,
         clock,
         budgets,
         state,
         completion_store,
+        dispatcher,
+        completion_dispatcher,
+        executor_keepalive,
         completed_operation_capacity,
     } = work;
+    let _executor_keepalive = executor_keepalive;
+    let deadline = CleanupDeadline::new(clock.as_ref(), budgets);
     let fallback_ticket = ticket.clone();
-    let report = match AssertUnwindSafe(execute_cleanup(ticket, effects, clock, budgets))
-        .catch_unwind()
-        .await
+    let report = match AssertUnwindSafe(execute_cleanup(
+        ticket,
+        effects,
+        deadline,
+        Arc::clone(&dispatcher),
+        Arc::clone(&cancellation),
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(report) => report,
         Err(payload) => panic_report(
@@ -1440,11 +2140,12 @@ async fn run_cleanup(work: CleanupWork) {
     let handoff = AssertUnwindSafe(handoff_completed_cleanup(
         &state,
         completion_store,
+        completion_dispatcher,
         completed_operation_capacity,
         key.clone(),
         Arc::clone(&cell),
         report,
-        budgets.termination,
+        deadline.remaining(),
     ))
     .catch_unwind()
     .await;
@@ -1463,55 +2164,40 @@ async fn run_cleanup(work: CleanupWork) {
 }
 
 async fn persist_completion(
-    completion_store: &Arc<dyn TeardownCompletionStore>,
+    dispatcher: Arc<BlockingDispatchPool>,
+    completion_store: TeardownCompletionStore,
     key: &TeardownCompletionKey,
     report: &TeardownReport,
     budget: Duration,
 ) -> Result<(), String> {
-    let store = Arc::clone(completion_store);
     let key = key.clone();
     let report = report.clone();
-    let runtime = tokio::runtime::Handle::current();
-    // The trait method itself is user-supplied synchronous code. Invoke and
-    // drive it on a blocking worker so a call that never returns is included
-    // in the caller's budget. Once detached on timeout it is intentionally not
-    // joined: Rust cannot safely kill arbitrary user code. The store seam is
-    // therefore fail-closed and must not own caller-critical resources.
-    let task = tokio::task::spawn_blocking(move || {
-        let future = std::panic::catch_unwind(AssertUnwindSafe(|| store.persist(&key, &report)))
-            .map_err(|payload| {
-                format!("completion persistence panicked: {}", panic_detail(payload))
-            })?;
-        runtime
-            .block_on(AssertUnwindSafe(future).catch_unwind())
-            .map_err(|payload| {
-                format!("completion persistence panicked: {}", panic_detail(payload))
-            })
-    });
-    match tokio::time::timeout(budget, task).await {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(detail))) => Err(detail),
-        Ok(Err(join_error)) => Err(format!(
-            "completion persistence worker failed: {join_error}"
-        )),
-        Err(_) => Err(format!(
-            "completion persistence timed out after {:?}",
-            budget
-        )),
-    }
+    let dispatch = dispatcher
+        .submit_async(move |_dispatch_cancellation| {
+            Box::pin(async move { completion_store.persist(&key, &report) })
+        })
+        .map_err(|error| error.detail().to_string())?;
+    dispatch.wait(budget, "completion persistence").await
 }
 
 async fn handoff_completed_cleanup(
     state: &Arc<Mutex<CoordinatorState>>,
-    completion_store: Arc<dyn TeardownCompletionStore>,
+    completion_store: TeardownCompletionStore,
+    dispatcher: Arc<BlockingDispatchPool>,
     completed_operation_capacity: usize,
     key: TeardownCompletionKey,
     cell: Arc<CleanupCell>,
     report: TeardownReport,
     persistence_budget: Duration,
 ) -> TeardownReport {
-    if let Err(detail) =
-        persist_completion(&completion_store, &key, &report, persistence_budget).await
+    if let Err(detail) = persist_completion(
+        dispatcher,
+        completion_store,
+        &key,
+        &report,
+        persistence_budget,
+    )
+    .await
     {
         let report = report.with_handoff_error(format!(
             "completed teardown handoff failed: {}",
@@ -1563,21 +2249,142 @@ fn validate_receipt(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EffectCall {
+    Drain,
+    CooperativeClose,
+    InterruptOrSafeClose,
+    TerminateTree,
+    SettleActiveProcessZero,
+    DetachAfterZero,
+    ReconcilePorts,
+    PersistSettlement,
+    ReleaseStoppedExact,
+}
+
+fn dispatch_stage(
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
+    ticket: TeardownTicket,
+    call: EffectCall,
+    cancellation: Arc<CancellationToken>,
+) -> Result<AsyncDispatch<StageResult>, String> {
+    dispatcher
+        .submit_async(move |dispatch_cancellation| {
+            Box::pin(async move {
+                let future = match call {
+                    EffectCall::Drain => effects.drain(&ticket),
+                    EffectCall::CooperativeClose => effects.cooperative_close(&ticket),
+                    EffectCall::InterruptOrSafeClose => effects.interrupt_or_safe_close(&ticket),
+                    EffectCall::TerminateTree => effects.terminate_tree(&ticket),
+                    EffectCall::SettleActiveProcessZero => {
+                        effects.settle_active_process_zero(&ticket)
+                    }
+                    EffectCall::DetachAfterZero => effects.detach_after_zero(&ticket),
+                    EffectCall::ReconcilePorts => effects.reconcile_ports(&ticket),
+                    EffectCall::PersistSettlement => effects.persist_settlement(&ticket),
+                    EffectCall::ReleaseStoppedExact => effects.release_stopped_exact(&ticket),
+                };
+                tokio::select! {
+                    _ = dispatch_cancellation.cancelled() => {
+                        Err("teardown stage dispatch cancellation requested".to_string())
+                    }
+                    _ = cancellation.cancelled() => {
+                        Err("teardown cleanup cancellation requested".to_string())
+                    }
+                    result = AssertUnwindSafe(future).catch_unwind() => match result {
+                        Ok(result) => Ok(result),
+                        Err(payload) => Err(format!("teardown stage panicked: {}", panic_detail(payload))),
+                    }
+                }
+            })
+        })
+        .map_err(|error| error.detail().to_string())
+}
+
+fn dispatch_wait(
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
+    ticket: TeardownTicket,
+    stage: WaitStage,
+    deadline: TeardownDeadline,
+    cancellation: Arc<CancellationToken>,
+) -> Result<AsyncDispatch<WaitResult>, String> {
+    dispatcher
+        .submit_async(move |dispatch_cancellation| {
+            Box::pin(async move {
+                let future = effects.wait_for_zero(&ticket, stage, deadline);
+                tokio::select! {
+                    _ = dispatch_cancellation.cancelled() => {
+                        Err("zero wait dispatch cancellation requested".to_string())
+                    }
+                    _ = cancellation.cancelled() => {
+                        Err("teardown cleanup cancellation requested".to_string())
+                    }
+                    result = AssertUnwindSafe(future).catch_unwind() => match result {
+                        Ok(result) => Ok(result),
+                        Err(payload) => Err(format!("zero wait panicked: {}", panic_detail(payload))),
+                    }
+                }
+            })
+        })
+        .map_err(|error| error.detail().to_string())
+}
+
+fn dispatch_residue(
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
+    ticket: TeardownTicket,
+    cancellation: Arc<CancellationToken>,
+) -> Result<AsyncDispatch<Option<ResidueEvidence>>, String> {
+    dispatcher
+        .submit_async(move |dispatch_cancellation| {
+            Box::pin(async move {
+                let future = effects.residue(&ticket);
+                tokio::select! {
+                    _ = dispatch_cancellation.cancelled() => {
+                        Err("teardown residue dispatch cancellation requested".to_string())
+                    }
+                    _ = cancellation.cancelled() => {
+                        Err("teardown cleanup cancellation requested".to_string())
+                    }
+                    result = AssertUnwindSafe(future).catch_unwind() => match result {
+                        Ok(result) => Ok(result),
+                        Err(payload) => Err(format!("teardown residue panicked: {}", panic_detail(payload))),
+                    }
+                }
+            })
+        })
+        .map_err(|error| error.detail().to_string())
+}
+
 async fn execute_cleanup(
     ticket: TeardownTicket,
     effects: Arc<dyn TeardownEffects>,
-    clock: Arc<dyn TeardownClock>,
-    budgets: TeardownBudgets,
+    deadline: CleanupDeadline,
+    dispatcher: Arc<BlockingDispatchPool>,
+    cancellation: Arc<CancellationToken>,
 ) -> TeardownReport {
     let mut attempted_stages = Vec::new();
     let mut errors = Vec::new();
+
+    if cancellation.is_requested() {
+        return waiter_failure_report(
+            ticket,
+            "teardown cleanup cancellation requested before execution",
+        );
+    }
 
     attempted_stages.push(TeardownStage::Drain);
     collect_stage_result(
         bounded_stage(
             TeardownStage::Drain,
-            budgets.cooperative_grace,
-            effects.drain(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::Drain,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1588,8 +2395,12 @@ async fn execute_cleanup(
     collect_stage_result(
         bounded_stage(
             TeardownStage::CooperativeClose,
-            budgets.cooperative_grace,
-            effects.cooperative_close(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::CooperativeClose,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1599,33 +2410,48 @@ async fn execute_cleanup(
     attempted_stages.push(TeardownStage::CooperativeWait);
     let cooperative = bounded_wait(
         TeardownStage::CooperativeWait,
-        budgets.cooperative_grace,
-        effects.wait_for_zero(
-            &ticket,
-            WaitStage::CooperativeGrace,
-            clock.deadline(budgets.cooperative_grace),
-        ),
+        deadline,
+        &dispatcher,
+        Arc::clone(&effects),
+        &ticket,
+        WaitStage::CooperativeGrace,
+        Arc::clone(&cancellation),
     )
     .await;
     if try_settle_after_wait(
         &ticket,
         cooperative,
         &effects,
-        budgets.termination,
+        deadline,
         &mut attempted_stages,
         &mut errors,
+        &dispatcher,
+        Arc::clone(&cancellation),
     )
     .await
     {
-        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
+        return settle_after_zero(
+            ticket,
+            effects,
+            deadline,
+            attempted_stages,
+            errors,
+            dispatcher,
+            cancellation,
+        )
+        .await;
     }
 
     attempted_stages.push(TeardownStage::InterruptOrSafeClose);
     collect_stage_result(
         bounded_stage(
             TeardownStage::InterruptOrSafeClose,
-            budgets.interrupt_grace,
-            effects.interrupt_or_safe_close(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::InterruptOrSafeClose,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1635,33 +2461,48 @@ async fn execute_cleanup(
     attempted_stages.push(TeardownStage::InterruptWait);
     let interrupted = bounded_wait(
         TeardownStage::InterruptWait,
-        budgets.interrupt_grace,
-        effects.wait_for_zero(
-            &ticket,
-            WaitStage::InterruptGrace,
-            clock.deadline(budgets.interrupt_grace),
-        ),
+        deadline,
+        &dispatcher,
+        Arc::clone(&effects),
+        &ticket,
+        WaitStage::InterruptGrace,
+        Arc::clone(&cancellation),
     )
     .await;
     if try_settle_after_wait(
         &ticket,
         interrupted,
         &effects,
-        budgets.termination,
+        deadline,
         &mut attempted_stages,
         &mut errors,
+        &dispatcher,
+        Arc::clone(&cancellation),
     )
     .await
     {
-        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
+        return settle_after_zero(
+            ticket,
+            effects,
+            deadline,
+            attempted_stages,
+            errors,
+            dispatcher,
+            cancellation,
+        )
+        .await;
     }
 
     attempted_stages.push(TeardownStage::TerminateTree);
     collect_stage_result(
         bounded_stage(
             TeardownStage::TerminateTree,
-            budgets.termination,
-            effects.terminate_tree(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::TerminateTree,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1671,29 +2512,47 @@ async fn execute_cleanup(
     attempted_stages.push(TeardownStage::TerminationWait);
     let terminated = bounded_wait(
         TeardownStage::TerminationWait,
-        budgets.termination,
-        effects.wait_for_zero(
-            &ticket,
-            WaitStage::Termination,
-            clock.deadline(budgets.termination),
-        ),
+        deadline,
+        &dispatcher,
+        Arc::clone(&effects),
+        &ticket,
+        WaitStage::Termination,
+        Arc::clone(&cancellation),
     )
     .await;
     if try_settle_after_wait(
         &ticket,
         terminated,
         &effects,
-        budgets.termination,
+        deadline,
         &mut attempted_stages,
         &mut errors,
+        &dispatcher,
+        Arc::clone(&cancellation),
     )
     .await
     {
-        return settle_after_zero(ticket, effects, budgets, attempted_stages, errors).await;
+        return settle_after_zero(
+            ticket,
+            effects,
+            deadline,
+            attempted_stages,
+            errors,
+            dispatcher,
+            cancellation,
+        )
+        .await;
     }
 
-    let adapter_residue =
-        bounded_residue(&effects, &ticket, budgets.termination, &mut errors).await;
+    let adapter_residue = bounded_residue(
+        &dispatcher,
+        Arc::clone(&effects),
+        &ticket,
+        deadline,
+        &mut errors,
+        Arc::clone(&cancellation),
+    )
+    .await;
     let outcome = if errors.is_empty() {
         TeardownOutcome::Leaked
     } else {
@@ -1717,55 +2576,82 @@ async fn execute_cleanup(
 
 async fn bounded_stage(
     stage: TeardownStage,
-    budget: Duration,
-    future: BoxFuture<'_, StageResult>,
+    deadline: CleanupDeadline,
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
+    ticket: &TeardownTicket,
+    call: EffectCall,
+    cancellation: Arc<CancellationToken>,
 ) -> StageResult {
-    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(payload)) => StageResult::Failed {
-            detail: format!("{stage:?} panic: {}", panic_detail(payload)),
-        },
-        Err(_) => StageResult::Failed {
-            detail: format!("{stage:?} timeout after {budget:?}"),
-        },
+    let dispatch = match dispatch_stage(dispatcher, effects, ticket.clone(), call, cancellation) {
+        Ok(dispatch) => dispatch,
+        Err(detail) => {
+            return StageResult::Failed {
+                detail: format!("{stage:?}: {detail}"),
+            };
+        }
+    };
+    match dispatch
+        .wait(deadline.remaining(), &format!("{stage:?}"))
+        .await
+    {
+        Ok(result) => result,
+        Err(detail) => StageResult::Failed { detail },
     }
 }
 
 async fn bounded_wait(
     stage: TeardownStage,
-    budget: Duration,
-    future: BoxFuture<'_, WaitResult>,
+    deadline: CleanupDeadline,
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
+    ticket: &TeardownTicket,
+    wait_stage: WaitStage,
+    cancellation: Arc<CancellationToken>,
 ) -> WaitResult {
-    match tokio::time::timeout(budget, AssertUnwindSafe(future).catch_unwind()).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(payload)) => WaitResult::Failed {
-            detail: format!("{stage:?} panic: {}", panic_detail(payload)),
-        },
-        Err(_) => WaitResult::Failed {
-            detail: format!("{stage:?} timeout after {budget:?}"),
-        },
+    let dispatch = match dispatch_wait(
+        dispatcher,
+        effects,
+        ticket.clone(),
+        wait_stage,
+        deadline.effect(),
+        cancellation,
+    ) {
+        Ok(dispatch) => dispatch,
+        Err(detail) => {
+            return WaitResult::Failed {
+                detail: format!("{stage:?}: {detail}"),
+            };
+        }
+    };
+    match dispatch
+        .wait(deadline.remaining(), &format!("{stage:?}"))
+        .await
+    {
+        Ok(result) => result,
+        Err(detail) => WaitResult::Failed { detail },
     }
 }
 
 async fn bounded_residue(
-    effects: &Arc<dyn TeardownEffects>,
+    dispatcher: &Arc<BlockingDispatchPool>,
+    effects: Arc<dyn TeardownEffects>,
     ticket: &TeardownTicket,
-    budget: Duration,
+    deadline: CleanupDeadline,
     errors: &mut Vec<String>,
+    cancellation: Arc<CancellationToken>,
 ) -> Option<ResidueEvidence> {
-    match tokio::time::timeout(
-        budget,
-        AssertUnwindSafe(effects.residue(ticket)).catch_unwind(),
-    )
-    .await
-    {
-        Ok(Ok(residue)) => residue,
-        Ok(Err(payload)) => {
-            errors.push(format!("Residue: panic: {}", panic_detail(payload)));
-            None
+    let dispatch = match dispatch_residue(dispatcher, effects, ticket.clone(), cancellation) {
+        Ok(dispatch) => dispatch,
+        Err(detail) => {
+            errors.push(format!("Residue: {detail}"));
+            return None;
         }
-        Err(_) => {
-            errors.push(format!("Residue: timeout after {budget:?}"));
+    };
+    match dispatch.wait(deadline.remaining(), "Residue").await {
+        Ok(residue) => residue,
+        Err(detail) => {
+            errors.push(format!("Residue: {detail}"));
             None
         }
     }
@@ -1781,17 +2667,23 @@ async fn try_settle_after_wait(
     ticket: &TeardownTicket,
     result: WaitResult,
     effects: &Arc<dyn TeardownEffects>,
-    budget: Duration,
+    deadline: CleanupDeadline,
     attempted_stages: &mut Vec<TeardownStage>,
     errors: &mut Vec<String>,
+    dispatcher: &Arc<BlockingDispatchPool>,
+    cancellation: Arc<CancellationToken>,
 ) -> bool {
     match result {
         WaitResult::Zero => {
             attempted_stages.push(TeardownStage::SettleActiveProcessZero);
             match bounded_stage(
                 TeardownStage::SettleActiveProcessZero,
-                budget,
-                effects.settle_active_process_zero(ticket),
+                deadline,
+                dispatcher,
+                Arc::clone(effects),
+                ticket,
+                EffectCall::SettleActiveProcessZero,
+                Arc::clone(&cancellation),
             )
             .await
             {
@@ -1816,17 +2708,23 @@ async fn try_settle_after_wait(
 async fn settle_after_zero(
     ticket: TeardownTicket,
     effects: Arc<dyn TeardownEffects>,
-    budgets: TeardownBudgets,
+    deadline: CleanupDeadline,
     mut attempted_stages: Vec<TeardownStage>,
     errors: Vec<String>,
+    dispatcher: Arc<BlockingDispatchPool>,
+    cancellation: Arc<CancellationToken>,
 ) -> TeardownReport {
     let mut errors = errors;
     attempted_stages.push(TeardownStage::DetachAfterZero);
     collect_stage_result(
         bounded_stage(
             TeardownStage::DetachAfterZero,
-            budgets.termination,
-            effects.detach_after_zero(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::DetachAfterZero,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1836,8 +2734,12 @@ async fn settle_after_zero(
     collect_stage_result(
         bounded_stage(
             TeardownStage::ReconcilePorts,
-            budgets.termination,
-            effects.reconcile_ports(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::ReconcilePorts,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1847,8 +2749,12 @@ async fn settle_after_zero(
     collect_stage_result(
         bounded_stage(
             TeardownStage::PersistSettlement,
-            budgets.termination,
-            effects.persist_settlement(&ticket),
+            deadline,
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            EffectCall::PersistSettlement,
+            Arc::clone(&cancellation),
         )
         .await,
         &mut errors,
@@ -1857,8 +2763,12 @@ async fn settle_after_zero(
     attempted_stages.push(TeardownStage::ReleaseStoppedExact);
     let release = bounded_stage(
         TeardownStage::ReleaseStoppedExact,
-        budgets.termination,
-        effects.release_stopped_exact(&ticket),
+        deadline,
+        &dispatcher,
+        Arc::clone(&effects),
+        &ticket,
+        EffectCall::ReleaseStoppedExact,
+        Arc::clone(&cancellation),
     )
     .await;
     let outcome = match release {
@@ -1870,7 +2780,15 @@ async fn settle_after_zero(
         }
     };
     let adapter_residue = if outcome != TeardownOutcome::Closed {
-        bounded_residue(&effects, &ticket, budgets.termination, &mut errors).await
+        bounded_residue(
+            &dispatcher,
+            Arc::clone(&effects),
+            &ticket,
+            deadline,
+            &mut errors,
+            cancellation,
+        )
+        .await
     } else {
         None
     };

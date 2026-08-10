@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,9 @@ use devmanager::process::registry::{
 };
 use devmanager::process::teardown::{
     AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
-    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionKey,
-    TeardownCompletionStore, TeardownCoordinator, TeardownDeadline, TeardownEffects,
-    TeardownOutcome, TeardownReport, TeardownScope, TeardownStage, TeardownTicket, WaitResult,
-    WaitStage,
+    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionStore,
+    TeardownCoordinator, TeardownDeadline, TeardownEffects, TeardownOutcome, TeardownScope,
+    TeardownStage, TeardownTicket, WaitResult, WaitStage,
 };
 use tokio::sync::watch;
 
@@ -283,50 +282,165 @@ impl TeardownAdmission for FakeAdmission {
         }
         Ok(receipts)
     }
+
+    fn rollback_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+        receipts: &[AdmissionReceipt],
+    ) -> Result<(), TeardownAdmissionError> {
+        if tickets.len() != receipts.len() {
+            return Err(TeardownAdmissionError::Other {
+                detail: "rollback receipt count did not match tickets".to_string(),
+            });
+        }
+        let mut rules = self.rules.lock().expect("admission rules");
+        for (ticket, receipt) in tickets.iter().zip(receipts) {
+            let rule = rules
+                .get(&ticket.resource_id())
+                .ok_or(TeardownAdmissionError::FenceMismatch)?;
+            if receipt.state() != AdmissionState::Closing
+                || receipt.scope() != ticket.scope()
+                || receipt.action_epoch() != ticket.action_epoch()
+                || receipt.fence() != ticket.fence()
+                || rule.action_epoch != ticket.action_epoch()
+                || rule.fence != *ticket.fence()
+                || rule.state != AdmissionState::Closing
+            {
+                return Err(TeardownAdmissionError::FenceMismatch);
+            }
+        }
+        for ticket in tickets {
+            if let Some(rule) = rules.get_mut(&ticket.resource_id()) {
+                rule.state = AdmissionState::Open;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockingAdmission {
+    inner: FakeAdmission,
+    entered_batch: Arc<AtomicBool>,
+    release_batch: Arc<AtomicBool>,
+}
+
+impl BlockingAdmission {
+    fn new(inner: FakeAdmission) -> Self {
+        Self {
+            inner,
+            entered_batch: Arc::new(AtomicBool::new(false)),
+            release_batch: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn wait_until_batch_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.entered_batch.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(self.entered_batch.load(Ordering::SeqCst));
+    }
+
+    fn release_batch(&self) {
+        self.release_batch.store(true, Ordering::SeqCst);
+    }
+}
+
+impl TeardownAdmission for BlockingAdmission {
+    fn close_admission(
+        &self,
+        ticket: &TeardownTicket,
+    ) -> Result<AdmissionReceipt, TeardownAdmissionError> {
+        self.inner.close_admission(ticket)
+    }
+
+    fn close_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+    ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError> {
+        self.entered_batch.store(true, Ordering::SeqCst);
+        while !self.release_batch.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        self.inner.close_admission_batch(tickets)
+    }
+
+    fn rollback_admission_batch(
+        &self,
+        tickets: &[TeardownTicket],
+        receipts: &[AdmissionReceipt],
+    ) -> Result<(), TeardownAdmissionError> {
+        self.inner.rollback_admission_batch(tickets, receipts)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 struct FakeCompletionStore {
-    reports: Arc<Mutex<Vec<(TeardownCompletionKey, TeardownReport)>>>,
-    persist_error: Arc<Mutex<Option<String>>>,
+    inner: TeardownCompletionStore,
 }
 
 impl FakeCompletionStore {
     fn fail_persist(&self, detail: &str) {
-        *self.persist_error.lock().expect("persist error") = Some(detail.to_string());
+        self.inner.fail_persist_for_test(detail);
+    }
+
+    fn store(&self) -> TeardownCompletionStore {
+        self.inner.clone()
     }
 }
 
-impl TeardownCompletionStore for FakeCompletionStore {
-    fn lookup(&self, key: &TeardownCompletionKey) -> Result<Option<TeardownReport>, String> {
-        Ok(self
-            .reports
-            .lock()
-            .expect("completion reports")
-            .iter()
-            .find(|(stored_key, _)| stored_key == key)
-            .map(|(_, report)| report.clone()))
+#[derive(Debug, Clone)]
+struct BlockingLookupStore {
+    inner: TeardownCompletionStore,
+}
+
+impl BlockingLookupStore {
+    fn new() -> Self {
+        let inner = TeardownCompletionStore::default();
+        inner.block_lookup_for_test();
+        Self { inner }
     }
 
-    fn persist<'a>(
-        &'a self,
-        key: &'a TeardownCompletionKey,
-        report: &'a TeardownReport,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            if let Some(detail) = self.persist_error.lock().expect("persist error").clone() {
-                return Err(detail);
-            }
-            let mut reports = self.reports.lock().expect("completion reports");
-            if let Some((_, stored_report)) =
-                reports.iter_mut().find(|(stored_key, _)| stored_key == key)
-            {
-                *stored_report = report.clone();
-            } else {
-                reports.push((key.clone(), report.clone()));
-            }
-            Ok(())
-        })
+    fn wait_until_started(&self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.inner.lookup_started_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(self.inner.lookup_started_for_test(), 1);
+    }
+
+    fn release(&self) {
+        self.inner.release_lookup_for_test();
+    }
+
+    fn store(&self) -> TeardownCompletionStore {
+        self.inner.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockingPersistStore {
+    inner: TeardownCompletionStore,
+}
+
+impl BlockingPersistStore {
+    fn new() -> Self {
+        let inner = TeardownCompletionStore::default();
+        inner.block_persist_for_test();
+        Self { inner }
+    }
+
+    fn max_active(&self) -> usize {
+        self.inner.persist_max_active_for_test()
+    }
+
+    fn release(&self) {
+        self.inner.release_persist_for_test();
+    }
+
+    fn store(&self) -> TeardownCompletionStore {
+        self.inner.clone()
     }
 }
 
@@ -791,6 +905,105 @@ impl TeardownEffects for FaultyEffects {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BlockingConstructionEffects {
+    inner: FakeEffects,
+    release: Arc<AtomicUsize>,
+    block_residue: bool,
+}
+
+impl BlockingConstructionEffects {
+    fn new(inner: &FakeEffects) -> Self {
+        Self {
+            inner: inner.clone(),
+            release: Arc::new(AtomicUsize::new(0)),
+            block_residue: false,
+        }
+    }
+
+    fn for_residue(inner: &FakeEffects) -> Self {
+        Self {
+            inner: inner.clone(),
+            release: Arc::new(AtomicUsize::new(0)),
+            block_residue: true,
+        }
+    }
+
+    fn release(&self) {
+        self.release.store(1, Ordering::SeqCst);
+    }
+}
+
+impl TeardownEffects for BlockingConstructionEffects {
+    fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        if !self.block_residue {
+            while self.release.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.inner.drain(ticket)
+    }
+
+    fn cooperative_close<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.inner.cooperative_close(ticket)
+    }
+
+    fn interrupt_or_safe_close<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.interrupt_or_safe_close(ticket)
+    }
+
+    fn terminate_tree<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.inner.terminate_tree(ticket)
+    }
+
+    fn wait_for_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        stage: WaitStage,
+        deadline: TeardownDeadline,
+    ) -> BoxFuture<'a, WaitResult> {
+        self.inner.wait_for_zero(ticket, stage, deadline)
+    }
+
+    fn settle_active_process_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.settle_active_process_zero(ticket)
+    }
+
+    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.inner.detach_after_zero(ticket)
+    }
+
+    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.inner.reconcile_ports(ticket)
+    }
+
+    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.inner.persist_settlement(ticket)
+    }
+
+    fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
+        if self.block_residue {
+            while self.release.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.inner.residue(ticket)
+    }
+
+    fn release_stopped_exact<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.release_stopped_exact(ticket)
+    }
+}
+
 fn coordinator(
     admission: &FakeAdmission,
     effects: &FakeEffects,
@@ -800,7 +1013,7 @@ fn coordinator(
         admission,
         Arc::new(effects.clone()),
         clock,
-        Arc::new(FakeCompletionStore::default()),
+        FakeCompletionStore::default().store(),
     )
 }
 
@@ -816,7 +1029,7 @@ fn coordinator_with_effects_and_budgets(
         Arc::new(clock.clone()),
         4,
         budgets,
-        Arc::new(FakeCompletionStore::default()),
+        FakeCompletionStore::default().store(),
     )
 }
 
@@ -824,7 +1037,7 @@ fn coordinator_with_store(
     admission: &FakeAdmission,
     effects: Arc<dyn TeardownEffects>,
     clock: &FakeClock,
-    completion_store: Arc<dyn TeardownCompletionStore>,
+    completion_store: TeardownCompletionStore,
 ) -> TeardownCoordinator {
     TeardownCoordinator::new(
         Arc::new(admission.clone()),
@@ -845,7 +1058,7 @@ fn coordinator_with_limit(
         Arc::new(effects.clone()),
         Arc::new(clock.clone()),
         configured_capacity,
-        Arc::new(FakeCompletionStore::default()),
+        FakeCompletionStore::default().store(),
     )
 }
 
@@ -862,7 +1075,7 @@ fn coordinator_with_limit_and_budgets(
         Arc::new(clock.clone()),
         configured_capacity,
         budgets,
-        Arc::new(FakeCompletionStore::default()),
+        FakeCompletionStore::default().store(),
     )
 }
 
@@ -1118,7 +1331,11 @@ fn teardown_escalation_order_is_fixed() {
             "release_stopped_exact",
         ]
     );
-    assert_eq!(clock.deadlines().len(), 3);
+    assert_eq!(clock.deadlines().len(), 1);
+    assert!(clock
+        .deadlines()
+        .windows(2)
+        .all(|deadlines| deadlines[0] == deadlines[1]));
 }
 
 #[test]
@@ -1196,10 +1413,11 @@ fn teardown_handoff_failure_keeps_idempotent_residue_without_poisoning_other_wor
     let effects = FakeEffects::default();
     effects.install(&first, BranchScript::cooperative_zero(&first));
     effects.install(&unrelated, BranchScript::cooperative_zero(&unrelated));
-    let store = Arc::new(FakeCompletionStore::default());
+    let store = FakeCompletionStore::default();
     store.fail_persist("completion journal unavailable");
     let clock = FakeClock::default();
-    let coordinator = coordinator_with_store(&admission, Arc::new(effects.clone()), &clock, store);
+    let coordinator =
+        coordinator_with_store(&admission, Arc::new(effects.clone()), &clock, store.store());
 
     let first_report = runtime().block_on(
         coordinator
@@ -1249,7 +1467,7 @@ fn teardown_completed_cache_evicts_deterministically_without_rerunning_cleanup()
         2,
         devmanager::process::teardown::TeardownBudgets::default(),
         1,
-        Arc::new(store),
+        store.store(),
     );
 
     runtime().block_on(
@@ -1369,7 +1587,7 @@ fn teardown_exhausted_cleanup_synthesizes_required_residue_when_adapter_has_none
 }
 
 #[test]
-fn teardown_executor_drop_settles_queued_cells_as_failed() {
+fn teardown_executor_drop_settles_active_and_queued_cells_as_failed() {
     let admission = FakeAdmission::default();
     let effects = FakeEffects::default();
     let mut tickets = Vec::new();
@@ -1423,17 +1641,349 @@ fn teardown_executor_drop_settles_queued_cells_as_failed() {
             .iter()
             .filter(|report| report.outcome() == TeardownOutcome::CleanupFailed)
             .count(),
-        1,
-        "the queued cleanup must settle as a failed cancellation"
+        5,
+        "dropping the coordinator must settle active and queued cleanup as failed cancellation"
     );
     assert_eq!(
-        effects
-            .events()
-            .iter()
-            .filter(|event| event.ends_with(":drain"))
-            .count(),
+        effects.drain_started_count(),
         4,
         "shutdown must not start a queued cleanup after cancellation"
+    );
+}
+
+#[test]
+fn teardown_coordinator_drop_settles_active_and_queued_waiters_promptly() {
+    let admission = FakeAdmission::default();
+    let effects = FakeEffects::default();
+    let mut tickets = Vec::new();
+    for index in 1..=5u16 {
+        let ticket = indexed_ticket(index);
+        admission.allow(&ticket);
+        effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+        tickets.push(ticket);
+    }
+    let release_drain = effects.install_drain_gate();
+    let clock = FakeClock::default();
+    let coordinator = coordinator_with_limit_and_budgets(
+        &admission,
+        &effects,
+        &clock,
+        4,
+        TeardownBudgets::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ),
+    );
+
+    let waiters: Vec<_> = tickets
+        .iter()
+        .cloned()
+        .map(|ticket| coordinator.request(ticket).expect("accepted cleanup"))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while effects.drain_started_count() < 4 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(effects.drain_started_count(), 4);
+
+    let started = Instant::now();
+    drop(coordinator);
+    let prompt = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            let mut reports = Vec::with_capacity(waiters.len());
+            for waiter in waiters.iter().cloned() {
+                reports.push(waiter.wait().await);
+            }
+            reports
+        })
+        .await
+    });
+
+    release_drain.send_replace(true);
+    let _ = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for waiter in waiters {
+                let _ = waiter.wait().await;
+            }
+        })
+        .await
+    });
+
+    assert!(
+        prompt.is_ok(),
+        "dropping the coordinator must settle active and queued waiters within 100ms (elapsed {:?})",
+        started.elapsed()
+    );
+    let reports = prompt.expect("prompt waiter settlement");
+    assert_eq!(reports.len(), 5);
+    assert!(reports.iter().all(|report| {
+        report.outcome() == TeardownOutcome::CleanupFailed
+            && report.residue().is_some()
+            && report.errors().iter().any(|error| error.contains("cancel"))
+    }));
+}
+
+#[test]
+fn teardown_stage_future_construction_is_inside_the_deadline() {
+    let ticket = ticket(27, 47, TeardownScope::Host, 28, 127, 1_027);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let blocking = BlockingConstructionEffects::new(&effects);
+    let clock = FakeClock::default();
+    let coordinator = coordinator_with_effects_and_budgets(
+        &admission,
+        Arc::new(blocking.clone()),
+        &clock,
+        TeardownBudgets::new(
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        ),
+    );
+    let waiter = coordinator.request(ticket).expect("admission winner");
+    let started = Instant::now();
+    let bounded = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_millis(100), waiter.clone().wait()).await
+    });
+
+    blocking.release();
+    let _ = runtime().block_on(waiter.wait());
+
+    assert!(
+        bounded.is_ok(),
+        "synchronous future construction must not bypass the stage deadline (elapsed {:?})",
+        started.elapsed()
+    );
+    let report = bounded.expect("bounded stage report");
+    assert_eq!(report.outcome(), TeardownOutcome::CleanupFailed);
+    assert!(report
+        .errors()
+        .iter()
+        .any(|error| error.contains("Drain") && error.contains("timeout")));
+}
+
+#[test]
+fn teardown_residue_future_construction_is_inside_the_deadline() {
+    let ticket = ticket(29, 49, TeardownScope::Host, 30, 129, 1_029);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::timeout_without_residue());
+    let blocking = BlockingConstructionEffects::for_residue(&effects);
+    let clock = FakeClock::default();
+    let coordinator = coordinator_with_effects_and_budgets(
+        &admission,
+        Arc::new(blocking.clone()),
+        &clock,
+        TeardownBudgets::new(
+            Duration::from_millis(15),
+            Duration::from_millis(15),
+            Duration::from_millis(15),
+        ),
+    );
+    let waiter = coordinator.request(ticket).expect("admission winner");
+    let bounded = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_millis(100), waiter.clone().wait()).await
+    });
+
+    assert!(
+        bounded.is_ok(),
+        "synchronous residue construction must not bypass its deadline"
+    );
+    let report = bounded.expect("bounded residue report");
+    assert_eq!(report.outcome(), TeardownOutcome::CleanupFailed);
+    assert!(report
+        .errors()
+        .iter()
+        .any(|error| error.contains("Residue") && error.contains("timeout")));
+
+    blocking.release();
+    let _ = runtime().block_on(waiter.wait());
+}
+
+#[test]
+fn teardown_shutdown_rejects_new_admission_without_lookup_or_effects() {
+    let ticket = ticket(30, 50, TeardownScope::Host, 31, 130, 1_030);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    let store = TeardownCompletionStore::default();
+    let coordinator = TeardownCoordinator::with_capacity(
+        Arc::new(admission.clone()),
+        Arc::new(effects.clone()),
+        Arc::new(FakeClock::default()),
+        1,
+        store.clone(),
+    );
+
+    coordinator.shutdown();
+    assert!(matches!(
+        coordinator.request(ticket),
+        Err(devmanager::process::teardown::TeardownReject::ExecutorClosed)
+    ));
+    assert_eq!(store.lookup_started_for_test(), 0);
+    assert!(admission.events().is_empty());
+    assert!(effects.events().is_empty());
+}
+
+#[test]
+fn teardown_shutdown_race_rolls_back_admission_when_submission_closes() {
+    let ticket = ticket(31, 51, TeardownScope::Host, 32, 131, 1_031);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let blocking_admission = BlockingAdmission::new(admission.clone());
+    let coordinator = Arc::new(TeardownCoordinator::with_capacity(
+        Arc::new(blocking_admission.clone()),
+        Arc::new(FakeEffects::default()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownCompletionStore::default(),
+    ));
+    let request_coordinator = Arc::clone(&coordinator);
+    let request_ticket = ticket.clone();
+    let request_thread = std::thread::spawn(move || request_coordinator.request(request_ticket));
+
+    blocking_admission.wait_until_batch_entered();
+    coordinator.shutdown();
+    blocking_admission.release_batch();
+
+    assert!(matches!(
+        request_thread
+            .join()
+            .expect("admission race request thread"),
+        Err(devmanager::process::teardown::TeardownReject::ExecutorClosed)
+    ));
+    assert!(
+        !admission.launch_or_input_is_rejected(ticket.resource_id()),
+        "a submission race must reopen the exact admission it did not schedule"
+    );
+}
+
+#[test]
+fn teardown_completion_lookup_is_bounded_at_the_store_boundary() {
+    let ticket = ticket(28, 48, TeardownScope::Host, 29, 128, 1_028);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let clock = FakeClock::default();
+    let store = BlockingLookupStore::new();
+    let coordinator = TeardownCoordinator::with_configuration(
+        Arc::new(admission),
+        Arc::new(effects),
+        Arc::new(clock),
+        1,
+        TeardownBudgets::new(
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        ),
+        store.store(),
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let request_thread = std::thread::spawn(move || {
+        sender
+            .send(coordinator.request(ticket))
+            .expect("lookup result receiver");
+    });
+    store.wait_until_started();
+    let result = receiver
+        .recv_timeout(Duration::from_millis(150))
+        .expect("completion lookup must return within its bound");
+    assert!(matches!(
+        result,
+        Err(devmanager::process::teardown::TeardownReject::CompletionLookupFailed { .. })
+    ));
+    store.release();
+    request_thread
+        .join()
+        .expect("bounded lookup request thread");
+}
+
+#[test]
+fn teardown_completion_persist_uses_fixed_capacity_under_stuck_store_pressure() {
+    const REQUESTS: u16 = 32;
+    let admission = FakeAdmission::default();
+    let effects = FakeEffects::default();
+    let clock = FakeClock::default();
+    let store = BlockingPersistStore::new();
+    let coordinator = TeardownCoordinator::with_configuration(
+        Arc::new(admission.clone()),
+        Arc::new(effects.clone()),
+        Arc::new(clock),
+        4,
+        TeardownBudgets::new(
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        ),
+        store.store(),
+    );
+
+    let mut waiters = Vec::with_capacity(REQUESTS as usize);
+    for index in 1..=REQUESTS {
+        let ticket = indexed_ticket(index);
+        admission.allow(&ticket);
+        effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+        waiters.push(coordinator.request(ticket).expect("accepted cleanup"));
+    }
+    let reports = runtime().block_on(async {
+        let mut reports = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            reports.push(
+                tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+                    .await
+                    .expect("stuck persistence must remain bounded"),
+            );
+        }
+        reports
+    });
+    store.release();
+
+    assert_eq!(reports.len(), REQUESTS as usize);
+    assert!(reports
+        .iter()
+        .all(|report| report.outcome() == TeardownOutcome::CleanupFailed));
+    assert!(
+        store.max_active() <= 4,
+        "completion persistence may poison fixed slots but must not create one worker per request"
+    );
+}
+
+#[test]
+fn teardown_completion_store_retention_is_bounded() {
+    const REQUESTS: u16 = 300;
+    let admission = FakeAdmission::default();
+    let effects = FakeEffects::default();
+    let store = FakeCompletionStore::default();
+    let coordinator = TeardownCoordinator::with_configuration(
+        Arc::new(admission.clone()),
+        Arc::new(effects.clone()),
+        Arc::new(FakeClock::default()),
+        4,
+        TeardownBudgets::default(),
+        store.store(),
+    );
+    let runtime = runtime();
+
+    for index in 1..=REQUESTS {
+        let ticket = indexed_ticket(index);
+        admission.allow(&ticket);
+        effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+        let _ = runtime.block_on(
+            coordinator
+                .request(ticket)
+                .expect("bounded store retention request")
+                .wait(),
+        );
+    }
+
+    assert!(
+        store.inner.retained_count_for_test() <= 256,
+        "completion store must retain a bounded exact-retry journal"
     );
 }
 

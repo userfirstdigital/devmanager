@@ -1,15 +1,19 @@
 //! Windows Job Object ownership for managed process trees.
 
 #[cfg(windows)]
+use std::collections::VecDeque;
+#[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(windows)]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(windows)]
 use std::thread::JoinHandle;
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
@@ -120,6 +124,14 @@ const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
 const SHUTDOWN_MESSAGE: u32 = u32::MAX;
 #[cfg(windows)]
 const SHUTDOWN_COMPLETION_KEY: usize = 0;
+#[cfg(windows)]
+const COMPLETION_LISTENER_POLL_MILLIS: u32 = 25;
+#[cfg(windows)]
+const COMPLETION_LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const ERROR_TIMEOUT: i32 = 258;
+#[cfg(windows)]
+const MAX_JOB_LEAK_EVIDENCE: usize = 256;
 #[cfg(windows)]
 static NEXT_COMPLETION_KEY: AtomicUsize = AtomicUsize::new(1);
 
@@ -249,7 +261,46 @@ pub struct ManagedProcessJob {
     completion_fence: Option<ManagedProcessFence>,
     completion_mailbox: Arc<Mutex<CompletionMailbox>>,
     completion_listener: Option<JoinHandle<()>>,
+    completion_stop: Arc<AtomicBool>,
+    listener_shutdown_failure: Option<String>,
 }
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedProcessJobLeakEvidence {
+    reason: String,
+    fence: Option<ManagedProcessFence>,
+}
+
+#[cfg(windows)]
+impl ManagedProcessJobLeakEvidence {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn fence(&self) -> Option<&ManagedProcessFence> {
+        self.fence.as_ref()
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+struct QuarantinedManagedProcessJob {
+    handle: Option<OwnedHandle>,
+    completion_port: Option<OwnedHandle>,
+    completion_key: usize,
+    completion_fence: Option<ManagedProcessFence>,
+    completion_mailbox: Arc<Mutex<CompletionMailbox>>,
+    completion_listener: Option<JoinHandle<()>>,
+    completion_stop: Arc<AtomicBool>,
+    evidence: ManagedProcessJobLeakEvidence,
+}
+
+#[cfg(windows)]
+static QUARANTINED_JOBS: OnceLock<Mutex<Vec<QuarantinedManagedProcessJob>>> = OnceLock::new();
+#[cfg(windows)]
+static JOB_LEAK_EVIDENCE: OnceLock<Mutex<VecDeque<ManagedProcessJobLeakEvidence>>> =
+    OnceLock::new();
 
 /// Non-Windows marker type returned only behind `Option::None`.
 #[cfg(not(windows))]
@@ -338,6 +389,24 @@ impl ManagedProcessJob {
         }
     }
 
+    /// Stops the completion listener within the release boundary while
+    /// retaining the Job and completion-port handles for the caller.
+    ///
+    /// The final handle close remains the `Drop` path after the registry has
+    /// removed the exact stopped entry. A failed listener stop leaves this
+    /// value intact so the caller can report residue and retry safely.
+    pub fn shutdown_for_release(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.shutdown_listener_until(Instant::now() + COMPLETION_LISTENER_SHUTDOWN_TIMEOUT)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+
     pub fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
         #[cfg(windows)]
         {
@@ -388,6 +457,7 @@ impl ManagedProcessJob {
             .as_raw_handle() as usize;
         let completion_key = self.completion_key;
         let mailbox = Arc::clone(&self.completion_mailbox);
+        let completion_stop = Arc::clone(&self.completion_stop);
         let listener_fence = fence.clone();
         let receiver = CompletionReceiverToken::issue();
         let listener = std::thread::Builder::new()
@@ -397,31 +467,158 @@ impl ManagedProcessJob {
                 fence.resource().runtime_generation
             ))
             .spawn(move || {
-                completion_listener(port, completion_key, listener_fence, mailbox, receiver)
+                completion_listener(
+                    port,
+                    completion_key,
+                    listener_fence,
+                    mailbox,
+                    completion_stop,
+                    receiver,
+                )
             })
             .map_err(|error| format!("could not spawn Job completion listener: {error}"))?;
         self.completion_fence = Some(fence);
         self.completion_listener = Some(listener);
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn shutdown_listener_until(&mut self, deadline: Instant) -> Result<(), String> {
+        if let Some(detail) = self.listener_shutdown_failure.as_ref() {
+            return Err(detail.clone());
+        }
+        let Some(listener) = self.completion_listener.take() else {
+            return Ok(());
+        };
+
+        self.completion_stop.store(true, Ordering::SeqCst);
+        let Some(port) = self.completion_port.as_ref() else {
+            self.completion_listener = Some(listener);
+            return Err(
+                "managed Job completion port is unavailable while stopping listener".to_string(),
+            );
+        };
+        let posted = unsafe {
+            PostQueuedCompletionStatus(
+                port.as_raw_handle(),
+                SHUTDOWN_MESSAGE,
+                SHUTDOWN_COMPLETION_KEY,
+                std::ptr::null_mut(),
+            ) != 0
+        };
+        if !posted {
+            let detail = format!(
+                "managed Job completion listener shutdown post failed: {}",
+                std::io::Error::last_os_error()
+            );
+            self.completion_listener = Some(listener);
+            return Err(detail);
+        }
+
+        while !listener.is_finished() {
+            let now = Instant::now();
+            if now >= deadline {
+                self.completion_listener = Some(listener);
+                return Err(format!(
+                    "managed Job completion listener did not stop before deadline; handles retained"
+                ));
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+        }
+
+        match listener.join() {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let detail = format!(
+                    "managed Job completion listener panicked during shutdown; handles retained"
+                );
+                self.listener_shutdown_failure = Some(detail.clone());
+                Err(detail)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn quarantine(&mut self, reason: String) {
+        reap_quarantined_managed_process_jobs();
+        let evidence = ManagedProcessJobLeakEvidence {
+            reason,
+            fence: self.completion_fence.clone(),
+        };
+        let mut evidence_history = JOB_LEAK_EVIDENCE
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .expect("managed Job leak evidence mutex poisoned");
+        if evidence_history.len() >= MAX_JOB_LEAK_EVIDENCE {
+            evidence_history.pop_front();
+        }
+        evidence_history.push_back(evidence.clone());
+        drop(evidence_history);
+        QUARANTINED_JOBS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("managed Job quarantine mutex poisoned")
+            .push(QuarantinedManagedProcessJob {
+                handle: self.handle.take(),
+                completion_port: self.completion_port.take(),
+                completion_key: self.completion_key,
+                completion_fence: self.completion_fence.take(),
+                completion_mailbox: Arc::clone(&self.completion_mailbox),
+                completion_listener: self.completion_listener.take(),
+                completion_stop: Arc::clone(&self.completion_stop),
+                evidence,
+            });
+    }
+}
+
+#[cfg(windows)]
+fn reap_quarantined_managed_process_jobs() {
+    let Some(quarantined) = QUARANTINED_JOBS.get() else {
+        return;
+    };
+    let mut quarantined = quarantined
+        .lock()
+        .expect("managed Job quarantine mutex poisoned");
+    let mut retained = Vec::with_capacity(quarantined.len());
+    for mut job in quarantined.drain(..) {
+        let listener_finished = job
+            .completion_listener
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(true);
+        if listener_finished {
+            if let Some(listener) = job.completion_listener.take() {
+                let _ = listener.join();
+            }
+        } else {
+            retained.push(job);
+        }
+    }
+    *quarantined = retained;
+}
+
+#[cfg(windows)]
+pub fn quarantined_managed_process_job_evidence() -> Vec<ManagedProcessJobLeakEvidence> {
+    reap_quarantined_managed_process_jobs();
+    JOB_LEAK_EVIDENCE
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .expect("managed Job leak evidence mutex poisoned")
+        .iter()
+        .cloned()
+        .collect()
 }
 
 #[cfg(windows)]
 impl Drop for ManagedProcessJob {
     fn drop(&mut self) {
-        if let Some(listener) = self.completion_listener.take() {
-            let posted = self.completion_port.as_ref().is_some_and(|port| unsafe {
-                PostQueuedCompletionStatus(
-                    port.as_raw_handle(),
-                    SHUTDOWN_MESSAGE,
-                    SHUTDOWN_COMPLETION_KEY,
-                    std::ptr::null_mut(),
-                ) != 0
-            });
-            if !posted {
-                drop(self.completion_port.take());
+        if self.completion_listener.is_some() || self.listener_shutdown_failure.is_some() {
+            if let Err(reason) =
+                self.shutdown_listener_until(Instant::now() + COMPLETION_LISTENER_SHUTDOWN_TIMEOUT)
+            {
+                self.quarantine(reason);
+                return;
             }
-            let _ = listener.join();
         }
         drop(self.completion_port.take());
         drop(self.handle.take());
@@ -613,6 +810,8 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
             completion_fence: None,
             completion_mailbox: Arc::new(Mutex::new(CompletionMailbox::default())),
             completion_listener: None,
+            completion_stop: Arc::new(AtomicBool::new(false)),
+            listener_shutdown_failure: None,
         })
     }
 }
@@ -660,6 +859,7 @@ fn completion_listener(
     expected_completion_key: usize,
     fence: ManagedProcessFence,
     mailbox: Arc<Mutex<CompletionMailbox>>,
+    stop: Arc<AtomicBool>,
     receiver: CompletionReceiverToken,
 ) {
     let completion_port = completion_port_value as *mut c_void;
@@ -673,7 +873,7 @@ fn completion_listener(
                 &mut message_id,
                 &mut completion_key,
                 &mut process_value,
-                u32::MAX,
+                COMPLETION_LISTENER_POLL_MILLIS,
             )
         };
         if completion_key == SHUTDOWN_COMPLETION_KEY
@@ -683,6 +883,12 @@ fn completion_listener(
             break;
         }
         if ok == 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_TIMEOUT) {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
             let detail = std::io::Error::last_os_error().to_string();
             mailbox
                 .lock()
@@ -861,6 +1067,10 @@ mod tests {
     use crate::domain::operation::ResourceFence;
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
     use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, ManagedProcessFence};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn authority() -> ManagedProcessFence {
         let resource_id = ResourceId::from_bytes([
@@ -883,6 +1093,112 @@ mod tests {
     fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
         let receiver = super::CompletionReceiverToken::issue();
         JobCompletionMessage::from_completion_receiver(&receiver, authority.clone(), event)
+    }
+
+    #[test]
+    fn completion_listener_ignores_mismatched_completion_keys() {
+        let raw_port = unsafe {
+            super::CreateIoCompletionPort(
+                (-1isize) as *mut super::c_void,
+                std::ptr::null_mut(),
+                0,
+                1,
+            )
+        };
+        assert!(!raw_port.is_null(), "create completion port");
+        let port = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_port) };
+        let port_value = port.as_raw_handle() as usize;
+        let expected_key = 0x71usize;
+        let mailbox = Arc::new(Mutex::new(super::CompletionMailbox::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = std::thread::spawn({
+            let mailbox = Arc::clone(&mailbox);
+            let stop = Arc::clone(&stop);
+            let fence = authority();
+            move || {
+                super::completion_listener(
+                    port_value,
+                    expected_key,
+                    fence,
+                    mailbox,
+                    stop,
+                    super::CompletionReceiverToken::issue(),
+                )
+            }
+        });
+
+        let wrong_key_posted = unsafe {
+            super::PostQueuedCompletionStatus(
+                port_value as *mut super::c_void,
+                super::JOB_OBJECT_MSG_NEW_PROCESS,
+                expected_key + 1,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(wrong_key_posted, 0, "post mismatched completion packet");
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(
+            !listener.is_finished(),
+            "a mismatched packet must not terminate the receiver"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let shutdown_posted = unsafe {
+            super::PostQueuedCompletionStatus(
+                port_value as *mut super::c_void,
+                super::SHUTDOWN_MESSAGE,
+                super::SHUTDOWN_COMPLETION_KEY,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(shutdown_posted, 0, "post listener shutdown packet");
+        listener.join().expect("completion listener join");
+        assert!(mailbox
+            .lock()
+            .expect("completion mailbox")
+            .drain()
+            .is_empty());
+        drop(port);
+    }
+
+    #[test]
+    fn managed_job_drop_quarantines_a_stuck_listener_within_deadline() {
+        let Some(mut job) = super::ManagedProcessJob::create()
+            .expect("create managed Job for listener shutdown test")
+        else {
+            return;
+        };
+        job.completion_listener = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(750));
+        }));
+
+        let shutdown_started = Instant::now();
+        let error = job
+            .shutdown_for_release()
+            .expect_err("stuck listener must report a bounded shutdown failure");
+        assert!(error.contains("did not stop before deadline"));
+        assert!(shutdown_started.elapsed() < Duration::from_millis(500));
+        assert!(job.handle.is_some(), "failed shutdown retains Job handle");
+        assert!(
+            job.completion_port.is_some(),
+            "failed shutdown retains completion port"
+        );
+        assert!(
+            job.completion_listener.is_some(),
+            "failed shutdown retains listener handle"
+        );
+
+        let evidence_before = super::quarantined_managed_process_job_evidence().len();
+        let drop_started = Instant::now();
+        drop(job);
+        assert!(drop_started.elapsed() < Duration::from_millis(500));
+        let evidence = super::quarantined_managed_process_job_evidence();
+        assert!(evidence.len() > evidence_before);
+        assert!(evidence
+            .last()
+            .expect("stuck listener evidence")
+            .reason()
+            .contains("did not stop before deadline"));
     }
 
     #[test]
