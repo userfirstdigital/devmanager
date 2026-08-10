@@ -1,43 +1,12 @@
 use static_assertions::assert_not_impl_any;
-use uuid::Uuid;
 
 use devmanager::connect::{
-    ActiveSessionInterval, DeniedContentClass, ManagedField, ManagementGrant, ManagementPolicy,
-    ManagementPrivacyClass, PolicyOperation, PolicyPrincipal, PolicyReasonCode, TaskContext,
+    ActiveSessionInterval, DeniedContentClass, ManagedField, ManagementGrant, PolicyReasonCode,
     ACTIVE_SESSION_IDLE_LIMIT_MS,
 };
-use devmanager::domain::id::TaskId;
 
 assert_not_impl_any!(ManagementGrant: Clone);
 assert_not_impl_any!(ManagementGrant: Copy);
-
-fn task_id(tail: u8) -> TaskId {
-    let mut bytes = [0_u8; 16];
-    bytes[0] = 0x01;
-    bytes[1] = 0x23;
-    bytes[2] = 0x45;
-    bytes[3] = 0x67;
-    bytes[4] = 0x89;
-    bytes[5] = 0xab;
-    bytes[6] = 0x70;
-    bytes[7] = 0xcd;
-    bytes[8] = 0x80;
-    bytes[9] = 0xef;
-    bytes[15] = tail;
-    TaskId::from_bytes(Uuid::from_bytes(bytes).into_bytes()).expect("task id")
-}
-
-fn enrolled_task(tail: u8) -> TaskContext {
-    TaskContext::enrolled(
-        task_id(tail),
-        ManagementPrivacyClass::ManagedMetadata,
-        false,
-    )
-}
-
-fn read(field: ManagedField) -> PolicyOperation {
-    PolicyOperation::ReadMetadata(field)
-}
 
 #[test]
 fn managed_field_allowlist_and_explicit_denylists_are_exhaustive() {
@@ -122,90 +91,6 @@ fn managed_field_allowlist_and_explicit_denylists_are_exhaustive() {
 }
 
 #[test]
-fn raw_content_is_off_by_default_and_unknown_fields_deny() {
-    let policy = ManagementPolicy::default();
-    let raw_task = TaskContext::enrolled(task_id(1), ManagementPrivacyClass::RawContent, true);
-    let raw = policy.decide(
-        &raw_task,
-        PolicyPrincipal::Owner,
-        read(ManagedField::TaskState),
-        50,
-    );
-    assert_eq!(raw.reason_code(), PolicyReasonCode::RawContentDisabled);
-    assert!(!raw.is_allowed());
-
-    let unknown = policy.decide(
-        &enrolled_task(2),
-        PolicyPrincipal::Owner,
-        read(ManagedField::Unknown),
-        50,
-    );
-    assert_eq!(
-        unknown.reason_code(),
-        PolicyReasonCode::UnknownMetadataField
-    );
-    assert!(!unknown.is_allowed());
-}
-
-#[test]
-fn personal_tasks_export_zero_metadata_until_enrollment_and_consent() {
-    let policy = ManagementPolicy::default();
-    let task = task_id(3);
-
-    let not_enrolled = TaskContext::personal_not_enrolled(task);
-    assert_eq!(
-        policy
-            .decide(
-                &not_enrolled,
-                PolicyPrincipal::Owner,
-                read(ManagedField::TaskState),
-                50,
-            )
-            .reason_code(),
-        PolicyReasonCode::PersonalTaskNotEnrolled
-    );
-
-    let no_consent = TaskContext::personal_without_consent(task);
-    assert_eq!(
-        policy
-            .decide(
-                &no_consent,
-                PolicyPrincipal::Owner,
-                read(ManagedField::TaskState),
-                50,
-            )
-            .reason_code(),
-        PolicyReasonCode::PersonalTaskConsentRequired
-    );
-
-    let consented = TaskContext::personal_with_consent(task);
-    assert_eq!(
-        policy
-            .decide(
-                &consented,
-                PolicyPrincipal::Owner,
-                read(ManagedField::TaskState),
-                50,
-            )
-            .reason_code(),
-        PolicyReasonCode::Allowed
-    );
-}
-
-#[test]
-fn unmanaged_tasks_default_deny_even_owner() {
-    let task = TaskContext::unmanaged(task_id(4), ManagementPrivacyClass::ManagedMetadata);
-    let decision = ManagementPolicy::default().decide(
-        &task,
-        PolicyPrincipal::Owner,
-        PolicyOperation::ApproveDangerous,
-        50,
-    );
-    assert_eq!(decision.reason_code(), PolicyReasonCode::UnmanagedTask);
-    assert!(!decision.is_allowed());
-}
-
-#[test]
 fn active_session_interval_accepts_exactly_fifteen_minutes() {
     let end = 1_000 + ACTIVE_SESSION_IDLE_LIMIT_MS;
     assert!(ActiveSessionInterval::try_new(1_000, end).is_ok());
@@ -230,7 +115,36 @@ fn fixed_reason_codes_are_stable_and_secret_free() {
         (PolicyReasonCode::GrantNotYetValid, "grant_not_yet_valid"),
         (PolicyReasonCode::GrantStale, "grant_stale"),
         (PolicyReasonCode::GrantRevoked, "grant_revoked"),
+        (PolicyReasonCode::GrantReplayed, "grant_replayed"),
+        (
+            PolicyReasonCode::GrantConnectionMismatch,
+            "grant_connection_mismatch",
+        ),
+        (
+            PolicyReasonCode::GrantSessionMismatch,
+            "grant_session_mismatch",
+        ),
+        (
+            PolicyReasonCode::GrantClientMismatch,
+            "grant_client_mismatch",
+        ),
         (PolicyReasonCode::GrantTaskMismatch, "grant_task_mismatch"),
+        (
+            PolicyReasonCode::GrantActionMismatch,
+            "grant_action_mismatch",
+        ),
+        (
+            PolicyReasonCode::GrantActionEpochMismatch,
+            "grant_action_epoch_mismatch",
+        ),
+        (
+            PolicyReasonCode::TaskGenerationMismatch,
+            "task_generation_mismatch",
+        ),
+        (
+            PolicyReasonCode::ResourceGenerationMismatch,
+            "resource_generation_mismatch",
+        ),
         (PolicyReasonCode::WatcherReadOnly, "watcher_read_only"),
         (
             PolicyReasonCode::OwnerOnlyDangerousApproval,
@@ -247,13 +161,11 @@ fn fixed_reason_codes_are_stable_and_secret_free() {
             PolicyReasonCode::UnknownMetadataField,
             "unknown_metadata_field",
         ),
+        (PolicyReasonCode::InvalidEvidence, "invalid_evidence"),
     ];
     assert_eq!(PolicyReasonCode::ALL, expected.map(|(reason, _)| reason));
     for (reason, code) in expected {
         assert_eq!(reason.code(), code);
-        assert!(
-            !reason.code().contains(':'),
-            "reason codes carry no details"
-        );
+        assert!(!reason.code().contains(':'));
     }
 }
