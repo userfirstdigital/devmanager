@@ -19,7 +19,7 @@ use crate::models::{
 use crate::notifications;
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
-use crate::services::ports_service::PortInventory;
+use crate::services::ports_service::{PortInventory, PortStartReservation};
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
 };
@@ -780,29 +780,6 @@ impl ProcessManager {
             .map(|_| ())
     }
 
-    fn enqueue_kill_port_op(
-        &self,
-        command_id: &str,
-        port: u16,
-        launch: ServerLaunchSpec,
-        dimensions: SessionDimensions,
-        banner: &str,
-        response: Option<Sender<RemoteActionResult>>,
-    ) -> Result<(), String> {
-        let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::KillPortAndRestart {
-                op_id,
-                command_id: command_id.to_string(),
-                port,
-                launch,
-                dimensions,
-                banner: banner.to_string(),
-                response,
-            })
-            .map(|_| ())
-    }
-
     fn schedule_stop_all_servers(
         &self,
         wait: Duration,
@@ -893,49 +870,10 @@ impl ProcessManager {
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
         self.validate_server_launch(app_state, command_id)?;
-        let lookup = app_state
-            .find_command(command_id)
-            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
-        let project_id = lookup.project.id.clone();
-        let command_id_owned = lookup.command.id.clone();
-        let command_label = lookup.command.label.clone();
-        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
-        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
-        let cwd = if cwd.is_dir() {
-            cwd
-        } else {
-            PathBuf::from(lookup.project.root_path.clone())
-        };
-        let env = build_command_env(lookup.folder, lookup.command);
-        let (program, args) =
-            build_server_launch_command(&app_state.config.settings, lookup.command);
-        let launch_spec = ServerLaunchSpec {
-            command_id: command_id_owned.clone(),
-            project_id: project_id.clone(),
-            port: lookup.command.port,
-            cwd,
-            program,
-            args,
-            env,
-            auto_restart: command_auto_restart,
-            log_file_path: build_server_log_file_path(
-                lookup.project,
-                lookup.folder,
-                lookup.command,
-            ),
-        };
-        app_state.open_server_tab(&project_id, &command_id_owned, Some(command_label));
-        self.update_session_state(&command_id_owned, |state| {
-            state.status = SessionStatus::Starting;
-            state.mark_dirty();
-        });
-        self.enqueue_kill_port_op(
-            &command_id_owned,
-            port,
-            launch_spec,
-            dimensions,
-            banner,
-            response,
+        let _ = (app_state, command_id, port, dimensions, banner, response);
+        Err(
+            "Port control is unavailable until an exact managed resource fence is supplied"
+                .to_string(),
         )
     }
 
@@ -5971,7 +5909,7 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result = run_server_launch_with_port_admission(inner, &launch, || {
+            let result = run_server_launch_with_port_admission(inner, &manager, &launch, || {
                 #[cfg(test)]
                 {
                     let spawner = inner
@@ -6060,7 +5998,7 @@ pub(crate) fn execute_process_op_inner(
                     ));
                 }
                 manager.set_active_session(command_id.clone());
-                run_server_launch_with_port_admission(inner, &launch, || {
+                run_server_launch_with_port_admission(inner, &manager, &launch, || {
                     if let Ok(session) = manager.get_session(&command_id) {
                         if clear_logs {
                             session.clear_virtual_output();
@@ -6116,34 +6054,10 @@ pub(crate) fn execute_process_op_inner(
             response,
             ..
         } => {
-            let result = (|| {
-                let is_active = inner
-                    .runtime_state
-                    .read()
-                    .ok()
-                    .and_then(|runtime| {
-                        runtime
-                            .sessions
-                            .get(&command_id)
-                            .map(|session| session.status.is_live())
-                    })
-                    .unwrap_or(false);
-                if is_active && !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
-                    return Err(format!(
-                        "Managed process `{command_id}` did not stop cleanly."
-                    ));
-                }
-                crate::services::ports_service::kill_port(port)?;
-                run_server_launch_with_port_admission(inner, &launch, || {
-                    spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                    let _ = manager
-                        .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
-                    manager.update_session_state(&command_id, |state| {
-                        state.configure_server(launch.clone());
-                    });
-                    Ok(())
-                })
-            })();
+            let _ = (&launch, dimensions, &banner);
+            let result = Err(format!(
+                "Port control is unavailable until an exact managed resource fence is supplied; no listener was terminated"
+            ));
             (
                 ProcessOpKind::KillPortAndRestart,
                 result,
@@ -6424,6 +6338,7 @@ pub(crate) fn execute_process_op_inner(
 /// operation has returned success or failure.
 fn run_server_launch_with_port_admission<T>(
     inner: &Arc<ProcessManagerInner>,
+    manager: &ProcessManager,
     launch: &ServerLaunchSpec,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
@@ -6453,7 +6368,161 @@ fn run_server_launch_with_port_admission<T>(
     )
     .map_err(|error| error.to_string())?;
 
-    launch_result
+    let value = launch_result?;
+    settle_server_port_start(inner, manager, launch, reservation)?;
+    Ok(value)
+}
+
+const PORT_BIND_SETTLEMENT_TIMEOUT: Duration = Duration::from_millis(250);
+const PORT_BIND_SETTLEMENT_POLL: Duration = Duration::from_millis(25);
+
+/// A logical reservation cannot make an arbitrary child bind atomic. Keep the
+/// reservation through the real spawn and a bounded post-launch reconciliation.
+/// A proven foreign listener is reported as EADDRINUSE-like failure; no
+/// unverified or foreign PID is ever terminated.
+fn settle_server_port_start(
+    inner: &Arc<ProcessManagerInner>,
+    manager: &ProcessManager,
+    launch: &ServerLaunchSpec,
+    reservation: PortStartReservation,
+) -> Result<(), String> {
+    let Some(port) = launch.port else {
+        drop(reservation);
+        return Ok(());
+    };
+    let deadline = Instant::now()
+        .checked_add(PORT_BIND_SETTLEMENT_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        let snapshot = match inner.port_inventory.refresh(&[port]) {
+            Ok(snapshot) => snapshot,
+            Err(_error) if Instant::now() < deadline => {
+                thread::sleep(PORT_BIND_SETTLEMENT_POLL);
+                continue;
+            }
+            Err(_) => {
+                drop(reservation);
+                return Ok(());
+            }
+        };
+        let listeners = snapshot
+            .observation(port)
+            .map(|observation| observation.listeners())
+            .unwrap_or(&[]);
+        match classify_post_launch_listener_settlement(listeners, |listener| {
+            listener_matches_session(inner, &launch.command_id, listener)
+        }) {
+            PostLaunchListenerSettlement::Owned => {
+                drop(reservation);
+                return Ok(());
+            }
+            PostLaunchListenerSettlement::Foreign => {
+                // Stop only the exact launched session. The foreign listener
+                // itself is never selected by this operation.
+                let _ = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(format!(
+                    "port {port} became occupied by a foreign listener during start (EADDRINUSE); no foreign process was terminated"
+                ));
+            }
+            PostLaunchListenerSettlement::Unverified => {
+                // The listener identity is insufficient to decide whether
+                // the process owns the port. Reap only the exact launch
+                // session so an unrelated listener is never touched.
+                let _ = manager.stop_server_and_wait(&launch.command_id, Duration::from_secs(2));
+                drop(reservation);
+                return Err(format!(
+                    "port {port} listener ownership could not be proven after start; only the exact launch session was stopped"
+                ));
+            }
+            PostLaunchListenerSettlement::Pending => {}
+        }
+        if Instant::now() >= deadline {
+            // A stock command may spawn successfully and bind later. The
+            // bounded settlement ends the reservation without manufacturing a
+            // green ownership claim; the next inventory publication remains
+            // authoritative and fail-closed until a listener is observed.
+            drop(reservation);
+            return Ok(());
+        }
+        thread::sleep(PORT_BIND_SETTLEMENT_POLL);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostLaunchListenerSettlement {
+    /// No listener is visible yet; keep polling while the reservation remains
+    /// owned by the start operation.
+    Pending,
+    /// Every observed listener was proven to belong to the exact launched
+    /// session generation.
+    Owned,
+    /// At least one listener has complete identity evidence and is not owned
+    /// by the exact launched session. The caller may report EADDRINUSE, but it
+    /// must never terminate that foreign process.
+    Foreign,
+    /// A listener exists but its ownership cannot be proven. Fail closed and
+    /// stop only the exact launch session; no unrelated process is selected.
+    Unverified,
+}
+
+fn classify_post_launch_listener_settlement<F>(
+    listeners: &[crate::process::ports::ListenerIdentity],
+    mut owns: F,
+) -> PostLaunchListenerSettlement
+where
+    F: FnMut(&crate::process::ports::ListenerIdentity) -> bool,
+{
+    if listeners.is_empty() {
+        return PostLaunchListenerSettlement::Pending;
+    }
+    let ownership = listeners
+        .iter()
+        .map(|listener| (listener.has_executable_proof(), owns(listener)))
+        .collect::<Vec<_>>();
+    if ownership.iter().all(|(_, owned)| *owned) {
+        return PostLaunchListenerSettlement::Owned;
+    }
+    if ownership
+        .iter()
+        .any(|(executable_proven, owned)| *executable_proven && !*owned)
+    {
+        return PostLaunchListenerSettlement::Foreign;
+    }
+    PostLaunchListenerSettlement::Unverified
+}
+
+fn listener_matches_session(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    listener: &crate::process::ports::ListenerIdentity,
+) -> bool {
+    if !listener.has_executable_proof() {
+        return false;
+    }
+    let Some(creation_time_100ns) =
+        platform_service::capture_process_creation_time_100ns(listener.pid())
+    else {
+        return false;
+    };
+    let Some(executable) = platform_service::capture_process_executable(listener.pid()) else {
+        return false;
+    };
+    let Ok(executable) = std::fs::canonicalize(executable) else {
+        return false;
+    };
+    let Some(listener_executable) = listener.canonical_executable() else {
+        return false;
+    };
+    if creation_time_100ns != listener.creation_time_100ns() || executable != listener_executable {
+        return false;
+    }
+    let tracked = session_managed_process_ids(inner, session_id);
+    if tracked.contains(&listener.pid()) {
+        return true;
+    }
+    live_runtime_root_pid(inner, session_id) == Some(listener.pid())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6880,6 +6949,38 @@ mod tests {
         let (program, _) = windows_shell_for(&crate::models::DefaultTerminal::Pwsh, false, None);
         assert_eq!(program, "powershell.exe");
     }
+
+    #[test]
+    fn post_launch_settlement_keeps_unverified_listener_fail_closed() {
+        let listener = crate::process::ports::ListenerIdentity::new(41_001, 41_001).unwrap();
+
+        assert_eq!(
+            classify_post_launch_listener_settlement(&[], |_| false),
+            PostLaunchListenerSettlement::Pending
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| false),
+            PostLaunchListenerSettlement::Unverified
+        );
+    }
+
+    #[test]
+    fn post_launch_settlement_reports_proven_foreign_race_without_authorizing_kill() {
+        let executable = std::env::current_exe().expect("test executable");
+        let listener =
+            crate::process::ports::ListenerIdentity::with_executable(41_002, 41_002, executable)
+                .expect("listener identity");
+
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| false),
+            PostLaunchListenerSettlement::Foreign
+        );
+        assert_eq!(
+            classify_post_launch_listener_settlement(std::slice::from_ref(&listener), |_| true),
+            PostLaunchListenerSettlement::Owned
+        );
+    }
+
     use crate::services::pid_file;
     use std::fs;
     use std::sync::Condvar;

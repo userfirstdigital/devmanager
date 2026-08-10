@@ -363,10 +363,9 @@ impl fmt::Display for ListenerIdentityError {
             Self::ZeroCreationTime => {
                 write!(formatter, "listener creation time must be non-zero")
             }
-            Self::ExecutableCanonicalization { path, source } => write!(
+            Self::ExecutableCanonicalization { source, .. } => write!(
                 formatter,
-                "could not canonicalize listener executable `{}`: {source}",
-                path.display()
+                "could not canonicalize listener executable: {source}"
             ),
         }
     }
@@ -909,6 +908,21 @@ impl ManagedResourceSnapshot {
         self.membership.is_fresh_at(now) && self.structure_is_valid()
     }
 
+    /// Compare the identity-bearing registry observation that accompanied a
+    /// listener scan with a second authoritative registry read. The wall
+    /// clock may advance between reads, so freshness timestamps are checked
+    /// separately; the fence, lifecycle, member identities, and registry
+    /// observation sequence must remain the same before ownership or
+    /// externality can be projected.
+    pub fn same_authoritative_membership(&self, other: &Self) -> bool {
+        self.fence == other.fence
+            && self.state == other.state
+            && self.members == other.members
+            && self.membership.membership_revision() == other.membership.membership_revision()
+            && self.membership.observation_sequence() == other.membership.observation_sequence()
+            && self.membership.validity() == other.membership.validity()
+    }
+
     fn structure_is_valid(&self) -> bool {
         self.members
             .iter()
@@ -1008,8 +1022,11 @@ fn classify_listener_authority(
         return PortAuthority::Unknown;
     }
     let Some(managed) = managed else {
-        return if listeners.is_empty() {
-            PortAuthority::Free
+        if listeners.is_empty() {
+            return PortAuthority::Free;
+        }
+        return if listeners.iter().all(ListenerIdentity::has_executable_proof) {
+            PortAuthority::ProvenExternal
         } else {
             PortAuthority::Unknown
         };
@@ -1156,6 +1173,29 @@ pub fn classify_port_authority_from_snapshot_at(
         endpoint_listeners
     };
     classify_listener_authority(&listeners, managed, now, deadline)
+}
+
+/// Classify only after two registry observations agree on the exact managed
+/// generation and membership. A listener table can be internally reconciled
+/// while the registry membership changes immediately afterwards; that
+/// cross-source race is not safe to paint external or managed.
+pub fn classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+    target: &PortTarget,
+    snapshot: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    reconciled_managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
+) -> PortAuthority {
+    let membership_agrees = match (managed, reconciled_managed) {
+        (None, None) => true,
+        (Some(first), Some(second)) => first.same_authoritative_membership(second),
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    if !membership_agrees {
+        return PortAuthority::Unknown;
+    }
+    classify_port_authority_from_snapshot_at(target, snapshot, managed, now, deadline)
 }
 
 fn status_for_authority(
@@ -1386,6 +1426,40 @@ pub fn project_port_status_from_snapshot_at(
         authority,
         managed,
     )
+}
+
+/// Projection boundary for callers that can obtain a second authoritative
+/// registry membership snapshot after listener enumeration. If no matching
+/// second observation exists, fail closed with the listener evidence retained
+/// for diagnostics but without a green/blue authority claim.
+pub fn project_port_status_from_snapshot_with_membership_reconciliation_at(
+    target: &PortTarget,
+    snapshot: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    reconciled_managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
+) -> PortStatus {
+    let membership_agrees = match (managed, reconciled_managed) {
+        (None, None) => true,
+        (Some(first), Some(second)) => first.same_authoritative_membership(second),
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    if !membership_agrees {
+        let listeners = snapshot
+            .observation(target.port)
+            .map_or_else(Vec::new, |observation| observation.listeners().to_vec());
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::Unknown,
+            listeners: Arc::from(listeners.into_boxed_slice()),
+            error: Some(bounded_sanitized_detail(
+                "managed membership changed during port authority reconciliation",
+            )),
+        };
+    }
+    project_port_status_from_snapshot_at(target, snapshot, managed, now, deadline)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

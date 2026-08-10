@@ -13,6 +13,7 @@ use devmanager::process::ports::{
     classify_port_authority, classify_port_authority_from_snapshot, ensure_managed_start_allowed,
     launch_if_port_free, launch_if_port_free_with_revalidation, project_port_status,
     project_port_status_at, project_port_status_from_snapshot,
+    project_port_status_from_snapshot_with_membership_reconciliation_at,
     registered_resource_snapshot_with_membership, ListenerIdentity, ManagedPortHealth,
     ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority, PortInventorySnapshot,
     PortObservation, PortObservationIssue, PortScanError, PortStartError, PortStatusKind,
@@ -173,6 +174,34 @@ fn stale_free_snapshot_is_unknown_instead_of_stopped() {
     );
 
     assert_eq!(status.kind(), PortStatusKind::Unknown);
+}
+
+#[test]
+fn fresh_identity_proven_listener_without_managed_generation_is_external() {
+    let port = 43_097;
+    let listener = listener(11_097, 1_097);
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(port, single_listener(listener.clone()))]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        Instant::now(),
+    )
+    .with_publication_sequence(1);
+
+    let authority = classify_port_authority_from_snapshot(
+        &PortTarget::new(port, fence(107, 1), ManagedPortHealth::Ready),
+        &snapshot,
+        None,
+    );
+    assert_eq!(authority, PortAuthority::ProvenExternal);
+
+    let status = project_port_status_from_snapshot(
+        &PortTarget::new(port, fence(107, 1), ManagedPortHealth::Ready),
+        &snapshot,
+        None,
+    );
+    assert_eq!(status.kind(), PortStatusKind::ProvenExternal);
+    assert_eq!(status.listener(), Some(listener));
 }
 
 #[test]
@@ -361,12 +390,15 @@ fn listener_with_unverified_ownership_is_occupied() {
     let resource = fence(3, 1);
     let status = project_port_status(
         &target(resource),
-        &single_listener(listener(11_003, 303)),
+        &single_listener(ListenerIdentity::new(11_003, 303).expect("unverified listener identity")),
         None,
     );
 
     assert_eq!(status.kind(), PortStatusKind::Unknown);
-    assert_eq!(status.listener(), Some(listener(11_003, 303)));
+    assert_eq!(
+        status.listener(),
+        Some(ListenerIdentity::new(11_003, 303).expect("unverified listener identity"))
+    );
 }
 
 #[test]
@@ -436,6 +468,64 @@ fn valid_registry_snapshot_can_prove_a_listener_external() {
         project_port_status_from_snapshot(&target, &snapshot, Some(&managed)).kind(),
         PortStatusKind::ProvenExternal
     );
+}
+
+#[test]
+fn membership_change_after_listener_scan_cannot_paint_external_blue() {
+    let resource = fence(19, 1);
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_019, 1_919);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let first = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("first membership snapshot");
+    let second = ManagedResourceSnapshot::new(
+        first.fence().clone(),
+        first.state(),
+        first.member_identities().to_vec(),
+        RegistryMembershipSnapshot::valid(2, 2, Instant::now(), Duration::from_secs(10)),
+    );
+    let port = 43_019;
+    let snapshot = PortInventorySnapshot::with_endpoints(
+        BTreeMap::from([(port, single_listener(listener(11_020, 2_020)))]),
+        BTreeMap::from([(
+            port,
+            vec![TcpEndpoint::tcp(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                listener(11_020, 2_020),
+            )],
+        )]),
+    );
+    let target = PortTarget::new(port, resource, ManagedPortHealth::Ready);
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(1);
+
+    assert_eq!(
+        devmanager::process::ports::classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+            &target,
+            &snapshot,
+            Some(&first),
+            Some(&second),
+            now,
+            deadline,
+        ),
+        PortAuthority::Unknown
+    );
+    let status = project_port_status_from_snapshot_with_membership_reconciliation_at(
+        &target,
+        &snapshot,
+        Some(&first),
+        Some(&second),
+        now,
+        deadline,
+    );
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
+    assert_eq!(status.listener(), Some(listener(11_020, 2_020)));
 }
 
 #[test]
@@ -519,15 +609,16 @@ fn a_stale_resource_generation_cannot_claim_a_current_listener() {
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
 
-    let stale_snapshot = registered_resource_snapshot_with_membership(
+    let current_snapshot = registered_resource_snapshot_with_membership(
         &registry,
-        stale_resource,
+        current_resource,
         RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    );
+    )
+    .expect("current resource snapshot");
     let status = project_port_status(
         &target(stale_resource),
         &single_listener(listener(11_007, 707)),
-        stale_snapshot.as_ref(),
+        Some(&current_snapshot),
     );
 
     assert_eq!(status.kind(), PortStatusKind::Unknown);

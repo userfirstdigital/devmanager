@@ -194,7 +194,10 @@ fn snapshot_listener_endpoints_with_lsof(
     ports: &[u16],
 ) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
-    let output = run_bounded_command("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])?;
+    let output = run_bounded_command(
+        trusted_lsof_program(),
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
+    )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -246,6 +249,20 @@ fn snapshot_listener_endpoints_with_lsof(
     }
     Ok(listeners)
 }
+
+#[cfg(target_os = "linux")]
+const TRUSTED_LSOF_PATH: &str = "/usr/bin/lsof";
+
+#[cfg(target_os = "macos")]
+const TRUSTED_LSOF_PATH: &str = "/usr/sbin/lsof";
+
+#[cfg(not(windows))]
+fn trusted_lsof_program() -> &'static str {
+    TRUSTED_LSOF_PATH
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+const TRUSTED_LSOF_PATH: &str = "/usr/sbin/lsof";
 
 #[cfg(not(windows))]
 const MAX_LSOF_OUTPUT_BYTES: usize = 256 * 1024;
@@ -1032,6 +1049,18 @@ mod tests {
 #[cfg(all(test, not(windows)))]
 mod non_windows_tests {
     use super::parse_lsof_listener_port;
+
+    #[test]
+    fn listener_probe_uses_a_pinned_lsof_path() {
+        let path = super::trusted_lsof_program();
+        assert!(path.starts_with('/'));
+        assert_eq!(
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("lsof")
+        );
+    }
 
     #[test]
     fn parse_lsof_listener_port_handles_localhost_and_ipv6() {

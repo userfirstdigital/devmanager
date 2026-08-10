@@ -18,6 +18,7 @@ use web::input_executor::WebInputExecutor;
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
 use web::request_executor::WebRequestExecutor;
 
+use crate::domain::operation::ResourceFence;
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
 };
@@ -26,6 +27,7 @@ use crate::models::{
     Settings, TabType,
 };
 use crate::persistence::{self, PersistenceError};
+use crate::process::ports::{PortStatus as RichPortStatus, PortStatusKind as RichPortStatusKind};
 use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
@@ -64,6 +66,7 @@ const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60)
 const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
 const CODEX_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CODEX_COMPOSER_RECONCILIATIONS: usize = 1024;
+pub(crate) const REMOTE_PORT_AUTHORITY_MAX_AGE_MS: u64 = 5_000;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -178,6 +181,11 @@ pub struct RemoteWorkspaceSnapshot {
     pub runtime_state: RuntimeState,
     pub session_views: HashMap<String, TerminalSessionView>,
     pub port_statuses: HashMap<u16, PortStatus>,
+    /// Exact, generation-fenced port evidence. `port_statuses` remains only
+    /// as a compatibility projection for older clients; control and colour
+    /// decisions must use this map.
+    #[serde(default)]
+    pub port_authorities: HashMap<u16, RemotePortAuthority>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
     pub server_id: String,
@@ -189,8 +197,137 @@ pub struct RemoteWorkspaceDelta {
     pub app_state: Option<AppState>,
     pub runtime_state: Option<RuntimeState>,
     pub port_statuses: Option<HashMap<u16, PortStatus>>,
+    #[serde(default)]
+    pub port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePortAuthorityKind {
+    Managed,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+    Occupied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteListenerIdentity {
+    pub pid: u32,
+    pub creation_time_100ns: u64,
+    /// The executable path is intentionally not sent over the remote wire.
+    /// This bit records that the local host captured and canonicalized it.
+    pub executable_proven: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePortAuthority {
+    pub port: u16,
+    pub kind: RemotePortAuthorityKind,
+    pub resource: Option<ResourceFence>,
+    pub listeners: Vec<RemoteListenerIdentity>,
+    pub membership_revision: u64,
+    pub observation_sequence: u64,
+    pub publication_sequence: u64,
+    pub observed_at_epoch_ms: u64,
+    pub freshness_deadline_epoch_ms: u64,
+    pub error: Option<String>,
+}
+
+impl RemotePortAuthority {
+    pub fn kind(&self) -> RemotePortAuthorityKind {
+        self.kind
+    }
+
+    pub fn from_rich(status: &RichPortStatus, now_epoch_ms: u64) -> Self {
+        let kind = match status.kind() {
+            RichPortStatusKind::ManagedHealthy | RichPortStatusKind::ManagedUnready => {
+                RemotePortAuthorityKind::Managed
+            }
+            RichPortStatusKind::ProvenExternal => RemotePortAuthorityKind::ProvenExternal,
+            RichPortStatusKind::ProbeError => RemotePortAuthorityKind::ProbeError,
+            RichPortStatusKind::Occupied => RemotePortAuthorityKind::Occupied,
+            RichPortStatusKind::Stopped => RemotePortAuthorityKind::Free,
+            RichPortStatusKind::Starting => RemotePortAuthorityKind::Unknown,
+            RichPortStatusKind::Unknown => RemotePortAuthorityKind::Unknown,
+        };
+        let resource = (kind == RemotePortAuthorityKind::Managed).then_some(status.resource);
+        Self {
+            port: status.port,
+            kind,
+            resource,
+            listeners: status
+                .listeners()
+                .iter()
+                .map(|listener| RemoteListenerIdentity {
+                    pid: listener.pid(),
+                    creation_time_100ns: listener.creation_time_100ns(),
+                    executable_proven: listener.has_executable_proof(),
+                })
+                .collect(),
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 0,
+            observed_at_epoch_ms: now_epoch_ms,
+            freshness_deadline_epoch_ms: now_epoch_ms
+                .saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+            error: status.error().map(str::to_string),
+        }
+    }
+
+    pub fn with_snapshot_metadata(
+        mut self,
+        publication_sequence: u64,
+        membership_revision: u64,
+        observation_sequence: u64,
+    ) -> Self {
+        self.publication_sequence = publication_sequence;
+        self.membership_revision = membership_revision;
+        self.observation_sequence = observation_sequence;
+        self
+    }
+
+    pub fn is_fresh_at(&self, now_epoch_ms: u64) -> bool {
+        self.publication_sequence > 0
+            && self.observed_at_epoch_ms <= now_epoch_ms
+            && now_epoch_ms.saturating_sub(self.observed_at_epoch_ms)
+                <= REMOTE_PORT_AUTHORITY_MAX_AGE_MS
+            && self.freshness_deadline_epoch_ms >= self.observed_at_epoch_ms
+            && now_epoch_ms <= self.freshness_deadline_epoch_ms
+    }
+
+    pub fn has_exact_managed_fence_for(
+        &self,
+        requested_port: u16,
+        session: &SessionRuntimeState,
+    ) -> bool {
+        if self.kind != RemotePortAuthorityKind::Managed
+            || self.port != requested_port
+            || self.resource.is_none()
+            || self
+                .resource
+                .is_some_and(|resource| resource.runtime_generation == 0)
+            || self.membership_revision == 0
+            || self.observation_sequence == 0
+            || !self
+                .listeners
+                .iter()
+                .all(|listener| listener.executable_proven)
+        {
+            return false;
+        }
+        let Some(pid) = session.pid else {
+            return false;
+        };
+        self.listeners
+            .iter()
+            .any(|listener| listener.pid == pid && listener.creation_time_100ns != 0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1639,6 +1776,7 @@ pub(crate) struct RemoteHostInner {
     shared_state: RwLock<AppState>,
     runtime_state: RwLock<RuntimeState>,
     port_statuses: RwLock<HashMap<u16, PortStatus>>,
+    port_authorities: RwLock<HashMap<u16, RemotePortAuthority>>,
     semantic_journals: Mutex<SemanticJournalStore>,
     /// Serializes semantic writers while the generation below gives browser
     /// capture a lock-free indication that publication is in progress.
@@ -1872,6 +2010,7 @@ impl RemoteHostService {
             shared_state: RwLock::new(AppState::default()),
             runtime_state: RwLock::new(RuntimeState::default()),
             port_statuses: RwLock::new(HashMap::new()),
+            port_authorities: RwLock::new(HashMap::new()),
             semantic_journals: Mutex::new(SemanticJournalStore::default()),
             semantic_publication_lock: Mutex::new(()),
             semantic_publication_generation: AtomicU64::new(0),
@@ -2042,7 +2181,12 @@ impl RemoteHostService {
         runtime_state: RuntimeState,
         port_statuses: HashMap<u16, PortStatus>,
     ) {
-        self.update_snapshot_parts(Some(app_state), Some(runtime_state), Some(port_statuses));
+        self.update_snapshot_parts(
+            Some(app_state),
+            Some(runtime_state),
+            Some(port_statuses),
+            Some(HashMap::new()),
+        );
     }
 
     pub fn update_snapshot_parts(
@@ -2050,6 +2194,7 @@ impl RemoteHostService {
         app_state: Option<AppState>,
         runtime_state: Option<RuntimeState>,
         port_statuses: Option<HashMap<u16, PortStatus>>,
+        port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     ) {
         let semantic_inputs_changed = app_state.is_some() || runtime_state.is_some();
         let _snapshot_guard = self
@@ -2073,6 +2218,12 @@ impl RemoteHostService {
         if let Some(port_statuses) = port_statuses {
             if let Ok(mut slot) = self.inner.port_statuses.write() {
                 *slot = port_statuses;
+                changed = true;
+            }
+        }
+        if let Some(port_authorities) = port_authorities {
+            if let Ok(mut slot) = self.inner.port_authorities.write() {
+                *slot = port_authorities;
                 changed = true;
             }
         }
@@ -4430,9 +4581,16 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or_default();
+        let port_authorities = inner
+            .port_authorities
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
         let app_hash = stable_hash(&app_state);
         let runtime_hash = stable_hash(&runtime_state);
         let port_hash = stable_hash(&port_statuses);
+        let authority_hash = stable_hash(&port_authorities);
+        let combined_port_hash = port_hash ^ authority_hash;
 
         let Ok(mut clients) = inner.clients.lock() else {
             thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
@@ -4445,7 +4603,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
                 controller_client_id.as_deref() == Some(client.client_id.as_str());
             let app_changed = client.last_app_hash != app_hash;
             let runtime_changed = client.last_runtime_hash != runtime_hash;
-            let port_changed = client.last_port_hash != port_hash;
+            let port_changed = client.last_port_hash != combined_port_hash;
             let controller_changed = client.last_controller_client_id != controller_client_id
                 || client.last_you_have_control != you_have_control;
             let web_revision_changed =
@@ -4464,13 +4622,14 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
                 app_state: app_changed.then_some(app_state.clone()),
                 runtime_state: runtime_changed.then_some(runtime_state.clone()),
                 port_statuses: port_changed.then_some(port_statuses.clone()),
+                port_authorities: port_changed.then_some(port_authorities.clone()),
                 controller_client_id: controller_client_id.clone(),
                 you_have_control,
             };
 
             client.last_app_hash = app_hash;
             client.last_runtime_hash = runtime_hash;
-            client.last_port_hash = port_hash;
+            client.last_port_hash = combined_port_hash;
             client.last_controller_client_id = controller_client_id.clone();
             client.last_you_have_control = you_have_control;
             client.last_snapshot_revision = snapshot_revision;
@@ -4718,6 +4877,7 @@ fn handle_client_connection(
     let app_hash = stable_hash(&snapshot.app_state);
     let runtime_hash = stable_hash(&snapshot.runtime_state);
     let port_hash = stable_hash(&snapshot.port_statuses);
+    let authority_hash = stable_hash(&snapshot.port_authorities);
     if let Ok(mut clients) = inner.clients.lock() {
         clients.insert(
             connection_id,
@@ -4733,7 +4893,7 @@ fn handle_client_connection(
                 focused_session_id: snapshot.runtime_state.active_session_id.clone(),
                 last_app_hash: app_hash,
                 last_runtime_hash: runtime_hash,
-                last_port_hash: port_hash,
+                last_port_hash: port_hash ^ authority_hash,
                 last_controller_client_id: controller_client_id.clone(),
                 last_you_have_control: you_have_control,
                 last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
@@ -5170,8 +5330,9 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-    let port_statuses = inner
-        .port_statuses
+    let now_epoch_ms = now_epoch_ms();
+    let port_authorities = inner
+        .port_authorities
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
@@ -5185,16 +5346,33 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
                 let Some(session) = runtime_state.sessions.get(&command.id) else {
                     continue;
                 };
-                let Some(status) = port_statuses.get(&requested_port) else {
+                let Some(authority) = port_authorities.get(&requested_port) else {
                     continue;
                 };
-                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                if session.status.is_live()
+                    && remote_authority_allows_forward(
+                        authority,
+                        requested_port,
+                        session,
+                        now_epoch_ms,
+                    )
+                {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn remote_authority_allows_forward(
+    authority: &RemotePortAuthority,
+    requested_port: u16,
+    session: &SessionRuntimeState,
+    now_epoch_ms: u64,
+) -> bool {
+    authority.is_fresh_at(now_epoch_ms)
+        && authority.has_exact_managed_fence_for(requested_port, session)
 }
 
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
@@ -5554,17 +5732,6 @@ pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id:
         .ok()
         .and_then(|controller| controller.clone())
         .is_some_and(|controller| controller == client_id)
-}
-
-fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let _ = (session, status);
-    // `PortStatus` is the legacy wire shape: it carries only a PID and an
-    // optional display name. PID reuse, creation time, executable identity,
-    // resource fence, membership revision, and freshness are all absent, so
-    // it can never authorize a remote forward or control operation. An exact
-    // authority projection must be added to the remote snapshot before this
-    // predicate can return true.
-    false
 }
 
 pub(crate) fn requires_control(action: &RemoteAction) -> bool {
@@ -5968,6 +6135,11 @@ fn base_snapshot_without_session_views(
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
     let config = inner
         .config
         .read()
@@ -5984,6 +6156,7 @@ fn base_snapshot_without_session_views(
         runtime_state,
         session_views: HashMap::new(),
         port_statuses,
+        port_authorities,
         you_have_control: controller_client_id.as_deref() == Some(client_id),
         controller_client_id,
         server_id: config.server_id,
@@ -6037,6 +6210,9 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
     }
     if let Some(port_statuses) = delta.port_statuses {
         snapshot.port_statuses = port_statuses;
+    }
+    if let Some(port_authorities) = delta.port_authorities {
+        snapshot.port_authorities = port_authorities;
     }
     snapshot.controller_client_id = delta.controller_client_id;
     snapshot.you_have_control = delta.you_have_control;
@@ -6133,10 +6309,13 @@ mod tests {
         KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
         PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteListenerIdentity,
+        RemoteMachineState, RemotePortAuthority, RemotePortAuthorityKind, RemoteSessionBootstrap,
+        RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
     };
+    use crate::domain::operation::ResourceFence;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
         JournalLimits, SemanticAdapterHealth, SemanticAttention, SemanticEventDraft,
@@ -7552,6 +7731,7 @@ mod tests {
                 ("keep".to_string(), session_view("keep")),
             ]),
             port_statuses: HashMap::new(),
+            port_authorities: HashMap::new(),
             controller_client_id: None,
             you_have_control: false,
             server_id: "host-1".to_string(),
@@ -8754,7 +8934,7 @@ mod tests {
         next_runtime.active_session_id = Some("server-session".to_string());
 
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
-        service.update_snapshot_parts(None, Some(next_runtime.clone()), None);
+        service.update_snapshot_parts(None, Some(next_runtime.clone()), None, None);
 
         let stored_app = service
             .inner
@@ -8794,14 +8974,104 @@ mod tests {
         );
         session.status = SessionStatus::Running;
         session.pid = Some(4242);
-        let status = PortStatus {
+        let now = super::now_epoch_ms();
+        let authority = RemotePortAuthority {
             port: 43123,
-            in_use: true,
-            pid: Some(4242),
-            process_name: Some("node".to_string()),
+            kind: RemotePortAuthorityKind::Unknown,
+            resource: None,
+            listeners: Vec::new(),
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 0,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now,
+            error: Some("legacy PID-only status".to_string()),
         };
 
-        assert!(!super::runtime_owns_port(&session, &status));
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+    }
+
+    #[test]
+    fn exact_remote_authority_fence_allows_forwarding() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = super::now_epoch_ms();
+        let authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Managed,
+            resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+            }],
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now,
+            freshness_deadline_epoch_ms: now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
+            error: None,
+        };
+
+        assert!(super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43124, &session, now
+        ));
+    }
+
+    #[test]
+    fn stale_or_pid_only_remote_authority_cannot_forward() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let now = super::now_epoch_ms();
+        let mut authority = RemotePortAuthority {
+            port: 43123,
+            kind: RemotePortAuthorityKind::Managed,
+            resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 42_420_000,
+                executable_proven: true,
+            }],
+            membership_revision: 9,
+            observation_sequence: 11,
+            publication_sequence: 13,
+            observed_at_epoch_ms: now.saturating_sub(REMOTE_PORT_AUTHORITY_MAX_AGE_MS + 1),
+            freshness_deadline_epoch_ms: now.saturating_sub(1),
+            error: None,
+        };
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+
+        authority.observed_at_epoch_ms = now;
+        authority.freshness_deadline_epoch_ms = now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS;
+        authority.listeners[0].executable_proven = false;
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
+
+        authority.listeners[0].executable_proven = true;
+        authority.resource = Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 0));
+        assert!(!super::remote_authority_allows_forward(
+            &authority, 43123, &session, now
+        ));
     }
 
     #[test]
@@ -8809,7 +9079,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
 
-        service.update_snapshot_parts(None, None, None);
+        service.update_snapshot_parts(None, None, None, None);
 
         assert_eq!(
             service.inner.snapshot_revision.load(Ordering::Relaxed),
