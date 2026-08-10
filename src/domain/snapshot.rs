@@ -501,8 +501,10 @@ pub struct ProcessAccountingMemberSnapshot {
     pub creation_time_100ns: Option<u64>,
     pub machine_cpu_percent: Option<f64>,
     pub core_equivalent_percent: Option<f64>,
-    /// Private memory bytes (Windows `PrivateUsage` is private committed
-    /// bytes; this is deliberately not named working set).
+    /// Platform-private memory bytes. Windows uses `PrivateUsage` (private
+    /// committed bytes); Unix uses `/proc/<pid>/smaps_rollup` private
+    /// clean+dirty (private resident bytes). This is deliberately not named
+    /// working set.
     pub private_memory_bytes: Option<u64>,
     pub io_read_bytes: Option<u64>,
     pub io_write_bytes: Option<u64>,

@@ -1,6 +1,7 @@
 use crate::models::{DefaultTerminal, MacTerminalProfile};
 use crate::process::identity::ManagedProcessIdentity;
 use crate::process::job::JobMemberObservation;
+use crate::process::sampler::SamplingBudget;
 use crate::services::{pid_file, platform_service};
 use crate::state::{
     PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
@@ -1871,6 +1872,25 @@ impl TerminalSession {
                 None
             }
         }
+    }
+
+    /// Return the current Job observation under the process-monitor tick
+    /// budget. A missing Job is an explicit `Ok(None)`; query and budget
+    /// failures remain typed as an error so callers can publish stale/unknown
+    /// state instead of resampling cached members as if they were current.
+    pub fn managed_process_observations_with_budget(
+        &self,
+        budget: &mut SamplingBudget,
+    ) -> Result<Option<Vec<JobMemberObservation>>, String> {
+        let job_slot = self
+            .process_job
+            .lock()
+            .map_err(|_| "managed Job lock poisoned".to_string())?;
+        let Some(job) = job_slot.as_ref() else {
+            return Ok(None);
+        };
+        job.active_process_observations_with_budget(budget)
+            .map(Some)
     }
 
     /// Return an exact Job-verified identity for control authorization. An

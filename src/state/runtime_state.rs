@@ -136,18 +136,29 @@ pub struct ProcessResourceNode {
     #[serde(default)]
     pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
+    #[serde(default = "default_memory_metric")]
+    pub memory_metric: ResourceMemoryMetric,
     /// Exact process generation when the operating system exposed it. A PID
     /// without creation time is never sufficient for control decisions.
     #[serde(default)]
     pub creation_time_100ns: Option<u64>,
-    /// Canonical executable identity, kept separate from the friendly label.
+    /// Redacted executable basename. Canonical identity stays private to Job
+    /// membership and sampler baseline checks.
     #[serde(default)]
     pub executable: Option<String>,
     /// Safe allowlisted command-shape label; raw command lines are never
     /// retained in the runtime projection.
     #[serde(default)]
     pub command_label: Option<String>,
-    /// Durable resource/session association used by the process monitor.
+    /// Number of command arguments observed, without retaining raw arguments.
+    #[serde(default)]
+    pub command_arg_count: u16,
+    /// Bounded total UTF-8 bytes of command arguments, without retaining the
+    /// command line itself.
+    #[serde(default)]
+    pub command_arg_bytes: u32,
+    /// Opaque resource/session association used by the process monitor;
+    /// arbitrary session IDs never cross this projection boundary.
     #[serde(default)]
     pub resource_id: Option<String>,
     #[serde(default)]
@@ -158,6 +169,49 @@ pub struct ProcessResourceNode {
     pub lifecycle: ProcessResourceLifecycle,
     #[serde(default)]
     pub metrics_status: ProcessMetricStatus,
+    #[serde(default)]
+    pub metric_values: ResourceMetricValueState,
+}
+
+/// Describes whether the numeric fields in a resource projection are current
+/// observations, immutable last-known values, or unavailable. Consumers must
+/// never infer idle CPU from a zero paired with `Unavailable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceMetricValueState {
+    Observed,
+    LastKnown,
+    #[default]
+    Unavailable,
+}
+
+/// The private-memory counter is intentionally named by its platform truth:
+/// Windows exposes `PrivateUsage` (private committed bytes), while Unix
+/// exposes `/proc/<pid>/smaps_rollup` private clean+dirty (private resident
+/// bytes). Consumers should display this label instead of calling either
+/// value a generic working set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceMemoryMetric {
+    PrivateCommitted,
+    PrivateResident,
+}
+
+impl ResourceMemoryMetric {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PrivateCommitted => "private committed",
+            Self::PrivateResident => "private resident",
+        }
+    }
+}
+
+fn default_memory_metric() -> ResourceMemoryMetric {
+    if cfg!(target_os = "windows") {
+        ResourceMemoryMetric::PrivateCommitted
+    } else {
+        ResourceMemoryMetric::PrivateResident
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -203,6 +257,8 @@ pub struct ResourceSnapshot {
     #[serde(default)]
     pub core_equivalent_percent: f32,
     pub memory_bytes: u64,
+    #[serde(default = "default_memory_metric")]
+    pub memory_metric: ResourceMemoryMetric,
     pub process_count: u32,
     pub process_ids: Vec<u32>,
     /// Some owned members may be inaccessible; totals remain useful but are
@@ -214,6 +270,12 @@ pub struct ResourceSnapshot {
     /// observed idle process.
     #[serde(default)]
     pub metrics_status: ProcessMetricStatus,
+    #[serde(default)]
+    pub metric_values: ResourceMetricValueState,
+    /// True when this projection intentionally carries an immutable prior
+    /// sample because current Job membership could not be queried.
+    #[serde(default)]
+    pub metrics_stale: bool,
     #[serde(default)]
     pub metrics_error: Option<String>,
     #[serde(default)]
@@ -238,10 +300,13 @@ impl Default for ResourceSnapshot {
             cpu_percent: 0.0,
             core_equivalent_percent: 0.0,
             memory_bytes: 0,
+            memory_metric: default_memory_metric(),
             process_count: 0,
             process_ids: Vec::new(),
             metrics_unavailable: false,
             metrics_status: ProcessMetricStatus::Unknown,
+            metric_values: ResourceMetricValueState::Unavailable,
+            metrics_stale: false,
             metrics_error: None,
             sampling_generation: 0,
             io_read_bytes: None,

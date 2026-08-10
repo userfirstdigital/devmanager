@@ -17,6 +17,9 @@ use crate::process::identity::ManagedProcessIdentity;
 use crate::process::registry::{
     JobCompletionEvent, JobCompletionMessage, JobMemberInfo, ManagedProcessFence,
 };
+use crate::process::sampler::SamplingBudget;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobMemberObservation {
@@ -35,19 +38,59 @@ pub enum JobMemberObservation {
 /// and creation-time checks; failures remain visible as partial members.
 pub fn collect_exact_job_observations<F>(
     active_process_ids: Result<Vec<u32>, String>,
-    mut inspect_process: F,
+    inspect_process: F,
 ) -> Result<Vec<JobMemberObservation>, String>
 where
     F: FnMut(u32) -> Result<JobMemberInfo, String>,
 {
-    let mut process_ids = active_process_ids?;
-    process_ids.sort_unstable();
-    process_ids.dedup();
+    let mut budget = SamplingBudget::new(
+        Instant::now() + Duration::from_secs(30),
+        MAX_JOB_PROCESS_ID_CAPACITY,
+    );
+    collect_exact_job_observations_with_budget(active_process_ids, inspect_process, &mut budget)
+}
 
-    Ok(process_ids
-        .into_iter()
-        .filter(|pid| *pid != 0)
-        .map(|pid| match inspect_process(pid) {
+/// Collect exact Job observations under the same bounded tick budget used by
+/// process accounting. The input is consumed incrementally into a set capped
+/// at `budget.max_members()`; a large Windows Job list is rejected before any
+/// process inspection or unbounded output allocation occurs.
+pub fn collect_exact_job_observations_with_budget<F>(
+    active_process_ids: Result<Vec<u32>, String>,
+    mut inspect_process: F,
+    budget: &mut SamplingBudget,
+) -> Result<Vec<JobMemberObservation>, String>
+where
+    F: FnMut(u32) -> Result<JobMemberInfo, String>,
+{
+    let mut process_ids = BTreeSet::new();
+    for pid in active_process_ids? {
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        if pid == 0 {
+            continue;
+        }
+        if process_ids.len() >= budget.remaining_capacity() && !process_ids.contains(&pid) {
+            return Err(format!(
+                "managed Job process list exceeds {} members",
+                budget.remaining_capacity()
+            ));
+        }
+        process_ids.insert(pid);
+    }
+    budget
+        .reserve_members(process_ids.len())
+        .map_err(|error| error.to_string())?;
+
+    let member_count = process_ids.len();
+    let mut observations = Vec::with_capacity(member_count);
+    for pid in process_ids {
+        // The identity/metrics inspector can perform several OS calls. Check
+        // before every member so a slow first query cannot turn the bounded
+        // tick into an unbounded Job walk.
+        if let Err(error) = budget.checkpoint() {
+            budget.release_reserved_members(member_count);
+            return Err(error.to_string());
+        }
+        let observation = match inspect_process(pid) {
             Ok(member) if member.identity().id().pid() == pid => JobMemberObservation::Accessible {
                 identity: member.identity().clone(),
             },
@@ -64,8 +107,10 @@ where
                 creation_time_100ns: None,
                 reason,
             },
-        })
-        .collect())
+        };
+        observations.push(observation);
+    }
+    Ok(observations)
 }
 
 #[cfg(windows)]
@@ -138,7 +183,6 @@ const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 #[cfg(windows)]
 const ERROR_MORE_DATA: i32 = 234;
-#[cfg(windows)]
 const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
 #[cfg(windows)]
 const MAX_COMPLETION_MESSAGES: usize = 4_096;
@@ -314,7 +358,7 @@ impl ManagedProcessJob {
     pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         #[cfg(windows)]
         {
-            query_job_active_process_ids(self.raw_job_handle())
+            query_job_active_process_ids(self.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY)
         }
 
         #[cfg(not(windows))]
@@ -326,6 +370,34 @@ impl ManagedProcessJob {
     pub fn active_process_observations(&self) -> Result<Vec<JobMemberObservation>, String> {
         let active_process_ids = self.active_process_ids();
         collect_exact_job_observations(active_process_ids, |pid| self.inspect_process(pid))
+    }
+
+    /// Query and inspect the current Job members without exceeding the
+    /// caller's process-accounting tick budget. This is the only production
+    /// path used by resource sampling; the legacy unbounded entry point above
+    /// remains for control/reconciliation callers.
+    pub fn active_process_observations_with_budget(
+        &self,
+        budget: &mut SamplingBudget,
+    ) -> Result<Vec<JobMemberObservation>, String> {
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        let active_process_ids = {
+            #[cfg(windows)]
+            {
+                query_job_active_process_ids(self.raw_job_handle(), budget.remaining_capacity())
+            }
+
+            #[cfg(not(windows))]
+            {
+                Ok(Vec::new())
+            }
+        };
+        budget.checkpoint().map_err(|error| error.to_string())?;
+        collect_exact_job_observations_with_budget(
+            active_process_ids,
+            |pid| self.inspect_process(pid),
+            budget,
+        )
     }
 
     pub fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
@@ -460,9 +532,12 @@ pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJo
 }
 
 #[cfg(windows)]
-fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
+fn query_job_active_process_ids(job: *mut c_void, max_members: usize) -> Result<Vec<u32>, String> {
     if job.is_null() {
         return Err("managed job handle is null".to_string());
+    }
+    if max_members == 0 {
+        return Err("managed Job process list budget is zero".to_string());
     }
 
     // JOBOBJECT_BASIC_PROCESS_ID_LIST:
@@ -472,12 +547,12 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
     let header_bytes = std::mem::size_of::<u32>()
         .checked_mul(2)
         .ok_or_else(|| "job process list header size overflow".to_string())?;
-    let mut capacity = 16usize;
+    let mut capacity = 16usize.min(max_members);
 
     loop {
-        if capacity > MAX_JOB_PROCESS_ID_CAPACITY {
+        if capacity > max_members {
             return Err(format!(
-                "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+                "QueryInformationJobObject process list exceeds {max_members} members"
             ));
         }
         let list_bytes = capacity
@@ -519,14 +594,12 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
             if error.raw_os_error() == Some(ERROR_MORE_DATA) {
                 let assigned = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
                 let needed = (assigned as usize).max(1);
-                if needed > MAX_JOB_PROCESS_ID_CAPACITY || capacity >= MAX_JOB_PROCESS_ID_CAPACITY {
+                if needed > max_members || capacity >= max_members {
                     return Err(format!(
-                        "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+                        "QueryInformationJobObject process list exceeds {max_members} members"
                     ));
                 }
-                let next_capacity = needed
-                    .max(capacity.saturating_mul(2))
-                    .min(MAX_JOB_PROCESS_ID_CAPACITY);
+                let next_capacity = needed.max(capacity.saturating_mul(2)).min(max_members);
                 if next_capacity <= capacity {
                     return Err(format!(
                         "QueryInformationJobObject returned ERROR_MORE_DATA but capacity {capacity} cannot grow"
@@ -540,9 +613,9 @@ fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
 
         let count = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
         if count > capacity {
-            if count > MAX_JOB_PROCESS_ID_CAPACITY {
+            if count > max_members {
                 return Err(format!(
-                    "QueryInformationJobObject returned {count} members (max {MAX_JOB_PROCESS_ID_CAPACITY})"
+                    "QueryInformationJobObject returned {count} members (max {max_members})"
                 ));
             }
             capacity = count;

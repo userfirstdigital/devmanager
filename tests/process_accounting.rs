@@ -3,7 +3,11 @@ use std::time::{Duration, Instant};
 
 use devmanager::domain::snapshot::{ProcessAccountingSnapshot, ProcessMetricStatus};
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity};
-use devmanager::process::job::{collect_exact_job_observations, JobMemberObservation};
+use devmanager::process::job::{
+    collect_exact_job_observations, collect_exact_job_observations_with_budget,
+    JobMemberObservation,
+};
+use devmanager::process::registry::JobMemberInfo;
 use devmanager::process::sampler::{
     require_exact_process_identity, AccessibleProcess, InaccessibleProcess,
     ProcessMemberObservation, ProcessSampler, SamplerError, SamplingBudget,
@@ -178,6 +182,92 @@ fn inaccessible_job_members_are_counted_and_mark_metrics_partial() {
     assert_eq!(snapshot.process_count, 2);
     assert!(snapshot.metrics_unavailable);
     assert_eq!(snapshot.memory_bytes, 5_000);
+}
+
+#[test]
+fn bounded_job_observation_never_materializes_more_than_the_tick_cap() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 512);
+    let process_ids = (1..=513).collect::<Vec<_>>();
+    let mut inspected = 0usize;
+
+    let result = collect_exact_job_observations_with_budget(
+        Ok(process_ids),
+        |pid| {
+            inspected += 1;
+            panic!("PID {pid} should not be inspected after the cap is rejected")
+        },
+        &mut budget,
+    );
+
+    let error = result.expect_err("oversized Job must fail before inspection");
+    assert!(error.contains("512"), "unexpected bounded error: {error}");
+    assert_eq!(inspected, 0);
+    assert!(budget.claimed_members() <= 512);
+}
+
+#[test]
+fn one_tick_budget_caps_job_members_across_multiple_jobs() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 512);
+    let first = collect_exact_job_observations_with_budget(
+        Ok((1..=400).collect::<Vec<_>>()),
+        |_| Err("inaccessible".to_string()),
+        &mut budget,
+    )
+    .expect("first Job remains bounded");
+    assert_eq!(first.len(), 400);
+    assert_eq!(budget.reserved_members(), 400);
+
+    let result = collect_exact_job_observations_with_budget(
+        Ok((401..=601).collect::<Vec<_>>()),
+        |_| panic!("second Job must not inspect past the shared cap"),
+        &mut budget,
+    );
+    let error = result.expect_err("second Job must fail closed at the shared cap");
+    assert!(
+        error.contains("112"),
+        "unexpected shared-cap error: {error}"
+    );
+    assert_eq!(budget.reserved_members(), 400);
+}
+
+#[test]
+fn job_member_inspection_stops_when_the_shared_deadline_expires() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_millis(20), 512);
+    let mut inspected = 0usize;
+    let result = collect_exact_job_observations_with_budget(
+        Ok(vec![701, 702]),
+        |pid| {
+            inspected += 1;
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(JobMemberInfo::new(identity(pid, 1), None))
+        },
+        &mut budget,
+    );
+
+    let error = result.expect_err("expired member inspection must fail closed");
+    assert!(error.contains("sampling work budget exceeded"));
+    assert_eq!(inspected, 1, "the second member must not be inspected");
+    assert_eq!(budget.reserved_members(), 0);
+}
+
+#[test]
+fn accounting_projection_redacts_executable_identity() {
+    let mut sampler = ProcessSampler::new();
+    let snapshot = sample(&mut sampler, Duration::ZERO, [accessible(901, 7, 0, 1024)]);
+    let executable = snapshot.members[0]
+        .executable
+        .as_deref()
+        .expect("accessible member has a display executable");
+    let canonical = std::env::current_exe().expect("test executable");
+
+    assert!(!executable.contains(canonical.to_string_lossy().as_ref()));
+    assert_eq!(
+        executable,
+        canonical
+            .file_name()
+            .expect("test executable basename")
+            .to_string_lossy()
+    );
 }
 
 #[test]

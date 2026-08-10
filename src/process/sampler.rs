@@ -5,7 +5,7 @@
 //! happens to be visible in a system process list.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -73,6 +73,7 @@ pub struct SamplingBudget {
     deadline: Instant,
     max_members: usize,
     claimed_members: usize,
+    reserved_members: usize,
 }
 
 impl SamplingBudget {
@@ -81,6 +82,7 @@ impl SamplingBudget {
             deadline,
             max_members,
             claimed_members: 0,
+            reserved_members: 0,
         }
     }
 
@@ -96,15 +98,76 @@ impl SamplingBudget {
         self.claimed_members
     }
 
-    fn claim(&mut self, count: usize) -> Result<(), SamplerError> {
-        let attempted = self.claimed_members.saturating_add(count);
-        if attempted > self.max_members || Instant::now() >= self.deadline {
+    pub fn remaining_capacity(&self) -> usize {
+        self.max_members
+            .saturating_sub(self.claimed_members.saturating_add(self.reserved_members))
+    }
+
+    /// Remaining member capacity after both sampled observations and Job
+    /// reservations. Callers must use this shared view before materializing
+    /// another member collection; counting only sampled members could let a
+    /// second Job exceed the tick cap while the first Job is still retained.
+    pub fn remaining_members(&self) -> usize {
+        self.remaining_capacity()
+    }
+
+    pub fn reserved_members(&self) -> usize {
+        self.reserved_members
+    }
+
+    /// Check the common tick deadline without consuming a member slot. Job
+    /// enumeration and process-list refreshes use this before doing OS work;
+    /// the sampler claims slots only for the observations it actually samples.
+    pub fn checkpoint(&self) -> Result<(), SamplerError> {
+        if Instant::now() >= self.deadline {
+            return Err(SamplerError::WorkBudgetExceeded {
+                attempted: self.claimed_members.saturating_add(self.reserved_members),
+                max: self.max_members,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a bounded member collection before it is inspected. This is
+    /// intentionally separate from `claim`: a Job query and the sampler share
+    /// one deadline/cap, but the same member should not consume two slots.
+    pub fn ensure_members(&self, count: usize) -> Result<(), SamplerError> {
+        self.checkpoint()?;
+        if count > self.remaining_capacity() {
+            return Err(SamplerError::WorkBudgetExceeded {
+                attempted: self
+                    .claimed_members
+                    .saturating_add(self.reserved_members)
+                    .saturating_add(count),
+                max: self.max_members,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn reserve_members(&mut self, count: usize) -> Result<(), SamplerError> {
+        self.ensure_members(count)?;
+        self.reserved_members = self.reserved_members.saturating_add(count);
+        Ok(())
+    }
+
+    pub fn release_reserved_members(&mut self, count: usize) {
+        self.reserved_members = self.reserved_members.saturating_sub(count);
+    }
+
+    pub(crate) fn claim(&mut self, count: usize) -> Result<(), SamplerError> {
+        self.checkpoint()?;
+        let attempted = self
+            .claimed_members
+            .saturating_add(self.reserved_members)
+            .saturating_add(count);
+        if attempted > self.max_members {
             return Err(SamplerError::WorkBudgetExceeded {
                 attempted,
                 max: self.max_members,
             });
         }
-        self.claimed_members = attempted;
+        self.claimed_members = self.claimed_members.saturating_add(count);
         Ok(())
     }
 }
@@ -184,6 +247,48 @@ fn sanitize_core_percent(value: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+const MAX_REDACTED_EXECUTABLE_BYTES: usize = 96;
+const MAX_DIAGNOSTIC_BYTES: usize = 128;
+
+/// Convert an executable identity into the only form safe for a runtime
+/// projection: a short basename with a conservative character allowlist.
+/// Canonical paths remain private to identity matching and sampler baselines.
+fn redacted_executable_basename(path: &Path) -> Option<String> {
+    let basename = path.file_name()?.to_string_lossy();
+    let mut output = String::with_capacity(basename.len().min(MAX_REDACTED_EXECUTABLE_BYTES));
+    for character in basename.chars() {
+        if output.len() >= MAX_REDACTED_EXECUTABLE_BYTES {
+            break;
+        }
+        output.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn sanitize_diagnostic_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len().min(MAX_DIAGNOSTIC_BYTES));
+    for character in text.chars() {
+        if output.len() >= MAX_DIAGNOSTIC_BYTES {
+            break;
+        }
+        output.push(
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | ':' | '.')
+            {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -564,12 +669,11 @@ impl ProcessSampler {
                         io_write_bytes: io_write_delta,
                         metrics_unavailable: !member_status.is_complete(),
                         status: member_status,
-                        executable: Some(
-                            member
-                                .identity
-                                .canonical_executable()
-                                .to_string_lossy()
-                                .into_owned(),
+                        // The sampler retains the exact executable only in
+                        // its private identity baseline. Its public snapshot
+                        // carries a bounded basename, never a canonical path.
+                        executable: redacted_executable_basename(
+                            member.identity.canonical_executable(),
                         ),
                         generation,
                     });
@@ -587,7 +691,16 @@ impl ProcessSampler {
                     has_partial_metrics = true;
                     status = ProcessMetricStatus::Partial;
                     if error.is_none() {
-                        error = Some(format!("metrics unavailable for PID {}", member.pid));
+                        let reason = member
+                            .reason
+                            .as_deref()
+                            .map(sanitize_diagnostic_text)
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or_else(|| "inaccessible".to_string());
+                        error = Some(format!(
+                            "metrics unavailable for PID {}: {reason}",
+                            member.pid
+                        ));
                     }
                     snapshots.push(ProcessAccountingMemberSnapshot {
                         pid: member.pid,
