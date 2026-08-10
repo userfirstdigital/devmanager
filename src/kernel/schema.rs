@@ -438,6 +438,19 @@ CREATE TABLE prompt_lineage_quarantine (
   command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
   quarantined_at_ms INTEGER NOT NULL
 );\n\
+-- This append-only ledger makes a quarantine deletion an auditable repair
+-- transition. A missing ledger row can only be cleared after the exact
+-- receipt/event rows named by the ledger are present again; PromptStore::open
+-- then validates their canonical bytes and full lineage in Rust.
+CREATE TABLE prompt_lineage_quarantine_ledger (
+  quarantine_id INTEGER PRIMARY KEY,
+  source_kind TEXT NOT NULL,
+  command_id BLOB NOT NULL CHECK(length(command_id) = 16),
+  event_id BLOB CHECK(event_id IS NULL OR length(event_id) = 16),
+  reason TEXT NOT NULL,
+  command_sha256 BLOB NOT NULL CHECK(length(command_sha256) = 32),
+  quarantined_at_ms INTEGER NOT NULL
+);\n\
 CREATE TABLE prompt_lineage_migration_state (
   singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
   blocked INTEGER NOT NULL CHECK(blocked IN (0, 1))
@@ -480,6 +493,13 @@ FROM prompt_chain_events AS events
 LEFT JOIN prompt_chain_command_receipts AS receipts
   ON receipts.command_id = events.command_id
 WHERE receipts.command_id IS NULL OR receipts.command_payload IS NULL;\n\
+INSERT INTO prompt_lineage_quarantine_ledger(
+  quarantine_id, source_kind, command_id, event_id, reason,
+  command_sha256, quarantined_at_ms
+)
+SELECT quarantine_id, source_kind, command_id, event_id, reason,
+       command_sha256, quarantined_at_ms
+FROM prompt_lineage_quarantine;\n\
 INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
 VALUES (1, EXISTS(
   SELECT 1 FROM prompt_lineage_quarantine
@@ -560,6 +580,80 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage requires exact repair before unblock');
 END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair
+  BEFORE UPDATE OF blocked ON prompt_lineage_migration_state
+  WHEN NEW.blocked = 0 AND EXISTS (
+    SELECT 1
+    FROM prompt_lineage_quarantine_ledger AS ledger
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM prompt_lineage_quarantine AS quarantine
+      WHERE quarantine.quarantine_id = ledger.quarantine_id
+        AND quarantine.source_kind = ledger.source_kind
+        AND quarantine.command_id = ledger.command_id
+        AND (quarantine.event_id IS ledger.event_id)
+        AND quarantine.reason = ledger.reason
+        AND quarantine.command_sha256 = ledger.command_sha256
+        AND quarantine.quarantined_at_ms = ledger.quarantined_at_ms
+    )
+    AND NOT (
+      (
+        ledger.source_kind = 'prompt_receipt'
+        AND ledger.event_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM prompt_command_receipts AS receipt
+          WHERE receipt.command_id = ledger.command_id
+            AND receipt.command_sha256 = ledger.command_sha256
+            AND receipt.command_payload IS NOT NULL
+            AND length(receipt.command_payload) > 0
+        )
+      )
+      OR (
+        ledger.source_kind = 'prompt_chain_receipt'
+        AND ledger.event_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM prompt_chain_command_receipts AS receipt
+          WHERE receipt.command_id = ledger.command_id
+            AND receipt.command_sha256 = ledger.command_sha256
+            AND receipt.command_payload IS NOT NULL
+            AND length(receipt.command_payload) > 0
+        )
+      )
+      OR (
+        ledger.source_kind = 'prompt_event'
+        AND ledger.event_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM prompt_events AS event
+          JOIN prompt_command_receipts AS receipt
+            ON receipt.command_id = event.command_id
+          WHERE event.prompt_event_id = ledger.event_id
+            AND event.command_id = ledger.command_id
+            AND receipt.command_sha256 = ledger.command_sha256
+            AND receipt.command_payload IS NOT NULL
+            AND length(receipt.command_payload) > 0
+        )
+      )
+      OR (
+        ledger.source_kind = 'prompt_chain_event'
+        AND ledger.event_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM prompt_chain_events AS event
+          JOIN prompt_chain_command_receipts AS receipt
+            ON receipt.command_id = event.command_id
+          WHERE event.prompt_chain_event_id = ledger.event_id
+            AND event.command_id = ledger.command_id
+            AND receipt.command_sha256 = ledger.command_sha256
+            AND receipt.command_payload IS NOT NULL
+            AND length(receipt.command_payload) > 0
+        )
+      )
+    )
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage requires ledger-backed exact repair before unblock');
+END;\n\
 CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair_insert
   BEFORE INSERT ON prompt_lineage_migration_state
   WHEN NEW.blocked = 0 AND (
@@ -575,6 +669,110 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair_insert
   )\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage requires exact repair before unblock');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair_insert
+  BEFORE INSERT ON prompt_lineage_migration_state
+  WHEN NEW.blocked = 0 AND EXISTS (
+    SELECT 1 FROM prompt_lineage_quarantine_ledger AS ledger
+    WHERE NOT EXISTS (
+      SELECT 1 FROM prompt_lineage_quarantine AS quarantine
+      WHERE quarantine.quarantine_id = ledger.quarantine_id
+        AND quarantine.source_kind = ledger.source_kind
+        AND quarantine.command_id = ledger.command_id
+        AND (quarantine.event_id IS ledger.event_id)
+        AND quarantine.reason = ledger.reason
+        AND quarantine.command_sha256 = ledger.command_sha256
+        AND quarantine.quarantined_at_ms = ledger.quarantined_at_ms
+    )
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage requires ledger-backed exact repair before unblock');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_immutable_delete
+  BEFORE DELETE ON prompt_lineage_migration_state
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration state is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_immutable_update
+  BEFORE UPDATE ON prompt_lineage_migration_state
+  WHEN NOT (
+    OLD.singleton_key = 1
+    AND NEW.singleton_key = 1
+    AND (
+      OLD.blocked = NEW.blocked
+      OR (
+        OLD.blocked = 0
+        AND NEW.blocked = 1
+        AND (
+          EXISTS (SELECT 1 FROM prompt_lineage_quarantine)
+          OR EXISTS (
+            SELECT 1 FROM prompt_command_receipts
+            WHERE command_payload IS NULL OR length(command_payload) = 0
+          )
+          OR EXISTS (
+            SELECT 1 FROM prompt_chain_command_receipts
+            WHERE command_payload IS NULL OR length(command_payload) = 0
+          )
+        )
+      )
+      OR (
+        OLD.blocked = 1
+        AND NEW.blocked = 0
+        AND NOT EXISTS (SELECT 1 FROM prompt_lineage_quarantine)
+        AND NOT EXISTS (
+          SELECT 1 FROM prompt_command_receipts
+          WHERE command_payload IS NULL OR length(command_payload) = 0
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM prompt_chain_command_receipts
+          WHERE command_payload IS NULL OR length(command_payload) = 0
+        )
+      )
+    )
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage migration state requires exact repair');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_append_only_insert
+  BEFORE INSERT ON prompt_lineage_quarantine
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine is migration-owned');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_immutable_update
+  BEFORE UPDATE ON prompt_lineage_quarantine
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_immutable_delete
+  BEFORE DELETE ON prompt_lineage_quarantine
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM prompt_lineage_quarantine_ledger AS ledger
+    WHERE ledger.quarantine_id = OLD.quarantine_id
+      AND ledger.source_kind = OLD.source_kind
+      AND ledger.command_id = OLD.command_id
+      AND (ledger.event_id IS OLD.event_id)
+      AND ledger.reason = OLD.reason
+      AND ledger.command_sha256 = OLD.command_sha256
+      AND ledger.quarantined_at_ms = OLD.quarantined_at_ms
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine deletion lacks repair provenance');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_ledger_immutable_insert
+  BEFORE INSERT ON prompt_lineage_quarantine_ledger
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine ledger is migration-owned');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_ledger_immutable_update
+  BEFORE UPDATE ON prompt_lineage_quarantine_ledger
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine ledger is immutable');
+END;\n\
+CREATE TRIGGER prompt_lineage_quarantine_ledger_immutable_delete
+  BEFORE DELETE ON prompt_lineage_quarantine_ledger
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage quarantine ledger is append-only');
 END;\n\
 CREATE TRIGGER saved_prompts_current_version_is_latest_insert
   BEFORE INSERT ON saved_prompts

@@ -290,7 +290,7 @@ fn idempotent_receipt_requires_correlated_command_target_version_and_revision() 
     let command_id = command_id(122);
     let prompt = prompt_id(123);
     let version = version_id(124);
-    let command = create_prompt(prompt, version);
+    let command = canonical_create_prompt(prompt, version);
     let mut stored_command = command.clone();
     if let PromptCommand::CreatePrompt(command) = &mut stored_command {
         command.tags = vec!["rust".into(), "review".into()];
@@ -327,10 +327,8 @@ fn idempotent_receipt_requires_correlated_command_target_version_and_revision() 
     .expect("insert corrupt receipt");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(command_id, command)
-        .expect_err("correlated receipt fields must be validated");
+    let error =
+        PromptStore::open(&path).expect_err("correlated receipt fields must be validated at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -378,10 +376,8 @@ fn idempotent_receipt_requires_exact_canonical_payload_bytes() {
     .expect("insert noncanonical receipt");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(command_id, command)
-        .expect_err("noncanonical receipt bytes must be rejected");
+    let error =
+        PromptStore::open(&path).expect_err("noncanonical receipt bytes must be rejected at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -475,10 +471,8 @@ fn idempotent_effectful_receipt_requires_exactly_one_effect_event() {
     .expect("insert duplicate effect row");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(rename_command_id, rename)
-        .expect_err("duplicate effect rows must reject idempotent replay");
+    let error = PromptStore::open(&path)
+        .expect_err("duplicate effect rows must reject idempotent replay at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -514,10 +508,8 @@ fn idempotent_effectful_receipt_requires_one_event_not_zero() {
     .expect("remove effect row");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(rename_command_id, rename)
-        .expect_err("missing effect row must reject idempotent replay");
+    let error = PromptStore::open(&path)
+        .expect_err("missing effect row must reject idempotent replay at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -554,10 +546,8 @@ fn idempotent_semantic_noop_requires_unchanged_state_and_zero_events() {
     .expect("forge changed state after no-op receipt");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(noop_command_id, noop)
-        .expect_err("no-op replay must prove unchanged exact state");
+    let error = PromptStore::open(&path)
+        .expect_err("no-op replay must prove unchanged exact state at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -605,10 +595,8 @@ fn idempotent_semantic_noop_rejects_a_forged_event() {
     .expect("insert forged no-op event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute(noop_command_id, noop)
-        .expect_err("no-op replay must reject a nonzero effect count");
+    let error = PromptStore::open(&path)
+        .expect_err("no-op replay must reject a nonzero effect count at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -656,10 +644,8 @@ fn idempotent_chain_receipt_requires_correlated_chain_target() {
     .expect("insert corrupt chain receipt");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute_chain(command_id, command)
-        .expect_err("chain receipt target must be validated");
+    let error =
+        PromptStore::open(&path).expect_err("chain receipt target must be validated at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -822,10 +808,8 @@ fn archived_prompt_metadata_commands_and_replay_are_rejected() {
     .expect("insert replay event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let replay_error = store
-        .rebuild_projection()
-        .expect_err("replay must reject archived metadata mutation");
+    let replay_error = PromptStore::open(&path)
+        .expect_err("open must reject archived metadata mutation before replay");
     assert!(matches!(replay_error, PromptStoreError::Corruption(_)));
 }
 
@@ -962,10 +946,7 @@ fn corrupt_tag_position_fails_closed() {
         [prompt.as_bytes().as_slice()],
     )
     .expect("corrupt isolated fixture");
-    let store = open_store(&path);
-    let error = store
-        .get_prompt(prompt)
-        .expect_err("sparse tag positions must not be returned as valid data");
+    let error = PromptStore::open(&path).expect_err("sparse tag positions must fail at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -1090,10 +1071,7 @@ fn projection_rejects_noncanonical_prompt_created_event() {
     .expect("insert event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("noncanonical event must fail closed");
+    let error = PromptStore::open(&path).expect_err("noncanonical event must fail closed at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -1161,10 +1139,8 @@ fn projection_rejects_noncanonical_prompt_mutation_event() {
     .expect("insert event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("noncanonical mutation event must fail closed");
+    let error =
+        PromptStore::open(&path).expect_err("noncanonical mutation event must fail closed at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -1978,7 +1954,6 @@ fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
     store
         .execute_chain(command_id(213), immediate_successor.clone())
         .expect("immediate-successor move is a semantic no-op");
-    drop(store);
 
     let conn = Connection::open(&path).expect("open isolated raw connection");
     conn.execute(
@@ -1991,11 +1966,21 @@ fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
     .expect("forge changed immediate-successor no-op state");
     drop(conn);
 
-    let mut store = open_store(&path);
     let error = store
         .execute_chain(command_id(213), immediate_successor)
         .expect_err("immediate-successor no-op must prove unchanged state");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
+
+    let conn = Connection::open(&path).expect("restore isolated raw connection");
+    conn.execute(
+        "UPDATE prompt_chain_links SET prompt_version_id = ?1 WHERE link_id = ?2",
+        rusqlite::params![
+            first.as_bytes().as_slice(),
+            first_link.as_bytes().as_slice()
+        ],
+    )
+    .expect("restore immediate-successor no-op state");
+    drop(conn);
 
     let end_move = PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
         chain_id: chain,
@@ -2006,7 +1991,6 @@ fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
     store
         .execute_chain(command_id(214), end_move.clone())
         .expect("end move is a semantic no-op");
-    drop(store);
 
     let conn = Connection::open(&path).expect("reopen isolated raw connection");
     conn.execute(
@@ -2019,7 +2003,6 @@ fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
     .expect("forge changed end no-op state");
     drop(conn);
 
-    let mut store = open_store(&path);
     let error = store
         .execute_chain(command_id(214), end_move)
         .expect_err("end no-op must prove unchanged state");
@@ -2045,8 +2028,6 @@ fn rebuild_repairs_missing_chain_projection_through_ordered_events() {
             }),
         )
         .expect("rename chain");
-    drop(store);
-
     let conn = Connection::open(&path).expect("open isolated raw connection");
     conn.execute(
         "DELETE FROM prompt_chains WHERE chain_id = ?1",
@@ -2055,7 +2036,6 @@ fn rebuild_repairs_missing_chain_projection_through_ordered_events() {
     .expect("remove only the chain projection");
     drop(conn);
 
-    let mut store = open_store(&path);
     store
         .rebuild_projection()
         .expect("valid ordered chain events rebuild the missing projection");
@@ -2098,17 +2078,8 @@ fn chain_link_create_rejects_stale_prompt_current_pointer() {
     .expect("insert later version without advancing pointer");
     drop(conn);
 
-    let chain = chain_id(208);
-    let mut store = open_store(&path);
-    store
-        .execute_chain(command_id(209), create_chain(chain))
-        .expect("create chain");
-    let error = store
-        .execute_chain(
-            command_id(210),
-            insert_link(chain, link_id(211), prompt, None, None, 1),
-        )
-        .expect_err("chain creation must validate the loaded prompt pointer");
+    let error = PromptStore::open(&path)
+        .expect_err("a stale prompt pointer must fail before chain operations");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -2153,17 +2124,8 @@ fn chain_link_update_rejects_stale_prompt_current_pointer() {
     .expect("insert later version without advancing pointer");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .execute_chain(
-            command_id(220),
-            PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
-                chain_id: chain,
-                link_id: link_id(218),
-                expected_revision: 2,
-            }),
-        )
-        .expect_err("chain update must validate the loaded prompt pointer");
+    let error = PromptStore::open(&path)
+        .expect_err("a stale prompt pointer must fail before chain updates");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -2240,10 +2202,8 @@ fn replay_rejects_untrimmed_chain_title_and_description() {
     .expect("seed chain event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("replay must reject untrimmed chain metadata");
+    let error = PromptStore::open(&path)
+        .expect_err("open must reject untrimmed chain metadata before replay");
     assert!(
         matches!(error, PromptStoreError::Corruption(_)),
         "unexpected replay error: {error:?}"
@@ -2381,12 +2341,6 @@ fn direct_sql_version_insert_atomically_advances_current_pointer() {
     assert_eq!(current_version_id, version_id(141).as_bytes().to_vec());
     drop(conn);
 
-    let store = open_store(&path);
-    let current = store
-        .get_prompt(prompt)
-        .expect("load prompt after atomic direct version insert")
-        .expect("prompt remains present");
-    assert_eq!(current.current_version_id, version_id(141));
     let conn = Connection::open(&path).expect("reopen database after direct version insert");
     let revision: i64 = conn
         .query_row(
@@ -2462,10 +2416,8 @@ fn replay_rejects_chain_links_not_derived_from_exact_command() {
     .expect("forge chain event content");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("chain replay must prove exact command link content");
+    let error = PromptStore::open(&path)
+        .expect_err("chain lineage must prove exact command link content at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -2648,16 +2600,12 @@ fn prompt_rebuild_rejects_an_oversized_journal_before_allocating_rows() {
         .expect("commit oversized journal fixture");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("oversized journal must fail before projection allocation");
+    let error = PromptStore::open(&path)
+        .expect_err("oversized journal must fail at open before replay allocation");
     match error {
         PromptStoreError::Corruption(message) => assert!(message.contains("10000")),
         other => panic!("unexpected oversized journal error: {other:?}"),
     }
-    drop(store);
-
     let conn = Connection::open(&path).expect("reopen database after bounded-journal rollback");
     let current_version_id: Vec<u8> = conn
         .query_row(
@@ -2735,10 +2683,7 @@ fn unsealed_prompt_version_is_reported_as_corruption() {
     .expect("insert unsealed corruption fixture");
     drop(conn);
 
-    let store = open_store(&path);
-    let error = store
-        .get_version(unsealed_version)
-        .expect_err("unsealed version must fail closed");
+    let error = PromptStore::open(&path).expect_err("unsealed version must fail closed at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -2955,10 +2900,8 @@ fn projection_rebuild_rejects_prompt_event_row_target_mismatch() {
     .expect("insert prompt event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("event row target must match event and receipt lineage");
+    let error = PromptStore::open(&path)
+        .expect_err("event row target must match event and receipt lineage at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -3024,10 +2967,7 @@ fn projection_rebuild_rejects_invalid_event_id() {
     .expect("insert invalid event id");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("invalid event ID must fail closed");
+    let error = PromptStore::open(&path).expect_err("invalid event ID must fail closed at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -3094,10 +3034,8 @@ fn projection_rebuild_rejects_command_and_event_time_lineage_mismatch() {
     .expect("insert lineage mismatch event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("command and time lineage must be validated");
+    let error =
+        PromptStore::open(&path).expect_err("command and time lineage must be validated at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -3163,10 +3101,8 @@ fn projection_rebuild_rejects_noncanonical_event_payload_bytes() {
     .expect("insert noncanonical event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("event payload bytes must be canonical");
+    let error =
+        PromptStore::open(&path).expect_err("event payload bytes must be canonical at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -3246,10 +3182,8 @@ fn chain_projection_rebuild_rejects_row_target_mismatch() {
     .expect("insert chain event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    let error = store
-        .rebuild_projection()
-        .expect_err("chain event target must match event and receipt lineage");
+    let error = PromptStore::open(&path)
+        .expect_err("chain event target must match event and receipt lineage at open");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
@@ -3278,15 +3212,9 @@ fn saved_prompt_reads_reject_untrimmed_metadata() {
     .expect("corrupt prompt metadata");
     drop(conn);
 
-    let store = open_store(&path);
-    assert!(matches!(
-        store.get_prompt(prompt),
-        Err(PromptStoreError::Corruption(_))
-    ));
-    assert!(matches!(
-        store.list_prompts(0, 10),
-        Err(PromptStoreError::Corruption(_))
-    ));
+    let error =
+        PromptStore::open(&path).expect_err("saved prompt metadata corruption must fail at open");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
 #[test]
@@ -3331,34 +3259,9 @@ fn chain_link_reads_move_and_remove_reject_stale_prompt_pointer() {
     .expect("insert later version without advancing pointer");
     drop(conn);
 
-    let mut store = open_store(&path);
-    assert!(matches!(
-        store.list_chain_links(chain),
-        Err(PromptStoreError::Corruption(_))
-    ));
-    assert!(matches!(
-        store.execute_chain(
-            command_id(242),
-            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
-                chain_id: chain,
-                link_id: link,
-                before_link_id: None,
-                expected_revision: 2,
-            }),
-        ),
-        Err(PromptStoreError::Corruption(_))
-    ));
-    assert!(matches!(
-        store.execute_chain(
-            command_id(243),
-            PromptChainCommand::RemovePromptChainLink(RemovePromptChainLink {
-                chain_id: chain,
-                link_id: link,
-                expected_revision: 2,
-            }),
-        ),
-        Err(PromptStoreError::Corruption(_))
-    ));
+    let error = PromptStore::open(&path)
+        .expect_err("a stale prompt pointer must fail before chain reads or mutations");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
 #[test]
@@ -3429,11 +3332,9 @@ fn replay_rejects_archived_chain_create_event() {
     .expect("seed archived chain event");
     drop(conn);
 
-    let mut store = open_store(&path);
-    assert!(matches!(
-        store.rebuild_projection(),
-        Err(PromptStoreError::Corruption(_))
-    ));
+    let error = PromptStore::open(&path)
+        .expect_err("archived chain creation must fail at open before replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
 #[test]
@@ -3631,6 +3532,8 @@ fn prompt_store_open_rejects_missing_lineage_migration_state() {
     drop(open_store(&path));
 
     let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute_batch("DROP TRIGGER prompt_lineage_migration_state_immutable_delete")
+        .expect("disable state immutability for missing-state fixture");
     conn.execute(
         "DELETE FROM prompt_lineage_migration_state WHERE singleton_key = 1",
         [],
@@ -3651,6 +3554,8 @@ fn sqlite_rejects_unblocking_unrepaired_lineage_quarantine() {
     drop(open_store(&path));
 
     let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute_batch("DROP TRIGGER prompt_lineage_quarantine_append_only_insert")
+        .expect("disable migration-owned insert trigger for quarantine fixture");
     conn.execute(
         "INSERT INTO prompt_lineage_quarantine(
             source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
@@ -3665,20 +3570,6 @@ fn sqlite_rejects_unblocking_unrepaired_lineage_quarantine() {
     assert!(
         unblock.is_err(),
         "SQLite must require exact quarantine repair before unblocking"
-    );
-    conn.execute(
-        "DELETE FROM prompt_lineage_migration_state WHERE singleton_key = 1",
-        [],
-    )
-    .expect("clear lineage state for reset fixture");
-    let reset = conn.execute(
-        "INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
-         VALUES (1, 0)",
-        [],
-    );
-    assert!(
-        reset.is_err(),
-        "resetting the lineage state must not bypass exact quarantine repair"
     );
     drop(conn);
 
@@ -3745,6 +3636,86 @@ fn sqlite_rejects_orphan_chain_receipt_atomically() {
         count, 0,
         "failed orphan chain receipt insert must be atomic"
     );
+}
+
+#[test]
+fn lineage_quarantine_repair_marker_can_be_cleared_idempotently() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(246);
+    let version = version_id(247);
+    let receipt_command = command_id(248);
+    let mut store = open_store(&path);
+    store
+        .execute(receipt_command, create_prompt(prompt, version))
+        .expect("create canonical receipt for repair proof");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    let command_sha256: Vec<u8> = conn
+        .query_row(
+            "SELECT command_sha256 FROM prompt_command_receipts WHERE command_id = ?1",
+            [receipt_command.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read canonical receipt digest");
+    conn.execute_batch(
+        "DROP TRIGGER prompt_lineage_quarantine_append_only_insert;
+         DROP TRIGGER prompt_lineage_quarantine_ledger_immutable_insert;",
+    )
+    .expect("disable migration-owned insert triggers for repair fixture");
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine(
+            source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+         ) VALUES ('prompt_receipt', ?1, NULL, 'exact repair pending', ?2, 1)",
+        rusqlite::params![receipt_command.as_bytes().as_slice(), &command_sha256],
+    )
+    .expect("seed migration repair marker");
+    let quarantine_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine_ledger(
+            quarantine_id, source_kind, command_id, event_id, reason,
+            command_sha256, quarantined_at_ms
+         ) VALUES (?1, 'prompt_receipt', ?2, NULL, 'exact repair pending', ?3, 1)",
+        rusqlite::params![
+            quarantine_id,
+            receipt_command.as_bytes().as_slice(),
+            &command_sha256,
+        ],
+    )
+    .expect("seed immutable repair ledger");
+    let ledger_update = conn
+        .execute(
+            "UPDATE prompt_lineage_quarantine_ledger SET reason = 'forged'",
+            [],
+        )
+        .expect_err("quarantine ledger updates must be immutable");
+    assert!(ledger_update.to_string().to_lowercase().contains("ledger"));
+    let ledger_delete = conn
+        .execute("DELETE FROM prompt_lineage_quarantine_ledger", [])
+        .expect_err("quarantine ledger deletion must be append-only");
+    assert!(ledger_delete.to_string().to_lowercase().contains("ledger"));
+    conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 1 WHERE singleton_key = 1",
+        [],
+    )
+    .expect("enter derived blocked state");
+    conn.execute("DELETE FROM prompt_lineage_quarantine", [])
+        .expect("clear repaired quarantine marker");
+    conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 0 WHERE singleton_key = 1",
+        [],
+    )
+    .expect("leave derived blocked state");
+    drop(conn);
+
+    PromptStore::open(&path).expect("exact repair marker cleanup must reopen healthy");
+    let conn = Connection::open(&path).expect("reopen repaired schema");
+    conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 0 WHERE singleton_key = 1",
+        [],
+    )
+    .expect("repair unblock must be idempotent");
 }
 
 #[test]
@@ -3896,11 +3867,9 @@ fn replay_rejects_duplicate_chain_link_ids() {
     }
     drop(conn);
 
-    let mut store = open_store(&path);
-    assert!(matches!(
-        store.rebuild_projection(),
-        Err(PromptStoreError::Corruption(_))
-    ));
+    let error = PromptStore::open(&path)
+        .expect_err("duplicate chain link IDs must fail at open before replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
 }
 
 #[test]
@@ -3977,9 +3946,386 @@ fn replay_rejects_prompt_created_with_stale_current_pointer() {
     .expect("seed stale prompt event");
     drop(conn);
 
+    let error = PromptStore::open(&path)
+        .expect_err("stale current pointer must fail at open before replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_semantic_event_corruption_before_replay() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(1);
+    let version = version_id(2);
+    let rename_command_id = command_id(3);
     let mut store = open_store(&path);
-    assert!(matches!(
-        store.rebuild_projection(),
-        Err(PromptStoreError::Corruption(_))
-    ));
+    store
+        .execute(command_id(4), create_prompt(prompt, version))
+        .expect("create prompt");
+    store
+        .execute(
+            rename_command_id,
+            PromptCommand::RenamePrompt(RenamePrompt {
+                prompt_id: prompt,
+                title: "Renamed code".into(),
+                expected_revision: 1,
+            }),
+        )
+        .expect("rename prompt");
+    drop(store);
+
+    let forged_event = PromptEvent::PromptRenamed {
+        prompt_id: prompt,
+        title: "Forged event".into(),
+        revision: 2,
+    };
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_events_immutable_update")
+        .expect("disable event immutability for corruption fixture");
+    conn.execute(
+        "UPDATE prompt_events SET payload = ?1
+         WHERE command_id = ?2 AND event_type = 'prompt.renamed'",
+        rusqlite::params![
+            forged_event.encode().expect("forged event payload"),
+            rename_command_id.as_bytes().as_slice(),
+        ],
+    )
+    .expect("forge event payload");
+    drop(conn);
+
+    let error = PromptStore::open(&path).expect_err(
+        "open must validate command, receipt, event, and projection semantics before healthy",
+    );
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_stale_current_projection_before_replay() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(5);
+    let first_version = version_id(6);
+    let second_version = version_id(7);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(8), create_prompt(prompt, first_version))
+        .expect("create prompt");
+    store
+        .execute(
+            command_id(9),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second_version,
+                variables: Vec::new(),
+                body: "second body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create second version");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER saved_prompts_current_version_is_latest")
+        .expect("disable current pointer trigger for corruption fixture");
+    conn.execute(
+        "UPDATE saved_prompts SET current_version_id = ?1 WHERE prompt_id = ?2",
+        rusqlite::params![
+            first_version.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+        ],
+    )
+    .expect("forge stale current pointer");
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("open must reject a stale current projection before replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_noncontiguous_event_sequence_before_replay() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(5);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(6), create_prompt(prompt, version_id(7)))
+        .expect("create prompt");
+    store
+        .execute(
+            command_id(8),
+            PromptCommand::RenamePrompt(RenamePrompt {
+                prompt_id: prompt,
+                title: "Renamed code".into(),
+                expected_revision: 1,
+            }),
+        )
+        .expect("rename prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    conn.execute_batch("DROP TRIGGER prompt_events_immutable_update")
+        .expect("disable event immutability for sequence fixture");
+    conn.execute(
+        "UPDATE prompt_events SET sequence = 3 WHERE sequence = 2",
+        [],
+    )
+    .expect("forge a sequence gap");
+    drop(conn);
+
+    let error =
+        PromptStore::open(&path).expect_err("a noncontiguous event sequence must fail at open");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_non_positive_event_sequence_before_replay() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(8);
+    let version = version_id(9);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(10), create_prompt(prompt, version))
+        .expect("create prompt");
+    let stored_version = store
+        .get_version(version)
+        .expect("query version")
+        .expect("created version");
+    drop(store);
+
+    let duplicate_command = command_id(11);
+    let receipt = PromptMutationReceipt {
+        command_id: duplicate_command,
+        prompt_id: prompt,
+        prompt_version_id: version,
+        revision: 1,
+    };
+    let event = PromptEvent::PromptCreated {
+        prompt: SavedPrompt {
+            id: prompt,
+            title: "Review code".into(),
+            description: Some("A bounded local prompt".into()),
+            tags: vec!["rust".into(), "review".into()],
+            current_version_id: version,
+            revision: 1,
+            archived_at_ms: None,
+        },
+        version: stored_version,
+    };
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    let command_payload: Vec<u8> = conn
+        .query_row(
+            "SELECT command_payload FROM prompt_command_receipts WHERE command_id = ?1",
+            [command_id(10).as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("read canonical command payload");
+    let command_sha256: [u8; 32] = Sha256::digest(&command_payload).into();
+    conn.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, command_payload, prompt_id, prompt_version_id,
+            revision, receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, 1725000000000)",
+        rusqlite::params![
+            duplicate_command.as_bytes().as_slice(),
+            command_sha256.as_slice(),
+            command_payload,
+            prompt.as_bytes().as_slice(),
+            version.as_bytes().as_slice(),
+            receipt.encode().expect("receipt payload"),
+        ],
+    )
+    .expect("seed duplicate receipt fixture");
+    conn.execute(
+        "INSERT INTO prompt_events(
+            prompt_event_id, command_id, prompt_id, event_type, occurred_at_ms, payload
+         ) VALUES (?1, ?2, ?3, ?4, 1725000000000, ?5)",
+        rusqlite::params![
+            EventId::new().as_bytes().as_slice(),
+            duplicate_command.as_bytes().as_slice(),
+            prompt.as_bytes().as_slice(),
+            event.event_type(),
+            event.encode().expect("event payload"),
+        ],
+    )
+    .expect("seed duplicate event fixture");
+    conn.execute_batch("DROP TRIGGER prompt_events_immutable_update")
+        .expect("disable event immutability for sequence fixture");
+    conn.execute(
+        "UPDATE prompt_events SET sequence = 0 WHERE command_id = ?1",
+        [duplicate_command.as_bytes().as_slice()],
+    )
+    .expect("forge non-positive event sequence");
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("non-positive event sequence must fail at open before replay");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn open_rejects_non_ascii_tag_in_durable_receipt_and_sql_projection() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(10);
+    let version = version_id(11);
+    let mut store = open_store(&path);
+    store
+        .execute(
+            command_id(12),
+            PromptCommand::CreatePrompt(CreatePrompt {
+                prompt_id: prompt,
+                prompt_version_id: version,
+                title: "ASCII tags".into(),
+                description: None,
+                tags: Vec::new(),
+                variables: Vec::new(),
+                body: "body".into(),
+                created_at_ms: 1,
+            }),
+        )
+        .expect("create prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    let sql_error = conn
+        .execute(
+            "INSERT INTO prompt_tags(prompt_id, tag, position) VALUES (?1, ?2, 0)",
+            rusqlite::params![prompt.as_bytes().as_slice(), "café"],
+        )
+        .expect_err("SQLite must reject non-ASCII tags under the shared policy");
+    assert!(sql_error.to_string().to_lowercase().contains("tag"));
+
+    let command_id = command_id(13);
+    let command = PromptCommand::SetPromptTags(SetPromptTags {
+        prompt_id: prompt,
+        tags: vec!["café".into()],
+        expected_revision: 1,
+    });
+    let command_payload = command
+        .encode()
+        .expect("encode invalid durable command fixture");
+    let command_sha256: [u8; 32] = Sha256::digest(&command_payload).into();
+    let receipt = PromptMutationReceipt {
+        command_id,
+        prompt_id: prompt,
+        prompt_version_id: version,
+        revision: 2,
+    };
+    conn.execute(
+        "INSERT INTO prompt_command_receipts(
+            command_id, command_sha256, command_payload, prompt_id, prompt_version_id,
+            revision, receipt, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            command_id.as_bytes().as_slice(),
+            command_sha256.as_slice(),
+            command_payload,
+            prompt.as_bytes().as_slice(),
+            version.as_bytes().as_slice(),
+            2_i64,
+            receipt.encode().expect("receipt payload"),
+            2_i64,
+        ],
+    )
+    .expect("seed invalid tag receipt");
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("open must reject a receipt whose canonical command violates tag policy");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn lineage_state_and_quarantine_rows_are_not_directly_mutable() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    store
+        .execute(command_id(14), create_prompt(prompt_id(15), version_id(16)))
+        .expect("create prompt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated raw connection");
+    let direct_insert = conn.execute(
+        "INSERT INTO prompt_lineage_quarantine(
+            source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+         ) VALUES ('direct', ?1, NULL, 'forged', zeroblob(32), 1)",
+        [command_id(17).as_bytes().as_slice()],
+    );
+    assert!(
+        direct_insert.is_err(),
+        "quarantine rows must be migration-owned"
+    );
+    conn.execute_batch("DROP TRIGGER prompt_lineage_quarantine_append_only_insert")
+        .expect("disable migration-owned insert trigger for quarantine fixture");
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine(
+            source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+         ) VALUES ('test', ?1, NULL, 'fixture', zeroblob(32), 1)",
+        [command_id(17).as_bytes().as_slice()],
+    )
+    .expect("seed quarantine fixture");
+    let quarantine_update = conn
+        .execute("UPDATE prompt_lineage_quarantine SET reason = 'forged'", [])
+        .expect_err("quarantine rows must be immutable");
+    assert!(quarantine_update
+        .to_string()
+        .to_lowercase()
+        .contains("quarantine"));
+    let state_delete = conn
+        .execute("DELETE FROM prompt_lineage_migration_state", [])
+        .expect_err("lineage state must not be replaceable");
+    assert!(state_delete.to_string().to_lowercase().contains("lineage"));
+    let state_insert = conn
+        .execute(
+            "INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
+             VALUES (1, 0)",
+            [],
+        )
+        .expect_err("lineage state must not be replaceable");
+    assert!(state_insert.to_string().to_lowercase().contains("lineage"));
+    let blocked_with_quarantine = conn
+        .execute(
+            "UPDATE prompt_lineage_migration_state SET blocked = 0
+             WHERE singleton_key = 1",
+            [],
+        )
+        .expect_err("state cannot be unblocked while quarantine remains");
+    assert!(blocked_with_quarantine
+        .to_string()
+        .to_lowercase()
+        .contains("repair"));
+    conn.execute_batch("DROP TRIGGER prompt_command_receipts_immutable_update")
+        .expect("disable receipt immutability for invalid lineage fixture");
+    conn.execute(
+        "UPDATE prompt_command_receipts SET command_payload = X'01'
+         WHERE command_id = ?1",
+        [command_id(14).as_bytes().as_slice()],
+    )
+    .expect("forge a noncanonical durable receipt");
+    let quarantine_delete = conn
+        .execute("DELETE FROM prompt_lineage_quarantine", [])
+        .expect_err("quarantine deletion must require immutable repair provenance");
+    assert!(quarantine_delete
+        .to_string()
+        .to_lowercase()
+        .contains("provenance"));
+    conn.execute_batch("DROP TRIGGER prompt_lineage_quarantine_immutable_delete")
+        .expect("disable quarantine delete protection for tamper fixture");
+    conn.execute("DELETE FROM prompt_lineage_quarantine", [])
+        .expect("remove quarantine after bypassing delete protection");
+    conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 0
+         WHERE singleton_key = 1",
+        [],
+    )
+    .expect("SQLite structural repair marker update");
+    drop(conn);
+
+    let error = PromptStore::open(&path)
+        .expect_err("quarantine deletion and forged unblock must not forge health");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
 }

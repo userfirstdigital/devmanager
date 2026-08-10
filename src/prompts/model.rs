@@ -14,6 +14,7 @@ pub const MAX_PROMPT_VARIABLES: usize = 32;
 pub const MAX_PROMPT_VARIABLE_NAME_SCALARS: usize = 64;
 pub const MAX_PROMPT_CHAIN_TITLE_SCALARS: usize = MAX_PROMPT_TITLE_SCALARS;
 pub const MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS: usize = MAX_PROMPT_DESCRIPTION_SCALARS;
+pub const MAX_PROMPT_CHAIN_LINKS: usize = 2_000;
 pub const DEFAULT_PROMPT_PAGE_SIZE: usize = 100;
 pub const MAX_PROMPT_PAGE_SIZE: usize = 1_000;
 pub const PROMPT_WIRE_SCHEMA_VERSION: u32 = 1;
@@ -257,6 +258,9 @@ pub enum PromptValidationError {
     EmptyTag {
         position: usize,
     },
+    InvalidTag {
+        position: usize,
+    },
     TagTooLong {
         position: usize,
         actual: usize,
@@ -298,6 +302,10 @@ impl fmt::Display for PromptValidationError {
                 write!(f, "prompt has more than {max} normalized tags ({actual})")
             }
             Self::EmptyTag { position } => write!(f, "prompt tag at position {position} is empty"),
+            Self::InvalidTag { position } => write!(
+                f,
+                "prompt tag at position {position} must use printable ASCII characters"
+            ),
             Self::TagTooLong {
                 position,
                 actual,
@@ -342,9 +350,12 @@ where
 pub fn normalized_tags(tags: &[String]) -> Result<Vec<String>, PromptValidationError> {
     let mut normalized = Vec::with_capacity(tags.len());
     for (position, tag) in tags.iter().enumerate() {
-        let tag = trim_prompt_whitespace(tag).to_lowercase();
+        let tag = trim_prompt_whitespace(tag).to_ascii_lowercase();
         if tag.is_empty() {
             return Err(PromptValidationError::EmptyTag { position });
+        }
+        if tag.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
+            return Err(PromptValidationError::InvalidTag { position });
         }
         let actual = tag.chars().count();
         if actual > MAX_PROMPT_TAG_SCALARS {
@@ -1568,6 +1579,11 @@ fn validate_chain_event_wire(event: &PromptChainEvent) -> Result<(), String> {
         } => {
             if *revision == 0 {
                 return Err("prompt chain links event revision is invalid".into());
+            }
+            if links.len() > MAX_PROMPT_CHAIN_LINKS {
+                return Err(format!(
+                    "prompt chain exceeds maximum of {MAX_PROMPT_CHAIN_LINKS} links"
+                ));
             }
             for (position, link) in links.iter().enumerate() {
                 let expected_position =

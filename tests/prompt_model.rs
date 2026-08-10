@@ -7,8 +7,8 @@ use devmanager::prompts::{
     PromptChainLink, PromptCommand, PromptValidationError, PromptVersion, RemovePromptChainLink,
     RenamePrompt, RenamePromptChain, RestorePrompt, RestorePromptChain, SetPromptTags,
     UpdatePromptChainLinkVersion, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS,
-    MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS, MAX_PROMPT_TAGS,
-    MAX_PROMPT_TAG_SCALARS, MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES,
+    MAX_PROMPT_CHAIN_LINKS, MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS,
+    MAX_PROMPT_TAGS, MAX_PROMPT_TAG_SCALARS, MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES,
     MAX_PROMPT_VARIABLE_NAME_SCALARS,
 };
 
@@ -104,6 +104,34 @@ fn prompt_tags_are_bounded_and_normalized() {
     .validate()
     .unwrap_err();
     assert!(matches!(error, PromptValidationError::TagTooLong { .. }));
+}
+
+#[test]
+fn prompt_tags_use_printable_lowercase_ascii_policy() {
+    let non_ascii = CreatePrompt {
+        prompt_id: PromptId::new(),
+        prompt_version_id: PromptVersionId::new(),
+        title: "Prompt".into(),
+        description: None,
+        tags: vec!["café".into()],
+        variables: Vec::new(),
+        body: "body".into(),
+        created_at_ms: 1,
+    };
+    assert!(matches!(
+        non_ascii.validate(),
+        Err(PromptValidationError::InvalidTag { .. })
+    ));
+
+    let normalized = SetPromptTags {
+        prompt_id: PromptId::new(),
+        tags: vec![" Review-1 ".into()],
+        expected_revision: 1,
+    };
+    assert_eq!(
+        normalized.validate().expect("ASCII tags normalize"),
+        vec!["review-1"]
+    );
 }
 
 #[test]
@@ -215,6 +243,30 @@ fn chain_metadata_uses_the_same_unicode_scalar_bounds() {
         error,
         PromptValidationError::DescriptionTooLong { .. }
     ));
+}
+
+#[test]
+fn prompt_chain_event_codec_enforces_the_two_thousand_link_cap() {
+    let chain_id = PromptChainId::new();
+    let links = (0..=MAX_PROMPT_CHAIN_LINKS)
+        .map(|position| PromptChainLink {
+            id: PromptChainLinkId::new(),
+            chain_id,
+            position: u32::try_from(position).expect("test position fits u32"),
+            prompt_id: PromptId::new(),
+            prompt_version_id: PromptVersionId::new(),
+        })
+        .collect();
+    let event = PromptChainEvent::PromptChainLinksReplaced {
+        chain_id,
+        links,
+        revision: 1,
+    };
+    let payload = event.encode().expect("encode bounded chain event fixture");
+    assert!(
+        PromptChainEvent::decode(&payload).is_err(),
+        "public codec must enforce the SQLite/store 2,000-link cap"
+    );
 }
 
 #[test]

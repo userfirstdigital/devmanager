@@ -19,13 +19,13 @@ use super::model::{
     PromptEvent, PromptMutationReceipt, PromptProjectionRebuild, PromptSnapshot,
     PromptValidationError, PromptVersion, RemovePromptChainLink, RenamePrompt, RenamePromptChain,
     RestorePrompt, RestorePromptChain, SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion,
-    MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS, MAX_PROMPT_CHAIN_TITLE_SCALARS,
-    MAX_PROMPT_PAGE_SIZE, MAX_PROMPT_TAGS, MAX_PROMPT_VARIABLES, PROMPT_WIRE_SCHEMA_VERSION,
+    MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS, MAX_PROMPT_CHAIN_LINKS,
+    MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_PAGE_SIZE, MAX_PROMPT_TAGS, MAX_PROMPT_VARIABLES,
+    PROMPT_WIRE_SCHEMA_VERSION,
 };
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION: u32 = 2;
-const MAX_PROMPT_CHAIN_LINKS: usize = 2_000;
 const MAX_PROMPT_JOURNAL_ROWS: usize = 10_000;
 const MAX_PROMPT_WIRE_BYTES: usize = 512 * 1024;
 const CURRENT_VERSION_LATEST_TRIGGER_SQL: &str =
@@ -193,7 +193,7 @@ impl PromptStore {
     pub fn open(path: &Path) -> Result<Self, PromptStoreError> {
         crate::kernel::KernelStore::open(path)
             .map_err(|error| PromptStoreError::Database(error.to_string()))?;
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
@@ -210,11 +210,7 @@ impl PromptStore {
                 "prompt lineage migration state is missing; exact repair is required".into(),
             ));
         };
-        if blocked != 0 {
-            return Err(PromptStoreError::Corruption(
-                "legacy prompt lineage is quarantined and requires exact repair".into(),
-            ));
-        }
+        validate_prompt_lineage_quarantine_ledger(&conn)?;
         let quarantine_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM prompt_lineage_quarantine",
             [],
@@ -229,12 +225,31 @@ impl PromptStore {
             [],
             |row| row.get(0),
         )?;
+        let derived_blocked = if quarantine_count != 0 || missing_payload_count != 0 {
+            1
+        } else {
+            0
+        };
+        if blocked != derived_blocked {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage migration state disagrees with derived repair state".into(),
+            ));
+        }
+        if blocked != 0 {
+            return Err(PromptStoreError::Corruption(
+                "legacy prompt lineage is quarantined and requires exact repair".into(),
+            ));
+        }
         if quarantine_count != 0 || missing_payload_count != 0 {
             return Err(PromptStoreError::Corruption(
                 "prompt lineage has unrepaired quarantine or missing command payloads".into(),
             ));
         }
+        validate_prompt_journal_bounds(&conn)?;
         validate_prompt_command_payloads(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prompt_lineage(&tx)?;
+        tx.rollback()?;
         Ok(Self { conn })
     }
 
@@ -637,6 +652,8 @@ impl PromptStore {
             )));
         }
         validate_current_version_projection(&tx)?;
+        validate_event_sequence_domain(&tx, "prompt_events")?;
+        validate_event_sequence_domain(&tx, "prompt_chain_events")?;
         tx.execute_batch(
             "DROP TRIGGER IF EXISTS saved_prompts_current_version_is_latest;\n\
              DROP TRIGGER IF EXISTS saved_prompts_current_version_is_latest_insert;",
@@ -651,6 +668,7 @@ impl PromptStore {
 
         let mut prompt_events_replayed = 0usize;
         let mut last_sequence = 0i64;
+        let mut expected_sequence = 1i64;
         let mut event_version_ids =
             HashSet::with_capacity(prompt_event_count.min(MAX_PROMPT_JOURNAL_ROWS));
         while let Some((
@@ -663,7 +681,15 @@ impl PromptStore {
             payload,
         )) = next_prompt_event_row(&tx, last_sequence)?
         {
+            if sequence != expected_sequence {
+                return Err(PromptStoreError::Corruption(
+                    "prompt event sequence is not a contiguous prefix".into(),
+                ));
+            }
             last_sequence = sequence;
+            expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+                PromptStoreError::Corruption("prompt event sequence overflow".into())
+            })?;
             let (event, occurred_at_ms, receipt_version_id) = validate_prompt_event_row(
                 &tx,
                 &event_id,
@@ -693,6 +719,7 @@ impl PromptStore {
 
         let mut chain_events_replayed = 0usize;
         let mut last_chain_sequence = 0i64;
+        let mut expected_chain_sequence = 1i64;
         while let Some((
             sequence,
             event_id,
@@ -703,7 +730,15 @@ impl PromptStore {
             payload,
         )) = next_chain_event_row(&tx, last_chain_sequence)?
         {
+            if sequence != expected_chain_sequence {
+                return Err(PromptStoreError::Corruption(
+                    "prompt chain event sequence is not a contiguous prefix".into(),
+                ));
+            }
             last_chain_sequence = sequence;
+            expected_chain_sequence = expected_chain_sequence.checked_add(1).ok_or_else(|| {
+                PromptStoreError::Corruption("prompt chain event sequence overflow".into())
+            })?;
             let (event, occurred_at_ms, command, resolved_prompt_version_id) =
                 validate_chain_event_row(
                     &tx,
@@ -856,6 +891,596 @@ fn validate_prompt_command_payloads(conn: &Connection) -> Result<(), PromptStore
     Ok(())
 }
 
+fn validate_prompt_journal_bounds(conn: &Connection) -> Result<(), PromptStoreError> {
+    let mut journal_rows = 0usize;
+    for table in [
+        "prompt_events",
+        "prompt_chain_events",
+        "prompt_command_receipts",
+        "prompt_chain_command_receipts",
+        "prompt_versions",
+    ] {
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        let count = usize::try_from(count)
+            .map_err(|_| PromptStoreError::Corruption("negative prompt journal count".into()))?;
+        journal_rows = journal_rows
+            .checked_add(count)
+            .ok_or_else(|| PromptStoreError::Corruption("prompt journal count overflow".into()))?;
+        if journal_rows > MAX_PROMPT_JOURNAL_ROWS {
+            return Err(PromptStoreError::Corruption(format!(
+                "prompt journal exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
+            )));
+        }
+    }
+    Ok(())
+}
+
+type QuarantineLedgerRow = (i64, String, Vec<u8>, Option<Vec<u8>>, String, Vec<u8>, i64);
+
+fn validate_prompt_lineage_quarantine_ledger(conn: &Connection) -> Result<(), PromptStoreError> {
+    let ledger_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM prompt_lineage_quarantine_ledger",
+        [],
+        |row| row.get(0),
+    )?;
+    let ledger_count = usize::try_from(ledger_count)
+        .map_err(|_| PromptStoreError::Corruption("negative lineage ledger count".into()))?;
+    if ledger_count > MAX_PROMPT_JOURNAL_ROWS {
+        return Err(PromptStoreError::Corruption(format!(
+            "prompt lineage ledger exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
+        )));
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT quarantine_id, source_kind, command_id, event_id, reason,
+                command_sha256, quarantined_at_ms
+         FROM prompt_lineage_quarantine_ledger
+         ORDER BY quarantine_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ))
+    })?;
+    for row in rows {
+        let ledger: QuarantineLedgerRow = row?;
+        let current: Option<QuarantineLedgerRow> = conn
+            .query_row(
+                "SELECT quarantine_id, source_kind, command_id, event_id, reason,
+                        command_sha256, quarantined_at_ms
+                 FROM prompt_lineage_quarantine
+                 WHERE quarantine_id = ?1",
+                [ledger.0],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match current {
+            Some(current) if current != ledger => {
+                return Err(PromptStoreError::Corruption(
+                    "prompt lineage quarantine row disagrees with its immutable ledger".into(),
+                ));
+            }
+            Some(_) => {}
+            None if quarantine_repair_proof_exists(conn, &ledger)? => {}
+            None => {
+                return Err(PromptStoreError::Corruption(
+                    "prompt lineage quarantine deletion lacks canonical repair proof".into(),
+                ));
+            }
+        }
+    }
+
+    let unknown_quarantine: Option<i64> = conn
+        .query_row(
+            "SELECT quarantine.quarantine_id
+             FROM prompt_lineage_quarantine AS quarantine
+             LEFT JOIN prompt_lineage_quarantine_ledger AS ledger
+               ON ledger.quarantine_id = quarantine.quarantine_id
+             WHERE ledger.quarantine_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if unknown_quarantine.is_some() {
+        return Err(PromptStoreError::Corruption(
+            "prompt lineage quarantine row has no immutable ledger entry".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn quarantine_repair_proof_exists(
+    conn: &Connection,
+    ledger: &QuarantineLedgerRow,
+) -> Result<bool, PromptStoreError> {
+    let (quarantine_id, source_kind, command_id, event_id, _reason, command_sha256, _at) = ledger;
+    if *quarantine_id <= 0 || command_sha256.len() != 32 {
+        return Ok(false);
+    }
+    let hash_is_unknown = command_sha256.iter().all(|byte| *byte == 0);
+    match source_kind.as_str() {
+        "prompt_receipt" if event_id.is_none() => {
+            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+                .query_row(
+                    "SELECT command_sha256, command_payload
+                     FROM prompt_command_receipts WHERE command_id = ?1",
+                    [command_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(hash, payload)| {
+                payload.is_some_and(|payload| {
+                    !payload.is_empty()
+                        && (hash_is_unknown || hash.as_slice() == command_sha256.as_slice())
+                })
+            }))
+        }
+        "prompt_chain_receipt" if event_id.is_none() => {
+            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+                .query_row(
+                    "SELECT command_sha256, command_payload
+                     FROM prompt_chain_command_receipts WHERE command_id = ?1",
+                    [command_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(hash, payload)| {
+                payload.is_some_and(|payload| {
+                    !payload.is_empty()
+                        && (hash_is_unknown || hash.as_slice() == command_sha256.as_slice())
+                })
+            }))
+        }
+        "prompt_event" => {
+            let Some(event_id) = event_id.as_deref() else {
+                return Ok(false);
+            };
+            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = conn
+                .query_row(
+                    "SELECT event.command_id, receipt.command_sha256, receipt.command_payload
+                     FROM prompt_events AS event
+                     JOIN prompt_command_receipts AS receipt
+                       ON receipt.command_id = event.command_id
+                     WHERE event.prompt_event_id = ?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(event_command_id, hash, payload)| {
+                event_command_id == *command_id
+                    && payload.is_some_and(|payload| {
+                        !payload.is_empty()
+                            && (hash_is_unknown || hash.as_slice() == command_sha256.as_slice())
+                    })
+            }))
+        }
+        "prompt_chain_event" => {
+            let Some(event_id) = event_id.as_deref() else {
+                return Ok(false);
+            };
+            let row: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = conn
+                .query_row(
+                    "SELECT event.command_id, receipt.command_sha256, receipt.command_payload
+                     FROM prompt_chain_events AS event
+                     JOIN prompt_chain_command_receipts AS receipt
+                       ON receipt.command_id = event.command_id
+                     WHERE event.prompt_chain_event_id = ?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(event_command_id, hash, payload)| {
+                event_command_id == *command_id
+                    && payload.is_some_and(|payload| {
+                        !payload.is_empty()
+                            && (hash_is_unknown || hash.as_slice() == command_sha256.as_slice())
+                    })
+            }))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn validate_event_sequence_domain(
+    tx: &Transaction<'_>,
+    table: &str,
+) -> Result<(), PromptStoreError> {
+    let table = match table {
+        "prompt_events" | "prompt_chain_events" => table,
+        _ => {
+            return Err(PromptStoreError::Corruption(
+                "unsupported prompt event table".into(),
+            ))
+        }
+    };
+    let has_invalid_sequence: i64 = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE sequence < 1)"),
+        [],
+        |row| row.get(0),
+    )?;
+    if has_invalid_sequence != 0 {
+        return Err(PromptStoreError::Corruption(format!(
+            "{table} contains a non-positive sequence"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_prompt_lineage(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    validate_current_version_projection(tx)?;
+    validate_event_sequence_domain(tx, "prompt_events")?;
+    validate_event_sequence_domain(tx, "prompt_chain_events")?;
+    let projection = capture_projection_snapshot(tx)?;
+
+    let mut last_sequence = 0_i64;
+    let mut expected_sequence = 1_i64;
+    let mut event_version_ids = HashSet::new();
+    while let Some((
+        sequence,
+        event_id,
+        command_id,
+        prompt_id,
+        event_type,
+        occurred_at_ms,
+        payload,
+    )) = next_prompt_event_row(tx, last_sequence)?
+    {
+        if sequence != expected_sequence {
+            return Err(PromptStoreError::Corruption(
+                "prompt event sequence is not a contiguous prefix".into(),
+            ));
+        }
+        last_sequence = sequence;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| PromptStoreError::Corruption("prompt event sequence overflow".into()))?;
+        let (event, _occurred_at_ms, receipt_version_id) = validate_prompt_event_row(
+            tx,
+            &event_id,
+            &command_id,
+            &prompt_id,
+            &event_type,
+            occurred_at_ms,
+            &payload,
+        )?;
+        match &event {
+            PromptEvent::PromptCreated { version, .. }
+            | PromptEvent::PromptVersionCreated { version, .. } => {
+                event_version_ids.insert(version.id);
+            }
+            _ => {}
+        }
+        validate_prompt_event_temporal_lineage(tx, &event, receipt_version_id)?;
+    }
+    validate_prompt_version_event_coverage(tx, &event_version_ids)?;
+
+    let mut last_chain_sequence = 0_i64;
+    let mut expected_chain_sequence = 1_i64;
+    while let Some((
+        sequence,
+        event_id,
+        command_id,
+        chain_id,
+        event_type,
+        occurred_at_ms,
+        payload,
+    )) = next_chain_event_row(tx, last_chain_sequence)?
+    {
+        if sequence != expected_chain_sequence {
+            return Err(PromptStoreError::Corruption(
+                "prompt chain event sequence is not a contiguous prefix".into(),
+            ));
+        }
+        last_chain_sequence = sequence;
+        expected_chain_sequence = expected_chain_sequence.checked_add(1).ok_or_else(|| {
+            PromptStoreError::Corruption("prompt chain event sequence overflow".into())
+        })?;
+        validate_chain_event_row(
+            tx,
+            &event_id,
+            &command_id,
+            &chain_id,
+            &event_type,
+            occurred_at_ms,
+            &payload,
+        )?;
+    }
+
+    validate_all_prompt_receipts(tx)?;
+    validate_all_chain_receipts(tx)?;
+    validate_projection_records(tx)?;
+    replay_and_compare_projection(tx, projection)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionSnapshot {
+    prompts: Vec<PromptProjectionRow>,
+    tags: Vec<TagProjectionRow>,
+    chains: Vec<ChainProjectionRow>,
+    links: Vec<LinkProjectionRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptProjectionRow {
+    prompt_id: Vec<u8>,
+    title: String,
+    description: Option<String>,
+    current_version_id: Vec<u8>,
+    revision: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    archived_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagProjectionRow {
+    prompt_id: Vec<u8>,
+    tag: String,
+    position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainProjectionRow {
+    chain_id: Vec<u8>,
+    title: String,
+    description: Option<String>,
+    revision: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    archived_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkProjectionRow {
+    link_id: Vec<u8>,
+    chain_id: Vec<u8>,
+    position: i64,
+    prompt_id: Vec<u8>,
+    prompt_version_id: Vec<u8>,
+}
+
+fn capture_projection_snapshot(
+    tx: &Transaction<'_>,
+) -> Result<ProjectionSnapshot, PromptStoreError> {
+    let prompt_count = bounded_projection_count(tx, "saved_prompts")?;
+    let tag_count = bounded_projection_count(tx, "prompt_tags")?;
+    let chain_count = bounded_projection_count(tx, "prompt_chains")?;
+    let link_count = bounded_projection_count(tx, "prompt_chain_links")?;
+
+    let mut prompts = Vec::with_capacity(prompt_count);
+    let mut statement = tx.prepare(
+        "SELECT prompt_id, title, description, current_version_id,
+                revision, created_at_ms, updated_at_ms, archived_at_ms
+         FROM saved_prompts ORDER BY prompt_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(PromptProjectionRow {
+            prompt_id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            current_version_id: row.get(3)?,
+            revision: row.get(4)?,
+            created_at_ms: row.get(5)?,
+            updated_at_ms: row.get(6)?,
+            archived_at_ms: row.get(7)?,
+        })
+    })?;
+    for row in rows {
+        prompts.push(row?);
+    }
+
+    let mut tags = Vec::with_capacity(tag_count);
+    let mut statement = tx.prepare(
+        "SELECT prompt_id, tag, position FROM prompt_tags
+         ORDER BY prompt_id, position, tag",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(TagProjectionRow {
+            prompt_id: row.get(0)?,
+            tag: row.get(1)?,
+            position: row.get(2)?,
+        })
+    })?;
+    for row in rows {
+        tags.push(row?);
+    }
+
+    let mut chains = Vec::with_capacity(chain_count);
+    let mut statement = tx.prepare(
+        "SELECT chain_id, title, description, revision,
+                created_at_ms, updated_at_ms, archived_at_ms
+         FROM prompt_chains ORDER BY chain_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ChainProjectionRow {
+            chain_id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            revision: row.get(3)?,
+            created_at_ms: row.get(4)?,
+            updated_at_ms: row.get(5)?,
+            archived_at_ms: row.get(6)?,
+        })
+    })?;
+    for row in rows {
+        chains.push(row?);
+    }
+
+    let mut links = Vec::with_capacity(link_count);
+    let mut statement = tx.prepare(
+        "SELECT link_id, chain_id, position, prompt_id, prompt_version_id
+         FROM prompt_chain_links ORDER BY chain_id, position, link_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(LinkProjectionRow {
+            link_id: row.get(0)?,
+            chain_id: row.get(1)?,
+            position: row.get(2)?,
+            prompt_id: row.get(3)?,
+            prompt_version_id: row.get(4)?,
+        })
+    })?;
+    for row in rows {
+        links.push(row?);
+    }
+
+    Ok(ProjectionSnapshot {
+        prompts,
+        tags,
+        chains,
+        links,
+    })
+}
+
+fn bounded_projection_count(tx: &Transaction<'_>, table: &str) -> Result<usize, PromptStoreError> {
+    let sql = match table {
+        "saved_prompts" | "prompt_tags" | "prompt_chains" | "prompt_chain_links" => {
+            format!("SELECT COUNT(*) FROM {table}")
+        }
+        _ => {
+            return Err(PromptStoreError::Corruption(
+                "unsupported prompt projection table".into(),
+            ))
+        }
+    };
+    let count: i64 = tx.query_row(&sql, [], |row| row.get(0))?;
+    let count = usize::try_from(count)
+        .map_err(|_| PromptStoreError::Corruption("negative prompt projection count".into()))?;
+    if count > MAX_PROMPT_JOURNAL_ROWS {
+        return Err(PromptStoreError::Corruption(format!(
+            "prompt projection exceeds maximum of {MAX_PROMPT_JOURNAL_ROWS} rows"
+        )));
+    }
+    Ok(count)
+}
+
+fn replay_and_compare_projection(
+    tx: &Transaction<'_>,
+    expected: ProjectionSnapshot,
+) -> Result<(), PromptStoreError> {
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS saved_prompts_current_version_is_latest;
+         DROP TRIGGER IF EXISTS saved_prompts_current_version_is_latest_insert;
+         DELETE FROM prompt_chain_links;
+         DELETE FROM prompt_chains;
+         DELETE FROM prompt_tags;
+         DELETE FROM saved_prompts;",
+    )?;
+
+    let mut last_sequence = 0_i64;
+    while let Some((
+        sequence,
+        _event_id,
+        _command_id,
+        _prompt_id,
+        _event_type,
+        occurred_at_ms,
+        payload,
+    )) = next_prompt_event_row(tx, last_sequence)?
+    {
+        last_sequence = sequence;
+        let event = PromptEvent::decode(&payload)
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        apply_event(tx, &event, occurred_at_ms)?;
+    }
+
+    let mut last_chain_sequence = 0_i64;
+    while let Some((
+        sequence,
+        _event_id,
+        command_id,
+        _chain_id,
+        _event_type,
+        occurred_at_ms,
+        payload,
+    )) = next_chain_event_row(tx, last_chain_sequence)?
+    {
+        last_chain_sequence = sequence;
+        let event = PromptChainEvent::decode(&payload)
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        let command_payload: Vec<u8> = tx.query_row(
+            "SELECT command_payload FROM prompt_chain_command_receipts WHERE command_id = ?1",
+            [command_id.as_slice()],
+            |row| row.get(0),
+        )?;
+        let decoded_command = decode_chain_command(&command_payload)?;
+        apply_chain_event(
+            tx,
+            &event,
+            occurred_at_ms,
+            &decoded_command.command,
+            decoded_command.resolved_prompt_version_id,
+        )?;
+    }
+
+    let actual = capture_projection_snapshot(tx)?;
+    if actual != expected {
+        return Err(PromptStoreError::Corruption(
+            "current prompt projection does not match exact durable event replay".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_records(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {
+    let mut statement = tx.prepare("SELECT prompt_id FROM saved_prompts ORDER BY prompt_id")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    for row in rows {
+        let prompt_id = prompt_id_from_bytes(&row?)?;
+        let prompt = load_prompt(tx, prompt_id)?.ok_or_else(|| {
+            PromptStoreError::Corruption("saved prompt projection row disappeared".into())
+        })?;
+        validate_saved_prompt_record(tx, &prompt)?;
+    }
+
+    let mut statement = tx.prepare("SELECT chain_id FROM prompt_chains ORDER BY chain_id")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    for row in rows {
+        let chain_id = prompt_chain_id_from_bytes(&row?)?;
+        let chain = load_chain(tx, chain_id)?.ok_or_else(|| {
+            PromptStoreError::Corruption("prompt chain projection row disappeared".into())
+        })?;
+        let links = load_chain_links(tx, chain.id)?;
+        validate_chain_links(tx, chain.id, &links)?;
+    }
+
+    let orphan_version_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_versions AS version
+         WHERE NOT EXISTS (
+           SELECT 1 FROM saved_prompts AS prompt
+           WHERE prompt.prompt_id = version.prompt_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan_version_count != 0 {
+        return Err(PromptStoreError::Corruption(
+            "prompt version has no saved prompt projection".into(),
+        ));
+    }
+    Ok(())
+}
+
 type PromptEventRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Vec<u8>);
 
 fn next_prompt_event_row(
@@ -962,12 +1587,10 @@ fn canonical_prompt_command(mut command: PromptCommand) -> Result<PromptCommand,
 }
 
 fn validate_sql_tags(tags: &[String]) -> Result<(), PromptStoreError> {
-    if tags.iter().any(|tag| {
-        tag.is_empty()
-            || tag != trim_prompt_whitespace(tag)
-            || tag.bytes().any(|byte| !(0x20..=0x7e).contains(&byte))
-            || tag.as_str() != tag.to_ascii_lowercase()
-    }) {
+    let normalized = normalized_tags(tags).map_err(|_| {
+        PromptStoreError::Corruption("prompt tags must use printable lowercase ASCII".into())
+    })?;
+    if normalized != tags {
         return Err(PromptStoreError::Corruption(
             "prompt tags must use printable lowercase ASCII".into(),
         ));
