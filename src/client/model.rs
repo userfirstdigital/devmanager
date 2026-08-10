@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactSummary;
@@ -27,14 +28,22 @@ pub const MAX_CLIENT_REPLAY_PAGES: usize = 1_024;
 pub const MAX_CLIENT_REPLAY_CURSORS: usize = 1_024;
 /// Search input is client-local presentation data, not an unbounded query.
 pub const MAX_CLIENT_SEARCH_CHARS: usize = 160;
-const MAX_INDEXED_TITLE_CHARS: usize = 1_024;
+/// Only this bounded title prefix is retained by the client search index.
+/// The host remains authoritative for the complete title.
+pub const MAX_INDEXED_TITLE_CHARS: usize = MAX_CLIENT_SEARCH_CHARS;
 /// Maximum indexed search identities handed to one bounded UI projection.
 /// The index still reports the complete truthful match count separately.
 pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
 /// Search postings cannot admit more identities than one bounded client
 /// model. This keeps every posting finite while preserving its exact count.
 pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
-const MAX_INDEXED_GRAM_CHARS: usize = 4;
+/// Exact postings cover common longer queries without a candidate scan.
+const MAX_INDEXED_GRAM_CHARS: usize = 8;
+/// Hard upper bound for the number of numeric posting identities retained by
+/// one model. Titles and grams are both prefix-bounded before this product is
+/// reached; the counter is exposed for diagnostics without scanning postings.
+pub const MAX_CLIENT_SEARCH_POSTING_ENTRIES: usize =
+    MAX_CLIENT_MODEL_ITEMS * MAX_INDEXED_TITLE_CHARS * MAX_INDEXED_GRAM_CHARS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -135,7 +144,7 @@ struct SearchPosting {
 }
 
 impl SearchPosting {
-    fn insert(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+    fn insert(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
         let key = SearchOrderKey::new(task_id, entry);
         let set = if entry.lifecycle == TaskLifecycle::Archived {
             &mut self.archived
@@ -143,18 +152,19 @@ impl SearchPosting {
             &mut self.active
         };
         if set.len() < MAX_CLIENT_SEARCH_POSTING_IDS {
-            set.insert(key);
+            return set.insert(key);
         }
+        false
     }
 
-    fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+    fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
         let key = SearchOrderKey::new(task_id, entry);
         let set = if entry.lifecycle == TaskLifecycle::Archived {
             &mut self.archived
         } else {
             &mut self.active
         };
-        set.remove(&key);
+        set.remove(&key)
     }
 
     fn ids(&self, archived: bool) -> &BTreeSet<SearchOrderKey> {
@@ -178,12 +188,14 @@ impl SearchPosting {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct SearchOrderKey {
     task_id: TaskId,
     attention_rank: u8,
     occurred_at_ms: i64,
     revision: u64,
+    lower_title: Arc<str>,
+    title: Arc<str>,
 }
 
 impl SearchOrderKey {
@@ -193,6 +205,8 @@ impl SearchOrderKey {
             attention_rank: entry.attention_rank,
             occurred_at_ms: entry.occurred_at_ms,
             revision: entry.revision,
+            lower_title: Arc::clone(&entry.lower_title),
+            title: Arc::clone(&entry.title),
         }
     }
 }
@@ -203,6 +217,8 @@ impl Ord for SearchOrderKey {
             .cmp(&other.attention_rank)
             .then_with(|| other.occurred_at_ms.cmp(&self.occurred_at_ms))
             .then_with(|| other.revision.cmp(&self.revision))
+            .then_with(|| self.lower_title.cmp(&other.lower_title))
+            .then_with(|| self.title.cmp(&other.title))
             .then_with(|| self.task_id.cmp(&other.task_id))
     }
 }
@@ -219,8 +235,8 @@ struct TaskProjectionEntry {
     attention_rank: u8,
     occurred_at_ms: i64,
     revision: u64,
-    lower_title: String,
-    title: String,
+    lower_title: Arc<str>,
+    title: Arc<str>,
 }
 
 /// Incremental, client-owned ordering index for Task Cockpit projections.
@@ -234,11 +250,13 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
-    /// Compact substring postings. Each entry stores only numeric ordering
-    /// metadata and a TaskId; title strings remain in `entries` exactly once.
+    /// Compact substring postings. Each entry stores bounded ordering metadata
+    /// and a TaskId; title strings remain in `entries` exactly once through
+    /// shared `Arc<str>` values.
     /// The active/archive sets make the common exact-gram path independent of
     /// the 100k task map.
     search: BTreeMap<String, SearchPosting>,
+    search_posting_entries: usize,
     full_rebuilds: u64,
     incremental_updates: u64,
 }
@@ -257,6 +275,7 @@ impl TaskProjectionIndex {
         let mut active_order = BTreeSet::new();
         let mut archived_order = BTreeSet::new();
         let mut search = BTreeMap::<String, SearchPosting>::new();
+        let mut search_posting_entries: usize = 0;
         for (task_id, entry) in &entries {
             let key = TaskOrderKey::new(*task_id, entry);
             if entry.lifecycle == TaskLifecycle::Archived {
@@ -265,7 +284,9 @@ impl TaskProjectionIndex {
                 active_order.insert(key);
             }
             for token in search_tokens(&entry.lower_title) {
-                search.entry(token).or_default().insert(*task_id, entry);
+                if search.entry(token).or_default().insert(*task_id, entry) {
+                    search_posting_entries = search_posting_entries.saturating_add(1);
+                }
             }
         }
         Self {
@@ -274,6 +295,7 @@ impl TaskProjectionIndex {
             active_order,
             archived_order,
             search,
+            search_posting_entries,
             full_rebuilds: 1,
             incremental_updates: 0,
         }
@@ -353,8 +375,8 @@ impl TaskProjectionIndex {
             return (ids, count, count.min(MAX_CLIENT_SEARCH_RESULTS));
         }
 
-        // A complete one-to-four-character gram is an exact substring index
-        // entry. It is already sorted by deterministic attention/occurred
+        // A complete one-to-eight-character gram is an exact substring index
+        // entry. It is already sorted by deterministic attention/occurred/title
         // ordering, so no candidate scan or title clone is needed.
         if query.chars().count() <= MAX_INDEXED_GRAM_CHARS {
             let Some(posting) = self.search.get(&query) else {
@@ -425,6 +447,13 @@ impl TaskProjectionIndex {
         self.incremental_updates
     }
 
+    /// Number of retained numeric posting identities. This is maintained
+    /// incrementally so diagnostics do not walk the index or affect search
+    /// hot-path work.
+    pub fn search_index_posting_entries(&self) -> usize {
+        self.search_posting_entries
+    }
+
     fn set_revision(&mut self, revision: u64) {
         self.revision = revision;
     }
@@ -447,7 +476,9 @@ impl TaskProjectionIndex {
             .get(&task_id)
             .expect("inserted task projection entry");
         for token in search_tokens(&search_title) {
-            self.search.entry(token).or_default().insert(task_id, entry);
+            if self.search.entry(token).or_default().insert(task_id, entry) {
+                self.search_posting_entries = self.search_posting_entries.saturating_add(1);
+            }
         }
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
@@ -462,7 +493,10 @@ impl TaskProjectionIndex {
                     .search
                     .get_mut(&token)
                     .map(|keys| {
-                        keys.remove(task_id, &entry);
+                        if keys.remove(task_id, &entry) {
+                            self.search_posting_entries =
+                                self.search_posting_entries.saturating_sub(1);
+                        }
                         keys.is_empty()
                     })
                     .unwrap_or(false);
@@ -481,15 +515,14 @@ fn search_tokens(value: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     let mut tokens = BTreeSet::new();
     for index in 0..chars.len() {
-        tokens.insert(chars[index].to_string());
-        if let Some(next) = chars.get(index + 1) {
-            tokens.insert(format!("{}{}", chars[index], next));
-        }
-        if let (Some(next), Some(last)) = (chars.get(index + 1), chars.get(index + 2)) {
-            tokens.insert(format!("{}{}{}", chars[index], next, last));
-            if let Some(fourth) = chars.get(index + 3) {
-                tokens.insert(format!("{}{}{}{}", chars[index], next, last, fourth));
+        for length in 1..=MAX_INDEXED_GRAM_CHARS {
+            let Some(end) = index.checked_add(length) else {
+                break;
+            };
+            if end > chars.len() {
+                break;
             }
+            tokens.insert(chars[index..end].iter().collect());
         }
     }
     tokens.into_iter().collect()
@@ -497,13 +530,24 @@ fn search_tokens(value: &str) -> Vec<String> {
 
 impl TaskProjectionEntry {
     fn from_snapshot(snapshot: &TaskSnapshot, occurred_at_ms: i64) -> Self {
+        let title = snapshot
+            .task
+            .title
+            .chars()
+            .take(MAX_INDEXED_TITLE_CHARS)
+            .collect::<String>();
+        let lower_title = title
+            .to_lowercase()
+            .chars()
+            .take(MAX_INDEXED_TITLE_CHARS)
+            .collect::<String>();
         Self {
             lifecycle: snapshot.task.lifecycle,
             attention_rank: attention_rank(snapshot.visible_status()),
             occurred_at_ms,
             revision: snapshot.task.revision,
-            lower_title: snapshot.task.title.to_lowercase(),
-            title: snapshot.task.title.clone(),
+            lower_title: Arc::from(lower_title),
+            title: Arc::from(title),
         }
     }
 }
@@ -514,8 +558,8 @@ struct TaskOrderKey {
     attention_rank: u8,
     occurred_at_ms: i64,
     revision: u64,
-    lower_title: String,
-    title: String,
+    lower_title: Arc<str>,
+    title: Arc<str>,
 }
 
 impl TaskOrderKey {
@@ -525,8 +569,8 @@ impl TaskOrderKey {
             attention_rank: entry.attention_rank,
             occurred_at_ms: entry.occurred_at_ms,
             revision: entry.revision,
-            lower_title: entry.lower_title.clone(),
-            title: entry.title.clone(),
+            lower_title: Arc::clone(&entry.lower_title),
+            title: Arc::clone(&entry.title),
         }
     }
 }
@@ -615,6 +659,10 @@ impl ClientModel {
 
     pub fn task_projection_index_incremental_updates(&self) -> u64 {
         self.task_projection_index.incremental_updates()
+    }
+
+    pub fn task_projection_index_search_posting_entries(&self) -> usize {
+        self.task_projection_index.search_index_posting_entries()
     }
 
     pub fn task_last_occurred_at_ms(&self, task_id: TaskId) -> Option<i64> {

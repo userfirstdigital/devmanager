@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 const PREFERENCES_SCHEMA: &str = "devmanager.client-preferences/v1";
@@ -55,8 +56,46 @@ impl std::error::Error for ClientPreferenceError {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PreferencesFile {
     schema: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_cursor",
+        serialize_with = "serialize_cursor"
+    )]
     inbox_unread_cursor: Option<Vec<u8>>,
+}
+
+/// New files use compact base64 instead of JSON's one-number-per-byte array,
+/// while the deserializer keeps accepting the original array representation.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CursorWire {
+    Compact(String),
+    Legacy(Vec<u8>),
+}
+
+fn serialize_cursor<S>(cursor: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match cursor {
+        Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_cursor<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let cursor = Option::<CursorWire>::deserialize(deserializer)?;
+    match cursor {
+        None => Ok(None),
+        Some(CursorWire::Compact(encoded)) => STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(CursorWire::Legacy(bytes)) => Ok(Some(bytes)),
+    }
 }
 
 /// The only durable client-local file currently owned by the Inbox surface.
@@ -144,6 +183,12 @@ impl InboxPreferenceStore {
         };
         let bytes = serde_json::to_vec(&file)
             .map_err(|error| ClientPreferenceError::Encode(error.to_string()))?;
+        if bytes.len() as u64 > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: bytes.len() as u64,
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
         write_atomically(&self.path, &bytes)
             .map_err(|error| ClientPreferenceError::Io(format!("{}: {error}", self.path.display())))
     }
@@ -247,6 +292,15 @@ mod tests {
             store.load_unread_cursor().expect("missing field is valid"),
             None
         );
+        fs::write(
+            store.path(),
+            br#"{"schema":"devmanager.client-preferences/v1","inboxUnreadCursor":[1,2,3]}"#,
+        )
+        .expect("legacy array preference file");
+        assert_eq!(
+            store.load_unread_cursor().expect("legacy array is valid"),
+            Some(vec![1, 2, 3])
+        );
     }
 
     #[test]
@@ -269,6 +323,33 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains("devmanager-tmp")));
+    }
+
+    #[test]
+    fn maximum_cursor_round_trip_is_encoded_and_bounded_before_publish() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        let cursor = vec![0x5a; MAX_CURSOR_BYTES];
+
+        store
+            .save_unread_cursor(Some(&cursor))
+            .expect("maximum cursor should fit the encoded preference bound");
+        assert!(
+            fs::metadata(store.path())
+                .expect("preference metadata")
+                .len()
+                <= MAX_PREFERENCE_FILE_BYTES
+        );
+        assert_eq!(
+            store
+                .load_unread_cursor()
+                .expect("maximum cursor round trip"),
+            Some(cursor)
+        );
+        assert!(matches!(
+            store.save_unread_cursor(Some(&vec![0x5a; MAX_CURSOR_BYTES + 1])),
+            Err(ClientPreferenceError::CursorTooLarge(bytes)) if bytes == MAX_CURSOR_BYTES + 1
+        ));
     }
 
     #[test]

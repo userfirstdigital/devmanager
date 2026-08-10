@@ -463,6 +463,22 @@ impl ClientSubscription {
         Ok(())
     }
 
+    /// Fence this generation after its transport has already disappeared.
+    ///
+    /// There is no remote release to send in this path, but callers still
+    /// retain `Arc` handles to the old subscription while replacing it.  Mark
+    /// those handles Released and drop their bounded queues/model so a late
+    /// tail can never mutate the replacement generation.
+    pub fn retire_without_transport(&mut self) {
+        self.subscription_id = None;
+        self.snapshot_id = None;
+        self.model = None;
+        self.seen_event_ids.clear();
+        self.seen_event_order.clear();
+        self.pending_replay_events.clear();
+        self.state = ClientSubscriptionState::Released;
+    }
+
     async fn best_effort_cleanup(&mut self, client: &mut HostClient) {
         if let Some(subscription_id) = self.subscription_id.take() {
             let _ = client.release_event_replay(subscription_id).await;

@@ -19,14 +19,15 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, ClientSubscription, ClientSubscriptionState, HostClient,
-    HostClientConfig, InboxHostController, InboxPreferenceStore, SubscriptionUpdate,
-    TrackedOperation, UnsolicitedServerMessage,
+    HostClientConfig, InboxHostController, InboxPreferenceStore, SubscriptionError,
+    SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
     RejectionCode,
 };
+use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
     AgentSessionId, ArtifactId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
     RequestId, ResourceId, TaskId,
@@ -579,6 +580,80 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
             .expect("archive command"),
         CommandReceipt::Accepted { .. }
     ));
+
+    let _ = host.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_native_next_synchronize_retires_old_tails_without_busy_leaks() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+    let controller_config = HostClientConfig {
+        named_profile: profile,
+        client_build: "native-next-repeated-sync-fixture".to_string(),
+        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7d)).expect("client id"),
+        requested: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::EventReplay,
+        ]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut readiness_client = connect_bounded(&controller_config, &mut host).await;
+    readiness_client.disconnect();
+    let mut controller = InboxHostController::new(
+        controller_config,
+        InboxPreferenceStore::at_profile_root(config_base.path().join("client-preferences")),
+    );
+    controller.synchronize().await.expect("initial synchronize");
+    let old_subscription = controller.subscription();
+    let old_subscription_id = old_subscription
+        .lock()
+        .expect("old subscription lock")
+        .subscription_id()
+        .expect("old replay subscription id");
+
+    for _ in 0..40 {
+        controller
+            .synchronize()
+            .await
+            .expect("repeated synchronize must not leak replay sessions");
+        assert_eq!(
+            controller.subscription_state(),
+            ClientSubscriptionState::Ready,
+            "every replacement must settle as ready"
+        );
+    }
+
+    assert_eq!(
+        old_subscription
+            .lock()
+            .expect("old subscription lock after replacement")
+            .state(),
+        ClientSubscriptionState::Released,
+        "old subscription must be explicitly released before replacement"
+    );
+    let late_tail = DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(0x7e)).expect("late event id"),
+        task_id: None,
+        sequence: 1,
+        task_revision: None,
+        occurred_at_ms: 1,
+        payload: Event::TaskReopened,
+    };
+    let late_error = old_subscription
+        .lock()
+        .expect("old subscription lock for late tail")
+        .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+            subscription_id: old_subscription_id,
+            event: late_tail,
+        })
+        .expect_err("late old-tail delivery must be fenced");
+    assert!(matches!(late_error, SubscriptionError::Released));
 
     let _ = host.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
 }

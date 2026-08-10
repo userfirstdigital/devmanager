@@ -1,3 +1,4 @@
+use devmanager::client::model::MAX_CLIENT_SEARCH_POSTING_ENTRIES;
 use devmanager::client::{
     ClientModel, ClientModelBuilder, HostClientConfig, InboxHostController, InboxPreferenceStore,
 };
@@ -1402,6 +1403,10 @@ fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertio
     let model = inbox_model(items);
     assert_eq!(model.task_projection_index_len(), 100_000);
     assert_eq!(model.task_projection_index_rebuilds(), 1);
+    assert!(
+        model.task_projection_index_search_posting_entries() <= MAX_CLIENT_SEARCH_POSTING_ENTRIES,
+        "search posting identities must remain within the bounded index budget"
+    );
 
     let first = Inbox::from_model(&model);
     let second = Inbox::from_model(&model);
@@ -1473,18 +1478,81 @@ fn indexed_search_keeps_common_and_adversarial_100k_queries_bounded_and_ordered(
         .collect();
     let model = inbox_model(items);
 
-    let queries = vec!["t".to_string(), "task".to_string(), "t".repeat(160)];
+    let queries = vec![
+        "t".to_string(),
+        "task".to_string(),
+        "task ".to_string(),
+        "Task 1234".to_string(),
+        "task ".repeat(32),
+        "é".repeat(160),
+        "t".repeat(160),
+    ];
     for query in queries {
         let (ids, total, work) = model.search_task_ids_with_work(&query, false);
-        if query == "t" || query == "task" {
+        if query == "t" || query == "task" || query == "task " {
             assert_eq!(total, 100_000, "truthful total for {query:?}");
             assert_eq!(ids.first().copied(), Some(inbox_task_id(99_999)));
+        } else if query == "Task 1234" {
+            assert_eq!(total, 11, "truthful specific-prefix total");
+            assert_eq!(ids.first().copied(), Some(inbox_task_id(12_349)));
         } else {
             assert_eq!(total, 0, "adversarial query must not fabricate matches");
         }
         assert!(ids.len() <= 5_000);
         assert!(work <= 5_000, "hot-path work must be capped for {query:?}");
     }
+}
+
+#[test]
+fn indexed_search_retains_title_tie_order_before_page_cap() {
+    let items = (0..6_000)
+        .map(|index| {
+            let title = if index % 2 == 0 {
+                format!("Task Alpha {index:04}")
+            } else {
+                format!("Task Zebra {index:04}")
+            };
+            inbox_task_item(
+                inbox_task_id(index),
+                &title,
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                1,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+    let (ids, total, work) = model.search_task_ids_with_work("task ", false);
+
+    let mut expected = (0..6_000)
+        .map(|index| {
+            (
+                if index % 2 == 0 {
+                    format!("task alpha {index:04}")
+                } else {
+                    format!("task zebra {index:04}")
+                },
+                inbox_task_id(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.cmp(right));
+    assert_eq!(total, 6_000);
+    assert_eq!(
+        ids,
+        expected
+            .into_iter()
+            .take(5_000)
+            .map(|(_, task_id)| task_id)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        work <= 5_000,
+        "title-index query scanned too many candidates"
+    );
 }
 
 #[test]

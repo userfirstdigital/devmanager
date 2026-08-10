@@ -132,11 +132,11 @@ impl InboxHostController {
     /// replay.  Replay events remain available through the shared subscription
     /// until the projection drains them.
     pub async fn synchronize(&mut self) -> Result<(), InboxControllerError> {
-        if self.subscription_state() == ClientSubscriptionState::Ready {
-            // Explicit synchronization always starts a fresh authoritative
-            // generation. This also makes a caller retry after a completed
-            // connection loss deterministic instead of returning NotReady.
-            self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        if self.subscription_state() != ClientSubscriptionState::Pending {
+            // Explicit synchronization always settles the old generation
+            // before replacing its Arc. This releases the host replay owner
+            // on a live connection and fences late tails on a lost one.
+            self.retire_subscription().await?;
         }
         if self.client.is_none() {
             self.client = Some(HostClient::connect(self.config.clone()).await?);
@@ -165,12 +165,25 @@ impl InboxHostController {
     /// before allowing live receive.  This makes a disconnect a bounded
     /// resync boundary rather than an attempt to apply stale events.
     pub async fn reconnect_and_synchronize(&mut self) -> Result<(), InboxControllerError> {
+        let old_subscription = Arc::clone(&self.subscription);
         if let Some(client) = self.client.as_mut() {
             if let Err(error) = client.reconnect().await {
+                old_subscription
+                    .lock()
+                    .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                    .retire_without_transport();
                 self.client = None;
                 return Err(error.into());
             }
+            old_subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
         } else {
+            old_subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
             self.client = Some(HostClient::connect(self.config.clone()).await?);
         }
         // A reconnect is a new subscription generation. Do not let a stale
@@ -178,6 +191,34 @@ impl InboxHostController {
         // or leak its old replay handoff into the new model.
         self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
         self.synchronize().await
+    }
+
+    async fn retire_subscription(&mut self) -> Result<(), InboxControllerError> {
+        let old_subscription = Arc::clone(&self.subscription);
+        let release_result = if let Some(client) = self.client.as_mut() {
+            let mut subscription = old_subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?;
+            Some(subscription.release(client).await)
+        } else {
+            old_subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
+            None
+        };
+        if let Some(Err(error)) = release_result {
+            if matches!(error, SubscriptionError::Transport(_)) {
+                old_subscription
+                    .lock()
+                    .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                    .retire_without_transport();
+                self.client = None;
+            }
+            return Err(error.into());
+        }
+        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        Ok(())
     }
 
     /// Drain one live update.  This is the only method that waits on host I/O;
