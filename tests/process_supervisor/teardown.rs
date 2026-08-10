@@ -14,10 +14,10 @@ use devmanager::process::registry::{
     ManagedProcessState, ProcessDisplayLabel, ProcessRegistry, RegisteredProcess,
 };
 use devmanager::process::teardown::{
-    AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
-    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionStore,
-    TeardownCoordinator, TeardownDeadline, TeardownEffects, TeardownOutcome, TeardownScope,
-    TeardownStage, TeardownTicket, WaitResult, WaitStage,
+    AdmissionReceipt, AdmissionState, BoxFuture, CleanupDeadline, ResidueEvidence, StageResult,
+    TeardownAdmission, TeardownAdmissionError, TeardownBudgets, TeardownClock,
+    TeardownCompletionStore, TeardownCoordinator, TeardownDeadline, TeardownEffects,
+    TeardownOutcome, TeardownScope, TeardownStage, TeardownTicket, WaitResult, WaitStage,
 };
 use tokio::sync::watch;
 
@@ -203,6 +203,7 @@ impl TeardownAdmission for FakeAdmission {
     fn close_admission(
         &self,
         ticket: &TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> Result<AdmissionReceipt, TeardownAdmissionError> {
         self.events
             .lock()
@@ -242,6 +243,7 @@ impl TeardownAdmission for FakeAdmission {
     fn close_admission_batch(
         &self,
         tickets: &[TeardownTicket],
+        _deadline: CleanupDeadline,
     ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError> {
         let mut rules = self.rules.lock().expect("admission rules");
         let mut receipts = Vec::with_capacity(tickets.len());
@@ -287,6 +289,7 @@ impl TeardownAdmission for FakeAdmission {
         &self,
         tickets: &[TeardownTicket],
         receipts: &[AdmissionReceipt],
+        _deadline: CleanupDeadline,
     ) -> Result<(), TeardownAdmissionError> {
         if tickets.len() != receipts.len() {
             return Err(TeardownAdmissionError::Other {
@@ -351,27 +354,36 @@ impl TeardownAdmission for BlockingAdmission {
     fn close_admission(
         &self,
         ticket: &TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> Result<AdmissionReceipt, TeardownAdmissionError> {
-        self.inner.close_admission(ticket)
+        self.inner.close_admission(ticket, deadline)
     }
 
     fn close_admission_batch(
         &self,
         tickets: &[TeardownTicket],
+        deadline: CleanupDeadline,
     ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError> {
         self.entered_batch.store(true, Ordering::SeqCst);
         while !self.release_batch.load(Ordering::SeqCst) {
+            if deadline.remaining().unwrap_or(Duration::ZERO).is_zero() {
+                return Err(TeardownAdmissionError::Timeout {
+                    detail: "admission close deadline expired".to_string(),
+                });
+            }
             std::thread::yield_now();
         }
-        self.inner.close_admission_batch(tickets)
+        self.inner.close_admission_batch(tickets, deadline)
     }
 
     fn rollback_admission_batch(
         &self,
         tickets: &[TeardownTicket],
         receipts: &[AdmissionReceipt],
+        deadline: CleanupDeadline,
     ) -> Result<(), TeardownAdmissionError> {
-        self.inner.rollback_admission_batch(tickets, receipts)
+        self.inner
+            .rollback_admission_batch(tickets, receipts, deadline)
     }
 }
 
@@ -477,6 +489,15 @@ impl TeardownClock for FakeClock {
             .expect("clock deadlines")
             .push(deadline);
         deadline
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanicClock;
+
+impl TeardownClock for PanicClock {
+    fn deadline(&self, _timeout: Duration) -> TeardownDeadline {
+        panic!("test clock panic")
     }
 }
 
@@ -947,14 +968,20 @@ impl BlockingConstructionEffects {
 
 impl TeardownEffects for BlockingConstructionEffects {
     fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let inner = self.inner.clone();
+        let ticket = ticket.clone();
+        let release = Arc::clone(&self.release);
+        let block_residue = self.block_residue;
         self.entered.store(true, Ordering::SeqCst);
-        if !self.block_residue {
-            while self.release.load(Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+        Box::pin(async move {
+            if !block_residue {
+                while release.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                inner.record(&ticket, "drain_future_constructed");
             }
-            self.inner.record(ticket, "drain_future_constructed");
-        }
-        self.inner.drain(ticket)
+            inner.drain(&ticket).await
+        })
     }
 
     fn cooperative_close<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
@@ -1001,12 +1028,18 @@ impl TeardownEffects for BlockingConstructionEffects {
     }
 
     fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
-        if self.block_residue {
-            while self.release.load(Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+        let inner = self.inner.clone();
+        let ticket = ticket.clone();
+        let release = Arc::clone(&self.release);
+        let block_residue = self.block_residue;
+        Box::pin(async move {
+            if block_residue {
+                while release.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
-        }
-        self.inner.residue(ticket)
+            inner.residue(&ticket).await
+        })
     }
 
     fn release_stopped_exact<'a>(
@@ -1770,7 +1803,7 @@ fn teardown_stage_future_construction_is_inside_the_deadline() {
 
     assert!(
         bounded.is_ok(),
-        "synchronous future construction must not bypass the stage deadline (elapsed {:?})",
+        "future polling must not bypass the stage deadline (elapsed {:?})",
         started.elapsed()
     );
     let report = bounded.expect("bounded stage report");
@@ -1807,7 +1840,7 @@ fn teardown_residue_future_construction_is_inside_the_deadline() {
 
     assert!(
         bounded.is_ok(),
-        "synchronous residue construction must not bypass its deadline"
+        "residue future polling must not bypass its deadline"
     );
     let report = bounded.expect("bounded residue report");
     assert_eq!(report.outcome(), TeardownOutcome::CleanupFailed);
@@ -1821,7 +1854,7 @@ fn teardown_residue_future_construction_is_inside_the_deadline() {
 }
 
 #[test]
-fn teardown_shutdown_waits_for_blocking_construction_before_return() {
+fn teardown_shutdown_cancels_pollable_effect_before_return() {
     let ticket = ticket(32, 52, TeardownScope::Host, 33, 132, 1_032);
     let admission = FakeAdmission::default();
     admission.allow(&ticket);
@@ -1856,18 +1889,17 @@ fn teardown_shutdown_waits_for_blocking_construction_before_return() {
         std::thread::yield_now();
     }
     let returned_before_release = returned.load(Ordering::SeqCst);
-    blocking.release();
     shutdown_thread
         .join()
-        .expect("shutdown must settle blocking worker");
+        .expect("shutdown must cancel the pollable worker");
 
     let events_at_return = events_at_return
         .lock()
         .expect("events at shutdown return")
         .expect("shutdown return event snapshot");
     assert!(
-        !returned_before_release,
-        "coordinator shutdown returned while effect construction was still blocked"
+        returned_before_release,
+        "coordinator shutdown must cancel a pollable effect without waiting for external release"
     );
     assert_eq!(
         events_at_return,
@@ -1932,6 +1964,90 @@ fn teardown_shutdown_race_rolls_back_admission_when_submission_closes() {
         !admission.launch_or_input_is_rejected(ticket.resource_id()),
         "a submission race must reopen the exact admission it did not schedule"
     );
+}
+
+#[test]
+fn teardown_stuck_admission_returns_typed_retention_at_the_absolute_deadline() {
+    let ticket = ticket(33, 53, TeardownScope::Host, 34, 133, 1_033);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let blocking_admission = BlockingAdmission::new(admission);
+    let coordinator = Arc::new(TeardownCoordinator::with_configuration(
+        Arc::new(blocking_admission.clone()),
+        Arc::new(FakeEffects::default()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::new(
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ),
+        TeardownCompletionStore::default(),
+    ));
+    let request_coordinator = Arc::clone(&coordinator);
+    let request_ticket = ticket.clone();
+    let started = Instant::now();
+    let request_thread = std::thread::spawn(move || request_coordinator.request(request_ticket));
+
+    blocking_admission.wait_until_batch_entered();
+    let result = request_thread
+        .join()
+        .expect("bounded admission request thread");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    match result {
+        Err(devmanager::process::teardown::TeardownReject::AdmissionTimeout { retained }) => {
+            assert_eq!(retained.tickets(), std::slice::from_ref(&ticket));
+            assert!(retained.receipts().is_empty());
+        }
+        other => panic!("expected retained admission timeout, got {other:?}"),
+    }
+    assert_eq!(coordinator.active_operation_count(), 0);
+    coordinator.shutdown();
+}
+
+#[test]
+fn teardown_clock_panic_and_duration_overflow_fail_closed_with_retained_ticket() {
+    let panic_ticket = ticket(34, 54, TeardownScope::Host, 35, 134, 1_034);
+    let panic_admission = FakeAdmission::default();
+    panic_admission.allow(&panic_ticket);
+    let panic_coordinator = TeardownCoordinator::with_configuration(
+        Arc::new(panic_admission),
+        Arc::new(FakeEffects::default()),
+        Arc::new(PanicClock),
+        1,
+        TeardownBudgets::default(),
+        TeardownCompletionStore::default(),
+    );
+    match panic_coordinator.request(panic_ticket.clone()) {
+        Err(devmanager::process::teardown::TeardownReject::CleanupFailed { retained }) => {
+            assert_eq!(retained.tickets(), std::slice::from_ref(&panic_ticket));
+            assert!(retained.receipts().is_empty());
+            assert!(retained.detail().contains("clock"));
+        }
+        other => panic!("expected clock CleanupFailed, got {other:?}"),
+    }
+    assert_eq!(panic_coordinator.active_operation_count(), 0);
+
+    let overflow_ticket = ticket(35, 55, TeardownScope::Host, 36, 135, 1_035);
+    let overflow_admission = FakeAdmission::default();
+    overflow_admission.allow(&overflow_ticket);
+    let overflow_coordinator = TeardownCoordinator::with_configuration(
+        Arc::new(overflow_admission),
+        Arc::new(FakeEffects::default()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::new(Duration::MAX, Duration::MAX, Duration::MAX),
+        TeardownCompletionStore::default(),
+    );
+    match overflow_coordinator.request(overflow_ticket.clone()) {
+        Err(devmanager::process::teardown::TeardownReject::CleanupFailed { retained }) => {
+            assert_eq!(retained.tickets(), std::slice::from_ref(&overflow_ticket));
+            assert!(retained.receipts().is_empty());
+            assert!(retained.detail().contains("overflow"));
+        }
+        other => panic!("expected overflow CleanupFailed, got {other:?}"),
+    }
+    assert_eq!(overflow_coordinator.active_operation_count(), 0);
 }
 
 #[test]

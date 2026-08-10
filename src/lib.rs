@@ -1,3 +1,6 @@
+#[cfg(test)]
+extern crate self as devmanager;
+
 pub mod ai;
 pub mod app;
 pub mod assets;

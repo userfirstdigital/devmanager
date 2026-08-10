@@ -58,7 +58,32 @@ impl std::error::Error for ProcessDisplayLabelError {}
 ///
 /// This query proves current membership only. It is deliberately not evidence
 /// that a caller successfully assigned a process to the Job.
-pub trait JobMembership {
+///
+/// The seam is crate-private: exposing it would let arbitrary callers block
+/// registry release or fabricate the membership observations that protect the
+/// receiver-owned ACTIVE_PROCESS_ZERO proof. Production entries use the
+/// concrete managed Windows Job adapter below.
+///
+/// The concrete adapter's membership queries and listener release are bounded
+/// by the Job/IOCP polling contract. An external blocking implementation is
+/// not an allowed registry authority.
+///
+/// ```compile_fail
+/// use devmanager::process::registry::{JobMemberInfo, JobMembership};
+///
+/// struct ExternalMembership;
+///
+/// impl JobMembership for ExternalMembership {
+///     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+///         Ok(Vec::new())
+///     }
+///     fn inspect_process(&self, _pid: u32) -> Result<JobMemberInfo, String> {
+///         panic!("external implementation must be rejected")
+///     }
+/// }
+/// ```
+#[allow(dead_code)]
+pub(crate) trait JobMembership {
     fn active_process_ids(&self) -> Result<Vec<u32>, String>;
 
     /// Terminate the owned Job tree, never a PID-selected process.
@@ -669,6 +694,7 @@ impl<J> ProcessRegistry<J> {
 
     /// Releases one stopped process only with the registry-minted authority
     /// bound to the exact teardown ticket, epoch, fence, and zero receipt.
+    #[allow(private_bounds)]
     pub fn release_stopped_with_authority(
         &mut self,
         ticket: &TeardownTicket,
@@ -758,6 +784,7 @@ impl<J> ProcessRegistry<J> {
     }
 }
 
+#[allow(private_bounds)]
 impl<J: JobMembership> ProcessRegistry<J> {
     pub fn register(
         &mut self,

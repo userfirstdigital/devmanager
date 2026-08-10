@@ -13,10 +13,10 @@ use devmanager::process::registry::{
     UnregisterOutcome,
 };
 use devmanager::process::teardown::{
-    AdmissionReceipt, AdmissionState, BoxFuture, ResidueEvidence, StageResult, TeardownAdmission,
-    TeardownAdmissionError, TeardownBudgets, TeardownClock, TeardownCompletionStore,
-    TeardownCoordinator, TeardownDeadline, TeardownEffects, TeardownReleaseAuthority,
-    TeardownScope, TeardownTicket, WaitResult, WaitStage,
+    AdmissionReceipt, AdmissionState, BoxFuture, CleanupDeadline, ResidueEvidence, StageResult,
+    TeardownAdmission, TeardownAdmissionError, TeardownBudgets, TeardownClock,
+    TeardownCompletionStore, TeardownCoordinator, TeardownDeadline, TeardownEffects,
+    TeardownReleaseAuthority, TeardownScope, TeardownTicket, WaitResult, WaitStage,
 };
 
 fn resource_id() -> ResourceId {
@@ -111,6 +111,7 @@ impl TeardownAdmission for WindowsAdmission {
     fn close_admission(
         &self,
         ticket: &TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> Result<AdmissionReceipt, TeardownAdmissionError> {
         if ticket.fence() != &self.fence {
             return Err(TeardownAdmissionError::FenceMismatch);
@@ -126,6 +127,7 @@ impl TeardownAdmission for WindowsAdmission {
     fn close_admission_batch(
         &self,
         tickets: &[TeardownTicket],
+        _deadline: CleanupDeadline,
     ) -> Result<Vec<AdmissionReceipt>, TeardownAdmissionError> {
         if tickets.iter().any(|ticket| ticket.fence() != &self.fence) {
             return Err(TeardownAdmissionError::FenceMismatch);
@@ -147,6 +149,7 @@ impl TeardownAdmission for WindowsAdmission {
         &self,
         tickets: &[TeardownTicket],
         receipts: &[AdmissionReceipt],
+        _deadline: CleanupDeadline,
     ) -> Result<(), TeardownAdmissionError> {
         if tickets.len() != receipts.len()
             || tickets.iter().zip(receipts).any(|(ticket, receipt)| {

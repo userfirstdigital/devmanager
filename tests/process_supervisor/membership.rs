@@ -816,8 +816,18 @@ fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
 
     let harness = tempfile::tempdir().expect("completion-port harness");
     let marker = harness.path().join("running.marker");
+    let helper = std::env::var_os("CARGO_BIN_EXE_devmanager-process-test-helper")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .expect("current test executable")
+                .parent()
+                .and_then(Path::parent)
+                .expect("test target directory")
+                .join("devmanager-process-test-helper.exe")
+        });
     let mut child = TestChild(
-        Command::new(env!("CARGO_BIN_EXE_devmanager-process-test-helper"))
+        Command::new(helper)
             .arg("mark-wait")
             .arg(&marker)
             .creation_flags(MANAGED_PROCESS_CREATION_FLAGS)
