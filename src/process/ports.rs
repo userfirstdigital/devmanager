@@ -1002,7 +1002,11 @@ fn classify_listener_authority(
     listeners: &[ListenerIdentity],
     managed: Option<&ManagedResourceSnapshot>,
     now: Instant,
+    deadline: Instant,
 ) -> PortAuthority {
+    if now > deadline {
+        return PortAuthority::Unknown;
+    }
     let Some(managed) = managed else {
         return if listeners.is_empty() {
             PortAuthority::Free
@@ -1054,11 +1058,38 @@ pub fn classify_port_authority(
     observation: &PortObservation,
     managed: Option<&ManagedResourceSnapshot>,
 ) -> PortAuthority {
+    let now = Instant::now();
+    classify_port_authority_at(
+        observation,
+        managed,
+        now,
+        now.checked_add(DEFAULT_FREE_PROOF_MAX_AGE).unwrap_or(now),
+    )
+}
+
+/// Classify an observation against an explicit observation clock and
+/// deadline. Callers that hold a scan deadline must pass it through this
+/// boundary; using a fresh `Instant::now()` in the projection would otherwise
+/// allow a callback to publish evidence after its admission window expired.
+pub fn classify_port_authority_at(
+    observation: &PortObservation,
+    managed: Option<&ManagedResourceSnapshot>,
+    observed_at: Instant,
+    deadline: Instant,
+) -> PortAuthority {
+    let now = Instant::now();
+    if now > deadline
+        || now
+            .checked_duration_since(observed_at)
+            .is_none_or(|age| age > DEFAULT_FREE_PROOF_MAX_AGE)
+    {
+        return PortAuthority::Unknown;
+    }
     match observation {
-        PortObservation::Free => classify_listener_authority(&[], managed, Instant::now()),
+        PortObservation::Free => classify_listener_authority(&[], managed, now, deadline),
         PortObservation::ProbeError(_) => PortAuthority::ProbeError,
         PortObservation::Listeners(listeners) => {
-            classify_listener_authority(listeners, managed, Instant::now())
+            classify_listener_authority(listeners, managed, now, deadline)
         }
     }
 }
@@ -1068,9 +1099,29 @@ pub fn classify_port_authority_from_snapshot(
     snapshot: &PortInventorySnapshot,
     managed: Option<&ManagedResourceSnapshot>,
 ) -> PortAuthority {
+    let now = Instant::now();
+    classify_port_authority_from_snapshot_at(
+        target,
+        snapshot,
+        managed,
+        now,
+        now.checked_add(DEFAULT_FREE_PROOF_MAX_AGE).unwrap_or(now),
+    )
+}
+
+pub fn classify_port_authority_from_snapshot_at(
+    target: &PortTarget,
+    snapshot: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
+) -> PortAuthority {
     let Some(observation) = snapshot.observation(target.port) else {
         return PortAuthority::ProbeError;
     };
+    if now > deadline || !snapshot.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE) {
+        return PortAuthority::Unknown;
+    }
     match snapshot.issue(target.port) {
         Some(PortObservationIssue::ProbeError(_))
         | Some(PortObservationIssue::ReconciliationFault(_)) => return PortAuthority::Unknown,
@@ -1104,7 +1155,7 @@ pub fn classify_port_authority_from_snapshot(
         }
         endpoint_listeners
     };
-    classify_listener_authority(&listeners, managed, Instant::now())
+    classify_listener_authority(&listeners, managed, now, deadline)
 }
 
 fn status_for_authority(
@@ -1143,6 +1194,24 @@ pub fn project_port_status(
     observation: &PortObservation,
     managed: Option<&ManagedResourceSnapshot>,
 ) -> PortStatus {
+    let now = Instant::now();
+    project_port_status_at(
+        target,
+        observation,
+        managed,
+        now,
+        now.checked_add(DEFAULT_FREE_PROOF_MAX_AGE).unwrap_or(now),
+    )
+}
+
+pub fn project_port_status_at(
+    target: &PortTarget,
+    observation: &PortObservation,
+    managed: Option<&ManagedResourceSnapshot>,
+    observed_at: Instant,
+    deadline: Instant,
+) -> PortStatus {
+    let now = Instant::now();
     if managed.is_some_and(|resource| resource.resource() != target.resource) {
         return PortStatus {
             port: target.port,
@@ -1169,10 +1238,24 @@ pub fn project_port_status(
             },
         };
     }
-
+    let evidence_fresh = now <= deadline
+        && now
+            .checked_duration_since(observed_at)
+            .is_some_and(|age| age <= DEFAULT_FREE_PROOF_MAX_AGE);
+    if !evidence_fresh {
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::Unknown,
+            listeners: Arc::from(observation.listeners()),
+            error: Some(bounded_sanitized_detail(
+                "port observation is stale or its projection deadline expired",
+            )),
+        };
+    }
     match observation {
         PortObservation::Free => {
-            let authority = classify_port_authority(observation, managed);
+            let authority = classify_port_authority_at(observation, managed, observed_at, deadline);
             status_for_authority(target, Arc::from([]), authority, managed)
         }
         PortObservation::ProbeError(detail) => PortStatus {
@@ -1183,7 +1266,7 @@ pub fn project_port_status(
             error: Some(bounded_sanitized_detail(detail)),
         },
         PortObservation::Listeners(listeners) => {
-            let authority = classify_listener_authority(listeners, managed, Instant::now());
+            let authority = classify_listener_authority(listeners, managed, now, deadline);
             status_for_authority(target, listeners.clone(), authority, managed)
         }
     }
@@ -1193,6 +1276,23 @@ pub fn project_port_status_from_snapshot(
     target: &PortTarget,
     snapshot: &PortInventorySnapshot,
     managed: Option<&ManagedResourceSnapshot>,
+) -> PortStatus {
+    let now = Instant::now();
+    project_port_status_from_snapshot_at(
+        target,
+        snapshot,
+        managed,
+        now,
+        now.checked_add(DEFAULT_FREE_PROOF_MAX_AGE).unwrap_or(now),
+    )
+}
+
+pub fn project_port_status_from_snapshot_at(
+    target: &PortTarget,
+    snapshot: &PortInventorySnapshot,
+    managed: Option<&ManagedResourceSnapshot>,
+    now: Instant,
+    deadline: Instant,
 ) -> PortStatus {
     if managed.is_some_and(|resource| resource.resource() != target.resource) {
         let listeners = snapshot
@@ -1219,9 +1319,13 @@ pub fn project_port_status_from_snapshot(
             )),
         };
     };
-    if managed.is_some_and(|resource| {
+    let starting = managed.is_some_and(|resource| {
         resource.resource() == target.resource && resource.state() == ManagedProcessState::Starting
-    }) {
+    });
+    if starting
+        && (snapshot.issue(target.port).is_some()
+            || matches!(observation, PortObservation::ProbeError(_)))
+    {
         return PortStatus {
             port: target.port,
             resource: target.resource,
@@ -1234,6 +1338,26 @@ pub fn project_port_status_from_snapshot(
                     PortObservation::ProbeError(detail) => Some(bounded_sanitized_detail(detail)),
                     PortObservation::Free | PortObservation::Listeners(_) => None,
                 }),
+        };
+    }
+    if now > deadline || !snapshot.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE) {
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::Unknown,
+            listeners: Arc::from(observation.listeners()),
+            error: Some(bounded_sanitized_detail(
+                "port inventory observation is stale or its projection deadline expired",
+            )),
+        };
+    }
+    if starting {
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind: PortStatusKind::Starting,
+            listeners: Arc::from(observation.listeners()),
+            error: None,
         };
     }
     if let Some(issue) = snapshot.issue(target.port) {
@@ -1254,7 +1378,8 @@ pub fn project_port_status_from_snapshot(
             error: snapshot.validation_error().map(bounded_sanitized_detail),
         };
     }
-    let authority = classify_port_authority_from_snapshot(target, snapshot, managed);
+    let authority =
+        classify_port_authority_from_snapshot_at(target, snapshot, managed, now, deadline);
     status_for_authority(
         target,
         Arc::from(observation.listeners()),
@@ -1350,6 +1475,21 @@ pub fn ensure_managed_start_allowed(
     snapshot: &PortInventorySnapshot,
     port: u16,
 ) -> Result<(), PortStartError> {
+    let now = Instant::now();
+    ensure_managed_start_allowed_at(
+        snapshot,
+        port,
+        now,
+        now.checked_add(DEFAULT_FREE_PROOF_MAX_AGE).unwrap_or(now),
+    )
+}
+
+pub fn ensure_managed_start_allowed_at(
+    snapshot: &PortInventorySnapshot,
+    port: u16,
+    now: Instant,
+    deadline: Instant,
+) -> Result<(), PortStartError> {
     if !snapshot.is_valid() {
         return Err(PortStartError::ProbeFailed {
             port,
@@ -1364,7 +1504,7 @@ pub fn ensure_managed_start_allowed(
         Some(_) if !snapshot.is_exactly_for(&[port]) => {
             Err(PortStartError::NotExactSnapshot { port })
         }
-        Some(_) if !snapshot.is_fresh_at(Instant::now(), DEFAULT_FREE_PROOF_MAX_AGE) => {
+        Some(_) if now > deadline || !snapshot.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE) => {
             Err(PortStartError::StaleProof { port })
         }
         Some(_) if snapshot.issue(port).is_some() => Err(PortStartError::ProbeFailed {

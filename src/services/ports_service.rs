@@ -7,13 +7,16 @@ use crate::process::ports::{
 use crate::services::platform_service;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Weak;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Retained for source compatibility. Timed-out scans are joined before the
+/// next scan is admitted, so no quarantine pool is used anymore.
+#[deprecated(note = "timed-out scans are joined instead of quarantined")]
 pub const MAX_SCAN_QUARANTINE: usize = 2;
 
 pub trait PortScanner: Send + Sync + 'static {
@@ -151,8 +154,6 @@ struct CoordinatorState {
     active_cancellation: Option<ScanCancellation>,
     worker_active: bool,
     shutdown: bool,
-    degraded: bool,
-    quarantined: Vec<Receiver<Result<PortInventorySnapshot, String>>>,
 }
 
 struct PortInventoryInner {
@@ -165,6 +166,7 @@ struct PortInventoryInner {
     scan_timeout: Duration,
     coordinator: Mutex<CoordinatorState>,
     wake_worker: Condvar,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 /// Background-owned listener inventory with immutable read-only snapshots.
@@ -247,10 +249,9 @@ impl PortInventory {
                     active_cancellation: None,
                     worker_active: false,
                     shutdown: false,
-                    degraded: false,
-                    quarantined: Vec::new(),
                 }),
                 wake_worker: Condvar::new(),
+                worker: Mutex::new(None),
             }),
         }
     }
@@ -308,24 +309,15 @@ impl PortInventory {
     pub fn request_scan(&self, ports: &[u16]) -> Result<PortScanRequest, PortScanError> {
         let ports = normalize_scan_ports(ports)?;
         let waiter = Arc::new(ScanWaiter::new());
-        let mut start_worker = false;
+        let mut previous_worker = None;
         {
             let mut state = self
                 .inner
                 .coordinator
                 .lock()
                 .expect("port inventory coordinator lock");
-            reap_quarantine(&mut state);
             if state.shutdown {
                 return Err(PortScanError::Shutdown);
-            }
-            if state.degraded && state.quarantined.len() < MAX_SCAN_QUARANTINE {
-                state.degraded = false;
-            }
-            if state.degraded {
-                return Err(PortScanError::QuarantineFull {
-                    max: MAX_SCAN_QUARANTINE,
-                });
             }
             let queued_waiters = state.active_waiters.len()
                 + state
@@ -349,27 +341,33 @@ impl PortInventory {
             }
             if !state.worker_active {
                 state.worker_active = true;
-                start_worker = true;
+                let weak_inner = Arc::downgrade(&self.inner);
+                match thread::Builder::new()
+                    .name("devmanager-port-inventory".to_string())
+                    .spawn(move || run_inventory_worker(weak_inner))
+                {
+                    Ok(handle) => {
+                        let mut slot = self
+                            .inner
+                            .worker
+                            .lock()
+                            .expect("port inventory worker lock");
+                        previous_worker = slot.replace(handle);
+                    }
+                    Err(error) => {
+                        let error =
+                            PortScanError::Scan(format!("could not start scan worker: {error}"));
+                        waiter.complete(Err(error.clone()));
+                        state.worker_active = false;
+                        state.pending = None;
+                        return Err(error);
+                    }
+                }
             }
             self.inner.wake_worker.notify_one();
         }
-        if start_worker {
-            let weak_inner = Arc::downgrade(&self.inner);
-            if let Err(error) = thread::Builder::new()
-                .name("devmanager-port-inventory".to_string())
-                .spawn(move || run_inventory_worker(weak_inner))
-            {
-                let error = PortScanError::Scan(format!("could not start scan worker: {error}"));
-                waiter.complete(Err(error.clone()));
-                let mut state = self
-                    .inner
-                    .coordinator
-                    .lock()
-                    .expect("port inventory coordinator lock");
-                state.worker_active = false;
-                state.pending = None;
-                return Err(error);
-            }
+        if let Some(previous_worker) = previous_worker {
+            let _ = previous_worker.join();
         }
         Ok(PortScanRequest { waiter })
     }
@@ -430,17 +428,13 @@ impl PortInventory {
     }
 
     pub fn shutdown(&self) {
-        let (active_waiters, pending_waiters) = {
+        let (active_waiters, pending_waiters, worker) = {
             let mut state = self
                 .inner
                 .coordinator
                 .lock()
                 .expect("port inventory coordinator lock");
-            if state.shutdown {
-                return;
-            }
             state.shutdown = true;
-            state.degraded = false;
             if let Some(cancellation) = state.active_cancellation.as_ref() {
                 cancellation.cancel();
             }
@@ -450,12 +444,22 @@ impl PortInventory {
                 .take()
                 .map(|pending| pending.waiters)
                 .unwrap_or_default();
-            state.quarantined.clear();
             self.inner.wake_worker.notify_all();
-            (active_waiters, pending_waiters)
+            let worker = self
+                .inner
+                .worker
+                .lock()
+                .expect("port inventory worker lock")
+                .take();
+            (active_waiters, pending_waiters, worker)
         };
         for waiter in active_waiters.into_iter().chain(pending_waiters) {
             waiter.complete(Err(PortScanError::Shutdown));
+        }
+        if let Some(worker) = worker {
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -468,6 +472,13 @@ impl Drop for PortInventoryInner {
                 cancellation.cancel();
             }
             self.wake_worker.notify_all();
+        }
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                if worker.thread().id() != thread::current().id() {
+                    let _ = worker.join();
+                }
+            }
         }
     }
 }
@@ -513,7 +524,7 @@ fn next_publication_sequence(inner: &PortInventoryInner) -> u64 {
 
 struct ScanExecution {
     result: Result<Arc<PortInventorySnapshot>, PortScanError>,
-    quarantine: Option<Receiver<Result<PortInventorySnapshot, String>>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 fn execute_scan(
@@ -529,20 +540,22 @@ fn execute_scan(
     let child_cancellation = cancellation.clone();
     let failure_ports = ports.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
-    let spawn_result = thread::Builder::new()
+    let worker = match thread::Builder::new()
         .name("devmanager-port-scan".to_string())
         .spawn(move || {
             let result = scanner.scan(&ports, &child_cancellation);
             let _ = sender.send(result);
-        });
-    if let Err(error) = spawn_result {
-        return ScanExecution {
-            result: Err(PortScanError::Scan(format!(
-                "could not start scan: {error}"
-            ))),
-            quarantine: None,
-        };
-    }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return ScanExecution {
+                result: Err(PortScanError::Scan(format!(
+                    "could not start scan: {error}"
+                ))),
+                worker: None,
+            }
+        }
+    };
 
     let remaining = cancellation
         .deadline()
@@ -563,12 +576,12 @@ fn execute_scan(
                     }
                     return ScanExecution {
                         result: Err(PortScanError::TimedOut),
-                        quarantine: None,
+                        worker: Some(worker),
                     };
                 }
                 return ScanExecution {
                     result: Err(PortScanError::Cancelled),
-                    quarantine: None,
+                    worker: Some(worker),
                 };
             }
             let snapshot = Arc::new(snapshot.with_publication_sequence(sequence));
@@ -577,7 +590,7 @@ fn execute_scan(
             }
             ScanExecution {
                 result: Ok(snapshot),
-                quarantine: None,
+                worker: Some(worker),
             }
         }
         Ok(Err(error)) => {
@@ -601,7 +614,7 @@ fn execute_scan(
                     } else {
                         PortScanError::Cancelled
                     }),
-                    quarantine: None,
+                    worker: Some(worker),
                 };
             }
             let error = bounded_scan_error(&error);
@@ -614,7 +627,7 @@ fn execute_scan(
             }
             ScanExecution {
                 result: Err(PortScanError::Scan(error)),
-                quarantine: None,
+                worker: Some(worker),
             }
         }
         Err(RecvTimeoutError::Timeout) => {
@@ -631,7 +644,7 @@ fn execute_scan(
             }
             ScanExecution {
                 result: Err(PortScanError::TimedOut),
-                quarantine: Some(receiver),
+                worker: Some(worker),
             }
         }
         Err(RecvTimeoutError::Disconnected) => {
@@ -645,7 +658,7 @@ fn execute_scan(
             }
             ScanExecution {
                 result: Err(PortScanError::Scan(error.to_string())),
-                quarantine: None,
+                worker: Some(worker),
             }
         }
     }
@@ -663,15 +676,6 @@ fn inner_publish_snapshot(
     true
 }
 
-fn reap_quarantine(state: &mut CoordinatorState) {
-    state
-        .quarantined
-        .retain(|receiver| match receiver.try_recv() {
-            Ok(_) | Err(TryRecvError::Disconnected) => false,
-            Err(TryRecvError::Empty) => true,
-        });
-}
-
 fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
     loop {
         let pending = {
@@ -682,10 +686,6 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
                 .coordinator
                 .lock()
                 .expect("port inventory coordinator lock");
-            reap_quarantine(&mut state);
-            if state.degraded && state.quarantined.len() < MAX_SCAN_QUARANTINE {
-                state.degraded = false;
-            }
             loop {
                 if state.shutdown {
                     state.worker_active = false;
@@ -714,6 +714,13 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
             waiter.complete(execution.result.clone());
         }
 
+        // A timed-out scanner is never quarantined or allowed to mutate the
+        // inventory after the coordinator advances. Complete callers at the
+        // deadline above, then join the child before admitting any next scan.
+        if let Some(worker) = execution.worker {
+            let _ = worker.join();
+        }
+
         let Some(inner) = weak_inner.upgrade() else {
             return;
         };
@@ -721,28 +728,9 @@ fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
             .coordinator
             .lock()
             .expect("port inventory coordinator lock");
-        if let Some(receiver) = execution.quarantine {
-            reap_quarantine(&mut state);
-            if state.quarantined.len() < MAX_SCAN_QUARANTINE {
-                state.quarantined.push(receiver);
-            } else {
-                state.degraded = true;
-            }
-        }
         state.active_waiters.clear();
         state.active_cancellation = None;
         if state.shutdown {
-            state.worker_active = false;
-            return;
-        }
-        if state.degraded {
-            if let Some(pending) = state.pending.take() {
-                for waiter in pending.waiters {
-                    waiter.complete(Err(PortScanError::QuarantineFull {
-                        max: MAX_SCAN_QUARANTINE,
-                    }));
-                }
-            }
             state.worker_active = false;
             return;
         }
@@ -1028,18 +1016,13 @@ fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
 
 #[cfg(not(windows))]
 fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
-    let identity = platform_service::capture_process_identity(pid)
-        .ok_or_else(|| format!("listener PID {pid} exited before identity verification"))?;
-    let creation_time_100ns = identity
-        .started_at_unix_secs
-        .checked_mul(10_000_000)
-        .ok_or_else(|| format!("listener PID {pid} creation time overflowed"))?;
-    ListenerIdentity::with_executable(
-        pid,
-        creation_time_100ns,
-        std::path::PathBuf::from(format!("/proc/{pid}/exe")),
-    )
-    .map_err(|error| format!("could not verify listener PID {pid}: {error}"))
+    let creation_time_100ns = platform_service::capture_process_creation_time_100ns(pid)
+        .ok_or_else(|| format!("listener PID {pid} creation time is unavailable"))?;
+    let executable = platform_service::capture_process_executable(pid).ok_or_else(|| {
+        format!("listener PID {pid} executable identity is unavailable on this platform")
+    })?;
+    ListenerIdentity::with_executable(pid, creation_time_100ns, executable)
+        .map_err(|error| format!("could not verify listener PID {pid}: {error}"))
 }
 
 pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {

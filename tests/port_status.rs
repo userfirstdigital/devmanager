@@ -12,11 +12,12 @@ use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, Pr
 use devmanager::process::ports::{
     classify_port_authority, classify_port_authority_from_snapshot, ensure_managed_start_allowed,
     launch_if_port_free, launch_if_port_free_with_revalidation, project_port_status,
-    project_port_status_from_snapshot, registered_resource_snapshot_with_membership,
-    ListenerIdentity, ManagedPortHealth, ManagedProcessSnapshotValidity, ManagedResourceSnapshot,
-    PortAuthority, PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError,
-    PortStartError, PortStatusKind, PortTarget, RegistryMembershipSnapshot, ScanCancellation,
-    TcpAddressFamily, TcpEndpoint, TcpEndpointRecord, TcpProtocol, MAX_SCAN_WAITERS,
+    project_port_status_at, project_port_status_from_snapshot,
+    registered_resource_snapshot_with_membership, ListenerIdentity, ManagedPortHealth,
+    ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority, PortInventorySnapshot,
+    PortObservation, PortObservationIssue, PortScanError, PortStartError, PortStatusKind,
+    PortTarget, RegistryMembershipSnapshot, ScanCancellation, TcpAddressFamily, TcpEndpoint,
+    TcpEndpointRecord, TcpProtocol, MAX_SCAN_WAITERS,
 };
 use devmanager::process::registry::{
     JobMembership, ManagedProcessFence, ManagedProcessState, ProcessRegistry, RegisteredProcess,
@@ -127,6 +128,88 @@ fn starting_resource_is_orange_even_before_a_listener_appears() {
     let status = project_port_status(&target(resource), &PortObservation::Free, Some(&managed));
 
     assert_eq!(status.kind(), PortStatusKind::Starting);
+}
+
+#[test]
+fn stale_starting_observation_remains_orange_with_probe_detail() {
+    let resource = fence(111, 1);
+    let (registry, _) = registry_with_root(resource, 11_111, 1_111);
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current starting resource");
+    let observed_at = Instant::now() - Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let status = project_port_status_at(
+        &PortTarget::new(43_098, resource, ManagedPortHealth::Ready),
+        &PortObservation::ProbeError("listener inventory unavailable".to_string()),
+        Some(&managed),
+        observed_at,
+        deadline,
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::Starting);
+    assert_eq!(status.error(), Some("listener inventory unavailable"));
+}
+
+#[test]
+fn stale_free_snapshot_is_unknown_instead_of_stopped() {
+    let port = 43_099;
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(port, PortObservation::Free)]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        Instant::now() - Duration::from_secs(60),
+    )
+    .with_publication_sequence(1);
+
+    let status = project_port_status_from_snapshot(
+        &PortTarget::new(port, fence(109, 1), ManagedPortHealth::Ready),
+        &snapshot,
+        None,
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
+}
+
+#[test]
+fn stale_managed_listener_snapshot_is_unknown_instead_of_green() {
+    let resource = fence(110, 1);
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_110, 1_110);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(
+            1,
+            1,
+            Instant::now() - Duration::from_secs(60),
+            Duration::from_secs(5),
+        ),
+    )
+    .expect("current resource");
+    let port = 43_100;
+    let listener = listener(11_110, 1_110);
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(port, single_listener(listener))]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        Instant::now() - Duration::from_secs(60),
+    )
+    .with_publication_sequence(1);
+
+    let status = project_port_status_from_snapshot(
+        &PortTarget::new(port, resource, ManagedPortHealth::Ready),
+        &snapshot,
+        Some(&managed),
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
 }
 
 #[test]
@@ -1283,6 +1366,53 @@ fn port_inventory_absolute_timeout_returns_before_an_uncooperative_scanner_finis
         }
         thread::sleep(Duration::from_millis(2));
     }
+    assert!(finished.load(Ordering::SeqCst));
+}
+
+#[test]
+fn port_inventory_shutdown_joins_an_uncooperative_scan_before_return() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let scanner = {
+        let finished = finished.clone();
+        move |ports: &[u16], _cancellation: &ScanCancellation| {
+            thread::sleep(Duration::from_millis(100));
+            finished.store(true, Ordering::SeqCst);
+            Ok(free_scan(ports))
+        }
+    };
+    let inventory = PortInventory::with_scanner_and_timeout(scanner, Duration::from_millis(20));
+    let request = inventory.request_scan(&[43_119]).expect("scan request");
+    assert_eq!(
+        request.wait(Duration::from_secs(1)),
+        Err(PortScanError::TimedOut)
+    );
+    inventory.shutdown();
+
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "shutdown returned while the scan worker still had access to shared state"
+    );
+}
+
+#[test]
+fn dropping_port_inventory_joins_an_uncooperative_scan_before_return() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let scanner = {
+        let finished = finished.clone();
+        move |ports: &[u16], _cancellation: &ScanCancellation| {
+            thread::sleep(Duration::from_millis(100));
+            finished.store(true, Ordering::SeqCst);
+            Ok(free_scan(ports))
+        }
+    };
+    let inventory = PortInventory::with_scanner_and_timeout(scanner, Duration::from_millis(20));
+    let request = inventory.request_scan(&[43_120]).expect("scan request");
+    assert_eq!(
+        request.wait(Duration::from_secs(1)),
+        Err(PortScanError::TimedOut)
+    );
+    drop(inventory);
+
     assert!(finished.load(Ordering::SeqCst));
 }
 

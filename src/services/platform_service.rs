@@ -1,8 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, OsStr};
+#[cfg(not(windows))]
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(not(windows))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 #[cfg(not(windows))]
 use std::thread;
 #[cfg(any(not(windows), test))]
@@ -185,10 +194,7 @@ fn snapshot_listener_endpoints_with_lsof(
     ports: &[u16],
 ) -> Result<BTreeMap<u16, Vec<TcpEndpointRecord>>, String> {
     let filter: HashSet<u16> = ports.iter().copied().collect();
-    let output = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
-        .output()
-        .map_err(|error| format!("Failed to run lsof: {error}"))?;
+    let output = run_bounded_command("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -239,6 +245,125 @@ fn snapshot_listener_endpoints_with_lsof(
         rows.dedup();
     }
     Ok(listeners)
+}
+
+#[cfg(not(windows))]
+const MAX_LSOF_OUTPUT_BYTES: usize = 256 * 1024;
+
+#[cfg(not(windows))]
+const MAX_LSOF_RUNTIME: Duration = Duration::from_millis(750);
+
+#[cfg(not(windows))]
+struct BoundedChildOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(not(windows))]
+fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedChildOutput, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to run {program}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program} stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{program} stderr was not piped"))?;
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_exceeded = output_exceeded.clone();
+    let stderr_exceeded = output_exceeded.clone();
+    let stdout_reader =
+        thread::spawn(move || read_bounded(stdout, MAX_LSOF_OUTPUT_BYTES, stdout_exceeded));
+    let stderr_reader =
+        thread::spawn(move || read_bounded(stderr, MAX_LSOF_OUTPUT_BYTES, stderr_exceeded));
+
+    let deadline = Instant::now()
+        .checked_add(MAX_LSOF_RUNTIME)
+        .unwrap_or_else(Instant::now);
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        if output_exceeded.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(next)) => {
+                status = Some(next);
+                break;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("could not poll {program}: {error}"));
+            }
+        }
+    }
+    let status = match status {
+        Some(status) => status,
+        None => child
+            .wait()
+            .map_err(|error| format!("could not wait for {program}: {error}"))?,
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| format!("{program} stdout reader panicked"))?
+        .map_err(|error| format!("could not read {program} stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("{program} stderr reader panicked"))?
+        .map_err(|error| format!("could not read {program} stderr: {error}"))?;
+
+    if timed_out {
+        return Err(format!("{program} process probe exceeded its deadline"));
+    }
+    if output_exceeded.load(Ordering::Acquire) {
+        return Err(format!(
+            "{program} process output exceeded {MAX_LSOF_OUTPUT_BYTES} bytes"
+        ));
+    }
+    Ok(BoundedChildOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(not(windows))]
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    exceeded: Arc<AtomicBool>,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(count) > max_bytes {
+            exceeded.store(true, Ordering::Release);
+            return Ok(output);
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
 }
 
 #[cfg(not(windows))]
@@ -549,6 +674,48 @@ pub fn process_identity_with_system(system: &sysinfo::System, pid: u32) -> Optio
     })
 }
 
+/// Return the platform-native executable path without assuming Linux `/proc`.
+/// sysinfo uses `proc_pidpath` on macOS and the native process APIs elsewhere.
+pub fn capture_process_executable(pid: u32) -> Option<PathBuf> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    system
+        .process(sysinfo::Pid::from_u32(pid))
+        .and_then(|process| process.exe().map(Path::to_path_buf))
+}
+
+/// Capture a process creation token with more precision than sysinfo's
+/// display-oriented Unix seconds. Linux exposes the kernel start tick in
+/// `/proc`; other Unix platforms retain the verified sysinfo timestamp while
+/// using their native executable lookup above (macOS has no `/proc` tree).
+pub fn capture_process_creation_time_100ns(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        let start_ticks = fields.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+        // `_SC_CLK_TCK` is 2 on Linux. Keep the FFI local so the application
+        // does not need to expose libc as a public dependency.
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        let ticks_per_second = unsafe { sysconf(2) };
+        if ticks_per_second <= 0 {
+            return None;
+        }
+        return start_ticks
+            .checked_mul(10_000_000)
+            .and_then(|ticks| ticks.checked_div(ticks_per_second as u64));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        capture_process_identity(pid)?
+            .started_at_unix_secs
+            .checked_mul(10_000_000)
+    }
+}
+
 pub fn process_matches_identity(
     pid: u32,
     started_at_unix_secs: u64,
@@ -644,10 +811,8 @@ pub fn get_process_name(pid: u32) -> Result<Option<String>, String> {
 
     #[cfg(not(windows))]
     {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .map_err(|error| format!("Failed to run ps: {error}"))?;
+        let pid_text = pid.to_string();
+        let output = run_bounded_command("ps", &["-p", pid_text.as_str(), "-o", "comm="])?;
         if !output.status.success() {
             return Ok(None);
         }

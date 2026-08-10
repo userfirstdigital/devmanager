@@ -19,6 +19,7 @@ use crate::models::{
 use crate::notifications;
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
+use crate::services::ports_service::PortInventory;
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
 };
@@ -222,6 +223,10 @@ pub(crate) struct ProcessManagerInner {
     observed_runtime_generations: Mutex<HashMap<String, u64>>,
     settings: RwLock<Settings>,
     terminal_backend: TerminalBackend,
+    /// One coordinator owns every managed server start admission. UI,
+    /// restore, remote, and auto-restart paths all share this inventory so a
+    /// reservation cannot be released when an operation is merely queued.
+    port_inventory: PortInventory,
     debug_enabled: bool,
     restart_backoffs: Mutex<HashMap<String, RestartBackoff>>,
     notification_sound: RwLock<Option<String>>,
@@ -510,6 +515,7 @@ impl ProcessManager {
             observed_runtime_generations: Mutex::new(HashMap::new()),
             settings: RwLock::new(Settings::default()),
             terminal_backend: TerminalBackend::PortablePtyFeedingAlacritty,
+            port_inventory: PortInventory::new(),
             debug_enabled,
             restart_backoffs: Mutex::new(HashMap::new()),
             notification_sound: RwLock::new(None),
@@ -698,6 +704,10 @@ impl ProcessManager {
 
     pub fn drain_process_op_completions(&self) -> Vec<ProcessOpCompletion> {
         self.op_queue.drain_completions()
+    }
+
+    pub fn port_inventory(&self) -> PortInventory {
+        self.inner.port_inventory.clone()
     }
 
     pub fn submit_process_op(&self, op: ProcessOp) -> Result<u64, String> {
@@ -902,6 +912,7 @@ impl ProcessManager {
         let launch_spec = ServerLaunchSpec {
             command_id: command_id_owned.clone(),
             project_id: project_id.clone(),
+            port: lookup.command.port,
             cwd,
             program,
             args,
@@ -1002,6 +1013,7 @@ impl ProcessManager {
         let launch_spec = ServerLaunchSpec {
             command_id: command_id.clone(),
             project_id: project_id.clone(),
+            port: lookup.command.port,
             cwd: cwd.clone(),
             program: program.clone(),
             args: args.clone(),
@@ -1065,6 +1077,7 @@ impl ProcessManager {
         let launch_spec = ServerLaunchSpec {
             command_id: command_id.clone(),
             project_id: project_id.clone(),
+            port: lookup.command.port,
             cwd: cwd.clone(),
             program: program.clone(),
             args: args.clone(),
@@ -5958,7 +5971,7 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result = {
+            let result = run_server_launch_with_port_admission(inner, &launch, || {
                 #[cfg(test)]
                 {
                     let spawner = inner
@@ -5976,7 +5989,7 @@ pub(crate) fn execute_process_op_inner(
                 {
                     spawn_server_session_with_inner(inner, &launch, dimensions)
                 }
-            }
+            })
             .map_err(|error| {
                 manager.update_session_state(&launch.command_id, |state| {
                     state.status = SessionStatus::Failed;
@@ -6047,40 +6060,42 @@ pub(crate) fn execute_process_op_inner(
                     ));
                 }
                 manager.set_active_session(command_id.clone());
-                if let Ok(session) = manager.get_session(&command_id) {
-                    if clear_logs {
-                        session.clear_virtual_output();
+                run_server_launch_with_port_admission(inner, &launch, || {
+                    if let Ok(session) = manager.get_session(&command_id) {
+                        if clear_logs {
+                            session.clear_virtual_output();
+                        }
+                        session.write_virtual_text(&format!(
+                            "{}\x1b[33m{banner}\x1b[0m\r\n",
+                            if clear_logs { "" } else { "\r\n" }
+                        ));
+                        session.restart_command(
+                            launch.cwd.clone(),
+                            dimensions,
+                            launch.program.clone(),
+                            launch.args.clone(),
+                            launch.env.clone(),
+                            launch.log_file_path.clone(),
+                            true,
+                        )?;
+                        manager.update_session_state(&command_id, |state| {
+                            state.configure_server(launch.clone());
+                        });
+                        return Ok(());
                     }
-                    session.write_virtual_text(&format!(
-                        "{}\x1b[33m{banner}\x1b[0m\r\n",
-                        if clear_logs { "" } else { "\r\n" }
-                    ));
-                    session.restart_command(
-                        launch.cwd.clone(),
-                        dimensions,
-                        launch.program.clone(),
-                        launch.args.clone(),
-                        launch.env.clone(),
-                        launch.log_file_path.clone(),
-                        true,
-                    )?;
+                    spawn_server_session_with_inner(inner, &launch, dimensions)?;
+                    let _ = manager.write_virtual_text(
+                        &command_id,
+                        &format!(
+                            "{}\x1b[33m{banner}\x1b[0m\r\n",
+                            if clear_logs { "" } else { "\r\n" }
+                        ),
+                    );
                     manager.update_session_state(&command_id, |state| {
                         state.configure_server(launch.clone());
                     });
-                    return Ok(());
-                }
-                spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                let _ = manager.write_virtual_text(
-                    &command_id,
-                    &format!(
-                        "{}\x1b[33m{banner}\x1b[0m\r\n",
-                        if clear_logs { "" } else { "\r\n" }
-                    ),
-                );
-                manager.update_session_state(&command_id, |state| {
-                    state.configure_server(launch.clone());
-                });
-                Ok(())
+                    Ok(())
+                })
             })();
             (
                 ProcessOpKind::RestartServer,
@@ -6119,13 +6134,15 @@ pub(crate) fn execute_process_op_inner(
                     ));
                 }
                 crate::services::ports_service::kill_port(port)?;
-                spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                let _ = manager
-                    .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
-                manager.update_session_state(&command_id, |state| {
-                    state.configure_server(launch.clone());
-                });
-                Ok(())
+                run_server_launch_with_port_admission(inner, &launch, || {
+                    spawn_server_session_with_inner(inner, &launch, dimensions)?;
+                    let _ = manager
+                        .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
+                    manager.update_session_state(&command_id, |state| {
+                        state.configure_server(launch.clone());
+                    });
+                    Ok(())
+                })
             })();
             (
                 ProcessOpKind::KillPortAndRestart,
@@ -6399,6 +6416,44 @@ pub(crate) fn execute_process_op_inner(
         context,
         remote_response,
     }
+}
+
+/// Keep the port reservation alive around the actual worker-side spawn or
+/// restart call. A reservation acquired by a UI callback is not sufficient:
+/// queueing only transfers intent, while this seam owns admission until the
+/// operation has returned success or failure.
+fn run_server_launch_with_port_admission<T>(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &ServerLaunchSpec,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(port) = launch.port else {
+        return operation();
+    };
+
+    let snapshot = inner
+        .port_inventory
+        .refresh(&[port])
+        .map_err(|error| format!("could not establish whether port {port} is free: {error}"))?;
+    let reservation = inner
+        .port_inventory
+        .reserve_start(&snapshot, port)
+        .map_err(|error| error.to_string())?;
+    let launch_result = crate::process::ports::launch_if_port_free_with_revalidation(
+        &snapshot,
+        port,
+        || {
+            if reservation.is_active() {
+                Ok(())
+            } else {
+                Err(crate::process::ports::PortStartError::ReservationConflict { port })
+            }
+        },
+        operation,
+    )
+    .map_err(|error| error.to_string())?;
+
+    launch_result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7318,6 +7373,7 @@ mod tests {
         let launch = ServerLaunchSpec {
             command_id: command_id.to_string(),
             project_id: "project".to_string(),
+            port: None,
             cwd: std::env::current_dir().unwrap(),
             program: "definitely-not-a-devmanager-server".to_string(),
             args: Vec::new(),

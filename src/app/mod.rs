@@ -1320,6 +1320,7 @@ impl NativeShell {
             cx,
         );
 
+        let port_inventory = process_manager.port_inventory();
         let shell = Self {
             state,
             session_manager,
@@ -1364,7 +1365,10 @@ impl NativeShell {
             did_focus_terminal: false,
             focused_terminal_session_id: None,
             active_port_state: None,
-            server_port_snapshot: ServerPortSnapshotState::default(),
+            server_port_snapshot: ServerPortSnapshotState {
+                inventory: port_inventory,
+                ..ServerPortSnapshotState::default()
+            },
             ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
@@ -11964,7 +11968,20 @@ impl NativeShell {
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
         let (tracked_ports, refresh_interval) = server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
-            self.server_port_snapshot = ServerPortSnapshotState::default();
+            // Keep the ProcessManager-owned coordinator even while the
+            // current config has no tracked ports. Replacing the state with a
+            // fresh inventory here would split later starts onto a second
+            // reservation/scan owner after a command is added again.
+            self.server_port_snapshot.tracked_ports.clear();
+            self.server_port_snapshot.statuses.clear();
+            self.server_port_snapshot.probe_failures.clear();
+            self.server_port_snapshot.last_checked_at = None;
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.active_refresh = None;
             return;
         }
 
@@ -11994,6 +12011,11 @@ impl NativeShell {
             return;
         }
 
+        stage_server_port_refresh(
+            &mut self.server_port_snapshot.statuses,
+            &mut self.server_port_snapshot.probe_failures,
+            &tracked_ports,
+        );
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
         let refresh_fence = PortRefreshFence {
@@ -12130,6 +12152,7 @@ impl NativeShell {
     fn invalidate_server_port_snapshot(&mut self, port: Option<u16>) {
         if let Some(port) = port {
             self.server_port_snapshot.statuses.remove(&port);
+            self.server_port_snapshot.probe_failures.remove(&port);
             if let Some(state) = self.active_port_state.as_mut() {
                 if state.port == port {
                     state.status = None;
@@ -12980,7 +13003,6 @@ impl NativeShell {
 
         let command_id = command_id.to_string();
         let inventory = self.server_port_snapshot.inventory.clone();
-        let reservation_inventory = inventory.clone();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -13042,29 +13064,9 @@ impl NativeShell {
                             }
                         };
 
-                        let reservation = match reservation_inventory.reserve_start(&snapshot, port)
-                        {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                this.terminal_actionable_notice = None;
-                                this.terminal_notice = Some(port_start_error_notice(&error));
-                                cx.notify();
-                                return;
-                            }
-                        };
-                        let reservation_port = reservation.port();
-                        let start_result = crate::process::ports::launch_if_port_free_with_revalidation(
+                        let start_result = crate::process::ports::launch_if_port_free(
                             &snapshot,
                             port,
-                            || {
-                                if reservation.is_active() {
-                                    Ok(())
-                                } else {
-                                    Err(crate::process::ports::PortStartError::ReservationConflict {
-                                        port: reservation_port,
-                                    })
-                                }
-                            },
                             || {
                                 if focus_started_server {
                                     this.interrupt_active_browser_replay_before_route_change(None);
@@ -13084,7 +13086,6 @@ impl NativeShell {
                                 }
                             },
                         );
-                        drop(reservation);
 
                         match start_result {
                             Ok(Ok(())) => {
@@ -16827,6 +16828,17 @@ fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
     !refresh_in_flight
 }
 
+fn stage_server_port_refresh(
+    statuses: &mut HashMap<u16, PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    ports: &[u16],
+) {
+    for &port in ports {
+        statuses.remove(&port);
+        probe_failures.remove(&port);
+    }
+}
+
 fn port_refresh_is_current(active: Option<&PortRefreshFence>, expected: &PortRefreshFence) -> bool {
     active == Some(expected)
 }
@@ -16871,6 +16883,17 @@ fn project_legacy_port_snapshot(
                 port,
                 "listener inventory snapshot does not match the requested port set".to_string(),
             );
+        }
+        return projection;
+    }
+    if !snapshot.is_fresh_at(
+        Instant::now(),
+        crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE,
+    ) {
+        for &port in ports {
+            projection
+                .probe_failures
+                .insert(port, "listener inventory snapshot is stale".to_string());
         }
         return projection;
     }
@@ -17139,6 +17162,13 @@ fn derive_server_indicator(
     port_statuses: &HashMap<u16, PortStatus>,
     probe_failures: &HashMap<u16, String>,
 ) -> sidebar::ServerIndicatorState {
+    if session.is_some_and(|session| session.status == SessionStatus::Starting) {
+        // A probe can fail while a process is still establishing its
+        // listener. Keep the launch transition orange until a current
+        // authority snapshot replaces it; never flash red from stale probe
+        // state.
+        return sidebar::ServerIndicatorState::Unready;
+    }
     if port.is_some_and(|port| probe_failures.contains_key(&port)) {
         return sidebar::ServerIndicatorState::Failed;
     }
@@ -20644,6 +20674,44 @@ mod tests {
             derive_server_indicator(None, Some(5174), &statuses, &probe_failures),
             sidebar::ServerIndicatorState::Failed
         );
+    }
+
+    #[test]
+    fn failed_port_refresh_does_not_override_starting_indicator() {
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Starting;
+
+        let statuses = HashMap::new();
+        let failures = HashMap::from([(5174, "listener inventory unavailable".to_string())]);
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses, &failures),
+            sidebar::ServerIndicatorState::Unready
+        );
+    }
+
+    #[test]
+    fn staging_port_refresh_invalidates_old_legacy_statuses_immediately() {
+        let mut statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: false,
+                pid: None,
+                process_name: None,
+            },
+        )]);
+        let mut failures = HashMap::from([(5174, "old failure".to_string())]);
+
+        stage_server_port_refresh(&mut statuses, &mut failures, &[5174]);
+
+        assert!(statuses.is_empty());
+        assert!(failures.is_empty());
     }
 
     #[test]

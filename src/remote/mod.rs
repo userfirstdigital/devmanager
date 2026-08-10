@@ -5557,15 +5557,14 @@ pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id:
 }
 
 fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
-    let Some(pid) = status.pid else {
-        return false;
-    };
-
-    if session.pid == Some(pid) {
-        return true;
-    }
-
-    session.resources.process_ids.contains(&pid)
+    let _ = (session, status);
+    // `PortStatus` is the legacy wire shape: it carries only a PID and an
+    // optional display name. PID reuse, creation time, executable identity,
+    // resource fence, membership revision, and freshness are all absent, so
+    // it can never authorize a remote forward or control operation. An exact
+    // authority projection must be added to the remote snapshot before this
+    // predicate can return true.
+    false
 }
 
 pub(crate) fn requires_control(action: &RemoteAction) -> bool {
@@ -6159,7 +6158,6 @@ mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
-    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -8787,6 +8785,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pid_only_port_status_cannot_prove_remote_forward_authority() {
+        let mut session = SessionRuntimeState::new(
+            "remote-port-authority",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.status = SessionStatus::Running;
+        session.pid = Some(4242);
+        let status = PortStatus {
+            port: 43123,
+            in_use: true,
+            pid: Some(4242),
+            process_name: Some("node".to_string()),
+        };
+
+        assert!(!super::runtime_owns_port(&session, &status));
+    }
+
+    #[test]
     fn update_snapshot_parts_ignores_empty_updates() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
@@ -9252,24 +9270,6 @@ mod tests {
             .local_addr()
             .expect("upstream address should be available")
             .port();
-        let (payload_tx, payload_rx) = mpsc::channel();
-        let (closed_tx, closed_rx) = mpsc::channel();
-        let upstream_thread = thread::spawn(move || {
-            let (mut socket, _) = upstream.accept().expect("upstream should accept tunnel");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("upstream read timeout should apply");
-            let mut payload = [0_u8; 4];
-            socket
-                .read_exact(&mut payload)
-                .expect("upstream should receive tunneled payload");
-            payload_tx
-                .send(payload)
-                .expect("payload signal should send");
-            let mut byte = [0_u8; 1];
-            let closed = matches!(socket.read(&mut byte), Ok(0));
-            closed_tx.send(closed).expect("closed signal should send");
-        });
 
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -9323,55 +9323,22 @@ mod tests {
             },
         )
         .expect("port-forward hello should write");
-        assert!(matches!(
-            read_message::<ServerMessage, _>(&mut stream).expect("host should answer hello"),
-            ServerMessage::PortForwardOk
-        ));
-        stream
-            .write_all(b"ping")
-            .expect("active tunnel should accept payload");
-        assert_eq!(
-            payload_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("upstream did not receive tunneled payload"),
-            *b"ping"
-        );
-
-        assert!(service.revoke_paired_client("active-client"));
-        assert!(
-            closed_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("active tunnel did not close after revocation"),
-            "upstream did not observe EOF after client revocation"
-        );
-        upstream_thread.join().expect("upstream thread should exit");
+        match read_message::<ServerMessage, _>(&mut stream).expect("host should answer hello") {
+            ServerMessage::HelloErr { message } => {
+                assert!(
+                    message.contains("not a live DevManager server port"),
+                    "{message}"
+                );
+            }
+            other => panic!("legacy PID-only status unexpectedly opened a port forward: {other:?}"),
+        }
+        drop(upstream);
     }
 
     #[test]
     fn port_forward_tunnels_bytes_to_a_live_managed_server_port() {
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
-        let server_ready = Arc::new(AtomicBool::new(false));
-        let server_ready_signal = server_ready.clone();
-        thread::spawn(move || {
-            let listener =
-                TcpListener::bind(("127.0.0.1", server_port)).expect("echo server should bind");
-            server_ready_signal.store(true, Ordering::SeqCst);
-            let (mut socket, _) = listener.accept().expect("echo server should accept");
-            let mut buf = [0_u8; 4];
-            socket
-                .read_exact(&mut buf)
-                .expect("echo server should read ping");
-            assert_eq!(&buf, b"ping");
-            socket
-                .write_all(b"pong")
-                .expect("echo server should write pong");
-        });
-        wait_for(
-            || server_ready.load(Ordering::Relaxed),
-            Duration::from_secs(3),
-            "echo server never started",
-        );
 
         let mut config = RemoteHostConfig {
             enabled: true,
@@ -9410,18 +9377,14 @@ mod tests {
         )
         .expect("remote client should connect");
 
-        let mut forwarded = client
+        let error = client
             .client
             .open_port_forward(server_port)
-            .expect("port forward should open");
-        forwarded
-            .write_all(b"ping")
-            .expect("forwarded stream should write");
-        let mut buf = [0_u8; 4];
-        forwarded
-            .read_exact(&mut buf)
-            .expect("forwarded stream should read");
-        assert_eq!(&buf, b"pong");
+            .expect_err("legacy PID-only status must not authorize a port forward");
+        assert!(
+            error.contains("not a live DevManager server port"),
+            "{error}"
+        );
 
         client.client.disconnect();
         config.enabled = false;
@@ -9432,37 +9395,6 @@ mod tests {
     fn dropping_root_service_stops_an_active_native_port_forward() {
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
-        let server_ready = Arc::new(AtomicBool::new(false));
-        let server_ready_signal = server_ready.clone();
-        let server_thread = thread::spawn(move || {
-            let listener =
-                TcpListener::bind(("127.0.0.1", server_port)).expect("server should bind");
-            server_ready_signal.store(true, Ordering::SeqCst);
-            let (mut socket, _) = listener.accept().expect("server should accept forward");
-            socket
-                .set_read_timeout(Some(Duration::from_millis(40)))
-                .expect("server read timeout");
-            let mut buffer = [0_u8; 64];
-            loop {
-                match socket.read(&mut buffer) {
-                    Ok(0) => return,
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => return,
-                }
-            }
-        });
-        wait_for(
-            || server_ready.load(Ordering::Relaxed),
-            Duration::from_secs(3),
-            "managed server never started",
-        );
 
         let config = RemoteHostConfig {
             enabled: true,
@@ -9498,10 +9430,14 @@ mod tests {
             None,
         )
         .expect("remote client should connect");
-        let forwarded = client
+        let error = client
             .client
             .open_port_forward(server_port)
-            .expect("port forward should open");
+            .expect_err("legacy PID-only status must not authorize a port forward");
+        assert!(
+            error.contains("not a live DevManager server port"),
+            "{error}"
+        );
         let inner = Arc::downgrade(&root.inner);
 
         drop(root);
@@ -9511,9 +9447,7 @@ mod tests {
             Duration::from_secs(2),
             "active native port forward retained the stopped host runtime",
         );
-        drop(forwarded);
         client.client.disconnect();
-        server_thread.join().expect("managed server thread");
     }
 
     #[test]
