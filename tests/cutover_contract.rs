@@ -18,8 +18,6 @@ const FIXTURE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/cutover-contract"
 );
-const FIXTURE_AUTH_TOKEN: &str = "phase-11.1a-generated-fixture-v1";
-
 struct FixtureRepo {
     _temp: TempDir,
     root: PathBuf,
@@ -108,15 +106,29 @@ fn write_ledger(root: &Path, document: &Value) {
     fs::write(path, ledger).expect("fixture ledger");
 }
 
+fn fixture_auth_token(root: &Path) -> String {
+    fs::read_to_string(root.join(".devmanager-next/audit-fixture.auth"))
+        .expect("fixture authority marker")
+        .trim()
+        .to_owned()
+}
+
+fn new_fixture_auth_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("fixture authority entropy");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn fixture_repo(document: Value, extra_files: &[(&str, &[u8])]) -> FixtureRepo {
     let temp = tempfile::tempdir().expect("fixture tempdir");
     let root = temp.path().to_path_buf();
+    let auth_token = new_fixture_auth_token();
     fs::create_dir_all(root.join("docs")).expect("fixture docs");
     fs::create_dir_all(root.join("src")).expect("fixture src");
     fs::create_dir_all(root.join(".devmanager-next")).expect("fixture audit auth directory");
     fs::write(
         root.join(".devmanager-next/audit-fixture.auth"),
-        format!("{FIXTURE_AUTH_TOKEN}\n"),
+        format!("{auth_token}\n"),
     )
     .expect("fixture audit auth marker");
     write_ledger(&root, &document);
@@ -175,7 +187,7 @@ fn spawn_audit(root: &Path, output_path: &Path) -> Output {
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", root.join("protected-appdata"))
-        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root))
         .output()
         .expect("spawn cutover audit")
 }
@@ -552,7 +564,7 @@ fn spawn_fake_audit(
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", root.join("protected-appdata"))
-        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
+        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", fixture_auth_token(root))
         .env("RG_FAKE_MODE", mode)
         .env("RG_FAKE_TARGET", target)
         .env("RG_FAKE_RESIDUE", residue)
@@ -1771,7 +1783,10 @@ fn path_isolated_rg_shim_proves_reference_scan_uses_original_handle_bytes() {
             output_path.to_str().expect("output path utf8"),
         ])
         .env("APPDATA", fixture.root.join("protected-appdata"))
-        .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
+        .env(
+            "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+            fixture_auth_token(&fixture.root),
+        )
         .env("RG_FAKE_MODE", "stdin-match")
         .env("RG_SHIM_LOG", &log_path)
         .env("PATH", isolated_path)
@@ -2107,7 +2122,10 @@ fn git_enumeration_uses_the_bounded_wrapper_for_all_failure_modes() {
                 output_path.to_str().expect("output path utf8"),
             ])
             .env("APPDATA", fixture.root.join("protected-appdata"))
-            .env("DEVMANAGER_CUTOVER_FIXTURE_AUTH", FIXTURE_AUTH_TOKEN)
+            .env(
+                "DEVMANAGER_CUTOVER_FIXTURE_AUTH",
+                fixture_auth_token(&fixture.root),
+            )
             .env("GIT_FAKE_MODE", mode)
             .env("GIT_REAL", &real_git)
             .env("GIT_CHILD_SENTINEL", "GIT_CHILD_SENTINEL")
@@ -2399,5 +2417,107 @@ fn report_replacement_is_relative_to_verified_parent_handle() {
     assert!(
         !source.contains("[System.IO.File]::Replace($tempPath, $full"),
         "check-then-absolute-path replacement is vulnerable to parent swaps"
+    );
+}
+
+#[test]
+fn fixture_authority_is_ephemeral_and_not_a_forgeable_static_marker() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Get-CutoverFixtureAuthority")
+            || source.contains("RandomNumberGenerator")
+            || source.contains("RandomNumberGenerator.Fill"),
+        "fixture authorization must be generated per fixture rather than using a known constant"
+    );
+    assert!(
+        !source.contains("phase-11.1a-generated-fixture-v1"),
+        "the audit script must not embed a reusable fixture capability"
+    );
+    assert!(
+        source.contains("fixture authority") && source.contains("one-time"),
+        "fixture authorization must document its one-time test-only boundary"
+    );
+}
+
+#[test]
+fn tool_resolution_trusts_pinned_installations_and_only_allows_fixture_shims_in_fixture_mode() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("Get-CutoverTrustedExecutable")
+            || source.contains("Test-CutoverTrustedExecutablePath"),
+        "Git and rg must be selected from trusted pinned locations"
+    );
+    assert!(
+        source.contains("authenticated-fixture") && source.contains("fixture tool"),
+        "arbitrary test shims must be confined to the authenticated fixture mode"
+    );
+    assert!(
+        source.contains("trusted tool root") || source.contains("trustedToolRoots"),
+        "candidate audits must reject an ambient PATH executable"
+    );
+}
+
+#[test]
+fn creation_identity_failure_preserves_and_reports_root_cleanup_proof() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("ProcessLaunchException") || source.contains("RootCleanupProven"),
+        "a creation-time identity failure must carry the retained root cleanup result"
+    );
+    assert!(
+        source.contains("ActiveProcessZero = launch")
+            || source.contains("ActiveProcessZero = processLaunch"),
+        "ACTIVE_PROCESS_ZERO must reflect the actual root termination outcome"
+    );
+    assert!(
+        source.contains("TerminateAndWaitRoot") && source.contains("rootCleanupProven"),
+        "the retained root handle must be terminated and waited before reporting"
+    );
+}
+
+#[test]
+fn descendant_records_include_pid_creation_and_verified_executable_identity() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("ExecutablePath") && source.contains("ExecutableIdentity"),
+        "owned descendants must retain executable identity alongside PID and creation time"
+    );
+    assert!(
+        source.contains("GetProcessImagePath") || source.contains("QueryFullProcessImageNameW"),
+        "descendant executable identity must come from the process handle"
+    );
+    assert!(
+        source.contains("OpenExecutableIdentity"),
+        "descendant paths must be checked as opened file identities"
+    );
+}
+
+#[test]
+fn temporary_report_creation_records_identity_and_deletes_failed_handles() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("tempIdentity"),
+        "temporary report creation must retain the handle identity it created"
+    );
+    assert!(
+        source.contains("DeleteByHandle") && source.contains("Open-CutoverConfinedWriteFile"),
+        "failed temporary creation must delete through its retained handle"
+    );
+    assert!(
+        source.contains("tempHandle") && source.contains("finally"),
+        "report handles must be closed on every failure path"
+    );
+}
+
+#[test]
+fn scanner_job_has_a_bounded_active_process_limit() {
+    let source = fs::read_to_string(AUDIT_SCRIPT).expect("read audit script");
+    assert!(
+        source.contains("JobObjectLimitActiveProcess"),
+        "the scanner Job must enforce an active-process limit"
+    );
+    assert!(
+        source.contains("ActiveProcessLimit") && source.contains("MaxTrackedProcesses"),
+        "the active-process limit must be tied to the bounded descendant budget"
     );
 }
