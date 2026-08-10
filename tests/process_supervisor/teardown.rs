@@ -908,6 +908,7 @@ impl TeardownEffects for FaultyEffects {
 #[derive(Debug, Clone)]
 struct BlockingConstructionEffects {
     inner: FakeEffects,
+    entered: Arc<AtomicBool>,
     release: Arc<AtomicUsize>,
     block_residue: bool,
 }
@@ -916,6 +917,7 @@ impl BlockingConstructionEffects {
     fn new(inner: &FakeEffects) -> Self {
         Self {
             inner: inner.clone(),
+            entered: Arc::new(AtomicBool::new(false)),
             release: Arc::new(AtomicUsize::new(0)),
             block_residue: false,
         }
@@ -924,6 +926,7 @@ impl BlockingConstructionEffects {
     fn for_residue(inner: &FakeEffects) -> Self {
         Self {
             inner: inner.clone(),
+            entered: Arc::new(AtomicBool::new(false)),
             release: Arc::new(AtomicUsize::new(0)),
             block_residue: true,
         }
@@ -932,14 +935,24 @@ impl BlockingConstructionEffects {
     fn release(&self) {
         self.release.store(1, Ordering::SeqCst);
     }
+
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self.entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(self.entered.load(Ordering::SeqCst));
+    }
 }
 
 impl TeardownEffects for BlockingConstructionEffects {
     fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        self.entered.store(true, Ordering::SeqCst);
         if !self.block_residue {
             while self.release.load(Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            self.inner.record(ticket, "drain_future_constructed");
         }
         self.inner.drain(ticket)
     }
@@ -1599,7 +1612,7 @@ fn teardown_executor_drop_settles_active_and_queued_cells_as_failed() {
     }
     let release_drain = effects.install_drain_gate();
     let clock = FakeClock::default();
-    let coordinator = coordinator_with_limit_and_budgets(
+    let coordinator = Arc::new(coordinator_with_limit_and_budgets(
         &admission,
         &effects,
         &clock,
@@ -1609,7 +1622,7 @@ fn teardown_executor_drop_settles_active_and_queued_cells_as_failed() {
             Duration::from_secs(30),
             Duration::from_secs(30),
         ),
-    );
+    ));
 
     let waiters: Vec<_> = tickets
         .iter()
@@ -1664,7 +1677,7 @@ fn teardown_coordinator_drop_settles_active_and_queued_waiters_promptly() {
     }
     let release_drain = effects.install_drain_gate();
     let clock = FakeClock::default();
-    let coordinator = coordinator_with_limit_and_budgets(
+    let coordinator = Arc::new(coordinator_with_limit_and_budgets(
         &admission,
         &effects,
         &clock,
@@ -1674,7 +1687,7 @@ fn teardown_coordinator_drop_settles_active_and_queued_waiters_promptly() {
             Duration::from_secs(30),
             Duration::from_secs(30),
         ),
-    );
+    ));
 
     let waiters: Vec<_> = tickets
         .iter()
@@ -1688,7 +1701,8 @@ fn teardown_coordinator_drop_settles_active_and_queued_waiters_promptly() {
     assert_eq!(effects.drain_started_count(), 4);
 
     let started = Instant::now();
-    drop(coordinator);
+    let shutdown_coordinator = Arc::clone(&coordinator);
+    let drop_thread = std::thread::spawn(move || shutdown_coordinator.shutdown());
     let prompt = runtime().block_on(async {
         tokio::time::timeout(Duration::from_millis(100), async {
             let mut reports = Vec::with_capacity(waiters.len());
@@ -1701,6 +1715,8 @@ fn teardown_coordinator_drop_settles_active_and_queued_waiters_promptly() {
     });
 
     release_drain.send_replace(true);
+    drop_thread.join().expect("join coordinator shutdown");
+    drop(coordinator);
     let _ = runtime().block_on(async {
         tokio::time::timeout(Duration::from_secs(2), async {
             for waiter in waiters {
@@ -1802,6 +1818,62 @@ fn teardown_residue_future_construction_is_inside_the_deadline() {
 
     blocking.release();
     let _ = runtime().block_on(waiter.wait());
+}
+
+#[test]
+fn teardown_shutdown_waits_for_blocking_construction_before_return() {
+    let ticket = ticket(32, 52, TeardownScope::Host, 33, 132, 1_032);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let blocking = BlockingConstructionEffects::new(&effects);
+    let coordinator = Arc::new(coordinator_with_effects_and_budgets(
+        &admission,
+        Arc::new(blocking.clone()),
+        &FakeClock::default(),
+        TeardownBudgets::default(),
+    ));
+    let _waiter = coordinator.request(ticket).expect("admission winner");
+    blocking.wait_until_entered();
+
+    let returned = Arc::new(AtomicBool::new(false));
+    let events_at_return = Arc::new(Mutex::new(None));
+    let shutdown_coordinator = Arc::clone(&coordinator);
+    let effects_for_thread = effects.clone();
+    let returned_for_thread = Arc::clone(&returned);
+    let events_at_return_for_thread = Arc::clone(&events_at_return);
+    let shutdown_thread = std::thread::spawn(move || {
+        shutdown_coordinator.shutdown();
+        *events_at_return_for_thread
+            .lock()
+            .expect("events at shutdown return") = Some(effects_for_thread.events().len());
+        returned_for_thread.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !returned.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let returned_before_release = returned.load(Ordering::SeqCst);
+    blocking.release();
+    shutdown_thread
+        .join()
+        .expect("shutdown must settle blocking worker");
+
+    let events_at_return = events_at_return
+        .lock()
+        .expect("events at shutdown return")
+        .expect("shutdown return event snapshot");
+    assert!(
+        !returned_before_release,
+        "coordinator shutdown returned while effect construction was still blocked"
+    );
+    assert_eq!(
+        events_at_return,
+        effects.events().len(),
+        "no effect mutation may occur after coordinator shutdown returns"
+    );
 }
 
 #[test]

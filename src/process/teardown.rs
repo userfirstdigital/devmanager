@@ -26,7 +26,6 @@ pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
 pub const DEFAULT_EXECUTOR_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_DISPATCH_WORKER_CAPACITY: usize = 4;
 const DEFAULT_DISPATCH_QUEUE_CAPACITY: usize = 256;
-const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A boxed asynchronous operation used by the pure runtime seams.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1035,7 +1034,7 @@ struct DispatchInner {
 /// The worker owns future construction and polling. A timeout drops only the
 /// response wait and requests cancellation; arbitrary Rust code cannot be
 /// forcibly killed safely, so a stuck operation keeps its fixed worker slot
-/// and its `Arc`-retained dispatcher alive until it returns.
+/// until it returns. Explicit shutdown joins that slot before returning.
 struct BlockingDispatchPool {
     inner: Arc<DispatchInner>,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -1054,6 +1053,7 @@ struct SyncDispatch<T> {
 
 impl BlockingDispatchPool {
     fn new(worker_capacity: usize, queue_capacity: usize) -> Arc<Self> {
+        let worker_capacity = worker_capacity.max(1);
         let inner = Arc::new(DispatchInner {
             state: Mutex::new(DispatchQueueState {
                 queue: VecDeque::with_capacity(queue_capacity),
@@ -1085,6 +1085,42 @@ impl BlockingDispatchPool {
         pool
     }
 
+    /// Closes admission, cancels queued work, and joins every worker before
+    /// returning. A blocking adapter may not be forcefully killed safely, so
+    /// shutdown deliberately waits for that fixed worker slot to finish; it
+    /// never detaches a worker that can still mutate effects or persistence.
+    fn shutdown(&self) {
+        let queued = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("dispatch state mutex poisoned");
+            state.closed = true;
+            let queued: Vec<_> = state.queue.drain(..).collect();
+            self.inner.changed.notify_all();
+            queued
+        };
+        for task in queued {
+            task.cancellation.request();
+        }
+
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("dispatch workers mutex poisoned");
+        let handles = std::mem::take(&mut *workers);
+        drop(workers);
+
+        let current = thread::current().id();
+        for handle in handles {
+            if handle.thread().id() == current {
+                continue;
+            }
+            let _ = handle.join();
+        }
+    }
+
     fn enqueue(&self, task: DispatchTask) -> Result<(), DispatchReject> {
         let mut state = self
             .inner
@@ -1112,10 +1148,8 @@ impl BlockingDispatchPool {
     {
         let (sender, receiver) = oneshot::channel();
         let cancellation = CancellationToken::new();
-        let keepalive = Arc::clone(self);
         let task_cancellation = Arc::clone(&cancellation);
         let task_operation: DispatchOperation = Box::new(move |dispatch_cancellation| {
-            let _keepalive = keepalive;
             Box::pin(async move {
                 if dispatch_cancellation.is_requested() {
                     let _ = sender.send(Err("bounded teardown dispatch cancelled".to_string()));
@@ -1157,10 +1191,8 @@ impl BlockingDispatchPool {
     {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancellation = CancellationToken::new();
-        let keepalive = Arc::clone(self);
         let task_cancellation = Arc::clone(&cancellation);
         let task_operation: DispatchOperation = Box::new(move |dispatch_cancellation| {
-            let _keepalive = keepalive;
             Box::pin(async move {
                 if dispatch_cancellation.is_requested() {
                     let _ = sender.send(Err("bounded teardown dispatch cancelled".to_string()));
@@ -1255,44 +1287,7 @@ fn dispatch_worker(inner: Arc<DispatchInner>) {
 
 impl Drop for BlockingDispatchPool {
     fn drop(&mut self) {
-        let queued = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("dispatch state mutex poisoned");
-            state.closed = true;
-            let queued: Vec<_> = state.queue.drain(..).collect();
-            self.inner.changed.notify_all();
-            queued
-        };
-        for task in queued {
-            task.cancellation.request();
-        }
-
-        let mut workers = self
-            .workers
-            .lock()
-            .expect("dispatch workers mutex poisoned");
-        let handles = std::mem::take(&mut *workers);
-        drop(workers);
-        let current = thread::current().id();
-        let deadline = Instant::now() + DISPATCH_WORKER_SHUTDOWN_TIMEOUT;
-        for handle in handles {
-            if handle.thread().id() == current {
-                continue;
-            }
-            while !handle.is_finished() {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                thread::sleep((deadline - now).min(Duration::from_millis(1)));
-            }
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
-        }
+        self.shutdown();
         debug_assert!(self.worker_capacity > 0);
     }
 }
@@ -1407,7 +1402,7 @@ impl TeardownExecutor {
     }
 
     fn shutdown(&self) {
-        let (queued, active) = {
+        let work = {
             let mut state = self
                 .keepalive
                 .inner
@@ -1415,15 +1410,20 @@ impl TeardownExecutor {
                 .lock()
                 .expect("teardown executor state mutex poisoned");
             if state.closed {
-                return;
+                None
+            } else {
+                state.closed = true;
+                let queued: Vec<_> = state.queue.drain(..).collect();
+                let active = state.active.clone();
+                state.active.clear();
+                state.occupied = state.occupied.saturating_sub(queued.len());
+                self.keepalive.inner.changed.notify_all();
+                Some((queued, active))
             }
-            state.closed = true;
-            let queued: Vec<_> = state.queue.drain(..).collect();
-            let active = state.active.clone();
-            state.active.clear();
-            state.occupied = state.occupied.saturating_sub(queued.len());
-            self.keepalive.inner.changed.notify_all();
-            (queued, active)
+        };
+        let Some((queued, active)) = work else {
+            self.keepalive.join_workers();
+            return;
         };
         for work in queued {
             cancel_queued_cleanup(work);
@@ -1440,9 +1440,12 @@ impl TeardownExecutor {
                 .expect("teardown coordinator state mutex poisoned")
                 .active
                 .retain(|entry| entry.key != execution.key);
-            // The waiter is settled immediately, while the in-flight work
-            // remains owned by the worker and its retained dispatch boundary.
         }
+
+        // Waiters are settled above, but the worker may still be inside an
+        // effect or persistence adapter. Join the fixed executor workers so
+        // no cleanup can mutate state after shutdown returns.
+        self.keepalive.join_workers();
     }
 
     fn is_closed(&self) -> bool {
@@ -1507,6 +1510,12 @@ impl Drop for TeardownExecutor {
 
 impl Drop for TeardownExecutorKeepalive {
     fn drop(&mut self) {
+        self.join_workers();
+    }
+}
+
+impl TeardownExecutorKeepalive {
+    fn join_workers(&self) {
         let current = thread::current().id();
         let mut workers = self
             .workers
@@ -1741,11 +1750,15 @@ impl TeardownCoordinator {
     }
 
     /// Closes fresh admission and settles every queued or active waiter with
-    /// a typed fail-closed report. In-flight effect/store code remains
-    /// retained by its fixed dispatch worker until it observes cancellation or
-    /// returns.
+    /// a typed fail-closed report, then joins every executor and dispatch
+    /// worker. In-flight effect/store code is allowed to finish its fixed
+    /// worker slot before this method returns, so no mutation can outlive the
+    /// coordinator shutdown boundary.
     pub fn shutdown(&self) {
         self.executor.shutdown();
+        self.dispatcher.shutdown();
+        self.completion_dispatcher.shutdown();
+        self.lookup_dispatcher.shutdown();
     }
 
     pub fn configured_capacity(&self) -> usize {
@@ -2093,7 +2106,7 @@ impl TeardownCoordinator {
 
 impl Drop for TeardownCoordinator {
     fn drop(&mut self) {
-        self.executor.shutdown();
+        self.shutdown();
     }
 }
 
@@ -2272,6 +2285,9 @@ fn dispatch_stage(
     dispatcher
         .submit_async(move |dispatch_cancellation| {
             Box::pin(async move {
+                if dispatch_cancellation.is_requested() || cancellation.is_requested() {
+                    return Err("teardown stage dispatch cancellation requested".to_string());
+                }
                 let future = match call {
                     EffectCall::Drain => effects.drain(&ticket),
                     EffectCall::CooperativeClose => effects.cooperative_close(&ticket),
@@ -2313,6 +2329,9 @@ fn dispatch_wait(
     dispatcher
         .submit_async(move |dispatch_cancellation| {
             Box::pin(async move {
+                if dispatch_cancellation.is_requested() || cancellation.is_requested() {
+                    return Err("zero wait dispatch cancellation requested".to_string());
+                }
                 let future = effects.wait_for_zero(&ticket, stage, deadline);
                 tokio::select! {
                     _ = dispatch_cancellation.cancelled() => {
@@ -2340,6 +2359,9 @@ fn dispatch_residue(
     dispatcher
         .submit_async(move |dispatch_cancellation| {
             Box::pin(async move {
+                if dispatch_cancellation.is_requested() || cancellation.is_requested() {
+                    return Err("teardown residue dispatch cancellation requested".to_string());
+                }
                 let future = effects.residue(&ticket);
                 tokio::select! {
                     _ = dispatch_cancellation.cancelled() => {
@@ -2926,7 +2948,14 @@ fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_text, MAX_EVIDENCE_TEXT_BYTES};
+    use super::{sanitize_text, BlockingDispatchPool, MAX_EVIDENCE_TEXT_BYTES};
+
+    #[test]
+    fn blocking_dispatch_pool_normalizes_zero_worker_configuration() {
+        let pool = BlockingDispatchPool::new(0, 1);
+        assert_eq!(pool.worker_capacity, 1);
+        pool.shutdown();
+    }
 
     #[test]
     fn sanitize_text_bounds_input_and_redacts_adversarial_secret_forms() {

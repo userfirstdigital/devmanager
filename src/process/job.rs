@@ -1,19 +1,15 @@
 //! Windows Job Object ownership for managed process trees.
 
 #[cfg(windows)]
-use std::collections::VecDeque;
-#[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(windows)]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::thread::JoinHandle;
-#[cfg(windows)]
-use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity};
@@ -127,11 +123,7 @@ const SHUTDOWN_COMPLETION_KEY: usize = 0;
 #[cfg(windows)]
 const COMPLETION_LISTENER_POLL_MILLIS: u32 = 25;
 #[cfg(windows)]
-const COMPLETION_LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(windows)]
 const ERROR_TIMEOUT: i32 = 258;
-#[cfg(windows)]
-const MAX_JOB_LEAK_EVIDENCE: usize = 256;
 #[cfg(windows)]
 static NEXT_COMPLETION_KEY: AtomicUsize = AtomicUsize::new(1);
 
@@ -262,45 +254,7 @@ pub struct ManagedProcessJob {
     completion_mailbox: Arc<Mutex<CompletionMailbox>>,
     completion_listener: Option<JoinHandle<()>>,
     completion_stop: Arc<AtomicBool>,
-    listener_shutdown_failure: Option<String>,
 }
-
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedProcessJobLeakEvidence {
-    reason: String,
-    fence: Option<ManagedProcessFence>,
-}
-
-#[cfg(windows)]
-impl ManagedProcessJobLeakEvidence {
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
-
-    pub fn fence(&self) -> Option<&ManagedProcessFence> {
-        self.fence.as_ref()
-    }
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-struct QuarantinedManagedProcessJob {
-    handle: Option<OwnedHandle>,
-    completion_port: Option<OwnedHandle>,
-    completion_key: usize,
-    completion_fence: Option<ManagedProcessFence>,
-    completion_mailbox: Arc<Mutex<CompletionMailbox>>,
-    completion_listener: Option<JoinHandle<()>>,
-    completion_stop: Arc<AtomicBool>,
-    evidence: ManagedProcessJobLeakEvidence,
-}
-
-#[cfg(windows)]
-static QUARANTINED_JOBS: OnceLock<Mutex<Vec<QuarantinedManagedProcessJob>>> = OnceLock::new();
-#[cfg(windows)]
-static JOB_LEAK_EVIDENCE: OnceLock<Mutex<VecDeque<ManagedProcessJobLeakEvidence>>> =
-    OnceLock::new();
 
 /// Non-Windows marker type returned only behind `Option::None`.
 #[cfg(not(windows))]
@@ -389,16 +343,16 @@ impl ManagedProcessJob {
         }
     }
 
-    /// Stops the completion listener within the release boundary while
-    /// retaining the Job and completion-port handles for the caller.
+    /// Stops the completion listener and joins it before returning.
     ///
-    /// The final handle close remains the `Drop` path after the registry has
-    /// removed the exact stopped entry. A failed listener stop leaves this
-    /// value intact so the caller can report residue and retry safely.
+    /// The listener owns the only receiver capability and may mutate the
+    /// completion mailbox. Joining it is therefore part of the release
+    /// boundary: once this method returns, no receiver thread can outlive the
+    /// Job or mutate its mailbox.
     pub fn shutdown_for_release(&mut self) -> Result<(), String> {
         #[cfg(windows)]
         {
-            self.shutdown_listener_until(Instant::now() + COMPLETION_LISTENER_SHUTDOWN_TIMEOUT)
+            self.shutdown_listener()
         }
 
         #[cfg(not(windows))]
@@ -483,143 +437,54 @@ impl ManagedProcessJob {
     }
 
     #[cfg(windows)]
-    fn shutdown_listener_until(&mut self, deadline: Instant) -> Result<(), String> {
-        if let Some(detail) = self.listener_shutdown_failure.as_ref() {
-            return Err(detail.clone());
-        }
+    fn shutdown_listener(&mut self) -> Result<(), String> {
         let Some(listener) = self.completion_listener.take() else {
             return Ok(());
         };
 
         self.completion_stop.store(true, Ordering::SeqCst);
-        let Some(port) = self.completion_port.as_ref() else {
-            self.completion_listener = Some(listener);
-            return Err(
-                "managed Job completion port is unavailable while stopping listener".to_string(),
-            );
+        let post_error = match self.completion_port.as_ref() {
+            Some(port) => {
+                let posted = unsafe {
+                    PostQueuedCompletionStatus(
+                        port.as_raw_handle(),
+                        SHUTDOWN_MESSAGE,
+                        SHUTDOWN_COMPLETION_KEY,
+                        std::ptr::null_mut(),
+                    ) != 0
+                };
+                (!posted).then(|| {
+                    format!(
+                        "managed Job completion listener shutdown post failed: {}",
+                        std::io::Error::last_os_error()
+                    )
+                })
+            }
+            None => {
+                Some("managed Job completion port is unavailable while stopping listener".into())
+            }
         };
-        let posted = unsafe {
-            PostQueuedCompletionStatus(
-                port.as_raw_handle(),
-                SHUTDOWN_MESSAGE,
-                SHUTDOWN_COMPLETION_KEY,
-                std::ptr::null_mut(),
-            ) != 0
-        };
-        if !posted {
-            let detail = format!(
-                "managed Job completion listener shutdown post failed: {}",
-                std::io::Error::last_os_error()
-            );
-            self.completion_listener = Some(listener);
+        let join_error = listener
+            .join()
+            .err()
+            .map(|_| "managed Job completion listener panicked during shutdown".to_string());
+        if let Some(detail) = post_error {
             return Err(detail);
         }
-
-        while !listener.is_finished() {
-            let now = Instant::now();
-            if now >= deadline {
-                self.completion_listener = Some(listener);
-                return Err(format!(
-                    "managed Job completion listener did not stop before deadline; handles retained"
-                ));
-            }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+        if let Some(detail) = join_error {
+            return Err(detail);
         }
-
-        match listener.join() {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                let detail = format!(
-                    "managed Job completion listener panicked during shutdown; handles retained"
-                );
-                self.listener_shutdown_failure = Some(detail.clone());
-                Err(detail)
-            }
-        }
+        Ok(())
     }
-
-    #[cfg(windows)]
-    fn quarantine(&mut self, reason: String) {
-        reap_quarantined_managed_process_jobs();
-        let evidence = ManagedProcessJobLeakEvidence {
-            reason,
-            fence: self.completion_fence.clone(),
-        };
-        let mut evidence_history = JOB_LEAK_EVIDENCE
-            .get_or_init(|| Mutex::new(VecDeque::new()))
-            .lock()
-            .expect("managed Job leak evidence mutex poisoned");
-        if evidence_history.len() >= MAX_JOB_LEAK_EVIDENCE {
-            evidence_history.pop_front();
-        }
-        evidence_history.push_back(evidence.clone());
-        drop(evidence_history);
-        QUARANTINED_JOBS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("managed Job quarantine mutex poisoned")
-            .push(QuarantinedManagedProcessJob {
-                handle: self.handle.take(),
-                completion_port: self.completion_port.take(),
-                completion_key: self.completion_key,
-                completion_fence: self.completion_fence.take(),
-                completion_mailbox: Arc::clone(&self.completion_mailbox),
-                completion_listener: self.completion_listener.take(),
-                completion_stop: Arc::clone(&self.completion_stop),
-                evidence,
-            });
-    }
-}
-
-#[cfg(windows)]
-fn reap_quarantined_managed_process_jobs() {
-    let Some(quarantined) = QUARANTINED_JOBS.get() else {
-        return;
-    };
-    let mut quarantined = quarantined
-        .lock()
-        .expect("managed Job quarantine mutex poisoned");
-    let mut retained = Vec::with_capacity(quarantined.len());
-    for mut job in quarantined.drain(..) {
-        let listener_finished = job
-            .completion_listener
-            .as_ref()
-            .map(JoinHandle::is_finished)
-            .unwrap_or(true);
-        if listener_finished {
-            if let Some(listener) = job.completion_listener.take() {
-                let _ = listener.join();
-            }
-        } else {
-            retained.push(job);
-        }
-    }
-    *quarantined = retained;
-}
-
-#[cfg(windows)]
-pub fn quarantined_managed_process_job_evidence() -> Vec<ManagedProcessJobLeakEvidence> {
-    reap_quarantined_managed_process_jobs();
-    JOB_LEAK_EVIDENCE
-        .get_or_init(|| Mutex::new(VecDeque::new()))
-        .lock()
-        .expect("managed Job leak evidence mutex poisoned")
-        .iter()
-        .cloned()
-        .collect()
 }
 
 #[cfg(windows)]
 impl Drop for ManagedProcessJob {
     fn drop(&mut self) {
-        if self.completion_listener.is_some() || self.listener_shutdown_failure.is_some() {
-            if let Err(reason) =
-                self.shutdown_listener_until(Instant::now() + COMPLETION_LISTENER_SHUTDOWN_TIMEOUT)
-            {
-                self.quarantine(reason);
-                return;
-            }
-        }
+        // The listener must be joined before either handle is closed. The
+        // completion port is the listener's wakeup boundary, while the
+        // polling stop flag is the fail-closed fallback if posting fails.
+        let _ = self.shutdown_listener();
         drop(self.completion_port.take());
         drop(self.handle.take());
     }
@@ -811,7 +676,6 @@ fn create_windows_job() -> Result<ManagedProcessJob, String> {
             completion_mailbox: Arc::new(Mutex::new(CompletionMailbox::default())),
             completion_listener: None,
             completion_stop: Arc::new(AtomicBool::new(false)),
-            listener_shutdown_failure: None,
         })
     }
 }
@@ -864,6 +728,9 @@ fn completion_listener(
 ) {
     let completion_port = completion_port_value as *mut c_void;
     loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut message_id = 0u32;
         let mut completion_key = 0usize;
         let mut process_value = std::ptr::null_mut();
@@ -1068,7 +935,7 @@ mod tests {
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
     use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, ManagedProcessFence};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1162,43 +1029,50 @@ mod tests {
     }
 
     #[test]
-    fn managed_job_drop_quarantines_a_stuck_listener_within_deadline() {
+    fn managed_job_drop_joins_listener_before_return() {
         let Some(mut job) = super::ManagedProcessJob::create()
             .expect("create managed Job for listener shutdown test")
         else {
             return;
         };
-        job.completion_listener = Some(std::thread::spawn(|| {
+        let listener_finished = Arc::new(AtomicBool::new(false));
+        let listener_finished_for_thread = Arc::clone(&listener_finished);
+        job.completion_listener = Some(std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(750));
+            listener_finished_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
 
-        let shutdown_started = Instant::now();
-        let error = job
-            .shutdown_for_release()
-            .expect_err("stuck listener must report a bounded shutdown failure");
-        assert!(error.contains("did not stop before deadline"));
-        assert!(shutdown_started.elapsed() < Duration::from_millis(500));
-        assert!(job.handle.is_some(), "failed shutdown retains Job handle");
-        assert!(
-            job.completion_port.is_some(),
-            "failed shutdown retains completion port"
-        );
-        assert!(
-            job.completion_listener.is_some(),
-            "failed shutdown retains listener handle"
-        );
-
-        let evidence_before = super::quarantined_managed_process_job_evidence().len();
         let drop_started = Instant::now();
         drop(job);
-        assert!(drop_started.elapsed() < Duration::from_millis(500));
-        let evidence = super::quarantined_managed_process_job_evidence();
-        assert!(evidence.len() > evidence_before);
-        assert!(evidence
-            .last()
-            .expect("stuck listener evidence")
-            .reason()
-            .contains("did not stop before deadline"));
+        let returned_before_listener = !listener_finished.load(Ordering::SeqCst);
+        let elapsed = drop_started.elapsed();
+        assert!(
+            !returned_before_listener,
+            "managed Job drop returned while its completion listener was still live (elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn repeated_managed_job_drops_join_every_listener() {
+        for _ in 0..4 {
+            let Some(mut job) = super::ManagedProcessJob::create()
+                .expect("create managed Job for repeated listener shutdown")
+            else {
+                return;
+            };
+            let listener_finished = Arc::new(AtomicBool::new(false));
+            let listener_finished_for_thread = Arc::clone(&listener_finished);
+            job.completion_listener = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                listener_finished_for_thread.store(true, Ordering::SeqCst);
+            }));
+
+            drop(job);
+            assert!(
+                listener_finished.load(Ordering::SeqCst),
+                "repeated Job drop left a completion listener running"
+            );
+        }
     }
 
     #[test]
