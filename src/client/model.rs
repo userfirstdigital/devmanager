@@ -31,6 +31,10 @@ const MAX_INDEXED_TITLE_CHARS: usize = 1_024;
 /// Maximum indexed search identities handed to one bounded UI projection.
 /// The index still reports the complete truthful match count separately.
 pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
+/// Search postings cannot admit more identities than one bounded client
+/// model. This keeps every posting finite while preserving its exact count.
+pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
+const MAX_INDEXED_GRAM_CHARS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -124,6 +128,91 @@ impl std::fmt::Display for ClientModelError {
 
 impl std::error::Error for ClientModelError {}
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SearchPosting {
+    active: BTreeSet<SearchOrderKey>,
+    archived: BTreeSet<SearchOrderKey>,
+}
+
+impl SearchPosting {
+    fn insert(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+        let key = SearchOrderKey::new(task_id, entry);
+        let set = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived
+        } else {
+            &mut self.active
+        };
+        if set.len() < MAX_CLIENT_SEARCH_POSTING_IDS {
+            set.insert(key);
+        }
+    }
+
+    fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+        let key = SearchOrderKey::new(task_id, entry);
+        let set = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived
+        } else {
+            &mut self.active
+        };
+        set.remove(&key);
+    }
+
+    fn ids(&self, archived: bool) -> &BTreeSet<SearchOrderKey> {
+        if archived {
+            &self.archived
+        } else {
+            &self.active
+        }
+    }
+
+    fn len(&self, archived: bool) -> usize {
+        self.ids(archived).len()
+    }
+
+    fn contains(&self, archived: bool, key: &SearchOrderKey) -> bool {
+        self.ids(archived).contains(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active.is_empty() && self.archived.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SearchOrderKey {
+    task_id: TaskId,
+    attention_rank: u8,
+    occurred_at_ms: i64,
+    revision: u64,
+}
+
+impl SearchOrderKey {
+    fn new(task_id: TaskId, entry: &TaskProjectionEntry) -> Self {
+        Self {
+            task_id,
+            attention_rank: entry.attention_rank,
+            occurred_at_ms: entry.occurred_at_ms,
+            revision: entry.revision,
+        }
+    }
+}
+
+impl Ord for SearchOrderKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.attention_rank
+            .cmp(&other.attention_rank)
+            .then_with(|| other.occurred_at_ms.cmp(&self.occurred_at_ms))
+            .then_with(|| other.revision.cmp(&self.revision))
+            .then_with(|| self.task_id.cmp(&other.task_id))
+    }
+}
+
+impl PartialOrd for SearchOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskProjectionEntry {
     lifecycle: TaskLifecycle,
@@ -145,10 +234,11 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
-    /// Bounded substring index. Each title contributes at most three
-    /// character grams per character position, so search candidates are
-    /// selected from the index instead of scanning the complete task map.
-    search: BTreeMap<String, BTreeSet<TaskOrderKey>>,
+    /// Compact substring postings. Each entry stores only numeric ordering
+    /// metadata and a TaskId; title strings remain in `entries` exactly once.
+    /// The active/archive sets make the common exact-gram path independent of
+    /// the 100k task map.
+    search: BTreeMap<String, SearchPosting>,
     full_rebuilds: u64,
     incremental_updates: u64,
 }
@@ -166,7 +256,7 @@ impl TaskProjectionIndex {
             .collect::<BTreeMap<_, _>>();
         let mut active_order = BTreeSet::new();
         let mut archived_order = BTreeSet::new();
-        let mut search = BTreeMap::<String, BTreeSet<TaskOrderKey>>::new();
+        let mut search = BTreeMap::<String, SearchPosting>::new();
         for (task_id, entry) in &entries {
             let key = TaskOrderKey::new(*task_id, entry);
             if entry.lifecycle == TaskLifecycle::Archived {
@@ -175,10 +265,7 @@ impl TaskProjectionIndex {
                 active_order.insert(key);
             }
             for token in search_tokens(&entry.lower_title) {
-                search
-                    .entry(token)
-                    .or_default()
-                    .insert(TaskOrderKey::new(*task_id, entry));
+                search.entry(token).or_default().insert(*task_id, entry);
             }
         }
         Self {
@@ -233,6 +320,19 @@ impl TaskProjectionIndex {
     /// rows, and the returned count is the truthful number of matches before
     /// the UI retention cap.
     pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
+        let (ids, total, _) = self.search_task_ids_with_work(query, archived);
+        (ids, total)
+    }
+
+    /// Search with observable bounded candidate work for diagnostics/tests.
+    /// Exact grams return the complete truthful total and only the retained
+    /// first page; longer queries intersect the smallest posting and verify
+    /// titles without cloning any posting or walking the task map.
+    pub fn search_task_ids_with_work(
+        &self,
+        query: &str,
+        archived: bool,
+    ) -> (Vec<TaskId>, usize, usize) {
         let query = query
             .chars()
             .take(MAX_CLIENT_SEARCH_CHARS)
@@ -250,37 +350,51 @@ impl TaskProjectionIndex {
                 .take(MAX_CLIENT_SEARCH_RESULTS)
                 .map(|key| key.task_id)
                 .collect();
-            return (ids, count);
+            return (ids, count, count.min(MAX_CLIENT_SEARCH_RESULTS));
+        }
+
+        // A complete one-to-four-character gram is an exact substring index
+        // entry. It is already sorted by deterministic attention/occurred
+        // ordering, so no candidate scan or title clone is needed.
+        if query.chars().count() <= MAX_INDEXED_GRAM_CHARS {
+            let Some(posting) = self.search.get(&query) else {
+                return (Vec::new(), 0, 0);
+            };
+            let ids = posting
+                .ids(archived)
+                .iter()
+                .take(MAX_CLIENT_SEARCH_RESULTS)
+                .map(|key| key.task_id)
+                .collect::<Vec<_>>();
+            let count = posting.len(archived);
+            let work = ids.len();
+            return (ids, count, work);
         }
         let tokens = search_tokens(&query);
-        let Some(first) = tokens.first().and_then(|token| self.search.get(token)) else {
-            return (Vec::new(), 0);
-        };
-        let mut candidates = first.clone();
-        for token in tokens.iter().skip(1) {
-            let Some(ids) = self.search.get(token) else {
-                return (Vec::new(), 0);
-            };
-            candidates.retain(|key| ids.contains(key));
-            if candidates.is_empty() {
-                return (Vec::new(), 0);
-            }
+        if tokens.iter().any(|token| !self.search.contains_key(token)) {
+            return (Vec::new(), 0, 0);
         }
-        let order = if archived {
-            &self.archived_order
-        } else {
-            &self.active_order
+        let Some((_, first)) = tokens
+            .iter()
+            .filter_map(|token| self.search.get(token).map(|posting| (token, posting)))
+            .min_by_key(|(_, posting)| posting.len(archived))
+        else {
+            return (Vec::new(), 0, 0);
         };
-        let mut ids = Vec::with_capacity(MAX_CLIENT_SEARCH_RESULTS.min(candidates.len()));
+        let first_ids = first.ids(archived);
+        let mut ids = Vec::with_capacity(MAX_CLIENT_SEARCH_RESULTS.min(first_ids.len()));
         let mut count = 0;
-        for key in candidates {
-            if !order.contains(&key) {
-                continue;
-            }
-            // One-, two-, and three-character indexes are exact. Longer
-            // queries use intersected grams as candidates and need one title
-            // check, still without walking the full task map.
-            let matches = query.chars().count() <= 3 || key.lower_title.contains(&query);
+        let mut work: usize = 0;
+        for key in first_ids {
+            work = work.saturating_add(1);
+            let matches = tokens.iter().all(|token| {
+                self.search
+                    .get(token)
+                    .is_some_and(|posting| posting.contains(archived, key))
+            }) && self
+                .entries
+                .get(&key.task_id)
+                .is_some_and(|entry| entry.lower_title.contains(&query));
             if !matches {
                 continue;
             }
@@ -289,8 +403,7 @@ impl TaskProjectionIndex {
                 ids.push(key.task_id);
             }
         }
-        ids.shrink_to_fit();
-        (ids, count)
+        (ids, count, work)
     }
 
     pub fn len(&self) -> usize {
@@ -329,8 +442,12 @@ impl TaskProjectionIndex {
         } else {
             self.active_order.insert(key.clone());
         }
+        let entry = self
+            .entries
+            .get(&task_id)
+            .expect("inserted task projection entry");
         for token in search_tokens(&search_title) {
-            self.search.entry(token).or_default().insert(key.clone());
+            self.search.entry(token).or_default().insert(task_id, entry);
         }
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
@@ -341,11 +458,14 @@ impl TaskProjectionIndex {
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
             for token in search_tokens(&entry.lower_title) {
-                let mut remove_token = false;
-                if let Some(keys) = self.search.get_mut(&token) {
-                    keys.remove(&key);
-                    remove_token = keys.is_empty();
-                }
+                let remove_token = self
+                    .search
+                    .get_mut(&token)
+                    .map(|keys| {
+                        keys.remove(task_id, &entry);
+                        keys.is_empty()
+                    })
+                    .unwrap_or(false);
                 if remove_token {
                     self.search.remove(&token);
                 }
@@ -367,6 +487,9 @@ fn search_tokens(value: &str) -> Vec<String> {
         }
         if let (Some(next), Some(last)) = (chars.get(index + 1), chars.get(index + 2)) {
             tokens.insert(format!("{}{}{}", chars[index], next, last));
+            if let Some(fourth) = chars.get(index + 3) {
+                tokens.insert(format!("{}{}{}{}", chars[index], next, last, fourth));
+            }
         }
     }
     tokens.into_iter().collect()
@@ -503,6 +626,15 @@ impl ClientModel {
 
     pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
         self.task_projection_index.search_task_ids(query, archived)
+    }
+
+    pub fn search_task_ids_with_work(
+        &self,
+        query: &str,
+        archived: bool,
+    ) -> (Vec<TaskId>, usize, usize) {
+        self.task_projection_index
+            .search_task_ids_with_work(query, archived)
     }
 
     /// Shared bound check for frozen replay continuation cursors/pages.

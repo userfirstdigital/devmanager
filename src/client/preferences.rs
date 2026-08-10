@@ -7,7 +7,7 @@
 //! implicit production path or environment fallback.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 const PREFERENCES_SCHEMA: &str = "devmanager.client-preferences/v1";
 const PREFERENCES_FILE_NAME: &str = "inbox-preferences.json";
 const MAX_CURSOR_BYTES: usize = 1_048_576;
+const MAX_PREFERENCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientPreferenceError {
@@ -23,6 +24,7 @@ pub enum ClientPreferenceError {
     Decode(String),
     UnsupportedSchema(String),
     CursorTooLarge(usize),
+    FileTooLarge { bytes: u64, max_bytes: u64 },
 }
 
 impl std::fmt::Display for ClientPreferenceError {
@@ -36,6 +38,12 @@ impl std::fmt::Display for ClientPreferenceError {
             }
             Self::CursorTooLarge(bytes) => {
                 write!(f, "inbox cursor exceeds {MAX_CURSOR_BYTES} bytes: {bytes}")
+            }
+            Self::FileTooLarge { bytes, max_bytes } => {
+                write!(
+                    f,
+                    "client preference file exceeds {max_bytes} bytes: {bytes}"
+                )
             }
         }
     }
@@ -77,13 +85,39 @@ impl InboxPreferenceStore {
 
     /// Missing files and missing fields are the backwards-compatible default.
     pub fn load_unread_cursor(&self) -> Result<Option<Vec<u8>>, ClientPreferenceError> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ClientPreferenceError::Io(error.to_string())),
         };
-        let file: PreferencesFile = serde_json::from_slice(&bytes)
-            .map_err(|error| ClientPreferenceError::Decode(error.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| ClientPreferenceError::Io(error.to_string()))?;
+        if metadata.len() > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: metadata.len(),
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_PREFERENCE_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| ClientPreferenceError::Io(error.to_string()))?;
+        if bytes.len() as u64 > MAX_PREFERENCE_FILE_BYTES {
+            return Err(ClientPreferenceError::FileTooLarge {
+                bytes: bytes.len() as u64,
+                max_bytes: MAX_PREFERENCE_FILE_BYTES,
+            });
+        }
+        /*
+         * The handle stays open through the bounded read above. This avoids
+         * turning a concurrently growing preference file into an unbounded
+         * allocation between metadata validation and decoding.
+         */
+        let file = match serde_json::from_slice::<PreferencesFile>(&bytes) {
+            Ok(file) => file,
+            Err(error) => return Err(ClientPreferenceError::Decode(error.to_string())),
+        };
         if file.schema != PREFERENCES_SCHEMA {
             return Err(ClientPreferenceError::UnsupportedSchema(file.schema));
         }
@@ -253,6 +287,20 @@ mod tests {
         assert!(matches!(
             store.save_unread_cursor(Some(&vec![0u8; MAX_CURSOR_BYTES + 1])),
             Err(ClientPreferenceError::CursorTooLarge(bytes)) if bytes == MAX_CURSOR_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn oversized_preference_file_is_rejected_before_unbounded_read() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = InboxPreferenceStore::at_profile_root(directory.path());
+        let bytes = MAX_PREFERENCE_FILE_BYTES + 1;
+        let file = std::fs::File::create(store.path()).expect("preference file");
+        file.set_len(bytes).expect("sparse oversized file");
+        assert!(matches!(
+            store.load_unread_cursor(),
+            Err(ClientPreferenceError::FileTooLarge { bytes: actual, max_bytes })
+                if actual == bytes && max_bytes == MAX_PREFERENCE_FILE_BYTES
         ));
     }
 }

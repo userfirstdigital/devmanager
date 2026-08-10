@@ -571,6 +571,7 @@ pub struct InboxRuntime {
     unread: UnreadCursor,
     filter: InboxFilter,
     projection: Option<Inbox>,
+    projection_stale: bool,
     projection_updates: u64,
 }
 
@@ -582,6 +583,7 @@ impl InboxRuntime {
     pub fn attach_subscription(&mut self, subscription: ClientSubscription) {
         self.live_subscription = None;
         self.subscription = Some(subscription);
+        self.projection_stale = false;
         self.rebuild_projection();
     }
 
@@ -592,6 +594,7 @@ impl InboxRuntime {
     pub fn attach_live_subscription(&mut self, subscription: LiveClientSubscription) {
         self.subscription = None;
         self.live_subscription = Some(subscription);
+        self.projection_stale = false;
         self.refresh_from_subscription();
     }
 
@@ -616,6 +619,16 @@ impl InboxRuntime {
 
     pub fn projection(&self) -> Option<&Inbox> {
         self.projection.as_ref()
+    }
+
+    pub fn projection_stale(&self) -> bool {
+        self.projection_stale
+    }
+
+    pub fn invalidate_for_resync(&mut self) {
+        self.projection_stale = true;
+        self.projection = None;
+        self.projection_updates = self.projection_updates.saturating_add(1);
     }
 
     pub fn unread_cursor(&self) -> &UnreadCursor {
@@ -670,6 +683,11 @@ impl InboxRuntime {
     pub fn refresh_from_subscription(&mut self) {
         if let Some(subscription) = self.live_subscription.clone() {
             if let Ok(mut subscription) = subscription.try_lock() {
+                if subscription.state() != crate::client::ClientSubscriptionState::Ready {
+                    self.projection_stale = true;
+                    self.projection = None;
+                    return;
+                }
                 for event in subscription.take_replay_events() {
                     let _ = self.unread.observe_durable_event(&event);
                 }
@@ -678,6 +696,7 @@ impl InboxRuntime {
                 self.projection = subscription
                     .model()
                     .map(|model| Inbox::from_model_with_filter(model, &filter, &unread));
+                self.projection_stale = false;
                 self.projection_updates = self.projection_updates.saturating_add(1);
             }
         } else {
@@ -744,6 +763,9 @@ impl InboxRuntime {
     ) -> Result<bool, SubscriptionError> {
         match update {
             SubscriptionUpdate::DurableEvent(event) => {
+                if self.projection_stale {
+                    return Ok(false);
+                }
                 let observed = self.unread.observe_durable_event(&event);
                 if !observed {
                     // ClientSubscription already applied this event (or the
@@ -780,7 +802,9 @@ impl InboxRuntime {
                 Ok(observed)
             }
             SubscriptionUpdate::ResyncRequired { .. } => {
-                self.rebuild_projection();
+                self.projection_stale = true;
+                self.projection = None;
+                self.projection_updates = self.projection_updates.saturating_add(1);
                 Ok(false)
             }
             SubscriptionUpdate::Stream(_) => Ok(false),
@@ -797,6 +821,10 @@ impl InboxRuntime {
     }
 
     fn rebuild_projection(&mut self) {
+        if self.projection_stale {
+            self.projection = None;
+            return;
+        }
         let filter = self.filter.clone();
         if let Some(subscription) = self.subscription.as_mut() {
             for event in subscription.take_replay_events() {
@@ -818,6 +846,7 @@ impl InboxRuntime {
                     .map(|model| Inbox::from_model_with_filter(model, &filter, &unread))
             });
         }
+        self.projection_stale = self.projection.is_none();
         self.projection_updates = self.projection_updates.saturating_add(1);
     }
 }

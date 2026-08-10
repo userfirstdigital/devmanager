@@ -1,7 +1,9 @@
 //! Pure Task Cockpit projection contracts.
 
+mod bootstrap;
 pub mod inbox;
 
+pub use bootstrap::NativeNextTaskCockpit;
 pub use inbox::{
     render_native_inbox, render_native_inbox_with_actions, Inbox, InboxError, InboxFilter,
     InboxItemKey, InboxOverflow, InboxPresentationWidth, InboxRenderItem, InboxRenderModel,

@@ -1456,6 +1456,38 @@ fn inbox_applies_one_100k_model_event_incrementally_and_keeps_indexed_search_tru
 }
 
 #[test]
+fn indexed_search_keeps_common_and_adversarial_100k_queries_bounded_and_ordered() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Task {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+
+    let queries = vec!["t".to_string(), "task".to_string(), "t".repeat(160)];
+    for query in queries {
+        let (ids, total, work) = model.search_task_ids_with_work(&query, false);
+        if query == "t" || query == "task" {
+            assert_eq!(total, 100_000, "truthful total for {query:?}");
+            assert_eq!(ids.first().copied(), Some(inbox_task_id(99_999)));
+        } else {
+            assert_eq!(total, 0, "adversarial query must not fabricate matches");
+        }
+        assert!(ids.len() <= 5_000);
+        assert!(work <= 5_000, "hot-path work must be capped for {query:?}");
+    }
+}
+
+#[test]
 fn case_only_titles_use_the_same_stable_order_and_fixture_exposes_action_coverage() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/ui/task-inbox.json"))

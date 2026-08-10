@@ -50,6 +50,12 @@ pub enum SubscriptionError {
     Model(ClientModelError),
     /// Foreign unsolicited frame preserved for the caller; subscription needs resync.
     ForeignSubscription(UnsolicitedServerMessage),
+    /// The caller failed to drain race-closing replay before the bounded
+    /// handoff filled. Dropping history would make unread/replay state false,
+    /// so synchronization must restart from a fresh authoritative snapshot.
+    ReplayOverflow {
+        limit: usize,
+    },
     InvalidResync,
     Transport(IpcError),
     Query(QueryError),
@@ -66,6 +72,9 @@ impl std::fmt::Display for SubscriptionError {
             Self::Model(error) => write!(f, "client model error: {error}"),
             Self::ForeignSubscription(_) => {
                 write!(f, "unsolicited message for a foreign subscription")
+            }
+            Self::ReplayOverflow { limit } => {
+                write!(f, "replay handoff exceeded bounded limit of {limit} events")
             }
             Self::InvalidResync => write!(f, "resync required fields are inconsistent"),
             Self::Transport(error) => write!(f, "subscription transport error: {error}"),
@@ -261,11 +270,7 @@ impl ClientSubscription {
         loop {
             let next = batch.page.next_cursor.clone();
             for event in &batch.page.events {
-                self.remember_event_id(event.id);
-                if self.pending_replay_events.len() >= MAX_PENDING_REPLAY_EVENTS {
-                    self.pending_replay_events.pop_front();
-                }
-                self.pending_replay_events.push_back(event.clone());
+                self.queue_replay_event(event.clone())?;
             }
             model.apply_replay_page(&batch.page)?;
             let Some(cursor) = next else {
@@ -412,6 +417,18 @@ impl ClientSubscription {
                 }
             }
         }
+    }
+
+    fn queue_replay_event(&mut self, event: DomainEvent) -> Result<(), SubscriptionError> {
+        if self.pending_replay_events.len() >= MAX_PENDING_REPLAY_EVENTS {
+            self.state = ClientSubscriptionState::NeedsResync;
+            return Err(SubscriptionError::ReplayOverflow {
+                limit: MAX_PENDING_REPLAY_EVENTS,
+            });
+        }
+        self.remember_event_id(event.id);
+        self.pending_replay_events.push_back(event);
+        Ok(())
     }
 
     /// Mark Ready → NeedsResync when the unsolicited inbox/transport fails.
@@ -768,5 +785,53 @@ mod tests {
             .projection()
             .and_then(|projection| projection.row(task))
             .is_some());
+    }
+
+    #[test]
+    fn inbox_runtime_stale_blocks_visible_rows_after_resync_until_authoritative_attach() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(ready_subscription());
+        assert!(runtime.projection().is_some());
+        runtime
+            .apply_subscription_update(SubscriptionUpdate::ResyncRequired {
+                last_delivered_sequence: 1,
+                newest_sequence: 2,
+            })
+            .expect("resync transition is observable");
+        assert!(runtime.projection().is_none());
+        runtime.attach_subscription(ready_subscription());
+        assert!(runtime.projection().is_some());
+    }
+
+    #[test]
+    fn replay_queue_overflow_is_typed_and_never_silently_evicts_history() {
+        let mut sub = ready_subscription();
+        for sequence in 0..MAX_PENDING_REPLAY_EVENTS {
+            sub.queue_replay_event(DomainEvent {
+                id: EventId::new(),
+                task_id: None,
+                sequence: sequence as u64,
+                task_revision: None,
+                occurred_at_ms: sequence as i64,
+                payload: Event::TaskReopened,
+            })
+            .expect("queue remains bounded before limit");
+        }
+        let err = sub
+            .queue_replay_event(DomainEvent {
+                id: EventId::new(),
+                task_id: None,
+                sequence: MAX_PENDING_REPLAY_EVENTS as u64,
+                task_revision: None,
+                occurred_at_ms: MAX_PENDING_REPLAY_EVENTS as i64,
+                payload: Event::TaskReopened,
+            })
+            .expect_err("overflow must force typed resync");
+        assert!(
+            matches!(err, SubscriptionError::ReplayOverflow { limit } if limit == MAX_PENDING_REPLAY_EVENTS)
+        );
+        assert_eq!(sub.pending_replay_events.len(), MAX_PENDING_REPLAY_EVENTS);
     }
 }

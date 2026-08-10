@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,8 @@ use uuid::Uuid;
 
 use devmanager::client::{
     connect, perform_client_hello, ClientSubscription, ClientSubscriptionState, HostClient,
-    HostClientConfig, SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
+    HostClientConfig, InboxHostController, InboxPreferenceStore, SubscriptionUpdate,
+    TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
 use devmanager::domain::command::{
@@ -48,6 +50,10 @@ use devmanager::host::{
     HOST_EXIT_ALREADY_RUNNING,
 };
 use devmanager::protocol::{Capability, CapabilitySet, ClientHello, FrameLimits};
+use devmanager::ui::shell::{InboxActionKind, Shell};
+use devmanager::ui::task_cockpit::{
+    InboxFilter, InboxPresentationWidth, InboxRenderItem, NativeNextTaskCockpit,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -456,6 +462,125 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
         .expect("terminate exact foreground host");
     assert!(!status.success(), "test termination should stop the host");
     assert!(host.try_wait().expect("final host poll").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let client_id = ClientId::from_bytes(fixed_uuid_v7(0x76)).expect("client id");
+    let command_config = HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: "native-next-inbox-fixture".to_string(),
+        client_id,
+        requested: CapabilitySet::from_capabilities([Capability::OperationSettlement]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut command_client = connect_bounded(&command_config, &mut host).await;
+    let (create, _, task_id) = create_task_named(
+        client_id,
+        0x77,
+        0x78,
+        0x79,
+        0x7a,
+        "Native-next fixture inbox",
+    );
+    command_client
+        .execute_command(create)
+        .await
+        .expect("fixture task command");
+    command_client.disconnect();
+
+    let controller = InboxHostController::new(
+        HostClientConfig {
+            named_profile: profile,
+            client_build: "native-next-inbox-fixture".to_string(),
+            client_id: ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
+            requested: CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+            ]),
+            limits: FrameLimits::v1_default(),
+        },
+        InboxPreferenceStore::at_profile_root(config_base.path().join("client-preferences")),
+    );
+    let mut cockpit = NativeNextTaskCockpit::from_controller(controller)
+        .expect("native-next bootstrap must load isolated preferences");
+    cockpit
+        .synchronize()
+        .await
+        .expect("native-next controller must synchronize fixture host");
+
+    let model = cockpit.render_model(InboxPresentationWidth::Regular);
+    assert!(model.items.iter().any(|item| {
+        matches!(
+            item,
+            InboxRenderItem::Row(row)
+                if row.task_id == task_id && row.title == "Native-next fixture inbox"
+        )
+    }));
+
+    let first_subscription = cockpit
+        .controller()
+        .expect("controller owner")
+        .subscription();
+    cockpit
+        .reconnect_and_synchronize()
+        .await
+        .expect("reconnect must resynchronize from an authoritative snapshot");
+    let second_subscription = cockpit
+        .controller()
+        .expect("controller owner")
+        .subscription();
+    assert!(
+        !Arc::ptr_eq(&first_subscription, &second_subscription),
+        "reconnect must replace the stale subscription generation"
+    );
+    assert!(cockpit
+        .render_model(InboxPresentationWidth::Regular)
+        .items
+        .iter()
+        .any(|item| matches!(item, InboxRenderItem::Row(row) if row.task_id == task_id)));
+
+    cockpit
+        .runtime_mut()
+        .set_filter(InboxFilter::new("").including_archived());
+    let shell = Shell::new(Some(task_id));
+    let inbox = cockpit
+        .runtime()
+        .projection()
+        .expect("visible inbox projection");
+    let captured = shell
+        .capture_inbox_row_action(
+            inbox.active_row(task_id).expect("active fixture row"),
+            shell.navigation_epoch(),
+            shell.focus_navigation_epoch(),
+            InboxActionKind::Archive,
+        )
+        .expect("shell captures the current archive row");
+    assert!(shell.dispatch_inbox_action(captured, inbox).is_ok());
+    let archive = captured
+        .host_command(
+            CommandId::from_bytes(fixed_uuid_v7(0x7c)).expect("archive command id"),
+            ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
+            1_725_000_001_000,
+        )
+        .expect("archive action is a real host command");
+    assert!(matches!(
+        cockpit
+            .execute_command(archive)
+            .await
+            .expect("archive command"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    let _ = host.terminate_and_wait_bounded(TERMINATE_TIMEOUT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

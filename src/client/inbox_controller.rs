@@ -132,6 +132,12 @@ impl InboxHostController {
     /// replay.  Replay events remain available through the shared subscription
     /// until the projection drains them.
     pub async fn synchronize(&mut self) -> Result<(), InboxControllerError> {
+        if self.subscription_state() == ClientSubscriptionState::Ready {
+            // Explicit synchronization always starts a fresh authoritative
+            // generation. This also makes a caller retry after a completed
+            // connection loss deterministic instead of returning NotReady.
+            self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        }
         if self.client.is_none() {
             self.client = Some(HostClient::connect(self.config.clone()).await?);
         }
@@ -167,6 +173,10 @@ impl InboxHostController {
         } else {
             self.client = Some(HostClient::connect(self.config.clone()).await?);
         }
+        // A reconnect is a new subscription generation. Do not let a stale
+        // Ready/NeedsResync object reject the authoritative synchronize call
+        // or leak its old replay handoff into the new model.
+        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
         self.synchronize().await
     }
 
