@@ -8,7 +8,11 @@
 //! managed field, or operation.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use uuid::Uuid;
 
@@ -20,6 +24,39 @@ use super::permission::{ActionId, ConnectRole, PermissionEvaluator, PermissionRe
 
 /// An active interval is split at this idle boundary before it is exported.
 pub const ACTIVE_SESSION_IDLE_LIMIT_MS: u64 = 15 * 60 * 1_000;
+
+const DEFAULT_GRANT_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
+/// A host-captured monotonic timestamp.  This capability has no public
+/// constructor and therefore cannot be replaced by a transport-supplied
+/// `now_ms` value.  Tests use the private deterministic constructor below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HostTimeAuthority {
+    instant: Instant,
+}
+
+impl HostTimeAuthority {
+    fn capture() -> Self {
+        Self {
+            instant: Instant::now(),
+        }
+    }
+
+    fn deadline_after(self, duration: Duration) -> Self {
+        Self {
+            instant: self.instant + duration,
+        }
+    }
+
+    #[cfg(test)]
+    fn at_test_millis(millis: u64) -> Self {
+        static TEST_EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = *TEST_EPOCH.get_or_init(Instant::now);
+        Self {
+            instant: epoch + Duration::from_millis(millis),
+        }
+    }
+}
 
 /// Privacy classes are policy inputs, not wire or storage representations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -390,9 +427,11 @@ pub struct ManagementGrant {
     id: GrantId,
     nonce: GrantNonce,
     binding: AuthorityBinding,
+    task_generation: u64,
+    resource_generation: u64,
     role: ManagementRole,
-    issued_at_ms: u64,
-    expires_at_ms: u64,
+    issued_at: HostTimeAuthority,
+    expires_at: HostTimeAuthority,
     state: GrantState,
 }
 
@@ -402,16 +441,24 @@ struct GrantId(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GrantNonce([u8; 16]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrantProof {
+    id: GrantId,
+    nonce: GrantNonce,
+}
+
+const GRANT_ACTIVE: u8 = 0;
+const GRANT_REVOKED: u8 = 1;
+const GRANT_CONSUMED: u8 = 2;
+
 #[derive(Debug)]
 struct GrantState {
-    revoked: AtomicBool,
-    consumed: AtomicBool,
+    status: AtomicU8,
 }
 
 impl PartialEq for GrantState {
     fn eq(&self, other: &Self) -> bool {
-        self.revoked.load(Ordering::Acquire) == other.revoked.load(Ordering::Acquire)
-            && self.consumed.load(Ordering::Acquire) == other.consumed.load(Ordering::Acquire)
+        self.status.load(Ordering::Acquire) == other.status.load(Ordering::Acquire)
     }
 }
 
@@ -422,9 +469,11 @@ impl fmt::Debug for ManagementGrant {
         formatter
             .debug_struct("ManagementGrant")
             .field("task_id", &self.binding.task_id)
+            .field("task_generation", &self.task_generation)
+            .field("resource_generation", &self.resource_generation)
             .field("role", &self.role)
-            .field("issued_at_ms", &self.issued_at_ms)
-            .field("expires_at_ms", &self.expires_at_ms)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
             .field("revoked", &self.is_revoked())
             .field("consumed", &self.is_consumed())
             .finish_non_exhaustive()
@@ -444,14 +493,16 @@ impl ManagementGrant {
     #[allow(dead_code)]
     fn try_new(
         binding: AuthorityBinding,
+        task_generation: u64,
+        resource_generation: u64,
         role: ManagementRole,
-        issued_at_ms: u64,
-        expires_at_ms: u64,
+        issued_at: HostTimeAuthority,
+        expires_at: HostTimeAuthority,
     ) -> Result<Self, GrantError> {
         if binding.action_epoch == 0 {
             return Err(GrantError::ZeroActionEpoch);
         }
-        if expires_at_ms <= issued_at_ms {
+        if expires_at <= issued_at {
             return Err(GrantError::ExpiryNotAfterIssue);
         }
         let id = Uuid::now_v7();
@@ -460,12 +511,13 @@ impl ManagementGrant {
             id: GrantId(id),
             nonce: GrantNonce(nonce),
             binding,
+            task_generation,
+            resource_generation,
             role,
-            issued_at_ms,
-            expires_at_ms,
+            issued_at,
+            expires_at,
             state: GrantState {
-                revoked: AtomicBool::new(false),
-                consumed: AtomicBool::new(false),
+                status: AtomicU8::new(GRANT_ACTIVE),
             },
         })
     }
@@ -473,7 +525,12 @@ impl ManagementGrant {
     /// Revocation is monotonic.  A holder cannot create or extend a grant;
     /// this method only removes authority from an already-issued one.
     pub fn revoke(&self) {
-        self.state.revoked.store(true, Ordering::Release);
+        let _ = self.state.status.compare_exchange(
+            GRANT_ACTIVE,
+            GRANT_REVOKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub const fn task_id(&self) -> TaskId {
@@ -485,27 +542,48 @@ impl ManagementGrant {
     }
 
     pub fn is_revoked(&self) -> bool {
-        self.state.revoked.load(Ordering::Acquire)
+        self.state.status.load(Ordering::Acquire) == GRANT_REVOKED
     }
 
     pub fn is_consumed(&self) -> bool {
-        self.state.consumed.load(Ordering::Acquire)
+        self.state.status.load(Ordering::Acquire) == GRANT_CONSUMED
     }
 
-    pub const fn issued_at_ms(&self) -> u64 {
-        self.issued_at_ms
+    const fn task_generation(&self) -> u64 {
+        self.task_generation
     }
 
-    pub const fn expires_at_ms(&self) -> u64 {
-        self.expires_at_ms
+    const fn resource_generation(&self) -> u64 {
+        self.resource_generation
+    }
+
+    fn proof(&self) -> GrantProof {
+        GrantProof {
+            id: self.id,
+            nonce: self.nonce,
+        }
     }
 
     fn binding(&self) -> AuthorityBinding {
         self.binding
     }
 
-    fn claim_once(&self) -> bool {
-        !self.state.consumed.swap(true, Ordering::AcqRel)
+    fn state(&self) -> u8 {
+        self.state.status.load(Ordering::Acquire)
+    }
+
+    fn claim_once(&self) -> Result<(), GrantStateError> {
+        match self.state.status.compare_exchange(
+            GRANT_ACTIVE,
+            GRANT_CONSUMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(GRANT_REVOKED) => Err(GrantStateError::Revoked),
+            Err(GRANT_CONSUMED) => Err(GrantStateError::Consumed),
+            Err(_) => Err(GrantStateError::Invalid),
+        }
     }
 
     #[allow(dead_code)]
@@ -517,6 +595,13 @@ impl ManagementGrant {
     fn nonce_for_tests(&self) -> GrantNonce {
         self.nonce
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantStateError {
+    Revoked,
+    Consumed,
+    Invalid,
 }
 
 /// Management roles are intentionally narrower than owner authority.
@@ -607,6 +692,7 @@ struct CanonicalActionEvidence {
     task_generation: u64,
     resource_generation: u64,
     provenance: EvidenceProvenance,
+    grant_proof: Option<GrantProof>,
 }
 
 /// A private wrapper produced only after the host command reducer has
@@ -640,6 +726,7 @@ struct CanonicalMetadataEvidence {
     field: ManagedField,
     content_class: ManagementPrivacyClass,
     provenance: EvidenceProvenance,
+    grant_proof: Option<GrantProof>,
 }
 
 impl CanonicalMetadataEvidence {
@@ -924,15 +1011,43 @@ impl HostPolicyBridge {
     fn issue_grant(
         &self,
         authority: CurrentHostAuthority,
-        issued_at_ms: u64,
-        expires_at_ms: u64,
     ) -> Result<ManagementGrant, HostPolicyError> {
         let role = authority
             .role
             .grant_role()
             .ok_or(HostPolicyError::PermissionDenied)?;
-        ManagementGrant::try_new(authority.binding, role, issued_at_ms, expires_at_ms)
-            .map_err(|_| HostPolicyError::InvalidGrant)
+        let issued_at = HostTimeAuthority::capture();
+        ManagementGrant::try_new(
+            authority.binding,
+            authority.task_generation,
+            authority.resource_generation,
+            role,
+            issued_at,
+            issued_at.deadline_after(DEFAULT_GRANT_LIFETIME),
+        )
+        .map_err(|_| HostPolicyError::InvalidGrant)
+    }
+
+    #[cfg(test)]
+    fn issue_grant_at(
+        &self,
+        authority: CurrentHostAuthority,
+        issued_at: HostTimeAuthority,
+        expires_at: HostTimeAuthority,
+    ) -> Result<ManagementGrant, HostPolicyError> {
+        let role = authority
+            .role
+            .grant_role()
+            .ok_or(HostPolicyError::PermissionDenied)?;
+        ManagementGrant::try_new(
+            authority.binding,
+            authority.task_generation,
+            authority.resource_generation,
+            role,
+            issued_at,
+            expires_at,
+        )
+        .map_err(|_| HostPolicyError::InvalidGrant)
     }
 
     fn issue_grant_principal<'grant>(
@@ -940,7 +1055,11 @@ impl HostPolicyBridge {
         authority: CurrentHostAuthority,
         grant: &'grant ManagementGrant,
     ) -> Result<PolicyPrincipal<'grant>, HostPolicyError> {
-        if authority.binding != grant.binding() || authority.role.grant_role() != Some(grant.role) {
+        if authority.binding != grant.binding()
+            || authority.task_generation != grant.task_generation()
+            || authority.resource_generation != grant.resource_generation()
+            || authority.role.grant_role() != Some(grant.role)
+        {
             return Err(HostPolicyError::PermissionDenied);
         }
         Ok(PolicyPrincipal::grant(grant))
@@ -963,6 +1082,41 @@ impl HostPolicyBridge {
             field,
             content_class,
             provenance: EvidenceProvenance::HostReducer { reducer_revision },
+            grant_proof: None,
+        };
+        if !evidence.is_well_formed() {
+            return Err(HostPolicyError::InvalidEvidence);
+        }
+        Ok(PolicyOperation {
+            evidence: PolicyEvidence::Metadata(evidence),
+        })
+    }
+
+    fn issue_granted_metadata_operation(
+        &self,
+        authority: CurrentHostAuthority,
+        grant: &ManagementGrant,
+        fact: HostMetadataFact,
+        reducer_revision: u64,
+    ) -> Result<PolicyOperation, HostPolicyError> {
+        if authority.binding.action != ActionId::READ_TASK {
+            return Err(HostPolicyError::ActionMismatch);
+        }
+        if authority.binding != grant.binding()
+            || authority.task_generation != grant.task_generation()
+            || authority.resource_generation != grant.resource_generation()
+        {
+            return Err(HostPolicyError::TaskGenerationMismatch);
+        }
+        let (field, content_class) = fact.canonical();
+        let evidence = CanonicalMetadataEvidence {
+            binding: authority.binding,
+            task_generation: authority.task_generation,
+            resource_generation: authority.resource_generation,
+            field,
+            content_class,
+            provenance: EvidenceProvenance::HostReducer { reducer_revision },
+            grant_proof: Some(grant.proof()),
         };
         if !evidence.is_well_formed() {
             return Err(HostPolicyError::InvalidEvidence);
@@ -1000,6 +1154,53 @@ impl HostPolicyBridge {
                 command_id: envelope.command_id,
                 expected_task_revision,
             },
+            grant_proof: None,
+        };
+        if !evidence.is_well_formed() {
+            return Err(HostPolicyError::InvalidEvidence);
+        }
+        Ok(PolicyOperation {
+            evidence: PolicyEvidence::Mutation(evidence),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn issue_granted_command_operation(
+        &self,
+        authority: CurrentHostAuthority,
+        grant: &ManagementGrant,
+        validated: &HostValidatedCommand,
+    ) -> Result<PolicyOperation, HostPolicyError> {
+        let envelope = &validated.envelope;
+        if authority.binding != grant.binding()
+            || authority.task_generation != grant.task_generation()
+            || authority.resource_generation != grant.resource_generation()
+        {
+            return Err(HostPolicyError::TaskGenerationMismatch);
+        }
+        if envelope.client_id != authority.binding.client_id {
+            return Err(HostPolicyError::ClientMismatch);
+        }
+        if envelope.task_id != Some(authority.binding.task_id) {
+            return Err(HostPolicyError::TaskMismatch);
+        }
+        let action =
+            canonical_command_action(&envelope.command).ok_or(HostPolicyError::ActionMismatch)?;
+        if action != authority.binding.action {
+            return Err(HostPolicyError::ActionMismatch);
+        }
+        let expected_task_revision = envelope
+            .expected_task_revision
+            .ok_or(HostPolicyError::InvalidEvidence)?;
+        let evidence = CanonicalActionEvidence {
+            binding: authority.binding,
+            task_generation: authority.task_generation,
+            resource_generation: authority.resource_generation,
+            provenance: EvidenceProvenance::ValidatedCommand {
+                command_id: envelope.command_id,
+                expected_task_revision,
+            },
+            grant_proof: Some(grant.proof()),
         };
         if !evidence.is_well_formed() {
             return Err(HostPolicyError::InvalidEvidence);
@@ -1022,6 +1223,7 @@ impl HostPolicyBridge {
             task_generation: authority.task_generation,
             resource_generation: authority.resource_generation,
             provenance: EvidenceProvenance::HostReducer { reducer_revision },
+            grant_proof: None,
         };
         if !evidence.is_well_formed() {
             return Err(HostPolicyError::InvalidEvidence);
@@ -1186,8 +1388,27 @@ impl ManagementPolicy {
         task: &TaskContext,
         principal: PolicyPrincipal<'_>,
         operation: PolicyOperation,
-        now_ms: u64,
     ) -> PolicyDecision {
+        self.decide_at(task, principal, operation, HostTimeAuthority::capture())
+    }
+
+    fn decide_at(
+        &self,
+        task: &TaskContext,
+        principal: PolicyPrincipal<'_>,
+        operation: PolicyOperation,
+        now: HostTimeAuthority,
+    ) -> PolicyDecision {
+        let evidence_proof = match &operation.evidence {
+            PolicyEvidence::Metadata(evidence) => evidence.grant_proof,
+            PolicyEvidence::Mutation(evidence) | PolicyEvidence::Dangerous(evidence) => {
+                evidence.grant_proof
+            }
+        };
+        if !principal_matches_evidence(&principal, evidence_proof) {
+            return PolicyDecision::deny(PolicyReasonCode::InvalidEvidence);
+        }
+
         if task.enrollment == TaskEnrollment::Unmanaged {
             return PolicyDecision::deny(PolicyReasonCode::UnmanagedTask);
         }
@@ -1208,7 +1429,7 @@ impl ManagementPolicy {
                     evidence.task_generation,
                     evidence.resource_generation,
                     evidence.binding.action,
-                    self.decide_metadata(task, &principal, evidence, now_ms),
+                    self.decide_metadata(task, &principal, evidence, now),
                 )
             }
             PolicyEvidence::Mutation(evidence) => {
@@ -1220,7 +1441,7 @@ impl ManagementPolicy {
                     evidence.task_generation,
                     evidence.resource_generation,
                     evidence.binding.action,
-                    self.decide_mutation(task, &principal, evidence, now_ms),
+                    self.decide_mutation(task, &principal, evidence, now),
                 )
             }
             PolicyEvidence::Dangerous(evidence) => {
@@ -1257,8 +1478,17 @@ impl ManagementPolicy {
         // second use of the same id/nonce is a replay, even if all labels are
         // otherwise identical.
         if let PrincipalAuthority::Grant(grant) = principal.authority {
-            if !grant.claim_once() {
-                return PolicyDecision::deny(PolicyReasonCode::GrantReplayed);
+            match grant.claim_once() {
+                Ok(()) => {}
+                Err(GrantStateError::Revoked) => {
+                    return PolicyDecision::deny(PolicyReasonCode::GrantRevoked)
+                }
+                Err(GrantStateError::Consumed) => {
+                    return PolicyDecision::deny(PolicyReasonCode::GrantReplayed)
+                }
+                Err(GrantStateError::Invalid) => {
+                    return PolicyDecision::deny(PolicyReasonCode::InvalidEvidence)
+                }
             }
         }
         PolicyDecision::allow()
@@ -1269,7 +1499,7 @@ impl ManagementPolicy {
         task: &TaskContext,
         principal: &PolicyPrincipal<'_>,
         evidence: CanonicalMetadataEvidence,
-        now_ms: u64,
+        now: HostTimeAuthority,
     ) -> PolicyDecision {
         if evidence.binding.action != ActionId::READ_TASK {
             return PolicyDecision::deny(PolicyReasonCode::GrantActionMismatch);
@@ -1305,7 +1535,7 @@ impl ManagementPolicy {
             });
         }
 
-        self.authorize(principal, evidence.binding, now_ms, false)
+        self.authorize(task, principal, evidence.binding, now, false)
     }
 
     fn decide_mutation(
@@ -1313,7 +1543,7 @@ impl ManagementPolicy {
         task: &TaskContext,
         principal: &PolicyPrincipal<'_>,
         evidence: CanonicalActionEvidence,
-        now_ms: u64,
+        now: HostTimeAuthority,
     ) -> PolicyDecision {
         if evidence.binding.action != ActionId::MUTATE_TASK {
             return PolicyDecision::deny(PolicyReasonCode::GrantActionMismatch);
@@ -1322,7 +1552,7 @@ impl ManagementPolicy {
             PrincipalAuthority::Owner(binding) => self.authorize_owner(binding, evidence.binding),
             PrincipalAuthority::NoGrant => PolicyDecision::deny(PolicyReasonCode::GrantMissing),
             PrincipalAuthority::Grant(grant) => {
-                if let Some(denial) = self.validate_grant(task, grant, evidence.binding, now_ms) {
+                if let Some(denial) = self.validate_grant(task, grant, evidence.binding, now) {
                     return denial;
                 }
                 match grant.role {
@@ -1354,9 +1584,10 @@ impl ManagementPolicy {
 
     fn authorize(
         &self,
+        task: &TaskContext,
         principal: &PolicyPrincipal<'_>,
         binding: AuthorityBinding,
-        now_ms: u64,
+        now: HostTimeAuthority,
         mutation: bool,
     ) -> PolicyDecision {
         match principal.authority {
@@ -1365,7 +1596,7 @@ impl ManagementPolicy {
             }
             PrincipalAuthority::NoGrant => PolicyDecision::deny(PolicyReasonCode::GrantMissing),
             PrincipalAuthority::Grant(grant) => {
-                if let Some(denial) = self.validate_grant_from_binding(grant, binding, now_ms) {
+                if let Some(denial) = self.validate_grant(task, grant, binding, now) {
                     return denial;
                 }
                 if mutation && grant.role == ManagementRole::ManagerWatcher {
@@ -1389,13 +1620,23 @@ impl ManagementPolicy {
         task: &TaskContext,
         grant: &ManagementGrant,
         operation_binding: AuthorityBinding,
-        now_ms: u64,
+        now: HostTimeAuthority,
     ) -> Option<PolicyDecision> {
-        if let Some(denial) = self.validate_grant_from_binding(grant, operation_binding, now_ms) {
+        if let Some(denial) = self.validate_grant_from_binding(grant, operation_binding, now) {
             return Some(denial);
         }
         if grant.task_id() != task.task_id {
             return Some(PolicyDecision::deny(PolicyReasonCode::GrantTaskMismatch));
+        }
+        if grant.task_generation() != task.task_generation {
+            return Some(PolicyDecision::deny(
+                PolicyReasonCode::TaskGenerationMismatch,
+            ));
+        }
+        if grant.resource_generation() != task.resource_generation {
+            return Some(PolicyDecision::deny(
+                PolicyReasonCode::ResourceGenerationMismatch,
+            ));
         }
         None
     }
@@ -1404,7 +1645,7 @@ impl ManagementPolicy {
         &self,
         grant: &ManagementGrant,
         operation_binding: AuthorityBinding,
-        now_ms: u64,
+        now: HostTimeAuthority,
     ) -> Option<PolicyDecision> {
         let grant_binding = grant.binding();
         if !grant_binding.same_connection(operation_binding) {
@@ -1429,16 +1670,16 @@ impl ManagementPolicy {
                 PolicyReasonCode::GrantActionEpochMismatch,
             ));
         }
-        if grant.is_revoked() {
+        if grant.state() == GRANT_REVOKED {
             return Some(PolicyDecision::deny(PolicyReasonCode::GrantRevoked));
         }
-        if now_ms < grant.issued_at_ms() {
+        if now < grant.issued_at {
             return Some(PolicyDecision::deny(PolicyReasonCode::GrantNotYetValid));
         }
-        if now_ms >= grant.expires_at_ms() {
+        if now >= grant.expires_at {
             return Some(PolicyDecision::deny(PolicyReasonCode::GrantStale));
         }
-        if grant.is_consumed() {
+        if grant.state() == GRANT_CONSUMED {
             return Some(PolicyDecision::deny(PolicyReasonCode::GrantReplayed));
         }
         None
@@ -1468,6 +1709,16 @@ impl ManagementPolicy {
             return PolicyDecision::deny(PolicyReasonCode::GrantActionEpochMismatch);
         }
         PolicyDecision::allow()
+    }
+}
+
+fn principal_matches_evidence(
+    principal: &PolicyPrincipal<'_>,
+    evidence_proof: Option<GrantProof>,
+) -> bool {
+    match principal.authority {
+        PrincipalAuthority::Owner(_) | PrincipalAuthority::NoGrant => evidence_proof.is_none(),
+        PrincipalAuthority::Grant(grant) => evidence_proof == Some(grant.proof()),
     }
 }
 
@@ -1670,7 +1921,12 @@ mod tests {
         let task = task_for(authority, ManagementPrivacyClass::ManagedMetadata);
         let principal = bridge.issue_owner_principal(authority).expect("owner");
         assert!(ManagementPolicy::default()
-            .decide(&task, principal, operation, 50)
+            .decide_at(
+                &task,
+                principal,
+                operation,
+                HostTimeAuthority::at_test_millis(50),
+            )
             .is_allowed());
     }
 
@@ -1683,7 +1939,12 @@ mod tests {
             .expect("dangerous operation");
         let owner = bridge.issue_owner_principal(authority).expect("owner");
         assert!(ManagementPolicy::default()
-            .decide(&task, owner, operation, 50)
+            .decide_at(
+                &task,
+                owner,
+                operation,
+                HostTimeAuthority::at_test_millis(50),
+            )
             .is_allowed());
 
         let (bridge, authority) = admitted(8, ActionId::READ_TASK, CanonicalRole::ManagerWatcher);
@@ -1691,8 +1952,12 @@ mod tests {
         let operation = bridge
             .issue_metadata_operation(authority, HostMetadataFact::TaskState, 1)
             .expect("operation");
-        let missing =
-            ManagementPolicy::default().decide(&task, PolicyPrincipal::no_grant(), operation, 50);
+        let missing = ManagementPolicy::default().decide_at(
+            &task,
+            PolicyPrincipal::no_grant(),
+            operation,
+            HostTimeAuthority::at_test_millis(50),
+        );
         assert_eq!(missing.reason_code(), PolicyReasonCode::GrantMissing);
     }
 
@@ -1710,13 +1975,13 @@ mod tests {
             _ => unreachable!(),
         };
         evidence.field = ManagedField::GitSummary;
-        let decision = ManagementPolicy::default().decide(
+        let decision = ManagementPolicy::default().decide_at(
             &task,
             principal,
             PolicyOperation {
                 evidence: PolicyEvidence::Metadata(evidence),
             },
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(decision.reason_code(), PolicyReasonCode::InvalidEvidence);
         assert!(!decision.is_allowed());
@@ -1735,13 +2000,13 @@ mod tests {
             _ => unreachable!(),
         };
         foreign.binding.session_id = session_id(44);
-        let foreign_decision = ManagementPolicy::default().decide(
+        let foreign_decision = ManagementPolicy::default().decide_at(
             &task,
             principal,
             PolicyOperation {
                 evidence: PolicyEvidence::Metadata(foreign),
             },
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(
             foreign_decision.reason_code(),
@@ -1756,13 +2021,13 @@ mod tests {
             _ => unreachable!(),
         };
         stale.task_generation += 1;
-        let stale_decision = ManagementPolicy::default().decide(
+        let stale_decision = ManagementPolicy::default().decide_at(
             &task,
             bridge.issue_owner_principal(authority).expect("owner"),
             PolicyOperation {
                 evidence: PolicyEvidence::Metadata(stale),
             },
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(
             stale_decision.reason_code(),
@@ -1777,13 +2042,13 @@ mod tests {
             _ => unreachable!(),
         };
         stale_resource.resource_generation += 1;
-        let stale_resource_decision = ManagementPolicy::default().decide(
+        let stale_resource_decision = ManagementPolicy::default().decide_at(
             &task,
             bridge.issue_owner_principal(authority).expect("owner"),
             PolicyOperation {
                 evidence: PolicyEvidence::Metadata(stale_resource),
             },
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(
             stale_resource_decision.reason_code(),
@@ -1795,26 +2060,39 @@ mod tests {
     fn grants_bind_to_session_and_are_one_shot() {
         let (bridge, authority) = admitted(5, ActionId::READ_TASK, CanonicalRole::TaskCollaborator);
         let task = task_for(authority, ManagementPrivacyClass::ManagedMetadata);
-        let grant = bridge.issue_grant(authority, 10, 100).expect("grant");
+        let grant = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
         let principal = bridge
             .issue_grant_principal(authority, &grant)
             .expect("principal");
         let operation = bridge
-            .issue_metadata_operation(authority, HostMetadataFact::TaskState, 1)
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
             .expect("operation");
         let policy = ManagementPolicy::default();
-        assert!(policy.decide(&task, principal, operation, 50).is_allowed());
+        assert!(policy
+            .decide_at(
+                &task,
+                principal,
+                operation,
+                HostTimeAuthority::at_test_millis(50),
+            )
+            .is_allowed());
 
         let replay_operation = bridge
-            .issue_metadata_operation(authority, HostMetadataFact::TaskState, 1)
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
             .expect("operation");
-        let replay = policy.decide(
+        let replay = policy.decide_at(
             &task,
             bridge
                 .issue_grant_principal(authority, &grant)
                 .expect("principal"),
             replay_operation,
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(replay.reason_code(), PolicyReasonCode::GrantReplayed);
 
@@ -1830,15 +2108,16 @@ mod tests {
                 provenance: EvidenceProvenance::HostReducer {
                     reducer_revision: 1,
                 },
+                grant_proof: Some(grant.proof()),
             }),
         };
-        let wrong_session = policy.decide(
+        let wrong_session = policy.decide_at(
             &task,
             bridge
                 .issue_grant_principal(authority, &grant)
                 .expect("principal"),
             wrong_session_operation,
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(
             wrong_session.reason_code(),
@@ -1850,35 +2129,168 @@ mod tests {
     fn grant_expiry_and_revocation_remain_denials() {
         let (bridge, authority) = admitted(6, ActionId::READ_TASK, CanonicalRole::ManagerWatcher);
         let task = task_for(authority, ManagementPrivacyClass::ManagedMetadata);
+        let grant = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
         let operation = bridge
-            .issue_metadata_operation(authority, HostMetadataFact::TaskState, 1)
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
             .expect("operation");
-        let grant = bridge.issue_grant(authority, 10, 100).expect("grant");
         grant.revoke();
         assert!(grant.is_revoked());
-        let decision = ManagementPolicy::default().decide(
+        let decision = ManagementPolicy::default().decide_at(
             &task,
             bridge
                 .issue_grant_principal(authority, &grant)
                 .expect("principal"),
             operation,
-            50,
+            HostTimeAuthority::at_test_millis(50),
         );
         assert_eq!(decision.reason_code(), PolicyReasonCode::GrantRevoked);
 
-        let expired = bridge.issue_grant(authority, 10, 100).expect("grant");
+        let expired = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
         let expired_operation = bridge
-            .issue_metadata_operation(authority, HostMetadataFact::TaskState, 1)
+            .issue_granted_metadata_operation(authority, &expired, HostMetadataFact::TaskState, 1)
             .expect("operation");
-        let decision = ManagementPolicy::default().decide(
+        let decision = ManagementPolicy::default().decide_at(
             &task,
             bridge
                 .issue_grant_principal(authority, &expired)
                 .expect("principal"),
             expired_operation,
-            100,
+            HostTimeAuthority::at_test_millis(100),
         );
         assert_eq!(decision.reason_code(), PolicyReasonCode::GrantStale);
+    }
+
+    #[test]
+    fn grants_become_stale_when_task_or_resource_generation_changes() {
+        let (bridge, authority) = admitted(9, ActionId::READ_TASK, CanonicalRole::TaskCollaborator);
+        let task = task_for(authority, ManagementPrivacyClass::ManagedMetadata);
+        let grant = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
+        let operation = bridge
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
+            .expect("operation");
+
+        let mut reset_task = task;
+        reset_task.task_generation += 1;
+        let task_reset = ManagementPolicy::default().decide_at(
+            &reset_task,
+            bridge
+                .issue_grant_principal(authority, &grant)
+                .expect("principal"),
+            operation,
+            HostTimeAuthority::at_test_millis(50),
+        );
+        assert_eq!(
+            task_reset.reason_code(),
+            PolicyReasonCode::TaskGenerationMismatch
+        );
+
+        let grant = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
+        let operation = bridge
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
+            .expect("operation");
+        let mut resource_reset = task;
+        resource_reset.resource_generation += 1;
+        let resource_reset = ManagementPolicy::default().decide_at(
+            &resource_reset,
+            bridge
+                .issue_grant_principal(authority, &grant)
+                .expect("principal"),
+            operation,
+            HostTimeAuthority::at_test_millis(50),
+        );
+        assert_eq!(
+            resource_reset.reason_code(),
+            PolicyReasonCode::ResourceGenerationMismatch
+        );
+    }
+
+    #[test]
+    fn grant_proof_must_match_the_operation_evidence() {
+        let (bridge, authority) =
+            admitted(10, ActionId::READ_TASK, CanonicalRole::TaskCollaborator);
+        let task = task_for(authority, ManagementPrivacyClass::ManagedMetadata);
+        let grant = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
+        let operation = bridge
+            .issue_granted_metadata_operation(authority, &grant, HostMetadataFact::TaskState, 1)
+            .expect("operation");
+        let mut evidence = match operation.evidence {
+            PolicyEvidence::Metadata(evidence) => evidence,
+            _ => unreachable!(),
+        };
+        let mut proof = grant.proof();
+        proof.id = GrantId(Uuid::now_v7());
+        evidence.grant_proof = Some(proof);
+        let decision = ManagementPolicy::default().decide_at(
+            &task,
+            bridge
+                .issue_grant_principal(authority, &grant)
+                .expect("principal"),
+            PolicyOperation {
+                evidence: PolicyEvidence::Metadata(evidence),
+            },
+            HostTimeAuthority::at_test_millis(50),
+        );
+        assert_eq!(decision.reason_code(), PolicyReasonCode::InvalidEvidence);
+    }
+
+    #[test]
+    fn revoke_and_first_use_compete_on_one_terminal_atomic_state() {
+        let (bridge, authority) =
+            admitted(11, ActionId::READ_TASK, CanonicalRole::TaskCollaborator);
+        let revoked = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
+        revoked.revoke();
+        assert_eq!(revoked.claim_once(), Err(GrantStateError::Revoked));
+        assert!(revoked.is_revoked());
+        assert!(!revoked.is_consumed());
+
+        let consumed = bridge
+            .issue_grant_at(
+                authority,
+                HostTimeAuthority::at_test_millis(10),
+                HostTimeAuthority::at_test_millis(100),
+            )
+            .expect("grant");
+        assert_eq!(consumed.claim_once(), Ok(()));
+        consumed.revoke();
+        assert!(consumed.is_consumed());
+        assert!(!consumed.is_revoked());
+        assert_eq!(consumed.claim_once(), Err(GrantStateError::Consumed));
     }
 
     #[test]

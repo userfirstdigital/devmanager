@@ -12,8 +12,11 @@ isolated `phase-9-10-policy-integration` worktree.
   binding, fixed reason codes, one-shot grants, and the validated 15-minute
   active-session interval. Decision, context, principal, operation, and grant
   construction are private; callers only inspect decisions. Grants carry an
-  opaque id/nonce, are non-copyable/non-cloneable, revoke in place, and are
-  consumed once by an allowed decision.
+  opaque id/nonce and exact task/resource generations, use a host-captured
+  monotonic deadline rather than caller-supplied wall-clock values, and are
+  non-copyable/non-cloneable. Revocation and first-use consumption compete via
+  one atomic terminal state, and each grant-backed operation carries the
+  matching opaque id/nonce proof.
 - `tests/management_policy.rs` — public descriptive contract tests, including
   negative trait assertions, exhaustive field classes, fixed reason codes, and
   the active-session boundary. API privacy and the removed caller-labelled
@@ -41,10 +44,11 @@ remote, or provider-runtime dependency.
   watcher mutation, and non-owner dangerous approval deny with fixed codes.
 - Collaborator mutation is allowed only through a valid matching task grant.
   Grants are exact connection/session/client/task/action-epoch authorities with
-  opaque id/nonce, expiry, revocation, and one-shot replay tracking. Exact
-  task/resource generations are checked on every evidence record. Exactly 15
-  minutes is accepted for an active interval; one millisecond over the
-  boundary is rejected.
+  opaque id/nonce, host-monotonic expiry, revocation, and one-shot replay
+  tracking. Exact task/resource generations are checked on every grant and
+  evidence record; a reset makes the old grant stale. Exactly 15 minutes is
+  accepted for an active interval; one millisecond over the boundary is
+  rejected.
 - The host bridge fails closed unless the deferred signed external authority is
   present. It calls the canonical `PermissionEvaluator` before issuing any
   current authority, derives action evidence from validated `CommandEnvelope`
@@ -59,11 +63,12 @@ remote, or provider-runtime dependency.
   `PolicyPrincipal::Owner`, arbitrary `TaskContext::enrolled`, and the
   caller-labelled operation constructors were all reachable. The correction
   removes those paths and adds runtime foreign/stale/relabel/replay proofs.
-- GREEN runtime and compile evidence used the fresh target
-  `CARGO_TARGET_DIR=C:\Temp\devmanager-phase910-policy-correction2` with
+- GREEN runtime and compile evidence used the fresh isolated target
+  `CARGO_TARGET_DIR=C:\Temp\devmanager-phase910-policy-review3` with
   `CARGO_BUILD_JOBS=1`:
-  - `cargo test --locked --lib connect::policy::tests -- --nocapture` — 8
-    passed, including foreign/stale/relabel/replay/revocation/expiry proofs.
+  - `cargo test --locked --lib connect::policy::tests -- --nocapture` — 11
+    passed, including foreign/stale-generation/reset/relabel/replay/
+    revocation/expiry/atomic-state proofs.
   - `cargo test --locked --test management_policy -- --nocapture` — 3 passed,
     including the public field, interval, reason-code, and non-copy/non-clone
     contract.
@@ -73,7 +78,7 @@ remote, or provider-runtime dependency.
   - `cargo test --locked --test connect_contract --test connect_session
     --test protocol_contract -- --nocapture` — 28 contract, 8 session, and 50
     protocol tests passed.
-  - `cargo test --locked --lib connect -- --test-threads=1` — 94 tests passed.
+  - `cargo test --locked --lib connect -- --test-threads=1` — 97 tests passed.
   - `cargo check --locked --lib` — exit 0. Seven unrelated
     `src/kernel`/`src/host` warnings remain; the corrected policy module adds
     none.
