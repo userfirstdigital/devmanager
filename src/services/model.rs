@@ -2447,11 +2447,19 @@ fn validate_command(command: &CommandSpec) -> Result<(), ValidationError> {
 fn validate_command_arguments(arguments: &[CommandArgument]) -> Result<(), ValidationError> {
     for (index, argument) in arguments.iter().enumerate() {
         CommandArgument::new(argument.as_str().to_owned())?;
-        if is_secret_option(argument.as_str())
+        let inline_secret_name = argument
+            .as_str()
+            .split_once('=')
+            .filter(|(option, _)| is_secret_option(option))
+            .map(|(_, assigned)| assigned)
+            .filter(|assigned| is_secret_name(assigned));
+        let split_secret_name = argument.as_str().split_once('=').is_none()
+            && is_secret_option(argument.as_str())
             && arguments
                 .get(index + 1)
                 .is_some_and(|next| is_secret_name(next.as_str()))
-            && arguments.get(index + 2).is_some()
+            && arguments.get(index + 2).is_some();
+        if (inline_secret_name.is_some() && arguments.get(index + 1).is_some()) || split_secret_name
         {
             return Err(ValidationError::RawSecret {
                 field: ValidationField::Argument,
@@ -2965,19 +2973,8 @@ fn health_port(health: &HealthSpec) -> Option<u16> {
 
 fn is_secret_argument(value: &str) -> bool {
     let option = value.split_once('=').map_or(value, |(name, _)| name);
-    matches!(
-        option.to_ascii_lowercase().as_str(),
-        "--token"
-            | "--api-token"
-            | "--access-token"
-            | "--api-key"
-            | "--api_key"
-            | "--secret"
-            | "--client-secret"
-            | "--password"
-            | "--private-key"
-            | "--private_key"
-    ) || is_secret_assignment(value)
+    (option.starts_with("--") && is_secret_name(option))
+        || is_secret_assignment(value)
         || value.split_once('=').is_some_and(|(name, assigned)| {
             is_secret_option(name)
                 && assigned
@@ -2998,28 +2995,32 @@ fn is_secret_assignment(value: &str) -> bool {
 
 fn is_secret_name(name: &str) -> bool {
     matches!(
-        name.trim_start_matches('-').to_ascii_lowercase().as_str(),
+        normalize_secret_name(name).as_str(),
         "token"
-            | "api-token"
             | "api_token"
-            | "access-token"
             | "access_token"
-            | "api-key"
             | "api_key"
+            | "access_key"
             | "secret"
-            | "client-secret"
             | "client_secret"
             | "password"
-            | "private-key"
             | "private_key"
     )
 }
 
 fn is_secret_option(value: &str) -> bool {
+    let option = value.split_once('=').map_or(value, |(name, _)| name);
     matches!(
-        value.to_ascii_lowercase().as_str(),
-        "--env" | "--set-env" | "--env-var" | "--set-env-var"
+        normalize_secret_name(option).as_str(),
+        "env" | "set_env" | "env_var" | "set_env_var"
     )
+}
+
+fn normalize_secret_name(value: &str) -> String {
+    value
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('-', "_")
 }
 
 #[allow(dead_code)]

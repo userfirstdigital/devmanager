@@ -14,7 +14,7 @@ use devmanager::services::health::{
 use devmanager::services::model::{
     CommandSpec, ExpectedPort, HealthPolicy, HealthSpec, PortProtocol, ServiceCatalog,
     ServiceDefinition, ServiceId, ServiceScope, StartupPolicy, StopPolicy, ValidationError,
-    MAX_ARGUMENT_COUNT, MAX_DEPENDENCY_COUNT, MAX_SERVICE_CATALOG_FRAME_BYTES,
+    ValidationField, MAX_ARGUMENT_COUNT, MAX_DEPENDENCY_COUNT, MAX_SERVICE_CATALOG_FRAME_BYTES,
     MAX_SERVICE_CATALOG_JSON_DEPTH, MAX_SERVICE_CATALOG_JSON_FIELD_NAME_BYTES, MAX_SERVICE_COUNT,
 };
 
@@ -295,6 +295,55 @@ fn secret_flags_and_assignments_are_rejected_structurally_but_name_only_refs_are
     let mut reference = fixture_definition(0);
     reference["command"]["env"] = serde_json::json!([{ "name": "API_TOKEN" }]);
     assert!(serde_json::from_value::<ServiceDefinition>(reference).is_ok());
+}
+
+#[test]
+fn inline_secret_option_names_reject_following_raw_values_without_leaking_diagnostics() {
+    const RAW_SECRET: &str = "RAW_SECRET_SENTINEL";
+    let cases = [
+        ("--env=TOKEN", "TOKEN"),
+        ("--set-env=TOKEN", "TOKEN"),
+        ("--env-var=TOKEN", "TOKEN"),
+        ("--set-env-var=TOKEN", "TOKEN"),
+        ("--ENV=token", "token"),
+        ("--set_env=API_KEY", "API_KEY"),
+        ("--ENV_VAR=ACCESS-KEY", "ACCESS-KEY"),
+        ("--SET_ENV_VAR=PRIVATE_KEY", "PRIVATE_KEY"),
+        ("--set-env_var=api-key", "api-key"),
+        ("--env-var=access_key", "access_key"),
+        ("--SET-ENV-VAR=private-key", "private-key"),
+    ];
+
+    for (option, key) in cases {
+        let error = CommandSpec::new("node")
+            .expect("valid command")
+            .with_args([option.to_string(), RAW_SECRET.to_string()])
+            .expect_err("inline secret option assignment must reject its raw value");
+        assert!(matches!(
+            error,
+            ValidationError::RawSecret {
+                field: ValidationField::Argument
+            }
+        ));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(key));
+        assert!(!diagnostic.contains(RAW_SECRET));
+    }
+}
+
+#[test]
+fn inline_nonsecret_option_names_continue_to_accept_following_values() {
+    for args in [
+        vec!["--env=PORT", "8080"],
+        vec!["--set_env=DEBUG", "true"],
+        vec!["--ENV_VAR=APP_MODE", "development"],
+        vec!["--SET-ENV-VAR=LOG_LEVEL", "info"],
+    ] {
+        CommandSpec::new("node")
+            .expect("valid command")
+            .with_args(args)
+            .expect("nonsecret inline option assignment should remain valid");
+    }
 }
 
 #[test]
