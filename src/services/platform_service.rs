@@ -195,20 +195,28 @@ fn snapshot_listener_endpoints_with_lsof(
 
     let mut listeners = BTreeMap::new();
     let mut current_pid = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "lsof returned non-UTF-8 listener data".to_string())?;
+    for line in stdout.lines() {
         if line.is_empty() {
             continue;
         }
+        if line.len() < 2 {
+            return Err("lsof returned a malformed listener record".to_string());
+        }
         let (prefix, value) = line.split_at(1);
         match prefix {
-            "p" => current_pid = value.trim().parse::<u32>().ok(),
+            "p" => {
+                current_pid = Some(value.trim().parse::<u32>().map_err(|_| {
+                    "lsof returned a listener record with an invalid PID".to_string()
+                })?);
+            }
             "n" => {
                 let Some(pid) = current_pid else {
-                    continue;
+                    return Err("lsof returned an endpoint before its PID".to_string());
                 };
-                let Some(endpoint) = parse_lsof_listener_endpoint(value, pid) else {
-                    continue;
-                };
+                let endpoint = parse_lsof_listener_endpoint(value, pid)
+                    .ok_or_else(|| "lsof returned a malformed listener endpoint".to_string())?;
                 if filter.contains(&endpoint.port()) {
                     let rows = listeners.entry(endpoint.port()).or_default();
                     rows.push(endpoint);
@@ -220,7 +228,9 @@ fn snapshot_listener_endpoints_with_lsof(
                     }
                 }
             }
-            _ => {}
+            _ => {
+                return Err("lsof returned an unsupported listener record field".to_string());
+            }
         }
     }
 
@@ -253,6 +263,11 @@ fn parse_lsof_listener_endpoint(value: &str, pid: u32) -> Option<TcpEndpointReco
         address => address.parse().ok()?,
     };
     Some(TcpEndpointRecord::tcp(address, port, pid))
+}
+
+#[cfg(not(windows))]
+fn parse_lsof_listener_port(value: &str) -> Option<u16> {
+    parse_lsof_listener_endpoint(value, 1).map(|endpoint| endpoint.port())
 }
 
 #[cfg(windows)]

@@ -11,12 +11,12 @@ use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::ports::{
     classify_port_authority, classify_port_authority_from_snapshot, ensure_managed_start_allowed,
-    launch_if_port_free, project_port_status, project_port_status_from_snapshot,
-    registered_resource_snapshot, registered_resource_snapshot_with_membership, ListenerIdentity,
-    ManagedPortHealth, ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority,
-    PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError, PortStartError,
-    PortStatusKind, PortTarget, RegistryMembershipSnapshot, ScanCancellation, TcpAddressFamily,
-    TcpEndpoint, TcpEndpointRecord, TcpProtocol, MAX_SCAN_WAITERS,
+    launch_if_port_free, launch_if_port_free_with_revalidation, project_port_status,
+    project_port_status_from_snapshot, registered_resource_snapshot_with_membership,
+    ListenerIdentity, ManagedPortHealth, ManagedProcessSnapshotValidity, ManagedResourceSnapshot,
+    PortAuthority, PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError,
+    PortStartError, PortStatusKind, PortTarget, RegistryMembershipSnapshot, ScanCancellation,
+    TcpAddressFamily, TcpEndpoint, TcpEndpointRecord, TcpProtocol, MAX_SCAN_WAITERS,
 };
 use devmanager::process::registry::{
     JobMembership, ManagedProcessFence, ManagedProcessState, ProcessRegistry, RegisteredProcess,
@@ -54,7 +54,8 @@ fn identity(pid: u32, creation_time_100ns: u64, executable: &Path) -> ManagedPro
 }
 
 fn listener(pid: u32, creation_time_100ns: u64) -> ListenerIdentity {
-    ListenerIdentity::new(pid, creation_time_100ns).expect("listener identity")
+    ListenerIdentity::with_executable(pid, creation_time_100ns, executable())
+        .expect("listener identity")
 }
 
 fn single_listener(identity: ListenerIdentity) -> PortObservation {
@@ -105,11 +106,23 @@ fn target(resource: ResourceFence) -> PortTarget {
     PortTarget::new(43001, resource, ManagedPortHealth::Ready)
 }
 
+fn reserve_ephemeral_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve ephemeral port");
+    let port = listener.local_addr().expect("ephemeral address").port();
+    drop(listener);
+    port
+}
+
 #[test]
 fn starting_resource_is_orange_even_before_a_listener_appears() {
     let resource = fence(1, 1);
     let (registry, _) = registry_with_root(resource, 11_001, 101);
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
 
     let status = project_port_status(&target(resource), &PortObservation::Free, Some(&managed));
 
@@ -117,10 +130,90 @@ fn starting_resource_is_orange_even_before_a_listener_appears() {
 }
 
 #[test]
+fn starting_resource_wins_over_a_stale_probe_fault() {
+    let resource = fence(101, 1);
+    let (registry, managed_fence) = registry_with_root(resource, 12_101, 10_101);
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(43001, PortObservation::ProbeError("stale".to_string()))]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        Instant::now() - Duration::from_secs(60),
+    );
+
+    let status = project_port_status_from_snapshot(&target(resource), &snapshot, Some(&managed));
+
+    assert_eq!(status.kind(), PortStatusKind::Starting);
+    let _ = managed_fence;
+}
+
+#[test]
+fn reconciliation_fault_on_a_free_port_is_unknown_not_stopped_or_external() {
+    let port = 43_101;
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(port, PortObservation::Free)]),
+        BTreeMap::new(),
+        BTreeMap::from([(
+            port,
+            PortObservationIssue::ReconciliationFault("listener table changed".to_string()),
+        )]),
+        Instant::now(),
+    );
+
+    let status = project_port_status_from_snapshot(
+        &PortTarget::new(port, fence(102, 1), ManagedPortHealth::Ready),
+        &snapshot,
+        None,
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
+    assert_ne!(status.kind(), PortStatusKind::Stopped);
+    assert_ne!(status.kind(), PortStatusKind::ProvenExternal);
+}
+
+#[test]
+fn public_snapshot_bounds_and_sanitizes_diagnostic_strings() {
+    let detail = format!("{}\r\n", "untrusted detail ".repeat(100));
+    let snapshot = PortInventorySnapshot::from_parts(
+        BTreeMap::from([(43_102, PortObservation::ProbeError(detail.clone()))]),
+        BTreeMap::new(),
+        BTreeMap::from([(43_102, PortObservationIssue::ReconciliationFault(detail))]),
+        Instant::now(),
+    );
+
+    let observation = snapshot.observation(43_102).expect("observation");
+    let issue = snapshot.issue(43_102).expect("issue");
+    assert!(observation.listeners().is_empty());
+    let observation_detail = match observation {
+        PortObservation::ProbeError(detail) => detail,
+        other => panic!("expected bounded probe detail, got {other:?}"),
+    };
+    assert!(observation_detail.chars().count() <= 256);
+    assert!(observation_detail
+        .chars()
+        .all(|character| !character.is_control()));
+    assert!(issue.detail().chars().count() <= 256);
+    assert!(issue
+        .detail()
+        .chars()
+        .all(|character| !character.is_control()));
+}
+
+#[test]
 fn probe_failure_remains_visible_while_managed_resource_is_starting() {
     let resource = fence(10, 1);
     let (registry, _) = registry_with_root(resource, 11_013, 1_013);
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
 
     let status = project_port_status(
         &target(resource),
@@ -128,7 +221,7 @@ fn probe_failure_remains_visible_while_managed_resource_is_starting() {
         Some(&managed),
     );
 
-    assert_eq!(status.kind(), PortStatusKind::ProbeError);
+    assert_eq!(status.kind(), PortStatusKind::Starting);
     assert_eq!(status.error(), Some("listener table unavailable"));
 }
 
@@ -139,7 +232,12 @@ fn matching_managed_ready_listener_is_green() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
 
     let status = project_port_status(
         &target(resource),
@@ -157,7 +255,12 @@ fn matching_managed_listener_without_readiness_is_orange_unready() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
     let target = PortTarget::new(43001, resource, ManagedPortHealth::NotReady);
 
     let status = project_port_status(
@@ -179,7 +282,7 @@ fn listener_with_unverified_ownership_is_occupied() {
         None,
     );
 
-    assert_eq!(status.kind(), PortStatusKind::Occupied);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
     assert_eq!(status.listener(), Some(listener(11_003, 303)));
 }
 
@@ -190,16 +293,25 @@ fn mixed_managed_and_ownership_unverified_listeners_are_preserved_and_fail_close
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
     let managed_listener = listener(11_009, 909);
     let ownership_unverified_listener = listener(11_010, 910);
     let observation = PortObservation::Listeners(Arc::from(
-        vec![managed_listener, ownership_unverified_listener].into_boxed_slice(),
+        vec![
+            managed_listener.clone(),
+            ownership_unverified_listener.clone(),
+        ]
+        .into_boxed_slice(),
     ));
 
     let status = project_port_status(&target(resource), &observation, Some(&managed));
 
-    assert_eq!(status.kind(), PortStatusKind::Occupied);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
     assert_eq!(status.listener(), None);
     assert_eq!(
         status.listeners(),
@@ -211,9 +323,13 @@ fn mixed_managed_and_ownership_unverified_listeners_are_preserved_and_fail_close
 fn valid_registry_snapshot_can_prove_a_listener_external() {
     let resource = fence(18, 1);
     let managed = ManagedResourceSnapshot::new(
-        resource,
+        ManagedProcessFence::new(
+            resource,
+            ProcessOwner::Host,
+            identity(11_018, 1_818, &executable()),
+        ),
         ManagedProcessState::Running,
-        vec![ManagedProcessId::new(11_018, 1_818).unwrap()],
+        vec![identity(11_018, 1_818, &executable())],
         RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
     );
     let target = PortTarget::new(43_018, resource, ManagedPortHealth::Ready);
@@ -240,6 +356,33 @@ fn valid_registry_snapshot_can_prove_a_listener_external() {
 }
 
 #[test]
+fn pid_and_creation_without_executable_proof_cannot_be_external() {
+    let resource = fence(181, 1);
+    let managed_identity = identity(11_181, 1_881, &executable());
+    let managed = ManagedResourceSnapshot::new(
+        ManagedProcessFence::new(resource, ProcessOwner::Host, managed_identity.clone()),
+        ManagedProcessState::Running,
+        vec![managed_identity],
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    );
+    let unverifiable = ListenerIdentity::new(11_999, 1_999).expect("listener identity");
+
+    assert_eq!(
+        classify_port_authority(&single_listener(unverifiable.clone()), Some(&managed)),
+        PortAuthority::Unknown
+    );
+    assert_eq!(
+        project_port_status(
+            &target(resource),
+            &single_listener(unverifiable),
+            Some(&managed),
+        )
+        .kind(),
+        PortStatusKind::Unknown
+    );
+}
+
+#[test]
 fn free_port_without_a_launch_is_gray() {
     let resource = fence(4, 1);
     let status = project_port_status(&target(resource), &PortObservation::Free, None);
@@ -257,7 +400,7 @@ fn probe_failure_is_not_treated_as_free() {
         None,
     );
 
-    assert_eq!(status.kind(), PortStatusKind::ProbeError);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
     assert_eq!(status.error(), Some("listener table unavailable"));
 }
 
@@ -268,7 +411,12 @@ fn pid_reuse_does_not_make_a_reused_pid_managed() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot(&registry, resource).expect("current resource");
+    let managed = registered_resource_snapshot_with_membership(
+        &registry,
+        resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current resource");
 
     let status = project_port_status(
         &target(resource),
@@ -276,7 +424,7 @@ fn pid_reuse_does_not_make_a_reused_pid_managed() {
         Some(&managed),
     );
 
-    assert_eq!(status.kind(), PortStatusKind::Occupied);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
 }
 
 #[test]
@@ -288,14 +436,18 @@ fn a_stale_resource_generation_cannot_claim_a_current_listener() {
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
 
-    let stale_snapshot = registered_resource_snapshot(&registry, stale_resource);
+    let stale_snapshot = registered_resource_snapshot_with_membership(
+        &registry,
+        stale_resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    );
     let status = project_port_status(
         &target(stale_resource),
         &single_listener(listener(11_007, 707)),
         stale_snapshot.as_ref(),
     );
 
-    assert_eq!(status.kind(), PortStatusKind::Occupied);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
 }
 
 #[test]
@@ -306,14 +458,19 @@ fn direct_projection_requires_the_exact_target_fence() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let current = registered_resource_snapshot(&registry, current_resource).expect("current");
+    let current = registered_resource_snapshot_with_membership(
+        &registry,
+        current_resource,
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    )
+    .expect("current");
 
     let status = project_port_status(
         &PortTarget::new(43_020, stale_resource, ManagedPortHealth::Ready),
         &single_listener(listener(11_020, 2_020)),
         Some(&current),
     );
-    assert_eq!(status.kind(), PortStatusKind::Occupied);
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
 }
 
 #[test]
@@ -337,7 +494,8 @@ fn cached_snapshots_are_read_without_running_a_probe() {
 #[test]
 fn occupied_start_is_rejected_with_listener_evidence() {
     let occupied = listener(11_009, 909);
-    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(43001, single_listener(occupied))]));
+    let snapshot =
+        PortInventorySnapshot::new(BTreeMap::from([(43001, single_listener(occupied.clone()))]));
 
     let error = ensure_managed_start_allowed(&snapshot, 43001).expect_err("occupied port");
 
@@ -407,11 +565,11 @@ fn probe_error_cannot_invoke_the_server_launch_callback() {
 #[test]
 fn stale_or_failed_membership_never_proves_managed_ownership() {
     let resource = fence(12, 1);
-    let member = ManagedProcessId::new(11_012, 1_212).expect("member identity");
+    let member = identity(11_012, 1_212, &executable());
     let stale = ManagedResourceSnapshot::new(
-        resource,
+        ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
         ManagedProcessState::Running,
-        vec![member],
+        vec![member.clone()],
         RegistryMembershipSnapshot::stale(7, 9, Instant::now() - Duration::from_secs(10)),
     );
     let stale_authority =
@@ -419,7 +577,7 @@ fn stale_or_failed_membership_never_proves_managed_ownership() {
     assert_eq!(stale_authority, PortAuthority::Unknown);
 
     let failed = ManagedResourceSnapshot::new(
-        resource,
+        ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
         ManagedProcessState::Running,
         vec![member],
         RegistryMembershipSnapshot::failed(7, 10, "membership access denied"),
@@ -433,6 +591,74 @@ fn stale_or_failed_membership_never_proves_managed_ownership() {
 }
 
 #[test]
+fn inactive_managed_states_never_prove_an_external_listener() {
+    let resource = fence(103, 1);
+    let managed_identity = listener(12_103, 1_203);
+    for state in [
+        ManagedProcessState::Stopping,
+        ManagedProcessState::Stopped,
+        ManagedProcessState::Failed,
+        ManagedProcessState::Leaked,
+    ] {
+        let managed = ManagedResourceSnapshot::new(
+            ManagedProcessFence::new(
+                resource,
+                ProcessOwner::Host,
+                identity(12_103, 1_203, &executable()),
+            ),
+            state,
+            vec![identity(12_103, 1_203, &executable())],
+            RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+        );
+        let target = PortTarget::new(43_103, resource, ManagedPortHealth::Ready);
+        let observation = single_listener(managed_identity.clone());
+        assert_eq!(
+            classify_port_authority(&observation, Some(&managed)),
+            PortAuthority::Unknown,
+            "inactive state {state:?} must not prove external ownership"
+        );
+        assert_eq!(
+            project_port_status(&target, &observation, Some(&managed)).kind(),
+            PortStatusKind::Unknown,
+            "inactive state {state:?} must remain unknown"
+        );
+        assert_eq!(
+            project_port_status(&target, &PortObservation::Free, Some(&managed)).kind(),
+            PortStatusKind::Unknown,
+            "inactive state {state:?} must remain unknown without a listener"
+        );
+    }
+}
+
+#[test]
+fn executable_mismatch_for_the_same_pid_and_creation_is_unknown() {
+    let resource = fence(104, 1);
+    let managed_executable = executable();
+    let other_executable = if cfg!(windows) {
+        PathBuf::from(r"C:\Windows\System32\cmd.exe")
+    } else {
+        PathBuf::from("/bin/sh")
+    };
+    let managed = ManagedResourceSnapshot::new(
+        ManagedProcessFence::new(
+            resource,
+            ProcessOwner::Host,
+            identity(12_104, 1_204, &managed_executable),
+        ),
+        ManagedProcessState::Running,
+        vec![identity(12_104, 1_204, &managed_executable)],
+        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    );
+    let listener = ListenerIdentity::with_executable(12_104, 1_204, &other_executable)
+        .expect("alternate executable identity");
+
+    assert_eq!(
+        classify_port_authority(&single_listener(listener), Some(&managed)),
+        PortAuthority::Unknown
+    );
+}
+
+#[test]
 fn missing_membership_revision_or_observation_sequence_is_not_fresh() {
     let now = Instant::now();
     assert!(!RegistryMembershipSnapshot::valid(0, 1, now, Duration::from_secs(5)).is_fresh_at(now));
@@ -440,18 +666,46 @@ fn missing_membership_revision_or_observation_sequence_is_not_fresh() {
 }
 
 #[test]
+fn invalid_endpoint_rows_make_the_snapshot_unusable() {
+    let port = 43_105;
+    let identity = listener(12_105, 1_205);
+    let snapshot = PortInventorySnapshot::with_endpoints(
+        BTreeMap::from([(port, single_listener(identity.clone()))]),
+        BTreeMap::from([(
+            port + 1,
+            vec![TcpEndpoint::tcp(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                identity.clone(),
+            )],
+        )]),
+    );
+
+    assert!(!snapshot.is_valid());
+    assert_eq!(
+        project_port_status_from_snapshot(
+            &PortTarget::new(port, fence(105, 1), ManagedPortHealth::Ready),
+            &snapshot,
+            None,
+        )
+        .kind(),
+        PortStatusKind::Unknown
+    );
+}
+
+#[test]
 fn stopped_failed_and_leaked_generations_cannot_be_managed() {
     let resource = fence(13, 1);
-    let member = ManagedProcessId::new(11_013, 1_313).expect("member identity");
+    let member = identity(11_013, 1_313, &executable());
     for state in [
         ManagedProcessState::Stopped,
         ManagedProcessState::Failed,
         ManagedProcessState::Leaked,
     ] {
         let managed = ManagedResourceSnapshot::new(
-            resource,
+            ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
             state,
-            vec![member],
+            vec![member.clone()],
             RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
         );
         assert_ne!(
@@ -477,7 +731,7 @@ fn registered_snapshot_requires_the_exact_fence_and_carries_membership_contract(
     assert_eq!(snapshot.observation_sequence(), 31);
     assert_eq!(
         snapshot.member_identities(),
-        &[ManagedProcessId::new(11_014, 1_414).unwrap()]
+        &[identity(11_014, 1_414, &executable())]
     );
     assert!(snapshot.is_fresh_at(Instant::now()));
     assert!(
@@ -492,15 +746,19 @@ fn mixed_managed_and_external_endpoints_are_unknown_even_when_the_pid_list_looks
     let managed_identity = listener(11_015, 1_515);
     let external_identity = listener(11_016, 1_616);
     let managed = ManagedResourceSnapshot::new(
-        resource,
+        ManagedProcessFence::new(
+            resource,
+            ProcessOwner::Host,
+            identity(11_015, 1_515, &executable()),
+        ),
         ManagedProcessState::Running,
-        vec![ManagedProcessId::new(11_015, 1_515).unwrap()],
+        vec![identity(11_015, 1_515, &executable())],
         RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
     );
     let port = 43_001;
     let observations = BTreeMap::from([(
         port,
-        PortObservation::from_listeners(vec![managed_identity, external_identity]),
+        PortObservation::from_listeners(vec![managed_identity.clone(), external_identity.clone()]),
     )]);
     let endpoints = BTreeMap::from([(
         port,
@@ -649,20 +907,28 @@ fn access_denied_identity_capture_is_probe_error_and_never_free_or_external() {
             &snapshot,
             None,
         ),
-        PortAuthority::ProbeError
+        PortAuthority::Unknown
     );
 }
 
 #[test]
 fn endpoint_observation_preserves_tcp_family_bind_and_dual_stack_rows() {
     let port = 43_004;
-    let identity = listener(11_019, 1_919);
-    let observations = BTreeMap::from([(port, single_listener(identity))]);
+    let listener_identity = listener(11_019, 1_919);
+    let observations = BTreeMap::from([(port, single_listener(listener_identity.clone()))]);
     let endpoints = BTreeMap::from([(
         port,
         vec![
-            TcpEndpoint::tcp(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port, identity),
-            TcpEndpoint::tcp(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port, identity),
+            TcpEndpoint::tcp(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+                listener_identity.clone(),
+            ),
+            TcpEndpoint::tcp(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                port,
+                listener_identity.clone(),
+            ),
         ],
     )]);
     let snapshot = PortInventorySnapshot::with_endpoints(observations, endpoints);
@@ -687,9 +953,21 @@ fn endpoint_observation_preserves_tcp_family_bind_and_dual_stack_rows() {
 
     let resource = fence(19, 1);
     let managed = ManagedResourceSnapshot::new(
-        resource,
+        ManagedProcessFence::new(
+            resource,
+            ProcessOwner::Host,
+            identity(
+                listener_identity.pid(),
+                listener_identity.creation_time_100ns(),
+                &executable(),
+            ),
+        ),
         ManagedProcessState::Running,
-        vec![ManagedProcessId::new(identity.pid(), identity.creation_time_100ns()).unwrap()],
+        vec![identity(
+            listener_identity.pid(),
+            listener_identity.creation_time_100ns(),
+            &executable(),
+        )],
         RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
     );
     assert_eq!(
@@ -720,6 +998,54 @@ fn launch_admission_rejects_stale_and_partial_free_proofs() {
         ensure_managed_start_allowed(&partial, port),
         Err(PortStartError::NotExactSnapshot { port: observed }) if observed == port
     ));
+}
+
+#[test]
+fn revalidation_rejects_a_listener_bound_after_the_initial_free_proof() {
+    let port = reserve_ephemeral_port();
+    let snapshot = PortInventorySnapshot::new(BTreeMap::from([(port, PortObservation::Free)]))
+        .with_publication_sequence(1);
+    let bound_listener = TcpListener::bind(("127.0.0.1", port)).expect("bind race listener");
+    let launched = AtomicBool::new(false);
+    let error = launch_if_port_free_with_revalidation(
+        &snapshot,
+        port,
+        || {
+            Err(PortStartError::Occupied {
+                port,
+                listener: listener(std::process::id(), 1),
+            })
+        },
+        || launched.store(true, Ordering::SeqCst),
+    )
+    .expect_err("bind-between-proof-and-start must be rejected");
+
+    assert!(matches!(error, PortStartError::Occupied { port: observed, .. } if observed == port));
+    assert!(!launched.load(Ordering::SeqCst));
+    drop(bound_listener);
+}
+
+#[test]
+fn port_start_reservation_serializes_cooperating_starts_and_releases_on_drop() {
+    let port = 43_009;
+    let inventory =
+        PortInventory::with_scanner(|ports: &[u16], _: &ScanCancellation| Ok(free_scan(ports)));
+    let snapshot = free_scan(&[port]).with_publication_sequence(1);
+    let first = inventory
+        .reserve_start(&snapshot, port)
+        .expect("first reservation");
+    assert!(first.is_active());
+    assert!(matches!(
+        inventory.reserve_start(&snapshot, port),
+        Err(PortStartError::ReservationConflict { port: observed }) if observed == port
+    ));
+
+    drop(first);
+    let second = inventory
+        .reserve_start(&snapshot, port)
+        .expect("reservation after drop");
+    assert!(second.is_active());
+    inventory.shutdown();
 }
 
 #[test]
@@ -1040,7 +1366,7 @@ fn real_temporary_listener_is_observed_and_never_touched_by_rejection() {
     let snapshot = scan_listener_inventory(&[port]).expect("listener inventory");
     let observed = snapshot.observation(port).expect("observed port");
     let observed_listener = match observed {
-        PortObservation::Listeners(listeners) if listeners.len() == 1 => listeners[0],
+        PortObservation::Listeners(listeners) if listeners.len() == 1 => listeners[0].clone(),
         other => panic!("expected listener observation, got {other:?}"),
     };
     assert_eq!(observed_listener.pid(), std::process::id());

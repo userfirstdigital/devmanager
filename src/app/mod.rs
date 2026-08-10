@@ -557,12 +557,20 @@ struct ServerPortSnapshotState {
     probe_failures: HashMap<u16, String>,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
+    refresh_generation: u64,
+    active_refresh: Option<PortRefreshFence>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PortRefreshProjection {
     statuses: HashMap<u16, PortStatus>,
     probe_failures: HashMap<u16, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortRefreshFence {
+    generation: u64,
+    ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -11969,15 +11977,12 @@ impl NativeShell {
                 .probe_failures
                 .retain(|port, _| tracked_ports.binary_search(port).is_ok());
             self.server_port_snapshot.last_checked_at = None;
-        }
-
-        if self.server_port_snapshot.statuses.is_empty() {
-            let cached_snapshot = self.server_port_snapshot.inventory.cached_snapshot();
-            if let Ok(statuses) =
-                ports_service::legacy_statuses_from_snapshot(&cached_snapshot, &tracked_ports)
-            {
-                self.server_port_snapshot.statuses = statuses;
-            }
+            self.server_port_snapshot.refresh_generation = self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1);
+            self.server_port_snapshot.refresh_in_flight = false;
+            self.server_port_snapshot.active_refresh = None;
         }
 
         let should_refresh = self
@@ -11991,6 +11996,15 @@ impl NativeShell {
 
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
+        let refresh_fence = PortRefreshFence {
+            generation: self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1),
+            ports: ports.clone(),
+        };
+        self.server_port_snapshot.refresh_generation = refresh_fence.generation;
+        self.server_port_snapshot.active_refresh = Some(refresh_fence.clone());
         let inventory = self.server_port_snapshot.inventory.clone();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
@@ -12001,25 +12015,35 @@ impl NativeShell {
                 async move {
                     let projection = background_executor
                         .spawn(async move {
-                            let refresh_result = inventory.refresh(&ports);
-                            let snapshot = inventory.cached_snapshot();
-                            let mut projection = project_legacy_port_snapshot(&snapshot, &ports);
-                            if projection.probe_failures.is_empty() {
-                                if let Err(error) = refresh_result {
+                            match inventory.refresh(&ports) {
+                                Ok(snapshot) => project_legacy_port_snapshot(&snapshot, &ports),
+                                Err(error) => {
+                                    let mut projection = PortRefreshProjection::default();
                                     let detail = bounded_port_probe_detail(&error);
                                     for &port in &ports {
                                         projection.probe_failures.insert(port, detail.clone());
                                     }
+                                    projection
                                 }
                             }
-                            projection
                         })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        let expected_fence = PortRefreshFence {
+                            generation: refresh_fence.generation,
+                            ports: refresh_fence.ports.clone(),
+                        };
+                        if !port_refresh_is_current(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &expected_fence,
+                        ) {
+                            return;
+                        }
                         this.server_port_snapshot.refresh_in_flight = false;
+                        this.server_port_snapshot.active_refresh = None;
                         this.server_port_snapshot.last_checked_at = Some(Instant::now());
                         let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
                         if let Some(notice) = apply_server_port_refresh(
@@ -12115,6 +12139,12 @@ impl NativeShell {
             }
         }
         self.server_port_snapshot.last_checked_at = None;
+        self.server_port_snapshot.refresh_generation = self
+            .server_port_snapshot
+            .refresh_generation
+            .saturating_add(1);
+        self.server_port_snapshot.refresh_in_flight = false;
+        self.server_port_snapshot.active_refresh = None;
     }
 
     fn record_port_kill_feedback(
@@ -12931,6 +12961,15 @@ impl NativeShell {
 
         self.invalidate_server_port_snapshot(Some(port));
         self.server_port_snapshot.refresh_in_flight = true;
+        let refresh_fence = PortRefreshFence {
+            generation: self
+                .server_port_snapshot
+                .refresh_generation
+                .saturating_add(1),
+            ports: vec![port],
+        };
+        self.server_port_snapshot.refresh_generation = refresh_fence.generation;
+        self.server_port_snapshot.active_refresh = Some(refresh_fence.clone());
         if let Some(state) = self.active_port_state.as_mut() {
             if state.command_id == command_id && state.port == port {
                 state.status = None;
@@ -12941,6 +12980,7 @@ impl NativeShell {
 
         let command_id = command_id.to_string();
         let inventory = self.server_port_snapshot.inventory.clone();
+        let reservation_inventory = inventory.clone();
         let background_executor = cx.background_executor().clone();
         let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
@@ -12955,7 +12995,14 @@ impl NativeShell {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if !port_refresh_is_current(
+                            this.server_port_snapshot.active_refresh.as_ref(),
+                            &refresh_fence,
+                        ) {
+                            return;
+                        }
                         this.server_port_snapshot.refresh_in_flight = false;
+                        this.server_port_snapshot.active_refresh = None;
                         if let Err(error) = this
                             .process_manager
                             .validate_server_launch(&this.state, &command_id)
@@ -12995,9 +13042,29 @@ impl NativeShell {
                             }
                         };
 
-                        let start_result = crate::process::ports::launch_if_port_free(
+                        let reservation = match reservation_inventory.reserve_start(&snapshot, port)
+                        {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                this.terminal_actionable_notice = None;
+                                this.terminal_notice = Some(port_start_error_notice(&error));
+                                cx.notify();
+                                return;
+                            }
+                        };
+                        let reservation_port = reservation.port();
+                        let start_result = crate::process::ports::launch_if_port_free_with_revalidation(
                             &snapshot,
                             port,
+                            || {
+                                if reservation.is_active() {
+                                    Ok(())
+                                } else {
+                                    Err(crate::process::ports::PortStartError::ReservationConflict {
+                                        port: reservation_port,
+                                    })
+                                }
+                            },
                             || {
                                 if focus_started_server {
                                     this.interrupt_active_browser_replay_before_route_change(None);
@@ -13017,6 +13084,7 @@ impl NativeShell {
                                 }
                             },
                         );
+                        drop(reservation);
 
                         match start_result {
                             Ok(Ok(())) => {
@@ -16759,24 +16827,30 @@ fn server_start_probe_allowed(refresh_in_flight: bool) -> bool {
     !refresh_in_flight
 }
 
+fn port_refresh_is_current(active: Option<&PortRefreshFence>, expected: &PortRefreshFence) -> bool {
+    active == Some(expected)
+}
+
 const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
 const MAX_PORT_PROBE_NOTICE_CHARS: usize = 1024;
 
 fn bounded_port_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let mut sanitized = String::with_capacity(text.len().min(max_chars));
-    let mut truncated = false;
-    for character in text.chars() {
-        if sanitized.chars().count() >= max_chars {
-            truncated = true;
-            break;
-        }
+    let mut characters = text.chars();
+    while sanitized.chars().count() < max_chars.saturating_sub(1) {
+        let Some(character) = characters.next() else {
+            return sanitized;
+        };
         sanitized.push(if character.is_control() {
             ' '
         } else {
             character
         });
     }
-    if truncated {
+    if characters.next().is_some() {
         sanitized.push('…');
     }
     sanitized
@@ -16791,7 +16865,33 @@ fn project_legacy_port_snapshot(
     ports: &[u16],
 ) -> PortRefreshProjection {
     let mut projection = PortRefreshProjection::default();
+    if !snapshot.is_exactly_for(ports) {
+        for &port in ports {
+            projection.probe_failures.insert(
+                port,
+                "listener inventory snapshot does not match the requested port set".to_string(),
+            );
+        }
+        return projection;
+    }
     for &port in ports {
+        if let Some(issue) = snapshot.issue(port) {
+            projection
+                .probe_failures
+                .insert(port, bounded_port_probe_detail(issue.detail()));
+            continue;
+        }
+        if !snapshot.is_valid() {
+            projection.probe_failures.insert(
+                port,
+                bounded_port_probe_detail(
+                    snapshot
+                        .validation_error()
+                        .unwrap_or("listener inventory snapshot was invalid"),
+                ),
+            );
+            continue;
+        }
         match snapshot.observation(port) {
             Some(crate::process::ports::PortObservation::Listeners(listeners)) => {
                 projection.statuses.insert(
@@ -17092,10 +17192,10 @@ fn derive_server_indicator(
 }
 
 fn occupied_indicator_state() -> sidebar::ServerIndicatorState {
-    // The sidebar's existing blue enum variant predates the ownership fence.
-    // Its user-facing meaning here is occupied with ownership unverified, not
-    // proof that the listener belongs to any particular process.
-    sidebar::ServerIndicatorState::External
+    // Legacy port rows contain only PID-level evidence. Until an exact
+    // generation/executable proof is available, occupied is unknown and must
+    // never be painted as the blue proven-external state.
+    sidebar::ServerIndicatorState::Unknown
 }
 
 fn legacy_port_occupancy_copy(port: u16, status: &PortStatus) -> String {
@@ -20494,6 +20594,22 @@ mod tests {
         let (ports, interval) = server_port_snapshot_plan(&state, &runtime);
         assert_eq!(ports, vec![4321, 5174]);
         assert_eq!(interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stale_port_refresh_callback_cannot_apply_to_a_new_generation_or_port_set() {
+        let old = PortRefreshFence {
+            generation: 7,
+            ports: vec![5174],
+        };
+        let current = PortRefreshFence {
+            generation: 8,
+            ports: vec![5174, 3000],
+        };
+
+        assert!(!port_refresh_is_current(Some(&current), &old));
+        assert!(!port_refresh_is_current(None, &old));
+        assert!(port_refresh_is_current(Some(&current), &current));
     }
 
     #[test]

@@ -1,18 +1,20 @@
 use crate::models::{AppConfig, PortConflict, PortConflictEntry, PortStatus};
 use crate::process::ports::{
     ListenerIdentity, PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError,
-    ScanCancellation, TcpEndpoint, TcpEndpointRecord, MAX_ENDPOINTS_PER_SCAN, MAX_PORTS_PER_SCAN,
-    MAX_SCAN_ERRORS, MAX_SCAN_WAITERS,
+    PortStartError, ScanCancellation, TcpEndpoint, TcpEndpointRecord, MAX_ENDPOINTS_PER_SCAN,
+    MAX_PORTS_PER_SCAN, MAX_SCAN_ERRORS, MAX_SCAN_WAITERS,
 };
 use crate::services::platform_service;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Weak;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+pub const MAX_SCAN_QUARANTINE: usize = 2;
 
 pub trait PortScanner: Send + Sync + 'static {
     fn scan(
@@ -68,7 +70,9 @@ pub struct PortScanRequest {
 
 impl PortScanRequest {
     pub fn wait(&self, timeout: Duration) -> Result<Arc<PortInventorySnapshot>, PortScanError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         let mut result = self.waiter.result.lock().expect("port scan waiter lock");
         loop {
             if let Some(result) = result.take() {
@@ -91,6 +95,49 @@ impl PortScanRequest {
     }
 }
 
+/// A short-lived admission fence owned by the exact start operation. It
+/// serializes cooperating DevManager starts for one port and is released even
+/// when the owner returns an error or is dropped. It does not claim ownership
+/// of an external listener; the start owner must still perform its exact bind
+/// or revalidation before spawning.
+#[derive(Debug)]
+pub struct PortStartReservation {
+    inner: Weak<PortInventoryInner>,
+    port: u16,
+    token: u64,
+}
+
+impl PortStartReservation {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner.upgrade().is_some_and(|inner| {
+            inner
+                .reservations
+                .lock()
+                .ok()
+                .and_then(|reservations| reservations.get(&self.port).copied())
+                == Some(self.token)
+        })
+    }
+}
+
+impl Drop for PortStartReservation {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Ok(mut reservations) = inner.reservations.lock() else {
+            return;
+        };
+        if reservations.get(&self.port).copied() == Some(self.token) {
+            reservations.remove(&self.port);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingScan {
     ports: Vec<u16>,
@@ -104,11 +151,16 @@ struct CoordinatorState {
     active_cancellation: Option<ScanCancellation>,
     worker_active: bool,
     shutdown: bool,
+    degraded: bool,
+    quarantined: Vec<Receiver<Result<PortInventorySnapshot, String>>>,
 }
 
 struct PortInventoryInner {
     snapshot: RwLock<Arc<PortInventorySnapshot>>,
     publication_sequence: AtomicU64,
+    reservation_sequence: AtomicU64,
+    reservations: Mutex<BTreeMap<u16, u64>>,
+    external_handles: AtomicUsize,
     scanner: Arc<dyn PortScanner>,
     scan_timeout: Duration,
     coordinator: Mutex<CoordinatorState>,
@@ -123,9 +175,29 @@ struct PortInventoryInner {
 /// admitted, so the service never overlaps listener-table probes. Published
 /// snapshots carry a monotonic sequence and late results cannot overwrite a
 /// newer one.
-#[derive(Clone)]
 pub struct PortInventory {
     inner: Arc<PortInventoryInner>,
+}
+
+impl Clone for PortInventory {
+    fn clone(&self) -> Self {
+        self.inner.external_handles.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for PortInventory {
+    fn drop(&mut self) {
+        if self.inner.external_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The worker may temporarily hold a strong Arc while it waits on
+            // the coordinator. Signal shutdown from the final public handle
+            // rather than relying on PortInventoryInner::drop, so that the
+            // worker is woken and releases that Arc deterministically.
+            self.shutdown();
+        }
+    }
 }
 
 impl std::fmt::Debug for PortInventory {
@@ -164,6 +236,9 @@ impl PortInventory {
             inner: Arc::new(PortInventoryInner {
                 snapshot: RwLock::new(Arc::new(PortInventorySnapshot::new(BTreeMap::new()))),
                 publication_sequence: AtomicU64::new(0),
+                reservation_sequence: AtomicU64::new(0),
+                reservations: Mutex::new(BTreeMap::new()),
+                external_handles: AtomicUsize::new(1),
                 scanner: Arc::new(scanner),
                 scan_timeout: scan_timeout.max(Duration::from_millis(1)),
                 coordinator: Mutex::new(CoordinatorState {
@@ -172,6 +247,8 @@ impl PortInventory {
                     active_cancellation: None,
                     worker_active: false,
                     shutdown: false,
+                    degraded: false,
+                    quarantined: Vec::new(),
                 }),
                 wake_worker: Condvar::new(),
             }),
@@ -238,8 +315,17 @@ impl PortInventory {
                 .coordinator
                 .lock()
                 .expect("port inventory coordinator lock");
+            reap_quarantine(&mut state);
             if state.shutdown {
                 return Err(PortScanError::Shutdown);
+            }
+            if state.degraded && state.quarantined.len() < MAX_SCAN_QUARANTINE {
+                state.degraded = false;
+            }
+            if state.degraded {
+                return Err(PortScanError::QuarantineFull {
+                    max: MAX_SCAN_QUARANTINE,
+                });
             }
             let queued_waiters = state.active_waiters.len()
                 + state
@@ -268,10 +354,10 @@ impl PortInventory {
             self.inner.wake_worker.notify_one();
         }
         if start_worker {
-            let inner = self.inner.clone();
+            let weak_inner = Arc::downgrade(&self.inner);
             if let Err(error) = thread::Builder::new()
                 .name("devmanager-port-inventory".to_string())
-                .spawn(move || run_inventory_worker(inner))
+                .spawn(move || run_inventory_worker(weak_inner))
             {
                 let error = PortScanError::Scan(format!("could not start scan worker: {error}"));
                 waiter.complete(Err(error.clone()));
@@ -295,11 +381,41 @@ impl PortInventory {
         let request = self
             .request_scan(ports)
             .map_err(|error| error.to_string())?;
-        match request.wait(self.inner.scan_timeout + Duration::from_millis(250)) {
+        match request.wait(self.inner.scan_timeout) {
             Ok(snapshot) => Ok(snapshot),
             Err(PortScanError::Scan(error)) => Err(error),
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    pub fn reserve_start(
+        &self,
+        snapshot: &PortInventorySnapshot,
+        port: u16,
+    ) -> Result<PortStartReservation, PortStartError> {
+        crate::process::ports::ensure_managed_start_allowed(snapshot, port)?;
+        let token = self
+            .inner
+            .reservation_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let mut reservations =
+            self.inner
+                .reservations
+                .lock()
+                .map_err(|_| PortStartError::ProbeFailed {
+                    port,
+                    detail: "port start reservation lock was poisoned".to_string(),
+                })?;
+        if reservations.contains_key(&port) {
+            return Err(PortStartError::ReservationConflict { port });
+        }
+        reservations.insert(port, token);
+        Ok(PortStartReservation {
+            inner: Arc::downgrade(&self.inner),
+            port,
+            token,
+        })
     }
 
     pub fn cancel_active_scan(&self) {
@@ -324,6 +440,7 @@ impl PortInventory {
                 return;
             }
             state.shutdown = true;
+            state.degraded = false;
             if let Some(cancellation) = state.active_cancellation.as_ref() {
                 cancellation.cancel();
             }
@@ -333,6 +450,7 @@ impl PortInventory {
                 .take()
                 .map(|pending| pending.waiters)
                 .unwrap_or_default();
+            state.quarantined.clear();
             self.inner.wake_worker.notify_all();
             (active_waiters, pending_waiters)
         };
@@ -395,16 +513,19 @@ fn next_publication_sequence(inner: &PortInventoryInner) -> u64 {
 
 struct ScanExecution {
     result: Result<Arc<PortInventorySnapshot>, PortScanError>,
-    drain: Option<Receiver<Result<PortInventorySnapshot, String>>>,
+    quarantine: Option<Receiver<Result<PortInventorySnapshot, String>>>,
 }
 
 fn execute_scan(
-    inner: &Arc<PortInventoryInner>,
+    weak_inner: &Weak<PortInventoryInner>,
+    scanner: Arc<dyn PortScanner>,
     ports: Vec<u16>,
     cancellation: ScanCancellation,
 ) -> ScanExecution {
-    let sequence = next_publication_sequence(inner);
-    let scanner = inner.scanner.clone();
+    let sequence = weak_inner
+        .upgrade()
+        .map(|inner| next_publication_sequence(&inner))
+        .unwrap_or(0);
     let child_cancellation = cancellation.clone();
     let failure_ports = ports.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -419,11 +540,14 @@ fn execute_scan(
             result: Err(PortScanError::Scan(format!(
                 "could not start scan: {error}"
             ))),
-            drain: None,
+            quarantine: None,
         };
     }
 
-    match receiver.recv_timeout(inner.scan_timeout) {
+    let remaining = cancellation
+        .deadline()
+        .saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
         Ok(Ok(snapshot)) => {
             if cancellation.is_cancelled() {
                 if Instant::now() >= cancellation.deadline() {
@@ -434,22 +558,26 @@ fn execute_scan(
                         )
                         .with_publication_sequence(sequence),
                     );
-                    let _ = inner_publish_snapshot(inner, failure);
+                    if let Some(inner) = weak_inner.upgrade() {
+                        let _ = inner_publish_snapshot(&inner, failure);
+                    }
                     return ScanExecution {
                         result: Err(PortScanError::TimedOut),
-                        drain: None,
+                        quarantine: None,
                     };
                 }
                 return ScanExecution {
                     result: Err(PortScanError::Cancelled),
-                    drain: None,
+                    quarantine: None,
                 };
             }
             let snapshot = Arc::new(snapshot.with_publication_sequence(sequence));
-            let _ = inner_publish_snapshot(inner, snapshot.clone());
+            if let Some(inner) = weak_inner.upgrade() {
+                let _ = inner_publish_snapshot(&inner, snapshot.clone());
+            }
             ScanExecution {
                 result: Ok(snapshot),
-                drain: None,
+                quarantine: None,
             }
         }
         Ok(Err(error)) => {
@@ -463,7 +591,9 @@ fn execute_scan(
                         )
                         .with_publication_sequence(sequence),
                     );
-                    let _ = inner_publish_snapshot(inner, failure);
+                    if let Some(inner) = weak_inner.upgrade() {
+                        let _ = inner_publish_snapshot(&inner, failure);
+                    }
                 }
                 return ScanExecution {
                     result: Err(if timeout {
@@ -471,7 +601,7 @@ fn execute_scan(
                     } else {
                         PortScanError::Cancelled
                     }),
-                    drain: None,
+                    quarantine: None,
                 };
             }
             let error = bounded_scan_error(&error);
@@ -479,10 +609,12 @@ fn execute_scan(
                 PortInventorySnapshot::probe_failure(failure_ports, error.clone())
                     .with_publication_sequence(sequence),
             );
-            let _ = inner_publish_snapshot(inner, failure);
+            if let Some(inner) = weak_inner.upgrade() {
+                let _ = inner_publish_snapshot(&inner, failure);
+            }
             ScanExecution {
                 result: Err(PortScanError::Scan(error)),
-                drain: None,
+                quarantine: None,
             }
         }
         Err(RecvTimeoutError::Timeout) => {
@@ -494,10 +626,12 @@ fn execute_scan(
                 )
                 .with_publication_sequence(sequence),
             );
-            let _ = inner_publish_snapshot(inner, failure);
+            if let Some(inner) = weak_inner.upgrade() {
+                let _ = inner_publish_snapshot(&inner, failure);
+            }
             ScanExecution {
                 result: Err(PortScanError::TimedOut),
-                drain: Some(receiver),
+                quarantine: Some(receiver),
             }
         }
         Err(RecvTimeoutError::Disconnected) => {
@@ -506,17 +640,19 @@ fn execute_scan(
                 PortInventorySnapshot::probe_failure(failure_ports, error)
                     .with_publication_sequence(sequence),
             );
-            let _ = inner_publish_snapshot(inner, failure);
+            if let Some(inner) = weak_inner.upgrade() {
+                let _ = inner_publish_snapshot(&inner, failure);
+            }
             ScanExecution {
                 result: Err(PortScanError::Scan(error.to_string())),
-                drain: None,
+                quarantine: None,
             }
         }
     }
 }
 
 fn inner_publish_snapshot(
-    inner: &Arc<PortInventoryInner>,
+    inner: &PortInventoryInner,
     snapshot: Arc<PortInventorySnapshot>,
 ) -> bool {
     let mut current = inner.snapshot.write().expect("port inventory cache lock");
@@ -527,13 +663,29 @@ fn inner_publish_snapshot(
     true
 }
 
-fn run_inventory_worker(inner: Arc<PortInventoryInner>) {
+fn reap_quarantine(state: &mut CoordinatorState) {
+    state
+        .quarantined
+        .retain(|receiver| match receiver.try_recv() {
+            Ok(_) | Err(TryRecvError::Disconnected) => false,
+            Err(TryRecvError::Empty) => true,
+        });
+}
+
+fn run_inventory_worker(weak_inner: Weak<PortInventoryInner>) {
     loop {
         let pending = {
+            let Some(inner) = weak_inner.upgrade() else {
+                return;
+            };
             let mut state = inner
                 .coordinator
                 .lock()
                 .expect("port inventory coordinator lock");
+            reap_quarantine(&mut state);
+            if state.degraded && state.quarantined.len() < MAX_SCAN_QUARANTINE {
+                state.degraded = false;
+            }
             loop {
                 if state.shutdown {
                     state.worker_active = false;
@@ -543,7 +695,12 @@ fn run_inventory_worker(inner: Arc<PortInventoryInner>) {
                     state.active_waiters = pending.waiters.clone();
                     let cancellation = ScanCancellation::new(Instant::now() + inner.scan_timeout);
                     state.active_cancellation = Some(cancellation.clone());
-                    break (pending.ports, pending.waiters, cancellation);
+                    break (
+                        pending.ports,
+                        pending.waiters,
+                        cancellation,
+                        inner.scanner.clone(),
+                    );
                 }
                 state = inner
                     .wake_worker
@@ -552,26 +709,40 @@ fn run_inventory_worker(inner: Arc<PortInventoryInner>) {
             }
         };
 
-        let execution = execute_scan(&inner, pending.0, pending.2);
+        let execution = execute_scan(&weak_inner, pending.3, pending.0, pending.2);
         for waiter in &pending.1 {
             waiter.complete(execution.result.clone());
         }
 
-        if let Some(receiver) = execution.drain {
-            // Keep the one-in-flight guarantee even when the caller has
-            // already received the absolute timeout. A cooperative scanner
-            // exits immediately after cancellation; an uncooperative scanner
-            // prevents a second native probe but cannot block shutdown callers.
-            let _ = receiver.recv();
-        }
-
+        let Some(inner) = weak_inner.upgrade() else {
+            return;
+        };
         let mut state = inner
             .coordinator
             .lock()
             .expect("port inventory coordinator lock");
+        if let Some(receiver) = execution.quarantine {
+            reap_quarantine(&mut state);
+            if state.quarantined.len() < MAX_SCAN_QUARANTINE {
+                state.quarantined.push(receiver);
+            } else {
+                state.degraded = true;
+            }
+        }
         state.active_waiters.clear();
         state.active_cancellation = None;
         if state.shutdown {
+            state.worker_active = false;
+            return;
+        }
+        if state.degraded {
+            if let Some(pending) = state.pending.take() {
+                for waiter in pending.waiters {
+                    waiter.complete(Err(PortScanError::QuarantineFull {
+                        max: MAX_SCAN_QUARANTINE,
+                    }));
+                }
+            }
             state.worker_active = false;
             return;
         }
@@ -646,8 +817,8 @@ where
         for row in second_rows {
             match second_identities.get(&row.pid()) {
                 Some(Ok(identity)) => {
-                    endpoint_values.push(TcpEndpoint::from_record(row, *identity));
-                    listener_values.push(*identity);
+                    endpoint_values.push(TcpEndpoint::from_record(row, identity.clone()));
+                    listener_values.push(identity.clone());
                 }
                 Some(Err(error)) => {
                     if errors.len() < MAX_SCAN_ERRORS {
@@ -725,9 +896,15 @@ fn normalize_listener_table(
     let mut endpoint_count = 0usize;
     for (port, mut rows) in table {
         if !allowed.contains(&port) {
-            continue;
+            return Err(format!(
+                "listener endpoint table returned unrequested port {port}"
+            ));
         }
-        rows.retain(|row| row.port() == port);
+        if rows.iter().any(|row| row.port() != port) {
+            return Err(format!(
+                "listener endpoint table row does not match requested port {port}"
+            ));
+        }
         rows.sort_unstable();
         rows.dedup();
         endpoint_count = endpoint_count.saturating_add(rows.len());
@@ -745,18 +922,19 @@ fn normalize_listener_table(
 }
 
 fn bounded_scan_error(error: &str) -> String {
-    let mut detail = error
-        .chars()
-        .take(256)
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    if error.chars().count() > 256 {
+    let mut characters = error.chars();
+    let mut detail = String::new();
+    while detail.chars().count() < 255 {
+        let Some(character) = characters.next() else {
+            return detail;
+        };
+        detail.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if characters.next().is_some() {
         detail.push('…');
     }
     detail
@@ -765,6 +943,8 @@ fn bounded_scan_error(error: &str) -> String {
 #[cfg(windows)]
 fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
     use std::ffi::c_void;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
@@ -785,6 +965,12 @@ fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
             kernel: *mut FileTime,
             user: *mut FileTime,
         ) -> i32;
+        fn QueryFullProcessImageNameW(
+            process: *mut c_void,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
         fn CloseHandle(object: *mut c_void) -> i32;
     }
 
@@ -802,6 +988,18 @@ fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
     let mut user = FileTime::default();
     let result =
         unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let mut executable_buffer = vec![0u16; 32_768];
+    let mut executable_length = executable_buffer.len() as u32;
+    let executable_result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            0,
+            executable_buffer.as_mut_ptr(),
+            &mut executable_length,
+        )
+    };
+    let executable = (executable_result != 0 && executable_length > 0)
+        .then(|| OsString::from_wide(&executable_buffer[..executable_length as usize]));
     let close_result = unsafe { CloseHandle(process) };
     if result == 0 {
         return Err(format!(
@@ -818,15 +1016,30 @@ fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
 
     let creation_time_100ns =
         ((creation.high_date_time as u64) << 32) | creation.low_date_time as u64;
-    ListenerIdentity::new(pid, creation_time_100ns).map_err(|error| error.to_string())
+    let executable = executable.ok_or_else(|| {
+        format!(
+            "could not read listener PID {pid} canonical executable: {}",
+            std::io::Error::last_os_error()
+        )
+    })?;
+    ListenerIdentity::with_executable(pid, creation_time_100ns, executable)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(windows))]
 fn capture_listener_identity(pid: u32) -> Result<ListenerIdentity, String> {
     let identity = platform_service::capture_process_identity(pid)
         .ok_or_else(|| format!("listener PID {pid} exited before identity verification"))?;
-    ListenerIdentity::new(pid, identity.started_at_unix_secs)
-        .map_err(|error| format!("could not verify listener PID {pid}: {error}"))
+    let creation_time_100ns = identity
+        .started_at_unix_secs
+        .checked_mul(10_000_000)
+        .ok_or_else(|| format!("listener PID {pid} creation time overflowed"))?;
+    ListenerIdentity::with_executable(
+        pid,
+        creation_time_100ns,
+        std::path::PathBuf::from(format!("/proc/{pid}/exe")),
+    )
+    .map_err(|error| format!("could not verify listener PID {pid}: {error}"))
 }
 
 pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {
@@ -844,11 +1057,23 @@ pub fn legacy_statuses_from_snapshot(
     snapshot: &PortInventorySnapshot,
     ports: &[u16],
 ) -> Result<HashMap<u16, PortStatus>, String> {
+    if !snapshot.is_exactly_for(ports) {
+        return Err(bounded_scan_error(
+            "port inventory snapshot does not exactly match the requested port set",
+        ));
+    }
+    if !snapshot.is_valid() {
+        return Err(bounded_scan_error(
+            snapshot
+                .validation_error()
+                .unwrap_or("port inventory snapshot failed validation"),
+        ));
+    }
     let mut statuses = HashMap::with_capacity(ports.len());
 
     for &port in ports {
         if let Some(issue) = snapshot.issue(port) {
-            return Err(issue.detail().to_string());
+            return Err(bounded_scan_error(issue.detail()));
         }
         let status = match snapshot.observation(port) {
             Some(PortObservation::Listeners(listeners)) => PortStatus {
@@ -863,7 +1088,7 @@ pub fn legacy_statuses_from_snapshot(
                 pid: None,
                 process_name: None,
             },
-            Some(PortObservation::ProbeError(error)) => return Err(error.clone()),
+            Some(PortObservation::ProbeError(error)) => return Err(bounded_scan_error(error)),
             None => {
                 return Err(format!(
                     "port {port} was not included in listener inventory"
