@@ -6,37 +6,39 @@ use super::interaction::{
     FocusEpoch, KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
+use gpui::{div, px, rgb, IntoElement, ParentElement, Styled};
 
 /// Stable icon vocabulary used by native controls.  Keeping the identifier
 /// typed prevents a fixture, remote client, or caller from smuggling an
 /// arbitrary asset path into the renderer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum IconId {
-    Activity,
-    Bot,
-    ChevronDown,
-    ChevronLeft,
-    ChevronRight,
-    ChevronUp,
-    FileText,
-    Folder,
-    GitBranch,
-    Globe,
-    MoreHorizontal,
-    Play,
-    Plus,
-    Refresh,
-    Server,
-    Settings,
-    Sparkles,
-    Square,
-    Terminal,
-    X,
-    Warning,
-    OpenInNew,
-}
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct IconId(u8);
 
+#[allow(non_upper_case_globals)]
 impl IconId {
+    pub const Activity: Self = Self(0);
+    pub const Bot: Self = Self(1);
+    pub const ChevronDown: Self = Self(2);
+    pub const ChevronLeft: Self = Self(3);
+    pub const ChevronRight: Self = Self(4);
+    pub const ChevronUp: Self = Self(5);
+    pub const FileText: Self = Self(6);
+    pub const Folder: Self = Self(7);
+    pub const GitBranch: Self = Self(8);
+    pub const Globe: Self = Self(9);
+    pub const MoreHorizontal: Self = Self(10);
+    pub const Play: Self = Self(11);
+    pub const Plus: Self = Self(12);
+    pub const Refresh: Self = Self(13);
+    pub const Server: Self = Self(14);
+    pub const Settings: Self = Self(15);
+    pub const Sparkles: Self = Self(16);
+    pub const Square: Self = Self(17);
+    pub const Terminal: Self = Self(18);
+    pub const X: Self = Self(19);
+    pub const Warning: Self = Self(20);
+    pub const OpenInNew: Self = Self(21);
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Activity => "activity",
@@ -61,7 +63,48 @@ impl IconId {
             Self::X => "x",
             Self::Warning => "warning",
             Self::OpenInNew => "open-in-new",
+            _ => "unknown",
         }
+    }
+
+    pub(crate) const fn asset_path(self) -> &'static str {
+        match self {
+            Self::Activity => crate::icons::ACTIVITY,
+            Self::Bot => crate::icons::BOT,
+            Self::ChevronDown => crate::icons::CHEVRON_DOWN,
+            Self::ChevronLeft => crate::icons::CHEVRON_LEFT,
+            Self::ChevronRight => crate::icons::CHEVRON_RIGHT,
+            Self::ChevronUp => crate::icons::CHEVRON_UP,
+            Self::FileText => crate::icons::FILE_TEXT,
+            Self::Folder => crate::icons::FOLDER,
+            Self::GitBranch => crate::icons::GIT_BRANCH,
+            Self::Globe => crate::icons::GLOBE,
+            Self::MoreHorizontal => crate::icons::MORE_HORIZONTAL,
+            Self::Play => crate::icons::PLAY,
+            Self::Plus => crate::icons::PLUS,
+            Self::Refresh => crate::icons::REFRESH_CW,
+            Self::Server => crate::icons::SERVER,
+            Self::Settings => crate::icons::SETTINGS,
+            Self::Sparkles => crate::icons::SPARKLES,
+            Self::Square => crate::icons::SQUARE,
+            Self::Terminal => crate::icons::TERMINAL,
+            Self::X => crate::icons::X,
+            Self::Warning => "icons/warning.svg",
+            Self::OpenInNew => "icons/open-in-new.svg",
+            _ => "icons/unknown.svg",
+        }
+    }
+}
+
+impl std::fmt::Debug for IconId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IconId(<approved>)")
+    }
+}
+
+impl std::fmt::Display for IconId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IconId(<approved>)")
     }
 }
 
@@ -217,6 +260,14 @@ impl IconButton {
         self.button.set_loading(loading)
     }
 
+    pub(crate) fn set_pressed_for_preview(&mut self) {
+        self.button.set_pressed_for_preview();
+    }
+
+    pub(crate) fn set_hovered_for_preview(&mut self, hovered: bool) -> Result<(), ComponentError> {
+        self.button.set_hovered(hovered)
+    }
+
     pub fn focus(&mut self) -> bool {
         self.button.focus()
     }
@@ -243,5 +294,34 @@ impl IconButton {
 
     pub fn presentation(&self, tokens: ThemeTokens) -> ControlPresentation {
         self.button.presentation(tokens)
+    }
+
+    /// Render an icon-only control through the shared button presentation and
+    /// typed icon asset mapping.  The accessible label remains metadata, not
+    /// an attacker-controlled asset path.
+    pub fn element(&self, tokens: ThemeTokens) -> impl IntoElement {
+        let presentation = self.presentation(tokens);
+        let mut element = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(tokens.density.controls.icon_gap))
+            .p(px(tokens.density.controls.control_padding))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(presentation.border.to_u32()))
+            .bg(rgb(presentation.background.to_u32()))
+            .child(crate::icons::app_icon(
+                self.icon.asset_path(),
+                tokens.density.icons.md,
+                presentation.foreground.to_u32(),
+            ));
+        if let Some(focus_ring) = presentation.focus_ring {
+            element = element.border_color(rgb(focus_ring.color.to_u32()));
+        }
+        if !presentation.disabled {
+            element = element.cursor_pointer();
+        }
+        element
     }
 }

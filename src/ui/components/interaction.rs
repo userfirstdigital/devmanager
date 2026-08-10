@@ -187,7 +187,67 @@ pub(crate) fn redacted_bounded_text(
 
 pub(crate) fn redact_sensitive_text(value: &str) -> String {
     let value = crate::diagnostics::runner::redact_secrets(value);
-    strip_terminal_control_sequences(&redact_ui_credential_lines(&value))
+    let value = strip_bidi_controls(&strip_terminal_control_sequences(
+        &redact_ui_credential_lines(&value),
+    ));
+    redact_path_like_tokens(&value)
+}
+
+fn redact_path_like_tokens(value: &str) -> String {
+    let mut redacted = String::with_capacity(value.len());
+    for token in value.split_inclusive(char::is_whitespace) {
+        let trailing_len = token
+            .char_indices()
+            .next_back()
+            .filter(|(_, character)| character.is_whitespace())
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(0);
+        let (body, trailing) = if trailing_len == 0 {
+            (token, "")
+        } else {
+            (
+                &token[..token.len() - trailing_len],
+                &token[token.len() - trailing_len..],
+            )
+        };
+        let trimmed = body.trim_matches(['"', '\'', '(', '[', '{']);
+        let has_windows_drive_prefix = trimmed.len() >= 3
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':'
+            && matches!(trimmed.as_bytes()[2], b'\\' | b'/');
+        let path_like = has_windows_drive_prefix
+            || trimmed.contains('\\')
+            || trimmed.contains('/')
+            || trimmed.starts_with("\\\\")
+            || trimmed.starts_with("~/")
+            || trimmed.starts_with("~\\")
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../");
+        if path_like {
+            redacted.push_str("[path]");
+        } else {
+            redacted.push_str(body);
+        }
+        redacted.push_str(trailing);
+    }
+    redacted
+}
+
+fn strip_bidi_controls(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !matches!(
+                *character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{206a}'..='\u{206f}'
+            )
+        })
+        .collect()
 }
 
 fn strip_terminal_control_sequences(value: &str) -> String {

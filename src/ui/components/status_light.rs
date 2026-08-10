@@ -5,6 +5,7 @@ use super::interaction::{
     MAX_ACCESSIBLE_DESCRIPTION_SCALARS, MAX_ACCESSIBLE_NAME_SCALARS,
 };
 use crate::ui::tokens::{Color, StatusMeaning, ThemeTokens};
+use gpui::{div, px, rgb, IntoElement, ParentElement, Styled};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusPresentation {
@@ -77,5 +78,29 @@ impl StatusLight {
             surface: semantic.background,
             foreground: semantic.foreground,
         }
+    }
+
+    /// Render the noninteractive semantic status surface used by production
+    /// status rows and by the native preview gallery.
+    pub fn element(&self, tokens: ThemeTokens) -> impl IntoElement {
+        let presentation = self.presentation(tokens);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(tokens.density.controls.icon_gap))
+            .px(px(tokens.density.controls.control_padding))
+            .py(px(tokens.density.spacing.xs))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(presentation.indicator.to_u32()))
+            .bg(rgb(presentation.surface.to_u32()))
+            .text_color(rgb(presentation.foreground.to_u32()))
+            .child(
+                div()
+                    .size(px(tokens.density.icons.xs))
+                    .rounded_full()
+                    .bg(rgb(presentation.indicator.to_u32())),
+            )
+            .child(self.label.clone())
     }
 }

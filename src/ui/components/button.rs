@@ -6,6 +6,7 @@ use super::interaction::{
     InteractionStateModel, InteractionTransition, KeyboardKey,
 };
 use crate::ui::tokens::ThemeTokens;
+use gpui::{div, px, rgb, IntoElement, ParentElement, Styled};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ButtonVariant {
@@ -142,6 +143,14 @@ impl Button {
         Ok(())
     }
 
+    pub(crate) fn set_pressed_for_preview(&mut self) {
+        let _ = self.interaction.transition(InteractionTransition::Press);
+    }
+
+    pub(crate) fn set_destructive_for_preview(&mut self) {
+        let _ = self.interaction.set_destructive(true);
+    }
+
     pub fn pointer_down(&mut self, pointer_id: u64, focus_epoch: FocusEpoch) -> bool {
         self.interaction.pointer_down(pointer_id, focus_epoch)
     }
@@ -183,6 +192,34 @@ impl Button {
 
     pub fn disabled(&self) -> bool {
         self.interaction.state().is_disabled()
+    }
+
+    /// Render the production button surface from the same interaction and
+    /// token presentation used by the shell.  Preview/gallery callers use
+    /// this element directly so visual evidence cannot drift into a hand-
+    /// styled `div` duplicate.
+    pub fn element(&self, tokens: ThemeTokens) -> impl IntoElement {
+        let presentation = self.presentation(tokens);
+        let mut element = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(tokens.density.spacing.xs))
+            .px(px(tokens.density.controls.control_padding))
+            .py(px(tokens.density.spacing.xs))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(presentation.border.to_u32()))
+            .bg(rgb(presentation.background.to_u32()))
+            .text_color(rgb(presentation.foreground.to_u32()))
+            .child(self.label.clone());
+        if let Some(focus_ring) = presentation.focus_ring {
+            element = element.border_color(rgb(focus_ring.color.to_u32()));
+        }
+        if !presentation.disabled {
+            element = element.cursor_pointer();
+        }
+        element
     }
 
     pub fn loading(&self) -> bool {

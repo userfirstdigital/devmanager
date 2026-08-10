@@ -12,6 +12,9 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::assets::AppAssets;
 use crate::client::action;
@@ -31,6 +34,7 @@ const PREVIEW_SENTINEL_RGB: u32 = ((PREVIEW_SENTINEL_RGBA[0] as u32) << 16)
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
 const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
+static PREVIEW_RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
 gpui::actions!(devmanager_next, [PreviewDismiss]);
 
@@ -67,7 +71,7 @@ const TASK_COCKPIT_ACTION_NAMES: [&str; 6] = [
     action::ACTION_TASK_RENAME,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewFixture {
     pub schema: String,
@@ -92,7 +96,7 @@ pub struct PreviewCaptureFixture {
     pub border: PreviewCaptureSetting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewRootFixture {
     pub kind: String,
@@ -125,9 +129,11 @@ pub enum GalleryState {
     Disabled,
     Loading,
     Destructive,
+    Selected,
+    Status,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentGallerySamples {
     pub long_text: String,
@@ -139,7 +145,7 @@ pub struct ComponentGallerySamples {
     pub overflow: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentGalleryFixture {
     pub themes: Vec<GalleryTheme>,
@@ -150,6 +156,27 @@ pub struct ComponentGalleryFixture {
 }
 
 impl ComponentGalleryFixture {
+    fn sanitize(&mut self) -> Result<(), String> {
+        for (name, value) in [
+            ("long_text", &mut self.samples.long_text),
+            ("unicode", &mut self.samples.unicode),
+            ("missing", &mut self.samples.missing),
+            ("error", &mut self.samples.error),
+            ("loading", &mut self.samples.loading),
+            ("empty", &mut self.samples.empty),
+            ("overflow", &mut self.samples.overflow),
+        ] {
+            *value = crate::ui::components::interaction::redacted_bounded_text(
+                "component gallery sample",
+                std::mem::take(value),
+                4096,
+                16384,
+            )
+            .map_err(|_| format!("component gallery sample {name} is empty or unsafe"))?;
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.themes.len() != 2
             || !self.themes.contains(&GalleryTheme::Dark)
@@ -176,6 +203,8 @@ impl ComponentGalleryFixture {
             GalleryState::Disabled,
             GalleryState::Loading,
             GalleryState::Destructive,
+            GalleryState::Selected,
+            GalleryState::Status,
         ];
         if self.states.len() != required_states.len()
             || required_states
@@ -217,7 +246,7 @@ impl ComponentGalleryFixture {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreviewPathPolicy {
     fixture_root: PathBuf,
     output_root: PathBuf,
@@ -239,10 +268,18 @@ impl PreviewPathPolicy {
 
     pub fn for_workspace(workspace_root: impl AsRef<Path>) -> Self {
         let workspace_root = workspace_root.as_ref();
+        let run_nonce = PREVIEW_RUN_NONCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
         Self::new(
             workspace_root.join("tests/fixtures/ui"),
             workspace_root.join(".devmanager-next/evidence/phase-05/screenshots"),
-            std::env::temp_dir().join("devmanager-next-preview"),
+            std::env::temp_dir().join(format!(
+                "devmanager-next-preview-{}-{timestamp}-{run_nonce}",
+                std::process::id()
+            )),
         )
     }
 
@@ -259,95 +296,22 @@ impl PreviewPathPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PreviewRequest {
     fixture_path: PathBuf,
     output_path: PathBuf,
-    trusted_output_root: PathBuf,
-    trusted_output_root_identity: RootIdentity,
+    trusted_output_authority: Arc<preview_capture::CaptureOutputAuthority>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RootIdentity {
-    #[cfg(windows)]
-    volume_serial: u32,
-    #[cfg(windows)]
-    file_index: u64,
-    #[cfg(not(windows))]
-    modified_nanos: u128,
-    #[cfg(not(windows))]
-    length: u64,
-}
-
-impl RootIdentity {
-    fn capture(path: &Path) -> Result<Self, PreviewError> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-            use windows::Win32::Foundation::HANDLE;
-            use windows::Win32::Storage::FileSystem::{
-                CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-            };
-
-            let wide: Vec<u16> = path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let handle = unsafe {
-                CreateFileW(
-                    windows::core::PCWSTR(wide.as_ptr()),
-                    FILE_GENERIC_READ.0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                    None,
-                )
-            }
-            .map_err(|error| PreviewError::FixtureIo {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-            let handle = unsafe { OwnedHandle::from_raw_handle(handle.0 as *mut std::ffi::c_void) };
-            let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            unsafe { GetFileInformationByHandle(HANDLE(handle.as_raw_handle()), &mut information) }
-                .map_err(|error| PreviewError::FixtureIo {
-                    path: path.to_path_buf(),
-                    message: error.to_string(),
-                })?;
-            Ok(Self {
-                volume_serial: information.dwVolumeSerialNumber,
-                file_index: (u64::from(information.nFileIndexHigh) << 32)
-                    | u64::from(information.nFileIndexLow),
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            let metadata = fs::metadata(path).map_err(|error| PreviewError::FixtureIo {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-            let modified_nanos = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            Ok(Self {
-                modified_nanos,
-                length: metadata.len(),
-            })
-        }
-    }
-
-    fn matches(self, path: &Path) -> bool {
-        Self::capture(path).is_ok_and(|current| current == self)
+impl PartialEq for PreviewRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.fixture_path == other.fixture_path
+            && self.output_path == other.output_path
+            && self.trusted_output_authority == other.trusted_output_authority
     }
 }
+
+impl Eq for PreviewRequest {}
 
 impl PreviewRequest {
     pub fn fixture_path(&self) -> &Path {
@@ -358,27 +322,24 @@ impl PreviewRequest {
         &self.output_path
     }
 
+    pub(crate) fn capture_authority(&self) -> &Arc<preview_capture::CaptureOutputAuthority> {
+        &self.trusted_output_authority
+    }
+
     pub fn write_bgra_png_atomic(
         &self,
         width: u32,
         height: u32,
         bgra: &[u8],
     ) -> Result<(), preview_capture::PreviewCaptureError> {
-        if !self
-            .trusted_output_root_identity
-            .matches(&self.trusted_output_root)
-        {
-            return Err(preview_capture::PreviewCaptureError::OutputFailed(
-                "trusted preview output root changed during validation".into(),
-            ));
-        }
-        preview_capture::encode_bgra_png_atomic_with_root(
-            &self.output_path,
-            &self.trusted_output_root,
+        let lease = preview_capture::CaptureGeneration::new().begin();
+        preview_capture::encode_bgra_png_atomic_with_authority(
+            Arc::clone(&self.trusted_output_authority),
             width,
             height,
             bgra,
             preview_capture::CaptureDeadline::from_now(preview_capture::FIRST_FRAME_DEADLINE),
+            &lease,
         )
     }
 
@@ -465,12 +426,25 @@ impl PreviewRequest {
             return Err(PreviewError::OutputAlreadyExists { path: output_path });
         }
 
-        let trusted_output_root_identity = RootIdentity::capture(&trusted_output_root)?;
+        let output_parent = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                PreviewError::InvalidArgument("output must have a parent directory".into())
+            })?;
+        fs::create_dir_all(output_parent).map_err(|error| PreviewError::OutputFailed {
+            reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+        })?;
+        reject_reparse_ancestors(output_parent, "output")?;
+        let trusted_output_authority =
+            preview_capture::CaptureOutputAuthority::new(&output_path, &trusted_output_root)
+                .map_err(|error| PreviewError::OutputFailed {
+                    reason: preview_capture::bounded_redacted_diagnostic(&error.to_string()),
+                })?;
         Ok(Self {
             fixture_path,
             output_path,
-            trusted_output_root,
-            trusted_output_root_identity,
+            trusted_output_authority: Arc::new(trusted_output_authority),
         })
     }
 }
@@ -512,7 +486,8 @@ where
                 })?));
             }
             other => {
-                return Err(PreviewError::Usage(format!("unknown argument: {other}")));
+                let _ = other;
+                return Err(PreviewError::Usage("unknown preview argument".to_string()));
             }
         }
     }
@@ -526,7 +501,7 @@ where
     PreviewRequest::validate(fixture, output, policy)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreviewResources {
     pub asset_paths: Vec<String>,
     pub font_families: Vec<String>,
@@ -547,7 +522,7 @@ impl PreviewResources {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreviewRootSnapshot {
     pub fixture_id: String,
     pub title: String,
@@ -572,7 +547,7 @@ pub enum PreviewOutputCapability {
     VisibleWindowsNativeCapture,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewOutputMetadata {
     pub schema: String,
@@ -584,7 +559,7 @@ pub struct PreviewOutputMetadata {
     pub host_started: bool,
 }
 
-#[derive(Debug)]
+// Debug/Display are intentionally opaque; this type owns validated paths and sample-bearing UI data.
 pub struct PreviewApplication {
     request: PreviewRequest,
     root_snapshot: PreviewRootSnapshot,
@@ -658,8 +633,15 @@ impl PreviewApplication {
                 });
             }
             ("component_gallery", Some(gallery)) => {
+                let mut gallery = gallery;
                 gallery
                     .validate()
+                    .map_err(|message| PreviewError::MalformedFixture {
+                        path: request.fixture_path.clone(),
+                        message,
+                    })?;
+                gallery
+                    .sanitize()
                     .map_err(|message| PreviewError::MalformedFixture {
                         path: request.fixture_path.clone(),
                         message,
@@ -808,7 +790,7 @@ pub(crate) fn register_preview_environment(cx: &mut gpui::App) {
     ]);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreviewRoot {
     snapshot: PreviewRootSnapshot,
 }
@@ -845,96 +827,218 @@ impl PreviewRoot {
 }
 
 fn render_component_gallery(gallery: &ComponentGalleryFixture) -> gpui::AnyElement {
-    // The fixture is validated before this method is reached.  These are the
-    // same native models used by the production shell; the preview only adds
-    // a small GPUI projection so WGC captures the actual token/component path.
-    let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
-    let button = Button::new_variant(
-        "Inspect task",
-        ButtonVariant::Primary,
-        action::ActionRequest::TaskList,
-    )
-    .expect("validated gallery button");
-    let button_style = button.presentation(tokens);
-    let icon_button = IconButton::new(
+    // This projection deliberately calls the production component elements;
+    // no gallery-only hand-styled controls are allowed to hide state drift.
+    let mut surface =
+        div()
+            .mt(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(div().text_sm().child(format!(
+                "Component gallery · {} themes · {} densities · {} scales",
+                gallery.themes.len(),
+                gallery.densities.len(),
+                gallery.scales.len()
+            )));
+
+    for &gallery_theme in &gallery.themes {
+        for &gallery_density in &gallery.densities {
+            for &percent in &gallery.scales {
+                let Some(scale) = gallery_scale(percent) else {
+                    continue;
+                };
+                let tokens = theme(
+                    match gallery_theme {
+                        GalleryTheme::Dark => ThemeMode::Dark,
+                        GalleryTheme::Light => ThemeMode::Light,
+                    },
+                    match gallery_density {
+                        GalleryDensity::Compact => Density::Compact,
+                        GalleryDensity::Comfortable => Density::Comfortable,
+                    },
+                    scale,
+                );
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.xs))
+                    .child(div().text_xs().child(format!(
+                        "{} / {} / {}%",
+                        gallery_theme_name(gallery_theme),
+                        gallery_density_name(gallery_density),
+                        percent
+                    )));
+                for &state in &gallery.states {
+                    if state == GalleryState::Status {
+                        for meaning in [
+                            StatusMeaning::External,
+                            StatusMeaning::Attention,
+                            StatusMeaning::Success,
+                            StatusMeaning::Warning,
+                            StatusMeaning::Destructive,
+                            StatusMeaning::Inactive,
+                        ] {
+                            row = row.child(render_gallery_status(tokens, meaning));
+                        }
+                    } else {
+                        row = row
+                            .child(render_gallery_button(tokens, state))
+                            .child(render_gallery_icon_button(tokens, state));
+                    }
+                }
+                surface = surface.child(row);
+            }
+        }
+    }
+
+    let sample_rows = [
+        ("unicode", gallery.samples.unicode.clone()),
+        ("long text", gallery.samples.long_text.clone()),
+        ("missing", gallery.samples.missing.clone()),
+        ("error", gallery.samples.error.clone()),
+        ("loading", gallery.samples.loading.clone()),
+        ("empty", gallery.samples.empty.clone()),
+        ("overflow", gallery.samples.overflow.clone()),
+    ];
+    for (name, sample) in sample_rows {
+        surface = surface.child(
+            div()
+                .flex()
+                .gap(px(4.0))
+                .child(div().text_xs().child(format!("{name}:")))
+                .child(div().text_xs().child(sample)),
+        );
+    }
+    surface.into_any_element()
+}
+
+fn gallery_scale(percent: u16) -> Option<Scale> {
+    match percent {
+        100 => Some(Scale::Scale100),
+        125 => Some(Scale::Scale125),
+        150 => Some(Scale::Scale150),
+        200 => Some(Scale::Scale200),
+        _ => None,
+    }
+}
+
+fn gallery_theme_name(theme: GalleryTheme) -> &'static str {
+    match theme {
+        GalleryTheme::Dark => "dark",
+        GalleryTheme::Light => "light",
+    }
+}
+
+fn gallery_density_name(density: GalleryDensity) -> &'static str {
+    match density {
+        GalleryDensity::Compact => "compact",
+        GalleryDensity::Comfortable => "comfortable",
+    }
+}
+
+fn render_gallery_button(
+    tokens: crate::ui::tokens::ThemeTokens,
+    state: GalleryState,
+) -> gpui::AnyElement {
+    let variant = if state == GalleryState::Destructive {
+        ButtonVariant::Destructive
+    } else {
+        ButtonVariant::Primary
+    };
+    let mut button = Button::new_variant("Inspect task", variant, action::ActionRequest::TaskList)
+        .expect("validated gallery button");
+    match state {
+        GalleryState::Hover => {
+            let _ = button.set_hovered(true);
+        }
+        GalleryState::Pressed | GalleryState::Selected => button.set_pressed_for_preview(),
+        GalleryState::Focused => {
+            let _ = button.focus();
+        }
+        GalleryState::Disabled => {
+            let _ = button.disable("Disabled for gallery coverage");
+        }
+        GalleryState::Loading => {
+            let _ = button.set_loading(true);
+        }
+        GalleryState::Destructive => button.set_destructive_for_preview(),
+        GalleryState::Default | GalleryState::Status => {}
+    }
+    debug_assert!(!button.accessibility().name().is_empty());
+    button.element(tokens).into_any_element()
+}
+
+fn render_gallery_icon_button(
+    tokens: crate::ui::tokens::ThemeTokens,
+    state: GalleryState,
+) -> gpui::AnyElement {
+    let mut icon_button = IconButton::new(
         IconId::Sparkles,
         "Open provider",
         TooltipContract::new("Open provider", 500).expect("validated gallery tooltip"),
         action::ActionRequest::TaskList,
     )
     .expect("validated gallery icon button");
-    let icon_style = icon_button.presentation(tokens);
-    let status = StatusLight::new(
-        StatusMeaning::Success,
-        "Worker ready",
-        "The worker is ready for a task",
-    )
-    .expect("validated gallery status light");
-    let status_style = status.presentation(tokens);
-    let sample = gallery.samples.unicode.clone();
-
-    div()
-        .mt(px(12.0))
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(
-            div()
-                .text_sm()
-                .text_color(gpui::rgb(tokens.text.secondary.to_u32()))
-                .child(format!(
-                    "Component gallery · {} themes · {} states",
-                    gallery.themes.len(),
-                    gallery.states.len()
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .border_1()
-                        .border_color(gpui::rgb(button_style.border.to_u32()))
-                        .bg(gpui::rgb(button_style.background.to_u32()))
-                        .text_color(gpui::rgb(button_style.foreground.to_u32()))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .child(button.label().to_string()),
-                )
-                .child(
-                    div()
-                        .border_1()
-                        .border_color(gpui::rgb(icon_style.border.to_u32()))
-                        .bg(gpui::rgb(icon_style.background.to_u32()))
-                        .text_color(gpui::rgb(icon_style.foreground.to_u32()))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .child(format!(
-                            "{} {}",
-                            icon_button.icon().as_str(),
-                            icon_button.tooltip().label
-                        )),
-                )
-                .child(
-                    div()
-                        .border_1()
-                        .border_color(gpui::rgb(status_style.indicator.to_u32()))
-                        .bg(gpui::rgb(status_style.surface.to_u32()))
-                        .text_color(gpui::rgb(status_style.foreground.to_u32()))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .child(status.label().to_string()),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(gpui::rgb(tokens.text.muted.to_u32()))
-                .child(sample),
-        )
-        .into_any_element()
+    match state {
+        GalleryState::Hover => {
+            let _ = icon_button.set_hovered_for_preview(true);
+        }
+        GalleryState::Pressed | GalleryState::Selected => icon_button.set_pressed_for_preview(),
+        GalleryState::Focused => {
+            let _ = icon_button.focus();
+        }
+        GalleryState::Disabled => {
+            let _ = icon_button.disable("Disabled for gallery coverage");
+        }
+        GalleryState::Loading => {
+            let _ = icon_button.set_loading(true);
+        }
+        GalleryState::Default | GalleryState::Destructive | GalleryState::Status => {}
+    }
+    debug_assert!(!icon_button.accessibility().name().is_empty());
+    debug_assert!(!icon_button.tooltip().label.is_empty());
+    icon_button.element(tokens).into_any_element()
 }
+
+fn render_gallery_status(
+    tokens: crate::ui::tokens::ThemeTokens,
+    meaning: StatusMeaning,
+) -> gpui::AnyElement {
+    let status = StatusLight::new(meaning, "Worker status", "Semantic worker status")
+        .expect("validated gallery status");
+    debug_assert!(!status.accessibility().name().is_empty());
+    debug_assert!(!status.description().is_empty());
+    status.element(tokens).into_any_element()
+}
+
+macro_rules! opaque_preview_format {
+    ($type:ty, $label:literal) => {
+        impl std::fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str($label)
+            }
+        }
+
+        impl Display for $type {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str($label)
+            }
+        }
+    };
+}
+
+opaque_preview_format!(PreviewFixture, "PreviewFixture(<opaque>)");
+opaque_preview_format!(PreviewRootFixture, "PreviewRootFixture(<opaque>)");
+opaque_preview_format!(ComponentGallerySamples, "ComponentGallerySamples(<opaque>)");
+opaque_preview_format!(ComponentGalleryFixture, "ComponentGalleryFixture(<opaque>)");
+opaque_preview_format!(PreviewPathPolicy, "PreviewPathPolicy(<opaque>)");
+opaque_preview_format!(PreviewRequest, "PreviewRequest(<opaque>)");
+opaque_preview_format!(PreviewResources, "PreviewResources(<opaque>)");
+opaque_preview_format!(PreviewRootSnapshot, "PreviewRootSnapshot(<opaque>)");
+opaque_preview_format!(PreviewOutputMetadata, "PreviewOutputMetadata(<opaque>)");
+opaque_preview_format!(PreviewApplication, "PreviewApplication(<opaque>)");
+opaque_preview_format!(PreviewRoot, "PreviewRoot(<opaque>)");
 
 impl Render for PreviewRoot {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -1129,11 +1233,8 @@ fn is_sensitive_path(path: &Path) -> bool {
 }
 
 fn safe_preview_path(path: &Path) -> String {
-    let label = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "<path>".into());
-    preview_capture::bounded_redacted_diagnostic(&label)
+    let _ = path;
+    "<approved preview path>".to_string()
 }
 
 fn bounded_preview_error(message: String) -> String {
@@ -1362,18 +1463,17 @@ impl Display for PreviewError {
                 max_bytes,
                 safe_preview_path(path)
             ))),
-            Self::FixtureIo { path, message } => f.write_str(&bounded_preview_error(format!(
-                "fixture I/O failed for {}: {message}",
-                safe_preview_path(path)
-            ))),
-            Self::MalformedFixture { path, message } => f.write_str(&bounded_preview_error(
-                format!("malformed fixture {}: {message}", safe_preview_path(path)),
-            )),
+            Self::FixtureIo { path, message } => {
+                let _ = (path, message);
+                f.write_str("fixture I/O failed")
+            }
+            Self::MalformedFixture { path, message } => {
+                let _ = (path, message);
+                f.write_str("malformed preview fixture")
+            }
             Self::UnsupportedSchema { path, schema } => {
-                f.write_str(&bounded_preview_error(format!(
-                    "unsupported fixture schema {schema} in {}",
-                    safe_preview_path(path)
-                )))
+                let _ = (path, schema);
+                f.write_str("unsupported fixture schema")
             }
             Self::OutputAlreadyExists { path } => f.write_str(&bounded_preview_error(format!(
                 "refusing to overwrite existing output: {}",

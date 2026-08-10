@@ -56,6 +56,188 @@ fn valid_request(policy: &PreviewPathPolicy, name: &str) -> PreviewRequest {
     .expect("valid preview request")
 }
 
+#[test]
+fn native_publication_has_no_path_based_fallback_or_re_resolved_rename() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        !source.contains("MoveFileExW"),
+        "publication must fail closed when handle-relative rename is unavailable"
+    );
+    assert!(
+        source.contains("RootDirectory"),
+        "Windows publication must remain parent-handle-relative"
+    );
+    assert!(
+        source.contains("FILE_FLAG_OPEN_REPARSE_POINT"),
+        "authority handles must be opened without following reparse points"
+    );
+}
+
+#[test]
+fn capture_stages_use_a_fixed_executor_and_retain_no_detached_reaper_list() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        !source.contains("CLEANUP_REAPERS"),
+        "late work must stay owned by the bounded executor"
+    );
+    assert!(
+        source.contains("CAPTURE_EXECUTOR_WORKERS"),
+        "capture stages must share a fixed worker bound"
+    );
+    assert!(
+        !source.contains("devmanager-capture-start"),
+        "capture startup must not allocate one thread per stage"
+    );
+    assert!(
+        !source.contains("devmanager-preview-application"),
+        "the visible application must not be a detached per-request worker"
+    );
+}
+
+#[test]
+fn generation_publication_is_serialized_with_final_file_mutation_and_result_commit() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        source.contains("publication_lock") || source.contains("publication: Mutex"),
+        "rename, result CAS, and cancellation need one serialized publication lock"
+    );
+    assert!(
+        source.contains("publish_capture") || source.contains("publish_with"),
+        "capture needs an explicit atomic publication seam for race tests"
+    );
+    assert!(
+        source.contains("store_capture_result_after_commit"),
+        "result CAS must happen inside the final publication boundary"
+    );
+}
+
+#[test]
+fn capture_and_preview_debug_output_is_opaque() {
+    let (_root, policy) = temporary_policy();
+    let request = valid_request(&policy, "opaque.png");
+    let request_debug = format!("{request:?}");
+    assert!(!request_debug.contains(policy.fixture_root().to_string_lossy().as_ref()));
+    assert!(!request_debug.contains(policy.output_root().to_string_lossy().as_ref()));
+
+    let hwnd_debug = format!(
+        "{:?}",
+        devmanager::ui::preview_capture::NativeHwnd(0x1234_isize)
+    );
+    assert!(!hwnd_debug.contains("1234"));
+}
+
+#[test]
+fn gallery_samples_are_sanitized_before_the_gpui_projection_boundary() {
+    const SECRET: &str = "UI_GALLERY_CAPTURE_SECRET_SENTINEL";
+    let (_root, policy) = temporary_policy();
+    let fixture_path = policy.fixture_root().join("unsafe-gallery.json");
+    let fixture = format!(
+        r#"{{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "unsafe-gallery",
+  "title": "Gallery",
+  "capture": {{ "cursor": "excluded", "border": "excluded" }},
+  "root": {{
+    "kind": "component_gallery",
+    "label": "Gallery",
+    "gallery": {{
+      "themes": ["dark", "light"],
+      "densities": ["compact", "comfortable"],
+      "scales": [100, 125, 150, 200],
+      "states": ["default", "hover", "pressed", "focused", "disabled", "loading", "destructive", "selected", "status"],
+      "samples": {{
+        "long_text": "{long}",
+        "unicode": "界面\u202ecredential: {secret} C:\\\\Users\\\\micro\\\\secret.txt /var/tmp/preview-secret",
+        "missing": "missing C:\\\\Users\\\\micro\\\\secret.txt /var/tmp/preview-secret",
+        "error": "api_key={secret}",
+        "loading": "loading",
+        "empty": "empty",
+        "overflow": "overflow"
+      }}
+    }}
+  }}
+}}"#,
+        long = "long text ".repeat(40),
+        secret = SECRET,
+    );
+    fs::write(&fixture_path, fixture).expect("unsafe gallery fixture");
+    let request = PreviewRequest::validate(
+        &fixture_path,
+        policy.output_root().join("unsafe-gallery.png"),
+        &policy,
+    )
+    .expect("fixture request");
+    let preview = PreviewApplication::load(request, &policy).expect("gallery load");
+    let gallery = preview.component_gallery().expect("gallery projection");
+    for sample in [
+        &gallery.samples.long_text,
+        &gallery.samples.unicode,
+        &gallery.samples.missing,
+        &gallery.samples.error,
+        &gallery.samples.loading,
+        &gallery.samples.empty,
+        &gallery.samples.overflow,
+    ] {
+        assert!(!sample.contains(SECRET));
+        assert!(!sample.contains('\u{202e}'));
+        assert!(!sample.contains('\u{1b}'));
+        assert!(!sample.contains("secret.txt"));
+        assert!(!sample.contains("/var/tmp"));
+    }
+}
+
+#[test]
+fn gallery_projection_invokes_shared_component_renderers_and_typed_icon_handles() {
+    let preview_source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    assert!(
+        preview_source.contains("button.element(") || preview_source.contains("button.render(")
+    );
+    assert!(
+        preview_source.contains("icon_button.element(")
+            || preview_source.contains("icon_button.render(")
+    );
+    assert!(
+        preview_source.contains("status.element(") || preview_source.contains("status.render(")
+    );
+
+    let icon_source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/components/icon_button.rs"),
+    )
+    .expect("icon button source");
+    assert!(!icon_source.contains("enum IconId"));
+    assert!(icon_source.contains("struct IconId"));
+}
+
+#[test]
+fn workspace_preview_temp_roots_are_process_run_unique() {
+    let first = PreviewPathPolicy::for_workspace(env!("CARGO_MANIFEST_DIR"));
+    let second = PreviewPathPolicy::for_workspace(env!("CARGO_MANIFEST_DIR"));
+    assert_ne!(
+        first.temp_root(),
+        second.temp_root(),
+        "independent preview runs must not share a mutable temporary root"
+    );
+    assert!(
+        first
+            .temp_root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("devmanager-next-preview-")),
+        "the temporary root must be scoped to this process/run"
+    );
+}
+
 #[cfg(windows)]
 fn create_directory_junction(target: &std::path::Path, link: &std::path::Path) {
     let link = link.to_string_lossy().replace('/', "\\");
@@ -445,6 +627,28 @@ fn trusted_output_root_identity_blocks_a_junction_swap_after_validation() {
 
     remove_directory_junction(&original_root);
     fs::rename(&moved_root, &original_root).expect("restore trusted output root");
+}
+
+#[cfg(windows)]
+#[test]
+fn trusted_output_parent_identity_blocks_regular_directory_substitution() {
+    let (_root, policy) = temporary_policy();
+    let parent = policy.output_root().join("nested");
+    fs::create_dir_all(&parent).expect("nested output parent");
+    let request = valid_request(&policy, "nested/substitution.png");
+    let moved_parent = policy.output_root().join("nested-before-substitution");
+    fs::rename(&parent, &moved_parent).expect("move trusted output parent");
+    fs::create_dir(&parent).expect("replace trusted output parent");
+
+    let result = request.write_bgra_png_atomic(1, 1, &[0x1e, 0x14, 0x0a, 0xff]);
+    assert!(matches!(
+        result,
+        Err(PreviewCaptureError::OutputFailed(message))
+            if message.contains("trusted preview output parent changed")
+    ));
+
+    fs::remove_dir(&parent).expect("remove substituted output parent");
+    fs::rename(&moved_parent, &parent).expect("restore trusted output parent");
 }
 
 #[test]
