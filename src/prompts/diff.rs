@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,11 +45,11 @@ pub struct PromptDiff<'a> {
 }
 
 impl<'a> PromptDiff<'a> {
-    pub fn old_body(&self) -> &'a str {
+    pub(crate) fn old_body(&self) -> &'a str {
         self.old_body
     }
 
-    pub fn new_body(&self) -> &'a str {
+    pub(crate) fn new_body(&self) -> &'a str {
         self.new_body
     }
 
@@ -111,11 +112,41 @@ pub enum LineHunkKind {
 /// old/new body, not to a normalized comparison buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineChange {
-    pub kind: LineChangeKind,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
-    pub text: String,
-    pub terminated: bool,
+    kind: LineChangeKind,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    text: String,
+    terminated: bool,
+}
+
+impl LineChange {
+    pub fn kind(&self) -> LineChangeKind {
+        self.kind
+    }
+
+    pub fn old_line(&self) -> Option<usize> {
+        self.old_line
+    }
+
+    pub fn new_line(&self) -> Option<usize> {
+        self.new_line
+    }
+
+    pub fn terminated(&self) -> bool {
+        self.terminated
+    }
+
+    pub fn text_bytes(&self) -> usize {
+        self.text.len()
+    }
+
+    pub fn text_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.text.as_bytes()).into()
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// The side represented by a line change.
@@ -131,12 +162,46 @@ pub enum LineChangeKind {
 /// text is copied from the original side and therefore remains valid UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineSpan {
-    pub kind: InlineSpanKind,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
-    pub old_range: Option<UnicodeRange>,
-    pub new_range: Option<UnicodeRange>,
-    pub text: String,
+    kind: InlineSpanKind,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    old_range: Option<UnicodeRange>,
+    new_range: Option<UnicodeRange>,
+    text: String,
+}
+
+impl InlineSpan {
+    pub fn kind(&self) -> InlineSpanKind {
+        self.kind
+    }
+
+    pub fn old_line(&self) -> Option<usize> {
+        self.old_line
+    }
+
+    pub fn new_line(&self) -> Option<usize> {
+        self.new_line
+    }
+
+    pub fn old_range(&self) -> Option<UnicodeRange> {
+        self.old_range
+    }
+
+    pub fn new_range(&self) -> Option<UnicodeRange> {
+        self.new_range
+    }
+
+    pub fn text_bytes(&self) -> usize {
+        self.text.len()
+    }
+
+    pub fn text_sha256(&self) -> [u8; 32] {
+        Sha256::digest(self.text.as_bytes()).into()
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// The side represented by an inline span.
@@ -199,6 +264,10 @@ pub enum DiffStatus {
 pub struct DiffCacheKey {
     old_body_sha256: [u8; 32],
     new_body_sha256: [u8; 32],
+    algorithm_version: u16,
+    projection_version: u16,
+    normalization: DiffNormalizationPolicy,
+    options_fingerprint: u64,
 }
 
 impl DiffCacheKey {
@@ -209,6 +278,156 @@ impl DiffCacheKey {
     pub fn new_body_sha256(&self) -> [u8; 32] {
         self.new_body_sha256
     }
+
+    pub fn algorithm_version(&self) -> u16 {
+        self.algorithm_version
+    }
+
+    pub fn projection_version(&self) -> u16 {
+        self.projection_version
+    }
+
+    pub fn normalization(&self) -> DiffNormalizationPolicy {
+        self.normalization
+    }
+
+    pub fn options_fingerprint(&self) -> u64 {
+        self.options_fingerprint
+    }
+}
+
+/// The comparison normalization policy is part of the cache key. CRLF is
+/// folded only while finding lines; Unicode scalar sequences remain exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DiffNormalizationPolicy {
+    CrLfOnlyUnicodeExact,
+}
+
+pub const PROMPT_DIFF_ALGORITHM_VERSION: u16 = 1;
+pub const PROMPT_DIFF_PUBLIC_PROJECTION_VERSION: u16 = 2;
+pub const PROMPT_DIFF_NORMALIZATION_POLICY: DiffNormalizationPolicy =
+    DiffNormalizationPolicy::CrLfOnlyUnicodeExact;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiffOptions {
+    work_limit: Option<usize>,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            work_limit: Some(DEFAULT_DIFF_WORK_UNITS),
+        }
+    }
+}
+
+impl DiffOptions {
+    pub fn with_work_limit(mut self, work_limit: usize) -> Self {
+        self.work_limit = Some(work_limit);
+        self
+    }
+
+    pub fn fingerprint(self) -> u64 {
+        let mut bytes = Vec::with_capacity(9);
+        match self.work_limit {
+            Some(limit) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(limit as u64).to_le_bytes());
+            }
+            None => bytes.push(0),
+        }
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        u64::from_le_bytes(
+            digest[..8]
+                .try_into()
+                .expect("digest prefix is eight bytes"),
+        )
+    }
+}
+
+struct CachedDiff {
+    key: DiffCacheKey,
+    bytes: Vec<u8>,
+}
+
+/// Owned, bounded cache of complete public diff projections. It never stores
+/// source bodies and never publishes cancelled, approximate, or truncated
+/// results.
+pub struct PromptDiffCache {
+    max_items: usize,
+    max_bytes: usize,
+    bytes: usize,
+    entries: VecDeque<CachedDiff>,
+}
+
+impl PromptDiffCache {
+    pub fn new(max_items: usize, max_bytes: usize) -> Self {
+        Self {
+            max_items,
+            max_bytes,
+            bytes: 0,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn get(&mut self, key: DiffCacheKey) -> Option<Vec<u8>> {
+        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        let entry = self.entries.remove(index)?;
+        self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+        let bytes = entry.bytes.clone();
+        self.bytes = self.bytes.saturating_add(entry.bytes.len());
+        self.entries.push_front(entry);
+        Some(bytes)
+    }
+
+    pub fn publish(&mut self, diff: &PromptDiff<'_>, cancellation: Option<&AtomicBool>) -> bool {
+        if self.max_items == 0
+            || self.max_bytes == 0
+            || diff.status != DiffStatus::Complete
+            || is_cancelled(cancellation)
+        {
+            return false;
+        }
+        let Some(key) = diff.cache_key() else {
+            return false;
+        };
+        let Ok(bytes) = encode_public_diff(diff) else {
+            return false;
+        };
+        if is_cancelled(cancellation) || bytes.len() > self.max_bytes {
+            return false;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            if let Some(entry) = self.entries.remove(index) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+            }
+        }
+        if is_cancelled(cancellation) {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        self.entries.push_front(CachedDiff { key, bytes });
+        while self.entries.len() > self.max_items || self.bytes > self.max_bytes {
+            if let Some(entry) = self.entries.pop_back() {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+            } else {
+                break;
+            }
+        }
+        true
+    }
+}
+
+fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
+    cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
 /// A failure to encode the canonical public diff projection within its wire
@@ -250,6 +469,7 @@ pub struct DiffBudget<'a> {
     work_limit: Option<usize>,
     work_used: usize,
     cancel_after_work: Option<usize>,
+    options: DiffOptions,
 }
 
 impl Default for DiffBudget<'_> {
@@ -260,6 +480,7 @@ impl Default for DiffBudget<'_> {
             work_limit: Some(DEFAULT_DIFF_WORK_UNITS),
             work_used: 0,
             cancel_after_work: None,
+            options: DiffOptions::default(),
         }
     }
 }
@@ -283,6 +504,7 @@ impl<'a> DiffBudget<'a> {
     /// Set a deterministic cost ceiling for the comparison phases.
     pub fn with_work_limit(mut self, work_limit: usize) -> Self {
         self.work_limit = Some(work_limit);
+        self.options = self.options.with_work_limit(work_limit);
         self
     }
 
@@ -373,6 +595,7 @@ pub fn diff_versions_with_budget<'a>(
     if budget.cancellation_or_deadline() {
         return empty_result(old, new, DiffStatus::Cancelled);
     }
+    let options_fingerprint = budget.options.fingerprint();
 
     let old_body_sha256 = match hash_with_budget(old, &mut budget) {
         Ok(hash) => hash,
@@ -398,6 +621,10 @@ pub fn diff_versions_with_budget<'a>(
     let cache_key = DiffCacheKey {
         old_body_sha256,
         new_body_sha256,
+        algorithm_version: PROMPT_DIFF_ALGORITHM_VERSION,
+        projection_version: PROMPT_DIFF_PUBLIC_PROJECTION_VERSION,
+        normalization: PROMPT_DIFF_NORMALIZATION_POLICY,
+        options_fingerprint,
     };
     let mut result = PromptDiff {
         old_body: old,
@@ -567,7 +794,8 @@ pub fn encode_public_diff(diff: &PromptDiff<'_>) -> Result<Vec<u8>, PromptDiffEn
                     "kind": format!("{:?}", change.kind),
                     "old_line": change.old_line,
                     "new_line": change.new_line,
-                    "text": change.text,
+                    "text_bytes": change.text.len(),
+                    "text_sha256": change.text_sha256(),
                     "terminated": change.terminated,
                 })).collect::<Vec<_>>(),
             })
@@ -589,7 +817,8 @@ pub fn encode_public_diff(diff: &PromptDiff<'_>) -> Result<Vec<u8>, PromptDiffEn
                     "start": range.start,
                     "end": range.end,
                 })),
-                "text": span.text,
+                "text_bytes": span.text.len(),
+                "text_sha256": span.text_sha256(),
             })
         })
         .collect();
@@ -597,6 +826,10 @@ pub fn encode_public_diff(diff: &PromptDiff<'_>) -> Result<Vec<u8>, PromptDiffEn
         serde_json::json!({
             "old_body_sha256": key.old_body_sha256,
             "new_body_sha256": key.new_body_sha256,
+            "algorithm_version": key.algorithm_version,
+            "projection_version": key.projection_version,
+            "normalization": format!("{:?}", key.normalization),
+            "options_fingerprint": key.options_fingerprint,
         })
     });
 
@@ -827,7 +1060,7 @@ fn append_line_changes<'a>(
         budget
             .observe_cancellation()
             .map_err(|_| PhaseStop::Cancelled)?;
-        if !output.reserve_line(old_lines[index].text) {
+        if !output.reserve_line() {
             return Err(PhaseStop::OutputLimit);
         }
         result.hunks[hunk_index].changes.push(LineChange {
@@ -842,7 +1075,7 @@ fn append_line_changes<'a>(
         budget
             .observe_cancellation()
             .map_err(|_| PhaseStop::Cancelled)?;
-        if !output.reserve_line(new_lines[index].text) {
+        if !output.reserve_line() {
             return Err(PhaseStop::OutputLimit);
         }
         result.hunks[hunk_index].changes.push(LineChange {
@@ -1071,7 +1304,7 @@ fn append_inline_span(
     budget
         .observe_cancellation()
         .map_err(|_| PhaseStop::Cancelled)?;
-    if !output.reserve_span(text) {
+    if !output.reserve_span() {
         return Err(PhaseStop::OutputLimit);
     }
     result.inline_spans.push(InlineSpan {
@@ -1225,16 +1458,16 @@ impl OutputBudget {
         self.reserve_bytes(1usize.saturating_add(json_hunk_bytes()))
     }
 
-    fn reserve_line(&mut self, text: &str) -> bool {
-        self.reserve_bytes(1usize.saturating_add(json_line_change_bytes(text)))
+    fn reserve_line(&mut self) -> bool {
+        self.reserve_bytes(1usize.saturating_add(json_line_change_bytes()))
     }
 
-    fn reserve_span(&mut self, text: &str) -> bool {
+    fn reserve_span(&mut self) -> bool {
         if self.spans >= MAX_PROMPT_DIFF_INLINE_SPANS {
             self.reason = Some(TruncationReason::InlineSpanLimit);
             return false;
         }
-        if !self.reserve_bytes(1usize.saturating_add(json_inline_span_bytes(text))) {
+        if !self.reserve_bytes(1usize.saturating_add(json_inline_span_bytes())) {
             return false;
         }
         self.spans += 1;
@@ -1351,6 +1584,10 @@ fn base_payload_bytes() -> usize {
             json_object_bytes(&[
                 json_field_bytes("old_body_sha256", json_hash_bytes()),
                 json_field_bytes("new_body_sha256", json_hash_bytes()),
+                json_field_bytes("algorithm_version", MAX_JSON_NUMBER_BYTES),
+                json_field_bytes("projection_version", MAX_JSON_NUMBER_BYTES),
+                json_field_bytes("normalization", json_string_bytes("CrLfOnlyUnicodeExact")),
+                json_field_bytes("options_fingerprint", MAX_JSON_NUMBER_BYTES),
             ]),
         ),
         json_field_bytes("hunks", json_array_bytes(&[])),
@@ -1372,23 +1609,25 @@ fn json_hunk_bytes() -> usize {
     ])
 }
 
-fn json_line_change_bytes(text: &str) -> usize {
+fn json_line_change_bytes() -> usize {
     json_object_bytes(&[
         json_field_bytes("kind", json_string_bytes("Removed")),
         json_field_bytes("old_line", MAX_JSON_NUMBER_BYTES),
         json_field_bytes("new_line", MAX_JSON_NUMBER_BYTES),
-        json_field_bytes("text", json_string_bytes(text)),
+        json_field_bytes("text_bytes", MAX_JSON_NUMBER_BYTES),
+        json_field_bytes("text_sha256", json_hash_bytes()),
         json_field_bytes("terminated", 5),
     ])
 }
 
-fn json_inline_span_bytes(text: &str) -> usize {
+fn json_inline_span_bytes() -> usize {
     json_object_bytes(&[
         json_field_bytes("kind", json_string_bytes("Removed")),
         json_field_bytes("old_line", MAX_JSON_NUMBER_BYTES),
         json_field_bytes("new_line", MAX_JSON_NUMBER_BYTES),
         json_field_bytes("old_range", json_range_bytes()),
         json_field_bytes("new_range", json_range_bytes()),
-        json_field_bytes("text", json_string_bytes(text)),
+        json_field_bytes("text_bytes", MAX_JSON_NUMBER_BYTES),
+        json_field_bytes("text_sha256", json_hash_bytes()),
     ])
 }
