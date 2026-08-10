@@ -47,14 +47,38 @@ fn native_fixture(root: &Path, name: &str, marker: &[u8]) -> PathBuf {
 }
 
 fn replace_with_native_fixture(path: &Path, marker: &[u8]) {
-    let replacement = path.with_extension("replacement");
-    native_fixture(
-        path.parent().expect("fixture parent"),
-        replacement.file_name().unwrap().to_str().unwrap(),
-        marker,
-    );
-    fs::remove_file(path).expect("remove replaced path");
-    fs::rename(replacement, path).expect("install replacement executable");
+    #[cfg(windows)]
+    {
+        // The production identity handle intentionally denies delete/rename
+        // sharing. Mutate the same test file instead so the identity/hash
+        // revalidation fence is exercised without weakening that lock.
+        fs::copy(
+            std::env::current_exe().expect("current test executable"),
+            path,
+        )
+        .expect("overwrite replaced fixture");
+        if !marker.is_empty() {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("open overwritten fixture")
+                .write_all(marker)
+                .expect("append replacement marker");
+        }
+        return;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let replacement = path.with_extension("replacement");
+        native_fixture(
+            path.parent().expect("fixture parent"),
+            replacement.file_name().unwrap().to_str().unwrap(),
+            marker,
+        );
+        fs::remove_file(path).expect("remove replaced path");
+        fs::rename(replacement, path).expect("install replacement executable");
+    }
 }
 
 fn file_hash(path: &Path) -> [u8; 32] {
@@ -428,6 +452,176 @@ fn discovery_accepts_only_the_controlled_runnable_windows_shim_contract() {
             arbitrary
         ))
         .is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn discovery_attests_stock_windows_provider_wrappers_and_keeps_path_order() {
+    let temp = tempdir().unwrap();
+
+    // Claude's npm wrapper targets the nested native executable rather than
+    // the wrapper itself.  This is the shape installed by the stock package.
+    let claude_root = temp.path().join("claude");
+    let claude_target = claude_root
+        .join("node_modules")
+        .join("@anthropic-ai")
+        .join("claude-code")
+        .join("bin");
+    fs::create_dir_all(&claude_target).unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        claude_target.join("claude.exe"),
+    )
+    .unwrap();
+    fs::write(
+        claude_root.join("claude.cmd"),
+        r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe" %*
+"#,
+    )
+    .unwrap();
+    let claude_snapshot =
+        ProviderPathSnapshot::capture(&std::env::join_paths([claude_root.as_os_str()]).unwrap())
+            .unwrap();
+    let claude = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .resolve_from_path_snapshot(&claude_snapshot)
+        .unwrap();
+    assert!(matches!(
+        claude.form(),
+        ProviderExecutableForm::WindowsShim { .. }
+    ));
+    claude.open_for_launch().unwrap().revalidate().unwrap();
+
+    // Codex's npm wrapper is a Node entry graph.  The interpreter is chosen
+    // from the same trusted PATH snapshot, with the sibling node.exe winning
+    // deterministically over later shadowing directories.
+    let codex_root = temp.path().join("node_modules").join(".bin");
+    let codex_script = temp
+        .path()
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("bin");
+    fs::create_dir_all(&codex_root).unwrap();
+    fs::create_dir_all(&codex_script).unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        codex_root.join("node.exe"),
+    )
+    .unwrap();
+    fs::write(codex_script.join("codex.js"), b"module.exports = {};\n").unwrap();
+    fs::write(
+        codex_root.join("codex.cmd"),
+        r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\..\@openai\codex\bin\codex.js" %*
+"#,
+    )
+    .unwrap();
+    let shadow_root = temp.path().join("shadow").join("node_modules").join(".bin");
+    let shadow_script = temp
+        .path()
+        .join("shadow")
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("bin");
+    fs::create_dir_all(&shadow_root).unwrap();
+    fs::create_dir_all(&shadow_script).unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        shadow_root.join("node.exe"),
+    )
+    .unwrap();
+    fs::copy(codex_root.join("codex.cmd"), shadow_root.join("codex.cmd")).unwrap();
+    fs::write(shadow_script.join("codex.js"), b"module.exports = {};\n").unwrap();
+    let codex_path =
+        std::env::join_paths([codex_root.as_os_str(), shadow_root.as_os_str()]).unwrap();
+    let codex_snapshot = ProviderPathSnapshot::capture(&codex_path).unwrap();
+    let codex = ProviderDiscoveryContract::for_kind(ProviderKind::Codex)
+        .resolve_from_path_snapshot(&codex_snapshot)
+        .unwrap_or_else(|error| panic!("codex resolution failed: {error:?}"));
+    assert!(matches!(
+        codex.form(),
+        ProviderExecutableForm::WindowsNodeScript { .. }
+    ));
+    codex.open_for_launch().unwrap().revalidate().unwrap();
+    assert!(matches!(
+        codex.origin(),
+        ProviderDiscoveryOrigin::PathEntry { index: 0, .. }
+    ));
+
+    // Cursor's stock .ps1 wrapper selects the highest trusted version graph.
+    let cursor_root = temp.path().join("cursor-agent");
+    let cursor_old = cursor_root.join("versions").join("2026.8.4-aaaa1111");
+    let cursor_new = cursor_root.join("versions").join("2026.08.05-aaaa2222");
+    let cursor_tie = cursor_root.join("versions").join("2026.08.05-bbbb3333");
+    fs::create_dir_all(&cursor_old).unwrap();
+    fs::create_dir_all(&cursor_new).unwrap();
+    fs::create_dir_all(&cursor_tie).unwrap();
+    for version in [&cursor_old, &cursor_new, &cursor_tie] {
+        fs::copy(std::env::current_exe().unwrap(), version.join("node.exe")).unwrap();
+        fs::write(version.join("index.js"), b"module.exports = {};\n").unwrap();
+    }
+    fs::write(
+        cursor_root.join("cursor-agent.ps1"),
+        r#"$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition
+function Parse-VersionString { param ([string]$versionString) return 1 }
+$versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory | Where-Object { $_.Name -match '^\d{4}\.\d{1,2}\.\d{1,2}-[a-f0-9]+$' } | Sort-Object { Parse-VersionString $_.Name } -Descending | Select-Object -First 1
+$versionName = $versionDir.Name
+$nodePath = "$scriptPath\versions\$versionName\node.exe"
+& "$nodePath" "$scriptPath\versions\$versionName\index.js" $args
+exit $LASTEXITCODE
+"#,
+    )
+    .unwrap();
+    fs::write(
+        cursor_root.join("cursor-agent.cmd"),
+        r#"@echo off
+setlocal enabledelayedexpansion
+set "CURSOR_INVOKED_AS=%~nx0"
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\cursor-agent.ps1" %*
+"#,
+    )
+    .unwrap();
+    let cursor_snapshot =
+        ProviderPathSnapshot::capture(&std::env::join_paths([cursor_root.as_os_str()]).unwrap())
+            .unwrap();
+    let cursor = ProviderDiscoveryContract::for_kind(ProviderKind::Cursor)
+        .resolve_from_path_snapshot(&cursor_snapshot)
+        .unwrap();
+    assert!(matches!(
+        cursor.form(),
+        ProviderExecutableForm::WindowsNodeScript { .. }
+    ));
+    if let ProviderExecutableForm::WindowsNodeScript { interpreter, .. } = cursor.form() {
+        assert!(interpreter
+            .canonical_path()
+            .ends_with(Path::new("2026.08.05-bbbb3333").join("node.exe")));
+    }
+    cursor.open_for_launch().unwrap().revalidate().unwrap();
 }
 
 #[test]

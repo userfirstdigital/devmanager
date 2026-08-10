@@ -5,11 +5,11 @@
 
 use crate::domain::ProviderSessionId;
 use crate::providers::capabilities::{
-    ProviderAuthEvidenceError, ProviderAuthEvidenceSource, ProviderAuthProbeObservation,
-    ProviderAuthProbeResult, ProviderCapabilities, ProviderCapabilitiesError, ProviderCapability,
-    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutableHandle,
-    ProviderExecutablePolicy, ProviderExecutablePolicyError, ProviderKind, ProviderVersion,
-    ProviderVersionError,
+    ProviderAuthEvidenceError, ProviderAuthProbeBinding, ProviderAuthProbeInvocation,
+    ProviderAuthProbeObservation, ProviderAuthProbeResult, ProviderCapabilities,
+    ProviderCapabilitiesError, ProviderCapability, ProviderDiscoveryError, ProviderExecutable,
+    ProviderExecutableError, ProviderExecutableHandle, ProviderExecutablePolicy,
+    ProviderExecutablePolicyError, ProviderKind, ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -289,6 +291,7 @@ pub struct ProviderProbeRequest {
     kind: ProviderProbeKind,
     timeout: Duration,
     max_output_bytes: usize,
+    auth_binding: Option<ProviderAuthProbeBinding>,
 }
 
 impl fmt::Debug for ProviderProbeRequest {
@@ -299,6 +302,7 @@ impl fmt::Debug for ProviderProbeRequest {
             .field("kind", &self.kind)
             .field("timeout", &self.timeout)
             .field("max_output_bytes", &self.max_output_bytes)
+            .field("auth_bound", &self.auth_binding.is_some())
             .finish()
     }
 }
@@ -355,7 +359,36 @@ impl ProviderProbeRequest {
             kind,
             timeout,
             max_output_bytes,
+            auth_binding: None,
         })
+    }
+
+    /// Binds this request to one exact issued auth invocation.  The nonce and
+    /// generation are private correlation material copied by the invocation;
+    /// callers cannot select or replace them.
+    pub fn bind_to_auth_invocation(
+        mut self,
+        invocation: &ProviderAuthProbeInvocation,
+    ) -> Result<Self, ProviderAuthEvidenceError> {
+        if self.kind != ProviderProbeKind::AuthStatus
+            || self.executable != *invocation.executable_handle()
+        {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        let binding = invocation.binding();
+        if self
+            .auth_binding
+            .as_ref()
+            .is_some_and(|existing| existing != &binding)
+        {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        self.auth_binding = Some(binding);
+        Ok(self)
+    }
+
+    pub(crate) fn auth_binding_matches(&self, invocation: &ProviderAuthProbeInvocation) -> bool {
+        self.auth_binding.as_ref() == Some(&invocation.binding())
     }
 
     pub fn executable(&self) -> &ProviderExecutableHandle {
@@ -392,6 +425,18 @@ impl ProviderProbeRequest {
 
     pub const fn max_output_bytes(&self) -> usize {
         self.max_output_bytes
+    }
+}
+
+impl ProviderAuthProbeInvocation {
+    /// Produces an auth-status request correlated to this exact issued
+    /// invocation.  Reusing the returned request with another invocation is
+    /// rejected by the registry's nonce+generation check.
+    pub fn bind_request(
+        &self,
+        request: ProviderProbeRequest,
+    ) -> Result<ProviderProbeRequest, ProviderAuthEvidenceError> {
+        request.bind_to_auth_invocation(self)
     }
 }
 
@@ -580,12 +625,12 @@ impl ProviderProbeResult {
 
     pub(crate) fn into_auth_observation(
         &self,
-        kind: ProviderKind,
+        invocation: &ProviderAuthProbeInvocation,
         request: &ProviderProbeRequest,
-        executable: ProviderExecutableHandle,
-        version: ProviderVersion,
     ) -> Result<ProviderAuthProbeObservation, ProviderAuthEvidenceError> {
-        if request.kind() != ProviderProbeKind::AuthStatus {
+        if request.kind() != ProviderProbeKind::AuthStatus
+            || !request.auth_binding_matches(invocation)
+        {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
         }
         if self.status != ProviderProbeStatus::Completed {
@@ -594,30 +639,170 @@ impl ProviderProbeResult {
         let output = self
             .output_for_adapter()
             .ok_or(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence)?;
-        let mut text = String::with_capacity(output.stdout().len() + output.stderr().len());
-        text.push_str(&String::from_utf8_lossy(output.stdout()).to_ascii_lowercase());
-        text.push_str(&String::from_utf8_lossy(output.stderr()).to_ascii_lowercase());
-        let result = if text.contains("authenticated subscription")
-            || text.contains("subscription authenticated")
-            || text.contains("logged in")
-        {
-            ProviderAuthProbeResult::AuthenticatedSubscription
-        } else if text.contains("auth required") || text.contains("authentication required") {
-            ProviderAuthProbeResult::AuthRequired
-        } else if text.contains("api key") || text.contains("api_key") {
-            ProviderAuthProbeResult::ApiKeyDetected
-        } else {
-            ProviderAuthProbeResult::Unknown
-        };
+        let result =
+            classify_auth_output(invocation.provider_kind(), output.stdout(), output.stderr());
         ProviderAuthProbeObservation::from_bounded_probe(
-            kind,
-            ProviderAuthEvidenceSource::for_kind(kind),
-            executable,
-            version,
+            invocation,
             result,
             result.default_confidence(),
         )
     }
+}
+
+/// Classify only provider-specific, structured authentication markers.  A
+/// generic "logged in" line is intentionally insufficient: wrapper output,
+/// API-key login, negative status, and contradictory text must never become a
+/// subscription claim.
+fn classify_auth_output(
+    kind: ProviderKind,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> ProviderAuthProbeResult {
+    let mut raw = Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
+    raw.extend_from_slice(stdout);
+    raw.extend_from_slice(stderr);
+    let text = String::from_utf8_lossy(&raw);
+    let lower = text.to_ascii_lowercase();
+
+    let api_key = contains_any(
+        &lower,
+        &[
+            "api key",
+            "api_key",
+            "apikey",
+            "api-key",
+            "token authentication",
+        ],
+    );
+    let negative = contains_any(
+        &lower,
+        &[
+            "not logged in",
+            "logged out",
+            "unauthenticated",
+            "authentication required",
+            "auth required",
+            "no active login",
+            "no active session",
+            "\"loggedin\":false",
+            "\"logged_in\":false",
+            "\"authenticated\":false",
+        ],
+    );
+    let positive = match kind {
+        ProviderKind::ClaudeCode => contains_any(
+            &lower,
+            &[
+                "logged in with claude.ai",
+                "authenticated with claude.ai",
+                "claude.ai subscription",
+            ],
+        ),
+        ProviderKind::Codex => contains_any(
+            &lower,
+            &[
+                "logged in using chatgpt",
+                "authenticated via chatgpt",
+                "chatgpt subscription",
+            ],
+        ),
+        ProviderKind::Cursor => contains_any(
+            &lower,
+            &[
+                "authenticated with cursor",
+                "logged in with cursor",
+                "cursor subscription",
+            ],
+        ),
+    };
+    if api_key {
+        return ProviderAuthProbeResult::ApiKeyDetected;
+    }
+    if negative && positive {
+        return ProviderAuthProbeResult::Unknown;
+    }
+    if negative {
+        return ProviderAuthProbeResult::AuthRequired;
+    }
+    if let Some(result) = classify_structured_json(kind, &text) {
+        return if positive && result == ProviderAuthProbeResult::AuthRequired {
+            ProviderAuthProbeResult::Unknown
+        } else {
+            result
+        };
+    }
+    if positive {
+        ProviderAuthProbeResult::AuthenticatedSubscription
+    } else {
+        ProviderAuthProbeResult::Unknown
+    }
+}
+
+fn classify_structured_json(kind: ProviderKind, text: &str) -> Option<ProviderAuthProbeResult> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let object = value.as_object()?;
+    let serialized = value.to_string().to_ascii_lowercase();
+    if contains_any(
+        &serialized,
+        &[
+            "not logged in",
+            "logged out",
+            "unauthenticated",
+            "authentication required",
+            "auth required",
+            "no active login",
+            "no active session",
+        ],
+    ) {
+        return Some(ProviderAuthProbeResult::AuthRequired);
+    }
+    let authenticated = object
+        .get("authenticated")
+        .or_else(|| object.get("loggedIn"))
+        .or_else(|| object.get("logged_in"))
+        .and_then(serde_json::Value::as_bool);
+    let method = object
+        .get("authMethod")
+        .or_else(|| object.get("auth_method"))
+        .or_else(|| object.get("loginMethod"))
+        .or_else(|| object.get("login_method"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if method
+        .as_deref()
+        .is_some_and(|method| contains_any(method, &["api", "key", "token"]))
+    {
+        return Some(ProviderAuthProbeResult::ApiKeyDetected);
+    }
+    if authenticated == Some(false) {
+        return Some(ProviderAuthProbeResult::AuthRequired);
+    }
+    if authenticated != Some(true) {
+        return None;
+    }
+    let subscription_method = match kind {
+        ProviderKind::ClaudeCode => contains_any(
+            method.as_deref().unwrap_or_default(),
+            &["claude.ai", "claude_ai", "oauth", "subscription"],
+        ),
+        ProviderKind::Codex => contains_any(
+            method.as_deref().unwrap_or_default(),
+            &["chatgpt", "oauth", "subscription"],
+        ),
+        ProviderKind::Cursor => contains_any(
+            method.as_deref().unwrap_or_default(),
+            &["cursor", "oauth", "subscription"],
+        ),
+    };
+    Some(if subscription_method {
+        ProviderAuthProbeResult::AuthenticatedSubscription
+    } else {
+        ProviderAuthProbeResult::Unknown
+    })
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,8 +867,16 @@ impl WindowsProviderProbeRunner {
         request: ProviderProbeRequest,
     ) -> Result<ProviderProbeResult, ProviderProbeError> {
         let deadline = std::time::Instant::now() + request.timeout();
+        #[cfg(unix)]
+        let (executable, fixed_arguments, _launch_files) =
+            prepare_unix_launch(&self.policy, request.executable())?;
+        #[cfg(windows)]
         let executable = validate_probe_executable(&self.policy, request.executable())?;
         let mut command = std::process::Command::new(&executable);
+        #[cfg(windows)]
+        command.args(request.executable().launch_fixed_arguments());
+        #[cfg(unix)]
+        command.args(fixed_arguments);
         command
             .args(request.arguments())
             .stdin(Stdio::null())
@@ -693,11 +886,13 @@ impl WindowsProviderProbeRunner {
 
         #[cfg(windows)]
         command.creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut process = ProbeProcess::spawn(command, deadline)?;
-        // Standard Command cannot pass the opened executable handle through
-        // CreateProcess. Revalidate immediately after spawn so a same-path
-        // replacement cannot be mistaken for the requested identity.
+        // Windows keeps the no-delete handles open through CreateProcess;
+        // Unix uses inherited descriptor paths from `prepare_unix_launch`.
+        // Revalidate immediately after spawn as a final identity diagnostic.
         if request.executable().revalidate().is_err() {
             process.terminate_tree(deadline)?;
             return Err(ProviderProbeError::Io(
@@ -784,7 +979,63 @@ fn validate_probe_executable(
     policy
         .validate_canonical_path(&canonical)
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
-    Ok(canonical)
+    Ok(requested.launch_program().canonical_path().to_path_buf())
+}
+
+#[cfg(unix)]
+fn prepare_unix_launch(
+    policy: &ProviderExecutablePolicy,
+    requested: &ProviderExecutableHandle,
+) -> Result<(PathBuf, Vec<std::ffi::OsString>, Vec<std::fs::File>), ProviderProbeError> {
+    validate_probe_executable(policy, requested)?;
+    let (program_file, script_file) = requested
+        .launch_files()
+        .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+    let program_path = inherit_descriptor(&program_file)?;
+    let mut launch_files = vec![program_file];
+    let fixed_arguments = if let Some(script_file) = script_file {
+        let script_path = inherit_descriptor(&script_file)?;
+        launch_files.push(script_file);
+        vec![script_path.into_os_string()]
+    } else {
+        Vec::new()
+    };
+    Ok((program_path, fixed_arguments, launch_files))
+}
+
+#[cfg(unix)]
+fn inherit_descriptor(file: &std::fs::File) -> Result<PathBuf, ProviderProbeError> {
+    use std::os::unix::io::AsRawFd;
+
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    let fd = file.as_raw_fd();
+    // `std::fs::File` descriptors are close-on-exec by default. Clear that
+    // bit only for the two already-attested launch files so the child can
+    // resolve its own `/proc/self/fd` (or `/dev/fd`) path at exec time.
+    let flags = unsafe { unix_fcntl(fd, F_GETFD, 0) };
+    if flags < 0 {
+        return Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ));
+    }
+    if flags & FD_CLOEXEC != 0 && unsafe { unix_fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) } < 0 {
+        return Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ));
+    }
+    let root = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    Ok(PathBuf::from(root).join(fd.to_string()))
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn unix_fcntl(fd: i32, command: i32, argument: i32) -> i32;
 }
 
 fn scrub_provider_secret_environment(command: &mut std::process::Command) {
@@ -832,6 +1083,8 @@ struct ProbeProcess {
     child: Child,
     managed_job: Option<crate::process::job::ManagedProcessJob>,
     deadline: std::time::Instant,
+    #[cfg(unix)]
+    process_group: bool,
 }
 
 impl ProbeProcess {
@@ -867,6 +1120,8 @@ impl ProbeProcess {
             child,
             managed_job,
             deadline,
+            #[cfg(unix)]
+            process_group: cfg!(unix),
         })
     }
 
@@ -889,6 +1144,18 @@ impl ProbeProcess {
                 ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
             })?;
         }
+        #[cfg(unix)]
+        let group_cleanup_ok = if self.process_group {
+            crate::services::platform_service::terminate_owned_process_group(
+                self.child.id(),
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .is_ok()
+        } else {
+            true
+        };
+        #[cfg(not(unix))]
+        let _group_cleanup_ok = true;
         // Job ACTIVE_PROCESS_ZERO state is authoritative for the managed tree.
         // The raw `Child` handle can lag that state on Windows, so do not
         // spend the absolute deadline waiting for a second observation of the
@@ -898,7 +1165,12 @@ impl ProbeProcess {
         } else {
             reap_child_until(&mut self.child, deadline)
         };
-        if !job_empty || !child_exited {
+        #[cfg(unix)]
+        let group_exited =
+            group_cleanup_ok && wait_for_unix_process_group_exit(self.child.id(), deadline);
+        #[cfg(not(unix))]
+        let group_exited = true;
+        if !job_empty || !child_exited || !group_exited {
             return Err(ProviderProbeError::Io(
                 ProviderProbeIoError::DescendantCleanupFailed,
             ));
@@ -923,6 +1195,25 @@ fn reap_child_until(child: &mut Child, deadline: std::time::Instant) -> bool {
             }
             Ok(None) | Err(_) => return false,
         }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_unix_process_group_exit(pid: u32, deadline: std::time::Instant) -> bool {
+    let group_target = format!("-{pid}");
+    loop {
+        let exists = std::process::Command::new("kill")
+            .args(["-0", "--", group_target.as_str()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !exists {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
     }
 }
 
@@ -1191,4 +1482,115 @@ pub trait ProviderAdapter: Send + Sync {
         &self,
         executable: &ProviderExecutable,
     ) -> Result<Option<QuotaObservation>, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_auth_output, ProviderAuthEvidenceError, ProviderAuthProbeResult,
+        ProviderExecutable, ProviderKind, ProviderProbeOutput, ProviderProbeRequest,
+        ProviderProbeResult,
+    };
+    use crate::providers::capabilities::ProviderAuthEvidenceRegistry;
+    use std::time::Duration;
+
+    #[test]
+    fn auth_parser_rejects_negative_and_contradictory_subscription_text() {
+        assert_eq!(
+            classify_auth_output(ProviderKind::ClaudeCode, b"not logged in", b""),
+            ProviderAuthProbeResult::AuthRequired
+        );
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::ClaudeCode,
+                b"logged in with claude.ai; not logged in",
+                b""
+            ),
+            ProviderAuthProbeResult::Unknown
+        );
+    }
+
+    #[test]
+    fn auth_parser_never_promotes_api_key_login_to_subscription() {
+        assert_eq!(
+            classify_auth_output(ProviderKind::Codex, b"logged in using API key", b""),
+            ProviderAuthProbeResult::ApiKeyDetected
+        );
+    }
+
+    #[test]
+    fn auth_parser_requires_provider_specific_subscription_markers() {
+        assert_eq!(
+            classify_auth_output(ProviderKind::ClaudeCode, b"logged in", b""),
+            ProviderAuthProbeResult::Unknown
+        );
+        assert_eq!(
+            classify_auth_output(ProviderKind::ClaudeCode, b"subscription active", b""),
+            ProviderAuthProbeResult::Unknown
+        );
+        assert_eq!(
+            classify_auth_output(ProviderKind::ClaudeCode, b"logged in with claude.ai", b""),
+            ProviderAuthProbeResult::AuthenticatedSubscription
+        );
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::Codex,
+                br#"{"authenticated":true,"auth_method":"chatgpt"}"#,
+                b""
+            ),
+            ProviderAuthProbeResult::AuthenticatedSubscription
+        );
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::ClaudeCode,
+                br#"{"authenticated":true,"message":"not logged in"}"#,
+                b""
+            ),
+            ProviderAuthProbeResult::AuthRequired
+        );
+    }
+
+    #[test]
+    fn auth_observation_is_bound_to_one_issued_invocation() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let mut evidence = ProviderAuthEvidenceRegistry::new();
+        let first = evidence
+            .begin(
+                ProviderKind::ClaudeCode,
+                executable.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let second = evidence
+            .begin(
+                ProviderKind::ClaudeCode,
+                executable,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let request = ProviderProbeRequest::auth_status(first.executable_handle().clone())
+            .unwrap()
+            .bind_to_auth_invocation(&first)
+            .unwrap();
+        assert!(request.clone().bind_to_auth_invocation(&second).is_err());
+        let output =
+            ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
+                .unwrap();
+        let result = ProviderProbeResult::with_output(&request, output).unwrap();
+        let observation = result.into_auth_observation(&first, &request).unwrap();
+        assert!(matches!(
+            evidence.accept_observation(second, observation),
+            Err(ProviderAuthEvidenceError::RequestBindingMismatch)
+        ));
+
+        // The exact request/observation pair remains valid for its own
+        // invocation after the cross-invocation attempt is rejected.
+        let output =
+            ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
+                .unwrap();
+        let result = ProviderProbeResult::with_output(&request, output).unwrap();
+        let observation = result.into_auth_observation(&first, &request).unwrap();
+        let accepted = evidence.accept_observation(first, observation);
+        assert!(accepted.is_ok(), "{accepted:?}");
+    }
 }

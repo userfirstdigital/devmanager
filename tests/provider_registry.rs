@@ -29,18 +29,31 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn copied_probe_fixture(temp: &tempfile::TempDir, stem: &str) -> PathBuf {
-    let path = temp.path().join(format!("{stem}.exe"));
+    let path = if cfg!(windows) {
+        temp.path().join(format!("{stem}.exe"))
+    } else {
+        temp.path().join(stem)
+    };
     std::fs::copy(
         env!("CARGO_BIN_EXE_devmanager-provider-probe-fixture"),
         &path,
     )
     .expect("copy harmless provider probe fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("fixture is executable");
+    }
     path
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn probe_runner(path: &Path) -> devmanager::providers::WindowsProviderProbeRunner {
     let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
     devmanager::providers::WindowsProviderProbeRunner::new(
@@ -603,6 +616,51 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
             evidence.source() == EvidenceSourceId::AuthStatusProbe
                 && evidence.status() == EvidenceStatus::Unknown
         }));
+}
+
+#[tokio::test]
+async fn registry_rejects_auth_receipt_after_provider_version_changes() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"version-bound-receipt");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Supported,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Supported,
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter.clone()).unwrap();
+    let config = discovery(Some(executable), None);
+    let identity = registry
+        .resolve_executable(ProviderKind::ClaudeCode, &config)
+        .await
+        .unwrap();
+    let invocation = registry
+        .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let receipt = registry
+        .accept_auth_probe(
+            ProviderKind::ClaudeCode,
+            &identity,
+            invocation,
+            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
+            Instant::now(),
+        )
+        .unwrap();
+
+    adapter.set_version(ProviderVersion::new("fixture-2").unwrap());
+    let result = registry
+        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, receipt)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ProviderError::AuthEvidence(
+            devmanager::providers::ProviderAuthEvidenceError::WrongVersion
+        ))
+    ));
 }
 
 #[tokio::test]
@@ -1809,6 +1867,48 @@ async fn windows_probe_runner_timeout_kills_the_entire_probe_tree() {
             .unwrap(),
         devmanager::providers::ProviderProbeKind::Help,
         std::time::Duration::from_secs(3),
+        4096,
+    )
+    .unwrap();
+
+    let result = runner.run(request).await;
+
+    assert!(matches!(result, Err(ProviderProbeError::TimedOut)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let child_pid = loop {
+        if let Ok(value) = std::fs::read_to_string(&child_pid_path) {
+            break value.parse::<u32>().unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture child pid was not published"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    while std::time::Instant::now() < deadline
+        && devmanager::services::platform_service::is_pid_running(child_pid)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!devmanager::services::platform_service::is_pid_running(
+        child_pid
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_probe_runner_timeout_kills_and_joins_the_entire_probe_tree() {
+    let temp = tempdir().unwrap();
+    let executable = copied_probe_fixture(&temp, "probe-tree");
+    let child_pid_path = executable.with_extension("child.pid");
+    let runner = probe_runner(&executable);
+    let request = ProviderProbeRequest::with_limits(
+        ProviderExecutable::from_path(&executable)
+            .unwrap()
+            .open_for_launch()
+            .unwrap(),
+        devmanager::providers::ProviderProbeKind::Help,
+        std::time::Duration::from_secs(2),
         4096,
     )
     .unwrap();

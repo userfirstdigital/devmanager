@@ -5,8 +5,8 @@ use crate::providers::capabilities::{
     AdapterRevision, ProviderAuthEvidenceError, ProviderAuthEvidenceReceipt,
     ProviderAuthEvidenceRegistry, ProviderAuthProbeInvocation, ProviderAuthProbeResult,
     ProviderCapabilities, ProviderDiscoveryCandidateInput, ProviderDiscoveryContract,
-    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderKind,
-    ProviderVersion, SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
+    ProviderDiscoveryError, ProviderExecutable, ProviderExecutableError, ProviderExecutableHandle,
+    ProviderKind, ProviderVersion, SemanticSchemaVersion, MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES,
 };
 use async_trait::async_trait;
 use serde::de;
@@ -229,10 +229,12 @@ impl ExecutableInspector for FileSystemExecutableInspector {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             #[cfg(target_os = "windows")]
-            if path
-                .extension()
-                .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("cmd"))
-            {
+            if path.extension().is_some_and(|extension| {
+                let extension = extension.to_string_lossy();
+                extension.eq_ignore_ascii_case("cmd")
+                    || extension.eq_ignore_ascii_case("ps1")
+                    || extension.eq_ignore_ascii_case("js")
+            }) {
                 return ProviderExecutable::inspect_non_native_blocking(&path);
             }
             ProviderExecutable::inspect_blocking(&path)
@@ -246,12 +248,24 @@ impl ExecutableInspector for FileSystemExecutableInspector {
 struct ProbeIdentityKey {
     kind: ProviderKind,
     executable: ProviderExecutable,
+    launch_handle: ProviderExecutableHandle,
     adapter_revision: AdapterRevision,
     semantic_schema_version: SemanticSchemaVersion,
 }
 
 struct ProbeFlight {
-    result: Mutex<Option<Result<(ProviderCapabilities, ProviderExecutable), ProviderError>>>,
+    result: Mutex<
+        Option<
+            Result<
+                (
+                    ProviderCapabilities,
+                    ProviderExecutable,
+                    ProviderExecutableHandle,
+                ),
+                ProviderError,
+            >,
+        >,
+    >,
     completed: Notify,
     started_at: Instant,
 }
@@ -259,11 +273,13 @@ struct ProbeFlight {
 struct ProbeRun {
     capabilities: ProviderCapabilities,
     executable: ProviderExecutable,
+    executable_handle: ProviderExecutableHandle,
     leader: bool,
 }
 
 struct CapabilityCacheEntry {
     capabilities: ProviderCapabilities,
+    launch_handle: ProviderExecutableHandle,
     sequence: u64,
     inserted_at: Instant,
 }
@@ -275,32 +291,51 @@ struct CapabilityCache {
 }
 
 impl CapabilityCache {
-    fn get(&mut self, key: &CapabilityCacheKey) -> Option<ProviderCapabilities> {
+    fn get(
+        &mut self,
+        key: &CapabilityCacheKey,
+        launch_handle: &ProviderExecutableHandle,
+    ) -> Option<ProviderCapabilities> {
         self.evict_expired(Instant::now());
         let entry = self.entries.get_mut(key)?;
+        if entry.launch_handle != *launch_handle {
+            return None;
+        }
         self.next_sequence = self.next_sequence.saturating_add(1);
         entry.sequence = self.next_sequence;
         Some(entry.capabilities.clone())
     }
 
-    fn insert(&mut self, key: CapabilityCacheKey, capabilities: ProviderCapabilities) {
+    fn insert(
+        &mut self,
+        key: CapabilityCacheKey,
+        capabilities: ProviderCapabilities,
+        launch_handle: ProviderExecutableHandle,
+    ) {
         let now = Instant::now();
         self.evict_expired(now);
-        self.entries.retain(|existing_key, _| {
+        self.entries.retain(|existing_key, entry| {
             !(existing_key.kind == key.kind
                 && existing_key.adapter_revision == key.adapter_revision
                 && existing_key.semantic_schema_version == key.semantic_schema_version
                 && existing_key.executable.canonical_path() == key.executable.canonical_path()
                 && (existing_key.executable != key.executable
-                    || existing_key.version != key.version))
+                    || existing_key.version != key.version
+                    || entry.launch_handle != launch_handle))
         });
         self.next_sequence = self.next_sequence.saturating_add(1);
-        if let Some(entry) = self.entries.get_mut(&key) {
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.launch_handle == launch_handle)
+        {
+            let entry = self.entries.get_mut(&key).expect("cache entry exists");
             entry.capabilities = capabilities;
             entry.sequence = self.next_sequence;
             entry.inserted_at = now;
             return;
         }
+        self.entries.remove(&key);
         while self.entries.len() >= MAX_PROVIDER_CAPABILITY_CACHE_ENTRIES {
             let Some(oldest_key) = self
                 .entries
@@ -316,6 +351,7 @@ impl CapabilityCache {
             key,
             CapabilityCacheEntry {
                 capabilities,
+                launch_handle,
                 sequence: self.next_sequence,
                 inserted_at: now,
             },
@@ -325,6 +361,7 @@ impl CapabilityCache {
     fn matching_entries(
         &mut self,
         identity: &ProbeIdentityKey,
+        launch_handle: &ProviderExecutableHandle,
     ) -> Vec<(CapabilityCacheKey, ProviderCapabilities)> {
         self.evict_expired(Instant::now());
         self.entries
@@ -335,6 +372,7 @@ impl CapabilityCache {
                     && key.adapter_revision == identity.adapter_revision
                     && key.semantic_schema_version == identity.semantic_schema_version
             })
+            .filter(|(_, entry)| entry.launch_handle == *launch_handle)
             .map(|(key, entry)| (key.clone(), entry.capabilities.clone()))
             .collect()
     }
@@ -392,7 +430,7 @@ impl ProviderRegistry {
         kind: ProviderKind,
         config: &ProviderDiscoveryConfig,
     ) -> Result<ProviderExecutable, ProviderError> {
-        let (_, identity) = self.select_executable(kind, config).await?;
+        let (_, identity, _) = self.select_executable(kind, config).await?;
         Ok(identity)
     }
 
@@ -401,7 +439,9 @@ impl ProviderRegistry {
         kind: ProviderKind,
         config: &ProviderDiscoveryConfig,
     ) -> Result<ProviderObservation, ProviderError> {
-        self.observe_internal(kind, config, None).await
+        self.observe_internal(kind, config, None)
+            .await
+            .map(|(observation, _)| observation)
     }
 
     pub async fn observe_with_auth_receipt(
@@ -410,7 +450,9 @@ impl ProviderRegistry {
         config: &ProviderDiscoveryConfig,
         receipt: ProviderAuthEvidenceReceipt,
     ) -> Result<ProviderObservation, ProviderError> {
-        self.observe_internal(kind, config, Some(receipt)).await
+        self.observe_internal(kind, config, Some(receipt))
+            .await
+            .map(|(observation, _)| observation)
     }
 
     pub async fn begin_auth_probe(
@@ -422,11 +464,17 @@ impl ProviderRegistry {
         if !self.adapters.contains_key(&kind) {
             return Err(ProviderError::ProviderNotRegistered(kind));
         }
-        let observation = self.observe(kind, config).await?;
+        let (observation, executable_handle) = self.observe_internal(kind, config, None).await?;
         self.auth_evidence
             .lock()
             .unwrap()
-            .begin_with_version(kind, observation.executable, observation.version, ttl)
+            .begin_with_handle_and_version(
+                kind,
+                crate::providers::capabilities::ProviderAuthEvidenceSource::for_kind(kind),
+                executable_handle,
+                observation.version,
+                ttl,
+            )
             .map_err(ProviderError::AuthEvidence)
     }
 
@@ -457,18 +505,15 @@ impl ProviderRegistry {
         request: &ProviderProbeRequest,
         result: &ProviderProbeResult,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderError> {
-        if request.executable() != invocation.executable_handle() {
+        if request.executable() != invocation.executable_handle()
+            || !request.auth_binding_matches(&invocation)
+        {
             return Err(ProviderError::AuthEvidence(
-                ProviderAuthEvidenceError::WrongExecutable,
+                ProviderAuthEvidenceError::RequestBindingMismatch,
             ));
         }
         let observation = result
-            .into_auth_observation(
-                invocation.provider_kind(),
-                request,
-                invocation.executable_handle().clone(),
-                invocation.version().clone(),
-            )
+            .into_auth_observation(&invocation, request)
             .map_err(ProviderError::AuthEvidence)?;
         self.auth_evidence
             .lock()
@@ -490,25 +535,27 @@ impl ProviderRegistry {
         kind: ProviderKind,
         config: &ProviderDiscoveryConfig,
         receipt: Option<ProviderAuthEvidenceReceipt>,
-    ) -> Result<ProviderObservation, ProviderError> {
+    ) -> Result<(ProviderObservation, ProviderExecutableHandle), ProviderError> {
         let adapter = self
             .adapters
             .get(&kind)
             .cloned()
             .ok_or(ProviderError::ProviderNotRegistered(kind))?;
-        let (requested_path, before) = self.select_executable(kind, config).await?;
+        let (requested_path, before, before_handle) = self.select_executable(kind, config).await?;
         let identity_key = ProbeIdentityKey {
             kind,
             executable: before.clone(),
+            launch_handle: before_handle.clone(),
             adapter_revision: TASK_4_1_ADAPTER_REVISION,
             semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
         };
-        let cached_before = self.cached_identity_entries(&identity_key);
+        let cached_before = self.cached_identity_entries(&identity_key, &before_handle);
         let probe = self
             .probe_once(
                 Arc::clone(&adapter),
                 requested_path.clone(),
                 before.clone(),
+                before_handle,
                 identity_key,
             )
             .await?;
@@ -538,7 +585,10 @@ impl ProviderRegistry {
         let had_matching_cached = matching_cached.is_some();
         let stable = matching_cached.or_else(|| {
             if !probe.leader {
-                self.cache.lock().unwrap().get(&key)
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .get(&key, &probe.executable_handle)
             } else {
                 None
             }
@@ -550,7 +600,12 @@ impl ProviderRegistry {
                     .auth_evidence
                     .lock()
                     .unwrap()
-                    .consume_at_for(kind, &probe.executable, receipt, std::time::Instant::now())
+                    .consume_at_for_handle(
+                        kind,
+                        &probe.executable_handle,
+                        &probe.capabilities.version,
+                        receipt,
+                    )
                     .map_err(ProviderError::AuthEvidence)?;
                 stable.with_auth_receipt(&consumed)?
             }
@@ -572,7 +627,7 @@ impl ProviderRegistry {
             cache_status,
         };
         observation.validate()?;
-        Ok(observation)
+        Ok((observation, probe.executable_handle))
     }
 
     async fn probe_once(
@@ -580,6 +635,7 @@ impl ProviderRegistry {
         adapter: Arc<dyn ProviderAdapter>,
         requested_path: PathBuf,
         before: ProviderExecutable,
+        before_handle: ProviderExecutableHandle,
         key: ProbeIdentityKey,
     ) -> Result<ProbeRun, ProviderError> {
         let (flight, leader) = {
@@ -607,7 +663,7 @@ impl ProviderRegistry {
                         && existing_key.semantic_schema_version == key.semantic_schema_version
                         && existing_key.executable.canonical_path()
                             == key.executable.canonical_path()
-                        && existing_key.executable != key.executable
+                        && existing_key.launch_handle != key.launch_handle
                 })
                 .map(|(existing_key, flight)| (existing_key.clone(), Arc::clone(flight)))
                 .collect();
@@ -647,7 +703,7 @@ impl ProviderRegistry {
 
         if leader {
             let result = self
-                .perform_probe(&adapter, &requested_path, &before, &key)
+                .perform_probe(&adapter, &requested_path, &before, &before_handle, &key)
                 .await;
             *flight.result.lock().unwrap() = Some(result.clone());
             flight.completed.notify_waiters();
@@ -658,17 +714,19 @@ impl ProviderRegistry {
             {
                 in_flight.remove(&key);
             }
-            result.map(|(capabilities, executable)| ProbeRun {
+            result.map(|(capabilities, executable, executable_handle)| ProbeRun {
                 capabilities,
                 executable,
+                executable_handle,
                 leader: true,
             })
         } else {
             loop {
                 if let Some(result) = flight.result.lock().unwrap().clone() {
-                    return result.map(|(capabilities, executable)| ProbeRun {
+                    return result.map(|(capabilities, executable, executable_handle)| ProbeRun {
                         capabilities,
                         executable,
+                        executable_handle,
                         leader: false,
                     });
                 }
@@ -688,8 +746,16 @@ impl ProviderRegistry {
         adapter: &Arc<dyn ProviderAdapter>,
         requested_path: &Path,
         before: &ProviderExecutable,
+        before_handle: &ProviderExecutableHandle,
         identity_key: &ProbeIdentityKey,
-    ) -> Result<(ProviderCapabilities, ProviderExecutable), ProviderError> {
+    ) -> Result<
+        (
+            ProviderCapabilities,
+            ProviderExecutable,
+            ProviderExecutableHandle,
+        ),
+        ProviderError,
+    > {
         let capabilities = adapter.probe(before).await?;
         if capabilities.kind != identity_key.kind {
             return Err(ProviderError::CapabilityKindMismatch {
@@ -740,6 +806,10 @@ impl ProviderRegistry {
             });
         }
 
+        before_handle
+            .revalidate()
+            .map_err(ProviderError::Executable)?;
+
         let cache_key = CapabilityCacheKey::new(
             identity_key.kind,
             after.clone(),
@@ -747,18 +817,19 @@ impl ProviderRegistry {
             identity_key.adapter_revision,
             identity_key.semantic_schema_version,
         );
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(cache_key, capabilities.stable_projection());
-        Ok((capabilities, after))
+        self.cache.lock().unwrap().insert(
+            cache_key,
+            capabilities.stable_projection(),
+            before_handle.clone(),
+        );
+        Ok((capabilities, after, before_handle.clone()))
     }
 
     async fn select_executable(
         &self,
         kind: ProviderKind,
         config: &ProviderDiscoveryConfig,
-    ) -> Result<(PathBuf, ProviderExecutable), ProviderError> {
+    ) -> Result<(PathBuf, ProviderExecutable, ProviderExecutableHandle), ProviderError> {
         let contract = ProviderDiscoveryContract::for_kind(kind);
 
         if let Some(override_path) = &config.executable_override {
@@ -785,7 +856,10 @@ impl ProviderRegistry {
                     after: identity,
                 });
             }
-            return Ok((candidate.requested_path().to_path_buf(), identity));
+            let handle = candidate
+                .open_for_launch()
+                .map_err(ProviderError::Executable)?;
+            return Ok((candidate.requested_path().to_path_buf(), identity, handle));
         }
 
         let path_value = config.path.clone().or_else(|| std::env::var_os("PATH"));
@@ -801,17 +875,25 @@ impl ProviderRegistry {
         let candidate = contract
             .resolve_from_path_snapshot(&snapshot)
             .map_err(|error| map_discovery_error(kind, None, error))?;
+        let handle = candidate
+            .open_for_launch()
+            .map_err(ProviderError::Executable)?;
         Ok((
             candidate.requested_path().to_path_buf(),
             candidate.executable().clone(),
+            handle,
         ))
     }
 
     fn cached_identity_entries(
         &self,
         identity: &ProbeIdentityKey,
+        launch_handle: &ProviderExecutableHandle,
     ) -> Vec<(CapabilityCacheKey, ProviderCapabilities)> {
-        self.cache.lock().unwrap().matching_entries(identity)
+        self.cache
+            .lock()
+            .unwrap()
+            .matching_entries(identity, launch_handle)
     }
 
     pub fn cache_len(&self) -> usize {

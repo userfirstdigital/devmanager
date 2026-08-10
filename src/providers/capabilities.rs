@@ -3,7 +3,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -939,6 +939,7 @@ pub enum ProviderAuthEvidenceError {
     WrongAuthSource,
     WrongExecutable,
     WrongVersion,
+    RequestBindingMismatch,
     Expired,
     FutureTimestamp,
     Reordered,
@@ -960,6 +961,9 @@ impl fmt::Display for ProviderAuthEvidenceError {
                 write!(f, "auth evidence executable does not match invocation")
             }
             Self::WrongVersion => write!(f, "auth evidence version does not match invocation"),
+            Self::RequestBindingMismatch => {
+                write!(f, "auth probe request does not match its invocation")
+            }
             Self::Expired => write!(f, "auth evidence invocation is expired"),
             Self::FutureTimestamp => write!(
                 f,
@@ -994,6 +998,15 @@ struct ProviderAuthReceiptKey {
     kind: ProviderKind,
     executable: ProviderExecutableHandle,
     version: ProviderVersion,
+    nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
+    generation: u64,
+}
+
+/// Private correlation material copied only from an issued invocation into
+/// the request and bounded observation.  Keeping this type crate-private
+/// prevents a wire/request caller from choosing a nonce or generation.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProviderAuthProbeBinding {
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
 }
@@ -1061,6 +1074,13 @@ impl ProviderAuthProbeInvocation {
 
     pub const fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub(crate) fn binding(&self) -> ProviderAuthProbeBinding {
+        ProviderAuthProbeBinding {
+            nonce: self.nonce,
+            generation: self.generation,
+        }
     }
 
     fn key(&self) -> ProviderAuthInvocationKey {
@@ -1184,22 +1204,25 @@ pub(crate) struct ProviderAuthProbeObservation {
     result: ProviderAuthProbeResult,
     observed_at: Instant,
     confidence: EvidenceConfidence,
+    binding: ProviderAuthProbeBinding,
     permit: ProviderAuthObservationPermit,
 }
 
 struct ProviderAuthObservationPermit {
-    _opaque: (),
+    binding: ProviderAuthProbeBinding,
 }
 
 impl ProviderAuthProbeObservation {
     pub(crate) fn from_bounded_probe(
-        kind: ProviderKind,
-        source: ProviderAuthEvidenceSource,
-        executable: ProviderExecutableHandle,
-        version: ProviderVersion,
+        invocation: &ProviderAuthProbeInvocation,
         result: ProviderAuthProbeResult,
         confidence: EvidenceConfidence,
     ) -> Result<Self, ProviderAuthEvidenceError> {
+        let kind = invocation.kind;
+        let source = invocation.source;
+        let executable = invocation.executable.clone();
+        let version = invocation.version.clone();
+        let binding = invocation.binding();
         if source.provider_kind() != kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
@@ -1211,7 +1234,8 @@ impl ProviderAuthProbeObservation {
             result,
             observed_at: Instant::now(),
             confidence,
-            permit: ProviderAuthObservationPermit { _opaque: () },
+            binding: binding.clone(),
+            permit: ProviderAuthObservationPermit { binding },
         })
     }
 }
@@ -1286,11 +1310,36 @@ impl ProviderAuthEvidenceRegistry {
         version: ProviderVersion,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        let executable = executable
+            .open_for_launch()
+            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        self.begin_with_source_and_version_handle(kind, source, executable, version, ttl)
+    }
+
+    pub(crate) fn begin_with_handle_and_version(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_with_source_and_version_handle(kind, source, executable, version, ttl)
+    }
+
+    fn begin_with_source_and_version_handle(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         let issued_at = Instant::now();
         let deadline = issued_at
             .checked_add(ttl.min(MAX_PROVIDER_AUTH_TTL))
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
-        self.begin_at_with_source_and_version(
+        self.begin_at_with_source_and_version_handle(
             kind, source, executable, version, issued_at, deadline,
         )
     }
@@ -1357,6 +1406,23 @@ impl ProviderAuthEvidenceRegistry {
         issued_at: Instant,
         deadline: Instant,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        let executable = executable
+            .open_for_launch()
+            .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
+        self.begin_at_with_source_and_version_handle(
+            kind, source, executable, version, issued_at, deadline,
+        )
+    }
+
+    fn begin_at_with_source_and_version_handle(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+        issued_at: Instant,
+        deadline: Instant,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         if source.provider_kind() != kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
@@ -1374,8 +1440,8 @@ impl ProviderAuthEvidenceRegistry {
         let deadline = issued_at
             .checked_add(ttl)
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
-        let executable = executable
-            .open_for_launch()
+        executable
+            .revalidate()
             .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
         self.evict_expired(now);
         self.invalidate_changed_identity(kind, &executable, &version);
@@ -1458,9 +1524,15 @@ impl ProviderAuthEvidenceRegistry {
             result,
             observed_at,
             confidence,
+            binding,
             permit,
         } = observation;
-        let _permit = permit;
+        let ProviderAuthObservationPermit {
+            binding: permit_binding,
+        } = permit;
+        if binding != invocation.binding() || permit_binding != invocation.binding() {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
         if kind != invocation.kind {
             return Err(ProviderAuthEvidenceError::WrongProvider);
         }
@@ -1630,6 +1702,27 @@ impl ProviderAuthEvidenceRegistry {
         }
         *consumed = true;
         Ok(receipt)
+    }
+
+    pub(crate) fn consume_at_for_handle(
+        &mut self,
+        expected_kind: ProviderKind,
+        expected_executable: &ProviderExecutableHandle,
+        expected_version: &ProviderVersion,
+        receipt: ProviderAuthEvidenceReceipt,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
+        if receipt.executable != *expected_executable {
+            return Err(ProviderAuthEvidenceError::WrongExecutable);
+        }
+        if receipt.version != *expected_version {
+            return Err(ProviderAuthEvidenceError::WrongVersion);
+        }
+        self.consume_at_for(
+            expected_kind,
+            expected_executable.executable(),
+            receipt,
+            Instant::now(),
+        )
     }
 
     pub fn pending_len(&mut self) -> usize {
@@ -1802,14 +1895,54 @@ impl Hash for ProviderExecutable {
 /// A launch-time capability bound to the same no-follow handle and file
 /// identity captured by [`ProviderExecutable`]. The later launcher can
 /// consume the handle instead of reopening an attacker-controlled path.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderExecutableHandle {
     executable: ProviderExecutable,
+    launch_plan: ProviderLaunchPlan,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ProviderLaunchPlan {
+    Direct,
+    DirectTarget(Box<ProviderExecutable>),
+    NodeScript {
+        interpreter: Box<ProviderExecutable>,
+        script: Box<ProviderExecutable>,
+    },
+    PowerShellScript {
+        interpreter: Box<ProviderExecutable>,
+        script: Box<ProviderExecutable>,
+    },
+}
+
+impl fmt::Debug for ProviderLaunchPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Direct => "direct",
+            Self::DirectTarget(_) => "direct_target",
+            Self::NodeScript { .. } => "node_script",
+            Self::PowerShellScript { .. } => "powershell_script",
+        };
+        formatter
+            .debug_struct("ProviderLaunchPlan")
+            .field("kind", &kind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ProviderExecutableHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderExecutableHandle")
+            .field("identity_bound", &true)
+            .field("launch_plan", &self.launch_plan)
+            .finish()
+    }
 }
 
 impl PartialEq for ProviderExecutableHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.executable == other.executable
+        self.executable == other.executable && self.launch_plan == other.launch_plan
     }
 }
 
@@ -1818,6 +1951,29 @@ impl Eq for ProviderExecutableHandle {}
 impl Hash for ProviderExecutableHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.executable.hash(state);
+        match &self.launch_plan {
+            ProviderLaunchPlan::Direct => 0_u8.hash(state),
+            ProviderLaunchPlan::DirectTarget(target) => {
+                1_u8.hash(state);
+                target.hash(state);
+            }
+            ProviderLaunchPlan::NodeScript {
+                interpreter,
+                script,
+            } => {
+                2_u8.hash(state);
+                interpreter.hash(state);
+                script.hash(state);
+            }
+            ProviderLaunchPlan::PowerShellScript {
+                interpreter,
+                script,
+            } => {
+                3_u8.hash(state);
+                interpreter.hash(state);
+                script.hash(state);
+            }
+        }
     }
 }
 
@@ -1860,6 +2016,47 @@ impl ProviderExecutable {
         self.validate_current()?;
         Ok(ProviderExecutableHandle {
             executable: self.clone(),
+            launch_plan: ProviderLaunchPlan::Direct,
+        })
+    }
+
+    pub(crate) fn open_for_launch_form(
+        &self,
+        form: &ProviderExecutableForm,
+    ) -> Result<ProviderExecutableHandle, ProviderExecutableError> {
+        self.validate_current()?;
+        let launch_plan = match form {
+            ProviderExecutableForm::Native => ProviderLaunchPlan::Direct,
+            ProviderExecutableForm::WindowsShim { target } => {
+                target.validate_current()?;
+                ProviderLaunchPlan::DirectTarget(target.clone())
+            }
+            ProviderExecutableForm::WindowsNodeScript {
+                interpreter,
+                script,
+            } => {
+                interpreter.validate_current()?;
+                script.validate_current()?;
+                ProviderLaunchPlan::NodeScript {
+                    interpreter: interpreter.clone(),
+                    script: script.clone(),
+                }
+            }
+            ProviderExecutableForm::WindowsPowerShellScript {
+                interpreter,
+                script,
+            } => {
+                interpreter.validate_current()?;
+                script.validate_current()?;
+                ProviderLaunchPlan::PowerShellScript {
+                    interpreter: interpreter.clone(),
+                    script: script.clone(),
+                }
+            }
+        };
+        Ok(ProviderExecutableHandle {
+            executable: self.clone(),
+            launch_plan,
         })
     }
 
@@ -2043,16 +2240,70 @@ impl ProviderExecutableHandle {
     }
 
     pub fn revalidate(&self) -> Result<(), ProviderExecutableError> {
-        self.executable.validate_current()
+        self.executable.validate_current()?;
+        match &self.launch_plan {
+            ProviderLaunchPlan::Direct => {}
+            ProviderLaunchPlan::DirectTarget(target) => target.validate_current()?,
+            ProviderLaunchPlan::NodeScript {
+                interpreter,
+                script,
+            }
+            | ProviderLaunchPlan::PowerShellScript {
+                interpreter,
+                script,
+            } => {
+                interpreter.validate_current()?;
+                script.validate_current()?;
+            }
+        }
+        Ok(())
     }
 
     pub fn try_clone_file(&self) -> Result<File, ProviderExecutableError> {
-        self.executable.clone_file_handle()
+        self.revalidate()?;
+        self.launch_program().clone_file_handle()
     }
 
     pub fn into_file(self) -> Result<File, ProviderExecutableError> {
         self.revalidate()?;
-        self.executable.clone_file_handle()
+        self.launch_program().clone_file_handle()
+    }
+
+    pub(crate) fn launch_program(&self) -> &ProviderExecutable {
+        match &self.launch_plan {
+            ProviderLaunchPlan::Direct => &self.executable,
+            ProviderLaunchPlan::DirectTarget(target) => target,
+            ProviderLaunchPlan::NodeScript { interpreter, .. }
+            | ProviderLaunchPlan::PowerShellScript { interpreter, .. } => interpreter,
+        }
+    }
+
+    pub(crate) fn launch_fixed_arguments(&self) -> Vec<OsString> {
+        match &self.launch_plan {
+            ProviderLaunchPlan::Direct | ProviderLaunchPlan::DirectTarget(_) => Vec::new(),
+            ProviderLaunchPlan::NodeScript { script, .. }
+            | ProviderLaunchPlan::PowerShellScript { script, .. } => {
+                vec![script.canonical_path().as_os_str().to_os_string()]
+            }
+        }
+    }
+
+    /// Clone every file that participates in this launch graph. Unix callers
+    /// use these handles as the executable/script descriptors themselves,
+    /// avoiding a second path lookup after identity attestation. The primary
+    /// handle is first in the tuple; the optional second handle is the script
+    /// for a Node or PowerShell wrapper.
+    #[cfg(unix)]
+    pub(crate) fn launch_files(&self) -> Result<(File, Option<File>), ProviderExecutableError> {
+        let program = self.launch_program().clone_file_handle()?;
+        let script = match &self.launch_plan {
+            ProviderLaunchPlan::NodeScript { script, .. }
+            | ProviderLaunchPlan::PowerShellScript { script, .. } => {
+                Some(script.clone_file_handle()?)
+            }
+            ProviderLaunchPlan::Direct | ProviderLaunchPlan::DirectTarget(_) => None,
+        };
+        Ok((program, script))
     }
 }
 
@@ -2211,8 +2462,17 @@ fn open_nofollow(path: &Path) -> Result<File, ProviderExecutableError> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Keep the attested file open without delete sharing. Windows then
+        // cannot replace or rename the path between identity capture and
+        // CreateProcess. Write sharing is retained for existing fixture and
+        // updater behavior; the bound hash/identity check rejects in-place
+        // mutation before the launch is admitted.
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
     }
 
     #[cfg(unix)]
@@ -2828,7 +3088,17 @@ impl fmt::Debug for ProviderDiscoveryOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderExecutableForm {
     Native,
-    WindowsShim { target: Box<ProviderExecutable> },
+    WindowsShim {
+        target: Box<ProviderExecutable>,
+    },
+    WindowsNodeScript {
+        interpreter: Box<ProviderExecutable>,
+        script: Box<ProviderExecutable>,
+    },
+    WindowsPowerShellScript {
+        interpreter: Box<ProviderExecutable>,
+        script: Box<ProviderExecutable>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2871,6 +3141,13 @@ impl ProviderDiscoveryCandidate {
 
     pub fn form(&self) -> &ProviderExecutableForm {
         &self.form
+    }
+
+    /// Converts an attested discovery graph into the launch capability used
+    /// by probes and later provider runtimes.  Every interpreter/target in a
+    /// wrapper graph is revalidated before the handle is issued.
+    pub fn open_for_launch(&self) -> Result<ProviderExecutableHandle, ProviderExecutableError> {
+        self.executable.open_for_launch_form(&self.form)
     }
 }
 
@@ -3078,20 +3355,19 @@ impl ProviderDiscoveryContract {
             }
 
             #[cfg(target_os = "windows")]
-            if let Some(shim_entrypoint) = self.shim_entrypoint() {
-                let shim_path = entry.directory.join(shim_entrypoint);
-                match fs::symlink_metadata(&shim_path) {
-                    Ok(_) => candidates.push(self.validate_windows_shim(
-                        shim_path,
-                        native_path.clone(),
-                        origin,
-                        true,
+            for wrapper_entrypoint in self.wrapper_entrypoints() {
+                let wrapper_path = entry.directory.join(wrapper_entrypoint);
+                match fs::symlink_metadata(&wrapper_path) {
+                    Ok(_) => candidates.push(self.resolve_windows_wrapper(
+                        wrapper_path,
+                        origin.clone(),
+                        snapshot,
                     )?),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(ProviderDiscoveryError::Executable(
                             ProviderExecutableError::Io {
-                                path: shim_path,
+                                path: wrapper_path,
                                 kind: error.kind(),
                             },
                         ));
@@ -3108,6 +3384,16 @@ impl ProviderDiscoveryContract {
     ) -> Result<ProviderDiscoveryCandidate, ProviderDiscoveryError> {
         match candidate {
             ProviderDiscoveryCandidateInput::Native { path, origin } => {
+                #[cfg(target_os = "windows")]
+                let executable = match ProviderExecutable::from_path(&path) {
+                    Ok(executable) => executable,
+                    Err(ProviderExecutableError::NotNativeExecutable(_)) => {
+                        let snapshot = ProviderPathSnapshot::capture_current()?;
+                        return self.resolve_windows_wrapper(path, origin, &snapshot);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                #[cfg(not(target_os = "windows"))]
                 let executable = ProviderExecutable::from_path(&path)?;
                 self.validate_origin(&executable, &origin)?;
                 self.validate_native_path(&executable)?;
@@ -3150,6 +3436,18 @@ impl ProviderDiscoveryContract {
             ));
         }
         self.validate_native_path(executable)
+    }
+
+    fn wrapper_entrypoints(&self) -> Vec<String> {
+        if !cfg!(windows) {
+            return Vec::new();
+        }
+        let stem = match self.kind {
+            ProviderKind::ClaudeCode => "claude",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor-agent",
+        };
+        vec![format!("{stem}.cmd"), format!("{stem}.ps1")]
     }
 
     fn validate_native_path(
@@ -3257,9 +3555,7 @@ impl ProviderDiscoveryContract {
             }
             let contents = std::str::from_utf8(&contents)
                 .map_err(|_| ProviderDiscoveryError::ShimProofInvalid(shim_path.clone()))?;
-            let expected_crlf = format!("@echo off\r\ncall \"%~dp0{target_name}\" %*\r\n");
-            let expected_lf = expected_crlf.replace("\r\n", "\n");
-            if contents != expected_crlf && contents != expected_lf {
+            if !attest_direct_cmd_wrapper(contents, &target_name) {
                 return Err(ProviderDiscoveryError::ShimProofInvalid(shim_path));
             }
             Ok(ProviderDiscoveryCandidate {
@@ -3273,6 +3569,479 @@ impl ProviderDiscoveryContract {
             })
         }
     }
+
+    #[cfg(target_os = "windows")]
+    fn resolve_windows_wrapper(
+        &self,
+        wrapper_path: PathBuf,
+        origin: ProviderDiscoveryOrigin,
+        snapshot: &ProviderPathSnapshot,
+    ) -> Result<ProviderDiscoveryCandidate, ProviderDiscoveryError> {
+        let wrapper = ProviderExecutable::inspect_non_native_blocking(&wrapper_path)?;
+        self.validate_wrapper_name(&wrapper)?;
+        if matches!(origin, ProviderDiscoveryOrigin::ConfiguredOverride) {
+            self.validate_origin(&wrapper, &origin)?;
+        }
+        let contents = wrapper.read_handle_contents().map_err(|_| {
+            ProviderDiscoveryError::ShimProofInvalid(wrapper.canonical_path().to_path_buf())
+        })?;
+        if contents.len() > MAX_PROVIDER_SHIM_BYTES {
+            return Err(ProviderDiscoveryError::ShimProofInvalid(wrapper_path));
+        }
+        let contents = std::str::from_utf8(&contents)
+            .map_err(|_| ProviderDiscoveryError::ShimProofInvalid(wrapper_path.clone()))?;
+        let provider_wrapper = attest_provider_wrapper(self.kind, &wrapper_path, contents);
+        let direct_claude_shim = self.kind == ProviderKind::ClaudeCode
+            && wrapper_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+            && attest_direct_cmd_wrapper(contents, &self.native_entrypoint);
+        if !provider_wrapper && !direct_claude_shim {
+            return Err(ProviderDiscoveryError::ShimProofInvalid(wrapper_path));
+        }
+
+        let form = match self.kind {
+            ProviderKind::ClaudeCode => {
+                let target_path =
+                    parse_claude_wrapper_target(&wrapper_path, contents).ok_or_else(|| {
+                        ProviderDiscoveryError::ShimProofInvalid(wrapper_path.clone())
+                    })?;
+                let target = ProviderExecutable::from_path(target_path)?;
+                self.validate_native_path(&target)?;
+                ProviderExecutableForm::WindowsShim {
+                    target: Box::new(target),
+                }
+            }
+            ProviderKind::Codex => {
+                let script_path = match parse_codex_wrapper_script(&wrapper_path, contents) {
+                    Some(path) => path,
+                    None => return Err(ProviderDiscoveryError::ShimProofInvalid(wrapper_path)),
+                };
+                let script = ProviderExecutable::inspect_non_native_blocking(&script_path)?;
+                let interpreter = resolve_node_interpreter(&wrapper_path, snapshot)?;
+                ProviderExecutableForm::WindowsNodeScript {
+                    interpreter: Box::new(interpreter),
+                    script: Box::new(script),
+                }
+            }
+            ProviderKind::Cursor => {
+                if wrapper_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+                {
+                    let script_path =
+                        parse_cursor_cmd_script(&wrapper_path, contents).ok_or_else(|| {
+                            ProviderDiscoveryError::ShimProofInvalid(wrapper_path.clone())
+                        })?;
+                    let script = ProviderExecutable::inspect_non_native_blocking(&script_path)?;
+                    let script_contents = script.read_handle_contents().map_err(|_| {
+                        ProviderDiscoveryError::ShimProofInvalid(script_path.clone())
+                    })?;
+                    let script_contents = std::str::from_utf8(&script_contents).map_err(|_| {
+                        ProviderDiscoveryError::ShimProofInvalid(script_path.clone())
+                    })?;
+                    if !attest_cursor_powershell_wrapper(script_contents) {
+                        return Err(ProviderDiscoveryError::ShimProofInvalid(script_path));
+                    }
+                    let (interpreter, node_script) =
+                        resolve_cursor_wrapper(&script_path, script_contents)?;
+                    ProviderExecutableForm::WindowsNodeScript {
+                        interpreter: Box::new(interpreter),
+                        script: Box::new(node_script),
+                    }
+                } else {
+                    let (interpreter, script) = resolve_cursor_wrapper(&wrapper_path, contents)?;
+                    ProviderExecutableForm::WindowsNodeScript {
+                        interpreter: Box::new(interpreter),
+                        script: Box::new(script),
+                    }
+                }
+            }
+        };
+        Ok(ProviderDiscoveryCandidate {
+            kind: self.kind,
+            origin,
+            requested_path: wrapper_path,
+            executable: wrapper,
+            form,
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn validate_wrapper_name(
+        &self,
+        wrapper: &ProviderExecutable,
+    ) -> Result<(), ProviderDiscoveryError> {
+        let file_name = wrapper
+            .canonical_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                ProviderDiscoveryError::WrongEntrypoint(wrapper.canonical_path().to_path_buf())
+            })?;
+        if self
+            .wrapper_entrypoints()
+            .iter()
+            .any(|entrypoint| same_entrypoint(file_name, entrypoint))
+        {
+            Ok(())
+        } else {
+            Err(ProviderDiscoveryError::WrongEntrypoint(
+                wrapper.canonical_path().to_path_buf(),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attest_direct_cmd_wrapper(contents: &str, target_name: &str) -> bool {
+    let normalized = contents.replace("\r\n", "\n");
+    let expected = format!("@echo off\ncall \"%~dp0{target_name}\" %*\n");
+    if normalized.eq_ignore_ascii_case(&expected) {
+        return true;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    let safe_markers = [
+        "@echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+    ];
+    if !safe_markers.iter().all(|marker| lower.contains(marker))
+        || lower.contains("powershell")
+        || lower.contains("cmd /c")
+        || lower.contains("http")
+        || lower.contains("&&")
+        || lower.contains("||")
+        || lower.contains("|")
+        || lower.contains(";")
+        || !lower.contains(&target_name.to_ascii_lowercase())
+    {
+        return false;
+    }
+    lower.lines().any(|line| {
+        line.contains("%dp0%")
+            && line.contains(&target_name.to_ascii_lowercase())
+            && line.contains("%*")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_provider_wrapper(kind: ProviderKind, path: &Path, contents: &str) -> bool {
+    let lower = contents.replace("\r\n", "\n").to_ascii_lowercase();
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    let unsafe_marker = lower.contains("invoke-expression")
+        || lower.contains("download")
+        || lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("cmd /c")
+        || lower.contains("start-process")
+        || lower.contains("powershell -command")
+        || lower.contains("-command ");
+    if unsafe_marker {
+        return false;
+    }
+    match kind {
+        ProviderKind::ClaudeCode => {
+            if extension.eq_ignore_ascii_case("cmd") {
+                attest_claude_cmd_wrapper(&lower)
+            } else {
+                attest_claude_powershell_wrapper(&lower)
+            }
+        }
+        ProviderKind::Codex => {
+            if extension.eq_ignore_ascii_case("cmd") {
+                attest_codex_cmd_wrapper(&lower)
+            } else {
+                attest_codex_powershell_wrapper(&lower)
+            }
+        }
+        ProviderKind::Cursor => {
+            if extension.eq_ignore_ascii_case("cmd") {
+                attest_cursor_cmd_wrapper(&lower)
+            } else {
+                attest_cursor_powershell_wrapper(&lower)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attest_claude_cmd_wrapper(lower: &str) -> bool {
+    [
+        "@echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+        "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+        "%*",
+    ]
+    .iter()
+    .all(|marker| lower.contains(marker))
+        && lower.lines().any(|line| {
+            line.contains("%dp0%")
+                && line.contains("node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
+                && line.contains("%*")
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_claude_powershell_wrapper(lower: &str) -> bool {
+    lower.contains("$basedir=split-path")
+        && lower.contains("$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+        && lower.contains("$args")
+        && lower.contains("exit $lastexitcode")
+}
+
+#[cfg(target_os = "windows")]
+fn attest_codex_cmd_wrapper(lower: &str) -> bool {
+    [
+        "@echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+        "if exist \"%dp0%\\node.exe\"",
+        "set \"_prog=%dp0%\\node.exe\"",
+        "set \"_prog=node\"",
+        "codex.js",
+        "%*",
+    ]
+    .iter()
+    .all(|marker| lower.contains(marker))
+        && lower.contains("endlocal & goto")
+        && lower.lines().any(|line| {
+            line.contains("%_prog%")
+                && line.contains("%dp0%\\..\\@openai\\codex\\bin\\codex.js")
+                && line.contains("%*")
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn attest_codex_powershell_wrapper(lower: &str) -> bool {
+    lower.contains("split-path")
+        && lower.contains("$basedir/node$exe")
+        && lower.contains("$basedir/../@openai/codex/bin/codex.js")
+        && lower.contains("\"node$exe\"")
+        && lower.contains("$lastexitcode")
+}
+
+#[cfg(target_os = "windows")]
+fn attest_cursor_cmd_wrapper(lower: &str) -> bool {
+    [
+        "@echo off",
+        "setlocal",
+        "cursor_invoked_as=%~nx0",
+        "set \"script_dir=%~dp0\"",
+        "powershell.exe",
+        "-noprofile",
+        "-executionpolicy bypass",
+        "-file \"%script_dir%\\cursor-agent.ps1\" %*",
+    ]
+    .iter()
+    .all(|marker| lower.contains(marker))
+        && !lower.contains("-command")
+        && !lower.contains("||")
+        && !lower.contains("&&")
+}
+
+#[cfg(target_os = "windows")]
+fn attest_cursor_powershell_wrapper(lower: &str) -> bool {
+    let lower = lower.to_ascii_lowercase();
+    let markers = [
+        lower.contains("$scriptpath = split-path -parent"),
+        lower.contains("get-childitem -path \"$scriptpath\\versions\""),
+        lower.contains("node.exe"),
+        lower.contains("index.js"),
+        lower.contains("parse-versionstring"),
+        lower.contains("sort-object"),
+        lower.contains("exit $lastexitcode"),
+    ];
+    markers.into_iter().all(|marker| marker)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_claude_wrapper_target(wrapper_path: &Path, contents: &str) -> Option<PathBuf> {
+    let lower = contents.to_ascii_lowercase();
+    if lower.contains("%~dp0claude.exe") {
+        return Some(wrapper_path.parent()?.join("claude.exe"));
+    }
+    if lower.contains("node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")
+        || lower.contains("node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+        || lower.contains("$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+    {
+        return Some(
+            wrapper_path
+                .parent()?
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code")
+                .join("bin")
+                .join("claude.exe"),
+        );
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn parse_codex_wrapper_script(wrapper_path: &Path, contents: &str) -> Option<PathBuf> {
+    let lower = contents.to_ascii_lowercase();
+    if !lower.contains("codex")
+        || !lower.contains("node")
+        || lower.contains("powershell")
+        || lower.contains("cmd /c")
+        || lower.contains("http")
+    {
+        return None;
+    }
+    let relative = wrapper_path
+        .parent()?
+        .join("..")
+        .join("@openai")
+        .join("codex")
+        .join("bin")
+        .join("codex.js");
+    Some(relative)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_cursor_cmd_script(wrapper_path: &Path, contents: &str) -> Option<PathBuf> {
+    let lower = contents.replace("\r\n", "\n").to_ascii_lowercase();
+    if !attest_cursor_cmd_wrapper(&lower) {
+        return None;
+    }
+    Some(wrapper_path.parent()?.join("cursor-agent.ps1"))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_node_interpreter(
+    wrapper_path: &Path,
+    snapshot: &ProviderPathSnapshot,
+) -> Result<ProviderExecutable, ProviderDiscoveryError> {
+    let sibling = wrapper_path.parent().map(|parent| parent.join("node.exe"));
+    if let Some(path) = sibling {
+        match ProviderExecutable::from_path(&path) {
+            Ok(node) => return Ok(node),
+            Err(ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_)) => {}
+            Err(error) => return Err(ProviderDiscoveryError::Executable(error)),
+        }
+    }
+    for entry in &snapshot.directories {
+        entry.validate_current()?;
+        let path = entry.directory.join("node.exe");
+        match ProviderExecutable::from_path(&path) {
+            Ok(node) => return Ok(node),
+            Err(ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_)) => {}
+            Err(error) => return Err(ProviderDiscoveryError::Executable(error)),
+        }
+    }
+    Err(ProviderDiscoveryError::NoCandidate(ProviderKind::Codex))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_cursor_wrapper(
+    wrapper_path: &Path,
+    contents: &str,
+) -> Result<(ProviderExecutable, ProviderExecutable), ProviderDiscoveryError> {
+    let lower = contents.to_ascii_lowercase();
+    if !lower.contains("get-childitem -path \"$scriptpath\\versions\"")
+        || !lower.contains("node.exe")
+        || !lower.contains("index.js")
+        || lower.contains("invoke-expression")
+        || lower.contains("download")
+        || lower.contains("http")
+    {
+        return Err(ProviderDiscoveryError::ShimProofInvalid(
+            wrapper_path.to_path_buf(),
+        ));
+    }
+    let parent = wrapper_path
+        .parent()
+        .ok_or_else(|| ProviderDiscoveryError::ShimProofInvalid(wrapper_path.to_path_buf()))?;
+    if parent.join("node.exe").is_file() && parent.join("index.js").is_file() {
+        let interpreter = ProviderExecutable::from_path(parent.join("node.exe"))?;
+        let script = ProviderExecutable::inspect_non_native_blocking(&parent.join("index.js"))?;
+        return Ok((interpreter, script));
+    }
+    let versions = parent.join("versions");
+    let mut candidates = fs::read_dir(&versions)
+        .map_err(|_| ProviderDiscoveryError::ShimProofInvalid(versions.clone()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            parse_cursor_version_key(&name).map(|key| (key, name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    // Preserve deterministic selection when an updater publishes two entries
+    // with the same date/time key.  The stock wrapper's directory iteration
+    // order is unspecified, so a lexical commit/name tie-break is part of the
+    // attested graph rather than an ambient filesystem detail.
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let (_, _, version_dir) = candidates
+        .pop()
+        .ok_or_else(|| ProviderDiscoveryError::ShimProofInvalid(versions.clone()))?;
+    let interpreter = ProviderExecutable::from_path(version_dir.join("node.exe"))?;
+    let script = ProviderExecutable::inspect_non_native_blocking(&version_dir.join("index.js"))?;
+    Ok((interpreter, script))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_cursor_version_key(name: &str) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    let mut parts = name.split('-');
+    let date = parts.next()?;
+    let date_parts = date
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if date_parts.len() != 3 || date_parts[0] < 2000 || date_parts[0] > 9999 {
+        return None;
+    }
+    let suffix = parts.collect::<Vec<_>>();
+    if suffix.is_empty() || suffix.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let (hour, minute, second) = if suffix.len() >= 4
+        && suffix[..3]
+            .iter()
+            .all(|part| part.parse::<u32>().is_ok_and(|value| value <= 99))
+    {
+        (
+            suffix[0].parse().ok()?,
+            suffix[1].parse().ok()?,
+            suffix[2].parse().ok()?,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    let commit = suffix.last()?;
+    if !commit
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((
+        date_parts[0],
+        date_parts[1],
+        date_parts[2],
+        hour,
+        minute,
+        second,
+    ))
 }
 
 fn same_entrypoint(left: &str, right: &str) -> bool {
@@ -3311,6 +4080,70 @@ fn is_forbidden_runner_name(name: &str) -> bool {
     ]
     .iter()
     .any(|forbidden| same_entrypoint(forbidden, name))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod wrapper_tests {
+    use super::{
+        attest_codex_cmd_wrapper, attest_cursor_cmd_wrapper, attest_cursor_powershell_wrapper,
+        attest_provider_wrapper,
+    };
+    use crate::providers::capabilities::ProviderKind;
+
+    #[test]
+    fn stock_codex_cmd_wrapper_is_attested() {
+        let wrapper = r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\..\@openai\codex\bin\codex.js" %*
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_codex_cmd_wrapper(&wrapper));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Codex,
+            std::path::Path::new("codex.cmd"),
+            &wrapper
+        ));
+
+        let cursor_cmd = r#"@echo off
+setlocal enabledelayedexpansion
+set "CURSOR_INVOKED_AS=%~nx0"
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\cursor-agent.ps1" %*
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_cursor_cmd_wrapper(&cursor_cmd));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Cursor,
+            std::path::Path::new("cursor-agent.cmd"),
+            &cursor_cmd
+        ));
+        let cursor_ps1 = r#"$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition
+function Parse-VersionString { param ([string]$versionString) return 1 }
+$versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory | Sort-Object { Parse-VersionString $_.Name } -Descending
+$nodePath = "$scriptPath\versions\x\node.exe"
+& "$nodePath" "$scriptPath\versions\x\index.js" $args
+exit $LASTEXITCODE
+"#
+        .replace("\r\n", "\n")
+        .to_ascii_lowercase();
+        assert!(attest_cursor_powershell_wrapper(&cursor_ps1));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
