@@ -1,5 +1,7 @@
 //! Caller-driven initial synchronization and live durable subscription.
 
+use std::collections::{HashSet, VecDeque};
+
 use crate::client::connection::UnsolicitedServerMessage;
 use crate::client::host_client::HostClient;
 use crate::client::model::{ClientModel, ClientModelBuilder, ClientModelError};
@@ -17,6 +19,7 @@ const SNAPSHOT_SECTIONS: [SnapshotSection; 5] = [
     SnapshotSection::Resources,
     SnapshotSection::Operations,
 ];
+const MAX_SEEN_EVENT_IDS: usize = 8_192;
 
 /// Explicit subscription lifecycle visible to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +95,8 @@ pub struct ClientSubscription {
     subscription_id: Option<SubscriptionId>,
     model: Option<ClientModel>,
     snapshot_id: Option<SnapshotId>,
+    seen_event_ids: HashSet<crate::domain::id::EventId>,
+    seen_event_order: VecDeque<crate::domain::id::EventId>,
 }
 
 impl Default for ClientSubscription {
@@ -107,6 +112,8 @@ impl ClientSubscription {
             subscription_id: None,
             model: None,
             snapshot_id: None,
+            seen_event_ids: HashSet::new(),
+            seen_event_order: VecDeque::new(),
         }
     }
 
@@ -230,6 +237,9 @@ impl ClientSubscription {
         let mut batch = open;
         loop {
             let next = batch.page.next_cursor.clone();
+            for event in &batch.page.events {
+                self.remember_event_id(event.id);
+            }
             model.apply_replay_page(&batch.page)?;
             let Some(cursor) = next else {
                 break;
@@ -301,6 +311,26 @@ impl ClientSubscription {
                         },
                     ));
                 }
+                if self.seen_event_ids.contains(&event.id) {
+                    // An exact replay of a previously delivered event is
+                    // idempotent. Keep the event visible to the caller so its
+                    // durable cursor can remain monotonic without mutating the
+                    // model a second time.
+                    return Ok(SubscriptionUpdate::DurableEvent(event));
+                }
+                if event.sequence
+                    <= self
+                        .model
+                        .as_ref()
+                        .ok_or(SubscriptionError::IncompleteSnapshot)?
+                        .last_applied_sequence()
+                {
+                    self.state = ClientSubscriptionState::NeedsResync;
+                    return Err(SubscriptionError::Model(
+                        ClientModelError::DuplicateOrRegression,
+                    ));
+                }
+                self.remember_event_id(event.id);
                 let model = self
                     .model
                     .as_mut()
@@ -343,6 +373,17 @@ impl ClientSubscription {
                 })
             }
             UnsolicitedServerMessage::Stream(frame) => Ok(SubscriptionUpdate::Stream(frame)),
+        }
+    }
+
+    fn remember_event_id(&mut self, event_id: crate::domain::id::EventId) {
+        if self.seen_event_ids.insert(event_id) {
+            self.seen_event_order.push_back(event_id);
+            if self.seen_event_order.len() > MAX_SEEN_EVENT_IDS {
+                if let Some(evicted) = self.seen_event_order.pop_front() {
+                    self.seen_event_ids.remove(&evicted);
+                }
+            }
         }
     }
 
@@ -462,6 +503,8 @@ mod tests {
             subscription_id: Some(SubscriptionId::from_bytes(fixed_uuid_v7(0xb4)).expect("sub")),
             model: Some(model),
             snapshot_id: None,
+            seen_event_ids: std::collections::HashSet::new(),
+            seen_event_order: std::collections::VecDeque::new(),
         }
     }
 
@@ -534,5 +577,127 @@ mod tests {
             sub.model().expect("model").last_applied_sequence(),
             cursor_before
         );
+    }
+
+    #[test]
+    fn inbox_runtime_projects_one_subscription_and_fences_replay_duplicates_and_foreign_events() {
+        use crate::ui::task_cockpit::InboxRuntime;
+
+        let mut runtime = InboxRuntime::new();
+        runtime.attach_subscription(ready_subscription());
+        let own = runtime
+            .subscription()
+            .and_then(|subscription| subscription.subscription_id())
+            .expect("ready subscription id");
+        let task = runtime
+            .subscription()
+            .and_then(|subscription| subscription.model())
+            .and_then(|model| model.tasks().keys().next().copied())
+            .expect("ready task");
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| row.title.as_str()),
+            Some("Sub")
+        );
+
+        let event = DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc2)).expect("event"),
+            task_id: Some(task),
+            sequence: 2,
+            task_revision: Some(2),
+            occurred_at_ms: 22,
+            payload: Event::TaskRenamed {
+                title: "Renamed".into(),
+            },
+        };
+        let message = UnsolicitedServerMessage::DurableEvent {
+            subscription_id: own,
+            event: event.clone(),
+        };
+        let update = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(message.clone())
+            .expect("live event");
+        assert!(runtime
+            .apply_subscription_update(update)
+            .expect("projection update"));
+        assert_eq!(runtime.unread_cursor().last_seen_sequence(), 2);
+        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert_eq!(
+            runtime
+                .projection()
+                .and_then(|projection| projection.row(task))
+                .map(|row| (row.title.as_str(), row.occurred_at_ms)),
+            Some(("Renamed", 22))
+        );
+        assert_eq!(
+            runtime
+                .subscription()
+                .and_then(|subscription| subscription.model())
+                .map(|model| model.task_projection_index_incremental_updates()),
+            Some(1),
+            "one durable event updates one keyed index entry"
+        );
+
+        let duplicate = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(message)
+            .expect("duplicate event is idempotent");
+        assert!(!runtime
+            .apply_subscription_update(duplicate)
+            .expect("duplicate projection update"));
+        assert_eq!(runtime.unread_cursor().unread_count(task), 1);
+        assert_eq!(runtime.projection_updates(), 2);
+
+        let lower = DomainEvent {
+            id: EventId::from_bytes(fixed_uuid_v7(0xc3)).expect("lower event"),
+            task_id: Some(task),
+            sequence: 1,
+            task_revision: Some(2),
+            occurred_at_ms: 11,
+            payload: Event::TaskRenamed {
+                title: "Out of order".into(),
+            },
+        };
+        let error = runtime
+            .subscription_mut()
+            .expect("subscription")
+            .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+                subscription_id: own,
+                event: lower,
+            })
+            .expect_err("unknown out-of-order event must require resync");
+        assert!(matches!(error, SubscriptionError::Model(_)));
+        assert_eq!(
+            runtime
+                .subscription()
+                .map(|subscription| subscription.state()),
+            Some(ClientSubscriptionState::NeedsResync)
+        );
+
+        let mut foreign = ready_subscription();
+        let foreign_id = SubscriptionId::from_bytes(fixed_uuid_v7(0xc5)).expect("foreign id");
+        assert_ne!(foreign_id, own);
+        let foreign_error = foreign
+            .handle_unsolicited_message(UnsolicitedServerMessage::DurableEvent {
+                subscription_id: foreign_id,
+                event: DomainEvent {
+                    id: EventId::from_bytes(fixed_uuid_v7(0xc4)).expect("foreign event"),
+                    task_id: None,
+                    sequence: 2,
+                    task_revision: None,
+                    occurred_at_ms: 23,
+                    payload: Event::TaskReopened,
+                },
+            })
+            .expect_err("foreign event must fail closed");
+        assert!(matches!(
+            foreign_error,
+            SubscriptionError::ForeignSubscription(_)
+        ));
     }
 }

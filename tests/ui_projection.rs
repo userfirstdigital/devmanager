@@ -1,7 +1,8 @@
 use devmanager::client::{ClientModel, ClientModelBuilder};
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
-    AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId, TaskId,
+    AgentSessionId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -18,8 +19,8 @@ use devmanager::ui::preview::{
 };
 use devmanager::ui::task_cockpit::{
     Inbox, InboxError, InboxFilter, InboxItemKey, InboxPresentationWidth, InboxRenderItem,
-    InboxSection, InboxState, PrimaryProviderState, RuntimeSummary, UnreadCursor,
-    DEFAULT_VISIBLE_ROWS,
+    InboxSection, InboxState, PrimaryProviderIcon, PrimaryProviderState, RuntimeSummary,
+    UnreadCursor, DEFAULT_VISIBLE_ROWS,
 };
 use devmanager::ui::{self, PreviewInitReport};
 use std::cell::Cell;
@@ -751,7 +752,7 @@ fn inbox_attention_order_is_deterministic_and_selection_is_task_id_based() {
 }
 
 #[test]
-fn inbox_keeps_legacy_task_list_identity_and_viewport_accessors_synchronized() {
+fn inbox_exposes_active_identity_and_viewport_accessors_synchronized() {
     let model = inbox_model(vec![
         inbox_task_item(
             inbox_task_id(0),
@@ -777,14 +778,13 @@ fn inbox_keeps_legacy_task_list_identity_and_viewport_accessors_synchronized() {
     let mut inbox = Inbox::from_model(&model);
 
     assert_eq!(
-        inbox.task_list().task_ids(),
-        &[inbox_task_id(1), inbox_task_id(0)]
+        inbox.task_ids().collect::<Vec<_>>(),
+        vec![inbox_task_id(1), inbox_task_id(0)]
     );
     inbox
-        .task_list_mut()
-        .set_viewport(1, 1)
-        .expect("legacy viewport accessor must remain usable");
-    assert_eq!(inbox.virtual_window(), inbox.task_list().virtual_window());
+        .set_active_viewport(1, 1)
+        .expect("active viewport must remain usable");
+    assert_eq!(inbox.active_virtual_window(), inbox.virtual_window());
     assert_eq!(inbox.visible_rows()[0].task_id, inbox_task_id(0));
 }
 
@@ -955,7 +955,7 @@ fn inbox_overflow_retains_attention_order_before_capping() {
     assert_eq!(inbox.len(), 5_000);
     assert_eq!(
         inbox.overflow(),
-        Some(devmanager::ui::task_cockpit::TaskListOverflow {
+        Some(devmanager::ui::task_cockpit::InboxOverflow {
             limit: 5_000,
             total_count: 5_001,
             retained_count: 5_000,
@@ -1059,7 +1059,8 @@ fn inbox_fixture_drives_bounded_display_data_and_compact_render_items() {
     assert_eq!(
         rich_row.display.primary_provider,
         PrimaryProviderState::Present {
-            kind: rich["provider"].as_str().expect("provider").into()
+            icon: PrimaryProviderIcon::Claude,
+            kind: "Claude".into()
         }
     );
     assert_eq!(
@@ -1071,7 +1072,7 @@ fn inbox_fixture_drives_bounded_display_data_and_compact_render_items() {
     );
     assert_eq!(
         rich_row.display.worktree,
-        rich["worktree_branch"].as_str().expect("worktree branch")
+        "feature·task-inbox-with-a-deliberately-long-branch-name"
     );
     assert!(!rich_row
         .display
@@ -1162,6 +1163,57 @@ fn inbox_accessibility_announces_unread_and_bounded_information() {
 }
 
 #[test]
+fn inbox_redacts_control_path_and_provider_session_data_at_projection_ingress() {
+    let task_id = inbox_task_id(36);
+    let agent_id = AgentSessionId::from_bytes(fixed_uuid_v7(0x36)).expect("agent");
+    let SnapshotItem::Task(mut task) = inbox_task_item_with_workspace(
+        task_id,
+        "token\u{0000}/title\u{202e}",
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        36,
+        WorkspaceRef::worktree(r"C:\Users\micro\secret-workspace", "feature/secret-branch")
+            .expect("workspace"),
+    ) else {
+        unreachable!("task fixture must be a task")
+    };
+    task.primary_agent_id = Some(agent_id);
+    let model = inbox_model_with_related(
+        vec![SnapshotItem::Task(task)],
+        vec![inbox_agent_item(task_id, agent_id, "codex:account-secret")],
+        Vec::new(),
+    );
+    let inbox = Inbox::from_model(&model);
+    let row = inbox.row(task_id).expect("redacted row");
+    assert!(!row.title.chars().any(char::is_control));
+    assert!(!row.title.contains('/'));
+    assert!(!row.title.contains('\u{202e}'));
+    assert_eq!(row.display.worktree, "feature·secret-branch");
+    assert_eq!(
+        row.display.primary_provider,
+        PrimaryProviderState::Present {
+            icon: PrimaryProviderIcon::Other,
+            kind: "Provider".into(),
+        }
+    );
+    let render = inbox.render_model(InboxPresentationWidth::Regular);
+    let row = render
+        .items
+        .iter()
+        .find_map(|item| match item {
+            InboxRenderItem::Row(row) if row.task_id == task_id => Some(row),
+            _ => None,
+        })
+        .expect("rendered redacted row");
+    assert!(!row.accessible_description.contains("account-secret"));
+    assert!(!row.accessible_description.contains("secret-workspace"));
+    assert!(!row.accessible_description.chars().any(char::is_control));
+}
+
+#[test]
 fn inbox_render_model_has_narrow_empty_filtered_and_error_states() {
     let empty =
         Inbox::from_model(&inbox_model(Vec::new())).render_model(InboxPresentationWidth::Narrow);
@@ -1242,6 +1294,38 @@ fn unread_cursor_is_bounded_semantic_state_and_reconnect_idempotent() {
 }
 
 #[test]
+fn durable_unread_cursor_roundtrips_and_ignores_duplicate_out_of_order_and_foreign_events() {
+    let task = inbox_task_id(51);
+    let event = |tail: u8, task_id: Option<TaskId>, sequence: u64| DomainEvent {
+        id: EventId::from_bytes(fixed_uuid_v7(tail)).expect("event id"),
+        task_id,
+        sequence,
+        task_revision: None,
+        occurred_at_ms: sequence as i64,
+        payload: Event::TaskReopened,
+    };
+    let first = event(0x51, Some(task), 7);
+    let mut cursor = UnreadCursor::default();
+    assert!(cursor.observe_durable_event(&first));
+    assert!(
+        !cursor.observe_durable_event(&first),
+        "duplicate id is idempotent"
+    );
+    assert!(!cursor.observe_durable_event(&event(0x52, Some(task), 6)));
+    assert_eq!(cursor.last_seen_sequence(), 7);
+    assert_eq!(cursor.unread_count(task), 1);
+    assert!(cursor.observe_durable_event(&event(0x53, None, 8)));
+    assert_eq!(cursor.last_seen_sequence(), 8);
+    assert_eq!(cursor.unread_count(task), 1);
+
+    let restored =
+        UnreadCursor::decode_durable(&cursor.encode_durable().expect("durable cursor encoding"))
+            .expect("durable cursor decoding");
+    assert_eq!(restored, cursor, "restart must preserve the event cursor");
+    assert!(UnreadCursor::decode_durable(b"not-a-cursor").is_err());
+}
+
+#[test]
 fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertions() {
     let items = (0..100_000)
         .map(|index| {
@@ -1265,7 +1349,7 @@ fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertio
     let second = Inbox::from_model(&model);
     assert_eq!(first, second);
     assert_eq!(first.len(), 5_000);
-    assert_eq!(first.task_list().task_ids().len(), 5_000);
+    assert_eq!(first.task_ids().count(), 5_000);
     assert_eq!(model.task_projection_index_rebuilds(), 1);
 }
 

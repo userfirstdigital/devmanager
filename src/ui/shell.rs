@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use crate::domain::id::TaskId;
-use crate::ui::task_cockpit::{Inbox, InboxPresentationWidth, InboxRenderModel};
+use crate::ui::task_cockpit::{
+    Inbox, InboxPresentationWidth, InboxRenderModel, RuntimeSummary, TaskRowModel,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerButton {
@@ -40,12 +42,41 @@ pub enum NavigationResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxActionKind {
+    Activate,
+    MarkRead,
+    Archive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxActionRejection {
+    StaleNavigationEpoch,
+    StaleFocusEpoch,
+    TaskNotInInbox,
+    RowGenerationChanged,
+    RuntimeGenerationChanged,
+    ReadOnly,
+    ActionNotAllowed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboxActionCommit {
+    pub task_id: TaskId,
+    pub action: InboxActionKind,
+}
+
 /// An action captured from an inbox row. The task identity and the shell's
 /// current navigation epoch travel together through asynchronous work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapturedInboxAction {
     task_id: TaskId,
     navigation_epoch: u64,
+    focus_epoch: u64,
+    row_generation: u64,
+    runtime_generation: Option<u64>,
+    read_only: bool,
+    action: InboxActionKind,
 }
 
 impl CapturedInboxAction {
@@ -55,6 +86,26 @@ impl CapturedInboxAction {
 
     pub fn navigation_epoch(self) -> u64 {
         self.navigation_epoch
+    }
+
+    pub fn focus_epoch(self) -> u64 {
+        self.focus_epoch
+    }
+
+    pub fn row_generation(self) -> u64 {
+        self.row_generation
+    }
+
+    pub fn runtime_generation(self) -> Option<u64> {
+        self.runtime_generation
+    }
+
+    pub fn read_only(self) -> bool {
+        self.read_only
+    }
+
+    pub fn action(self) -> InboxActionKind {
+        self.action
     }
 }
 
@@ -151,6 +202,7 @@ pub type TerminalPointerOwner = PointerOwner;
 pub struct Shell {
     selected_task: Option<TaskId>,
     navigation_epoch: u64,
+    focus_epoch: u64,
     transient_priority: Option<TransientPriority>,
     pointer_owner: Option<PointerCapture>,
     generation: u64,
@@ -163,6 +215,7 @@ impl Shell {
         Self {
             selected_task,
             navigation_epoch: 0,
+            focus_epoch: 0,
             transient_priority: None,
             pointer_owner: None,
             generation: 0,
@@ -178,7 +231,7 @@ impl Shell {
     }
 
     pub fn focus_navigation_epoch(&self) -> u64 {
-        self.navigation_epoch
+        self.focus_epoch
     }
 
     pub fn transient_priority(&self) -> Option<TransientPriority> {
@@ -212,6 +265,81 @@ impl Shell {
         Ok(CapturedInboxAction {
             task_id,
             navigation_epoch: self.navigation_epoch,
+            focus_epoch: self.focus_epoch,
+            row_generation: 0,
+            runtime_generation: None,
+            read_only: false,
+            action: InboxActionKind::Activate,
+        })
+    }
+
+    /// Capture a complete row action at pointer/keyboard time. All identity
+    /// and generation facts travel with the request; callers must pass the
+    /// token to `dispatch_inbox_action` at execution time.
+    pub fn capture_inbox_row_action(
+        &self,
+        row: &TaskRowModel,
+        expected_navigation_epoch: u64,
+        expected_focus_epoch: u64,
+        action: InboxActionKind,
+    ) -> Result<CapturedInboxAction, InboxActionRejection> {
+        if expected_navigation_epoch != self.navigation_epoch {
+            return Err(InboxActionRejection::StaleNavigationEpoch);
+        }
+        if expected_focus_epoch != self.focus_epoch {
+            return Err(InboxActionRejection::StaleFocusEpoch);
+        }
+        if row.read_only {
+            return Err(InboxActionRejection::ReadOnly);
+        }
+        let runtime_generation = match row.display.runtime {
+            RuntimeSummary::Present { generation, .. } => Some(generation),
+            RuntimeSummary::Missing => None,
+        };
+        Ok(CapturedInboxAction {
+            task_id: row.task_id,
+            navigation_epoch: self.navigation_epoch,
+            focus_epoch: self.focus_epoch,
+            row_generation: row.revision,
+            runtime_generation,
+            read_only: row.read_only,
+            action,
+        })
+    }
+
+    /// Revalidate every captured fact against the current projection at the
+    /// point the action is actually dispatched. This closes reorder, keyboard
+    /// replay, cross-task click-through, and archived-row races.
+    pub fn dispatch_inbox_action(
+        &self,
+        action: CapturedInboxAction,
+        inbox: &Inbox,
+    ) -> Result<InboxActionCommit, InboxActionRejection> {
+        if action.navigation_epoch != self.navigation_epoch {
+            return Err(InboxActionRejection::StaleNavigationEpoch);
+        }
+        if action.focus_epoch != self.focus_epoch {
+            return Err(InboxActionRejection::StaleFocusEpoch);
+        }
+        let Some(row) = inbox.active_row(action.task_id) else {
+            return Err(InboxActionRejection::TaskNotInInbox);
+        };
+        if action.read_only || row.read_only {
+            return Err(InboxActionRejection::ReadOnly);
+        }
+        if row.revision != action.row_generation {
+            return Err(InboxActionRejection::RowGenerationChanged);
+        }
+        let current_runtime_generation = match row.display.runtime {
+            RuntimeSummary::Present { generation, .. } => Some(generation),
+            RuntimeSummary::Missing => None,
+        };
+        if current_runtime_generation != action.runtime_generation {
+            return Err(InboxActionRejection::RuntimeGenerationChanged);
+        }
+        Ok(InboxActionCommit {
+            task_id: action.task_id,
+            action: action.action,
         })
     }
 
@@ -258,6 +386,7 @@ impl Shell {
         };
         self.selected_task = Some(task_id);
         self.navigation_epoch = next_epoch;
+        self.focus_epoch = next_epoch;
         self.invalidate_pointer_owner();
         NavigationResult::Committed {
             task_id,
@@ -332,6 +461,7 @@ impl Shell {
             return false;
         };
         self.navigation_epoch = next_epoch;
+        self.focus_epoch = next_epoch;
         true
     }
 

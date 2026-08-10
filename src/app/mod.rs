@@ -19,6 +19,7 @@ use crate::browser::{
     BrowserRisk, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
+use crate::domain::id::TaskId;
 use crate::git::git_service;
 use crate::models::{
     AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
@@ -42,6 +43,11 @@ use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
 use crate::terminal::{self, view};
+use crate::ui::shell::{InboxActionKind, TaskCockpitShell};
+use crate::ui::task_cockpit::{
+    render_native_inbox_with_actions, InboxPresentationWidth, InboxRowMouseDownHandler,
+    InboxRuntime,
+};
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, apply_browser_enabled_preference, CommandDraft, DiagnosticsDraft, EditorAction,
@@ -345,6 +351,11 @@ struct NativeShell {
     pending_install_update: Option<String>,
     pending_app_termination: Option<PendingAppTermination>,
     window_subscriptions: Vec<Subscription>,
+    /// One durable ClientSubscription -> ClientModel -> Inbox bridge for the
+    /// native shell. It is intentionally separate from legacy session tabs;
+    /// once attached, the Inbox is the sole task-list projection.
+    inbox_runtime: InboxRuntime,
+    inbox_shell: TaskCockpitShell,
 }
 
 type BrowserReplaySecretSubmitter =
@@ -1059,6 +1070,47 @@ fn resolve_remote_state_startup(
 }
 
 impl NativeShell {
+    fn handle_inbox_row_mouse_down(
+        &mut self,
+        task_id: TaskId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let Some(inbox) = self.inbox_runtime.projection() else {
+            window.prevent_default();
+            return;
+        };
+        let navigation_epoch = self.inbox_shell.navigation_epoch();
+        let focus_epoch = self.inbox_shell.focus_navigation_epoch();
+        let action_committed = inbox
+            .active_row(task_id)
+            .and_then(|row| {
+                self.inbox_shell
+                    .capture_inbox_row_action(
+                        row,
+                        navigation_epoch,
+                        focus_epoch,
+                        InboxActionKind::Activate,
+                    )
+                    .ok()
+            })
+            .and_then(|captured| self.inbox_shell.dispatch_inbox_action(captured, inbox).ok())
+            .is_some();
+        if action_committed {
+            let _ = self
+                .inbox_shell
+                .navigation_mouse_down(task_id, navigation_epoch, inbox);
+        }
+        // The row owns this pointer event even when the generation/epoch fence
+        // rejects it; it must never bubble into a terminal or another task.
+        window.prevent_default();
+        cx.notify();
+    }
+
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
         let (mut browser_host, browser_app_config_dir, browser_config_diagnostic) =
@@ -1387,6 +1439,8 @@ impl NativeShell {
             pending_install_update: None,
             pending_app_termination: None,
             window_subscriptions: Vec::new(),
+            inbox_runtime: InboxRuntime::new(),
+            inbox_shell: TaskCockpitShell::new(None),
         };
 
         Self::spawn_splash_image_fetch(shell.native_dialog_blockers.clone(), cx);
@@ -14784,6 +14838,28 @@ impl Render for NativeShell {
         } else {
             None
         };
+        let inbox_render_model = self
+            .inbox_runtime
+            .projection()
+            .map(|inbox| {
+                self.inbox_shell
+                    .inbox_render_model(inbox, InboxPresentationWidth::Regular)
+            })
+            .unwrap_or_else(|| {
+                self.inbox_runtime
+                    .render_model(InboxPresentationWidth::Regular)
+            });
+        let show_task_inbox = self.inbox_runtime.projection().is_some()
+            && terminal_model
+                .as_ref()
+                .is_none_or(|model| model.active_tab_type.is_none());
+        let inbox_entity = cx.weak_entity();
+        let inbox_row_handler: InboxRowMouseDownHandler =
+            Arc::new(move |task_id, event, window, app| {
+                let _ = inbox_entity.update(app, |this, cx| {
+                    this.handle_inbox_row_mouse_down(task_id, event, window, cx);
+                });
+            });
         let browser_model = self.active_browser_model();
 
         let make_open_settings_handler =
@@ -15645,6 +15721,11 @@ impl Render for NativeShell {
                                 },
                             ))
                             .into_any_element()
+                    } else if show_task_inbox {
+                        render_native_inbox_with_actions(
+                            &inbox_render_model,
+                            Some(inbox_row_handler.clone()),
+                        )
                     } else {
                         let model = terminal_model.as_ref().expect("terminal model");
                         let terminal_surface = div()

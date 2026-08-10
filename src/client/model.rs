@@ -2,7 +2,7 @@
 //! and advanced by ordered durable events.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactSummary;
@@ -122,6 +122,7 @@ impl std::error::Error for ClientModelError {}
 struct TaskProjectionEntry {
     lifecycle: TaskLifecycle,
     attention_rank: u8,
+    occurred_at_ms: i64,
     revision: u64,
     lower_title: String,
     title: String,
@@ -136,34 +137,40 @@ struct TaskProjectionEntry {
 pub struct TaskProjectionIndex {
     revision: u64,
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
-    active_task_ids: Vec<TaskId>,
-    archived_task_ids: Vec<TaskId>,
+    active_order: BTreeSet<TaskOrderKey>,
+    archived_order: BTreeSet<TaskOrderKey>,
     full_rebuilds: u64,
+    incremental_updates: u64,
 }
 
 impl TaskProjectionIndex {
     fn from_tasks(tasks: &BTreeMap<TaskId, TaskSnapshot>, revision: u64) -> Self {
         let entries = tasks
             .iter()
-            .map(|(task_id, snapshot)| (*task_id, TaskProjectionEntry::from_snapshot(snapshot)))
+            .map(|(task_id, snapshot)| {
+                (
+                    *task_id,
+                    TaskProjectionEntry::from_snapshot(snapshot, snapshot.task.created_at_ms),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        let mut active_task_ids = Vec::new();
-        let mut archived_task_ids = Vec::new();
+        let mut active_order = BTreeSet::new();
+        let mut archived_order = BTreeSet::new();
         for (task_id, entry) in &entries {
+            let key = TaskOrderKey::new(*task_id, entry);
             if entry.lifecycle == TaskLifecycle::Archived {
-                archived_task_ids.push(*task_id);
+                archived_order.insert(key);
             } else {
-                active_task_ids.push(*task_id);
+                active_order.insert(key);
             }
         }
-        sort_task_ids(&mut active_task_ids, &entries);
-        sort_task_ids(&mut archived_task_ids, &entries);
         Self {
             revision,
             entries,
-            active_task_ids,
-            archived_task_ids,
+            active_order,
+            archived_order,
             full_rebuilds: 1,
+            incremental_updates: 0,
         }
     }
 
@@ -171,12 +178,36 @@ impl TaskProjectionIndex {
         self.revision
     }
 
-    pub fn active_task_ids(&self) -> &[TaskId] {
-        &self.active_task_ids
+    pub fn active_task_ids(&self) -> Vec<TaskId> {
+        self.active_order.iter().map(|key| key.task_id).collect()
     }
 
-    pub fn archived_task_ids(&self) -> &[TaskId] {
-        &self.archived_task_ids
+    pub fn active_count(&self) -> usize {
+        self.active_order.len()
+    }
+
+    pub fn archived_count(&self) -> usize {
+        self.archived_order.len()
+    }
+
+    pub fn top_active_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.active_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn top_archived_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.archived_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn archived_task_ids(&self) -> Vec<TaskId> {
+        self.archived_order.iter().map(|key| key.task_id).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -191,56 +222,47 @@ impl TaskProjectionIndex {
         self.full_rebuilds
     }
 
+    /// Number of keyed updates since construction. This is intentionally an
+    /// observable counter: production diagnostics can prove that a live event
+    /// updates one index entry instead of rebuilding a 100k-task list.
+    pub fn incremental_updates(&self) -> u64 {
+        self.incremental_updates
+    }
+
     fn set_revision(&mut self, revision: u64) {
         self.revision = revision;
     }
 
-    fn update_task(&mut self, snapshot: &TaskSnapshot) {
+    fn update_task(&mut self, snapshot: &TaskSnapshot, occurred_at_ms: i64) {
         let task_id = snapshot.task.id;
         self.remove_task_id(task_id);
-        let entry = TaskProjectionEntry::from_snapshot(snapshot);
+        let entry = TaskProjectionEntry::from_snapshot(snapshot, occurred_at_ms);
         let archived = entry.lifecycle == TaskLifecycle::Archived;
+        let key = TaskOrderKey::new(task_id, &entry);
         self.entries.insert(task_id, entry);
-        let insertion = if archived {
-            self.archived_task_ids
-                .binary_search_by(|candidate| compare_task_ids(candidate, &task_id, &self.entries))
-                .unwrap_or_else(|index| index)
+        if archived {
+            self.archived_order.insert(key);
         } else {
-            self.active_task_ids
-                .binary_search_by(|candidate| compare_task_ids(candidate, &task_id, &self.entries))
-                .unwrap_or_else(|index| index)
-        };
-        let ids = if archived {
-            &mut self.archived_task_ids
-        } else {
-            &mut self.active_task_ids
-        };
-        ids.insert(insertion, task_id);
+            self.active_order.insert(key);
+        }
+        self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
     fn remove_task_id(&mut self, task_id: TaskId) {
-        if let Some(index) = self
-            .active_task_ids
-            .iter()
-            .position(|candidate| *candidate == task_id)
-        {
-            self.active_task_ids.remove(index);
-        } else if let Some(index) = self
-            .archived_task_ids
-            .iter()
-            .position(|candidate| *candidate == task_id)
-        {
-            self.archived_task_ids.remove(index);
+        if let Some(entry) = self.entries.remove(&task_id) {
+            let key = TaskOrderKey::new(task_id, &entry);
+            self.active_order.remove(&key);
+            self.archived_order.remove(&key);
         }
-        self.entries.remove(&task_id);
     }
 }
 
 impl TaskProjectionEntry {
-    fn from_snapshot(snapshot: &TaskSnapshot) -> Self {
+    fn from_snapshot(snapshot: &TaskSnapshot, occurred_at_ms: i64) -> Self {
         Self {
             lifecycle: snapshot.task.lifecycle,
             attention_rank: attention_rank(snapshot.visible_status()),
+            occurred_at_ms,
             revision: snapshot.task.revision,
             lower_title: snapshot.task.title.to_lowercase(),
             title: snapshot.task.title.clone(),
@@ -248,24 +270,45 @@ impl TaskProjectionEntry {
     }
 }
 
-fn sort_task_ids(ids: &mut [TaskId], entries: &BTreeMap<TaskId, TaskProjectionEntry>) {
-    ids.sort_by(|left, right| compare_task_ids(left, right, entries));
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TaskOrderKey {
+    task_id: TaskId,
+    attention_rank: u8,
+    occurred_at_ms: i64,
+    revision: u64,
+    lower_title: String,
+    title: String,
 }
 
-fn compare_task_ids(
-    left: &TaskId,
-    right: &TaskId,
-    entries: &BTreeMap<TaskId, TaskProjectionEntry>,
-) -> Ordering {
-    let left_entry = entries.get(left).expect("task index entry exists");
-    let right_entry = entries.get(right).expect("task index entry exists");
-    left_entry
-        .attention_rank
-        .cmp(&right_entry.attention_rank)
-        .then_with(|| right_entry.revision.cmp(&left_entry.revision))
-        .then_with(|| left_entry.lower_title.cmp(&right_entry.lower_title))
-        .then_with(|| left_entry.title.cmp(&right_entry.title))
-        .then_with(|| left.cmp(right))
+impl TaskOrderKey {
+    fn new(task_id: TaskId, entry: &TaskProjectionEntry) -> Self {
+        Self {
+            task_id,
+            attention_rank: entry.attention_rank,
+            occurred_at_ms: entry.occurred_at_ms,
+            revision: entry.revision,
+            lower_title: entry.lower_title.clone(),
+            title: entry.title.clone(),
+        }
+    }
+}
+
+impl Ord for TaskOrderKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.attention_rank
+            .cmp(&other.attention_rank)
+            .then_with(|| other.occurred_at_ms.cmp(&self.occurred_at_ms))
+            .then_with(|| other.revision.cmp(&self.revision))
+            .then_with(|| self.lower_title.cmp(&other.lower_title))
+            .then_with(|| self.title.cmp(&other.title))
+            .then_with(|| self.task_id.cmp(&other.task_id))
+    }
+}
+
+impl PartialOrd for TaskOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn attention_rank(status: VisibleTaskStatus) -> u8 {
@@ -330,6 +373,17 @@ impl ClientModel {
 
     pub fn task_projection_index_rebuilds(&self) -> u64 {
         self.task_projection_index.full_rebuilds()
+    }
+
+    pub fn task_projection_index_incremental_updates(&self) -> u64 {
+        self.task_projection_index.incremental_updates()
+    }
+
+    pub fn task_last_occurred_at_ms(&self, task_id: TaskId) -> Option<i64> {
+        self.task_projection_index
+            .entries
+            .get(&task_id)
+            .map(|entry| entry.occurred_at_ms)
     }
 
     /// Shared bound check for frozen replay continuation cursors/pages.
@@ -435,7 +489,8 @@ impl ClientModel {
         let staged = self.stage_event(event)?;
         if let Some((task_id, snapshot)) = staged.task {
             self.tasks.insert(task_id, snapshot.clone());
-            self.task_projection_index.update_task(&snapshot);
+            self.task_projection_index
+                .update_task(&snapshot, event.occurred_at_ms);
         }
         if let Some((operation_id, facts)) = staged.operation {
             self.operations.insert(operation_id, facts);
