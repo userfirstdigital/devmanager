@@ -587,10 +587,17 @@ impl HostClient {
         };
 
         match reply.outcome {
+            QueryOutcome::Err(error @ QueryError::NotFound) => {
+                self.fence_retired_subscription(subscription_id).await?;
+                Ok(Err(error))
+            }
             QueryOutcome::Err(error) => Ok(Err(error)),
             QueryOutcome::Ok(QueryResult::EventReplayReleased {
                 subscription_id: released,
-            }) if released == subscription_id => Ok(Ok(())),
+            }) if released == subscription_id => {
+                self.fence_retired_subscription(subscription_id).await?;
+                Ok(Ok(()))
+            }
             QueryOutcome::Ok(QueryResult::EventReplayReleased { .. }) => {
                 self.retire_connection();
                 Err(IpcError::CorrelationMismatch)
@@ -828,6 +835,23 @@ impl HostClient {
 
     fn retire_connection(&mut self) {
         self.connection = None;
+    }
+
+    async fn fence_retired_subscription(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), IpcError> {
+        let result = match self.connection.as_ref() {
+            Some(connection) => connection.retire_subscription_id(subscription_id).await,
+            None => Err(IpcError::Unavailable),
+        };
+        if result.is_err() {
+            // A bounded drain failure is not safe to carry into a replacement
+            // generation. Force reconnect/resync instead of dropping unknown
+            // frames or leaving the shared queue poisoned.
+            self.retire_connection();
+        }
+        result
     }
 
     #[cfg(test)]

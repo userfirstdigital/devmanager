@@ -20,7 +20,10 @@ pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };
 pub use inbox_controller::{InboxControllerError, InboxHostController, SharedInboxSubscription};
-pub use model::{ClientModel, ClientModelBuilder, ClientModelError};
+pub use model::{
+    ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation, SearchPage,
+    SearchPageStatus,
+};
 pub use preferences::{ClientPreferenceError, InboxPreferenceStore};
 pub use subscription::{
     ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,

@@ -1,4 +1,6 @@
-use devmanager::client::model::MAX_CLIENT_SEARCH_POSTING_ENTRIES;
+use devmanager::client::model::{
+    MAX_CLIENT_SEARCH_POSTING_BYTES, MAX_CLIENT_SEARCH_POSTING_ENTRIES,
+};
 use devmanager::client::{
     ClientModel, ClientModelBuilder, HostClientConfig, InboxHostController, InboxPreferenceStore,
 };
@@ -1407,6 +1409,11 @@ fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertio
         model.task_projection_index_search_posting_entries() <= MAX_CLIENT_SEARCH_POSTING_ENTRIES,
         "search posting identities must remain within the bounded index budget"
     );
+    assert!(
+        model.task_projection_index_search_posting_entries() * std::mem::size_of::<TaskId>()
+            <= MAX_CLIENT_SEARCH_POSTING_BYTES,
+        "compact posting identities must stay within the byte budget"
+    );
 
     let first = Inbox::from_model(&model);
     let second = Inbox::from_model(&model);
@@ -1501,6 +1508,104 @@ fn indexed_search_keeps_common_and_adversarial_100k_queries_bounded_and_ordered(
         assert!(ids.len() <= 5_000);
         assert!(work <= 5_000, "hot-path work must be capped for {query:?}");
     }
+}
+
+#[test]
+fn indexed_search_repeated_titles_never_scan_a_full_long_query_posting() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                "aaaaaaaaa",
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+
+    let (ids, known_total, work) = model.search_task_ids_with_work("aaaaaaaaa", false);
+
+    assert_eq!(ids.len(), 5_000);
+    assert!(
+        known_total <= 5_000,
+        "a bounded page cannot claim an exact total"
+    );
+    assert!(
+        work <= 5_000,
+        "long repeated-title query scanned the full posting"
+    );
+}
+
+#[test]
+fn indexed_search_normalizes_expanding_unicode_before_the_shared_bound() {
+    let title = "İ".repeat(160);
+    let model = inbox_model(vec![inbox_task_item(
+        inbox_task_id(0),
+        &title,
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        0,
+    )]);
+
+    let (ids, total, work) = model.search_task_ids_with_work(&title, false);
+
+    assert_eq!(ids, vec![inbox_task_id(0)]);
+    assert_eq!(total, 1, "expanded Unicode title must remain searchable");
+    assert!(work <= 5_000);
+}
+
+#[test]
+fn indexed_search_continuations_are_bounded_and_fenced_to_the_current_query() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                "aaaaaaaaa",
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+
+    let mut page = model.search_task_ids_page("aaaaaaaaa", false, None);
+    assert_eq!(
+        page.status,
+        devmanager::client::model::SearchPageStatus::Partial
+    );
+    assert_eq!(page.known_total, 5_000);
+    assert_eq!(page.exact_total, None);
+    assert_eq!(page.work, 5_000);
+    assert!(page.continuation().is_some());
+
+    let stale = model.search_task_ids_page("bbbbbbbbb", false, page.continuation());
+    assert!(
+        stale.is_stale(),
+        "a prior query must never publish into a new query"
+    );
+
+    let mut pages = 1;
+    while let Some(continuation) = page.continuation().cloned() {
+        page = model.search_task_ids_page("aaaaaaaaa", false, Some(&continuation));
+        assert!(page.work <= 5_000);
+        pages += 1;
+        assert!(pages <= 21, "continuation must make bounded progress");
+    }
+    assert!(page.is_complete());
+    assert_eq!(page.exact_total, Some(100_000));
+    assert_eq!(page.ids.len(), 5_000);
 }
 
 #[test]

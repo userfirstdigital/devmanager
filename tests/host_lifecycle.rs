@@ -1305,6 +1305,115 @@ async fn durable_event_replay_transitions_to_live_without_gap_or_duplicate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_real_subscription_drains_only_retired_queued_frames() {
+    let config_base = TempDir::new().expect("process-unique config base");
+    let profile = unique_profile();
+    let paths = isolated_paths(&config_base, &profile);
+    let lock_path = paths.root.join("host.lock");
+
+    let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
+    let _identity = wait_for_identity(&mut host, &lock_path).await;
+
+    let writer_id = ClientId::from_bytes(fixed_uuid_v7(0xc2)).expect("writer client id");
+    let reader_id = ClientId::from_bytes(fixed_uuid_v7(0xc3)).expect("reader client id");
+    let requested =
+        CapabilitySet::from_capabilities([Capability::PagedSnapshots, Capability::EventReplay]);
+    let config = |client_id| HostClientConfig {
+        named_profile: profile.clone(),
+        client_build: format!("devmanager/{}", env!("CARGO_PKG_VERSION")),
+        client_id,
+        requested,
+        limits: FrameLimits::v1_default(),
+    };
+    let mut writer = connect_bounded(&config(writer_id), &mut host).await;
+    let mut reader = connect_bounded(&config(reader_id), &mut host).await;
+
+    let mut old = ClientSubscription::new();
+    old.synchronize(&mut reader)
+        .await
+        .expect("old subscription synchronize");
+
+    let (first_create, _, first_task_id) =
+        create_task_named(writer_id, 0xc4, 0xc5, 0xc6, 0xc7, "Retired first");
+    assert!(matches!(
+        writer
+            .execute_command(first_create)
+            .await
+            .expect("first event-producing command"),
+        CommandReceipt::Accepted { .. }
+    ));
+    let first_update = timeout(READY_TIMEOUT, old.recv_and_apply(&reader))
+        .await
+        .expect("old subscription receives first event")
+        .expect("old subscription first event apply");
+    assert!(matches!(
+        first_update,
+        SubscriptionUpdate::DurableEvent(event) if event.task_id == Some(first_task_id)
+    ));
+
+    // Keep the rest of the first command's three durable events queued, and
+    // add more old-generation events while the caller does not drain them.
+    for (offset, title) in [(0xc8, "Retired second"), (0xcc, "Retired third")] {
+        let (create, _, _) =
+            create_task_named(writer_id, offset, offset + 1, offset + 2, offset + 3, title);
+        assert!(matches!(
+            writer
+                .execute_command(create)
+                .await
+                .expect("queued old-generation command"),
+            CommandReceipt::Accepted { .. }
+        ));
+    }
+
+    old.release(&mut reader)
+        .await
+        .expect("retire old subscription and drain its queue");
+
+    let mut replacement = ClientSubscription::new();
+    replacement
+        .synchronize(&mut reader)
+        .await
+        .expect("replacement subscription synchronize");
+
+    let (replacement_create, _, replacement_task_id) =
+        create_task_named(writer_id, 0xd0, 0xd1, 0xd2, 0xd3, "Replacement event");
+    assert!(matches!(
+        writer
+            .execute_command(replacement_create)
+            .await
+            .expect("replacement event-producing command"),
+        CommandReceipt::Accepted { .. }
+    ));
+
+    while !replacement
+        .model()
+        .expect("replacement model")
+        .tasks()
+        .contains_key(&replacement_task_id)
+    {
+        let update = timeout(READY_TIMEOUT, replacement.recv_and_apply(&reader))
+            .await
+            .expect("replacement receives live event")
+            .expect("replacement live event apply");
+        assert!(
+            matches!(update, SubscriptionUpdate::DurableEvent(_)),
+            "retired frames must not surface as replacement errors: {update:?}"
+        );
+    }
+
+    replacement
+        .release(&mut reader)
+        .await
+        .expect("release replacement subscription");
+    writer.disconnect();
+    reader.disconnect();
+    let status = host
+        .terminate_and_wait_bounded(TERMINATE_TIMEOUT)
+        .expect("terminate exact foreground host");
+    assert!(!status.success(), "test termination should stop the host");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_snapshot_retains_id_across_section_restart_without_cursor() {
     let config_base = TempDir::new().expect("process-unique config base");
     let profile = unique_profile();

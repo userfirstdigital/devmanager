@@ -136,6 +136,7 @@ pub enum IpcError {
     ConnectionPoisoned,
     Busy,
     Unavailable,
+    RetiredSubscriptionFlood { limit: usize },
     Security(String),
 }
 
@@ -178,6 +179,10 @@ impl std::fmt::Display for IpcError {
             }
             Self::Busy => write!(f, "kernel store is busy"),
             Self::Unavailable => write!(f, "kernel store is temporarily unavailable"),
+            Self::RetiredSubscriptionFlood { limit } => write!(
+                f,
+                "retired subscription queue exceeded bounded drain limit of {limit}"
+            ),
             Self::Security(message) => write!(f, "named-pipe security error: {message}"),
         }
     }
@@ -204,6 +209,7 @@ impl std::error::Error for IpcError {
             | Self::ConnectionPoisoned
             | Self::Busy
             | Self::Unavailable
+            | Self::RetiredSubscriptionFlood { .. }
             | Self::Security(_) => None,
         }
     }

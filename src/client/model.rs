@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
 use crate::domain::agent::AgentSessionFacts;
@@ -34,16 +35,20 @@ pub const MAX_INDEXED_TITLE_CHARS: usize = MAX_CLIENT_SEARCH_CHARS;
 /// Maximum indexed search identities handed to one bounded UI projection.
 /// The index still reports the complete truthful match count separately.
 pub const MAX_CLIENT_SEARCH_RESULTS: usize = 5_000;
+/// Maximum candidate identities inspected by one input/paint search page.
+/// Longer searches continue from a bounded cursor on a later background turn.
+pub const MAX_CLIENT_SEARCH_WORK: usize = MAX_CLIENT_SEARCH_RESULTS;
 /// Search postings cannot admit more identities than one bounded client
 /// model. This keeps every posting finite while preserving its exact count.
 pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
 /// Exact postings cover common longer queries without a candidate scan.
 const MAX_INDEXED_GRAM_CHARS: usize = 8;
-/// Hard upper bound for the number of numeric posting identities retained by
-/// one model. Titles and grams are both prefix-bounded before this product is
-/// reached; the counter is exposed for diagnostics without scanning postings.
+/// Hard upper bound for the number of compact TaskId identities retained by
+/// one model's substring postings. Saturated postings degrade to bounded
+/// ordered-title continuation scans instead of allocating past this budget.
+pub const MAX_CLIENT_SEARCH_POSTING_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLIENT_SEARCH_POSTING_ENTRIES: usize =
-    MAX_CLIENT_MODEL_ITEMS * MAX_INDEXED_TITLE_CHARS * MAX_INDEXED_GRAM_CHARS;
+    MAX_CLIENT_SEARCH_POSTING_BYTES / std::mem::size_of::<TaskId>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -139,35 +144,61 @@ impl std::error::Error for ClientModelError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SearchPosting {
-    active: BTreeSet<SearchOrderKey>,
-    archived: BTreeSet<SearchOrderKey>,
+    active: BTreeSet<TaskId>,
+    archived: BTreeSet<TaskId>,
+    active_total: usize,
+    archived_total: usize,
+    active_truncated: bool,
+    archived_truncated: bool,
 }
 
 impl SearchPosting {
-    fn insert(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
-        let key = SearchOrderKey::new(task_id, entry);
+    fn insert(
+        &mut self,
+        task_id: TaskId,
+        entry: &TaskProjectionEntry,
+        budget_available: bool,
+    ) -> bool {
         let set = if entry.lifecycle == TaskLifecycle::Archived {
             &mut self.archived
         } else {
             &mut self.active
         };
-        if set.len() < MAX_CLIENT_SEARCH_POSTING_IDS {
-            return set.insert(key);
+        let truncated = if entry.lifecycle == TaskLifecycle::Archived {
+            &mut self.archived_truncated
+        } else {
+            &mut self.active_truncated
+        };
+        if set.contains(&task_id) {
+            return false;
         }
-        false
+        if entry.lifecycle == TaskLifecycle::Archived {
+            self.archived_total = self.archived_total.saturating_add(1);
+        } else {
+            self.active_total = self.active_total.saturating_add(1);
+        }
+        if set.len() >= MAX_CLIENT_SEARCH_POSTING_IDS || !budget_available {
+            *truncated = true;
+            return false;
+        }
+        set.insert(task_id)
     }
 
     fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
-        let key = SearchOrderKey::new(task_id, entry);
         let set = if entry.lifecycle == TaskLifecycle::Archived {
             &mut self.archived
         } else {
             &mut self.active
         };
-        set.remove(&key)
+        if entry.lifecycle == TaskLifecycle::Archived {
+            self.archived_total = self.archived_total.saturating_sub(1);
+        } else {
+            self.active_total = self.active_total.saturating_sub(1);
+        }
+        set.remove(&task_id)
     }
 
-    fn ids(&self, archived: bool) -> &BTreeSet<SearchOrderKey> {
+    fn ids(&self, archived: bool) -> &BTreeSet<TaskId> {
         if archived {
             &self.archived
         } else {
@@ -176,56 +207,32 @@ impl SearchPosting {
     }
 
     fn len(&self, archived: bool) -> usize {
-        self.ids(archived).len()
+        if archived {
+            self.archived_total
+        } else {
+            self.active_total
+        }
     }
 
-    fn contains(&self, archived: bool, key: &SearchOrderKey) -> bool {
-        self.ids(archived).contains(key)
+    fn contains(&self, archived: bool, task_id: TaskId) -> bool {
+        self.ids(archived).contains(&task_id)
+    }
+
+    fn complete(&self, archived: bool) -> bool {
+        if archived {
+            !self.archived_truncated
+        } else {
+            !self.active_truncated
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.active.is_empty() && self.archived.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct SearchOrderKey {
-    task_id: TaskId,
-    attention_rank: u8,
-    occurred_at_ms: i64,
-    revision: u64,
-    lower_title: Arc<str>,
-    title: Arc<str>,
-}
-
-impl SearchOrderKey {
-    fn new(task_id: TaskId, entry: &TaskProjectionEntry) -> Self {
-        Self {
-            task_id,
-            attention_rank: entry.attention_rank,
-            occurred_at_ms: entry.occurred_at_ms,
-            revision: entry.revision,
-            lower_title: Arc::clone(&entry.lower_title),
-            title: Arc::clone(&entry.title),
-        }
-    }
-}
-
-impl Ord for SearchOrderKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.attention_rank
-            .cmp(&other.attention_rank)
-            .then_with(|| other.occurred_at_ms.cmp(&self.occurred_at_ms))
-            .then_with(|| other.revision.cmp(&self.revision))
-            .then_with(|| self.lower_title.cmp(&other.lower_title))
-            .then_with(|| self.title.cmp(&other.title))
-            .then_with(|| self.task_id.cmp(&other.task_id))
-    }
-}
-
-impl PartialOrd for SearchOrderKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        self.active.is_empty()
+            && self.archived.is_empty()
+            && self.active_total == 0
+            && self.archived_total == 0
+            && !self.active_truncated
+            && !self.archived_truncated
     }
 }
 
@@ -239,6 +246,62 @@ struct TaskProjectionEntry {
     title: Arc<str>,
 }
 
+/// Cursor for a bounded continuation search. The cursor is revision-fenced so
+/// a model update cannot make a background result silently skip or duplicate
+/// identities in the newly ordered index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchContinuation {
+    query: String,
+    archived: bool,
+    revision: u64,
+    cursor: Option<TaskOrderKey>,
+    retained_ids: Vec<TaskId>,
+    lower_bound: usize,
+}
+
+/// Completion state for one bounded search page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPageStatus {
+    Complete,
+    Partial,
+    Stale,
+}
+
+/// Search results that never require scanning or cloning an unbounded posting.
+/// `known_total` is a lower bound until `exact_total` is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    pub ids: Vec<TaskId>,
+    pub known_total: usize,
+    pub exact_total: Option<usize>,
+    pub work: usize,
+    pub status: SearchPageStatus,
+    pub query_truncated: bool,
+    continuation: Option<SearchContinuation>,
+}
+
+impl SearchPage {
+    pub fn is_complete(&self) -> bool {
+        self.status == SearchPageStatus::Complete
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.status == SearchPageStatus::Partial
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.status == SearchPageStatus::Stale
+    }
+
+    pub fn lower_bound(&self) -> usize {
+        self.known_total
+    }
+
+    pub fn continuation(&self) -> Option<&SearchContinuation> {
+        self.continuation.as_ref()
+    }
+}
+
 /// Incremental, client-owned ordering index for Task Cockpit projections.
 ///
 /// The task map remains the only task truth. This index only stores bounded,
@@ -250,13 +313,13 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
-    /// Compact substring postings. Each entry stores bounded ordering metadata
-    /// and a TaskId; title strings remain in `entries` exactly once through
-    /// shared `Arc<str>` values.
-    /// The active/archive sets make the common exact-gram path independent of
-    /// the 100k task map.
+    /// Compact substring postings. Each posting stores only bounded TaskIds;
+    /// title/order strings remain in `entries` and the canonical order sets
+    /// exactly once. Saturated postings are marked and use bounded fallback
+    /// scans instead of allocating beyond the global entry budget.
     search: BTreeMap<String, SearchPosting>,
     search_posting_entries: usize,
+    search_index_saturated: bool,
     full_rebuilds: u64,
     incremental_updates: u64,
 }
@@ -276,6 +339,7 @@ impl TaskProjectionIndex {
         let mut archived_order = BTreeSet::new();
         let mut search = BTreeMap::<String, SearchPosting>::new();
         let mut search_posting_entries: usize = 0;
+        let mut search_index_saturated = false;
         for (task_id, entry) in &entries {
             let key = TaskOrderKey::new(*task_id, entry);
             if entry.lifecycle == TaskLifecycle::Archived {
@@ -284,7 +348,18 @@ impl TaskProjectionIndex {
                 active_order.insert(key);
             }
             for token in search_tokens(&entry.lower_title) {
-                if search.entry(token).or_default().insert(*task_id, entry) {
+                if !search.contains_key(&token)
+                    && search_posting_entries >= MAX_CLIENT_SEARCH_POSTING_ENTRIES
+                {
+                    search_index_saturated = true;
+                    continue;
+                }
+                let budget_available = search_posting_entries < MAX_CLIENT_SEARCH_POSTING_ENTRIES;
+                if search
+                    .entry(token)
+                    .or_default()
+                    .insert(*task_id, entry, budget_available)
+                {
                     search_posting_entries = search_posting_entries.saturating_add(1);
                 }
             }
@@ -296,6 +371,7 @@ impl TaskProjectionIndex {
             archived_order,
             search,
             search_posting_entries,
+            search_index_saturated,
             full_rebuilds: 1,
             incremental_updates: 0,
         }
@@ -337,29 +413,41 @@ impl TaskProjectionIndex {
         self.archived_order.iter().map(|key| key.task_id).collect()
     }
 
-    /// Return exact substring matches from the bounded title index. Results
-    /// retain the same attention/occurred-time ordering as ordinary inbox
-    /// rows, and the returned count is the truthful number of matches before
-    /// the UI retention cap.
+    /// Return the first bounded search page. For a large posting the count is
+    /// a truthful lower bound; callers that need the exact total continue from
+    /// [`Self::search_task_ids_page`]'s cursor off the input/paint path.
     pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
         let (ids, total, _) = self.search_task_ids_with_work(query, archived);
         (ids, total)
     }
 
-    /// Search with observable bounded candidate work for diagnostics/tests.
-    /// Exact grams return the complete truthful total and only the retained
-    /// first page; longer queries intersect the smallest posting and verify
-    /// titles without cloning any posting or walking the task map.
-    pub fn search_task_ids_with_work(
+    /// Return one bounded search page. The query and index revision fence a
+    /// continuation so stale background work cannot publish another query's
+    /// results. At most [`MAX_CLIENT_SEARCH_WORK`] candidates are inspected.
+    pub fn search_task_ids_page(
         &self,
         query: &str,
         archived: bool,
-    ) -> (Vec<TaskId>, usize, usize) {
-        let query = query
-            .chars()
-            .take(MAX_CLIENT_SEARCH_CHARS)
-            .collect::<String>()
-            .to_lowercase();
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        let (query, query_truncated) = normalize_search_query(query);
+        if let Some(continuation) = continuation {
+            if continuation.query != query
+                || continuation.archived != archived
+                || continuation.revision != self.revision
+            {
+                return SearchPage {
+                    ids: Vec::new(),
+                    known_total: 0,
+                    exact_total: None,
+                    work: 0,
+                    status: SearchPageStatus::Stale,
+                    query_truncated,
+                    continuation: None,
+                };
+            }
+        }
+
         if query.trim().is_empty() {
             let order = if archived {
                 &self.archived_order
@@ -372,60 +460,202 @@ impl TaskProjectionIndex {
                 .take(MAX_CLIENT_SEARCH_RESULTS)
                 .map(|key| key.task_id)
                 .collect();
-            return (ids, count, count.min(MAX_CLIENT_SEARCH_RESULTS));
+            return SearchPage {
+                ids,
+                known_total: count,
+                exact_total: Some(count),
+                work: count.min(MAX_CLIENT_SEARCH_WORK),
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            };
         }
 
-        // A complete one-to-eight-character gram is an exact substring index
-        // entry. It is already sorted by deterministic attention/occurred/title
-        // ordering, so no candidate scan or title clone is needed.
-        if query.chars().count() <= MAX_INDEXED_GRAM_CHARS {
-            let Some(posting) = self.search.get(&query) else {
-                return (Vec::new(), 0, 0);
-            };
-            let ids = posting
-                .ids(archived)
-                .iter()
-                .take(MAX_CLIENT_SEARCH_RESULTS)
-                .map(|key| key.task_id)
-                .collect::<Vec<_>>();
-            let count = posting.len(archived);
-            let work = ids.len();
-            return (ids, count, work);
-        }
         let tokens = search_tokens(&query);
-        if tokens.iter().any(|token| !self.search.contains_key(token)) {
-            return (Vec::new(), 0, 0);
+        let missing_token = tokens.iter().any(|token| !self.search.contains_key(token));
+        if missing_token && !self.search_index_saturated {
+            return SearchPage {
+                ids: Vec::new(),
+                known_total: 0,
+                exact_total: Some(0),
+                work: 0,
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            };
         }
-        let Some((_, first)) = tokens
+        let first = tokens
             .iter()
             .filter_map(|token| self.search.get(token).map(|posting| (token, posting)))
             .min_by_key(|(_, posting)| posting.len(archived))
-        else {
-            return (Vec::new(), 0, 0);
+            .map(|(_, posting)| posting);
+
+        let mut ids = continuation
+            .map(|continuation| continuation.retained_ids.clone())
+            .unwrap_or_default();
+        ids.truncate(MAX_CLIENT_SEARCH_RESULTS);
+        let mut count = continuation
+            .map(|continuation| continuation.lower_bound)
+            .unwrap_or_default();
+        let start_cursor = continuation.and_then(|continuation| continuation.cursor.as_ref());
+        let mut last_cursor = start_cursor.cloned();
+        let all_postings_complete = tokens.iter().all(|token| {
+            self.search
+                .get(token)
+                .is_some_and(|posting| posting.complete(archived))
+        });
+        let exact_gram_total = (query.chars().count() <= MAX_INDEXED_GRAM_CHARS)
+            .then(|| self.search.get(&query))
+            .flatten()
+            .map(|posting| posting.len(archived));
+
+        // A small complete posting can be materialized and sorted by the
+        // canonical order key without exceeding the page work bound. This
+        // keeps specific searches ordered even though postings store only
+        // compact TaskIds.
+        if continuation.is_none()
+            && !missing_token
+            && first.is_some_and(|first| {
+                first.len(archived) <= MAX_CLIENT_SEARCH_WORK
+                    && (first.complete(archived)
+                        || first.ids(archived).len() == first.len(archived))
+            })
+        {
+            let first = first.expect("small posting candidate");
+            let mut candidate_keys = first
+                .ids(archived)
+                .iter()
+                .filter_map(|task_id| {
+                    self.entries
+                        .get(task_id)
+                        .map(|entry| TaskOrderKey::new(*task_id, entry))
+                })
+                .collect::<Vec<_>>();
+            candidate_keys.sort_unstable();
+            let mut page_ids =
+                Vec::with_capacity(candidate_keys.len().min(MAX_CLIENT_SEARCH_RESULTS));
+            let mut count = 0usize;
+            for key in &candidate_keys {
+                let matches = (!all_postings_complete
+                    || tokens.iter().all(|token| {
+                        self.search
+                            .get(token)
+                            .is_some_and(|posting| posting.contains(archived, key.task_id))
+                    }))
+                    && self
+                        .entries
+                        .get(&key.task_id)
+                        .is_some_and(|entry| entry.lower_title.contains(&query));
+                if matches {
+                    count = count.saturating_add(1);
+                    if page_ids.len() < MAX_CLIENT_SEARCH_RESULTS {
+                        page_ids.push(key.task_id);
+                    }
+                }
+            }
+            return SearchPage {
+                work: candidate_keys.len(),
+                ids: page_ids,
+                known_total: count,
+                exact_total: Some(count),
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            };
+        }
+
+        let order = if archived {
+            &self.archived_order
+        } else {
+            &self.active_order
         };
-        let first_ids = first.ids(archived);
-        let mut ids = Vec::with_capacity(MAX_CLIENT_SEARCH_RESULTS.min(first_ids.len()));
-        let mut count = 0;
-        let mut work: usize = 0;
-        for key in first_ids {
+        let mut candidates: Box<dyn Iterator<Item = &TaskOrderKey> + '_> =
+            if let Some(cursor) = start_cursor {
+                Box::new(order.range((Excluded(cursor), Unbounded)))
+            } else {
+                Box::new(order.iter())
+            };
+        let posting_filter = all_postings_complete;
+        let exact_single_posting_total = exact_gram_total.or_else(|| {
+            if tokens.len() == 1 && posting_filter {
+                first.map(|posting| posting.len(archived))
+            } else {
+                None
+            }
+        });
+        let mut work = 0usize;
+        for key in candidates.by_ref().take(MAX_CLIENT_SEARCH_WORK) {
             work = work.saturating_add(1);
-            let matches = tokens.iter().all(|token| {
-                self.search
-                    .get(token)
-                    .is_some_and(|posting| posting.contains(archived, key))
-            }) && self
-                .entries
-                .get(&key.task_id)
-                .is_some_and(|entry| entry.lower_title.contains(&query));
+            last_cursor = Some(key.clone());
+            let matches = (!posting_filter
+                || tokens.iter().all(|token| {
+                    self.search
+                        .get(token)
+                        .is_some_and(|posting| posting.contains(archived, key.task_id))
+                }))
+                && self
+                    .entries
+                    .get(&key.task_id)
+                    .is_some_and(|entry| entry.lower_title.contains(&query));
             if !matches {
                 continue;
             }
-            count += 1;
+            count = count.saturating_add(1);
             if ids.len() < MAX_CLIENT_SEARCH_RESULTS {
                 ids.push(key.task_id);
             }
         }
-        (ids, count, work)
+        let exhausted = candidates.next().is_none();
+        if exhausted {
+            SearchPage {
+                ids,
+                known_total: count,
+                exact_total: exact_single_posting_total.or_else(|| {
+                    if posting_filter {
+                        Some(count)
+                    } else {
+                        None
+                    }
+                }),
+                work,
+                status: SearchPageStatus::Complete,
+                query_truncated,
+                continuation: None,
+            }
+        } else {
+            SearchPage {
+                ids: ids.clone(),
+                known_total: count,
+                exact_total: exact_single_posting_total,
+                work,
+                status: SearchPageStatus::Partial,
+                query_truncated,
+                continuation: Some(SearchContinuation {
+                    query,
+                    archived,
+                    revision: self.revision,
+                    cursor: last_cursor,
+                    retained_ids: ids,
+                    lower_bound: count,
+                }),
+            }
+        }
+    }
+
+    /// Search with observable bounded candidate work for diagnostics/tests.
+    /// Exact grams return the complete truthful total and only the retained
+    /// first page; longer queries return a lower bound until continued.
+    pub fn search_task_ids_with_work(
+        &self,
+        query: &str,
+        archived: bool,
+    ) -> (Vec<TaskId>, usize, usize) {
+        let page = self.search_task_ids_page(query, archived, None);
+        (
+            page.ids,
+            page.exact_total.unwrap_or(page.known_total),
+            page.work,
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -454,6 +684,10 @@ impl TaskProjectionIndex {
         self.search_posting_entries
     }
 
+    pub fn search_index_saturated(&self) -> bool {
+        self.search_index_saturated
+    }
+
     fn set_revision(&mut self, revision: u64) {
         self.revision = revision;
     }
@@ -476,7 +710,19 @@ impl TaskProjectionIndex {
             .get(&task_id)
             .expect("inserted task projection entry");
         for token in search_tokens(&search_title) {
-            if self.search.entry(token).or_default().insert(task_id, entry) {
+            if !self.search.contains_key(&token)
+                && self.search_posting_entries >= MAX_CLIENT_SEARCH_POSTING_ENTRIES
+            {
+                self.search_index_saturated = true;
+                continue;
+            }
+            let budget_available = self.search_posting_entries < MAX_CLIENT_SEARCH_POSTING_ENTRIES;
+            if self
+                .search
+                .entry(token)
+                .or_default()
+                .insert(task_id, entry, budget_available)
+            {
                 self.search_posting_entries = self.search_posting_entries.saturating_add(1);
             }
         }
@@ -528,6 +774,21 @@ fn search_tokens(value: &str) -> Vec<String> {
     tokens.into_iter().collect()
 }
 
+/// Lowercase first, then apply the scalar bound. Lowercase can expand a
+/// Unicode scalar (for example, `İ`), so bounding before normalization would
+/// make the authoritative title index and the UI query disagree.
+fn normalize_search_query(value: &str) -> (String, bool) {
+    let lowered = value.to_lowercase();
+    let truncated = lowered.chars().count() > MAX_CLIENT_SEARCH_CHARS;
+    (
+        lowered
+            .chars()
+            .take(MAX_CLIENT_SEARCH_CHARS)
+            .collect::<String>(),
+        truncated || value.chars().count() > MAX_CLIENT_SEARCH_CHARS,
+    )
+}
+
 impl TaskProjectionEntry {
     fn from_snapshot(snapshot: &TaskSnapshot, occurred_at_ms: i64) -> Self {
         let title = snapshot
@@ -536,11 +797,7 @@ impl TaskProjectionEntry {
             .chars()
             .take(MAX_INDEXED_TITLE_CHARS)
             .collect::<String>();
-        let lower_title = title
-            .to_lowercase()
-            .chars()
-            .take(MAX_INDEXED_TITLE_CHARS)
-            .collect::<String>();
+        let lower_title = normalize_search_query(&title).0;
         Self {
             lifecycle: snapshot.task.lifecycle,
             attention_rank: attention_rank(snapshot.visible_status()),
@@ -665,6 +922,10 @@ impl ClientModel {
         self.task_projection_index.search_index_posting_entries()
     }
 
+    pub fn task_projection_index_search_saturated(&self) -> bool {
+        self.task_projection_index.search_index_saturated()
+    }
+
     pub fn task_last_occurred_at_ms(&self, task_id: TaskId) -> Option<i64> {
         self.task_projection_index
             .entries
@@ -674,6 +935,16 @@ impl ClientModel {
 
     pub fn search_task_ids(&self, query: &str, archived: bool) -> (Vec<TaskId>, usize) {
         self.task_projection_index.search_task_ids(query, archived)
+    }
+
+    pub fn search_task_ids_page(
+        &self,
+        query: &str,
+        archived: bool,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.task_projection_index
+            .search_task_ids_page(query, archived, continuation)
     }
 
     pub fn search_task_ids_with_work(
