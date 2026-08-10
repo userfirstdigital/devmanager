@@ -342,7 +342,7 @@ where
 pub fn normalized_tags(tags: &[String]) -> Result<Vec<String>, PromptValidationError> {
     let mut normalized = Vec::with_capacity(tags.len());
     for (position, tag) in tags.iter().enumerate() {
-        let tag = tag.trim().to_lowercase();
+        let tag = trim_prompt_whitespace(tag).to_lowercase();
         if tag.is_empty() {
             return Err(PromptValidationError::EmptyTag { position });
         }
@@ -370,7 +370,7 @@ pub fn normalized_tags(tags: &[String]) -> Result<Vec<String>, PromptValidationE
 pub fn normalized_variables(variables: &[String]) -> Result<Vec<String>, PromptValidationError> {
     let mut normalized = Vec::with_capacity(variables.len());
     for (position, variable) in variables.iter().enumerate() {
-        let variable = variable.trim().to_string();
+        let variable = trim_prompt_whitespace(variable).to_string();
         if variable.is_empty() {
             return Err(PromptValidationError::EmptyVariable { position });
         }
@@ -397,7 +397,7 @@ pub fn normalized_variables(variables: &[String]) -> Result<Vec<String>, PromptV
 
 fn validate_title(title: &str) -> Result<(), PromptValidationError> {
     let actual = title.chars().count();
-    if title.trim().is_empty() {
+    if trim_prompt_whitespace(title).is_empty() {
         return Err(PromptValidationError::EmptyTitle);
     }
     if actual > MAX_PROMPT_TITLE_SCALARS {
@@ -1388,7 +1388,7 @@ where
     F: FnOnce(usize, usize) -> PromptValidationError,
 {
     let actual = title.chars().count();
-    if title.trim().is_empty() {
+    if trim_prompt_whitespace(title).is_empty() {
         return Err(PromptValidationError::EmptyTitle);
     }
     if actual > max {
@@ -1415,7 +1415,7 @@ fn validate_canonical_title(title: &str, max: usize) -> Result<(), String> {
         PromptValidationError::TitleTooLong { actual, max }
     })
     .map_err(|error| error.to_string())?;
-    if title != title.trim() {
+    if title != trim_prompt_whitespace(title) {
         return Err("prompt title must be trimmed".into());
     }
     Ok(())
@@ -1423,10 +1423,16 @@ fn validate_canonical_title(title: &str, max: usize) -> Result<(), String> {
 
 fn validate_canonical_description(description: Option<&str>, max: usize) -> Result<(), String> {
     validate_description_with_limit(description, max).map_err(|error| error.to_string())?;
-    if description.is_some_and(|description| description != description.trim()) {
+    if description.is_some_and(|description| description != trim_prompt_whitespace(description)) {
         return Err("prompt description must be trimmed".into());
     }
     Ok(())
+}
+
+/// Prompt metadata uses Rust's Unicode whitespace definition at every boundary.
+/// The SQLite migration mirrors this exact codepoint set with `char(...)`.
+pub fn trim_prompt_whitespace(value: &str) -> &str {
+    value.trim_matches(char::is_whitespace)
 }
 
 fn validate_canonical_tags(tags: &[String]) -> Result<(), String> {

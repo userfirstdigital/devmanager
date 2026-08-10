@@ -12,15 +12,15 @@ use crate::domain::id::{
 };
 
 use super::model::{
-    normalized_tags, normalized_variables, ArchivePrompt, ArchivePromptChain, CreatePrompt,
-    CreatePromptChain, CreatePromptVersion, InsertPromptChainLink, MovePromptChainLink,
-    PromptChain, PromptChainCommand, PromptChainEvent, PromptChainLink, PromptChainLinkContext,
-    PromptChainMutationReceipt, PromptCommand, PromptEvent, PromptMutationReceipt,
-    PromptProjectionRebuild, PromptSnapshot, PromptValidationError, PromptVersion,
-    RemovePromptChainLink, RenamePrompt, RenamePromptChain, RestorePrompt, RestorePromptChain,
-    SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion, MAX_PROMPT_BODY_BYTES,
-    MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS, MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_PAGE_SIZE,
-    MAX_PROMPT_TAGS, MAX_PROMPT_VARIABLES, PROMPT_WIRE_SCHEMA_VERSION,
+    normalized_tags, normalized_variables, trim_prompt_whitespace, ArchivePrompt,
+    ArchivePromptChain, CreatePrompt, CreatePromptChain, CreatePromptVersion,
+    InsertPromptChainLink, MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent,
+    PromptChainLink, PromptChainLinkContext, PromptChainMutationReceipt, PromptCommand,
+    PromptEvent, PromptMutationReceipt, PromptProjectionRebuild, PromptSnapshot,
+    PromptValidationError, PromptVersion, RemovePromptChainLink, RenamePrompt, RenamePromptChain,
+    RestorePrompt, RestorePromptChain, SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion,
+    MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS, MAX_PROMPT_CHAIN_TITLE_SCALARS,
+    MAX_PROMPT_PAGE_SIZE, MAX_PROMPT_TAGS, MAX_PROMPT_VARIABLES, PROMPT_WIRE_SCHEMA_VERSION,
 };
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -205,11 +205,36 @@ impl PromptStore {
                 |row| row.get(0),
             )
             .optional()?;
-        if blocked == Some(1) {
+        let Some(blocked) = blocked else {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage migration state is missing; exact repair is required".into(),
+            ));
+        };
+        if blocked != 0 {
             return Err(PromptStoreError::Corruption(
                 "legacy prompt lineage is quarantined and requires exact repair".into(),
             ));
         }
+        let quarantine_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prompt_lineage_quarantine",
+            [],
+            |row| row.get(0),
+        )?;
+        let missing_payload_count: i64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM prompt_command_receipts
+                 WHERE command_payload IS NULL OR length(command_payload) = 0)
+                + (SELECT COUNT(*) FROM prompt_chain_command_receipts
+                   WHERE command_payload IS NULL OR length(command_payload) = 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        if quarantine_count != 0 || missing_payload_count != 0 {
+            return Err(PromptStoreError::Corruption(
+                "prompt lineage has unrepaired quarantine or missing command payloads".into(),
+            ));
+        }
+        validate_prompt_command_payloads(&conn)?;
         Ok(Self { conn })
     }
 
@@ -765,6 +790,72 @@ fn validate_current_version_projection(tx: &Transaction<'_>) -> Result<(), Promp
     Ok(())
 }
 
+fn validate_prompt_command_payloads(conn: &Connection) -> Result<(), PromptStoreError> {
+    let mut statement = conn.prepare(
+        "SELECT command_sha256, command_payload
+         FROM prompt_command_receipts
+         ORDER BY command_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+    })?;
+    for row in rows {
+        let (stored_hash, payload) = row?;
+        let payload = payload.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "prompt receipt command payload is missing after migration repair".into(),
+            )
+        })?;
+        validate_wire_size("prompt command", &payload)?;
+        if stored_hash.len() != 32 || sha256_bytes(&payload).as_slice() != stored_hash.as_slice() {
+            return Err(PromptStoreError::Corruption(
+                "prompt receipt command payload does not match its digest".into(),
+            ));
+        }
+        let command = PromptCommand::decode(&payload)
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        if command
+            .encode()
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?
+            != payload
+        {
+            return Err(PromptStoreError::Corruption(
+                "prompt receipt command payload is not canonical".into(),
+            ));
+        }
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT command_sha256, command_payload
+         FROM prompt_chain_command_receipts
+         ORDER BY command_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+    })?;
+    for row in rows {
+        let (stored_hash, payload) = row?;
+        let payload = payload.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "prompt chain receipt command payload is missing after migration repair".into(),
+            )
+        })?;
+        validate_wire_size("prompt chain command", &payload)?;
+        if stored_hash.len() != 32 || sha256_bytes(&payload).as_slice() != stored_hash.as_slice() {
+            return Err(PromptStoreError::Corruption(
+                "prompt chain receipt command payload does not match its digest".into(),
+            ));
+        }
+        let decoded = decode_chain_command(&payload)?;
+        if encode_chain_command(&decoded.command, decoded.resolved_prompt_version_id)? != payload {
+            return Err(PromptStoreError::Corruption(
+                "prompt chain receipt command payload is not canonical".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 type PromptEventRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Vec<u8>);
 
 fn next_prompt_event_row(
@@ -845,11 +936,11 @@ fn validate_prompt_version_event_coverage(
 fn canonical_prompt_command(mut command: PromptCommand) -> Result<PromptCommand, PromptStoreError> {
     match &mut command {
         PromptCommand::CreatePrompt(command) => {
-            command.title = command.title.trim().to_string();
+            command.title = trim_prompt_whitespace(&command.title).to_string();
             command.description = command
                 .description
                 .take()
-                .map(|description| description.trim().to_string());
+                .map(|description| trim_prompt_whitespace(&description).to_string());
             command.tags = normalized_tags(&command.tags)?;
             validate_sql_tags(&command.tags)?;
             command.variables = normalized_variables(&command.variables)?;
@@ -858,7 +949,7 @@ fn canonical_prompt_command(mut command: PromptCommand) -> Result<PromptCommand,
             command.variables = normalized_variables(&command.variables)?;
         }
         PromptCommand::RenamePrompt(command) => {
-            command.title = command.title.trim().to_string();
+            command.title = trim_prompt_whitespace(&command.title).to_string();
         }
         PromptCommand::SetPromptTags(command) => {
             command.tags = normalized_tags(&command.tags)?;
@@ -873,7 +964,7 @@ fn canonical_prompt_command(mut command: PromptCommand) -> Result<PromptCommand,
 fn validate_sql_tags(tags: &[String]) -> Result<(), PromptStoreError> {
     if tags.iter().any(|tag| {
         tag.is_empty()
-            || tag != tag.trim()
+            || tag != trim_prompt_whitespace(tag)
             || tag.bytes().any(|byte| !(0x20..=0x7e).contains(&byte))
             || tag.as_str() != tag.to_ascii_lowercase()
     }) {
@@ -898,14 +989,14 @@ fn canonical_prompt_chain_command(
 ) -> Result<PromptChainCommand, PromptStoreError> {
     match &mut command {
         PromptChainCommand::CreatePromptChain(command) => {
-            command.title = command.title.trim().to_string();
+            command.title = trim_prompt_whitespace(&command.title).to_string();
             command.description = command
                 .description
                 .take()
-                .map(|description| description.trim().to_string());
+                .map(|description| trim_prompt_whitespace(&description).to_string());
         }
         PromptChainCommand::RenamePromptChain(command) => {
-            command.title = command.title.trim().to_string();
+            command.title = trim_prompt_whitespace(&command.title).to_string();
         }
         PromptChainCommand::InsertPromptChainLink(_)
         | PromptChainCommand::MovePromptChainLink(_)
@@ -1053,11 +1144,11 @@ fn apply_create(
     )?;
     let prompt = SavedPrompt {
         id: command.prompt_id,
-        title: command.title.trim().to_string(),
+        title: trim_prompt_whitespace(&command.title).to_string(),
         description: command
             .description
             .as_deref()
-            .map(str::trim)
+            .map(trim_prompt_whitespace)
             .map(str::to_string),
         tags,
         current_version_id: version.id,
@@ -1129,7 +1220,7 @@ fn apply_rename(
     check_revision(&prompt, command.expected_revision)?;
     ensure_prompt_active(&prompt)?;
     command.validate()?;
-    let title = command.title.trim();
+    let title = trim_prompt_whitespace(&command.title);
     if prompt.title == title {
         let receipt = PromptMutationReceipt {
             command_id,
@@ -1367,11 +1458,11 @@ fn apply_create_chain(
     command.validate()?;
     let chain = PromptChain {
         id: command.chain_id,
-        title: command.title.trim().to_string(),
+        title: trim_prompt_whitespace(&command.title).to_string(),
         description: command
             .description
             .as_deref()
-            .map(str::trim)
+            .map(trim_prompt_whitespace)
             .map(str::to_string),
         revision: 1,
         archived_at_ms: None,
@@ -1402,7 +1493,7 @@ fn apply_rename_chain(
         return Err(PromptStoreError::InvalidTransition);
     }
     command.validate()?;
-    let title = command.title.trim();
+    let title = trim_prompt_whitespace(&command.title);
     if chain.title == title {
         return Ok((
             chain_receipt(command_id, &chain, None),
@@ -1920,11 +2011,11 @@ fn apply_event(
             if prompt.revision != 1
                 || prompt.current_version_id != version.id
                 || prompt.archived_at_ms.is_some()
-                || prompt.title != prompt.title.trim()
+                || prompt.title != trim_prompt_whitespace(&prompt.title)
                 || prompt
                     .description
                     .as_deref()
-                    .is_some_and(|description| description != description.trim())
+                    .is_some_and(|description| description != trim_prompt_whitespace(description))
                 || normalized_tags(&prompt.tags).map_err(|_| {
                     PromptStoreError::Corruption("prompt.created tags are invalid".into())
                 })? != prompt.tags
@@ -1997,7 +2088,7 @@ fn apply_event(
                 "prompt rename event references missing prompt".into(),
             ))?;
             let expected_revision = next_revision(prompt.revision)?;
-            let title_is_valid = title.trim() == title
+            let title_is_valid = trim_prompt_whitespace(title) == title
                 && (RenamePrompt {
                     prompt_id: *prompt_id,
                     title: title.clone(),
@@ -2294,12 +2385,12 @@ fn apply_chain_event(
         PromptChainEvent::PromptChainCreated { chain } => {
             if chain.revision != 1
                 || chain.archived_at_ms.is_some()
-                || chain.title.trim().is_empty()
-                || chain.title != chain.title.trim()
+                || trim_prompt_whitespace(&chain.title).is_empty()
+                || chain.title != trim_prompt_whitespace(&chain.title)
                 || chain.title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
                 || chain.description.as_deref().is_some_and(|description| {
                     description.chars().count() > MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS
-                        || description != description.trim()
+                        || description != trim_prompt_whitespace(description)
                 })
             {
                 return Err(PromptStoreError::Corruption(
@@ -2318,8 +2409,8 @@ fn apply_chain_event(
             })?;
             if chain.archived_at_ms.is_some()
                 || *revision != next_revision(chain.revision)?
-                || title.trim().is_empty()
-                || title != title.trim()
+                || trim_prompt_whitespace(title).is_empty()
+                || title != trim_prompt_whitespace(title)
                 || title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
             {
                 return Err(PromptStoreError::Corruption(
@@ -2995,11 +3086,11 @@ fn validate_prompt_event_command(
             )?;
             let expected_prompt = SavedPrompt {
                 id: command.prompt_id,
-                title: command.title.trim().to_string(),
+                title: trim_prompt_whitespace(&command.title).to_string(),
                 description: command
                     .description
                     .as_deref()
-                    .map(str::trim)
+                    .map(trim_prompt_whitespace)
                     .map(str::to_string),
                 tags: normalized_tags(&command.tags)?,
                 current_version_id: command.prompt_version_id,
@@ -3048,7 +3139,7 @@ fn validate_prompt_event_command(
             },
         ) => {
             if *prompt_id != command.prompt_id
-                || title != command.title.trim()
+                || title != trim_prompt_whitespace(&command.title)
                 || *revision != next_revision(command.expected_revision)?
                 || receipt.revision != *revision
             {
@@ -3353,12 +3444,12 @@ fn validate_chain_event_command(
             PromptChainEvent::PromptChainCreated { chain },
         ) => {
             if chain.id != command.chain_id
-                || chain.title != command.title.trim()
+                || chain.title != trim_prompt_whitespace(&command.title)
                 || chain.description
                     != command
                         .description
                         .as_deref()
-                        .map(str::trim)
+                        .map(trim_prompt_whitespace)
                         .map(str::to_string)
                 || chain.revision != 1
                 || chain.archived_at_ms.is_some()
@@ -3379,7 +3470,7 @@ fn validate_chain_event_command(
             },
         ) => {
             if *chain_id != command.chain_id
-                || title != command.title.trim()
+                || title != trim_prompt_whitespace(&command.title)
                 || *revision != next_revision(command.expected_revision)?
                 || receipt.chain_id != command.chain_id
                 || receipt.link_id.is_some()
@@ -4143,11 +4234,11 @@ fn validate_saved_prompt_record(
             "saved prompt revision must be positive".into(),
         ));
     }
-    if prompt.title != prompt.title.trim()
+    if prompt.title != trim_prompt_whitespace(&prompt.title)
         || prompt
             .description
             .as_deref()
-            .is_some_and(|description| description != description.trim())
+            .is_some_and(|description| description != trim_prompt_whitespace(description))
     {
         return Err(PromptStoreError::Corruption(
             "saved prompt metadata is not canonical".into(),
@@ -4270,11 +4361,11 @@ fn load_chain(
     }
     .validate()
     .map_err(|_| PromptStoreError::Corruption("prompt chain metadata is invalid".into()))?;
-    if chain.title != chain.title.trim()
+    if chain.title != trim_prompt_whitespace(&chain.title)
         || chain
             .description
             .as_deref()
-            .is_some_and(|description| description != description.trim())
+            .is_some_and(|description| description != trim_prompt_whitespace(description))
     {
         return Err(PromptStoreError::Corruption(
             "prompt chain metadata is not canonical".into(),
@@ -4585,11 +4676,11 @@ fn validate_prompt_chain_event_structure(event: &PromptChainEvent) -> Result<(),
         PromptChainEvent::PromptChainCreated { chain } => {
             if chain.revision != 1
                 || chain.archived_at_ms.is_some()
-                || chain.title.trim().is_empty()
-                || chain.title != chain.title.trim()
+                || trim_prompt_whitespace(&chain.title).is_empty()
+                || chain.title != trim_prompt_whitespace(&chain.title)
                 || chain.title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
                 || chain.description.as_deref().is_some_and(|description| {
-                    description != description.trim()
+                    description != trim_prompt_whitespace(description)
                         || description.chars().count() > MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS
                 })
             {
@@ -4600,8 +4691,8 @@ fn validate_prompt_chain_event_structure(event: &PromptChainEvent) -> Result<(),
             title, revision, ..
         } => {
             if *revision == 0
-                || title.trim().is_empty()
-                || title != title.trim()
+                || trim_prompt_whitespace(title).is_empty()
+                || title != trim_prompt_whitespace(title)
                 || title.chars().count() > MAX_PROMPT_CHAIN_TITLE_SCALARS
             {
                 return Err(invalid());

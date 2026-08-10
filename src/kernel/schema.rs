@@ -484,6 +484,98 @@ INSERT INTO prompt_lineage_migration_state(singleton_key, blocked)
 VALUES (1, EXISTS(
   SELECT 1 FROM prompt_lineage_quarantine
 ));\n\
+DROP TRIGGER prompt_command_receipts_immutable_update;
+CREATE TRIGGER prompt_command_receipts_immutable_update
+  BEFORE UPDATE ON prompt_command_receipts
+  WHEN NOT (
+    OLD.command_payload IS NULL
+    AND NEW.command_payload IS NOT NULL
+    AND length(NEW.command_payload) > 0
+    AND NEW.command_id = OLD.command_id
+    AND NEW.command_sha256 = OLD.command_sha256
+    AND NEW.prompt_id = OLD.prompt_id
+    AND NEW.prompt_version_id = OLD.prompt_version_id
+    AND NEW.revision = OLD.revision
+    AND NEW.receipt = OLD.receipt
+    AND NEW.created_at_ms = OLD.created_at_ms
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipts are immutable');
+END;\n\
+DROP TRIGGER prompt_chain_command_receipts_immutable_update;
+CREATE TRIGGER prompt_chain_command_receipts_immutable_update
+  BEFORE UPDATE ON prompt_chain_command_receipts
+  WHEN NOT (
+    OLD.command_payload IS NULL
+    AND NEW.command_payload IS NOT NULL
+    AND length(NEW.command_payload) > 0
+    AND NEW.command_id = OLD.command_id
+    AND NEW.command_sha256 = OLD.command_sha256
+    AND NEW.chain_id = OLD.chain_id
+    AND (NEW.chain_link_id IS OLD.chain_link_id)
+    AND NEW.revision = OLD.revision
+    AND NEW.receipt = OLD.receipt
+    AND NEW.created_at_ms = OLD.created_at_ms
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipts are immutable');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_command_payload_required_insert
+  BEFORE INSERT ON prompt_command_receipts
+  WHEN NEW.command_payload IS NULL OR length(NEW.command_payload) = 0\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt payload is required');
+END;\n\
+CREATE TRIGGER prompt_command_receipts_command_payload_required_update
+  BEFORE UPDATE OF command_payload ON prompt_command_receipts
+  WHEN NEW.command_payload IS NULL OR length(NEW.command_payload) = 0\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt command receipt payload is required');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_command_payload_required_insert
+  BEFORE INSERT ON prompt_chain_command_receipts
+  WHEN NEW.command_payload IS NULL OR length(NEW.command_payload) = 0\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt payload is required');
+END;\n\
+CREATE TRIGGER prompt_chain_command_receipts_command_payload_required_update
+  BEFORE UPDATE OF command_payload ON prompt_chain_command_receipts
+  WHEN NEW.command_payload IS NULL OR length(NEW.command_payload) = 0\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt chain command receipt payload is required');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair
+  BEFORE UPDATE OF blocked ON prompt_lineage_migration_state
+  WHEN NEW.blocked = 0 AND (
+    EXISTS (SELECT 1 FROM prompt_lineage_quarantine)
+    OR EXISTS (
+      SELECT 1 FROM prompt_command_receipts
+      WHERE command_payload IS NULL OR length(command_payload) = 0
+    )
+    OR EXISTS (
+      SELECT 1 FROM prompt_chain_command_receipts
+      WHERE command_payload IS NULL OR length(command_payload) = 0
+    )
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage requires exact repair before unblock');
+END;\n\
+CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_repair_insert
+  BEFORE INSERT ON prompt_lineage_migration_state
+  WHEN NEW.blocked = 0 AND (
+    EXISTS (SELECT 1 FROM prompt_lineage_quarantine)
+    OR EXISTS (
+      SELECT 1 FROM prompt_command_receipts
+      WHERE command_payload IS NULL OR length(command_payload) = 0
+    )
+    OR EXISTS (
+      SELECT 1 FROM prompt_chain_command_receipts
+      WHERE command_payload IS NULL OR length(command_payload) = 0
+    )
+  )\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt lineage requires exact repair before unblock');
+END;\n\
 CREATE TRIGGER saved_prompts_current_version_is_latest_insert
   BEFORE INSERT ON saved_prompts
   WHEN NOT EXISTS (
@@ -509,6 +601,18 @@ CREATE TRIGGER prompt_versions_next_sequence_insert
 BEGIN
   SELECT RAISE(ABORT, 'prompt version history must be contiguous');
 END;\n\
+CREATE TRIGGER prompt_versions_advance_current_after_insert
+  AFTER INSERT ON prompt_versions
+  WHEN NEW.version = (
+    SELECT MAX(latest.version) FROM prompt_versions AS latest
+    WHERE latest.prompt_id = NEW.prompt_id
+  )\n\
+BEGIN
+  UPDATE saved_prompts
+  SET current_version_id = NEW.prompt_version_id
+  WHERE prompt_id = NEW.prompt_id
+    AND current_version_id <> NEW.prompt_version_id;
+END;\n\
 CREATE TRIGGER prompt_command_receipts_lineage_insert
   BEFORE INSERT ON prompt_command_receipts
   WHEN NOT EXISTS (
@@ -528,18 +632,20 @@ CREATE TRIGGER prompt_chain_command_receipts_lineage_insert
 BEGIN
   SELECT RAISE(ABORT, 'prompt chain command receipt lineage is missing');
 END;\n\
+-- SQLite trim(X) only removes ASCII spaces. Keep this explicit Unicode
+-- White_Space set in lockstep with prompts::model::trim_prompt_whitespace.
 CREATE TRIGGER saved_prompts_metadata_insert_bounds
   BEFORE INSERT ON saved_prompts
   WHEN typeof(NEW.title) <> 'text'
     OR length(NEW.title) = 0
     OR length(NEW.title) > 160
     OR length(CAST(NEW.title AS BLOB)) > 640
-    OR NEW.title <> trim(NEW.title)
+    OR NEW.title <> trim(NEW.title, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR (NEW.description IS NOT NULL AND (
       typeof(NEW.description) <> 'text'
       OR length(NEW.description) > 2000
       OR length(CAST(NEW.description AS BLOB)) > 8000
-      OR NEW.description <> trim(NEW.description)
+      OR NEW.description <> trim(NEW.description, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     ))\n\
 BEGIN
   SELECT RAISE(ABORT, 'saved prompt title or description is out of bounds');
@@ -550,12 +656,12 @@ CREATE TRIGGER saved_prompts_metadata_update_bounds
     OR length(NEW.title) = 0
     OR length(NEW.title) > 160
     OR length(CAST(NEW.title AS BLOB)) > 640
-    OR NEW.title <> trim(NEW.title)
+    OR NEW.title <> trim(NEW.title, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR (NEW.description IS NOT NULL AND (
       typeof(NEW.description) <> 'text'
       OR length(NEW.description) > 2000
       OR length(CAST(NEW.description AS BLOB)) > 8000
-      OR NEW.description <> trim(NEW.description)
+      OR NEW.description <> trim(NEW.description, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     ))\n\
 BEGIN
   SELECT RAISE(ABORT, 'saved prompt title or description is out of bounds');
@@ -566,12 +672,12 @@ CREATE TRIGGER prompt_chains_metadata_insert_bounds
     OR length(NEW.title) = 0
     OR length(NEW.title) > 160
     OR length(CAST(NEW.title AS BLOB)) > 640
-    OR NEW.title <> trim(NEW.title)
+    OR NEW.title <> trim(NEW.title, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR (NEW.description IS NOT NULL AND (
       typeof(NEW.description) <> 'text'
       OR length(NEW.description) > 2000
       OR length(CAST(NEW.description AS BLOB)) > 8000
-      OR NEW.description <> trim(NEW.description)
+      OR NEW.description <> trim(NEW.description, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     ))\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt chain title or description is out of bounds');
@@ -582,12 +688,12 @@ CREATE TRIGGER prompt_chains_metadata_update_bounds
     OR length(NEW.title) = 0
     OR length(NEW.title) > 160
     OR length(CAST(NEW.title AS BLOB)) > 640
-    OR NEW.title <> trim(NEW.title)
+    OR NEW.title <> trim(NEW.title, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR (NEW.description IS NOT NULL AND (
       typeof(NEW.description) <> 'text'
       OR length(NEW.description) > 2000
       OR length(CAST(NEW.description AS BLOB)) > 8000
-      OR NEW.description <> trim(NEW.description)
+      OR NEW.description <> trim(NEW.description, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     ))\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt chain title or description is out of bounds');
@@ -609,7 +715,7 @@ CREATE TRIGGER prompt_tags_ascii_lower_insert
   BEFORE INSERT ON prompt_tags
   WHEN typeof(NEW.tag) <> 'text'
     OR length(NEW.tag) = 0
-    OR NEW.tag <> trim(NEW.tag)
+    OR NEW.tag <> trim(NEW.tag, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR NEW.tag <> lower(NEW.tag)
     OR NEW.tag GLOB '*[^ -~]*'\n\
 BEGIN
@@ -619,11 +725,25 @@ CREATE TRIGGER prompt_tags_ascii_lower_update
   BEFORE UPDATE OF tag ON prompt_tags
   WHEN typeof(NEW.tag) <> 'text'
     OR length(NEW.tag) = 0
-    OR NEW.tag <> trim(NEW.tag)
+    OR NEW.tag <> trim(NEW.tag, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))
     OR NEW.tag <> lower(NEW.tag)
     OR NEW.tag GLOB '*[^ -~]*'\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt tags must use printable lowercase ASCII');
+END;\n\
+CREATE TRIGGER prompt_version_variables_unicode_whitespace_insert
+  BEFORE INSERT ON prompt_version_variables
+  WHEN typeof(NEW.variable) <> 'text'
+    OR NEW.variable <> trim(NEW.variable, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt variable is not normalized');
+END;\n\
+CREATE TRIGGER prompt_version_variables_unicode_whitespace_update
+  BEFORE UPDATE OF variable ON prompt_version_variables
+  WHEN typeof(NEW.variable) <> 'text'
+    OR NEW.variable <> trim(NEW.variable, char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288))\n\
+BEGIN
+  SELECT RAISE(ABORT, 'prompt variable is not normalized');
 END;\n\
 CREATE TRIGGER prompt_version_variables_max_count_insert
   BEFORE INSERT ON prompt_version_variables
