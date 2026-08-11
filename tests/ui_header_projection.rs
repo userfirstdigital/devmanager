@@ -7,15 +7,17 @@ use devmanager::domain::task::{
 };
 use devmanager::ui::components::ActionRequest;
 use devmanager::ui::task_cockpit::header::{
-    presentation_text, ActionTarget, AgentObservation, ConnectObservation, ConnectState,
-    HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout, HeaderObservation, HighWaterDecision,
-    HostHealth, HostObservation, HostObservationIdentity, HostResourceObservation,
-    OpaqueProviderSessionRef, PendingHeaderActionOutcome, PendingHeaderActionQueue,
-    ProjectProjection, ProjectedAction, QuotaObservation, RemoteHealth, SpecialistProjection,
-    TaskHeaderModel, TaskIdentity, TitleLayout, TopBarModel, TopBarProjectionController,
-    TopBarProjectionInput, UpdateObservation, UpdateState, WorkspaceProjection,
-    HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS, MAX_SPECIALIST_VIRTUAL_WINDOW,
+    presentation_text, ActionTarget, AgentObservation, AgentResourceField, ConnectObservation,
+    ConnectState, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout, HeaderObservation,
+    HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
+    HostResourceObservation, OpaqueProviderSessionRef, PendingHeaderActionOutcome,
+    PendingHeaderActionQueue, ProjectProjection, ProjectedAction, QuotaObservation, RemoteHealth,
+    SpecialistProjection, TaskHeaderModel, TaskIdentity, TitleLayout, TopBarModel,
+    TopBarProjectionController, TopBarProjectionInput, UpdateObservation, UpdateState,
+    WorkspaceProjection, HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS,
+    MAX_SPECIALIST_VIRTUAL_WINDOW,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -50,6 +52,44 @@ fn observation(
         fingerprint: revision + u64::from(removed),
         removed,
     }
+}
+
+fn resource_fingerprint_for_test(observation: &HostResourceObservation) -> u64 {
+    let mut hasher = Sha256::new();
+    match observation.cpu_percent {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match observation.memory_bytes {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(observation.revision.to_be_bytes());
+    match observation.observed_at_ms {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match observation.generation {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    u64::from_be_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("fixed digest prefix"),
+    )
 }
 
 #[test]
@@ -916,6 +956,165 @@ fn controller_observations_advance_snapshot_epoch_and_clock_atomically() {
     );
     let model = controller.model();
     assert!(model.host.is_some(), "new-generation host must be visible");
+}
+
+#[test]
+fn resource_observation_rejects_atomically_when_memory_stamp_conflicts() {
+    let older = HostResourceObservation {
+        cpu_percent: Some(1.0),
+        memory_bytes: Some(10),
+        revision: 1,
+        observed_at_ms: Some(100),
+        generation: Some(1),
+    };
+    let newer = HostResourceObservation {
+        cpu_percent: Some(2.0),
+        memory_bytes: Some(20),
+        revision: 2,
+        observed_at_ms: Some(200),
+        generation: Some(1),
+    };
+    let newer_fingerprint = resource_fingerprint_for_test(&newer);
+    let conflicting_memory_fingerprint = newer_fingerprint ^ 1;
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        controller
+            .apply_full_resync(
+                1,
+                TopBarProjectionInput {
+                    now_ms: 100,
+                    generation: 1,
+                    resources: Some(older.clone()),
+                    ..TopBarProjectionInput::default()
+                },
+                [
+                    HeaderObservation {
+                        key: HeaderFieldKey::HostResource {
+                            field: AgentResourceField::Cpu,
+                        },
+                        generation: 1,
+                        revision: 1,
+                        observed_at_ms: 100,
+                        fingerprint: newer_fingerprint,
+                        removed: false,
+                    },
+                    HeaderObservation {
+                        key: HeaderFieldKey::HostResource {
+                            field: AgentResourceField::Memory,
+                        },
+                        generation: 1,
+                        revision: 2,
+                        observed_at_ms: 200,
+                        fingerprint: conflicting_memory_fingerprint,
+                        removed: false,
+                    },
+                ],
+            )
+            .unwrap(),
+        HighWaterDecision::Accepted
+    );
+    let before = controller.high_water().clone();
+
+    assert_eq!(
+        controller.observe_resource(newer.clone()),
+        HighWaterDecision::RejectedConflict
+    );
+    assert_eq!(
+        controller.input().resources.as_ref().unwrap().revision,
+        older.revision,
+        "a rejected compound observation must not reach the model"
+    );
+
+    let mut before_probe = before.clone();
+    let mut after_probe = controller.high_water().clone();
+    assert_eq!(
+        before_probe.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Cpu,
+            },
+            1,
+            2,
+            200,
+            newer_fingerprint ^ 2,
+            false,
+        ),
+        HighWaterDecision::Accepted,
+        "the baseline CPU mark should still be at revision one"
+    );
+    assert_eq!(
+        after_probe.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Cpu,
+            },
+            1,
+            2,
+            200,
+            newer_fingerprint ^ 2,
+            false,
+        ),
+        HighWaterDecision::Accepted,
+        "the rejected compound observation must not advance the CPU mark"
+    );
+
+    let mut before_memory_probe = before;
+    let mut after_memory_probe = controller.high_water().clone();
+    assert_eq!(
+        before_memory_probe.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Memory,
+            },
+            1,
+            2,
+            200,
+            newer_fingerprint,
+            false,
+        ),
+        HighWaterDecision::RejectedConflict,
+        "the baseline memory mark should retain the conflicting fingerprint"
+    );
+    assert_eq!(
+        after_memory_probe.observe(
+            HeaderFieldKey::HostResource {
+                field: AgentResourceField::Memory,
+            },
+            1,
+            2,
+            200,
+            newer_fingerprint,
+            false,
+        ),
+        HighWaterDecision::RejectedConflict,
+        "the rejected compound observation must not advance the memory mark"
+    );
+}
+
+#[test]
+fn oversize_rename_reports_only_the_bounded_probe() {
+    let identity = TaskIdentity {
+        task_id: task_id(24),
+        revision: 1,
+        resource_generation: 1,
+        connection_epoch: 1,
+        focus_epoch: 1,
+        client_epoch: 1,
+        navigation_epoch: 1,
+        request_epoch: 1,
+        action_epoch: 1,
+    };
+    let error = ProjectedAction::task_rename(identity, "x".repeat(100_000)).unwrap_err();
+    assert!(matches!(
+        error,
+        devmanager::ui::task_cockpit::header::HeaderActionError::TaskTitleTooLong {
+            actual: 161,
+            max: 160,
+        }
+    ));
 }
 
 #[test]

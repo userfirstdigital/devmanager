@@ -134,11 +134,11 @@ pub struct OpaqueSourceRef([u8; 16]);
 
 impl OpaqueSourceRef {
     pub fn try_from_raw(raw: &str) -> Result<Self, &'static str> {
+        if scalar_count_up_to(raw, MAX_SOURCE_SCALARS) > MAX_SOURCE_SCALARS {
+            return Err("source id exceeds the bounded scalar limit");
+        }
         if raw.trim().is_empty() {
             return Err("source id must not be blank");
-        }
-        if raw.chars().count() > MAX_SOURCE_SCALARS {
-            return Err("source id exceeds the bounded scalar limit");
         }
         let digest = Sha256::digest(raw.as_bytes());
         let mut bytes = [0_u8; 16];
@@ -188,6 +188,10 @@ pub fn presentation_text(value: &str, max_scalars: usize) -> String {
 
 fn truncate_scalars(value: &str, max_scalars: usize) -> String {
     value.chars().take(max_scalars).collect()
+}
+
+fn scalar_count_up_to(value: &str, max_scalars: usize) -> usize {
+    value.chars().take(max_scalars.saturating_add(1)).count()
 }
 
 fn bounded_label(value: &str, max_scalars: usize) -> String {
@@ -693,7 +697,10 @@ fn compare_stamp(
 }
 
 fn bounded_key_text(value: &str, max_scalars: usize) -> Option<String> {
-    if value.trim().is_empty() || value.chars().count() > max_scalars {
+    if scalar_count_up_to(value, max_scalars) > max_scalars {
+        return None;
+    }
+    if value.trim().is_empty() {
         return None;
     }
     Some(value.to_owned())
@@ -913,8 +920,9 @@ impl SpecialistProjection {
                 overflowed = true;
             }
 
-            if observation.label.chars().count() > MAX_LABEL_SCALARS
-                || observation.provider.chars().count() > MAX_PROVIDER_SCALARS
+            if scalar_count_up_to(observation.label, MAX_LABEL_SCALARS) > MAX_LABEL_SCALARS
+                || scalar_count_up_to(observation.provider, MAX_PROVIDER_SCALARS)
+                    > MAX_PROVIDER_SCALARS
                 || observation
                     .provider_session_id
                     .is_some_and(|value| value.len() > MAX_PROVIDER_SESSION_ID_BYTES)
@@ -1320,15 +1328,15 @@ impl ProjectedAction {
         title: impl AsRef<str>,
     ) -> Result<Self, HeaderActionError> {
         let title = title.as_ref();
-        let actual = title.chars().count();
-        if title.trim().is_empty() {
-            return Err(HeaderActionError::EmptyTaskTitle);
-        }
+        let actual = scalar_count_up_to(title, MAX_LABEL_SCALARS);
         if actual > MAX_LABEL_SCALARS {
             return Err(HeaderActionError::TaskTitleTooLong {
                 actual,
                 max: MAX_LABEL_SCALARS,
             });
+        }
+        if title.trim().is_empty() {
+            return Err(HeaderActionError::EmptyTaskTitle);
         }
         Self::checked(
             ActionRequest::TaskRename(TaskRenameArguments {
@@ -2107,12 +2115,12 @@ fn validate_bounded_wire(
     value: &str,
     max_scalars: usize,
 ) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("{field} must not be blank"));
-    }
-    let actual = value.chars().count();
+    let actual = scalar_count_up_to(value, max_scalars);
     if actual > max_scalars {
         return Err(format!("{field} exceeds {max_scalars} scalars ({actual})"));
+    }
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be blank"));
     }
     Ok(())
 }
@@ -2900,7 +2908,8 @@ impl TopBarProjectionController {
             return HighWaterDecision::IgnoredStale;
         }
         let fingerprint = resource_fingerprint(&observation);
-        let cpu = self.high_water.observe(
+        let mut candidate_high_water = self.high_water.clone();
+        let cpu = candidate_high_water.observe(
             HeaderFieldKey::HostResource {
                 field: AgentResourceField::Cpu,
             },
@@ -2910,7 +2919,7 @@ impl TopBarProjectionController {
             fingerprint,
             false,
         );
-        let memory = self.high_water.observe(
+        let memory = candidate_high_water.observe(
             HeaderFieldKey::HostResource {
                 field: AgentResourceField::Memory,
             },
@@ -2922,6 +2931,7 @@ impl TopBarProjectionController {
         );
         let decision = combine_high_water_decisions(cpu, memory);
         if matches!(decision, HighWaterDecision::Accepted) {
+            self.high_water = candidate_high_water;
             self.commit_observation_clock(generation, observed_at_ms);
             self.input.resources = Some(HostResourceObservation {
                 cpu_percent: valid_cpu_percent(observation.cpu_percent),
