@@ -174,25 +174,44 @@ impl fmt::Display for OpaqueSourceRef {
 }
 
 /// Copy at most `max_scalars` sanitized scalars before invoking the bounded
-/// secret redactor.  In particular, this does not first clone or redact an
-/// unbounded provider/path/input string.
+/// secret redactor, without ever splitting an extended grapheme cluster.  In
+/// particular, this does not first clone or redact an unbounded
+/// provider/path/input string.
 pub fn presentation_text(value: &str, max_scalars: usize) -> String {
     if max_scalars == 0 {
         return String::new();
     }
     let mut bounded = String::with_capacity(value.len().min(max_scalars.saturating_mul(4)));
-    for character in value.chars().take(max_scalars) {
-        if character.is_control() && character != '\n' && character != '\t' {
-            bounded.push(' ');
-        } else {
-            bounded.push(character);
+    let mut scalar_count: usize = 0;
+    for grapheme in value.graphemes(true) {
+        let grapheme_scalars = grapheme.chars().count();
+        if scalar_count.saturating_add(grapheme_scalars) > max_scalars {
+            break;
         }
+        for character in grapheme.chars() {
+            if character.is_control() && character != '\n' && character != '\t' {
+                bounded.push(' ');
+            } else {
+                bounded.push(character);
+            }
+        }
+        scalar_count += grapheme_scalars;
     }
-    truncate_scalars(&redact_secrets(&bounded), max_scalars)
+    truncate_graphemes(&redact_secrets(&bounded), max_scalars)
 }
 
-fn truncate_scalars(value: &str, max_scalars: usize) -> String {
-    value.chars().take(max_scalars).collect()
+fn truncate_graphemes(value: &str, max_scalars: usize) -> String {
+    let mut bounded = String::with_capacity(value.len().min(max_scalars.saturating_mul(4)));
+    let mut scalar_count: usize = 0;
+    for grapheme in value.graphemes(true) {
+        let grapheme_scalars = grapheme.chars().count();
+        if scalar_count.saturating_add(grapheme_scalars) > max_scalars {
+            break;
+        }
+        bounded.push_str(grapheme);
+        scalar_count += grapheme_scalars;
+    }
+    bounded
 }
 
 fn scalar_count_up_to(value: &str, max_scalars: usize) -> usize {
@@ -1353,18 +1372,40 @@ pub struct HeaderActionEnvelope {
 }
 
 impl HeaderActionEnvelope {
-    pub fn request(&self) -> &ActionRequest {
-        &self.request
-    }
-
     pub fn target(&self) -> &ActionTarget {
         &self.target
+    }
+
+    /// Consume the capture only when the canonical shell presents the exact
+    /// task/observation fence that produced it.  The request cannot be
+    /// detached from that fence through this API.
+    pub fn into_request_if_current(
+        self,
+        current_target: &ActionTarget,
+    ) -> Result<ActionRequest, HeaderActionError> {
+        if &self.target != current_target {
+            return Err(HeaderActionError::StaleTarget);
+        }
+        Ok(self.request)
+    }
+
+    fn descriptor(&self) -> &'static ActionDescriptor {
+        self.request.descriptor()
+    }
+
+    fn id(&self) -> &'static str {
+        self.request.id()
+    }
+
+    fn safely_coalescible(&self) -> bool {
+        self.descriptor().risk == ActionRisk::ReadOnly && self.id() == ACTION_TASK_SHOW
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderActionError {
     MismatchedTarget,
+    StaleTarget,
     EmptyTaskTitle,
     TaskTitleTooLong { actual: usize, max: usize },
 }
@@ -1373,6 +1414,7 @@ impl fmt::Display for HeaderActionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MismatchedTarget => formatter.write_str("action request and target disagree"),
+            Self::StaleTarget => formatter.write_str("action target is no longer current"),
             Self::EmptyTaskTitle => formatter.write_str("task title must not be blank"),
             Self::TaskTitleTooLong { actual, max } => {
                 write!(
@@ -1479,10 +1521,6 @@ impl ProjectedAction {
     pub fn id(&self) -> &'static str {
         self.request.id()
     }
-
-    fn safely_coalescible(&self) -> bool {
-        self.descriptor().risk == ActionRisk::ReadOnly && self.id() == ACTION_TASK_SHOW
-    }
 }
 
 fn sanitize_action_request(mut request: ActionRequest) -> ActionRequest {
@@ -1492,8 +1530,8 @@ fn sanitize_action_request(mut request: ActionRequest) -> ActionRequest {
     request
 }
 
-pub type HeaderAction = ProjectedAction;
-pub type TopBarAction = ProjectedAction;
+pub type HeaderAction = HeaderActionEnvelope;
+pub type TopBarAction = HeaderActionEnvelope;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingHeaderActionOutcome {
@@ -1530,7 +1568,7 @@ impl PendingHeaderActionOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingHeaderActionQueue {
-    actions: VecDeque<ProjectedAction>,
+    actions: VecDeque<HeaderActionEnvelope>,
     capacity: usize,
 }
 
@@ -1544,7 +1582,7 @@ impl PendingHeaderActionQueue {
 
     /// Coalesce only an exact, read-only task-show capture.  Mutating actions
     /// remain ordered even when their target epochs match.
-    pub fn push(&mut self, action: ProjectedAction) -> PendingHeaderActionOutcome {
+    pub fn push(&mut self, action: HeaderActionEnvelope) -> PendingHeaderActionOutcome {
         if action.safely_coalescible() && self.actions.iter().any(|pending| pending == &action) {
             return PendingHeaderActionOutcome::Coalesced;
         }
@@ -1557,7 +1595,7 @@ impl PendingHeaderActionQueue {
 
     pub fn try_push(
         &mut self,
-        action: ProjectedAction,
+        action: HeaderActionEnvelope,
     ) -> Result<PendingHeaderActionOutcome, PendingHeaderActionError> {
         match self.push(action) {
             PendingHeaderActionOutcome::Full => Err(PendingHeaderActionError::Full),
@@ -1578,18 +1616,15 @@ impl PendingHeaderActionQueue {
     }
 
     /// Drain only the caller's bounded canonical-runtime tick budget.
-    pub fn drain_for_tick(&mut self, limit: usize) -> Vec<ProjectedAction> {
+    pub fn drain_for_tick(&mut self, limit: usize) -> Vec<HeaderActionEnvelope> {
         let count = limit.min(self.actions.len());
         self.actions.drain(..count).collect()
     }
 
-    /// The canonical shell consumes captures as typed envelopes so a raw
-    /// request cannot be detached from its observation/task fence.
+    /// Compatibility spelling for canonical shell callers.  Both queue drain
+    /// paths return the same sealed envelope type; no raw action is exposed.
     pub fn drain_envelopes_for_tick(&mut self, limit: usize) -> Vec<HeaderActionEnvelope> {
         self.drain_for_tick(limit)
-            .into_iter()
-            .map(ProjectedAction::into_envelope)
-            .collect()
     }
 }
 
@@ -2580,7 +2615,7 @@ impl TopBarModel {
                     age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Button,
                     focusable: true,
-                    action: ProjectedAction::remote_status(stamp),
+                    action: ProjectedAction::remote_status(stamp).into_envelope(),
                     accessible_description: presentation_text(
                         &accessible_description,
                         MAX_ACCESSIBLE_SCALARS,
@@ -2653,7 +2688,7 @@ impl TopBarModel {
                     age_ms: stamp.age_ms(input.now_ms),
                     role: AccessibleRole::Button,
                     focusable: true,
-                    action: ProjectedAction::quota_status(stamp),
+                    action: ProjectedAction::quota_status(stamp).into_envelope(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2761,7 +2796,7 @@ impl TopBarModel {
             quota_overflow_count: 0,
             quotas_truncated: quota_hidden_count != 0,
             quota_overflow_action: quota_action_stamp
-                .map(|stamp| ProjectedAction::quota_status(stamp)),
+                .map(|stamp| ProjectedAction::quota_status(stamp).into_envelope()),
             resources,
             unavailable,
             accessible_description: presentation_text(&accessible, MAX_ACCESSIBLE_SCALARS),
@@ -2826,12 +2861,48 @@ impl TopBarProjectionController {
         {
             return Ok(HighWaterDecision::IgnoredStale);
         }
+        let snapshot = normalize_top_bar_input(snapshot);
+        let snapshot_observations = snapshot_header_observations(&snapshot)?;
+        let snapshot_stamps: BTreeMap<HeaderFieldKey, (u64, u64)> = snapshot_observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation.key.clone(),
+                    (observation.generation, observation.revision),
+                )
+            })
+            .collect();
+        let supplemental_observations = observations.into_iter().filter_map(move |observation| {
+            let Some(key) = bounded_header_key(&observation.key) else {
+                return Some(observation);
+            };
+            if let Some((snapshot_generation, snapshot_revision)) = snapshot_stamps.get(&key) {
+                if compare_stamp(
+                    observation.generation,
+                    observation.revision,
+                    *snapshot_generation,
+                    *snapshot_revision,
+                ) != std::cmp::Ordering::Greater
+                {
+                    // The accepted snapshot is authoritative for an equal or
+                    // older duplicate; a caller cannot lower or conflict with
+                    // the floor derived from that visible payload.
+                    return None;
+                }
+            }
+            Some(observation)
+        });
         let mut candidate = self.high_water.clone();
-        let decision =
-            candidate.apply_full_resync(full_resync_epoch, snapshot.generation, observations);
+        let decision = candidate.apply_full_resync(
+            full_resync_epoch,
+            snapshot.generation,
+            snapshot_observations
+                .into_iter()
+                .chain(supplemental_observations),
+        );
         if decision == HighWaterDecision::Accepted {
             self.high_water = candidate;
-            self.input = normalize_top_bar_input(snapshot);
+            self.input = snapshot;
             self.quota_overflow_count = 0;
         }
         Ok(decision)
@@ -3100,7 +3171,7 @@ impl TopBarProjectionController {
     pub fn model(&self) -> TopBarModel {
         let mut model = TopBarModel::from_input(&self.input);
         model.quota_overflow_count = self.quota_overflow_count;
-        if self.quota_overflow_count != 0 {
+        if self.quota_overflow_count != 0 || self.high_water.requires_full_resync() {
             let stale_quota_count = model.quotas.len();
             let overflow_action = model
                 .quota_overflow_action
@@ -3358,6 +3429,123 @@ fn normalize_top_bar_input(mut input: TopBarProjectionInput) -> TopBarProjection
         resource.cpu_percent = valid_cpu_percent(resource.cpu_percent);
     }
     input
+}
+
+/// Derive the high-water bundle from the same normalized snapshot that will
+/// become visible.  The caller may add nested observations, but it cannot omit
+/// a visible top-bar field and thereby lower that field's monotonic floor.
+fn snapshot_header_observations(
+    input: &TopBarProjectionInput,
+) -> Result<Vec<HeaderObservation>, TopBarProjectionError> {
+    let mut observations = Vec::with_capacity(input.quotas.len() + 8);
+    let push_stamp = |generation: Option<u64>, observed_at_ms: Option<i64>| {
+        if let (Some(generation), Some(_)) = (generation, observed_at_ms) {
+            if generation != input.generation {
+                return Err(TopBarProjectionError::InvalidObservation("generation"));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(host) = input.host.as_ref() {
+        push_stamp(host.generation, host.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) = (host.generation, host.observed_at_ms) {
+            observations.push(HeaderObservation {
+                key: HeaderFieldKey::Host {
+                    source_id: host.identity.host_id.clone(),
+                },
+                generation,
+                revision: host.identity.revision,
+                observed_at_ms,
+                fingerprint: host_fingerprint(host),
+                removed: false,
+            });
+        }
+    }
+    if let Some(connect) = input.connect.as_ref() {
+        push_stamp(connect.generation, connect.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) =
+            (connect.generation, connect.observed_at_ms)
+        {
+            observations.push(HeaderObservation {
+                key: HeaderFieldKey::Connect {
+                    source_id: connect.host_id.clone(),
+                },
+                generation,
+                revision: connect.revision,
+                observed_at_ms,
+                fingerprint: connect_fingerprint(connect),
+                removed: false,
+            });
+        }
+    }
+    if let Some(update) = input.update.as_ref() {
+        push_stamp(update.generation, update.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) = (update.generation, update.observed_at_ms)
+        {
+            observations.push(HeaderObservation {
+                key: HeaderFieldKey::Update {
+                    source_id: update.source_id.clone(),
+                },
+                generation,
+                revision: update.revision,
+                observed_at_ms,
+                fingerprint: update_observation_fingerprint(update),
+                removed: false,
+            });
+        }
+    }
+    if let Some(remote) = input.remote.as_ref() {
+        push_stamp(remote.generation, remote.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) = (remote.generation, remote.observed_at_ms)
+        {
+            observations.push(HeaderObservation {
+                key: HeaderFieldKey::Remote {
+                    source_id: remote.identity.source_id.clone(),
+                },
+                generation,
+                revision: remote.identity.revision,
+                observed_at_ms,
+                fingerprint: remote_fingerprint(remote),
+                removed: false,
+            });
+        }
+    }
+    for quota in &input.quotas {
+        push_stamp(quota.generation, quota.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) = (quota.generation, quota.observed_at_ms) {
+            observations.push(HeaderObservation {
+                key: HeaderFieldKey::Quota {
+                    provider: quota.identity.provider.clone(),
+                    provider_session_ref: quota.identity.provider_session_ref,
+                },
+                generation,
+                revision: quota.revision,
+                observed_at_ms,
+                fingerprint: quota_fingerprint(quota),
+                removed: false,
+            });
+        }
+    }
+    if let Some(resource) = input.resources.as_ref() {
+        push_stamp(resource.generation, resource.observed_at_ms)?;
+        if let (Some(generation), Some(observed_at_ms)) =
+            (resource.generation, resource.observed_at_ms)
+        {
+            let fingerprint = resource_fingerprint(resource);
+            for field in [AgentResourceField::Cpu, AgentResourceField::Memory] {
+                observations.push(HeaderObservation {
+                    key: HeaderFieldKey::HostResource { field },
+                    generation,
+                    revision: resource.revision,
+                    observed_at_ms,
+                    fingerprint,
+                    removed: false,
+                });
+            }
+        }
+    }
+    Ok(observations)
 }
 
 fn combine_high_water_decisions(
@@ -3618,7 +3806,7 @@ fn status_link(status: TopBarStatus, label: &str, stamp: ObservationStamp) -> To
         ),
         role: AccessibleRole::Button,
         focusable: true,
-        action: ProjectedAction::host_status(stamp),
+        action: ProjectedAction::host_status(stamp).into_envelope(),
     }
 }
 
@@ -3908,8 +4096,8 @@ impl TaskHeaderModel {
         )
     }
 
-    pub fn task_show_action(&self) -> ProjectedAction {
-        ProjectedAction::task_show(self.identity)
+    pub fn task_show_action(&self) -> HeaderAction {
+        ProjectedAction::task_show(self.identity).into_envelope()
     }
 
     pub fn layout(&self, width_px: u16) -> HeaderLayout {
@@ -4005,6 +4193,44 @@ impl TaskHeaderModel {
             action: None,
             unavailable: false,
         }
+    }
+
+    /// Include the width-selected overflow menu in the semantic tree.  The
+    /// layout owns the same bounded labels/actions as paint, so every hidden
+    /// field remains reachable through a focusable node carrying the exact
+    /// task fence captured for this header.
+    pub fn accessibility_tree_at(&self, width_px: u16) -> SemanticNode {
+        let mut tree = self.accessibility_tree();
+        let layout = self.layout(width_px);
+        let Some(control) = layout.overflow_control else {
+            return tree;
+        };
+        let children = layout
+            .overflow_items
+            .into_iter()
+            .map(|item| SemanticNode {
+                role: AccessibleRole::Button,
+                label: item.label,
+                description: item.description,
+                focusable: item.focusable,
+                children: Vec::new(),
+                action: Some(item.action),
+                unavailable: false,
+            })
+            .collect();
+        tree.children.push(SemanticNode {
+            role: AccessibleRole::Region,
+            label: presentation_text(
+                &format!("Task header overflow menu: {}", control.label),
+                MAX_ACCESSIBLE_SCALARS,
+            ),
+            description: control.description,
+            focusable: control.focusable,
+            children,
+            action: Some(control.action),
+            unavailable: false,
+        });
+        tree
     }
 }
 

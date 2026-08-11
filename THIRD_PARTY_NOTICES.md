@@ -60,6 +60,15 @@ The lockfile's resolved package metadata was reviewed with `cargo metadata --for
 
 The graph does not activate the optional `decimal`, `inspector`, `tree-sitter-languages`, or `webview` feature dependencies. License expressions are the package metadata audit input; each resolved package remains subject to its own license text and notices.
 
+## unicode-segmentation 1.12.0
+
+- Source: `https://github.com/unicode-rs/unicode-segmentation/tree/v1.12.0`
+- Crates.io package: `https://crates.io/crates/unicode-segmentation/1.12.0`
+- Manifest reviewed: `https://raw.githubusercontent.com/unicode-rs/unicode-segmentation/v1.12.0/Cargo.toml`
+- License text reviewed: `https://raw.githubusercontent.com/unicode-rs/unicode-segmentation/v1.12.0/LICENSE-MIT` and `https://raw.githubusercontent.com/unicode-rs/unicode-segmentation/v1.12.0/LICENSE-APACHE`
+- The package declares `MIT OR Apache-2.0` and is pinned as `unicode-segmentation = "1.12.0"` in `Cargo.toml`; the exact resolved checksum is recorded in `Cargo.lock`.
+- This dependency is used only for bounded extended-grapheme segmentation in task-header presentation and layout, including ZWJ emoji sequences.
+
 ## windows-capture 1.5.0
 
 - Source: `https://github.com/NiiightmareXD/windows-capture/tree/1.5.0`

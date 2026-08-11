@@ -44,6 +44,7 @@ use crate::ui::components::{
 use crate::ui::shell::{
     NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
 };
+use crate::ui::task_cockpit::header::{ActionTarget, HeaderActionEnvelope};
 use crate::ui::task_cockpit::{TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
@@ -836,6 +837,19 @@ impl NativeInteraction {
                 key: crate::ui::components::KeyboardKey::Enter,
             },
         )
+    }
+
+    /// Dispatch a header capture only after the host presents the exact
+    /// current task/observation fence.  Header callers cannot bypass this
+    /// check by extracting a raw request from the envelope.
+    pub fn action_from_header_envelope(
+        &mut self,
+        envelope: HeaderActionEnvelope,
+        current_target: &ActionTarget,
+        source: ActivationSource,
+    ) -> Option<NativeActionRecord> {
+        let request = envelope.into_request_if_current(current_target).ok()?;
+        self.action_from_source(request, source)
     }
 
     pub fn action_from_source(

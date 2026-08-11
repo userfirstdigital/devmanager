@@ -5,16 +5,18 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, VisibleTaskStatus, WorkspaceRef,
 };
-use devmanager::ui::components::ActionRequest;
+use devmanager::ui::components::{AccessibleRole, ActionRequest};
+use devmanager::ui::components::{ActivationSource, KeyboardKey};
+use devmanager::ui::native_shell::NativeInteraction;
 use devmanager::ui::task_cockpit::header::{
     presentation_text, ActionTarget, AgentObservation, AgentResourceField, ConnectObservation,
-    ConnectState, HeaderActionEnvelope, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout,
-    HeaderObservation, HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
-    HostResourceObservation, OpaqueProviderSessionRef, PendingHeaderActionOutcome,
-    PendingHeaderActionQueue, ProjectProjection, ProjectedAction, QuotaObservation, RemoteHealth,
-    SpecialistProjection, TaskHeaderModel, TaskIdentity, TitleLayout, TopBarModel,
-    TopBarProjectionController, TopBarProjectionInput, UpdateObservation, UpdateState,
-    WorkspaceProjection, HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS,
+    ConnectState, HeaderActionEnvelope, HeaderActionError, HeaderFieldKey, HeaderHighWaterLedger,
+    HeaderLayout, HeaderObservation, HighWaterDecision, HostHealth, HostObservation,
+    HostObservationIdentity, HostResourceObservation, OpaqueProviderSessionRef,
+    PendingHeaderActionOutcome, PendingHeaderActionQueue, ProjectProjection, ProjectedAction,
+    QuotaObservation, RemoteHealth, SpecialistProjection, TaskHeaderModel, TaskIdentity,
+    TitleLayout, TopBarModel, TopBarProjectionController, TopBarProjectionInput, UpdateObservation,
+    UpdateState, WorkspaceProjection, HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS,
     MAX_SPECIALIST_VIRTUAL_WINDOW, MAX_TOP_BAR_QUOTA_CACHE, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 use sha2::{Digest, Sha256};
@@ -661,6 +663,66 @@ fn idle_controller_tick_hides_expired_quota_without_new_observations() {
 }
 
 #[test]
+fn quota_event_expiry_hides_cached_values_before_resync() {
+    let session = OpaqueProviderSessionRef::try_from_raw("event-expiry-quota").unwrap();
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        quotas: vec![QuotaObservation::new("claude", session, 1, 1, 100, "fresh")],
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        controller.observe_quota(QuotaObservation::new(
+            "claude",
+            session,
+            1,
+            2,
+            100 + PROVIDER_QUOTA_MAX_AGE_MS + 1,
+            "new",
+        )),
+        HighWaterDecision::NeedsFullResync
+    );
+    let model = controller.model();
+    assert!(model.quotas.is_empty());
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::Quota));
+}
+
+#[test]
+fn full_resync_derives_quota_floor_when_callers_omit_observations() {
+    let session = OpaqueProviderSessionRef::try_from_raw("derived-quota-floor").unwrap();
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    let snapshot_quota = QuotaObservation::new("claude", session, 1, 9, 100, "fresh");
+    assert_eq!(
+        controller
+            .apply_full_resync(
+                1,
+                TopBarProjectionInput {
+                    now_ms: 100,
+                    generation: 1,
+                    quotas: vec![snapshot_quota],
+                    ..TopBarProjectionInput::default()
+                },
+                std::iter::empty(),
+            )
+            .unwrap(),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        controller.observe_quota(QuotaObservation::new("claude", session, 1, 8, 101, "stale",)),
+        HighWaterDecision::IgnoredStale
+    );
+}
+
+#[test]
 fn quota_flood_enters_visible_unavailable_resync_state_instead_of_stale_display() {
     let mut quotas = Vec::new();
     for index in 0..MAX_TOP_BAR_QUOTA_CACHE {
@@ -745,15 +807,24 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     };
     let show = ProjectedAction::task_show(identity);
     let mut queue = PendingHeaderActionQueue::new(2);
-    assert_eq!(queue.push(show.clone()), PendingHeaderActionOutcome::Queued);
-    assert_eq!(queue.push(show), PendingHeaderActionOutcome::Coalesced);
+    assert_eq!(
+        queue.push(show.clone().into_envelope()),
+        PendingHeaderActionOutcome::Queued
+    );
+    assert_eq!(
+        queue.push(show.into_envelope()),
+        PendingHeaderActionOutcome::Coalesced
+    );
 
     let rename = ProjectedAction::task_rename(identity, "next").unwrap();
     assert_eq!(
-        queue.push(rename.clone()),
+        queue.push(rename.clone().into_envelope()),
         PendingHeaderActionOutcome::Queued
     );
-    assert_eq!(queue.push(rename), PendingHeaderActionOutcome::Full);
+    assert_eq!(
+        queue.push(rename.into_envelope()),
+        PendingHeaderActionOutcome::Full
+    );
     assert_eq!(
         queue.drain_for_tick(8).len(),
         2,
@@ -765,7 +836,10 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     assert!(bounded.is_err());
     let bounded = ProjectedAction::task_rename(identity, "bounded title").unwrap();
     let bounded_envelope = bounded.into_envelope();
-    let ActionRequest::TaskRename(arguments) = bounded_envelope.request() else {
+    let ActionRequest::TaskRename(arguments) = bounded_envelope
+        .into_request_if_current(&ActionTarget::Task(identity))
+        .unwrap()
+    else {
         panic!("rename action")
     };
     assert!(arguments.title.chars().count() <= 160);
@@ -787,7 +861,7 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     );
 
     let mut typed_queue = PendingHeaderActionQueue::new(1);
-    typed_queue.push(ProjectedAction::task_show(identity));
+    typed_queue.push(ProjectedAction::task_show(identity).into_envelope());
     let envelopes = typed_queue.drain_envelopes_for_tick(1);
     assert!(matches!(
         envelopes.first().map(HeaderActionEnvelope::target),
@@ -813,9 +887,79 @@ fn projected_action_exposes_only_a_fenced_typed_envelope() {
         envelope.target(),
         ActionTarget::Task(captured) if *captured == identity
     ));
-    assert!(
-        matches!(envelope.request(), ActionRequest::TaskShow { task_id } if task_id == &identity.task_id)
+    assert!(matches!(
+        envelope.into_request_if_current(&ActionTarget::Task(identity)),
+        Ok(ActionRequest::TaskShow { task_id }) if task_id == identity.task_id
+    ));
+}
+
+#[test]
+fn header_envelope_requires_the_exact_current_target_to_extract_a_request() {
+    let identity = TaskIdentity {
+        task_id: task_id(37),
+        revision: 10,
+        resource_generation: 2,
+        connection_epoch: 3,
+        focus_epoch: 4,
+        client_epoch: 5,
+        navigation_epoch: 6,
+        request_epoch: 7,
+        action_epoch: 8,
+    };
+    let mut stale = identity;
+    stale.revision += 1;
+    let envelope = ProjectedAction::task_show(identity).into_envelope();
+    assert_eq!(
+        envelope
+            .clone()
+            .into_request_if_current(&ActionTarget::Task(stale)),
+        Err(HeaderActionError::StaleTarget)
     );
+    assert!(matches!(
+        envelope.into_request_if_current(&ActionTarget::Task(identity)),
+        Ok(ActionRequest::TaskShow { task_id }) if task_id == identity.task_id
+    ));
+}
+
+#[test]
+fn native_shell_header_dispatch_consumes_only_a_current_envelope() {
+    let identity = TaskIdentity {
+        task_id: task_id(38),
+        revision: 10,
+        resource_generation: 2,
+        connection_epoch: 3,
+        focus_epoch: 4,
+        client_epoch: 5,
+        navigation_epoch: 6,
+        request_epoch: 7,
+        action_epoch: 8,
+    };
+    let mut stale = identity;
+    stale.focus_epoch += 1;
+    let mut interaction = NativeInteraction::new(Some(identity.task_id));
+    let envelope = ProjectedAction::task_show(identity).into_envelope();
+    assert!(interaction
+        .action_from_header_envelope(
+            envelope.clone(),
+            &ActionTarget::Task(stale),
+            ActivationSource::Keyboard {
+                key: KeyboardKey::Enter,
+            },
+        )
+        .is_none());
+    let record = interaction
+        .action_from_header_envelope(
+            envelope,
+            &ActionTarget::Task(identity),
+            ActivationSource::Keyboard {
+                key: KeyboardKey::Enter,
+            },
+        )
+        .expect("current header envelope dispatch");
+    assert!(matches!(
+        record.event.request,
+        ActionRequest::TaskShow { task_id } if task_id == identity.task_id
+    ));
 }
 
 #[test]
@@ -1385,6 +1529,22 @@ fn narrow_layout_provides_a_focusable_overflow_control_with_the_task_fence() {
         .children
         .iter()
         .all(|node| node.focusable));
+    let narrow_tree = model.accessibility_tree_at(320);
+    let menu = narrow_tree
+        .children
+        .last()
+        .expect("width-aware overflow menu node");
+    assert_eq!(menu.role, AccessibleRole::Region);
+    assert!(menu.focusable);
+    assert_eq!(
+        menu.action.as_ref().map(|action| action.target()),
+        Some(&ActionTarget::Task(identity))
+    );
+    assert_eq!(menu.children.len(), layout.overflow_items.len());
+    assert!(menu
+        .children
+        .iter()
+        .all(|item| item.focusable && item.action.is_some()));
 }
 
 #[test]
@@ -1423,6 +1583,12 @@ fn header_layout_does_not_split_grapheme_clusters_and_accepts_scale() {
     assert!(lines
         .iter()
         .all(|line| !line.starts_with('\u{200d}') && !line.ends_with('\u{200d}')));
+}
+
+#[test]
+fn presentation_text_keeps_zwj_clusters_whole_at_the_scalar_bound() {
+    let title = "👩‍💻".repeat(80);
+    assert_eq!(presentation_text(&title, 160), "👩‍💻".repeat(53));
 }
 
 #[test]
