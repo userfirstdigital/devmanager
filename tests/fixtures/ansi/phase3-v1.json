@@ -1,0 +1,9 @@
+{
+  "revision": "phase3.10-ansi-v1",
+  "cases": [
+    { "name": "clear-line", "bytes": "\\u001b[2K\\u001b[1G" },
+    { "name": "color", "bytes": "\\u001b[38;5;45msoak\\u001b[0m" },
+    { "name": "cursor", "bytes": "\\u001b[?25lhidden\\u001b[?25h" },
+    { "name": "split-sequence", "chunks": ["\\u001b[", "31mred", "\\u001b[0m"] }
+  ]
+}

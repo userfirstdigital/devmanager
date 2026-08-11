@@ -1,70 +1,110 @@
-# Phase 3 performance budgets
+# Phase 3.10 process-soak contract
 
-These are objective, conservative **Provisional engineering budgets** for the
-Phase 3 process/terminal work. They are guardrails for the soak harness, not
-claims about current measured performance and not release evidence. Each value
-must be replaced or confirmed with real host/client evidence from a completed
-Phase 3 soak and the conformance corpus before it becomes a release gate; this
-requires later real evidence, not an inferred pass from helper-only tests.
-The PTY first-output/input acknowledgement pair is intentionally listed as two
-separate measurable boundaries below.
+This document defines bounded infrastructure evidence. It does not claim that
+the installed DevManager is healthy and it is not a release result. The soak
+uses only a temporary, process-unique worktree fixture. It never launches,
+installs, restarts, or inspects an installed app; it never reads or hashes a
+production profile, `config.json`, `remote.json`, or `session.json`.
 
-| Measurement | Provisional budget | Boundary and evidence required |
+## Immutable run input
+
+`Invoke-ProcessSoak.ps1` accepts one UTF-8 JSON manifest (maximum 1 MiB) and
+rejects unknown or missing fields. The manifest contains `schemaVersion`, an
+immutable `revision`, SHA-256 plus canonical paths for the supervisor, helper,
+and cycle executables, a temporary working directory, `seed`, bounded
+`iterations` (at most 100), bounded suite/cycle/cleanup deadlines and stdout,
+stderr, and result byte caps, and a finite `scenarioCatalog`. Every scenario
+is an argument array beginning with the fixed `cycle` protocol and has an
+expected exit code. The script hashes every executable before dispatch and the
+Rust supervisor repeats canonical identity and hash validation before launch.
+The run records bounded manifest content, and the original input hash is
+verified unchanged after execution; the retained `manifest.json` artifact records
+the revision, seed, budgets, scenario catalog, binary hashes, byte count, and
+source name without persisting an absolute source path.
+
+## Fixed Rust supervisor
+
+The PowerShell layer starts the allowlisted supervisor as a child with an
+argument array. It never dot-sources a callback, imports worktree code, uses
+`Start-Process`, polls with sleeps, or terminates a raw PID. On Windows the
+Rust supervisor creates and owns one Job Object per cycle, launches the exact
+cycle executable suspended with the validated argument array, assigns it to
+the Job before resuming it, and records a live process creation time and
+canonical executable path. It reads stdout and stderr concurrently under hard
+caps and parses exactly one bounded JSON result. Per-cycle and suite deadlines
+use monotonic clocks. On timeout, interruption, malformed/multiple/oversized
+output, crash, nonzero exit, or residue it terminates the owned Job, joins
+both readers, and independently proves `ACTIVE_PROCESS_ZERO` through the Job
+completion port and active-member query. A raw PID is never a termination
+authority. Every reported member identity is obtained by opening the live Job
+member and querying its creation time and executable path; self-reported PIDs
+from cycle output are informational only.
+
+The result itself is one bounded JSON line. A passing result requires every
+cycle to have the expected exit, one valid result, exact scenario/iteration
+identity, live root identity, and `activeProcessZero=true`. Rejected manifests,
+missing tools, malformed protocol output, nonzero exits, crashes, deadlines,
+reader cap violations, and incomplete cleanup are failures or `UNAVAILABLE`,
+never false passes.
+
+## Evidence publication
+
+Evidence is written only beneath the validated temporary root:
+
+```text
+.devmanager-next/evidence/phase-03-process-soak/runs/<unique-run>/
+  manifest.json
+  summary.json
+  performance.json
+  conformance.json
+  run.json
+```
+
+The root and run name are canonicalized and checked for reparse points. Each
+artifact is serialized to a same-directory temporary file and atomically moved
+into its previously absent final name. Run IDs are unique and append-only;
+existing files are never overwritten. `performance.json` contains each cycle
+duration plus p50, p95, maximum, and count. `conformance.json` records the
+manifest revision/hash, scenario outcomes, exact-one-JSON validation, reader
+caps, real identities, cleanup deadline, and Job zero proof.
+
+## Budgets and measurements
+
+These are provisional infrastructure budgets for focused validation:
+
+| Measurement | Budget | Evidence |
 | --- | ---: | --- |
-| Test-helper close latency | ≤ 500 ms p95 | From the close request reaching the bounded helper until its natural exit; record helper identity, request time, exit time, and whether the close was cooperative or forced. |
-| PTY first output | ≤ 500 ms p95 | From an admitted PTY launch until the first non-empty output byte is observed by the host; measure with the real host/client cycle, not the helper-only test. |
-| PTY input acknowledgement | ≤ 250 ms p95 | From an admitted input sequence until the matching acknowledgement is observed; preserve the sequence and provider/session identity in sanitized evidence. |
-| 10 MB output delivery | ≤ 5 s, zero loss | Deliver exactly 10 MiB through the managed PTY path, with no sequence gap, duplicate, or unbounded queue; record bytes admitted, physically delivered, and terminal settlement. |
-| 100-cycle memory/handle growth (memory) | ≤ 16 MiB private-bytes delta | Compare a quiet baseline with the same host after 100 launch/write/resize/detach/reattach/close cycles; exclude Cargo, rustc, test harnesses, and unrelated processes. |
-| 100-cycle handle growth | ≤ 32 handles delta | Compare the host's handle count at the same lifecycle point before and after 100 cycles; require the host and every managed Job to have settled before sampling. |
+| Cycle/supervisor close settlement | ≤ 500 ms p95 | Monotonic cycle duration and `ACTIVE_PROCESS_ZERO` |
+| First bounded result | ≤ 500 ms p95 | One exact result line and byte counts |
+| 10 MiB bounded output fixture | ≤ 5 s, zero loss | Capped stdout/stderr totals and failure on overflow |
+| 100-cycle memory/handle review | ≤ 16 MiB / 32 handles delta | Future real soak only; never inferred from this dry run |
 
-## Cycle evidence contract
+Report p50 and p95 from sorted monotonic durations: p50 is the ceiling of
+`count × 0.50`, p95 the ceiling of `count × 0.95`, both clamped to the last
+sample. Missing or ambiguous timestamps fail the measurement.
 
-The runner accepts only `cycleSchemaVersion=1` evidence. A completed result is
-an exact object with these top-level fields: `schemaVersion`, `status`, `cycle`,
-`seed`, `host`, `client`, `terminal`, `operations`, `managedRoot`,
-`ownedProcessIdentities`, `resources`, and `timing`. Missing fields, unknown
-fields, duplicate identities or operation evidence, wrong cycle/seed, partial
-results, and inconsistent deltas are failures. A bare object containing only
-`status=completed` is never a cycle result.
+CPU percentages use the same denominator as Windows Task Manager. For a
+sample interval of `sampleMs`, process CPU time `processMs`, and `logical`
+logical processors:
 
-The host, client, and managed-root identities each carry the exact
-`processId`, fully qualified `executablePath`, and `creationDate`; host/client
-generations and terminal generation must agree. `operations` must prove launch,
-first output, input acknowledgement, and close settlement with either a unique
-operation ID or a marker plus timestamp. The managed root must report an
-authoritative Job member count of zero. Each cycle must report exact helper,
-provider, and host-child identities, observed listener/named-pipe/PTY/Job
-resources, empty owned/leaked residue, internally consistent resource deltas,
-and bounded `launchMs`, `firstOutputMs`, `inputAckMs`, `closeSettlementMs`, and
-`totalMs` values.
+```text
+whole-machine % = processMs / (sampleMs × logical) × 100
+core-equivalent % = processMs / sampleMs × 100
+```
 
-The runner checks every emitted exact process identity against the live process
-identity (PID, executable path, and creation time) after settlement and repeats
-the check at final settlement. It does not infer orphan freedom from an
-executable inventory. Persisted evidence is sanitized to process IDs,
-executable leaves, UTC start times, bounded safe identifiers, and redacted
-errors; raw command lines, paths, secrets, and extension output are not
-persisted.
+The first is capped at 100% for a single process on a whole-machine display;
+the second can exceed 100% when multiple logical processors are consumed.
+The evidence records the logical-processor count and both values, not an
+ambiguous “CPU percent.”
 
-The production baseline is captured before any optional cycle extension is
-loaded. Its `config.json` and `remote.json` hashes plus installed DevManager
-PID/start identity must remain unchanged after load, during cycles, and at
-finalization. Until the real typed host/client cycle API defines
-`Invoke-DevManagerProcessSoakCycle`, the 100-cycle command is intentionally
-`UNAVAILABLE` (exit code 78) before iterations; helper-only fixtures must not
-turn that status into a pass.
+## Conformance corpus
 
-## Measurement rules
-
-- Record the seed, iteration count, helper identities, host/client identities,
-  and the exact lifecycle boundary for every run.
-- Report p50, p95, maximum, and sample count for latency metrics. A missing or
-  ambiguous timestamp is a failed measurement, not an interpolated value.
-- Keep production baseline evidence separate from soak evidence. The soak must
-  verify unchanged production `config.json` and `remote.json` hashes and must
-  settle every exact emitted identity/resource at the Job boundary without
-  claiming that an executable-inventory difference is an orphan.
-- Do not convert a provisional budget to a release claim until a real,
-  repeatable host/client cycle API produces the evidence and the remaining
-  Phase 3 process, terminal, port, and isolation gates agree with it.
+ANSI/VT handling is referenced by the versioned corpus at
+`tests/fixtures/ansi/phase3-v1.json`. It includes clear-line, color, cursor,
+and escape sequences split across reader chunks. The fixed cycle fixture also
+records this corpus revision. Timeout tree cleanup, occupied external
+listeners, helper/cycle hash mismatch, malformed/multiple/oversized output,
+nonzero exit, crash, restart/resume, interruption, and no-false-pass paths
+are covered by the focused infrastructure tests. Only those tests and an
+isolated two-cycle dry run are allowed before the final Phase 3 union; do not
+run the 100-cycle soak on a partial union.
