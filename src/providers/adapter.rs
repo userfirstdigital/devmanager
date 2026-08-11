@@ -874,6 +874,7 @@ pub enum ProviderProbeIoError {
 pub enum ProviderProbeError {
     Io(ProviderProbeIoError),
     TimedOut,
+    UnsupportedAttestation,
     OutputTooLarge,
     NonZeroExit(Option<i32>),
     InvalidRequest(ProviderProbeRequestError),
@@ -884,6 +885,12 @@ impl fmt::Display for ProviderProbeError {
         match self {
             Self::Io(error) => write!(f, "provider probe I/O failed: {error:?}"),
             Self::TimedOut => write!(f, "provider probe timed out"),
+            Self::UnsupportedAttestation => {
+                write!(
+                    f,
+                    "provider probe image attestation is unsupported on this platform"
+                )
+            }
             Self::OutputTooLarge => write!(f, "provider probe output exceeded its bound"),
             Self::NonZeroExit(code) => write!(f, "provider probe exited unsuccessfully: {code:?}"),
             Self::InvalidRequest(error) => error.fmt(f),
@@ -948,6 +955,7 @@ impl WindowsProviderProbeRunner {
             command,
             deadline,
             Some(request.executable().launch_program().canonical_path()),
+            request.executable(),
         )?;
         // Windows keeps the no-delete handles open through CreateProcess;
         // Unix uses inherited descriptor paths from `prepare_unix_launch`.
@@ -1069,7 +1077,10 @@ fn validate_probe_executable(
 }
 
 #[cfg(windows)]
-fn attest_launched_image(child: &Child, expected: &std::path::Path) -> bool {
+fn attest_launched_image(
+    child: &Child,
+    expected: &std::path::Path,
+) -> Result<(), ProviderProbeError> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
     use windows::core::PWSTR;
@@ -1091,29 +1102,86 @@ fn attest_launched_image(child: &Child, expected: &std::path::Path) -> bool {
         )
     };
     if !result.is_ok() {
-        return false;
+        return Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ));
     }
-    std::fs::canonicalize(std::ffi::OsString::from_wide(&buffer[..length as usize]))
+    if std::fs::canonicalize(std::ffi::OsString::from_wide(&buffer[..length as usize]))
         .ok()
         .is_some_and(|path| path == expected)
+    {
+        Ok(())
+    } else {
+        Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn attest_launched_image(child: &Child, expected: &std::path::Path) -> bool {
-    std::fs::read_link(format!("/proc/{}/exe", child.id()))
+fn attest_launched_image(
+    child: &Child,
+    expected: &std::path::Path,
+) -> Result<(), ProviderProbeError> {
+    if std::fs::read_link(format!("/proc/{}/exe", child.id()))
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
         .is_some_and(|path| path == expected)
+    {
+        Ok(())
+    } else {
+        Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ))
+    }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn attest_launched_image(_child: &Child, _expected: &std::path::Path) -> bool {
-    true
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn attest_launched_image(
+    child: &Child,
+    expected: &std::path::Path,
+) -> Result<(), ProviderProbeError> {
+    let mut buffer = vec![0_u8; 4096];
+    let length =
+        unsafe { proc_pidpath(child.id() as i32, buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length <= 0 {
+        return Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ));
+    }
+    let path = std::str::from_utf8(&buffer[..length as usize])
+        .ok()
+        .map(PathBuf::from)
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    if path.is_some_and(|path| path == expected) {
+        Ok(())
+    } else {
+        Err(ProviderProbeError::Io(
+            ProviderProbeIoError::ExecutableNotAllowed,
+        ))
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn attest_launched_image(
+    _child: &Child,
+    _expected: &std::path::Path,
+) -> Result<(), ProviderProbeError> {
+    Err(ProviderProbeError::UnsupportedAttestation)
 }
 
 #[cfg(not(any(windows, unix)))]
-fn attest_launched_image(_child: &Child, _expected: &std::path::Path) -> bool {
-    false
+fn attest_launched_image(
+    _child: &Child,
+    _expected: &std::path::Path,
+) -> Result<(), ProviderProbeError> {
+    Err(ProviderProbeError::UnsupportedAttestation)
 }
 
 #[cfg(unix)]
@@ -1121,6 +1189,11 @@ fn prepare_unix_launch(
     policy: &ProviderExecutablePolicy,
     requested: &ProviderExecutableHandle,
 ) -> Result<(PathBuf, Vec<std::ffi::OsString>, Vec<std::fs::File>), ProviderProbeError> {
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = (policy, requested);
+        return Err(ProviderProbeError::UnsupportedAttestation);
+    }
     validate_probe_executable(policy, requested)?;
     let (program_file, script_file) = requested
         .launch_files()
@@ -1226,7 +1299,13 @@ impl ProbeProcess {
         mut command: std::process::Command,
         deadline: std::time::Instant,
         expected: Option<&Path>,
+        _requested: &ProviderExecutableHandle,
     ) -> Result<Self, ProviderProbeError> {
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            let _ = (&command, deadline, expected, _requested);
+            return Err(ProviderProbeError::UnsupportedAttestation);
+        }
         let mut child = command.spawn().map_err(|error| {
             ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
                 ProviderProbeIoError::ExecutableMissing
@@ -1236,16 +1315,37 @@ impl ProbeProcess {
                 ProviderProbeIoError::SpawnFailed
             })
         })?;
-        #[cfg(windows)]
-        if !expected.is_some_and(|expected| attest_launched_image(&child, expected)) {
+        #[cfg(target_os = "macos")]
+        // `std::process::Command::spawn` waits for the child exec-error pipe;
+        // a SIGSTOP in `pre_exec` would therefore deadlock this parent before
+        // it could inspect the retained graph. Stop the just-created child
+        // immediately instead, then perform the exact image and descriptor
+        // checks while suspended and before SIGCONT.
+        if suspend_macos_process(child.id()).is_err() {
             let _ = child.kill();
             reap_child_until(&mut child, deadline);
-            return Err(ProviderProbeError::Io(
-                ProviderProbeIoError::ExecutableNotAllowed,
-            ));
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
         }
-        #[cfg(not(windows))]
-        let _ = expected;
+        #[cfg(windows)]
+        if let Some(expected) = expected {
+            if attest_launched_image(&child, expected).is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(expected) = expected {
+            if attest_launched_image(&child, expected).is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+            }
+        }
         let managed_job =
             match crate::services::platform_service::claim_suspended_process(child.id()) {
                 Ok(job) => job,
@@ -1255,6 +1355,40 @@ impl ProbeProcess {
                     return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
                 }
             };
+        #[cfg(target_os = "macos")]
+        {
+            let Some(expected) = expected else {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::UnsupportedAttestation);
+            };
+            if _requested.revalidate().is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+            }
+            if attest_launched_image(&child, expected).is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+            }
+            if resume_macos_suspended_process(child.id()).is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+            }
+            if attest_launched_image(&child, expected).is_err() {
+                let _ = child.kill();
+                reap_child_until(&mut child, deadline);
+                return Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+            }
+        }
         #[cfg(windows)]
         if managed_job.is_none() {
             let _ = child.kill();
@@ -1351,6 +1485,34 @@ impl ProbeProcess {
         }
         drop(self.managed_job.take());
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_SIGSTOP: i32 = 17;
+#[cfg(target_os = "macos")]
+const MACOS_SIGCONT: i32 = 19;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn macos_kill(pid: i32, signal: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn suspend_macos_process(pid: u32) -> std::io::Result<()> {
+    if unsafe { macos_kill(pid as i32, MACOS_SIGSTOP) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resume_macos_suspended_process(pid: u32) -> std::io::Result<()> {
+    if unsafe { macos_kill(pid as i32, MACOS_SIGCONT) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1848,5 +2010,34 @@ mod tests {
             Err(ProviderAuthEvidenceError::RequestBindingMismatch)
         ));
         assert!(result.into_auth_observation(&invocation, &request).is_ok());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[test]
+    fn unsupported_unix_attestation_is_typed_and_fail_closed() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let handle = executable.open_for_launch().unwrap();
+        let file_name = handle.canonical_path().file_name().unwrap().to_os_string();
+        let policy = ProviderExecutablePolicy::new([file_name]).unwrap();
+        assert!(matches!(
+            prepare_unix_launch(&policy, &handle),
+            Err(ProviderProbeError::UnsupportedAttestation)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_image_attestation_rejects_a_different_expected_image() {
+        use std::process::Command;
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .spawn()
+            .unwrap();
+        assert!(
+            attest_launched_image(&child, Path::new("/definitely/not-the-running-image")).is_err()
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

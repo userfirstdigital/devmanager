@@ -1328,8 +1328,13 @@ pub struct ProviderAuthEvidenceRegistry {
     pending_order: VecDeque<ProviderAuthInvocationKey>,
     accepted: HashMap<ProviderAuthReceiptKey, (ProviderAuthEvidenceReceipt, bool)>,
     accepted_order: VecDeque<ProviderAuthReceiptKey>,
-    last_accepted:
-        HashMap<(ProviderKind, ProviderExecutableHandle, ProviderVersion), (u64, Instant, u64)>,
+    /// Bounded retirement authority independent from the receipt/body LRU.
+    ///
+    /// Generations are allocated globally, so one monotonic high-water mark
+    /// safely retires every older pending invocation even after its accepted
+    /// receipt body has been evicted. Keeping this separate from `accepted`
+    /// prevents an LRU/cache operation from reviving stale work.
+    retirement_high_water: Option<(u64, Instant, u64)>,
 }
 
 impl ProviderAuthEvidenceRegistry {
@@ -1345,7 +1350,7 @@ impl ProviderAuthEvidenceRegistry {
             pending_order: VecDeque::new(),
             accepted: HashMap::new(),
             accepted_order: VecDeque::new(),
-            last_accepted: HashMap::new(),
+            retirement_high_water: None,
         }
     }
 
@@ -1695,21 +1700,16 @@ impl ProviderAuthEvidenceRegistry {
         }
         self.remove_pending(&key);
 
-        let identity_key = (
-            invocation.kind,
-            invocation.executable.clone(),
-            invocation.version.clone(),
-        );
         if let Some((last_generation, last_observed_at, last_observed_at_ms)) =
-            self.last_accepted.get(&identity_key)
+            self.retirement_high_water
         {
-            if invocation.generation <= *last_generation {
+            if invocation.generation <= last_generation {
                 return Err(ProviderAuthEvidenceError::Reordered);
             }
-            if observed_at <= *last_observed_at {
+            if observed_at <= last_observed_at {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
-            if observed_at_ms <= *last_observed_at_ms {
+            if observed_at_ms <= last_observed_at_ms {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
         }
@@ -1727,10 +1727,7 @@ impl ProviderAuthEvidenceRegistry {
             deadline_ms,
             confidence,
         };
-        self.last_accepted.insert(
-            identity_key,
-            (invocation.generation, observed_at, observed_at_ms),
-        );
+        self.retirement_high_water = Some((invocation.generation, observed_at, observed_at_ms));
         self.evict_oldest_accepted();
         let receipt_key = receipt.key();
         self.accepted_order.push_back(receipt_key.clone());
@@ -1787,13 +1784,8 @@ impl ProviderAuthEvidenceRegistry {
             return Err(ProviderAuthEvidenceError::Expired);
         }
         if self
-            .last_accepted
-            .get(&(
-                receipt.kind,
-                receipt.executable.clone(),
-                receipt.version.clone(),
-            ))
-            .map_or(true, |(generation, _, _)| *generation != receipt.generation)
+            .retirement_high_water
+            .map_or(true, |(generation, _, _)| generation != receipt.generation)
         {
             return Err(ProviderAuthEvidenceError::Reordered);
         }
@@ -1917,25 +1909,16 @@ impl ProviderAuthEvidenceRegistry {
             let Some(key) = self.accepted_order.pop_front() else {
                 break;
             };
-            if let Some((receipt, _)) = self.accepted.remove(&key) {
-                let identity_key = (
-                    receipt.kind,
-                    receipt.executable.clone(),
-                    receipt.version.clone(),
-                );
-                if self
-                    .last_accepted
-                    .get(&identity_key)
-                    .is_some_and(|(generation, _, _)| *generation == receipt.generation)
-                {
-                    self.last_accepted.remove(&identity_key);
-                }
+            if self.accepted.remove(&key).is_some() {
+                // Receipt/body eviction must never alter the monotonic
+                // retirement watermark. The body is only a display/consume
+                // record; stale pending generations remain rejected.
             }
         }
     }
 
     fn remove_accepted(&mut self, key: &ProviderAuthReceiptKey) {
-        if let Some((receipt, _)) = self.accepted.remove(key) {
+        if let Some((_receipt, _)) = self.accepted.remove(key) {
             if let Some(position) = self
                 .accepted_order
                 .iter()
@@ -1943,18 +1926,9 @@ impl ProviderAuthEvidenceRegistry {
             {
                 self.accepted_order.remove(position);
             }
-            let identity_key = (
-                receipt.kind,
-                receipt.executable.clone(),
-                receipt.version.clone(),
-            );
-            if self
-                .last_accepted
-                .get(&identity_key)
-                .is_some_and(|(generation, _, _)| *generation == receipt.generation)
-            {
-                self.last_accepted.remove(&identity_key);
-            }
+            // Do not clear retirement_high_water when the receipt body is
+            // expired, consumed, or evicted. It is the independent authority
+            // that prevents an older pending generation from reaccepting.
         }
     }
 }
@@ -4270,6 +4244,122 @@ mod auth_timestamp_tests {
         assert!(evidence
             .expires_at()
             .is_some_and(|expires_at| expires_at > evidence.observed_at()));
+    }
+
+    #[test]
+    fn retired_generation_survives_receipt_body_eviction_and_rejects_older_pending_probe() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_name = if cfg!(windows) {
+            "devmanager_provider_probe_fixture.exe"
+        } else {
+            "devmanager_provider_probe_fixture"
+        };
+        let root_fixture_name = if cfg!(windows) {
+            "devmanager-provider-probe-fixture.exe"
+        } else {
+            "devmanager-provider-probe-fixture"
+        };
+        let source = [
+            manifest
+                .join("target")
+                .join("debug")
+                .join("deps")
+                .join(fixture_name),
+            manifest
+                .join("target")
+                .join("debug")
+                .join(root_fixture_name),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| std::env::current_exe().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_copy = temp.path().join("provider-fixture.exe");
+        std::fs::copy(source, &fixture_copy).unwrap();
+        let executable = ProviderExecutable::from_path(&fixture_copy).unwrap();
+        let mut registry = ProviderAuthEvidenceRegistry::new();
+
+        let older = registry
+            .begin_with_version(
+                ProviderKind::ClaudeCode,
+                executable.clone(),
+                ProviderVersion::new("fixture-1").unwrap(),
+                Duration::from_secs(240),
+            )
+            .unwrap();
+        let newer = registry
+            .begin_with_version(
+                ProviderKind::ClaudeCode,
+                executable.clone(),
+                ProviderVersion::new("fixture-1").unwrap(),
+                Duration::from_secs(240),
+            )
+            .unwrap();
+        let newer_observation = ProviderAuthProbeObservation::from_bounded_probe(
+            &newer,
+            ProviderAuthProbeResult::AuthRequired,
+            EvidenceConfidence::High,
+        )
+        .unwrap();
+        registry
+            .accept_observation(newer, newer_observation)
+            .unwrap();
+
+        // Fill the bounded receipt/body LRU while the older invocation remains
+        // pending. The retirement authority must not be evicted with those
+        // display/body entries.
+        for _ in 0..(MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES + 1) {
+            let invocation = registry
+                .begin_with_version(
+                    ProviderKind::ClaudeCode,
+                    executable.clone(),
+                    ProviderVersion::new("fixture-1").unwrap(),
+                    Duration::from_secs(240),
+                )
+                .unwrap();
+            let observation = ProviderAuthProbeObservation::from_bounded_probe(
+                &invocation,
+                ProviderAuthProbeResult::AuthRequired,
+                EvidenceConfidence::High,
+            )
+            .unwrap();
+            registry
+                .accept_observation(invocation, observation)
+                .unwrap();
+        }
+
+        let older_observation = ProviderAuthProbeObservation::from_bounded_probe(
+            &older,
+            ProviderAuthProbeResult::AuthRequired,
+            EvidenceConfidence::High,
+        )
+        .unwrap();
+        assert!(matches!(
+            registry.accept_observation(older, older_observation),
+            Err(ProviderAuthEvidenceError::Reordered)
+        ));
+
+        // A fresh registry represents a restart and intentionally begins a
+        // new generation epoch; the retired authority is not persisted as a
+        // receipt/body cache artifact.
+        let mut restarted = ProviderAuthEvidenceRegistry::new();
+        let restarted_invocation = restarted
+            .begin_with_version(
+                ProviderKind::ClaudeCode,
+                executable,
+                ProviderVersion::new("fixture-1").unwrap(),
+                Duration::from_secs(240),
+            )
+            .unwrap();
+        let restarted_observation = ProviderAuthProbeObservation::from_bounded_probe(
+            &restarted_invocation,
+            ProviderAuthProbeResult::AuthRequired,
+            EvidenceConfidence::High,
+        )
+        .unwrap();
+        assert!(restarted
+            .accept_observation(restarted_invocation, restarted_observation)
+            .is_ok());
     }
 }
 

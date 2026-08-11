@@ -15,9 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -289,22 +288,14 @@ impl ProbeFlight {
     }
 }
 
-struct ProbeLeaderCleanup<'a> {
-    registry: &'a ProviderRegistry,
-    key: ProbeIdentityKey,
+struct ProbeLeaderCleanup {
     flight: Arc<ProbeFlight>,
     armed: bool,
 }
 
-impl<'a> ProbeLeaderCleanup<'a> {
-    fn new(
-        registry: &'a ProviderRegistry,
-        key: ProbeIdentityKey,
-        flight: Arc<ProbeFlight>,
-    ) -> Self {
+impl ProbeLeaderCleanup {
+    fn new(flight: Arc<ProbeFlight>) -> Self {
         Self {
-            registry,
-            key,
             flight,
             armed: true,
         }
@@ -315,20 +306,12 @@ impl<'a> ProbeLeaderCleanup<'a> {
     }
 }
 
-impl Drop for ProbeLeaderCleanup<'_> {
+impl Drop for ProbeLeaderCleanup {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         self.flight.cancel();
-        if let Ok(mut in_flight) = self.registry.in_flight.lock() {
-            if in_flight
-                .get(&self.key)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-            {
-                in_flight.remove(&self.key);
-            }
-        }
     }
 }
 
@@ -457,19 +440,21 @@ impl CapabilityCache {
 
 pub struct ProviderRegistry {
     adapters: BTreeMap<ProviderKind, Arc<dyn ProviderAdapter>>,
-    cache: Mutex<CapabilityCache>,
-    in_flight: Mutex<HashMap<ProbeIdentityKey, Arc<ProbeFlight>>>,
+    cache: Arc<Mutex<CapabilityCache>>,
+    in_flight: Arc<Mutex<HashMap<ProbeIdentityKey, Arc<ProbeFlight>>>>,
     executable_inspector: Arc<dyn ExecutableInspector>,
     auth_evidence: Mutex<ProviderAuthEvidenceRegistry>,
 }
 
 impl Drop for ProviderRegistry {
     fn drop(&mut self) {
-        if let Ok(in_flight) = self.in_flight.get_mut() {
+        if let Ok(in_flight) = self.in_flight.lock() {
             for flight in in_flight.values() {
                 flight.cancel();
             }
-            in_flight.clear();
+            // Do not clear the map here. A detached worker owns the same map
+            // and removes its flight only after the adapter/native leader has
+            // actually joined. This keeps drop/eviction from orphaning work.
         }
     }
 }
@@ -482,8 +467,8 @@ impl ProviderRegistry {
     pub fn with_executable_inspector(inspector: Arc<dyn ExecutableInspector>) -> Self {
         Self {
             adapters: BTreeMap::new(),
-            cache: Mutex::new(CapabilityCache::default()),
-            in_flight: Mutex::new(HashMap::new()),
+            cache: Arc::new(Mutex::new(CapabilityCache::default())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             executable_inspector: inspector,
             auth_evidence: Mutex::new(ProviderAuthEvidenceRegistry::new()),
         }
@@ -747,9 +732,8 @@ impl ProviderRegistry {
                 })
                 .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
                 .collect();
-            for (expired_key, expired_flight) in expired {
+            for (_expired_key, expired_flight) in expired {
                 expired_flight.cancel();
-                in_flight.remove(&expired_key);
             }
             let replaced: Vec<_> = in_flight
                 .iter()
@@ -763,23 +747,26 @@ impl ProviderRegistry {
                 })
                 .map(|(existing_key, flight)| (existing_key.clone(), Arc::clone(flight)))
                 .collect();
-            for (replaced_key, replaced_flight) in replaced {
+            for (_replaced_key, replaced_flight) in replaced {
                 replaced_flight.cancel();
-                in_flight.remove(&replaced_key);
             }
             if let Some(flight) = in_flight.get(&key) {
                 (Arc::clone(flight), false)
             } else {
-                while in_flight.len() >= MAX_PROVIDER_IN_FLIGHT_ENTRIES {
-                    let Some((oldest_key, oldest_flight)) = in_flight
-                        .iter()
-                        .min_by_key(|(_, flight)| flight.started_at)
-                        .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
-                    else {
-                        break;
-                    };
-                    oldest_flight.cancel();
-                    in_flight.remove(&oldest_key);
+                if in_flight.len() >= MAX_PROVIDER_IN_FLIGHT_ENTRIES {
+                    // Cancellation is cooperative for the async layer, but
+                    // the adapter may own an uncancellable native leader.
+                    // Keep that flight in the map until its worker joins so
+                    // the capacity charge cannot be evicted and immediately
+                    // replaced by unbounded native work.
+                    if let Some((_, oldest_flight)) =
+                        in_flight.iter().min_by_key(|(_, flight)| flight.started_at)
+                    {
+                        oldest_flight.cancel();
+                    }
+                    return Err(ProviderError::Probe(
+                        crate::providers::adapter::ProviderProbeError::TimedOut,
+                    ));
                 }
                 let flight = Arc::new(ProbeFlight {
                     result: Mutex::new(None),
@@ -795,41 +782,16 @@ impl ProviderRegistry {
         };
 
         if leader {
-            let mut leader_cleanup =
-                ProbeLeaderCleanup::new(self, key.clone(), Arc::clone(&flight));
-            let remaining = flight.deadline.saturating_duration_since(Instant::now());
-            let mut cancellation = pin!(flight.cancellation.notified());
-            cancellation.as_mut().enable();
-            let result = if flight.cancelled.load(Ordering::Acquire) {
-                Err(ProviderError::Probe(
-                    crate::providers::adapter::ProviderProbeError::TimedOut,
-                ))
-            } else {
-                tokio::select! {
-                    result = self.perform_probe(&adapter, &requested_path, &before, &before_handle, &key) => result,
-                    _ = &mut cancellation => Err(ProviderError::Probe(
-                        crate::providers::adapter::ProviderProbeError::TimedOut,
-                    )),
-                    _ = tokio::time::sleep(remaining) => Err(ProviderError::Probe(
-                        crate::providers::adapter::ProviderProbeError::TimedOut,
-                    )),
-                }
-            };
-            let published = {
-                let mut slot = flight.result.lock().unwrap();
-                if slot.is_none() {
-                    *slot = Some(result.clone());
-                }
-                slot.clone().unwrap_or(result)
-            };
-            flight.completed.notify_waiters();
-            let mut in_flight = self.in_flight.lock().unwrap();
-            if in_flight
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &flight))
-            {
-                in_flight.remove(&key);
-            }
+            self.spawn_probe_worker(
+                Arc::clone(&flight),
+                key,
+                adapter,
+                requested_path,
+                before,
+                before_handle,
+            );
+            let mut leader_cleanup = ProbeLeaderCleanup::new(Arc::clone(&flight));
+            let published = Self::await_probe_flight(Arc::clone(&flight)).await;
             leader_cleanup.disarm();
             published.map(|(capabilities, executable, executable_handle)| ProbeRun {
                 capabilities,
@@ -838,52 +800,107 @@ impl ProviderRegistry {
                 leader: true,
             })
         } else {
-            loop {
-                if let Some(result) = flight.result.lock().unwrap().clone() {
-                    return result.map(|(capabilities, executable, executable_handle)| ProbeRun {
-                        capabilities,
-                        executable,
-                        executable_handle,
-                        leader: false,
-                    });
-                }
+            Self::await_probe_flight(Arc::clone(&flight)).await.map(
+                |(capabilities, executable, executable_handle)| ProbeRun {
+                    capabilities,
+                    executable,
+                    executable_handle,
+                    leader: false,
+                },
+            )
+        }
+    }
+
+    fn spawn_probe_worker(
+        &self,
+        flight: Arc<ProbeFlight>,
+        key: ProbeIdentityKey,
+        adapter: Arc<dyn ProviderAdapter>,
+        requested_path: PathBuf,
+        before: ProviderExecutable,
+        before_handle: ProviderExecutableHandle,
+    ) {
+        let cache = Arc::clone(&self.cache);
+        let in_flight = Arc::clone(&self.in_flight);
+        let executable_inspector = Arc::clone(&self.executable_inspector);
+        tokio::spawn(async move {
+            // The timer only publishes cancellation. It never owns the
+            // adapter future, so cancellation cannot drop native work.
+            let timer_flight: Weak<ProbeFlight> = Arc::downgrade(&flight);
+            let timer = tokio::spawn(async move {
+                let Some(flight) = timer_flight.upgrade() else {
+                    return;
+                };
                 let remaining = flight.deadline.saturating_duration_since(Instant::now());
-                let mut completed = pin!(flight.completed.notified());
-                let mut cancellation = pin!(flight.cancellation.notified());
-                completed.as_mut().enable();
-                cancellation.as_mut().enable();
-                if let Some(result) = flight.result.lock().unwrap().clone() {
-                    return result.map(|(capabilities, executable, executable_handle)| ProbeRun {
-                        capabilities,
-                        executable,
-                        executable_handle,
-                        leader: false,
-                    });
+                tokio::time::sleep(remaining).await;
+                flight.cancel();
+            });
+
+            // Keep this future owned by the detached worker until the
+            // adapter returns. ProviderProbeRunner's blocking task is joined
+            // by that future, including after callers cancel or time out.
+            let result = Self::perform_probe(
+                &cache,
+                &executable_inspector,
+                &adapter,
+                &requested_path,
+                &before,
+                &before_handle,
+                &key,
+            )
+            .await;
+            timer.abort();
+
+            {
+                let mut slot = flight.result.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(result);
                 }
-                if flight.cancelled.load(Ordering::Acquire) {
-                    return Err(ProviderError::Probe(
-                        crate::providers::adapter::ProviderProbeError::TimedOut,
-                    ));
-                }
-                tokio::select! {
-                    _ = &mut completed => {}
-                    _ = &mut cancellation => {
-                        return Err(ProviderError::Probe(
-                            crate::providers::adapter::ProviderProbeError::TimedOut,
-                        ));
-                    }
-                    _ = tokio::time::sleep(remaining) => {
-                        return Err(ProviderError::Probe(
-                            crate::providers::adapter::ProviderProbeError::TimedOut,
-                        ));
-                    }
-                }
+            }
+            flight.completed.notify_waiters();
+
+            let mut in_flight = in_flight.lock().unwrap();
+            if in_flight
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &flight))
+            {
+                in_flight.remove(&key);
+            }
+        });
+    }
+
+    async fn await_probe_flight(
+        flight: Arc<ProbeFlight>,
+    ) -> Result<
+        (
+            ProviderCapabilities,
+            ProviderExecutable,
+            ProviderExecutableHandle,
+        ),
+        ProviderError,
+    > {
+        loop {
+            if let Some(result) = flight.result.lock().unwrap().clone() {
+                return result;
+            }
+
+            let mut completed = std::pin::pin!(flight.completed.notified());
+            let mut cancellation = std::pin::pin!(flight.cancellation.notified());
+            completed.as_mut().enable();
+            cancellation.as_mut().enable();
+            if let Some(result) = flight.result.lock().unwrap().clone() {
+                return result;
+            }
+            tokio::select! {
+                _ = &mut completed => {}
+                _ = &mut cancellation => {}
             }
         }
     }
 
     async fn perform_probe(
-        &self,
+        cache: &Arc<Mutex<CapabilityCache>>,
+        executable_inspector: &Arc<dyn ExecutableInspector>,
         adapter: &Arc<dyn ProviderAdapter>,
         requested_path: &Path,
         before: &ProviderExecutable,
@@ -921,19 +938,19 @@ impl ProviderRegistry {
         capabilities.validate()?;
 
         // Reinspect after every capability probe and before any cache write.
-        let after = self
-            .executable_inspector
-            .inspect(requested_path)
-            .await
-            .map_err(|error| match error {
-                ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_) => {
-                    ProviderError::MissingCli {
-                        kind: identity_key.kind,
-                        requested: Some(requested_path.to_path_buf()),
+        let after =
+            executable_inspector
+                .inspect(requested_path)
+                .await
+                .map_err(|error| match error {
+                    ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_) => {
+                        ProviderError::MissingCli {
+                            kind: identity_key.kind,
+                            requested: Some(requested_path.to_path_buf()),
+                        }
                     }
-                }
-                other => ProviderError::Executable(other),
-            })?;
+                    other => ProviderError::Executable(other),
+                })?;
         let contract = ProviderDiscoveryContract::for_kind(identity_key.kind);
         if after.is_native() {
             contract
@@ -958,7 +975,7 @@ impl ProviderRegistry {
             identity_key.adapter_revision,
             identity_key.semantic_schema_version,
         );
-        self.cache.lock().unwrap().insert(
+        cache.lock().unwrap().insert(
             cache_key,
             capabilities.stable_projection(),
             before_handle.clone(),

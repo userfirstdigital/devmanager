@@ -697,7 +697,7 @@ async fn same_identity_concurrent_misses_share_one_expensive_probe() {
 }
 
 #[tokio::test]
-async fn cancelled_probe_leader_cleans_its_bounded_inflight_entry() {
+async fn cancelled_probe_leader_stays_charged_until_worker_completion() {
     let temp = tempdir().unwrap();
     let executable = executable_file(temp.path(), "claude", b"cancelled-leader");
     let adapter = FakeAdapter::new(capabilities(
@@ -708,17 +708,215 @@ async fn cancelled_probe_leader_cleans_its_bounded_inflight_entry() {
         CapabilitySupport::Unknown,
         CapabilitySupport::Unknown,
     ));
-    adapter.set_probe_delay(Duration::from_secs(5));
+    adapter.set_probe_delay(Duration::from_millis(500));
     let mut registry = ProviderRegistry::new();
     registry.register(adapter).unwrap();
 
     let observed = tokio::time::timeout(
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         registry.observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None)),
     )
     .await;
     assert!(observed.is_err(), "the delayed leader should be cancelled");
+    assert_eq!(registry.in_flight_len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while registry.in_flight_len() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(registry.in_flight_len(), 0);
+}
+
+struct PausedNativeAdapter {
+    capabilities: ProviderCapabilities,
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl ProviderAdapter for PausedNativeAdapter {
+    fn kind(&self) -> ProviderKind {
+        self.capabilities.kind
+    }
+
+    async fn probe(
+        &self,
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<ProviderCapabilities, ProviderError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let release = Arc::clone(&self.release);
+        tokio::task::spawn_blocking(move || {
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        Ok(self.capabilities.clone())
+    }
+
+    fn build_launch(
+        &self,
+        _request: LaunchProviderRequest,
+    ) -> Result<ProviderLaunchSpec, ProviderError> {
+        Err(ProviderError::UnsupportedCapability(
+            ProviderCapability::BuildLaunch,
+        ))
+    }
+
+    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
+        Vec::new()
+    }
+
+    fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
+        StopStrategy::Unsupported
+    }
+
+    async fn observe_quota(
+        &self,
+        _executable: &ProviderExecutableHandle,
+    ) -> Result<Option<QuotaObservation>, ProviderError> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn cancelled_paused_native_leader_stays_charged_until_native_join_and_rejects_new_work() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"paused-native-leader");
+    let adapter = Arc::new(PausedNativeAdapter {
+        capabilities: capabilities(
+            ProviderKind::ClaudeCode,
+            "fixture-1",
+            ProviderAuthState::Unknown,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unknown,
+        ),
+        started: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
+        release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let release = Arc::clone(&adapter.release);
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter.clone()).unwrap();
+    let config = discovery(Some(executable.clone()), None);
+
+    let task_registry = Arc::new(registry);
+    let observed_registry = Arc::clone(&task_registry);
+    let observed = tokio::spawn(async move {
+        observed_registry
+            .observe(ProviderKind::ClaudeCode, &config)
+            .await
+    });
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    while adapter.started.load(Ordering::Acquire) == 0 && Instant::now() < startup_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(adapter.started.load(Ordering::Acquire), 1);
+    observed.abort();
+    let _ = observed.await;
+
+    assert_eq!(task_registry.in_flight_len(), 1);
+    let replacement = tokio::time::timeout(
+        Duration::from_millis(100),
+        task_registry.observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None)),
+    )
+    .await;
+    assert!(matches!(
+        replacement,
+        Err(_) | Ok(Err(ProviderError::Probe(ProviderProbeError::TimedOut)))
+    ));
+    assert_eq!(adapter.started.load(Ordering::Acquire), 1);
+
+    // Dropping the registry must cancel admission without dropping the
+    // retained worker or its native leader. Release it only after Drop and
+    // prove the native task still joins exactly once.
+    let registry = match Arc::try_unwrap(task_registry) {
+        Ok(registry) => registry,
+        Err(_) => panic!("no registry clones remain"),
+    };
+    drop(registry);
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while adapter.finished.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(adapter.finished.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn inflight_eviction_cancels_oldest_without_exceeding_native_leader_bound() {
+    const MAX_PAUSED_LEADERS: usize = 64;
+
+    let temp = tempdir().unwrap();
+    let adapter = Arc::new(PausedNativeAdapter {
+        capabilities: capabilities(
+            ProviderKind::ClaudeCode,
+            "fixture-1",
+            ProviderAuthState::Unknown,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unknown,
+        ),
+        started: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
+        release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter.clone()).unwrap();
+    let task_registry = Arc::new(registry);
+    let mut tasks = Vec::new();
+    for index in 0..MAX_PAUSED_LEADERS {
+        let root = temp.path().join(format!("candidate-{index}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = executable_file(&root, "claude", b"paused-native-capacity");
+        let observed_registry = Arc::clone(&task_registry);
+        tasks.push(tokio::spawn(async move {
+            observed_registry
+                .observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None))
+                .await
+        }));
+    }
+
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while adapter.started.load(Ordering::Acquire) < MAX_PAUSED_LEADERS
+        && Instant::now() < startup_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(adapter.started.load(Ordering::Acquire), MAX_PAUSED_LEADERS);
+    assert_eq!(task_registry.in_flight_len(), MAX_PAUSED_LEADERS);
+
+    let rejected_root = temp.path().join("rejected");
+    std::fs::create_dir_all(&rejected_root).unwrap();
+    let rejected_executable = executable_file(&rejected_root, "claude", b"paused-native-rejected");
+    let rejected = tokio::time::timeout(
+        Duration::from_millis(250),
+        task_registry.observe(
+            ProviderKind::ClaudeCode,
+            &discovery(Some(rejected_executable), None),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        rejected,
+        Err(_) | Ok(Err(ProviderError::Probe(ProviderProbeError::TimedOut)))
+    ));
+    assert_eq!(adapter.started.load(Ordering::Acquire), MAX_PAUSED_LEADERS);
+    assert_eq!(task_registry.in_flight_len(), MAX_PAUSED_LEADERS);
+
+    adapter.release.store(true, Ordering::Release);
+    for task in tasks {
+        let _ = task.await.unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while task_registry.in_flight_len() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(adapter.finished.load(Ordering::Acquire), MAX_PAUSED_LEADERS);
+    assert_eq!(task_registry.in_flight_len(), 0);
 }
 
 #[tokio::test]
