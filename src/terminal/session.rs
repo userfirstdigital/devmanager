@@ -3,13 +3,11 @@ use crate::domain::id::{OperationId, ResourceId};
 use crate::domain::resource::ResourceKind;
 use crate::models::{DefaultTerminal, MacTerminalProfile};
 use crate::process::identity::ProcessOwner;
-#[cfg(windows)]
 use crate::process::job::JobMemberObservation;
 #[cfg(windows)]
 use crate::process::launcher::{
     prepare_suspended_pty, validate_terminal_launch_source_bounds, LaunchIntent,
 };
-#[cfg(windows)]
 use crate::process::registry::ManagedProcessFence;
 #[cfg(windows)]
 use crate::process::teardown::{
@@ -18,8 +16,8 @@ use crate::process::teardown::{
 use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
 use crate::services::{pid_file, platform_service};
 use crate::state::{
-    PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
-    SessionRuntimeState, SessionStatus, ShellIntegrationKind,
+    PromptMarkKind, ResourceSnapshot, RuntimeState, SessionDimensions, SessionExitState,
+    SessionKind, SessionRuntimeState, SessionStatus, ShellIntegrationKind,
 };
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -45,6 +43,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::MutexGuard;
+#[cfg(windows)]
+use std::sync::RwLockWriteGuard;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -451,6 +451,59 @@ pub struct TerminalSession {
     scrolling_history: Arc<RwLock<usize>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     output_notifier: Option<SessionOutputNotifier>,
+}
+
+/// Opaque read-only result of one exact Job query. The retained teardown Arc
+/// is deliberately private: accounting can carry this proof back to the
+/// session for publication validation but cannot invoke teardown itself.
+pub(crate) struct ManagedProcessObservationCapture {
+    #[cfg(windows)]
+    teardown: Arc<ManagedTerminalTeardown>,
+    fence: ManagedProcessFence,
+}
+
+impl std::fmt::Debug for ManagedProcessObservationCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedProcessObservationCapture")
+            .field("fence", &self.fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedProcessObservationCapture {
+    pub(crate) fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedProcessObservationQuery {
+    capture: ManagedProcessObservationCapture,
+    members: Result<Vec<JobMemberObservation>, String>,
+}
+
+impl ManagedProcessObservationQuery {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ManagedProcessObservationCapture,
+        Result<Vec<JobMemberObservation>, String>,
+    ) {
+        (self.capture, self.members)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedResourceSamplePublication {
+    Published {
+        dirty_changed: bool,
+        cleared_unreaped: bool,
+    },
+    StaleGeneration {
+        dirty_changed: bool,
+    },
 }
 
 impl TerminalSession {
@@ -2759,35 +2812,6 @@ impl TerminalSession {
         Ok(teardown.map(|teardown| teardown.managed_process_fence()))
     }
 
-    /// Returns active PIDs from the session's managed Job Object, if any.
-    ///
-    /// Does not expose the raw Job handle. Query failures degrade to `None`
-    /// after emitting a concise diagnostic.
-    #[cfg(test)]
-    pub(crate) fn managed_process_ids(&self) -> Option<Vec<u32>> {
-        #[cfg(windows)]
-        {
-            return self
-                .managed_process_snapshot()
-                .map(|(_, active_process_ids)| active_process_ids);
-        }
-        #[cfg(not(windows))]
-        {
-            let job_slot = self.process_job.lock().ok()?;
-            let job = job_slot.as_ref()?;
-            match job.active_process_ids() {
-                Ok(process_ids) => Some(process_ids),
-                Err(error) => {
-                    eprintln!(
-                        "[terminal:{}] managed job query failed: {error}",
-                        self.session_id
-                    );
-                    None
-                }
-            }
-        }
-    }
-
     /// Snapshots the exact managed root fence and current Job membership from
     /// the teardown-owned registry. This deliberately exposes neither the Job
     /// handle nor any raw termination operation.
@@ -2806,7 +2830,7 @@ impl TerminalSession {
         &self,
         absolute_deadline: std::time::Instant,
         max_members: usize,
-    ) -> Result<Option<(ManagedProcessFence, Vec<JobMemberObservation>)>, String> {
+    ) -> Result<Option<ManagedProcessObservationQuery>, String> {
         if std::time::Instant::now() >= absolute_deadline {
             return Err("terminal managed-process observation exceeded deadline".to_string());
         }
@@ -2818,12 +2842,106 @@ impl TerminalSession {
         let Some(teardown) = teardown else {
             return Ok(None);
         };
-        let observation =
-            teardown.managed_process_observations_until(absolute_deadline, max_members)?;
-        if std::time::Instant::now() >= absolute_deadline {
-            return Err("terminal managed-process observation exceeded deadline".to_string());
+        let fence = teardown.managed_process_fence();
+        let members = teardown
+            .managed_process_observations_until(absolute_deadline, max_members)
+            .and_then(|(observed_fence, members)| {
+                if observed_fence == fence {
+                    Ok(members)
+                } else {
+                    Err("terminal managed-process observation generation changed".to_string())
+                }
+            });
+        Ok(Some(ManagedProcessObservationQuery {
+            capture: ManagedProcessObservationCapture { teardown, fence },
+            members,
+        }))
+    }
+
+    /// Publishes one accounting snapshot only if the exact teardown Arc,
+    /// registry fence, runtime generation, and root PID captured by the Job
+    /// query are still current. Lock order intentionally matches restart:
+    /// lifecycle first, then runtime projection.
+    #[cfg(windows)]
+    pub(crate) fn publish_managed_resource_sample_if_current(
+        &self,
+        capture: &ManagedProcessObservationCapture,
+        snapshot: ResourceSnapshot,
+        awaiting_external_editor: bool,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<ManagedResourceSamplePublication, String> {
+        let _lifecycle = lock_terminal_lifecycle_until(&self.lifecycle, absolute_deadline)?;
+        let current_teardown =
+            lock_terminal_teardown_slot_until(&self.teardown, absolute_deadline)?.clone();
+        let exact_teardown_is_current = current_teardown.as_ref().is_some_and(|current| {
+            Arc::ptr_eq(current, &capture.teardown)
+                && current.matches_fence(&capture.fence)
+                && capture.teardown.matches_fence(&capture.fence)
+        });
+        let exact_registry_is_current = exact_teardown_is_current
+            && capture
+                .teardown
+                .exact_registry_entry_is_current_until(absolute_deadline)?;
+
+        let mut runtime =
+            lock_terminal_runtime_write_until(&self.runtime_state, absolute_deadline)?;
+        let Some(session) = runtime.sessions.get_mut(&self.session_id) else {
+            return Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: false,
+            });
+        };
+        let dirty_before = session.dirty_generation;
+        let exact_runtime_is_current =
+            session.status.is_live() && session.pid == Some(capture.fence.root().id().pid());
+        if !exact_teardown_is_current || !exact_registry_is_current || !exact_runtime_is_current {
+            // Never disturb a replacement generation. If the row still holds
+            // the rejected G1 action fence, remove that local authority and
+            // explicitly type the retained values as stale/unknown.
+            if session.resources.managed_process_fence.as_ref() == Some(&capture.fence) {
+                session.resources.managed_process_fence = None;
+                session.resources.metrics_unavailable = true;
+                session.resources.metrics_status =
+                    crate::domain::snapshot::ProcessMetricStatus::Unknown;
+                session.resources.metrics_stale = true;
+                session.resources.metrics_error = Some("sampling_generation_stale".to_string());
+                session.resources.process_count_value_state =
+                    last_known_resource_value_state(session.resources.process_count_value_state);
+                session.resources.cpu_value_state =
+                    last_known_resource_value_state(session.resources.cpu_value_state);
+                session.resources.memory_value_state =
+                    last_known_resource_value_state(session.resources.memory_value_state);
+                session.resources.metric_values =
+                    last_known_resource_value_state(session.resources.metric_values);
+                session.mark_dirty();
+            }
+            return Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: session.dirty_generation != dirty_before,
+            });
         }
-        Ok(Some(observation))
+
+        let cleared_unreaped = session.reap_incomplete && snapshot.process_ids.is_empty();
+        session.note_resource_sample(snapshot);
+        session.note_external_editor_wait(awaiting_external_editor);
+        Ok(ManagedResourceSamplePublication::Published {
+            dirty_changed: session.dirty_generation != dirty_before,
+            cleared_unreaped,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn last_known_resource_value_state(
+    state: crate::state::ResourceMetricValueState,
+) -> crate::state::ResourceMetricValueState {
+    match state {
+        crate::state::ResourceMetricValueState::Observed
+        | crate::state::ResourceMetricValueState::Partial
+        | crate::state::ResourceMetricValueState::LastKnown => {
+            crate::state::ResourceMetricValueState::LastKnown
+        }
+        crate::state::ResourceMetricValueState::Unavailable => {
+            crate::state::ResourceMetricValueState::Unavailable
+        }
     }
 }
 
@@ -2843,6 +2961,14 @@ fn lock_terminal_lifecycle(lifecycle: &Mutex<()>) -> Result<MutexGuard<'_, ()>, 
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_millis(100))
         .ok_or_else(|| "terminal lifecycle deadline overflow".to_string())?;
+    lock_terminal_lifecycle_until(lifecycle, deadline)
+}
+
+#[cfg(windows)]
+fn lock_terminal_lifecycle_until(
+    lifecycle: &Mutex<()>,
+    deadline: std::time::Instant,
+) -> Result<MutexGuard<'_, ()>, String> {
     loop {
         if std::time::Instant::now() >= deadline {
             return Err("terminal lifecycle remained contended".to_string());
@@ -2852,6 +2978,30 @@ fn lock_terminal_lifecycle(lifecycle: &Mutex<()>) -> Result<MutexGuard<'_, ()>, 
             Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err("terminal lifecycle poisoned".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_terminal_runtime_write_until<'a>(
+    runtime_state: &'a Arc<RwLock<RuntimeState>>,
+    deadline: std::time::Instant,
+) -> Result<RwLockWriteGuard<'a, RuntimeState>, String> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("terminal runtime projection remained contended".to_string());
+        }
+        match runtime_state.try_write() {
+            Ok(runtime) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("terminal runtime projection remained contended".to_string());
+                }
+                return Ok(runtime);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("terminal runtime projection poisoned".to_string())
             }
         }
     }
@@ -3561,11 +3711,13 @@ mod tests {
         let observation_deadline = std::time::Instant::now()
             .checked_add(Duration::from_secs(1))
             .expect("observation deadline");
-        let (observation_fence, observations) = session
+        let observation = session
             .managed_process_observations_until(observation_deadline, 32)
             .expect("bounded observation query")
             .expect("managed observation authority");
-        assert_eq!(observation_fence, fence);
+        let (observation_capture, observations) = observation.into_parts();
+        let observations = observations.expect("managed Job observations");
+        assert_eq!(observation_capture.fence(), &fence);
         assert!(observations.iter().any(|observation| matches!(
             observation,
             crate::process::job::JobMemberObservation::Accessible { identity }
@@ -3614,6 +3766,186 @@ mod tests {
             0,
             "terminal close must join its reader and wait actors before returning"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_sampling_capture_cannot_publish_or_close_restarted_generation() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal sampling-generation journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = Arc::new(
+            spawn_with_command(
+                "sampling-generation-barrier-test",
+                std::env::current_dir().expect("test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                100,
+                None,
+                Arc::clone(&runtime),
+                false,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+                false,
+                None,
+                None,
+                authority,
+            )
+            .expect("spawn first managed generation"),
+        );
+
+        let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let sampling_session = Arc::clone(&session);
+        let sampler = thread::spawn(move || {
+            let query = sampling_session
+                .managed_process_observations_until(
+                    std::time::Instant::now() + Duration::from_secs(2),
+                    32,
+                )
+                .expect("first-generation Job query")
+                .expect("first-generation managed authority");
+            let (capture, members) = query.into_parts();
+            members.expect("first-generation Job members");
+            let old_fence = capture.fence().clone();
+            captured_tx
+                .send(old_fence.clone())
+                .expect("publish after-query barrier");
+            release_rx.recv().expect("release stale sampler");
+
+            let stale_snapshot = crate::state::ResourceSnapshot {
+                process_count: 1,
+                process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                process_ids: vec![old_fence.root().id().pid()],
+                managed_process_fence: Some(old_fence),
+                metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                metric_values: crate::state::ResourceMetricValueState::Observed,
+                cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                ..crate::state::ResourceSnapshot::default()
+            };
+            sampling_session.publish_managed_resource_sample_if_current(
+                &capture,
+                stale_snapshot,
+                false,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+        });
+
+        let old_fence = captured_rx.recv().expect("first generation captured");
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect("install second managed generation");
+        let restart_fence = session
+            .managed_process_snapshot()
+            .expect("second-generation managed snapshot")
+            .0;
+        assert_eq!(restart_fence.resource().runtime_generation, 2);
+        runtime
+            .write()
+            .expect("runtime state")
+            .sessions
+            .get_mut("sampling-generation-barrier-test")
+            .expect("second-generation runtime")
+            .note_resource_sample(crate::state::ResourceSnapshot {
+                process_count: 1,
+                process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                process_ids: vec![restart_fence.root().id().pid()],
+                managed_process_fence: Some(restart_fence.clone()),
+                metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                metric_values: crate::state::ResourceMetricValueState::Observed,
+                cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                ..crate::state::ResourceSnapshot::default()
+            });
+
+        release_tx
+            .send(())
+            .expect("release first-generation sample");
+        assert_eq!(
+            sampler.join().expect("join stale sampler"),
+            Ok(ManagedResourceSamplePublication::StaleGeneration {
+                dirty_changed: false
+            })
+        );
+
+        let current = runtime
+            .read()
+            .expect("runtime state")
+            .sessions
+            .get("sampling-generation-barrier-test")
+            .cloned()
+            .expect("current runtime generation");
+        assert_eq!(current.pid, Some(restart_fence.root().id().pid()));
+        assert_eq!(current.resources.process_count, 1);
+        assert_eq!(
+            current.resources.process_count_value_state,
+            crate::state::ResourceMetricValueState::Observed
+        );
+        assert!(!current
+            .resources
+            .process_ids
+            .contains(&old_fence.root().id().pid()));
+        assert_eq!(
+            current.resources.managed_process_fence.as_ref(),
+            Some(&restart_fence)
+        );
+
+        let stale_action_error = session
+            .close_managed_process_exact(&old_fence, true)
+            .expect_err("an old monitor action must not close the replacement generation");
+        assert!(
+            stale_action_error.contains("generation changed"),
+            "unexpected stale action error: {stale_action_error}"
+        );
+        assert!(
+            platform_service::is_pid_running(restart_fence.root().id().pid()),
+            "the replacement generation must remain alive"
+        );
+        session.close(false).expect("close replacement generation");
     }
 
     #[cfg(windows)]

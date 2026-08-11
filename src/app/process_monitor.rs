@@ -200,6 +200,7 @@ fn render_session_card(
     let memory = entry.memory_bytes;
     let memory_metric = entry.memory_metric;
     let process_count = entry.process_count;
+    let process_count_value_state = entry.process_count_value_state;
     let metrics_unavailable = entry.metrics_unavailable;
     let metrics_status = entry.metrics_status;
     let cpu_value_state = entry.cpu_value_state;
@@ -313,10 +314,14 @@ fn render_session_card(
                                         .text_xs()
                                         .text_color(rgb(theme::TEXT_SUBTLE))
                                         .child(SharedString::from(format!(
-                                            "{project_name} · {} · {process_count} proc · {} · {}{}",
+                                            "{project_name} · {} · {} · {} · {}{}",
                                             root_pid
                                                 .map(|pid| format!("pid {pid}"))
                                                 .unwrap_or_else(|| "no root pid".to_string()),
+                                            format_metric_process_count(
+                                                process_count,
+                                                process_count_value_state,
+                                            ),
                                             format_metric_cpu_detail(
                                                 cpu,
                                                 core_equivalent_percent,
@@ -609,6 +614,7 @@ fn process_monitor_entries(
                 memory_bytes: session.resources.memory_bytes,
                 memory_metric: session.resources.memory_metric,
                 process_count,
+                process_count_value_state: session.resources.process_count_value_state,
                 metrics_unavailable: session.resources.metrics_unavailable,
                 metrics_status: session.resources.metrics_status,
                 cpu_value_state: session.resources.cpu_value_state,
@@ -849,13 +855,28 @@ fn format_metric_memory(
     }
 }
 
+fn format_metric_process_count(
+    process_count: u32,
+    value_state: ResourceMetricValueState,
+) -> String {
+    let noun = if process_count == 1 { "proc" } else { "procs" };
+    match value_state {
+        ResourceMetricValueState::Observed => format!("{process_count} {noun}"),
+        ResourceMetricValueState::Partial => format!("{process_count} {noun} (partial)"),
+        ResourceMetricValueState::LastKnown => {
+            format!("{process_count} {noun} (last known)")
+        }
+        ResourceMetricValueState::Unavailable => "process count unavailable".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_process_monitor_kill_action, format_cpu_detail_with_core, format_metric_cpu_detail,
-        format_metric_memory, monitor_sessions, monitor_totals, ordered_process_nodes,
-        pointer_disposition, process_monitor_entries, session_label, PointerDisposition,
-        PointerTarget,
+        format_metric_memory, format_metric_process_count, monitor_sessions, monitor_totals,
+        ordered_process_nodes, pointer_disposition, process_monitor_entries, session_label,
+        PointerDisposition, PointerTarget,
     };
     use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
@@ -1301,6 +1322,14 @@ mod tests {
             crate::state::ResourceMetricValueState::LastKnown,
         )
         .contains("last known"));
+        assert_eq!(
+            format_metric_process_count(2, crate::state::ResourceMetricValueState::LastKnown,),
+            "2 procs (last known)"
+        );
+        assert_eq!(
+            format_metric_process_count(0, crate::state::ResourceMetricValueState::Unavailable,),
+            "process count unavailable"
+        );
     }
 }
 
@@ -1318,6 +1347,7 @@ struct ProcessMonitorEntry {
     memory_bytes: u64,
     memory_metric: ResourceMemoryMetric,
     process_count: u32,
+    process_count_value_state: ResourceMetricValueState,
     metrics_unavailable: bool,
     metrics_status: crate::domain::snapshot::ProcessMetricStatus,
     cpu_value_state: ResourceMetricValueState,

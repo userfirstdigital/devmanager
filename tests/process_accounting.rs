@@ -295,6 +295,30 @@ fn one_tick_budget_rejects_conflicting_job_identity_for_the_same_pid() {
 }
 
 #[test]
+fn preadmitted_job_pid_still_rejects_a_conflicting_metric_generation() {
+    let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 1);
+    collect_exact_job_observations_with_budget(
+        Ok(vec![614]),
+        |pid| Ok(JobMemberInfo::new(identity(pid, 7), None)),
+        &mut budget,
+    )
+    .expect("authoritative Job identity");
+    let mut sampler = ProcessSampler::new();
+
+    let error = sampler
+        .sample_at_with_budget(
+            Duration::ZERO,
+            LOGICAL_PROCESSORS,
+            [accessible(614, 8, 0, 1_000)],
+            &mut budget,
+        )
+        .expect_err("a preadmitted PID must not bypass exact generation validation");
+
+    assert_eq!(error, SamplerError::ConflictingProcessIdentity { pid: 614 });
+    assert_eq!(budget.claimed_members(), 1);
+}
+
+#[test]
 fn unknown_inaccessible_generation_cannot_merge_with_an_exact_job_identity() {
     let mut budget = SamplingBudget::new(Instant::now() + Duration::from_secs(1), 2);
     collect_exact_job_observations_with_budget(

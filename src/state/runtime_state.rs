@@ -343,6 +343,12 @@ pub struct ResourceSnapshot {
     #[serde(default = "default_memory_metric")]
     pub memory_metric: ResourceMemoryMetric,
     pub process_count: u32,
+    /// Confidence for the authoritative Job-member count. This remains
+    /// independent from CPU/memory confidence so a failed counter query does
+    /// not hide a successfully observed member count, while a retained count
+    /// can never be mistaken for a current one.
+    #[serde(default)]
+    pub process_count_value_state: ResourceMetricValueState,
     pub process_ids: Vec<u32>,
     /// Some owned members may be inaccessible; totals remain useful but are
     /// explicitly partial rather than silently presented as complete.
@@ -398,6 +404,7 @@ impl Default for ResourceSnapshot {
             memory_bytes: 0,
             memory_metric: default_memory_metric(),
             process_count: 0,
+            process_count_value_state: ResourceMetricValueState::Unavailable,
             process_ids: Vec::new(),
             metrics_unavailable: false,
             metrics_status: ProcessMetricStatus::Unknown,

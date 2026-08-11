@@ -743,7 +743,7 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
 
     if session.runtime.status.is_live() && session.runtime.resources.last_sample_at.is_some() {
         let resource_metrics = format_compact_resource_metrics(&session.runtime.resources);
-        let procs = session.runtime.resources.process_count;
+        let process_count = format_compact_process_count(&session.runtime.resources);
         let uptime = session
             .runtime
             .started_at
@@ -764,10 +764,7 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
         } else {
             format!(" • {uptime}")
         };
-        return Some(format!(
-            "{resource_metrics} • {procs} proc{}{uptime_part}",
-            if procs == 1 { "" } else { "s" }
-        ));
+        return Some(format!("{resource_metrics} • {process_count}{uptime_part}"));
     }
 
     has_live_terminal.then(|| match model.active_tab_type.as_ref() {
@@ -1586,9 +1583,20 @@ fn format_compact_resource_metrics(resources: &ResourceSnapshot) -> String {
     format!("{cpu} • {memory}")
 }
 
+fn format_compact_process_count(resources: &ResourceSnapshot) -> String {
+    let count = resources.process_count;
+    let noun = if count == 1 { "proc" } else { "procs" };
+    match resources.process_count_value_state {
+        ResourceMetricValueState::Observed => format!("{count} {noun}"),
+        ResourceMetricValueState::Partial => format!("{count} {noun} (partial)"),
+        ResourceMetricValueState::LastKnown => format!("{count} {noun} (last known)"),
+        ResourceMetricValueState::Unavailable => "process count unavailable".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod resource_metric_tests {
-    use super::format_compact_resource_metrics;
+    use super::{format_compact_process_count, format_compact_resource_metrics};
     use crate::state::{ResourceMemoryMetric, ResourceMetricValueState, ResourceSnapshot};
 
     #[test]
@@ -1617,5 +1625,19 @@ mod resource_metric_tests {
         let label = format_compact_resource_metrics(&partial);
         assert!(label.contains("6.2% CPU (partial)"));
         assert!(label.contains("private committed 4 MB"));
+
+        let retained_count = ResourceSnapshot {
+            process_count: 3,
+            process_count_value_state: ResourceMetricValueState::LastKnown,
+            ..ResourceSnapshot::default()
+        };
+        assert_eq!(
+            format_compact_process_count(&retained_count),
+            "3 procs (last known)"
+        );
+        assert_eq!(
+            format_compact_process_count(&ResourceSnapshot::default()),
+            "process count unavailable"
+        );
     }
 }

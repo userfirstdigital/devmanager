@@ -298,7 +298,7 @@ impl SamplingBudget {
         Ok(true)
     }
 
-    fn admit_observation(
+    pub(crate) fn admit_observation(
         &mut self,
         member: &ProcessMemberObservation,
     ) -> Result<bool, SamplerError> {
@@ -891,13 +891,11 @@ fn unique_members_with_budget(
         insert_unique_member(&mut unique, member);
     }
     for member in unique.values() {
-        // A Job collector has already admitted authoritative identities. A
-        // later metrics query may legitimately be inaccessible without
-        // revoking that ownership; only a fresh sampler-only budget needs to
-        // admit the deduplicated observation here.
-        if !budget.contains_pid(member.pid()) {
-            budget.admit_observation(member)?;
-        }
+        // A prior Job admission reserves capacity, but it never exempts a
+        // later metric observation from exact identity validation. Re-admit
+        // every deduplicated row: an exact duplicate is free, while PID reuse
+        // or an unknown inaccessible generation fails closed.
+        budget.admit_observation(member)?;
     }
     Ok(unique.into_values().collect())
 }

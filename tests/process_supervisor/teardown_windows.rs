@@ -477,6 +477,13 @@ fn windows_terminal_teardown_bridge_closes_from_native_session_authority() {
         report.errors(),
         report.residue()
     );
+    let observation_error = teardown
+        .managed_process_observations_until(std::time::Instant::now() + Duration::from_secs(1), 32)
+        .expect_err("a released exact registry entry must be unavailable, not an empty sample");
+    assert_eq!(
+        observation_error,
+        "terminal managed-process registry entry unavailable"
+    );
     assert!(teardown
         .active_process_ids()
         .expect("query native terminal Job")

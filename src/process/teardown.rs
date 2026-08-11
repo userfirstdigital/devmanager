@@ -1649,16 +1649,37 @@ impl ManagedTerminalTeardown {
         if Instant::now() >= absolute_deadline {
             return Err("terminal managed-process observation exceeded deadline".to_string());
         }
-        let observations = match process {
-            Some(process) => process
-                .job()
-                .active_process_observations_until(absolute_deadline, max_members)?,
-            None => Vec::new(),
-        };
+        let process = process
+            .ok_or_else(|| "terminal managed-process registry entry unavailable".to_string())?;
+        let observations = process
+            .job()
+            .active_process_observations_until(absolute_deadline, max_members)?;
         if Instant::now() >= absolute_deadline {
             return Err("terminal managed-process observation exceeded deadline".to_string());
         }
         Ok((state.fence.clone(), observations))
+    }
+
+    /// Confirms that this retained teardown still owns the exact registered
+    /// Job generation. A closed/released teardown may remain behind an Arc,
+    /// but it must never authorize accounting publication after its registry
+    /// entry has been consumed.
+    pub(crate) fn exact_registry_entry_is_current_until(
+        &self,
+        absolute_deadline: Instant,
+    ) -> Result<bool, String> {
+        if Instant::now() >= absolute_deadline {
+            return Err("terminal managed-process validation exceeded deadline".to_string());
+        }
+        let state = lock_mutex_until(
+            &self.state,
+            absolute_deadline,
+            "terminal managed-process validation",
+        )?;
+        if Instant::now() >= absolute_deadline {
+            return Err("terminal managed-process validation exceeded deadline".to_string());
+        }
+        Ok(state.registry.exact_fence_matches(&state.fence))
     }
 }
 
