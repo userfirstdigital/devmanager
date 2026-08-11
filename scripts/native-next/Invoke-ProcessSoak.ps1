@@ -11,9 +11,7 @@ param(
     [int]$Iterations = 100,
 
     [ValidateRange(0, [int]::MaxValue)]
-    [int]$Seed = 3403,
-
-    [string]$ManifestPath = (Join-Path $PSScriptRoot 'phase3-process-soak.manifest.json')
+    [int]$Seed = 3403
 )
 
 Set-StrictMode -Version Latest
@@ -55,15 +53,6 @@ function ConvertTo-BoundedError {
     $text = [string]$Value
     if ($text.Length -gt 512) { $text = $text.Substring(0, 512) }
     [regex]::Replace($text, '[\x00-\x1f\x7f]', '_')
-}
-
-function Resolve-SoakPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if ([System.IO.Path]::IsPathRooted($Path)) {
-        return [System.IO.Path]::GetFullPath($Path)
-    }
-    $worktree = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
-    [System.IO.Path]::GetFullPath((Join-Path $worktree $Path))
 }
 
 function Invoke-BoundedRustSupervisor {
@@ -130,6 +119,8 @@ function Invoke-BoundedRustSupervisor {
 
     $started = $false
     $timedOut = $false
+    $deadline = [Diagnostics.Stopwatch]::GetTimestamp() +
+        [int64]($supervisorDeadlineMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000)
     try {
         $started = $process.Start()
         if (-not $started) { throw 'unable to start Rust supervisor.' }
@@ -137,18 +128,12 @@ function Invoke-BoundedRustSupervisor {
         $stderrState.reader = $process.StandardError
         $stdoutState.task = $stdoutState.reader.ReadAsync($stdoutState.buffer, 0, $stdoutState.buffer.Length)
         $stderrState.task = $stderrState.reader.ReadAsync($stderrState.buffer, 0, $stderrState.buffer.Length)
-        $deadline = [Diagnostics.Stopwatch]::GetTimestamp() +
-            [int64]($supervisorDeadlineMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000)
-        $cleanupDeadline = $deadline
         while (-not ($stdoutState.done -and $stderrState.done -and $process.HasExited)) {
             $now = [Diagnostics.Stopwatch]::GetTimestamp()
             $remaining = [int](($deadline - $now) * 1000 / [Diagnostics.Stopwatch]::Frequency)
             if ($remaining -le 0 -and -not $timedOut) {
                 $timedOut = $true
-                $process.Kill($true)
-                $cleanupDeadline = [Diagnostics.Stopwatch]::GetTimestamp() +
-                    [int64](5000 * [Diagnostics.Stopwatch]::Frequency / 1000)
-                $remaining = 5000
+                throw 'Rust supervisor exceeded the absolute deadline; wrapper has no safe tree-termination authority.'
             }
             $tasks = @(@($stdoutState.task, $stderrState.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
             if ($tasks.Count -gt 0) {
@@ -170,11 +155,10 @@ function Invoke-BoundedRustSupervisor {
                 if ($state.totalBytes -gt $cap) { $state.truncated = $true }
                 $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
             }
-            if ($timedOut -and [Diagnostics.Stopwatch]::GetTimestamp() -gt $cleanupDeadline) {
-                throw 'Rust supervisor output readers exceeded the bounded cleanup deadline.'
-            }
         }
-        [void]$process.WaitForExit(1000)
+        $remaining = [int](([Diagnostics.Stopwatch]::GetTimestamp() - $deadline) * -1000 / [Diagnostics.Stopwatch]::Frequency)
+        if ($remaining -le 0) { throw 'Rust supervisor did not settle before the absolute deadline.' }
+        [void]$process.WaitForExit([Math]::Min(1000, $remaining))
         if ($timedOut) { throw 'Rust supervisor exceeded the absolute deadline.' }
         $stdoutText = $stdoutState.text.ToString()
         $stderrText = $stderrState.text.ToString()
@@ -197,20 +181,7 @@ function Invoke-BoundedRustSupervisor {
         }
     }
     finally {
-        try {
-            if ($started -and -not $process.HasExited) {
-                try {
-                    $process.Kill($true)
-                    [void]$process.WaitForExit(5000)
-                }
-                catch {
-                    throw "Rust supervisor cleanup failed: $($_.Exception.Message)"
-                }
-            }
-        }
-        finally {
-            $process.Dispose()
-        }
+        $process.Dispose()
     }
 }
 
@@ -220,8 +191,8 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 }
 
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
-$manifestResolved = Resolve-SoakPath -Path $ManifestPath
-$supervisorPath = Join-Path $worktreeRoot 'target\debug\devmanager-process-test-helper.exe'
+$manifestResolved = Join-Path $PSScriptRoot 'phase3-process-soak.manifest.json'
+$supervisorPath = Join-Path $worktreeRoot 'target-native-next\debug\devmanager-process-test-helper.exe'
 # These are only retained isolated roots for the default manifest; Rust owns
 # every manifest/evidence file open and all publication under its root.
 $defaultTempDirectory = Join-Path $worktreeRoot '.tmp-phase3-soak'

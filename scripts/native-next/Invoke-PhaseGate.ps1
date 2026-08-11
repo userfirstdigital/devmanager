@@ -19,6 +19,23 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Isolation.ps1')
 . (Join-Path $PSScriptRoot 'PhaseGate.ps1')
 
+$iterations = 2
+$seed = 3403
+if ($Recipe -eq 'phase-03-process-supervisor') {
+    $iterationText = [Environment]::GetEnvironmentVariable('DEVMANAGER_PHASE3_SOAK_ITERATIONS', 'Process')
+    $seedText = [Environment]::GetEnvironmentVariable('DEVMANAGER_PHASE3_SOAK_SEED', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($iterationText)) {
+        if (-not [int]::TryParse($iterationText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$iterations) -or $iterations -lt 1 -or $iterations -gt 100) {
+            throw 'Phase 3 soak Iterations bridge is outside 1..100.'
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($seedText)) {
+        if (-not [int]::TryParse($seedText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$seed) -or $seed -lt 0) {
+            throw 'Phase 3 soak Seed bridge is outside its bounded range.'
+        }
+    }
+}
+
 function Repair-DevManagerPhase3SupervisorPlan {
     param(
         [Parameter(Mandatory = $true)]
@@ -51,15 +68,25 @@ function Assert-DevManagerPhase3SupervisorHasTests {
         return
     }
 
+    $harnessRoot = Join-Path ([string]$Plan.workingDirectory) 'target-native-next\debug\deps'
+    $harnesses = @(
+        Get-ChildItem -LiteralPath $harnessRoot -Filter 'process_soak_infrastructure-*.exe' -File -ErrorAction Stop |
+            Where-Object { $_.Name -notmatch '\.d\.exe$' }
+    )
+    if ($harnesses.Count -eq 0) {
+        throw 'typed-unavailable: no prebuilt process soak harness is available.'
+    }
+    $harness = $harnesses | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $harness.FullName
     $listInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $listInfo.FileName = [string]$Plan.executable
+    $listInfo.FileName = [System.IO.Path]::GetFullPath($harness.FullName)
     $listInfo.UseShellExecute = $false
     $listInfo.CreateNoWindow = $true
     $listInfo.RedirectStandardOutput = $true
     $listInfo.RedirectStandardError = $true
     $listInfo.WorkingDirectory = [string]$Plan.workingDirectory
     Set-DevManagerPhaseGateProcessEnvironment -StartInfo $listInfo -Plan $Plan
-    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--test', 'process_soak_infrastructure', '--', '--list')) {
+    foreach ($argument in [string[]]@('--list')) {
         [void]$listInfo.ArgumentList.Add($argument)
     }
 
@@ -71,8 +98,8 @@ function Assert-DevManagerPhase3SupervisorHasTests {
         $listResult.Stdout -split "`r?`n" |
             Where-Object { $_ -match ':\s*test$' }
     )
-    if ($testLines.Count -eq 0) {
-        throw 'phase-03-process-supervisor preflight found zero tests; refusing a green gate.'
+    if ($testLines.Count -lt 29) {
+        throw "phase-03-process-supervisor preflight found only $($testLines.Count) tests; expected at least 29."
     }
 }
 
@@ -329,9 +356,9 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
                 '-File',
                 $soakScript,
                 '-Iterations',
-                '2',
+                [string]$iterations,
                 '-Seed',
-                '3403')) {
+                [string]$seed)) {
             [void]$soakInfo.ArgumentList.Add($argument)
         }
         $soakResult = Invoke-DevManagerPhaseGateBoundedCommand `

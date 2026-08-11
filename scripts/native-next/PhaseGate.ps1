@@ -163,10 +163,23 @@ function Resolve-DevManagerPhaseGateRecipe {
         }
     }
 
-    $arguments = [string[]]@($table[$name])
+    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+        throw 'SystemRoot is unavailable for the explicit phase-gate environment.'
+    }
+    $tempDirectory = [System.IO.Path]::GetFullPath((Join-Path $worktree '.tmp-phase3-soak'))
+    $cargoDirectory = [System.IO.Path]::GetDirectoryName($resolved)
     $environment = [ordered]@{
+        SystemRoot       = [string]$systemRoot
+        TEMP             = $tempDirectory
+        TMP              = $tempDirectory
+        PATH             = @(
+            [System.IO.Path]::Combine([string]$systemRoot, 'System32'),
+            [string]$cargoDirectory
+        ) -join ';'
         CARGO_TARGET_DIR = $cargoTargetDir
     }
+    $arguments = [string[]]@($table[$name])
     $environmentRemovals = [string[]]@(
         'DEVMANAGER_CONFIG_DIR',
         'DEVMANAGER_APP_IDENTITY'
@@ -217,8 +230,10 @@ function Assert-DevManagerPhaseGateExecutionPlan {
         throw 'Phase-gate execution plan is missing environmentRemovals.'
     }
 
-    if (-not $Plan.environment.Contains('CARGO_TARGET_DIR')) {
-        throw "Execution plan missing required environment key 'CARGO_TARGET_DIR'."
+    foreach ($requiredEnv in @('SystemRoot', 'TEMP', 'TMP', 'PATH', 'CARGO_TARGET_DIR')) {
+        if (-not $Plan.environment.Contains($requiredEnv)) {
+            throw "Execution plan missing required environment key '$requiredEnv'."
+        }
     }
 
     $removals = [string[]]@($Plan.environmentRemovals)
@@ -234,8 +249,8 @@ function Assert-DevManagerPhaseGateExecutionPlan {
                 throw "library-tests-serial must not include a $removed override."
             }
         }
-        if (@($Plan.environment.Keys).Count -ne 1) {
-            throw "library-tests-serial must override only CARGO_TARGET_DIR."
+        if (@($Plan.environment.Keys).Count -ne 5) {
+            throw "library-tests-serial must declare only explicit system and Cargo environment."
         }
         if (($removals -join ',') -cne 'DEVMANAGER_PROFILE,DEVMANAGER_INSTANCE_LABEL,DEVMANAGER_RUNTIME_KIND,DEVMANAGER_CONFIG_DIR,DEVMANAGER_APP_IDENTITY') {
             throw "library-tests-serial environmentRemovals must clear all DevManager runtime identity (got: $($removals -join ', '))."
@@ -247,8 +262,8 @@ function Assert-DevManagerPhaseGateExecutionPlan {
                 throw "Execution plan missing required environment key '$requiredEnv'."
             }
         }
-        if (@($Plan.environment.Keys).Count -ne 4) {
-            throw "Non-library Phase 0 recipes must declare exactly four environment overrides."
+        if (@($Plan.environment.Keys).Count -ne 8) {
+            throw "Non-library Phase 0 recipes must declare exactly eight explicit environment values."
         }
         if ([string]$Plan.environment['DEVMANAGER_INSTANCE_LABEL'] -ne 'Next') {
             throw "Execution plan must force DEVMANAGER_INSTANCE_LABEL=Next."
@@ -275,13 +290,9 @@ function Set-DevManagerPhaseGateProcessEnvironment {
 
     Assert-DevManagerPhaseGateExecutionPlan -Plan $Plan
 
-    foreach ($key in @($Plan.environmentRemovals)) {
-        $name = [string]$key
-        if ([string]::IsNullOrWhiteSpace($name)) { continue }
-        if ($StartInfo.Environment.ContainsKey($name)) {
-            [void]$StartInfo.Environment.Remove($name)
-        }
-    }
+    # Start from an empty block. Inherited caller state is never a source of
+    # authority for a Cargo, pwsh, or helper child.
+    $StartInfo.Environment.Clear()
 
     foreach ($key in @($Plan.environment.Keys)) {
         $StartInfo.Environment[[string]$key] = [string]$Plan.environment[$key]
@@ -313,9 +324,7 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
         while (-not ($stdout.done -and $stderr.done -and $process.HasExited)) {
             $remaining = [int](($deadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
             if ($remaining -le 0) {
-                $process.Kill($true)
-                [void]$process.WaitForExit(5000)
-                throw 'bounded phase-gate command exceeded its absolute deadline.'
+                throw 'typed-unavailable: bounded phase-gate command exceeded its absolute deadline; Rust supervisor ownership is required for tree cancellation.'
             }
             $tasks = @(@($stdout.task, $stderr.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
             if ($tasks.Count -gt 0) { [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, [Math]::Max(1, $remaining)) }
@@ -330,7 +339,9 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
                 $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
             }
         }
-        [void]$process.WaitForExit(1000)
+        $remaining = [int](($deadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
+        if ($remaining -le 0) { throw 'typed-unavailable: bounded phase-gate command did not settle before its absolute deadline.' }
+        [void]$process.WaitForExit([Math]::Min(1000, $remaining))
         if ($stdout.truncated -or $stderr.truncated) { throw 'bounded phase-gate command exceeded its output cap.' }
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
@@ -341,7 +352,6 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
         }
     }
     finally {
-        if ($started -and -not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(1000) }
         $process.Dispose()
     }
 }

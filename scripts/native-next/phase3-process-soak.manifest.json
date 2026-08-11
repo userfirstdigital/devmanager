@@ -1,14 +1,16 @@
 {
   "schemaVersion": 1,
-  "revision": "phase3.10-supervisor-v2",
-  "gitRevision": "ddd6c55",
-  "buildId": "phase3.10-supervisor-build-v2",
-  "supervisorExecutable": "target\\debug\\devmanager-process-test-helper.exe",
-  "supervisorSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
-  "helperExecutable": "target\\debug\\devmanager-process-test-helper.exe",
-  "helperSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
-  "cycleExecutable": "target\\debug\\devmanager-process-test-helper.exe",
-  "cycleSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
+  "revision": "phase3.10-supervisor-v3",
+  "gitRevision": "CURRENT",
+  "buildId": "CURRENT",
+  "targetDirectory": "target-native-next",
+  "sourceTreeState": "CURRENT",
+  "supervisorExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "supervisorSha256": "CURRENT",
+  "helperExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "helperSha256": "CURRENT",
+  "cycleExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
+  "cycleSha256": "CURRENT",
   "workingDirectory": ".",
   "evidenceRoot": ".devmanager-next\\evidence",
   "environment": {
@@ -16,13 +18,13 @@
     "tempDirectory": ".tmp-phase3-soak",
     "pathDirectories": [
       "C:\\WINDOWS\\System32",
-      "target\\debug"
+      "target-native-next\\debug"
     ],
     "allowlist": {}
   },
   "ansiCorpus": {
     "path": "tests\\fixtures\\ansi\\phase3-v1.json",
-    "sha256": "3cac840e8b807e00fb58bd6e75fae45f62183d5a566473a014f9a65d4dbbea5d",
+    "sha256": "b18f4257eb34fda828983c09746046013319d72fb85e7e3c30e1e1ff3809ce5d",
     "revision": "phase3.10-ansi-v1"
   },
   "seed": 3403,
@@ -33,7 +35,7 @@
     "cleanupDeadlineMs": 5000,
     "stdoutBytes": 65536,
     "stderrBytes": 16384,
-    "resultBytes": 262144
+    "resultBytes": 16384
   },
   "scenarioCatalog": [
     {
@@ -49,6 +51,11 @@
     {
       "name": "restart-resume",
       "arguments": ["cycle", "restart-resume"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "occupied-port",
+      "arguments": ["cycle", "occupied-port"],
       "expectedExitCode": 0
     }
   ]

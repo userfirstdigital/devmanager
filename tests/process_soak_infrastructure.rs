@@ -87,6 +87,24 @@ fn sha256_file(path: &Path) -> String {
 }
 
 #[cfg(windows)]
+fn current_git_revision() -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .expect("read current source revision");
+    assert!(output.status.success(), "git revision probe: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("git revision UTF-8")
+        .trim()
+        .to_string()
+}
+
+#[cfg(windows)]
+fn current_build_id() -> String {
+    format!("sha256:{}", sha256_file(&helper_path()))
+}
+
+#[cfg(windows)]
 fn supervisor_manifest(
     directory: &tempfile::TempDir,
     scenario: &str,
@@ -101,9 +119,11 @@ fn supervisor_manifest(
     let corpus = PathBuf::from("tests/fixtures/ansi/phase3-v1.json");
     let manifest = serde_json::json!({
         "schemaVersion": 1,
-        "revision": "phase3.10-supervisor-v2",
-        "gitRevision": "ddd6c55",
-        "buildId": "phase3.10-supervisor-build-v2",
+        "revision": "phase3.10-supervisor-v3",
+        "gitRevision": current_git_revision(),
+        "buildId": current_build_id(),
+        "targetDirectory": "target-native-next",
+        "sourceTreeState": "CURRENT",
         "supervisorExecutable": executable,
         "supervisorSha256": sha256_file(&executable),
         "helperExecutable": executable,
@@ -136,7 +156,7 @@ fn supervisor_manifest(
         "scenarioCatalog": [{
             "name": scenario,
             "arguments": ["cycle", scenario],
-            "expectedExitCode": 0
+            "expectedExitCode": if scenario == "nonzero" { 1 } else { 0 }
         }]
     });
     let path = directory.path().join("manifest.json");
@@ -153,10 +173,6 @@ fn run_supervisor(_directory: &tempfile::TempDir, manifest: &Path) -> std::proce
     let mut command = Command::new(helper_path());
     command.args(["supervise", "--manifest"]);
     command.arg(manifest);
-    command.args([
-        "--evidence-root",
-        _directory.path().to_str().expect("evidence path"),
-    ]);
     configure_helper(&mut command);
     command.output().expect("run Rust process supervisor")
 }
@@ -188,32 +204,18 @@ fn configure_soak_environment(command: &mut Command, _directory: &tempfile::Temp
 }
 
 #[cfg(windows)]
-fn configure_single_cargo_path(command: &mut Command) {
-    let cargo_directory = std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .find(|path| {
-            path.join("cargo.exe").is_file()
-                && path
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains(".rustup\\toolchains\\")
-        })
-        .expect("direct rustup cargo directory");
-    command.env("PATH", cargo_directory);
-}
-
-#[cfg(windows)]
-fn run_soak_with_manifest(directory: &tempfile::TempDir, manifest: &Path) -> std::process::Output {
+fn run_soak(directory: &tempfile::TempDir) -> std::process::Output {
     let mut command = Command::new("pwsh");
     command.args([
         "-NoProfile",
         "-NonInteractive",
         "-File",
         "scripts/native-next/Invoke-ProcessSoak.ps1",
-        "-ManifestPath",
+        "-Iterations",
+        "2",
+        "-Seed",
+        "3403",
     ]);
-    command.arg(manifest);
     configure_soak_environment(&mut command, directory);
     command.output().expect("run process soak fixture").into()
 }
@@ -246,6 +248,11 @@ fn rust_supervisor_runs_allowlisted_cycle_and_reports_real_identity() {
     assert_eq!(result["schemaVersion"], 1);
     assert_eq!(result["status"], "passed");
     assert_eq!(result["iterations"], 1);
+    assert!(result["sourceTreeState"].as_str().is_some());
+    assert_ne!(
+        result["sourceTreeState"],
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
     assert_eq!(result["cycles"][0]["scenario"], "natural");
     assert_eq!(result["cycles"][0]["result"]["seed"], 3403);
     assert_eq!(result["cycles"][0]["result"]["iteration"], 1);
@@ -267,6 +274,17 @@ fn rust_supervisor_runs_allowlisted_cycle_and_reports_real_identity() {
     assert!(result["cycles"][0]["jobAudit"]["processHandleCountBefore"]
         .as_u64()
         .is_some());
+    assert!(
+        result["cycles"][0]["jobAudit"]["hostProcessHandleCountBefore"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        result["cycles"][0]["jobAudit"]["hostProcessHandleCountAfter"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(result["cycles"][0]["jobAudit"]["ownedListenersDuring"].is_array());
     assert!(result["cycles"][0]["jobAudit"]["ownedListenersAfter"].is_array());
     assert_eq!(
         result["cycles"][0]["jobAudit"]["externalListenersUnchanged"],
@@ -294,6 +312,10 @@ fn rust_supervisor_runs_allowlisted_cycle_and_reports_real_identity() {
         .unwrap_or_default()
         .to_ascii_lowercase()
         .ends_with("devmanager-process-test-helper.exe"));
+    assert!(!result["cycles"][0]["rootIdentity"]["executablePath"]
+        .as_str()
+        .unwrap_or_default()
+        .contains(':'));
     assert_eq!(
         result["cycles"][0]["stdoutBytes"]
             .as_u64()
@@ -306,7 +328,7 @@ fn rust_supervisor_runs_allowlisted_cycle_and_reports_real_identity() {
 #[cfg(windows)]
 #[test]
 fn rust_supervisor_rejects_manifest_revision_or_build_mismatch() {
-    for field in ["gitRevision", "buildId"] {
+    for field in ["gitRevision", "buildId", "sourceTreeState"] {
         let directory = temporary_soak_environment();
         let manifest = supervisor_manifest(&directory, "natural", 1, 2_000, 16 * 1024);
         let mut value: Value = serde_json::from_slice(&fs::read(&manifest).expect("read manifest"))
@@ -336,10 +358,6 @@ fn rust_supervisor_does_not_inherit_parent_secret_into_cycle() {
     let mut command = Command::new(helper_path());
     command.args(["supervise", "--manifest"]);
     command.arg(&manifest);
-    command.args([
-        "--evidence-root",
-        directory.path().to_str().expect("evidence path"),
-    ]);
     command.env("PHASE3_SOAK_SECRET", "must-not-cross-boundary");
     configure_helper(&mut command);
     let output = command.output().expect("run environment probe");
@@ -347,6 +365,59 @@ fn rust_supervisor_does_not_inherit_parent_secret_into_cycle() {
     let result = supervisor_result(&output);
     assert_eq!(result["status"], "passed");
     assert_eq!(result["cycles"][0]["environment"]["secretPresent"], false);
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_supervisor_rejects_secret_allowlist_entries_before_launch() {
+    let directory = temporary_soak_environment();
+    let manifest = supervisor_manifest(&directory, "natural", 1, 2_000, 16 * 1024);
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).expect("read manifest"))
+        .expect("parse manifest");
+    value["environment"]["allowlist"]["PHASE3_SOAK_SECRET"] =
+        Value::String("must-not-be-authorized".to_string());
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&value).expect("serialize secret allowlist"),
+    )
+    .expect("write secret allowlist");
+    let output = run_supervisor(&directory, &manifest);
+    assert!(!output.status.success());
+    let result = supervisor_result(&output);
+    assert_eq!(result["status"], "rejected");
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("allowlist"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_supervisor_rejects_evidence_root_outside_worktree() {
+    let directory = temporary_soak_environment();
+    let outside = tempfile::tempdir().expect("create external evidence fixture");
+    let manifest = supervisor_manifest(&directory, "natural", 1, 2_000, 16 * 1024);
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).expect("read manifest"))
+        .expect("parse manifest");
+    value["evidenceRoot"] = Value::String(
+        outside
+            .path()
+            .to_str()
+            .expect("external evidence path")
+            .to_string(),
+    );
+    value["cycleSha256"] = Value::String("00".repeat(32));
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&value).expect("serialize external evidence manifest"),
+    )
+    .expect("write external evidence manifest");
+    let output = run_supervisor(&directory, &manifest);
+    assert!(!output.status.success());
+    let result = supervisor_result(&output);
+    assert_eq!(result["status"], "rejected");
+    assert!(result.get("runDirectory").is_none());
+    assert!(!outside.path().join("phase-03-process-soak").exists());
 }
 
 #[cfg(windows)]
@@ -372,6 +443,15 @@ fn rust_supervisor_rejects_cycle_hash_mismatch_before_launch() {
         .to_ascii_lowercase()
         .contains("sha"));
     assert_eq!(result["launched"], false);
+    let run_directory = result["runDirectory"]
+        .as_str()
+        .expect("failure run directory");
+    assert!(!Path::new(run_directory).is_absolute());
+    assert!(directory
+        .path()
+        .join(run_directory)
+        .join("failure.json")
+        .is_file());
 }
 
 #[cfg(windows)]
@@ -424,7 +504,14 @@ fn rust_supervisor_rejects_helper_identity_mismatch_before_launch() {
     let result = supervisor_result(&output);
     assert_eq!(result["status"], "rejected");
     assert_eq!(result["launched"], false);
-    assert_eq!(result.as_object().map(serde_json::Map::len), Some(4));
+    assert!(
+        result
+            .as_object()
+            .map(serde_json::Map::len)
+            .unwrap_or_default()
+            >= 4
+    );
+    assert!(!Path::new(result["runDirectory"].as_str().unwrap_or_default()).is_absolute());
     assert!(result["error"]
         .as_str()
         .unwrap_or_default()
@@ -572,7 +659,10 @@ fn rust_supervisor_suite_deadline_stops_additional_cycles() {
     let output = run_supervisor(&directory, &manifest);
     assert!(!output.status.success(), "suite deadline must fail closed");
     let result = supervisor_result(&output);
-    assert_eq!(result["status"], "failed");
+    assert_eq!(
+        result["status"], "failed",
+        "suite deadline result: {result:?}"
+    );
     assert!(result["completedCycles"].as_u64().unwrap_or_default() <= 2);
 }
 
@@ -590,6 +680,17 @@ fn rust_supervisor_does_not_touch_external_listener() {
     let output = run_supervisor(&directory, &manifest);
     assert!(output.status.success(), "supervisor output: {output:?}");
     assert!(TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok());
+    let occupied_manifest = supervisor_manifest(&directory, "occupied-port", 1, 2_000, 16 * 1024);
+    let occupied_output = run_supervisor(&directory, &occupied_manifest);
+    assert!(
+        occupied_output.status.success(),
+        "occupied-port supervisor output: {occupied_output:?}"
+    );
+    let occupied_result = supervisor_result(&occupied_output);
+    assert_eq!(
+        occupied_result["cycles"][0]["result"]["secondBindRejected"],
+        true
+    );
     drop(external);
 }
 
@@ -597,9 +698,9 @@ fn rust_supervisor_does_not_touch_external_listener() {
 #[test]
 fn process_soak_script_dispatches_immutable_manifest_and_publishes_atomic_report() {
     let directory = temporary_soak_environment();
-    let manifest = supervisor_manifest(&directory, "natural", 2, 2_000, 16 * 1024);
+    let manifest = PathBuf::from("scripts/native-next/phase3-process-soak.manifest.json");
     let before_hash = sha256_file(&manifest);
-    let output = run_soak_with_manifest(&directory, &manifest);
+    let output = run_soak(&directory);
     assert!(output.status.success(), "soak output: {output:?}");
     let summary = parse_json_lines(&output.stdout)
         .into_iter()
@@ -608,11 +709,14 @@ fn process_soak_script_dispatches_immutable_manifest_and_publishes_atomic_report
     assert_eq!(summary["status"], "passed", "soak summary: {summary:?}");
     assert_eq!(summary["supervisor"]["status"], "passed");
     assert_eq!(summary["supervisor"]["completedCycles"], 2);
-    let run_directory = PathBuf::from(
-        summary["runDirectory"]
-            .as_str()
-            .expect("run directory in summary"),
-    );
+    let run_directory = std::env::current_dir()
+        .expect("current worktree")
+        .join(".devmanager-next/evidence")
+        .join(
+            summary["runDirectory"]
+                .as_str()
+                .expect("run directory in summary"),
+        );
     for artifact in [
         "manifest.json",
         "summary.json",
@@ -629,13 +733,18 @@ fn process_soak_script_dispatches_immutable_manifest_and_publishes_atomic_report
         &fs::read(run_directory.join("manifest.json")).expect("read manifest artifact"),
     )
     .expect("parse manifest artifact");
-    assert_eq!(manifest_artifact["revision"], "phase3.10-supervisor-v2");
+    assert_eq!(manifest_artifact["revision"], "phase3.10-supervisor-v3");
     assert_eq!(manifest_artifact["scenarioCatalog"][0]["name"], "natural");
     assert_eq!(
         manifest_artifact["binaries"]["cycleSha256"],
         sha256_file(&helper_path())
     );
-    assert!(manifest_artifact.get("cycleExecutable").is_none());
+    assert!(manifest_artifact["binaries"]["cycleExecutable"].is_string());
+    assert!(manifest_artifact["binaries"]["cycleExecutable"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("target-native-next"));
+    assert!(!Path::new(summary["runDirectory"].as_str().unwrap_or_default()).is_absolute());
     let performance: Value = serde_json::from_slice(
         &fs::read(run_directory.join("performance.json")).expect("read performance artifact"),
     )
@@ -676,6 +785,15 @@ fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     assert!(!source.contains("Get-FileHash"));
     assert!(!source.contains("Publish-AtomicJson"));
     assert!(!source.contains("Get-Content -LiteralPath $manifest"));
+    assert!(!source.contains("ManifestPath"));
+    assert!(!source.contains("Kill($true)"));
+    assert!(!source.contains("target\\debug"));
+    assert!(
+        source.find("$deadline =").expect("wrapper deadline")
+            < source
+                .find("$started = $process.Start()")
+                .expect("wrapper process start")
+    );
 }
 
 #[test]
@@ -695,6 +813,15 @@ fn phase_gate_supervisor_invocation_uses_bounded_explicit_environment() {
 }
 
 #[test]
+fn rust_supervisor_does_not_reset_cleanup_deadline_on_launch_failure() {
+    let source = fs::read_to_string("src/bin/devmanager-process-test-helper.rs")
+        .expect("read process supervisor source");
+    assert!(!source.contains("terminate_and_wait(Instant::now()"));
+    assert!(!source.contains("Duration::from_secs(5)"));
+    assert!(source.contains("name == \"target\""));
+}
+
+#[test]
 fn phase3_supervisor_gate_includes_soak_tests_and_fixed_supervisor_entrypoint() {
     let source = fs::read_to_string("scripts/native-next/Invoke-Phase3ProcessSupervisorGate.ps1")
         .expect("phase3 supervisor gate");
@@ -704,6 +831,9 @@ fn phase3_supervisor_gate_includes_soak_tests_and_fixed_supervisor_entrypoint() 
     assert!(source.contains("Assert-ProductionUnchanged.ps1"));
     assert!(source.contains("ReadToEndAsync") == false);
     assert!(source.contains("WaitForExit("));
+    assert!(!source.contains("Kill($true)"));
+    assert!(source.contains("Iterations"));
+    assert!(source.contains("Seed"));
 }
 
 #[cfg(windows)]
@@ -733,14 +863,24 @@ fn phase_gate_quiet_window_honors_monotonic_elapsed_budget() {
 }
 
 #[test]
+#[cfg(windows)]
 fn process_soak_cpu_math_matches_task_manager_denominators() {
-    let sample_ms: f64 = 1_000.0;
-    let process_ms: f64 = 750.0;
-    let logical_processors: f64 = 4.0;
-    let whole_machine = process_ms / (sample_ms * logical_processors) * 100.0;
-    let core_equivalent = process_ms / sample_ms * 100.0;
-    assert!((whole_machine - 18.75).abs() < f64::EPSILON);
-    assert!((core_equivalent - 75.0).abs() < f64::EPSILON);
+    let directory = temporary_soak_environment();
+    let manifest = supervisor_manifest(&directory, "natural", 1, 2_000, 16 * 1024);
+    let output = run_supervisor(&directory, &manifest);
+    assert!(output.status.success(), "measured CPU probe: {output:?}");
+    let result = supervisor_result(&output);
+    let cpu = &result["cycles"][0]["cpu"];
+    let process_time = cpu["processCpuTime100ns"].as_f64().expect("process CPU");
+    let wall_ms = cpu["wallTimeMs"].as_f64().expect("wall time");
+    let logical = cpu["logicalProcessorCount"].as_f64().expect("logical CPUs");
+    assert!(process_time > 0.0);
+    assert!(wall_ms > 0.0);
+    assert!(logical > 0.0);
+    let whole_machine = process_time / (wall_ms * 10_000.0 * logical) * 100.0;
+    let core_equivalent = process_time / (wall_ms * 10_000.0) * 100.0;
+    assert!((whole_machine - cpu["wholeMachinePercent"].as_f64().unwrap()).abs() < 0.01);
+    assert!((core_equivalent - cpu["coreEquivalentPercent"].as_f64().unwrap()).abs() < 0.01);
 }
 
 #[test]
@@ -759,6 +899,11 @@ fn ansi_corpus_reference_is_versioned_and_contains_split_sequences() {
         .expect("ANSI cases")
         .iter()
         .any(|case| case["name"] == "split-sequence"));
+    assert!(corpus["cases"]
+        .as_array()
+        .expect("ANSI cases")
+        .iter()
+        .any(|case| case["name"] == "unicode"));
 }
 
 fn assert_ready_and_done(captured: &CapturedOutput, expected_mode: &str) -> (Value, Value) {
@@ -957,7 +1102,7 @@ fn loopback_listener_is_temporary_bounded_and_identity_tagged() {
 
 #[cfg(windows)]
 #[test]
-fn process_soak_runner_reports_unavailable_without_a_real_cycle_api() {
+fn process_soak_runner_rejects_caller_manifest_override() {
     let directory = temporary_soak_environment();
     let output = run_soak_without_manifest(&directory);
     let combined = format!(
@@ -965,14 +1110,14 @@ fn process_soak_runner_reports_unavailable_without_a_real_cycle_api() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.status.code(), Some(78), "probe output: {combined}");
-    let summary = parse_json_lines(&output.stdout)
-        .into_iter()
-        .last()
-        .expect("unavailable soak result");
-    assert_eq!(summary["status"], "unavailable");
-    assert_eq!(summary["launched"], false);
-    assert!(combined.contains("manifest"), "probe output: {combined}");
+    assert!(
+        !output.status.success(),
+        "override must fail closed: {combined}"
+    );
+    assert!(
+        combined.contains("ManifestPath"),
+        "probe output: {combined}"
+    );
 }
 
 #[cfg(windows)]
@@ -988,7 +1133,6 @@ fn phase3_process_supervisor_entrypoint_lists_real_tests() {
         "-ListOnly",
     ]);
     configure_soak_environment(&mut command, &directory);
-    configure_single_cargo_path(&mut command);
     let output = command.output().expect("run process supervisor list gate");
     let combined = format!(
         "{}{}",
