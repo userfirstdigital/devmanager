@@ -246,6 +246,16 @@ fn native_shell_exposes_no_external_runtime_injection_authority() {
         "pub enum NativeHostRuntimeAttachment",
         "pub fn new_with_host_runtime_port",
         "pub fn attach_host_runtime_port",
+        "pub fn connect_blocking",
+        "pub fn connect(profile:",
+        "pub fn new(client: HostClient)",
+        "pub struct NativeHostClientRuntime",
+        "pub fn run_native_shell_with_runtime",
+        "pub fn new_with_host_runtime(",
+        "pub fn new_with_host_runtime_and_preferences(",
+        "pub fn attach_host_runtime(",
+        "error: Some(resync_error)",
+        "error: Some(error),",
     ] {
         assert!(
             !source.contains(forbidden),

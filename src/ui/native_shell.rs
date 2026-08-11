@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -198,8 +198,8 @@ fn reap_retained_children() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     children.retain_mut(|child| match child.child.try_wait() {
-        Ok(Some(_)) | Err(_) => false,
-        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
     });
 }
 
@@ -239,11 +239,23 @@ fn join_worker_with_deadline(worker: OwnedWorker, deadline: NativeShutdownDeadli
 
 fn terminate_child_with_deadline(mut child: OwnedChild, deadline: NativeShutdownDeadline) {
     reap_retained_children();
-    let _ = child.child.kill();
+    if child.child.kill().is_err() {
+        match child.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => {
+                retain_child(child);
+                return;
+            }
+        }
+    }
     while !deadline.expired() {
         match child.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return,
             Ok(None) => std::thread::sleep(Duration::from_millis(2).min(deadline.remaining())),
+            Err(_) => {
+                retain_child(child);
+                return;
+            }
         }
     }
     retain_child(child);
@@ -846,6 +858,34 @@ enum NativeHostWorkerCommand {
     Shutdown,
 }
 
+/// Try to hand the oldest pending action to the worker without losing it when
+/// the bounded channel is saturated or has already disconnected. The action is
+/// removed only after `try_send` accepts ownership; both error variants return
+/// it and put it back at the exact front of the queue.
+fn dispatch_pending_action(
+    pending: &mut VecDeque<NativeActionRecord>,
+    command_tx: &SyncSender<NativeHostWorkerCommand>,
+) -> NativeHostActionResult {
+    let Some(action) = pending.pop_front() else {
+        return NativeHostActionResult::Queued;
+    };
+    match command_tx.try_send(NativeHostWorkerCommand::Execute(action)) {
+        Ok(()) => NativeHostActionResult::Queued,
+        Err(TrySendError::Full(NativeHostWorkerCommand::Execute(action))) => {
+            pending.push_front(action);
+            NativeHostActionResult::QueueFull
+        }
+        Err(TrySendError::Disconnected(NativeHostWorkerCommand::Execute(action))) => {
+            pending.push_front(action);
+            NativeHostActionResult::Disconnected
+        }
+        Err(TrySendError::Full(NativeHostWorkerCommand::Shutdown))
+        | Err(TrySendError::Disconnected(NativeHostWorkerCommand::Shutdown)) => {
+            unreachable!("shutdown is never dispatched from the action queue")
+        }
+    }
+}
+
 /// Borrowed seam for the canonical header projection. The shell owns only the
 /// attachment lifecycle; the later header component can convert its bounded
 /// immutable projection into this value without opening another client.
@@ -955,7 +995,31 @@ impl NativeHostProjection {
 /// lane drains the records and uses the same client for command/query I/O.
 /// Keeping the client in this one owner prevents header, inbox, and shell
 /// attachments from silently opening a second connection.
-pub struct NativeHostClientRuntime {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeHostRuntimeBinding {
+    workspace_root: PathBuf,
+    profile_root: PathBuf,
+    named_profile: String,
+}
+
+impl NativeHostRuntimeBinding {
+    fn for_profile(profile: &IsolatedDevProfile) -> Self {
+        Self {
+            workspace_root: profile.workspace_root().to_path_buf(),
+            profile_root: profile.root().to_path_buf(),
+            named_profile: profile.named_profile().to_string(),
+        }
+    }
+
+    fn matches_profile(&self, profile: &IsolatedDevProfile) -> bool {
+        self.workspace_root == profile.workspace_root()
+            && self.profile_root == profile.root()
+            && self.named_profile == profile.named_profile()
+    }
+}
+
+pub(crate) struct NativeHostClientRuntime {
+    binding: NativeHostRuntimeBinding,
     endpoint: String,
     client: Arc<Mutex<HostClient>>,
     subscription: Arc<Mutex<ClientSubscription>>,
@@ -986,8 +1050,9 @@ pub(crate) trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Sen
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
     fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection>;
-    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord>;
-    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
+    fn pending_front(&self) -> Option<&NativeActionRecord>;
+    fn drop_pending_front(&mut self) -> Option<NativeActionRecord>;
+    fn dispatch_next_pending(&mut self) -> NativeHostActionResult;
 }
 
 impl std::fmt::Debug for NativeHostClientRuntime {
@@ -1023,7 +1088,7 @@ impl NativeHostClientRuntime {
     /// The caller is responsible for launching that host with this profile's
     /// isolated config base. No production/default profile lookup is performed
     /// and no second connection is created by this type.
-    pub async fn connect(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
+    pub(crate) async fn connect(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
         let deadline = NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET);
         let client = tokio::time::timeout(
             deadline.remaining(),
@@ -1036,7 +1101,16 @@ impl NativeHostClientRuntime {
         .map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
-        let mut runtime = Self::new(client)?;
+        let runtime_guard = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("runtime bootstrap failed: {error}"),
+                })?,
+        );
+        let mut runtime = Self::new_with_runtime(profile, client, runtime_guard)?;
         tokio::time::timeout(deadline.remaining(), runtime.bootstrap_projection())
             .await
             .map_err(|_| NativeShellError::HostConnect {
@@ -1049,7 +1123,7 @@ impl NativeHostClientRuntime {
     /// runtime remains owned by this one client owner so the connection's
     /// reader/writer tasks continue draining while GPUI paints and handles
     /// input. A failed attempt becomes a typed shell error at the call site.
-    pub fn connect_blocking(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
+    pub(crate) fn connect_blocking(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
         let deadline = NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET);
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -1070,7 +1144,7 @@ impl NativeHostClientRuntime {
         let client = client.map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
-        let mut runtime_owner = match Self::new_with_runtime(client, runtime.clone()) {
+        let mut runtime_owner = match Self::new_with_runtime(profile, client, runtime.clone()) {
             Ok(runtime_owner) => runtime_owner,
             Err(error) => {
                 if let Ok(runtime) = Arc::try_unwrap(runtime) {
@@ -1123,7 +1197,7 @@ impl NativeHostClientRuntime {
             }
         };
         let mut runtime_owner =
-            match Self::new_with_runtime_and_process(client, runtime.clone(), process) {
+            match Self::new_with_runtime_and_process(profile, client, runtime.clone(), process) {
                 Ok(runtime_owner) => runtime_owner,
                 Err((error, mut process)) => {
                     process.terminate(deadline);
@@ -1152,27 +1226,16 @@ impl NativeHostClientRuntime {
         Ok(runtime_owner)
     }
 
-    pub fn new(client: HostClient) -> Result<Self, NativeShellError> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .map_err(|error| NativeShellError::HostConnect {
-                    message: format!("runtime bootstrap failed: {error}"),
-                })?,
-        );
-        Self::new_with_runtime(client, runtime)
-    }
-
     fn new_with_runtime(
+        profile: &IsolatedDevProfile,
         client: HostClient,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, NativeShellError> {
-        Self::new_with_runtime_guard(client, Some(runtime))
+        Self::new_with_runtime_guard(profile, client, Some(runtime))
     }
 
     fn new_with_runtime_guard(
+        profile: &IsolatedDevProfile,
         client: HostClient,
         runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self, NativeShellError> {
@@ -1225,6 +1288,7 @@ impl NativeHostClientRuntime {
             None
         };
         Ok(Self {
+            binding: NativeHostRuntimeBinding::for_profile(profile),
             endpoint,
             client,
             subscription,
@@ -1242,11 +1306,12 @@ impl NativeHostClientRuntime {
     }
 
     fn new_with_runtime_and_process(
+        profile: &IsolatedDevProfile,
         client: HostClient,
         runtime: Arc<tokio::runtime::Runtime>,
         process: NativeHostProcess,
     ) -> Result<Self, (NativeShellError, NativeHostProcess)> {
-        let mut runtime_owner = match Self::new_with_runtime_guard(client, Some(runtime)) {
+        let mut runtime_owner = match Self::new_with_runtime_guard(profile, client, Some(runtime)) {
             Ok(runtime_owner) => runtime_owner,
             Err(error) => return Err((error, process)),
         };
@@ -1254,23 +1319,43 @@ impl NativeHostClientRuntime {
         Ok(runtime_owner)
     }
 
-    pub fn is_connected(&self) -> bool {
+    pub(crate) fn is_connected(&self) -> bool {
         self.client
             .lock()
             .map(|client| client.is_connected())
             .unwrap_or(false)
     }
 
-    pub fn endpoint(&self) -> &str {
+    pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    pub fn pending_count(&self) -> usize {
+    fn validate_attachment(&self, profile: &IsolatedDevProfile) -> Result<(), NativeShellError> {
+        if !self.binding.matches_profile(profile) {
+            return Err(NativeShellError::HostConnect {
+                message: "native host runtime profile binding does not match shell profile"
+                    .to_string(),
+            });
+        }
+        if !self.bootstrapped.load(Ordering::Acquire) {
+            return Err(NativeShellError::HostConnect {
+                message: "native host runtime has no bootstrapped client projection".to_string(),
+            });
+        }
+        if !self.is_connected() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host runtime is disconnected".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
     /// Queue one action without performing transport work on the UI thread.
-    pub fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+    pub(crate) fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
         if !self.is_connected() {
             return NativeHostActionResult::Disconnected;
         }
@@ -1281,21 +1366,16 @@ impl NativeHostClientRuntime {
         NativeHostActionResult::Queued
     }
 
-    /// Drain a bounded batch for the controller/task lane.
-    pub fn take_pending(&mut self) -> Vec<NativeActionRecord> {
-        self.take_pending_bounded(MAX_PENDING_HOST_ACTIONS)
+    fn pending_front(&self) -> Option<&NativeActionRecord> {
+        self.pending.front()
     }
 
-    pub fn take_pending_bounded(&mut self, max: usize) -> Vec<NativeActionRecord> {
-        let count = max.min(MAX_PENDING_HOST_ACTIONS).min(self.pending.len());
-        self.pending.drain(..count).collect()
+    fn drop_pending_front(&mut self) -> Option<NativeActionRecord> {
+        self.pending.pop_front()
     }
 
-    pub fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        self.command_tx
-            .try_send(NativeHostWorkerCommand::Execute(action))
-            .map(|_| NativeHostActionResult::Queued)
-            .unwrap_or(NativeHostActionResult::QueueFull)
+    fn dispatch_next_pending(&mut self) -> NativeHostActionResult {
+        dispatch_pending_action(&mut self.pending, &self.command_tx)
     }
 
     /// Drain only already-buffered unsolicited host projections. This method
@@ -1432,12 +1512,16 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         self.take_ready_projection_messages(max)
     }
 
-    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord> {
-        self.take_pending_bounded(max)
+    fn pending_front(&self) -> Option<&NativeActionRecord> {
+        NativeHostClientRuntime::pending_front(self)
     }
 
-    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        NativeHostClientRuntime::dispatch_pending(self, action)
+    fn drop_pending_front(&mut self) -> Option<NativeActionRecord> {
+        NativeHostClientRuntime::drop_pending_front(self)
+    }
+
+    fn dispatch_next_pending(&mut self) -> NativeHostActionResult {
+        NativeHostClientRuntime::dispatch_next_pending(self)
     }
 }
 
@@ -1710,7 +1794,7 @@ fn pump_subscription_once(
                             NativeHostProjection {
                                 kind: NativeHostProjectionKind::Error,
                                 client_model: None,
-                                error: Some(resync_error),
+                                error: Some(bounded_host_error(resync_error)),
                                 epochs: None,
                             }
                             .at_epochs(current_runtime_epochs(epochs)),
@@ -1777,7 +1861,7 @@ fn pump_subscription_once(
                     NativeHostProjection {
                         kind: NativeHostProjectionKind::Error,
                         client_model: None,
-                        error: Some(error),
+                        error: Some(bounded_host_error(error)),
                         epochs: None,
                     }
                     .at_epochs(current_runtime_epochs(epochs)),
@@ -2034,6 +2118,7 @@ impl NativeInteraction {
             self.connection_epoch = epochs.connection_epoch;
             self.resource_generation = epochs.resource_generation;
             self.runtime_generation = epochs.runtime_generation;
+            self.shell.on_resync();
             self.pending_keyboard = None;
             self.pointer_capture = None;
             self.pointer_owner = None;
@@ -2955,17 +3040,12 @@ impl NativeShell {
         )
     }
 
-    pub fn new_with_host_runtime(
+    pub(crate) fn new_with_host_runtime(
         profile: IsolatedDevProfile,
         host_runtime: Option<NativeHostClientRuntime>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let host_state = host_runtime
-            .as_ref()
-            .map(|runtime| NativeHostState::Connected {
-                endpoint: runtime.endpoint().to_string(),
-            })
-            .unwrap_or(NativeHostState::Disconnected);
+        let (host_runtime, host_state) = validated_runtime_attachment(&profile, host_runtime);
         Self::new_with_host_runtime_and_state_and_preferences(
             profile,
             host_runtime,
@@ -2975,18 +3055,13 @@ impl NativeShell {
         )
     }
 
-    pub fn new_with_host_runtime_and_preferences(
+    pub(crate) fn new_with_host_runtime_and_preferences(
         profile: IsolatedDevProfile,
         host_runtime: Option<NativeHostClientRuntime>,
         preferences: RuntimePreferencesSnapshot,
         cx: &mut Context<Self>,
     ) -> Self {
-        let host_state = host_runtime
-            .as_ref()
-            .map(|runtime| NativeHostState::Connected {
-                endpoint: runtime.endpoint().to_string(),
-            })
-            .unwrap_or(NativeHostState::Disconnected);
+        let (host_runtime, host_state) = validated_runtime_attachment(&profile, host_runtime);
         Self::new_with_host_runtime_and_state_and_preferences(
             profile,
             host_runtime,
@@ -3223,26 +3298,61 @@ impl NativeShell {
             self.last_projection_kinds = accepted_projection_kinds;
         }
 
-        let pending = match self.host_runtime.as_mut() {
-            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.take_pending(max),
-            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.take_pending_bounded(max),
-            None => Vec::new(),
-        };
-        for action in pending {
-            if !self.interaction.accepts_action_record(&action) {
+        for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
+            let Some(has_pending) = self.host_runtime.as_ref().map(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.pending_front().is_some(),
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.pending_front().is_some(),
+            }) else {
+                break;
+            };
+            if !has_pending {
+                break;
+            }
+
+            let stale = match self.host_runtime.as_ref() {
+                Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime
+                    .pending_front()
+                    .is_some_and(|action| !self.interaction.accepts_action_record(action)),
+                Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime
+                    .pending_front()
+                    .is_some_and(|action| !self.interaction.accepts_action_record(action)),
+                None => false,
+            };
+            if stale {
+                match self.host_runtime.as_mut() {
+                    Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                        let _ = runtime.drop_pending_front();
+                    }
+                    Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                        let _ = runtime.drop_pending_front();
+                    }
+                    None => break,
+                }
                 continue;
             }
-            if let Some(runtime) = self.host_runtime.as_mut() {
-                let result = match runtime {
-                    NativeHostRuntimeAttachment::Injected(runtime) => {
-                        runtime.dispatch_pending(action)
-                    }
-                    NativeHostRuntimeAttachment::Client(runtime) => {
-                        runtime.dispatch_pending(action)
-                    }
-                };
-                if matches!(result, NativeHostActionResult::Disconnected) {
+
+            let result = match self.host_runtime.as_mut() {
+                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                    runtime.dispatch_next_pending()
+                }
+                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                    runtime.dispatch_next_pending()
+                }
+                None => break,
+            };
+            match result {
+                NativeHostActionResult::Queued => {}
+                NativeHostActionResult::Disconnected => {
                     self.host_state = NativeHostState::Disconnected;
+                    break;
+                }
+                NativeHostActionResult::QueueFull => {
+                    self.host_state = NativeHostState::Error {
+                        message: bounded_host_error(
+                            "native host worker queue is saturated; action retained".to_string(),
+                        ),
+                    };
+                    break;
                 }
             }
         }
@@ -3314,7 +3424,7 @@ impl NativeShell {
         self.bounds_subscription = Some(bounds);
     }
 
-    pub fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
+    pub(crate) fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
         self.host_runtime
             .as_ref()
             .and_then(|attachment| match attachment {
@@ -3323,7 +3433,7 @@ impl NativeShell {
             })
     }
 
-    pub fn host_runtime_mut(&mut self) -> Option<&mut NativeHostClientRuntime> {
+    pub(crate) fn host_runtime_mut(&mut self) -> Option<&mut NativeHostClientRuntime> {
         self.host_runtime
             .as_mut()
             .and_then(|attachment| match attachment {
@@ -3362,11 +3472,17 @@ impl NativeShell {
 
     /// Attach exactly one pre-connected host runtime. The shell never opens
     /// another connection when an attachment is present.
-    pub fn attach_host_runtime(
+    pub(crate) fn attach_host_runtime(
         &mut self,
         host_runtime: NativeHostClientRuntime,
     ) -> Result<(), NativeHostClientRuntime> {
         if self.host_runtime.is_some() {
+            return Err(host_runtime);
+        }
+        if let Err(error) = host_runtime.validate_attachment(&self.profile) {
+            self.host_state = NativeHostState::Error {
+                message: bounded_host_error(error.to_string()),
+            };
             return Err(host_runtime);
         }
         self.interaction.sync_host_epochs(host_runtime.epochs());
@@ -3973,17 +4089,12 @@ pub(crate) fn run_native_shell_with_bootstrap(
 /// The attachment is moved into the shell entity exactly once. Header and
 /// inbox owners can share its controller/task lane through their projection
 /// seams; this function never creates a second `HostClient`.
-pub fn run_native_shell_with_runtime(
+pub(crate) fn run_native_shell_with_runtime(
     workspace_root: impl AsRef<Path>,
     host_runtime: Option<NativeHostClientRuntime>,
 ) -> Result<(), NativeShellError> {
     let profile = isolated_dev_profile(workspace_root)?;
-    let host_state = host_runtime
-        .as_ref()
-        .map(|runtime| NativeHostState::Connected {
-            endpoint: runtime.endpoint().to_string(),
-        })
-        .unwrap_or(NativeHostState::Disconnected);
+    let (host_runtime, host_state) = validated_runtime_attachment(&profile, host_runtime);
     launch_native_shell(
         profile,
         host_runtime.map(NativeHostRuntimeAttachment::Client),
@@ -4055,6 +4166,27 @@ fn bounded_host_error(message: String) -> String {
     message.chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
+fn validated_runtime_attachment(
+    profile: &IsolatedDevProfile,
+    host_runtime: Option<NativeHostClientRuntime>,
+) -> (Option<NativeHostClientRuntime>, NativeHostState) {
+    let Some(runtime) = host_runtime else {
+        return (None, NativeHostState::Disconnected);
+    };
+    match runtime.validate_attachment(profile) {
+        Ok(()) => {
+            let endpoint = runtime.endpoint().to_string();
+            (Some(runtime), NativeHostState::Connected { endpoint })
+        }
+        Err(error) => (
+            None,
+            NativeHostState::Error {
+                message: bounded_host_error(error.to_string()),
+            },
+        ),
+    }
+}
+
 fn enqueue_pending_preference(
     pending: &mut VecDeque<RuntimePreferencesSnapshot>,
     preferences: RuntimePreferencesSnapshot,
@@ -4068,11 +4200,14 @@ fn enqueue_pending_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_reaper_permit, enqueue_pending_preference, ensure_isolated_host_config_base,
-        isolated_dev_profile, reap_retained_children, reap_retained_workers, retain_child,
-        retain_worker, wait_for_cancellation, AccessibilityTree, NativePlatformAccessibilityBridge,
-        NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, MAX_PENDING_PREFERENCES,
-        MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS,
+        acquire_reaper_permit, dispatch_pending_action, enqueue_pending_preference,
+        ensure_isolated_host_config_base, isolated_dev_profile, reap_retained_children,
+        reap_retained_workers, retain_child, retain_worker, retained_children,
+        wait_for_cancellation, AccessibilityTree, NativeHostActionResult, NativeHostRuntimeEpochs,
+        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge,
+        NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, TaskId,
+        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
+        MAX_RETAINED_WORKERS,
     };
     use std::collections::VecDeque;
     use std::process::Command;
@@ -4193,6 +4328,119 @@ mod tests {
         );
         drop(recovered);
         reap_retained_children();
+    }
+
+    #[test]
+    fn blocked_worker_queue_keeps_the_exact_action_until_capacity_returns() {
+        let (command_tx, _command_rx) = std::sync::mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
+        let mut interaction = NativeInteraction::new(Some(TaskId::new()));
+        let action = interaction
+            .action(crate::ui::components::ActionRequest::HostStatus)
+            .expect("host status action");
+        for _ in 0..MAX_PENDING_HOST_ACTIONS {
+            command_tx
+                .try_send(NativeHostWorkerCommand::Execute(action.clone()))
+                .expect("fill worker queue");
+        }
+        let expected_id = action.id;
+        let expected_task = action.task_id;
+        let expected_command = format!("{:?}", action.command);
+        let mut pending = VecDeque::from([action]);
+
+        assert_eq!(
+            dispatch_pending_action(&mut pending, &command_tx),
+            NativeHostActionResult::QueueFull
+        );
+        let retained = pending.pop_front().expect("full worker retains action");
+        assert_eq!(retained.id, expected_id);
+        assert_eq!(retained.task_id, expected_task);
+        assert_eq!(format!("{:?}", retained.command), expected_command);
+    }
+
+    #[test]
+    fn disconnected_worker_queue_keeps_the_exact_action_for_typed_failure() {
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
+        drop(command_rx);
+        let mut interaction = NativeInteraction::new(Some(TaskId::new()));
+        let action = interaction
+            .action(crate::ui::components::ActionRequest::HostStatus)
+            .expect("host status action");
+        let expected_id = action.id;
+        let expected_task = action.task_id;
+        let expected_command = format!("{:?}", action.command);
+        let mut pending = VecDeque::from([action]);
+
+        assert_eq!(
+            dispatch_pending_action(&mut pending, &command_tx),
+            NativeHostActionResult::Disconnected
+        );
+        let retained = pending
+            .pop_front()
+            .expect("disconnected worker retains action");
+        assert_eq!(retained.id, expected_id);
+        assert_eq!(retained.task_id, expected_task);
+        assert_eq!(format!("{:?}", retained.command), expected_command);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_reaper_keeps_owned_child_when_wait_observation_errors() {
+        reap_retained_children();
+        let permit = acquire_reaper_permit(ReaperKind::Child).expect("child permit");
+        let mut child = exited_child();
+        child.wait().expect("observe child exit");
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        unsafe {
+            CloseHandle(HANDLE(child.as_raw_handle() as _)).expect("close observed child handle");
+        }
+        retain_child(OwnedChild {
+            child,
+            _permit: permit,
+        });
+
+        reap_retained_children();
+        let children = retained_children()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(children.len(), 1, "wait errors retain child ownership");
+        drop(children);
+
+        let mut children = retained_children()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retained = children.pop().expect("test retained child");
+        drop(children);
+        drop(retained);
+    }
+
+    #[test]
+    fn host_epoch_resync_invalidates_shell_terminal_capture_before_new_press() {
+        let task_id = TaskId::new();
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        let first = interaction.terminal_mouse_down(
+            1,
+            task_id,
+            crate::ui::shell::PointerButton::Primary,
+            Some(task_id),
+        );
+        assert!(first.capture.is_ok(), "initial terminal press");
+
+        assert!(interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 2,
+            resource_generation: 2,
+            runtime_generation: 2,
+        }));
+        let second = interaction.terminal_mouse_down(
+            2,
+            task_id,
+            crate::ui::shell::PointerButton::Primary,
+            Some(task_id),
+        );
+        assert!(
+            second.capture.is_ok(),
+            "resync must release old shell capture"
+        );
     }
 
     #[test]
