@@ -29,6 +29,11 @@ const MAX_PROMPT_JOURNAL_ROWS: usize = 10_000;
 /// The public codec contract has a larger 4 MiB budget. Durable SQLite rows
 /// remain bounded to 512 KiB here.
 const MAX_PROMPT_DURABLE_WIRE_BYTES: usize = 512 * 1024;
+// Keep temporary positions outside the valid dense prefix while a single
+// ordered mutation shifts rows. The chain's durable maximum is 2,000 links,
+// so this offset cannot overlap a valid position and avoids row-by-row
+// delete/reinsert renumbering.
+const CHAIN_POSITION_SHIFT: i64 = MAX_PROMPT_CHAIN_LINKS as i64 + 1;
 const CURRENT_VERSION_LATEST_TRIGGER_SQL: &str =
     "CREATE TRIGGER saved_prompts_current_version_is_latest\n\
   BEFORE UPDATE OF current_version_id ON saved_prompts\n\
@@ -2559,7 +2564,14 @@ fn apply_insert_chain_link(
     renumber_links(&mut links)?;
     let revision = next_revision(chain.revision)?;
     let occurred_at_ms = now_ms();
-    write_chain_links(tx, &chain, &links, revision, occurred_at_ms)?;
+    insert_chain_link_rows(
+        tx,
+        &chain,
+        &links[position],
+        position,
+        revision,
+        occurred_at_ms,
+    )?;
     Ok((
         PromptChainMutationReceipt {
             command_id,
@@ -2605,6 +2617,10 @@ fn apply_move_chain_link(
             return Err(PromptStoreError::NotFound);
         }
     }
+    let target_index = command
+        .before_link_id
+        .and_then(|before_link_id| links.iter().position(|link| link.id() == before_link_id))
+        .unwrap_or(links.len());
     let moving = links.remove(moving_index);
     let position = command
         .before_link_id
@@ -2623,7 +2639,14 @@ fn apply_move_chain_link(
     }
     let revision = next_revision(chain.revision)?;
     let occurred_at_ms = now_ms();
-    write_chain_links(tx, &chain, &links, revision, occurred_at_ms)?;
+    move_chain_link_rows(
+        tx,
+        &chain,
+        moving_index,
+        target_index,
+        revision,
+        occurred_at_ms,
+    )?;
     Ok((
         chain_receipt(command_id, &chain, Some(command.link_id)).with_revision(revision),
         Some(PromptChainEvent::PromptChainLinksReplaced {
@@ -2654,7 +2677,7 @@ fn apply_remove_chain_link(
     renumber_links(&mut links)?;
     let revision = next_revision(chain.revision)?;
     let occurred_at_ms = now_ms();
-    write_chain_links(tx, &chain, &links, revision, occurred_at_ms)?;
+    remove_chain_link_rows(tx, &chain, position, revision, occurred_at_ms)?;
     Ok((
         chain_receipt(command_id, &chain, Some(command.link_id)).with_revision(revision),
         Some(PromptChainEvent::PromptChainLinksReplaced {
@@ -2703,7 +2726,14 @@ fn apply_update_chain_link_version(
     );
     let revision = next_revision(chain.revision)?;
     let occurred_at_ms = now_ms();
-    write_chain_links(tx, &chain, &links, revision, occurred_at_ms)?;
+    update_chain_link_version_row(
+        tx,
+        &chain,
+        links[position].id(),
+        prompt.current_version_id,
+        revision,
+        occurred_at_ms,
+    )?;
     Ok((
         chain_receipt(command_id, &chain, Some(command.link_id)).with_revision(revision),
         Some(PromptChainEvent::PromptChainLinksReplaced {
@@ -2892,6 +2922,205 @@ fn validate_chain_links(
     Ok(())
 }
 
+fn advance_chain_revision(
+    tx: &Transaction<'_>,
+    chain: &PromptChain,
+    revision: u64,
+    updated_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let changed = tx.execute(
+        "UPDATE prompt_chains SET revision = ?1, updated_at_ms = ?2
+         WHERE chain_id = ?3 AND revision = ?4",
+        rusqlite::params![
+            to_i64(revision)?,
+            updated_at_ms,
+            chain.id.as_bytes().as_slice(),
+            to_i64(chain.revision)?,
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PromptStoreError::RevisionConflict {
+            expected: chain.revision,
+            actual: chain.revision,
+        })
+    }
+}
+
+/// Insert one link while shifting the affected suffix in bounded SQL work.
+/// Temporary positions keep the unique `(chain_id, position)` index valid
+/// without deleting and reinserting every link.
+fn insert_chain_link_rows(
+    tx: &Transaction<'_>,
+    chain: &PromptChain,
+    link: &PromptChainLink,
+    position: usize,
+    revision: u64,
+    updated_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let position = i64::try_from(position)
+        .map_err(|_| PromptStoreError::Corruption("prompt chain position overflow".into()))?;
+    advance_chain_revision(tx, chain, revision, updated_at_ms)?;
+    tx.execute(
+        "UPDATE prompt_chain_links
+         SET position = position + ?2
+         WHERE chain_id = ?1",
+        rusqlite::params![chain.id.as_bytes().as_slice(), CHAIN_POSITION_SHIFT],
+    )?;
+    tx.execute(
+        "UPDATE prompt_chain_links
+         SET position = position - ?2
+             + CASE WHEN position - ?2 >= ?3 THEN 1 ELSE 0 END
+         WHERE chain_id = ?1",
+        rusqlite::params![
+            chain.id.as_bytes().as_slice(),
+            CHAIN_POSITION_SHIFT,
+            position,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO prompt_chain_links(
+            link_id, chain_id, position, prompt_id, prompt_version_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            link.id().as_bytes().as_slice(),
+            link.chain_id().as_bytes().as_slice(),
+            position,
+            link.prompt_id().as_bytes().as_slice(),
+            link.prompt_version_id().as_bytes().as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Move one link by shifting only the affected interval. `moving_position`
+/// and `before_position` refer to the original dense order; `before_position`
+/// may equal the original link count for an append-to-end move.
+fn move_chain_link_rows(
+    tx: &Transaction<'_>,
+    chain: &PromptChain,
+    moving_position: usize,
+    before_position: usize,
+    revision: u64,
+    updated_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let moving_position = i64::try_from(moving_position)
+        .map_err(|_| PromptStoreError::Corruption("prompt chain position overflow".into()))?;
+    let before_position = i64::try_from(before_position)
+        .map_err(|_| PromptStoreError::Corruption("prompt chain position overflow".into()))?;
+    advance_chain_revision(tx, chain, revision, updated_at_ms)?;
+    tx.execute(
+        "UPDATE prompt_chain_links
+         SET position = position + ?2
+         WHERE chain_id = ?1",
+        rusqlite::params![chain.id.as_bytes().as_slice(), CHAIN_POSITION_SHIFT],
+    )?;
+    if moving_position < before_position {
+        tx.execute(
+            "UPDATE prompt_chain_links
+             SET position = CASE
+               WHEN position - ?2 = ?3 THEN ?4 - 1
+               WHEN position - ?2 > ?3 AND position - ?2 < ?4
+                 THEN position - ?2 - 1
+               ELSE position - ?2
+             END
+             WHERE chain_id = ?1",
+            rusqlite::params![
+                chain.id.as_bytes().as_slice(),
+                CHAIN_POSITION_SHIFT,
+                moving_position,
+                before_position,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE prompt_chain_links
+             SET position = CASE
+               WHEN position - ?2 = ?3 THEN ?4
+               WHEN position - ?2 >= ?4 AND position - ?2 < ?3
+                 THEN position - ?2 + 1
+               ELSE position - ?2
+             END
+             WHERE chain_id = ?1",
+            rusqlite::params![
+                chain.id.as_bytes().as_slice(),
+                CHAIN_POSITION_SHIFT,
+                moving_position,
+                before_position,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_chain_link_rows(
+    tx: &Transaction<'_>,
+    chain: &PromptChain,
+    position: usize,
+    revision: u64,
+    updated_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    let position = i64::try_from(position)
+        .map_err(|_| PromptStoreError::Corruption("prompt chain position overflow".into()))?;
+    advance_chain_revision(tx, chain, revision, updated_at_ms)?;
+    tx.execute(
+        "UPDATE prompt_chain_links
+         SET position = position + ?2
+         WHERE chain_id = ?1",
+        rusqlite::params![chain.id.as_bytes().as_slice(), CHAIN_POSITION_SHIFT],
+    )?;
+    tx.execute(
+        "DELETE FROM prompt_chain_links
+         WHERE chain_id = ?1 AND position = ?2 + ?3",
+        rusqlite::params![
+            chain.id.as_bytes().as_slice(),
+            CHAIN_POSITION_SHIFT,
+            position,
+        ],
+    )?;
+    tx.execute(
+        "UPDATE prompt_chain_links
+         SET position = position - ?2
+             - CASE WHEN position - ?2 > ?3 THEN 1 ELSE 0 END
+         WHERE chain_id = ?1",
+        rusqlite::params![
+            chain.id.as_bytes().as_slice(),
+            CHAIN_POSITION_SHIFT,
+            position,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_chain_link_version_row(
+    tx: &Transaction<'_>,
+    chain: &PromptChain,
+    link_id: PromptChainLinkId,
+    prompt_version_id: PromptVersionId,
+    revision: u64,
+    updated_at_ms: i64,
+) -> Result<(), PromptStoreError> {
+    advance_chain_revision(tx, chain, revision, updated_at_ms)?;
+    let changed = tx.execute(
+        "UPDATE prompt_chain_links
+         SET prompt_version_id = ?1
+         WHERE chain_id = ?2 AND link_id = ?3",
+        rusqlite::params![
+            prompt_version_id.as_bytes().as_slice(),
+            chain.id.as_bytes().as_slice(),
+            link_id.as_bytes().as_slice(),
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PromptStoreError::Corruption(
+            "prompt chain link disappeared while updating its version".into(),
+        ))
+    }
+}
+
 fn write_chain_links(
     tx: &Transaction<'_>,
     chain: &PromptChain,
@@ -2905,28 +3134,7 @@ fn write_chain_links(
         )));
     }
     validate_chain_links(tx, chain.id, links)?;
-    let changed = tx
-        .execute(
-            "UPDATE prompt_chains SET revision = ?1, updated_at_ms = ?2
-         WHERE chain_id = ?3 AND revision = ?4",
-            rusqlite::params![
-                to_i64(revision)?,
-                updated_at_ms,
-                chain.id.as_bytes().as_slice(),
-                to_i64(chain.revision)?,
-            ],
-        )
-        .map_err(|error| {
-            PromptStoreError::Database(format!(
-                "write_chain_links revision update failed: {error:?}"
-            ))
-        })?;
-    if changed != 1 {
-        return Err(PromptStoreError::RevisionConflict {
-            expected: chain.revision,
-            actual: chain.revision,
-        });
-    }
+    advance_chain_revision(tx, chain, revision, updated_at_ms)?;
     tx.execute(
         "DELETE FROM prompt_chain_links WHERE chain_id = ?1",
         [chain.id.as_bytes().as_slice()],
