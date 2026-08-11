@@ -8,10 +8,17 @@ use serde::{Deserialize, Serialize};
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactFacts;
 use crate::domain::host::{HostCleanupBranch, HostCleanupBranchOutcome};
-use crate::domain::id::{AgentSessionId, CommandId, EventId, OperationId, ResourceId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ApprovalId, ClientId, CommandId, EventId, OperationId, QuestionId, ResourceId,
+    TaskId, TurnId,
+};
 use crate::domain::operation::{
     validate_outcome_fence, validate_terminal_fact_source, CancellationReason, OperationErrorCode,
     OperationUncertaintyCode, OutcomeFenceError, OutcomeSource,
+};
+use crate::domain::provider_input::{
+    validate_action_nested_ids, ProviderDeliveryVisibility, ProviderInputAction,
+    ProviderInputSettlement, ProviderResolutionWinner, ProviderWaitFence, ProviderWaitRecord,
 };
 use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
@@ -592,6 +599,66 @@ pub struct HostCleanupBranchCompletedPayload {
     pub outcome: HostCleanupBranchOutcome,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInputAcceptedPayload {
+    pub command_id: CommandId,
+    pub client_id: ClientId,
+    pub agent_session_id: AgentSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub question_id: Option<QuestionId>,
+    pub approval_id: Option<ApprovalId>,
+    pub action: ProviderInputAction,
+    pub wait: bool,
+    pub delivery: ProviderDeliveryVisibility,
+}
+
+impl fmt::Debug for ProviderInputAcceptedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderInputAcceptedPayload")
+            .field("command_id", &self.command_id)
+            .field("client_id", &self.client_id)
+            .field("agent_session_id", &self.agent_session_id)
+            .field("runtime_generation", &self.runtime_generation)
+            .field("turn_id", &self.turn_id)
+            .field("action_epoch", &self.action_epoch)
+            .field("question_id", &self.question_id)
+            .field("approval_id", &self.approval_id)
+            .field("action", &self.action)
+            .field("wait", &self.wait)
+            .field("delivery", &self.delivery)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderQuestionPresentedPayload {
+    pub agent_session_id: AgentSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub question_id: QuestionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderApprovalPresentedPayload {
+    pub agent_session_id: AgentSessionId,
+    pub runtime_generation: u64,
+    pub turn_id: TurnId,
+    pub action_epoch: u64,
+    pub approval_id: ApprovalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderWaitSettledPayload {
+    pub fence: ProviderWaitFence,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     TaskCreated {
@@ -648,6 +715,36 @@ pub enum Event {
     OperationFailed(OperationFailedFact),
     OperationCancelled(OperationCancelledFact),
     OperationUncertain(OperationUncertainFact),
+    ProviderInputAccepted {
+        command_id: CommandId,
+        client_id: ClientId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+        action: ProviderInputAction,
+        wait: bool,
+        delivery: ProviderDeliveryVisibility,
+    },
+    ProviderQuestionPresented {
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: QuestionId,
+    },
+    ProviderApprovalPresented {
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        approval_id: ApprovalId,
+    },
+    ProviderWaitSettled {
+        fence: ProviderWaitFence,
+    },
 }
 
 impl Event {
@@ -672,6 +769,10 @@ impl Event {
             Self::OperationFailed(_) => "operation.failed",
             Self::OperationCancelled(_) => "operation.cancelled",
             Self::OperationUncertain(_) => "operation.uncertain",
+            Self::ProviderInputAccepted { .. } => "provider_input.accepted",
+            Self::ProviderQuestionPresented { .. } => "provider_input.question_presented",
+            Self::ProviderApprovalPresented { .. } => "provider_input.approval_presented",
+            Self::ProviderWaitSettled { .. } => "provider_input.wait_settled",
         }
     }
 
@@ -730,6 +831,14 @@ enum EventBody {
     OperationCancelled(OperationCancelledFact),
     #[serde(rename = "operation.uncertain")]
     OperationUncertain(OperationUncertainFact),
+    #[serde(rename = "provider_input.accepted")]
+    ProviderInputAccepted(ProviderInputAcceptedPayload),
+    #[serde(rename = "provider_input.question_presented")]
+    ProviderQuestionPresented(ProviderQuestionPresentedPayload),
+    #[serde(rename = "provider_input.approval_presented")]
+    ProviderApprovalPresented(ProviderApprovalPresentedPayload),
+    #[serde(rename = "provider_input.wait_settled")]
+    ProviderWaitSettled(ProviderWaitSettledPayload),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -829,6 +938,62 @@ impl From<&Event> for EventDocument {
             Event::OperationFailed(fact) => EventBody::OperationFailed(fact.clone()),
             Event::OperationCancelled(fact) => EventBody::OperationCancelled(fact.clone()),
             Event::OperationUncertain(fact) => EventBody::OperationUncertain(fact.clone()),
+            Event::ProviderInputAccepted {
+                command_id,
+                client_id,
+                agent_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+                approval_id,
+                action,
+                wait,
+                delivery,
+            } => EventBody::ProviderInputAccepted(ProviderInputAcceptedPayload {
+                command_id: *command_id,
+                client_id: *client_id,
+                agent_session_id: *agent_session_id,
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                question_id: *question_id,
+                approval_id: *approval_id,
+                action: action.clone(),
+                wait: *wait,
+                delivery: *delivery,
+            }),
+            Event::ProviderQuestionPresented {
+                agent_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                question_id,
+            } => EventBody::ProviderQuestionPresented(ProviderQuestionPresentedPayload {
+                agent_session_id: *agent_session_id,
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                question_id: *question_id,
+            }),
+            Event::ProviderApprovalPresented {
+                agent_session_id,
+                runtime_generation,
+                turn_id,
+                action_epoch,
+                approval_id,
+            } => EventBody::ProviderApprovalPresented(ProviderApprovalPresentedPayload {
+                agent_session_id: *agent_session_id,
+                runtime_generation: *runtime_generation,
+                turn_id: *turn_id,
+                action_epoch: *action_epoch,
+                approval_id: *approval_id,
+            }),
+            Event::ProviderWaitSettled { fence } => {
+                EventBody::ProviderWaitSettled(ProviderWaitSettledPayload {
+                    fence: fence.clone(),
+                })
+            }
         };
         Self {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -930,6 +1095,43 @@ impl TryFrom<EventDocument> for Event {
             EventBody::OperationFailed(fact) => Event::OperationFailed(fact),
             EventBody::OperationCancelled(fact) => Event::OperationCancelled(fact),
             EventBody::OperationUncertain(fact) => Event::OperationUncertain(fact),
+            EventBody::ProviderInputAccepted(p) => {
+                validate_action_nested_ids(&p.action, p.question_id, p.approval_id)
+                    .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
+                if p.wait != p.action.waits_for_turn() {
+                    return Err(EventSerdeError::Payload(
+                        "provider input wait flag disagrees with action".into(),
+                    ));
+                }
+                Event::ProviderInputAccepted {
+                    command_id: p.command_id,
+                    client_id: p.client_id,
+                    agent_session_id: p.agent_session_id,
+                    runtime_generation: p.runtime_generation,
+                    turn_id: p.turn_id,
+                    action_epoch: p.action_epoch,
+                    question_id: p.question_id,
+                    approval_id: p.approval_id,
+                    action: p.action,
+                    wait: p.wait,
+                    delivery: p.delivery,
+                }
+            }
+            EventBody::ProviderQuestionPresented(p) => Event::ProviderQuestionPresented {
+                agent_session_id: p.agent_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+            },
+            EventBody::ProviderApprovalPresented(p) => Event::ProviderApprovalPresented {
+                agent_session_id: p.agent_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                approval_id: p.approval_id,
+            },
+            EventBody::ProviderWaitSettled(p) => Event::ProviderWaitSettled { fence: p.fence },
         })
     }
 }
@@ -1033,6 +1235,7 @@ pub fn apply(
                 primary_agent_id: None,
                 artifacts: BTreeMap::new(),
                 resources: BTreeMap::new(),
+                provider_sessions: BTreeMap::new(),
             })
         }
         Event::OperationAccepted(_fact) => {
@@ -1146,6 +1349,7 @@ fn apply_into(
                 return Err(ApplyError::AlreadyExists);
             }
             snap.agents.insert(agent.id, agent.clone());
+            snap.provider_sessions.entry(agent.id).or_default();
         }
         Event::PrimaryAgentSet { agent_session_id } => {
             let Some(agent) = snap.agents.get(agent_session_id) else {
@@ -1228,6 +1432,135 @@ fn apply_into(
             }
             resource.lifecycle = ResourceLifecycle::Released;
             resource.updated_at_ms = occurred_at_ms;
+        }
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => {
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(ApplyError::NotFound)?;
+            if agent.runtime_generation != *runtime_generation
+                || snap.task.action_epoch != *action_epoch
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if delivery.is_delivered() {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            session.current_turn = Some(*turn_id);
+            session.last_settlement = Some(ProviderInputSettlement {
+                command_id: *command_id,
+                intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                delivery: *delivery,
+            });
+            let winner = ProviderResolutionWinner {
+                command_id: *command_id,
+                client_id: *client_id,
+                accepted_at_ms: occurred_at_ms,
+            };
+            match action {
+                ProviderInputAction::AnswerQuestion {
+                    question_id: qid, ..
+                } => {
+                    session
+                        .bounded_insert_question_winner(*qid, winner)
+                        .map_err(|_| ApplyError::InvalidTransition)?;
+                }
+                ProviderInputAction::ResolveApproval {
+                    approval_id: aid, ..
+                } => {
+                    session
+                        .bounded_insert_approval_winner(*aid, winner)
+                        .map_err(|_| ApplyError::InvalidTransition)?;
+                }
+                _ => {}
+            }
+            if *wait {
+                session
+                    .bounded_insert_wait(
+                        *command_id,
+                        ProviderWaitRecord {
+                            fence: ProviderWaitFence::new(
+                                *command_id,
+                                snap.task.id,
+                                *action_epoch,
+                                *agent_session_id,
+                                *runtime_generation,
+                                *turn_id,
+                                *question_id,
+                                *approval_id,
+                            ),
+                            pending: true,
+                        },
+                    )
+                    .map_err(|_| ApplyError::InvalidTransition)?;
+            }
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => {
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(ApplyError::NotFound)?;
+            if agent.runtime_generation != *runtime_generation
+                || snap.task.action_epoch != *action_epoch
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            session.current_turn = Some(*turn_id);
+            session.open_question = Some(*question_id);
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => {
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(ApplyError::NotFound)?;
+            if agent.runtime_generation != *runtime_generation
+                || snap.task.action_epoch != *action_epoch
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            let session = snap.provider_sessions.entry(*agent_session_id).or_default();
+            session.current_turn = Some(*turn_id);
+            session.open_approval = Some(*approval_id);
+        }
+        Event::ProviderWaitSettled { fence } => {
+            let session = snap
+                .provider_sessions
+                .get_mut(&fence.agent_session_id())
+                .ok_or(ApplyError::NotFound)?;
+            let record = session
+                .waits
+                .get_mut(&fence.command_id())
+                .ok_or(ApplyError::NotFound)?;
+            if !record.fence.matches(fence) {
+                return Err(ApplyError::InvalidTransition);
+            }
+            record.pending = false;
         }
         Event::TaskCreated { .. }
         | Event::HostCloseBegun { .. }

@@ -13,6 +13,7 @@ use crate::domain::id::{
     AgentSessionId, ArtifactId, EventId, OperationId, ResourceId, SnapshotId, TaskId,
 };
 use crate::domain::operation::OperationFacts;
+use crate::domain::provider_input::ProviderSessionProjection;
 use crate::domain::resource::ResourceFacts;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, VisibleTaskStatus,
@@ -29,6 +30,7 @@ pub struct TaskSnapshot {
     pub primary_agent_id: Option<AgentSessionId>,
     pub artifacts: BTreeMap<ArtifactId, ArtifactFacts>,
     pub resources: BTreeMap<ResourceId, ResourceFacts>,
+    pub provider_sessions: BTreeMap<AgentSessionId, ProviderSessionProjection>,
 }
 
 impl TaskSnapshot {

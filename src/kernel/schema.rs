@@ -204,6 +204,15 @@ CREATE INDEX idx_semantic_journal_facts_sequence\n\
   ON semantic_journal_facts(authority_digest, sequence);\n\
 ";
 
+const V8_SQL: &str = "\
+ALTER TABLE command_receipts ADD COLUMN payload_digest BLOB CHECK(payload_digest IS NULL OR length(payload_digest) = 32);\n\
+CREATE TABLE provider_input_state (\n\
+  agent_session_id BLOB PRIMARY KEY CHECK(length(agent_session_id) = 16),\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16) REFERENCES tasks(task_id),\n\
+  state BLOB NOT NULL\n\
+);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -244,6 +253,13 @@ pub(crate) const V6_SHA256: [u8; 32] = [
 pub(crate) const V7_SHA256: [u8; 32] = [
     0xe5, 0x15, 0x64, 0xcc, 0x51, 0x8f, 0x00, 0xa8, 0xb2, 0x40, 0x50, 0x6d, 0xda, 0x22, 0x3b, 0x96,
     0x4f, 0x6f, 0xd5, 0x9e, 0xa6, 0xde, 0xf9, 0xa6, 0x4a, 0x70, 0x26, 0x05, 0x23, 0x41, 0x0e, 0x2c,
+];
+
+/// Compiled SHA-256 of [`V8_SQL`]. The input-authority migration keeps the
+/// journal migration immutable and follows it as a separate schema version.
+pub(crate) const V8_SHA256: [u8; 32] = [
+    0xd1, 0xd0, 0xd1, 0x80, 0xb6, 0x41, 0x1e, 0x65, 0xb8, 0x95, 0xe8, 0xaa, 0x5c, 0x12, 0x55, 0x9c,
+    0x2f, 0x55, 0x02, 0x13, 0xbf, 0x59, 0x9c, 0x67, 0x80, 0x96, 0xb5, 0x6f, 0x26, 0x60, 0x45, 0x17,
 ];
 
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
@@ -307,6 +323,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V7_SQL),
                 "V7_SHA256 literal must match V7_SQL bytes"
             );
+            assert_eq!(
+                V8_SHA256,
+                sha256_bytes(V8_SQL),
+                "V8_SHA256 literal must match V8_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -349,6 +370,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v7_semantic_journal",
                     sql: V7_SQL,
                     sha256: V7_SHA256,
+                },
+                Migration {
+                    version: 8,
+                    name: "v8_provider_input_authority",
+                    sql: V8_SQL,
+                    sha256: V8_SHA256,
                 },
             ];
             verify_manifest(&migrations);
@@ -573,6 +600,7 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "resources",
     "host_admission",
     "host_cleanup_branches",
+    "provider_input_state",
 ];
 
 #[cfg(test)]
@@ -744,7 +772,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 7);
+        assert_eq!(history.len(), 8);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -765,6 +793,9 @@ mod tests {
         assert_eq!(history[6].0, 7);
         assert_eq!(history[6].1, "v7_semantic_journal");
         assert_eq!(history[6].2, V7_SHA256.to_vec());
+        assert_eq!(history[7].0, 8);
+        assert_eq!(history[7].1, "v8_provider_input_authority");
+        assert_eq!(history[7].2, V8_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(

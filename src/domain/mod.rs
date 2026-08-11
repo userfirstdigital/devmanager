@@ -6,6 +6,7 @@ pub mod event;
 pub mod host;
 pub mod id;
 pub mod operation;
+pub mod provider_input;
 pub mod query;
 pub mod resource;
 pub mod snapshot;
@@ -17,8 +18,9 @@ pub use artifact::{
     PrivacyClass,
 };
 pub use command::{
-    decide, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    RejectionCode, RenameTaskIntent, SetTaskAttentionIntent,
+    command_payload_digest, decide, Command, CommandEnvelope, CommandReceipt,
+    ConfirmHostQuitIntent, CreateTaskIntent, RejectionCode, RenameTaskIntent,
+    SetTaskAttentionIntent, SubmitProviderInputIntent,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
@@ -30,15 +32,23 @@ pub use host::{
     HostQuitResourceBlocker, HostQuitWorktreeInspection,
 };
 pub use id::{
-    AgentSessionId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId, EventId,
-    IdError, OperationId, OutboxId, ProjectId, RequestId, ResourceId, ServiceId, SnapshotId,
-    SubscriptionId, TaskId, TerminalId, TransferId,
+    AgentSessionId, ApprovalId, ArtifactId, BrowserContextId, ClientId, CommandId, EnvironmentId,
+    EventId, IdError, OperationId, OutboxId, ProjectId, QuestionId, RequestId, ResourceId,
+    ServiceId, SnapshotId, SubscriptionId, TaskId, TerminalId, TransferId, TurnId,
 };
 pub use operation::{
     validate_outcome_fence, validate_source_for_kind, validate_terminal_fact_source,
     CancellationReason, OperationErrorCode, OperationFacts, OperationOutcome, OperationOutcomeKind,
     OperationState, OperationUncertaintyCode, OutcomeFenceError, OutcomeSource, ResourceFence,
     MAX_EXTERNAL_IDENTITY_BYTES,
+};
+pub use provider_input::{
+    PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderDeliveryHoldReason,
+    ProviderDeliveryVisibility, ProviderInputAction, ProviderInputIntentError,
+    ProviderInputSettlement, ProviderIntentPhase, ProviderResolutionWinner,
+    ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord, SettleProviderWaitIntent,
+    MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES, MAX_PROVIDER_QUESTION_WINS,
+    MAX_PROVIDER_SESSION_STATE_BYTES, MAX_PROVIDER_WAITS,
 };
 pub use query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult};
 pub use resource::{

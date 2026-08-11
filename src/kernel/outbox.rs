@@ -224,7 +224,11 @@ pub(crate) fn plan_effects(
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
-            | Event::ResourceReleased { .. } => {
+            | Event::ResourceReleased { .. }
+            | Event::ProviderInputAccepted { .. }
+            | Event::ProviderQuestionPresented { .. }
+            | Event::ProviderApprovalPresented { .. }
+            | Event::ProviderWaitSettled { .. } => {
                 pure_fact_count = pure_fact_count
                     .checked_add(1)
                     .ok_or(StoreError::Corruption)?;
@@ -753,6 +757,7 @@ mod tests {
             primary_agent_id: None,
             artifacts: BTreeMap::new(),
             resources,
+            provider_sessions: BTreeMap::new(),
         };
 
         let close = plan_effects(

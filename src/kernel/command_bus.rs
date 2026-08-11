@@ -2051,7 +2051,23 @@ fn execute_in_tx(
     tx: &Transaction<'_>,
     envelope: CommandEnvelope,
 ) -> Result<CommandReceipt, StoreError> {
-    if let Some(existing) = lookup_receipt(tx, envelope.command_id)? {
+    if let Some((existing, stored_digest)) = lookup_receipt_with_digest(tx, envelope.command_id)? {
+        if let Some(stored) = stored_digest {
+            let incoming = crate::domain::command::command_payload_digest(&envelope)
+                .map_err(|detail| StoreError::CodecMismatch { detail })?;
+            if stored != incoming {
+                let effective_task_id = effective_task_scope(&envelope);
+                let snapshot = match effective_task_id {
+                    Some(task_id) => load_task_snapshot(tx, task_id)?,
+                    None => None,
+                };
+                return Ok(CommandReceipt::Rejected {
+                    command_id: envelope.command_id,
+                    code: RejectionCode::IdempotencyConflict,
+                    current_revision: snapshot.as_ref().map(|snap| snap.task.revision),
+                });
+            }
+        }
         return Ok(existing);
     }
 
@@ -2153,15 +2169,30 @@ fn lookup_receipt(
     tx: &Connection,
     command_id: CommandId,
 ) -> Result<Option<CommandReceipt>, StoreError> {
-    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, i64)> = tx
+    Ok(lookup_receipt_with_digest(tx, command_id)?.map(|(receipt, _)| receipt))
+}
+
+fn lookup_receipt_with_digest(
+    tx: &Connection,
+    command_id: CommandId,
+) -> Result<Option<(CommandReceipt, Option<[u8; 32]>)>, StoreError> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<i64>, i64, Option<Vec<u8>>)> = tx
         .query_row(
-            "SELECT receipt, task_id, committed_sequence, created_at_ms
+            "SELECT receipt, task_id, committed_sequence, created_at_ms, payload_digest
              FROM command_receipts WHERE command_id = ?1",
             [command_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((payload, row_task_id, committed_sequence, created_at_ms)) = row else {
+    let Some((payload, row_task_id, committed_sequence, created_at_ms, digest_bytes)) = row else {
         return Ok(None);
     };
     let receipt = decode_receipt_document(&payload)?;
@@ -2202,7 +2233,16 @@ fn lookup_receipt(
             validate_rejected_receipt_correlation(tx, command_id, committed_sequence)?;
         }
     }
-    Ok(Some(receipt))
+    let digest = match digest_bytes {
+        None => None,
+        Some(bytes) => {
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| StoreError::CodecMismatch {
+                detail: "command_receipts.payload_digest must be 32 bytes".into(),
+            })?;
+            Some(arr)
+        }
+    };
+    Ok(Some((receipt, digest)))
 }
 
 /// Validate durable e2 dispatch metadata after an explicit projection rebuild.
@@ -4464,8 +4504,19 @@ fn enforce_command_decision_lifecycle_gate(
         }
         Event::AgentSessionRegistered { .. }
         | Event::PrimaryAgentSet { .. }
-        | Event::ResourceRegistered { .. } => {
+        | Event::ResourceRegistered { .. }
+        | Event::ProviderInputAccepted { .. }
+        | Event::ProviderQuestionPresented { .. }
+        | Event::ProviderApprovalPresented { .. } => {
             if snap.task.lifecycle != TaskLifecycle::Open {
+                return Err(StoreError::Corruption);
+            }
+        }
+        Event::ProviderWaitSettled { .. } => {
+            if !matches!(
+                snap.task.lifecycle,
+                TaskLifecycle::Open | TaskLifecycle::Closing
+            ) {
                 return Err(StoreError::Corruption);
             }
         }
@@ -5439,6 +5490,10 @@ fn is_pure_slice_decision_fact(event: &Event) -> bool {
             | Event::PrimaryAgentSet { .. }
             | Event::ArtifactRegistered { .. }
             | Event::ResourceRegistered { .. }
+            | Event::ProviderInputAccepted { .. }
+            | Event::ProviderQuestionPresented { .. }
+            | Event::ProviderApprovalPresented { .. }
+            | Event::ProviderWaitSettled { .. }
     )
 }
 
@@ -5516,6 +5571,10 @@ fn persist_rejection(
     Ok(receipt)
 }
 
+/// Commits decision facts plus OperationAccepted/OperationSettled in one
+/// transaction. For `SubmitProviderInput`, OperationSettled is *intent*
+/// acceptance only. Delivery stays `ProviderDeliveryVisibility::Hold` on
+/// the decision event until a destination/outbox adapter exists.
 fn persist_pure_acceptance(
     tx: &Transaction<'_>,
     envelope: &CommandEnvelope,
@@ -5749,10 +5808,13 @@ fn insert_receipt_row(
     created_at_ms: i64,
 ) -> Result<(), StoreError> {
     let payload = encode_receipt_document(receipt)?;
+    let digest = crate::domain::command::command_payload_digest(envelope)
+        .map_err(|detail| StoreError::CodecMismatch { detail })?;
     tx.execute(
         "INSERT INTO command_receipts(
-            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            command_id, client_id, task_id, receipt, committed_sequence, created_at_ms,
+            payload_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             envelope.command_id.as_bytes().as_slice(),
             envelope.client_id.as_bytes().as_slice(),
@@ -5766,6 +5828,7 @@ fn insert_receipt_row(
                 None => None,
             },
             created_at_ms,
+            digest.as_slice(),
         ],
     )?;
     Ok(())
@@ -5892,6 +5955,7 @@ pub(crate) fn load_task_snapshot(
         primary_agent_id: task_row.primary_agent_id,
         artifacts,
         resources,
+        provider_sessions: load_provider_sessions(conn, task_id)?,
     }))
 }
 
@@ -5984,6 +6048,45 @@ fn load_task_row(conn: &Connection, task_id: TaskId) -> Result<Option<LoadedTask
             None => None,
         },
     }))
+}
+
+fn load_provider_sessions(
+    conn: &Connection,
+    task_id: TaskId,
+) -> Result<
+    BTreeMap<AgentSessionId, crate::domain::provider_input::ProviderSessionProjection>,
+    StoreError,
+> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_session_id, state FROM provider_input_state WHERE task_id = ?1
+         ORDER BY agent_session_id ASC",
+    )?;
+    let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut sessions = BTreeMap::new();
+    for row in rows {
+        let (agent_bytes, state) = row?;
+        if state.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
+            return Err(StoreError::Projection(
+                "provider_input_state.state exceeds its byte bound".into(),
+            ));
+        }
+        let agent_session_id =
+            id16::<AgentSessionId>("provider_input_state.agent_session_id", &agent_bytes)?;
+        if !sessions
+            .insert(
+                agent_session_id,
+                unpack_projection_blob("provider_input_state.state", &state)?,
+            )
+            .is_none()
+        {
+            return Err(StoreError::Projection(
+                "duplicate provider_input_state agent_session_id".into(),
+            ));
+        }
+    }
+    Ok(sessions)
 }
 
 fn load_agents(

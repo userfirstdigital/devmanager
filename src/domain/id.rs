@@ -177,3 +177,6 @@ define_id!(SubscriptionId);
 define_id!(SnapshotId);
 define_id!(EventId);
 define_id!(OutboxId);
+define_id!(TurnId);
+define_id!(QuestionId);
+define_id!(ApprovalId);

@@ -41,6 +41,7 @@ fn protocol_capability_bits_are_stable_and_unknown_bits_are_tolerated() {
         (Capability::ManagementMetadata, 11),
         (Capability::ExplicitDetach, 12),
         (Capability::HostShutdown, 13),
+        (Capability::ProviderInput, 14),
     ];
     for (capability, bit_index) in named {
         assert_eq!(capability.bit(), 1_u64 << bit_index);
@@ -1027,6 +1028,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             "unsupported_capability",
         ),
         (RejectionCode::Closing, "closing"),
+        (RejectionCode::IdempotencyConflict, "idempotency_conflict"),
     ]
     .into_iter()
     .enumerate()
@@ -4688,6 +4690,7 @@ fn protocol_inspect_host_quit_is_strict_empty_named_query_and_result() {
 
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
     assert_eq!(Capability::HostShutdown.bit(), 1_u64 << 13);
+    assert_eq!(Capability::ProviderInput.bit(), 1_u64 << 14);
 
     let inspection = HostQuitInspection {
         inspection_id: 42,

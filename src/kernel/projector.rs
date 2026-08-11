@@ -213,6 +213,10 @@ pub(crate) fn apply_event(
                 ],
             )?;
             bump_task_revision(tx, shadow, task_id, event)?;
+            upsert_provider_session_state(tx, shadow, task_id, agent.id, |session| {
+                let _ = session;
+                Ok(())
+            })?;
         }
         Event::PrimaryAgentSet { agent_session_id } => {
             let task_id = require_task_id(event)?;
@@ -322,6 +326,137 @@ pub(crate) fn apply_event(
                 ResourceLifecycle::Releasing,
                 ResourceLifecycle::Released,
                 event.occurred_at_ms,
+            )?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => {
+            let task_id = require_task_id(event)?;
+            let (_, epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+            let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            if stored_epoch != *action_epoch {
+                return Err(StoreError::Projection(
+                    "provider input action_epoch does not match task fence".into(),
+                ));
+            }
+            if delivery.is_delivered() {
+                return Err(StoreError::Projection(
+                    "provider input cannot project Delivered without a destination adapter".into(),
+                ));
+            }
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                session.current_turn = Some(*turn_id);
+                session.last_settlement =
+                    Some(crate::domain::provider_input::ProviderInputSettlement {
+                        command_id: *command_id,
+                        intent: crate::domain::provider_input::ProviderIntentPhase::Accepted,
+                        delivery: *delivery,
+                    });
+                let winner = crate::domain::provider_input::ProviderResolutionWinner {
+                    command_id: *command_id,
+                    client_id: *client_id,
+                    accepted_at_ms: event.occurred_at_ms,
+                };
+                match action {
+                    crate::domain::ProviderInputAction::AnswerQuestion {
+                        question_id: qid, ..
+                    } => {
+                        session
+                            .bounded_insert_question_winner(*qid, winner)
+                            .map_err(|err| StoreError::Projection(err.to_string()))?;
+                    }
+                    crate::domain::ProviderInputAction::ResolveApproval {
+                        approval_id: aid,
+                        ..
+                    } => {
+                        session
+                            .bounded_insert_approval_winner(*aid, winner)
+                            .map_err(|err| StoreError::Projection(err.to_string()))?;
+                    }
+                    _ => {}
+                }
+                if *wait {
+                    session
+                        .bounded_insert_wait(
+                            *command_id,
+                            crate::domain::provider_input::ProviderWaitRecord {
+                                fence: crate::domain::provider_input::ProviderWaitFence::new(
+                                    *command_id,
+                                    task_id,
+                                    *action_epoch,
+                                    *agent_session_id,
+                                    *runtime_generation,
+                                    *turn_id,
+                                    *question_id,
+                                    *approval_id,
+                                ),
+                                pending: true,
+                            },
+                        )
+                        .map_err(|err| StoreError::Projection(err.to_string()))?;
+                }
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            turn_id,
+            question_id,
+            ..
+        } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                session.current_turn = Some(*turn_id);
+                session.open_question = Some(*question_id);
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            turn_id,
+            approval_id,
+            ..
+        } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                session.current_turn = Some(*turn_id);
+                session.open_approval = Some(*approval_id);
+                Ok(())
+            })?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        Event::ProviderWaitSettled { fence } => {
+            let task_id = require_task_id(event)?;
+            upsert_provider_session_state(
+                tx,
+                shadow,
+                task_id,
+                fence.agent_session_id(),
+                |session| {
+                    let record = session.waits.get_mut(&fence.command_id()).ok_or_else(|| {
+                        StoreError::Projection("provider wait settlement missing wait".into())
+                    })?;
+                    if !record.fence.matches(fence) {
+                        return Err(StoreError::Projection(
+                            "provider wait settlement fence mismatch".into(),
+                        ));
+                    }
+                    record.pending = false;
+                    Ok(())
+                },
             )?;
             bump_task_revision(tx, shadow, task_id, event)?;
         }
@@ -1562,6 +1697,66 @@ fn opt_u64(field: &'static str, value: Option<u64>) -> Result<Option<i64>, Store
         Some(v) => Ok(Some(u64_to_sqlite_i64(field, v)?)),
         None => Ok(None),
     }
+}
+
+fn upsert_provider_session_state(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    mutate: impl FnOnce(
+        &mut crate::domain::provider_input::ProviderSessionProjection,
+    ) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let table = table_name("provider_input_state", shadow);
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            &format!("SELECT state FROM {table} WHERE agent_session_id = ?1"),
+            [agent_session_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let had_row = existing.is_some();
+    let mut session = match existing {
+        Some(bytes) => {
+            if bytes.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
+                return Err(StoreError::Projection(
+                    "provider_input_state.state exceeds its byte bound".into(),
+                ));
+            }
+            rmp_serde::from_slice(&bytes).map_err(|err| {
+                StoreError::Projection(format!("provider_input_state.state decode: {err}"))
+            })?
+        }
+        None => crate::domain::provider_input::ProviderSessionProjection::default(),
+    };
+    mutate(&mut session)?;
+    let packed = pack(&session)?;
+    if packed.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
+        return Err(StoreError::Projection(
+            "provider_input_state exceeded its byte bound".into(),
+        ));
+    }
+    if had_row {
+        tx.execute(
+            &format!("UPDATE {table} SET task_id = ?1, state = ?2 WHERE agent_session_id = ?3"),
+            rusqlite::params![
+                task_id.as_bytes().as_slice(),
+                packed,
+                agent_session_id.as_bytes().as_slice(),
+            ],
+        )?;
+    } else {
+        tx.execute(
+            &format!("INSERT INTO {table}(agent_session_id, task_id, state) VALUES (?1, ?2, ?3)"),
+            rusqlite::params![
+                agent_session_id.as_bytes().as_slice(),
+                task_id.as_bytes().as_slice(),
+                packed,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Pack a projection MessagePack blob. Same encoding the store uses when writing.

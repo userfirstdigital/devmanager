@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod capabilities;
 pub mod claude;
 pub mod cursor;
+pub mod input;
 pub mod journal;
 pub mod registry;
 pub mod session;

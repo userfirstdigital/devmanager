@@ -2,12 +2,16 @@ use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::domain::agent::AgentSessionFacts;
+use crate::domain::agent::{AgentSessionFacts, AgentSessionLifecycle};
 use crate::domain::artifact::ArtifactFacts;
 use crate::domain::event::Event;
 use crate::domain::id::{
     AgentSessionId, ClientId, CommandId, EnvironmentId, EventId, OperationId, ProjectId,
-    ResourceId, TaskId,
+    ResourceId, TaskId, TurnId,
+};
+use crate::domain::provider_input::{
+    validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
+    ProviderInputAction, ProviderInputIntentError, SettleProviderWaitIntent,
 };
 use crate::domain::resource::ResourceFacts;
 use crate::domain::snapshot::TaskSnapshot;
@@ -26,6 +30,7 @@ pub enum RejectionCode {
     OwnershipConflict,
     UnsupportedCapability,
     Closing,
+    IdempotencyConflict,
 }
 
 impl<'de> Deserialize<'de> for RejectionCode {
@@ -54,6 +59,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                     "ownership_conflict" => Ok(RejectionCode::OwnershipConflict),
                     "unsupported_capability" => Ok(RejectionCode::UnsupportedCapability),
                     "closing" => Ok(RejectionCode::Closing),
+                    "idempotency_conflict" => Ok(RejectionCode::IdempotencyConflict),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -64,6 +70,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                             "ownership_conflict",
                             "unsupported_capability",
                             "closing",
+                            "idempotency_conflict",
                         ],
                     )),
                 }
@@ -741,6 +748,113 @@ impl<'de> Deserialize<'de> for ConfirmHostQuitIntent {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SubmitProviderInputIntent {
+    agent_session_id: AgentSessionId,
+    runtime_generation: u64,
+    turn_id: TurnId,
+    action_epoch: u64,
+    question_id: Option<crate::domain::id::QuestionId>,
+    approval_id: Option<crate::domain::id::ApprovalId>,
+    action: ProviderInputAction,
+}
+
+impl std::fmt::Debug for SubmitProviderInputIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmitProviderInputIntent")
+            .field("agent_session_id", &self.agent_session_id)
+            .field("runtime_generation", &self.runtime_generation)
+            .field("turn_id", &self.turn_id)
+            .field("action_epoch", &self.action_epoch)
+            .field("question_id", &self.question_id)
+            .field("approval_id", &self.approval_id)
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
+impl SubmitProviderInputIntent {
+    pub fn try_new(
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        turn_id: TurnId,
+        action_epoch: u64,
+        question_id: Option<crate::domain::id::QuestionId>,
+        approval_id: Option<crate::domain::id::ApprovalId>,
+        action: ProviderInputAction,
+    ) -> Result<Self, ProviderInputIntentError> {
+        validate_action_nested_ids(&action, question_id, approval_id)?;
+        Ok(Self {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+        })
+    }
+
+    pub fn agent_session_id(&self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    pub fn question_id(&self) -> Option<crate::domain::id::QuestionId> {
+        self.question_id
+    }
+
+    pub fn approval_id(&self) -> Option<crate::domain::id::ApprovalId> {
+        self.approval_id
+    }
+
+    pub fn action(&self) -> &ProviderInputAction {
+        &self.action
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderInputIntentError> {
+        validate_action_nested_ids(&self.action, self.question_id, self.approval_id)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitProviderInputIntent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            agent_session_id: AgentSessionId,
+            runtime_generation: u64,
+            turn_id: TurnId,
+            action_epoch: u64,
+            question_id: Option<crate::domain::id::QuestionId>,
+            approval_id: Option<crate::domain::id::ApprovalId>,
+            action: ProviderInputAction,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.agent_session_id,
+            wire.runtime_generation,
+            wire.turn_id,
+            wire.action_epoch,
+            wire.question_id,
+            wire.approval_id,
+            wire.action,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
@@ -749,12 +863,55 @@ pub enum Command {
     SetTaskAttention(SetTaskAttentionIntent),
     BeginCloseTask,
     ReopenTask,
-    RegisterAgentSession { agent: AgentSessionFacts },
-    SetPrimaryAgent { agent_session_id: AgentSessionId },
-    RegisterArtifact { artifact: ArtifactFacts },
-    RegisterResource { resource: ResourceFacts },
-    ReleaseResource { resource_id: ResourceId },
+    RegisterAgentSession {
+        agent: AgentSessionFacts,
+    },
+    SetPrimaryAgent {
+        agent_session_id: AgentSessionId,
+    },
+    RegisterArtifact {
+        artifact: ArtifactFacts,
+    },
+    RegisterResource {
+        resource: ResourceFacts,
+    },
+    ReleaseResource {
+        resource_id: ResourceId,
+    },
     ConfirmHostQuit(ConfirmHostQuitIntent),
+    SubmitProviderInput(SubmitProviderInputIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    PresentProviderQuestion(PresentProviderQuestionIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    PresentProviderApproval(PresentProviderApprovalIntent),
+    /// Journal ingress only. Host `ClientRequest` rejects this variant.
+    SettleProviderWait(SettleProviderWaitIntent),
+}
+
+/// Canonical SHA-256 over client, task, expected revision, and command.
+/// `issued_at_ms` is excluded. Fence identities (task/agent/generation/
+/// epoch/turn/question/approval/action) are part of `command` and therefore
+/// part of the digest. A retry with a different fence is a conflict.
+pub fn command_payload_digest(envelope: &CommandEnvelope) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    #[derive(Serialize)]
+    struct DigestBody<'a> {
+        client_id: ClientId,
+        task_id: Option<TaskId>,
+        expected_task_revision: Option<u64>,
+        command: &'a Command,
+    }
+    let packed = rmp_serde::to_vec_named(&DigestBody {
+        client_id: envelope.client_id,
+        task_id: envelope.task_id,
+        expected_task_revision: envelope.expected_task_revision,
+        command: &envelope.command,
+    })
+    .map_err(|error| error.to_string())?;
+    let digest = Sha256::digest(packed);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
 }
 
 pub fn decide(
@@ -882,6 +1039,18 @@ pub fn decide(
             }
         }
         Command::ConfirmHostQuit(_) => Err(RejectionCode::InvalidTransition),
+        Command::SubmitProviderInput(intent) => {
+            decide_submit_provider_input(snapshot, envelope, intent)
+        }
+        Command::PresentProviderQuestion(intent) => {
+            decide_present_provider_question(snapshot, envelope, intent)
+        }
+        Command::PresentProviderApproval(intent) => {
+            decide_present_provider_approval(snapshot, envelope, intent)
+        }
+        Command::SettleProviderWait(intent) => {
+            decide_settle_provider_wait(snapshot, envelope, intent)
+        }
     }
 }
 
@@ -953,6 +1122,224 @@ fn decide_begin_close(
     }
 }
 
+fn decide_submit_provider_input(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &SubmitProviderInputIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    intent
+        .validate()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    if agent.task_id != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    require_open_agent(agent)?;
+    if agent.runtime_generation != intent.runtime_generation() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.task.action_epoch != intent.action_epoch() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    match intent.action() {
+        ProviderInputAction::SendNow { .. } => {
+            if let Some(current) = session.current_turn {
+                if current != intent.turn_id() {
+                    return Err(RejectionCode::InvalidTransition);
+                }
+            }
+        }
+        ProviderInputAction::SteerCurrentTurn { .. }
+        | ProviderInputAction::QueueFollowUp { .. }
+        | ProviderInputAction::StopTurn => {
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::AnswerQuestion { question_id, .. } => {
+            if session.question_winners.contains_key(question_id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            if session.open_question != Some(*question_id) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::ResolveApproval { approval_id, .. } => {
+            if session.approval_winners.contains_key(approval_id) {
+                return Err(RejectionCode::AlreadyExists);
+            }
+            if session.open_approval != Some(*approval_id) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+    }
+    if intent.action().waits_for_turn()
+        && !session.waits.contains_key(&envelope.command_id)
+        && session.waits.len() >= crate::domain::provider_input::MAX_PROVIDER_WAITS
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(vec![Event::ProviderInputAccepted {
+        command_id: envelope.command_id,
+        client_id: envelope.client_id,
+        agent_session_id: intent.agent_session_id(),
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        question_id: intent.question_id(),
+        approval_id: intent.approval_id(),
+        action: intent.action().clone(),
+        wait: intent.action().waits_for_turn(),
+        delivery: crate::domain::provider_input::ProviderDeliveryVisibility::hold_until_destination_adapter(),
+    }])
+}
+
+fn decide_present_provider_question(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PresentProviderQuestionIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_open_agent(agent)?;
+    if agent.runtime_generation != intent.runtime_generation()
+        || snap.task.action_epoch != intent.action_epoch()
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = session.current_turn {
+        if current != intent.turn_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+    }
+    if session.question_winners.contains_key(&intent.question_id()) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if let Some(open) = session.open_question {
+        if open != intent.question_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderQuestionPresented {
+        agent_session_id: intent.agent_session_id(),
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        question_id: intent.question_id(),
+    }])
+}
+
+fn decide_present_provider_approval(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &PresentProviderApprovalIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let agent = snap
+        .agents
+        .get(&intent.agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_open_agent(agent)?;
+    if agent.runtime_generation != intent.runtime_generation()
+        || snap.task.action_epoch != intent.action_epoch()
+    {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.agent_session_id())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = session.current_turn {
+        if current != intent.turn_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+    }
+    if session.approval_winners.contains_key(&intent.approval_id()) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if let Some(open) = session.open_approval {
+        if open != intent.approval_id() {
+            return Err(RejectionCode::InvalidTransition);
+        }
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderApprovalPresented {
+        agent_session_id: intent.agent_session_id(),
+        runtime_generation: intent.runtime_generation(),
+        turn_id: intent.turn_id(),
+        action_epoch: intent.action_epoch(),
+        approval_id: intent.approval_id(),
+    }])
+}
+
+fn decide_settle_provider_wait(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &SettleProviderWaitIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_open_or_closing_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    if intent.fence().task_id() != snap.task.id {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    let session = snap
+        .provider_sessions
+        .get(&intent.fence().agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    let record = session
+        .waits
+        .get(&intent.fence().command_id())
+        .ok_or(RejectionCode::NotFound)?;
+    if !record.fence.matches(intent.fence()) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    let agent = snap
+        .agents
+        .get(&intent.fence().agent_session_id())
+        .ok_or(RejectionCode::NotFound)?;
+    require_live_agent(agent)?;
+    if agent.runtime_generation != intent.fence().runtime_generation() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.task.action_epoch != intent.fence().action_epoch() {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if !record.pending {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    Ok(vec![Event::ProviderWaitSettled {
+        fence: intent.fence().clone(),
+    }])
+}
+
 fn require_task<'a>(
     snapshot: Option<&'a TaskSnapshot>,
     envelope: &CommandEnvelope,
@@ -999,5 +1386,21 @@ fn require_runtime_capable_task<'a>(
         TaskLifecycle::Open => Ok(snap),
         TaskLifecycle::Closing => Err(RejectionCode::Closing),
         TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+    }
+}
+
+fn require_open_agent(agent: &AgentSessionFacts) -> Result<(), RejectionCode> {
+    match agent.lifecycle {
+        AgentSessionLifecycle::Open => Ok(()),
+        AgentSessionLifecycle::Closing | AgentSessionLifecycle::Closed => {
+            Err(RejectionCode::InvalidTransition)
+        }
+    }
+}
+
+fn require_live_agent(agent: &AgentSessionFacts) -> Result<(), RejectionCode> {
+    match agent.lifecycle {
+        AgentSessionLifecycle::Open | AgentSessionLifecycle::Closing => Ok(()),
+        AgentSessionLifecycle::Closed => Err(RejectionCode::InvalidTransition),
     }
 }

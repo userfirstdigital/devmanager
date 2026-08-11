@@ -10,9 +10,11 @@ use crate::domain::event::{
     AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
     HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
     OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
-    PrimaryAgentSetPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
-    ResourceReleasedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
-    TaskRenamedPayload, TaskUnitPayload, EVENT_SCHEMA_VERSION,
+    PrimaryAgentSetPayload, ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload,
+    ProviderQuestionPresentedPayload, ProviderWaitSettledPayload, ResourceRegisteredPayload,
+    ResourceReleaseBegunPayload, ResourceReleasedPayload, TaskAttentionSetPayload,
+    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
+    EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -957,7 +959,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
     // Atomically replace stable projection table contents (never rename tables).
     // Delete children before parents to satisfy foreign keys.
     tx.execute_batch(
-        "DELETE FROM agent_sessions;\n\
+        "DELETE FROM provider_input_state;\n\
+         DELETE FROM agent_sessions;\n\
          DELETE FROM artifacts;\n\
          DELETE FROM resources;\n\
          DELETE FROM operations;\n\
@@ -972,7 +975,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          INSERT INTO artifacts SELECT * FROM shadow_artifacts;\n\
          INSERT INTO resources SELECT * FROM shadow_resources;\n\
          INSERT INTO host_admission SELECT * FROM shadow_host_admission;\n\
-         INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;",
+         INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;\n\
+         INSERT INTO provider_input_state SELECT * FROM shadow_provider_input_state;",
     )?;
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DROP TABLE {}", shadow_name(table)), [])?;
@@ -1024,6 +1028,12 @@ fn canonical_table_dump(
         }
         ("host_cleanup_branches", true) => {
             "SELECT * FROM shadow_host_cleanup_branches ORDER BY operation_id ASC, branch ASC"
+        }
+        ("provider_input_state", false) => {
+            "SELECT * FROM provider_input_state ORDER BY agent_session_id ASC"
+        }
+        ("provider_input_state", true) => {
+            "SELECT * FROM shadow_provider_input_state ORDER BY agent_session_id ASC"
         }
         _ => {
             return Err(StoreError::Projection(format!(
@@ -1224,6 +1234,60 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::OperationFailed(fact) => rmp_serde::to_vec(fact),
         Event::OperationCancelled(fact) => rmp_serde::to_vec(fact),
         Event::OperationUncertain(fact) => rmp_serde::to_vec(fact),
+        Event::ProviderInputAccepted {
+            command_id,
+            client_id,
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            delivery,
+        } => rmp_serde::to_vec(&ProviderInputAcceptedPayload {
+            command_id: *command_id,
+            client_id: *client_id,
+            agent_session_id: *agent_session_id,
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+            approval_id: *approval_id,
+            action: action.clone(),
+            wait: *wait,
+            delivery: *delivery,
+        }),
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => rmp_serde::to_vec(&ProviderQuestionPresentedPayload {
+            agent_session_id: *agent_session_id,
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            question_id: *question_id,
+        }),
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => rmp_serde::to_vec(&ProviderApprovalPresentedPayload {
+            agent_session_id: *agent_session_id,
+            runtime_generation: *runtime_generation,
+            turn_id: *turn_id,
+            action_epoch: *action_epoch,
+            approval_id: *approval_id,
+        }),
+        Event::ProviderWaitSettled { fence } => rmp_serde::to_vec(&ProviderWaitSettledPayload {
+            fence: fence.clone(),
+        }),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
     Ok(bytes)
@@ -1361,6 +1425,46 @@ pub(crate) fn decode_stored_event(
         "operation.uncertain" => {
             let fact: OperationUncertainFact = unpack(payload)?;
             Event::OperationUncertain(fact)
+        }
+        "provider_input.accepted" => {
+            let p: ProviderInputAcceptedPayload = unpack(payload)?;
+            Event::ProviderInputAccepted {
+                command_id: p.command_id,
+                client_id: p.client_id,
+                agent_session_id: p.agent_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+                approval_id: p.approval_id,
+                action: p.action,
+                wait: p.wait,
+                delivery: p.delivery,
+            }
+        }
+        "provider_input.question_presented" => {
+            let p: ProviderQuestionPresentedPayload = unpack(payload)?;
+            Event::ProviderQuestionPresented {
+                agent_session_id: p.agent_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                question_id: p.question_id,
+            }
+        }
+        "provider_input.approval_presented" => {
+            let p: ProviderApprovalPresentedPayload = unpack(payload)?;
+            Event::ProviderApprovalPresented {
+                agent_session_id: p.agent_session_id,
+                runtime_generation: p.runtime_generation,
+                turn_id: p.turn_id,
+                action_epoch: p.action_epoch,
+                approval_id: p.approval_id,
+            }
+        }
+        "provider_input.wait_settled" => {
+            let p: ProviderWaitSettledPayload = unpack(payload)?;
+            Event::ProviderWaitSettled { fence: p.fence }
         }
         other => {
             return Err(StoreError::CodecMismatch {
