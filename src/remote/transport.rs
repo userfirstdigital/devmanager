@@ -9,8 +9,8 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::{BufReader, Cursor, ErrorKind};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,94 @@ fn tls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 pub struct TlsConnectResult {
     pub stream: ClientTlsStream,
     pub certificate_fingerprint: String,
+    pub handshake_deadline: Instant,
+}
+
+#[derive(Debug)]
+pub struct TlsAcceptResult {
+    pub stream: ServerTlsStream,
+}
+
+struct ResolverJob {
+    address: String,
+    port: u16,
+    result: mpsc::SyncSender<Result<Vec<SocketAddr>, String>>,
+}
+
+struct ResolverPool {
+    sender: mpsc::SyncSender<ResolverJob>,
+    _workers: Vec<thread::JoinHandle<()>>,
+}
+
+static RESOLVER_POOL: OnceLock<ResolverPool> = OnceLock::new();
+
+fn resolver_pool() -> &'static ResolverPool {
+    RESOLVER_POOL.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<ResolverJob>(4);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let receiver = receiver.clone();
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("remote-dns-resolver-{index}"))
+                    .spawn(move || loop {
+                        let job = receiver
+                            .lock()
+                            .ok()
+                            .and_then(|receiver| receiver.recv().ok());
+                        let Some(job) = job else { break };
+                        let result = (job.address.as_str(), job.port)
+                            .to_socket_addrs()
+                            .map(|addresses| addresses.collect())
+                            .map_err(|error| error.to_string());
+                        let _ = job.result.send(result);
+                    })
+                    .expect("remote DNS resolver worker should start"),
+            );
+        }
+        ResolverPool {
+            sender,
+            _workers: workers,
+        }
+    })
+}
+
+fn resolve_with_deadline(
+    address: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!(
+            "DNS resolution deadline expired for {address}:{port}"
+        ));
+    }
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    resolver_pool()
+        .sender
+        .try_send(ResolverJob {
+            address: address.to_string(),
+            port,
+            result: result_tx,
+        })
+        .map_err(|_| {
+            format!(
+                "DNS resolver capacity is exhausted for {address}:{port}; resolution remains owned by the bounded resolver pool"
+            )
+        })?;
+    match result_rx.recv_timeout(remaining) {
+        Ok(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
+        Ok(Ok(_)) => Err(format!("DNS resolution returned no addresses for {address}:{port}")),
+        Ok(Err(error)) => Err(format!("Could not resolve {address}:{port}: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "DNS resolution exceeded its absolute deadline for {address}:{port}; the bounded resolver worker remains owned and visible"
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("DNS resolver pool disconnected unexpectedly".to_string())
+        }
+    }
 }
 
 pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), String> {
@@ -70,8 +158,23 @@ pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), Str
 pub fn accept_tls(
     stream: TcpStream,
     config: &RemoteHostConfig,
-    mut should_stop: impl FnMut() -> bool,
+    should_stop: impl FnMut() -> bool,
 ) -> Result<ServerTlsStream, String> {
+    return accept_tls_with_deadline(
+        stream,
+        config,
+        Instant::now() + HANDSHAKE_TIMEOUT,
+        should_stop,
+    )
+    .map(|result| result.stream);
+}
+
+pub fn accept_tls_with_deadline(
+    stream: TcpStream,
+    config: &RemoteHostConfig,
+    handshake_deadline: Instant,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<TlsAcceptResult, String> {
     let mut socket = stream;
     socket
         .set_nonblocking(false)
@@ -79,52 +182,50 @@ pub fn accept_tls(
     socket
         .set_nodelay(true)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
-    socket
-        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL))
-        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
-    socket
-        .set_write_timeout(Some(WRITE_TIMEOUT))
-        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
-
     let mut connection = ServerConnection::new(server_config(config)?)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
-    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     while connection.is_handshaking() {
         if should_stop() {
             return Err("Remote host stopped during the TLS handshake.".to_string());
         }
-        if Instant::now() >= handshake_deadline {
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err("Remote TLS handshake timed out.".to_string());
         }
+        socket
+            .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL.min(remaining)))
+            .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
+        socket
+            .set_write_timeout(Some(WRITE_TIMEOUT.min(remaining)))
+            .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
         match connection.complete_io(&mut socket) {
             Ok(_) => {}
             Err(error)
                 if matches!(
                     error.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) =>
-            {
-                thread::sleep(Duration::from_millis(5));
-            }
+                ) => {}
             Err(error) => return Err(format!("Remote TLS handshake failed: {error}")),
         }
     }
-
     socket
         .set_read_timeout(Some(ACTIVE_READ_TIMEOUT))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
-    Ok(StreamOwned::new(connection, socket))
+    socket
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
+    Ok(TlsAcceptResult {
+        stream: StreamOwned::new(connection, socket),
+    })
 }
 
-pub fn connect_tls(
+pub fn connect_tls_with_deadline(
     address: &str,
     port: u16,
     expected_fingerprint: Option<&str>,
+    connect_deadline: Instant,
 ) -> Result<TlsConnectResult, String> {
-    let connect_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let addresses = (address, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("Could not resolve {address}:{port}: {error}"))?;
+    let addresses = resolve_with_deadline(address, port, connect_deadline)?;
     let mut socket = None;
     let mut last_error = None;
     for socket_address in addresses {
@@ -154,11 +255,15 @@ pub fn connect_tls(
     socket
         .set_nodelay(true)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
+    let remaining = connect_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("Remote TLS handshake deadline expired before setup.".to_string());
+    }
     socket
-        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL.min(remaining)))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
-        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .set_write_timeout(Some(WRITE_TIMEOUT.min(remaining)))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
 
     let verifier = Arc::new(PinnedFingerprintVerifier::new(expected_fingerprint));
@@ -172,36 +277,54 @@ pub fn connect_tls(
         .map_err(|_| "Invalid remote TLS server name.".to_string())?;
     let mut connection = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
-    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     while connection.is_handshaking() {
-        if Instant::now() >= handshake_deadline {
+        let remaining = connect_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err("Remote TLS handshake timed out.".to_string());
         }
+        socket
+            .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL.min(remaining)))
+            .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
+        socket
+            .set_write_timeout(Some(WRITE_TIMEOUT.min(remaining)))
+            .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
         match connection.complete_io(&mut socket) {
             Ok(_) => {}
             Err(error)
                 if matches!(
                     error.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) =>
-            {
-                thread::sleep(Duration::from_millis(5));
-            }
+                ) => {}
             Err(error) => return Err(format!("Remote TLS handshake failed: {error}")),
         }
     }
-
     let certificate_fingerprint = verifier
         .observed_fingerprint()
         .ok_or_else(|| "Remote TLS fingerprint was unavailable.".to_string())?;
     socket
         .set_read_timeout(Some(ACTIVE_READ_TIMEOUT))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
-
+    socket
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     Ok(TlsConnectResult {
         stream: StreamOwned::new(connection, socket),
         certificate_fingerprint,
+        handshake_deadline: connect_deadline,
     })
+}
+
+pub fn connect_tls(
+    address: &str,
+    port: u16,
+    expected_fingerprint: Option<&str>,
+) -> Result<TlsConnectResult, String> {
+    connect_tls_with_deadline(
+        address,
+        port,
+        expected_fingerprint,
+        Instant::now() + HANDSHAKE_TIMEOUT,
+    )
 }
 
 pub fn certificate_fingerprint_from_pem(pem: &str) -> Result<String, String> {

@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::{
-    now_epoch_ms, RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource,
-    RemoteHostInner,
+    now_epoch_ms, ListenerLease, RemoteAccessActivityEvent, RemoteAccessActivityKind,
+    RemoteAccessSource, RemoteHostInner,
 };
 use crate::remote::presentation::StableSessionKey;
 use crate::state::SessionKind;
@@ -377,7 +377,11 @@ pub struct WebListenerHandle {
 }
 
 impl WebListenerHandle {
-    pub(crate) fn start(inner: Arc<RemoteHostInner>, config: WebConfig) -> Result<Self, String> {
+    pub(crate) fn start(
+        inner: Arc<RemoteHostInner>,
+        config: WebConfig,
+        lease: ListenerLease,
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -397,8 +401,21 @@ impl WebListenerHandle {
 
         runtime.spawn(async move {
             let app = build_router(router_state);
+            if !lease.is_current() {
+                let _ = bind_result_tx.send(Err(
+                    "web listener generation reservation became stale before bind".to_string(),
+                ));
+                return;
+            }
             match tokio::net::TcpListener::bind(&bind).await {
                 Ok(listener) => {
+                    if !lease.is_current() {
+                        let _ = bind_result_tx.send(Err(
+                            "web listener generation reservation became stale after bind"
+                                .to_string(),
+                        ));
+                        return;
+                    }
                     let _ = bind_result_tx.send(Ok(()));
                     let _ = axum::serve(
                         listener,

@@ -18,6 +18,7 @@ use web::input_executor::WebInputExecutor;
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
 use web::request_executor::WebRequestExecutor;
 
+use crate::domain::operation::ResourceFence;
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
 };
@@ -26,6 +27,7 @@ use crate::models::{
     Settings, TabType,
 };
 use crate::persistence::{self, PersistenceError};
+use crate::process::ports::{PortStatus as RichPortStatus, PortStatusKind as RichPortStatusKind};
 use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
@@ -43,7 +45,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +69,7 @@ const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60)
 const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
 const CODEX_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CODEX_COMPOSER_RECONCILIATIONS: usize = 1024;
+pub(crate) const REMOTE_PORT_AUTHORITY_MAX_AGE_MS: u64 = 5_000;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -196,6 +199,11 @@ pub struct RemoteWorkspaceSnapshot {
     pub runtime_state: RuntimeState,
     pub session_views: HashMap<String, TerminalSessionView>,
     pub port_statuses: HashMap<u16, PortStatus>,
+    /// Exact, generation-fenced port evidence. `port_statuses` remains only
+    /// as a compatibility projection for older clients; control and colour
+    /// decisions must use this map.
+    #[serde(default)]
+    pub port_authorities: HashMap<u16, RemotePortAuthority>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
     pub server_id: String,
@@ -207,8 +215,138 @@ pub struct RemoteWorkspaceDelta {
     pub app_state: Option<AppState>,
     pub runtime_state: Option<RuntimeState>,
     pub port_statuses: Option<HashMap<u16, PortStatus>>,
+    #[serde(default)]
+    pub port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     pub controller_client_id: Option<String>,
     pub you_have_control: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePortAuthorityKind {
+    Managed,
+    ProvenExternal,
+    Unknown,
+    ProbeError,
+    Free,
+    Occupied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteListenerIdentity {
+    pub pid: u32,
+    pub creation_time_100ns: u64,
+    /// The executable path is intentionally not sent over the remote wire.
+    /// This bit records that the local host captured and canonicalized it.
+    pub executable_proven: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePortAuthority {
+    pub port: u16,
+    pub kind: RemotePortAuthorityKind,
+    pub resource: Option<ResourceFence>,
+    pub listeners: Vec<RemoteListenerIdentity>,
+    pub membership_revision: u64,
+    pub observation_sequence: u64,
+    pub publication_sequence: u64,
+    pub observed_at_epoch_ms: u64,
+    pub freshness_deadline_epoch_ms: u64,
+    pub error: Option<String>,
+}
+
+impl RemotePortAuthority {
+    pub fn kind(&self) -> RemotePortAuthorityKind {
+        self.kind
+    }
+
+    pub fn from_rich(status: &RichPortStatus, now_epoch_ms: u64) -> Self {
+        let kind = match status.kind() {
+            RichPortStatusKind::ManagedHealthy | RichPortStatusKind::ManagedUnready => {
+                RemotePortAuthorityKind::Managed
+            }
+            RichPortStatusKind::ProvenExternal => RemotePortAuthorityKind::ProvenExternal,
+            RichPortStatusKind::ProbeError => RemotePortAuthorityKind::ProbeError,
+            RichPortStatusKind::Occupied => RemotePortAuthorityKind::Occupied,
+            RichPortStatusKind::Stopped => RemotePortAuthorityKind::Free,
+            RichPortStatusKind::Starting | RichPortStatusKind::Unknown => {
+                RemotePortAuthorityKind::Unknown
+            }
+        };
+        let resource = (kind == RemotePortAuthorityKind::Managed).then_some(status.resource);
+        Self {
+            port: status.port,
+            kind,
+            resource,
+            listeners: status
+                .listeners()
+                .iter()
+                .map(|listener| RemoteListenerIdentity {
+                    pid: listener.pid(),
+                    creation_time_100ns: listener.creation_time_100ns(),
+                    executable_proven: listener.has_executable_proof(),
+                })
+                .collect(),
+            membership_revision: 0,
+            observation_sequence: 0,
+            publication_sequence: 0,
+            observed_at_epoch_ms: now_epoch_ms,
+            freshness_deadline_epoch_ms: now_epoch_ms
+                .saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+            error: status.error().map(str::to_string),
+        }
+    }
+
+    pub fn with_snapshot_metadata(
+        mut self,
+        publication_sequence: u64,
+        membership_revision: u64,
+        observation_sequence: u64,
+    ) -> Self {
+        self.publication_sequence = publication_sequence;
+        self.membership_revision = membership_revision;
+        self.observation_sequence = observation_sequence;
+        self
+    }
+
+    pub fn is_fresh_at(&self, now_epoch_ms: u64) -> bool {
+        self.publication_sequence > 0
+            && self.observed_at_epoch_ms <= now_epoch_ms
+            && now_epoch_ms.saturating_sub(self.observed_at_epoch_ms)
+                <= REMOTE_PORT_AUTHORITY_MAX_AGE_MS
+            && self.freshness_deadline_epoch_ms >= self.observed_at_epoch_ms
+            && now_epoch_ms <= self.freshness_deadline_epoch_ms
+    }
+
+    pub fn has_exact_managed_fence_for(
+        &self,
+        requested_port: u16,
+        session: &SessionRuntimeState,
+    ) -> bool {
+        if self.kind != RemotePortAuthorityKind::Managed
+            || self.port != requested_port
+            || self.resource.is_none()
+            || self
+                .resource
+                .is_some_and(|resource| resource.runtime_generation == 0)
+            || self.membership_revision == 0
+            || self.observation_sequence == 0
+            || !self
+                .listeners
+                .iter()
+                .all(|listener| listener.executable_proven)
+        {
+            return false;
+        }
+        let Some(pid) = session.pid else {
+            return false;
+        };
+        self.listeners
+            .iter()
+            .any(|listener| listener.pid == pid && listener.creation_time_100ns != 0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,6 +1042,12 @@ type HostConfigPersistenceTestHook = Arc<
 #[cfg(test)]
 static HOST_CONFIG_PERSISTENCE_TEST_HOOK: Mutex<Option<HostConfigPersistenceTestHook>> =
     Mutex::new(None);
+#[cfg(test)]
+type RemoteStatePermissionVerifyTestHook = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+#[cfg(test)]
+static REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK: Mutex<
+    Option<RemoteStatePermissionVerifyTestHook>,
+> = Mutex::new(None);
 
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
@@ -1264,6 +1408,42 @@ fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     ))
 }
 
+fn verify_saved_remote_state_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return hook(path);
+    }
+    verify_remote_state_file_permissions(path)
+}
+
+fn restore_remote_state_bytes(path: &Path, previous_bytes: Option<&[u8]>) -> std::io::Result<()> {
+    let Some(previous_bytes) = previous_bytes else {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+    };
+    let restore_path = path.with_extension(format!(
+        "json.restore-{}-{}",
+        std::process::id(),
+        REMOTE_STATE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = write_private_remote_state_temp(&restore_path, previous_bytes) {
+        let _ = fs::remove_file(&restore_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&restore_path, path) {
+        let _ = fs::remove_file(&restore_path);
+        return Err(error);
+    }
+    verify_remote_state_file_permissions(path)
+}
+
 pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
@@ -1283,6 +1463,16 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
         path: path.clone(),
         source,
     })?;
+    let previous_bytes = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(PersistenceError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
     let temp_path = path.with_extension(format!(
         "json.tmp-{}-{}",
         std::process::id(),
@@ -1299,10 +1489,21 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
         let _ = fs::remove_file(&temp_path);
         return Err(PersistenceError::Io { path, source });
     }
-    verify_remote_state_file_permissions(&path).map_err(|source| PersistenceError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    if let Err(source) = verify_saved_remote_state_permissions(&path) {
+        let restore_result = restore_remote_state_bytes(&path, previous_bytes.as_deref());
+        return Err(PersistenceError::Io {
+            path: path.clone(),
+            source: match restore_result {
+                Ok(()) => source,
+                Err(restore_error) => std::io::Error::new(
+                    source.kind(),
+                    format!(
+                        "post-rename permission verification failed: {source}; restoring previous remote state failed: {restore_error}"
+                    ),
+                ),
+            },
+        });
+    }
     Ok(())
 }
 
@@ -1800,6 +2001,8 @@ impl Drop for RemoteHostServiceOwner {
                 .wrapping_add(1);
             self.inner.stop_flag.store(true, Ordering::SeqCst);
             self.inner.listener_running.store(false, Ordering::Release);
+            wake_native_listener(&self.inner);
+            notify_broadcaster(&self.inner);
 
             (
                 stop_generation,
@@ -1966,6 +2169,120 @@ struct ReconciledCodexProviderKey {
     expires_at: Instant,
 }
 
+pub(crate) struct ListenerLease {
+    port: u16,
+    generation: u64,
+    inner: Weak<RemoteHostInner>,
+}
+
+impl ListenerLease {
+    fn is_current(&self) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        !inner.stop_flag.load(Ordering::Acquire)
+            && inner.native_runtime_generation.load(Ordering::Acquire) == self.generation
+            && inner
+                .listener_leases
+                .lock()
+                .ok()
+                .and_then(|leases| leases.get(&self.port).copied())
+                == Some(self.generation)
+    }
+}
+
+impl Drop for ListenerLease {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if let Ok(mut leases) = inner.listener_leases.lock() {
+            if leases.get(&self.port).copied() == Some(self.generation) {
+                leases.remove(&self.port);
+            }
+        };
+    }
+}
+
+fn acquire_listener_lease(
+    inner: &Arc<RemoteHostInner>,
+    port: u16,
+    generation: u64,
+) -> Result<ListenerLease, String> {
+    if port == 0 {
+        return Err("listener port must be non-zero".to_string());
+    }
+    if inner.stop_flag.load(Ordering::Acquire)
+        || inner.native_runtime_generation.load(Ordering::Acquire) != generation
+    {
+        return Err("listener generation is no longer current".to_string());
+    }
+    let mut leases = inner
+        .listener_leases
+        .lock()
+        .map_err(|_| "listener lease registry unavailable".to_string())?;
+    if let Some(existing_generation) = leases.get(&port).copied() {
+        return Err(format!(
+            "listener port {port} is already reserved by generation {existing_generation}"
+        ));
+    }
+    leases.insert(port, generation);
+    Ok(ListenerLease {
+        port,
+        generation,
+        inner: Arc::downgrade(inner),
+    })
+}
+
+fn acquire_config_listener_leases(
+    inner: &Arc<RemoteHostInner>,
+    generation: u64,
+    config: &RemoteHostConfig,
+) -> Result<(Option<ListenerLease>, Option<ListenerLease>), String> {
+    let native = if config.enabled {
+        Some(acquire_listener_lease(inner, config.port, generation)?)
+    } else {
+        None
+    };
+    let web = if config.web.enabled {
+        match acquire_listener_lease(inner, config.web.port, generation) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                drop(native);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    Ok((native, web))
+}
+
+fn notify_broadcaster(inner: &RemoteHostInner) {
+    if let Ok(mut sequence) = inner.broadcaster_signal_lock.lock() {
+        *sequence = sequence.wrapping_add(1);
+        inner.broadcaster_signal.notify_all();
+    }
+}
+
+fn wait_for_broadcaster_signal(inner: &RemoteHostInner, timeout: Duration) {
+    let Ok(sequence) = inner.broadcaster_signal_lock.lock() else {
+        return;
+    };
+    let _ = inner.broadcaster_signal.wait_timeout(sequence, timeout);
+}
+
+fn wake_native_listener(inner: &RemoteHostInner) {
+    let endpoint = inner
+        .native_listener_wakeup
+        .lock()
+        .ok()
+        .and_then(|slot| *slot);
+    if let Some(endpoint) = endpoint {
+        let _ = TcpStream::connect_timeout(&endpoint, Duration::from_millis(100));
+    }
+}
+
 pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
     config_update_lock: Mutex<()>,
@@ -1982,6 +2299,7 @@ pub(crate) struct RemoteHostInner {
     shared_state: RwLock<AppState>,
     runtime_state: RwLock<RuntimeState>,
     port_statuses: RwLock<HashMap<u16, PortStatus>>,
+    port_authorities: RwLock<HashMap<u16, RemotePortAuthority>>,
     semantic_journals: Mutex<SemanticJournalStore>,
     /// Serializes semantic writers while the generation below gives browser
     /// capture a lock-free indication that publication is in progress.
@@ -2041,6 +2359,10 @@ pub(crate) struct RemoteHostInner {
     worker_residue_count: AtomicUsize,
     listener_thread: Mutex<Option<RemoteWorker>>,
     broadcaster_thread: Mutex<Option<RemoteWorker>>,
+    listener_leases: Mutex<HashMap<u16, u64>>,
+    native_listener_wakeup: Mutex<Option<SocketAddr>>,
+    broadcaster_signal: Condvar,
+    broadcaster_signal_lock: Mutex<u64>,
     native_connection_workers: Mutex<HashMap<u64, NativeConnectionWorker>>,
     // Both fields are written on lifecycle transitions and (Phase 1b+)
     // surfaced through the settings panel; suppress the transient warning.
@@ -2199,12 +2521,18 @@ struct RemoteClientInner {
 
 struct RemoteClientConnectionOwner {
     outgoing: mpsc::Sender<ClientMessage>,
+    socket_wakeup: Mutex<Option<TcpStream>>,
     reader: Mutex<Option<RemoteWorker>>,
     inner: Weak<RemoteClientInner>,
 }
 
 impl Drop for RemoteClientConnectionOwner {
     fn drop(&mut self) {
+        if let Ok(mut socket) = self.socket_wakeup.lock() {
+            if let Some(socket) = socket.take() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
         let _ = self.outgoing.send(ClientMessage::Disconnect);
         let reader = self
             .reader
@@ -2247,6 +2575,7 @@ struct LocalPortForwardEntry {
     scope_id: Option<u64>,
     stop: Option<Arc<AtomicBool>>,
     worker: Option<RemoteWorker>,
+    wakeup: Option<SocketAddr>,
     retry_after_epoch_ms: u64,
 }
 
@@ -2285,6 +2614,7 @@ impl RemoteHostService {
             shared_state: RwLock::new(AppState::default()),
             runtime_state: RwLock::new(RuntimeState::default()),
             port_statuses: RwLock::new(HashMap::new()),
+            port_authorities: RwLock::new(HashMap::new()),
             semantic_journals: Mutex::new(SemanticJournalStore::default()),
             semantic_publication_lock: Mutex::new(()),
             semantic_publication_generation: AtomicU64::new(0),
@@ -2332,6 +2662,10 @@ impl RemoteHostService {
             worker_residue_count: AtomicUsize::new(0),
             listener_thread: Mutex::new(None),
             broadcaster_thread: Mutex::new(None),
+            listener_leases: Mutex::new(HashMap::new()),
+            native_listener_wakeup: Mutex::new(None),
+            broadcaster_signal: Condvar::new(),
+            broadcaster_signal_lock: Mutex::new(0),
             native_connection_workers: Mutex::new(HashMap::new()),
             web_listener: Mutex::new(None),
             web_listener_error: RwLock::new(None),
@@ -2469,7 +2803,12 @@ impl RemoteHostService {
         runtime_state: RuntimeState,
         port_statuses: HashMap<u16, PortStatus>,
     ) {
-        self.update_snapshot_parts(Some(app_state), Some(runtime_state), Some(port_statuses));
+        self.update_snapshot_parts_with_authorities(
+            Some(app_state),
+            Some(runtime_state),
+            Some(port_statuses),
+            None,
+        );
     }
 
     pub fn update_snapshot_parts(
@@ -2477,6 +2816,16 @@ impl RemoteHostService {
         app_state: Option<AppState>,
         runtime_state: Option<RuntimeState>,
         port_statuses: Option<HashMap<u16, PortStatus>>,
+    ) {
+        self.update_snapshot_parts_with_authorities(app_state, runtime_state, port_statuses, None);
+    }
+
+    pub fn update_snapshot_parts_with_authorities(
+        &self,
+        app_state: Option<AppState>,
+        runtime_state: Option<RuntimeState>,
+        port_statuses: Option<HashMap<u16, PortStatus>>,
+        port_authorities: Option<HashMap<u16, RemotePortAuthority>>,
     ) {
         let semantic_inputs_changed = app_state.is_some() || runtime_state.is_some();
         let _snapshot_guard = self
@@ -2503,6 +2852,12 @@ impl RemoteHostService {
                 changed = true;
             }
         }
+        if let Some(port_authorities) = port_authorities {
+            if let Ok(mut slot) = self.inner.port_authorities.write() {
+                *slot = port_authorities;
+                changed = true;
+            }
+        }
         if semantic_inputs_changed {
             let tabs = self
                 .inner
@@ -2525,6 +2880,7 @@ impl RemoteHostService {
         }
         if changed {
             self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+            notify_broadcaster(&self.inner);
         }
     }
 
@@ -3547,6 +3903,7 @@ impl RemoteHostService {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+                    notify_broadcaster(&self.inner);
                 }
                 // Keep the generation odd until the conservative revision is
                 // visible, and release both guards normally before unwinding.
@@ -3564,6 +3921,7 @@ impl RemoteHostService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+            notify_broadcaster(&self.inner);
         }
         drop(epoch);
         drop(publication_guard);
@@ -3944,6 +4302,8 @@ impl RemoteHostService {
             self.inner
                 .last_connection_is_error
                 .store(false, Ordering::Release);
+            wake_native_listener(&self.inner);
+            notify_broadcaster(&self.inner);
             if let Ok(mut error) = self.inner.web_listener_error.write() {
                 *error = None;
             }
@@ -4010,10 +4370,28 @@ impl RemoteHostService {
             .map(|slot| slot.clone())
             .unwrap_or_default();
 
+        let (native_lease, web_lease) =
+            match acquire_config_listener_leases(&self.inner, generation, &config) {
+                Ok(leases) => leases,
+                Err(error) => {
+                    if config.enabled {
+                        if let Ok(mut slot) = self.inner.listener_error.write() {
+                            *slot = Some(format!("Listener reservation failed: {error}"));
+                        }
+                    }
+                    if config.web.enabled {
+                        if let Ok(mut slot) = self.inner.web_listener_error.write() {
+                            *slot = Some(format!("Web listener reservation failed: {error}"));
+                        }
+                    }
+                    return;
+                }
+            };
+
         let mut new_listener_worker = config.enabled.then(|| {
             let listener_inner = self.inner.clone();
             RemoteWorker::spawn("remote-native-listener", None, move || {
-                run_listener(listener_inner, generation);
+                run_listener(listener_inner, generation, native_lease);
             })
         });
         let mut new_broadcaster_worker = (config.enabled || config.web.enabled).then(|| {
@@ -4069,7 +4447,11 @@ impl RemoteHostService {
         // can enable just the web UI if they only care about browser access,
         // or vice versa.
         if config.web.enabled {
-            match WebListenerHandle::start(self.inner.clone(), config.web.clone()) {
+            match WebListenerHandle::start(
+                self.inner.clone(),
+                config.web.clone(),
+                web_lease.expect("enabled web listener must have a lease"),
+            ) {
                 Ok(handle) => {
                     let mut stale_handle = Some(handle);
                     {
@@ -4137,15 +4519,21 @@ impl RemoteClientHandle {
         let transport::TlsConnectResult {
             mut stream,
             certificate_fingerprint,
+            handshake_deadline,
         } = transport::connect_tls(address, port, expected_fingerprint)?;
         let hello = ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_label: client_label.to_string(),
             auth,
         };
-        write_message(&mut stream, &hello)
+        let _ = stream.sock.set_write_timeout(Some(
+            handshake_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(5)),
+        ));
+        write_message_until_deadline(&mut stream, &hello, handshake_deadline)
             .map_err(|error| format_handshake_stage_error(address, port, "write", &error))?;
-        let response: ServerMessage = read_message(&mut stream)
+        let response: ServerMessage = read_message_until_deadline(&mut stream, handshake_deadline)
             .map_err(|error| format_handshake_stage_error(address, port, "read", &error))?;
         let (server_id, client_id, client_token, controller_client_id, you_have_control, snapshot) =
             match response {
@@ -4209,6 +4597,7 @@ impl RemoteClientHandle {
             reader_exit_test_hook: RwLock::new(None),
         });
 
+        let socket_wakeup = stream.sock.try_clone().ok();
         let reader_inner = inner.clone();
         let reader = RemoteWorker::spawn("remote-client-reader", None, move || {
             run_client_connection(stream, rx, reader_inner)
@@ -4220,6 +4609,7 @@ impl RemoteClientHandle {
         }
         let connection = Arc::new(RemoteClientConnectionOwner {
             outgoing: tx,
+            socket_wakeup: Mutex::new(socket_wakeup),
             reader: Mutex::new(Some(reader)),
             inner: Arc::downgrade(&inner),
         });
@@ -4453,6 +4843,7 @@ impl RemoteClientHandle {
         let transport::TlsConnectResult {
             mut stream,
             certificate_fingerprint,
+            handshake_deadline,
         } = transport::connect_tls(
             &self.inner.address,
             self.inner.port,
@@ -4463,7 +4854,12 @@ impl RemoteClientHandle {
                 "Remote TLS fingerprint changed while opening the forwarded port.".to_string(),
             );
         }
-        write_message(
+        let _ = stream.sock.set_write_timeout(Some(
+            handshake_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(5)),
+        ));
+        write_message_until_deadline(
             &mut stream,
             &ClientMessage::PortForwardHello {
                 protocol_version: PROTOCOL_VERSION,
@@ -4472,9 +4868,10 @@ impl RemoteClientHandle {
                 auth_token: self.inner.client_token.clone(),
                 requested_port,
             },
+            handshake_deadline,
         )
         .map_err(|error| format!("Port forward handshake failed: {error}"))?;
-        match read_message::<ServerMessage, _>(&mut stream)
+        match read_message_until_deadline::<ServerMessage, _>(&mut stream, handshake_deadline)
             .map_err(|error| format!("Port forward handshake failed: {error}"))?
         {
             ServerMessage::PortForwardOk => {
@@ -4632,6 +5029,7 @@ impl LocalPortForwardManager {
                                 scope_id: None,
                                 stop: None,
                                 worker: None,
+                                wakeup: None,
                                 retry_after_epoch_ms: now_epoch_ms.saturating_add(1000),
                             },
                         );
@@ -4725,6 +5123,9 @@ impl Drop for LocalPortForwardManagerInner {
 
         let deadline = Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT;
         for (_, mut entry) in entries {
+            if let Some(wakeup) = entry.wakeup.take() {
+                let _ = TcpStream::connect_timeout(&wakeup, Duration::from_millis(100));
+            }
             if let Some(worker) = entry.worker.take() {
                 settle_unowned_remote_worker(worker, deadline);
             }
@@ -4774,6 +5175,9 @@ fn stop_local_port_forward_port(
 ) {
     if let Some(stop) = entry.stop.take() {
         stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(wakeup) = entry.wakeup.take() {
+        let _ = TcpStream::connect_timeout(&wakeup, Duration::from_millis(100));
     }
     let connections = close_local_port_forward_scope(inner, port, entry.scope_id.take());
     #[cfg(test)]
@@ -5033,8 +5437,9 @@ fn start_local_port_forward_listener(
         }
     })?;
     listener
-        .set_nonblocking(true)
+        .set_nonblocking(false)
         .map_err(|error| format!("Could not configure localhost:{port}: {error}"))?;
+    let wakeup = listener.local_addr().ok();
     let scope_id = inner.next_scope_id.fetch_add(1, Ordering::Relaxed);
     inner
         .worker_registry
@@ -5052,6 +5457,7 @@ fn start_local_port_forward_listener(
         scope_id: Some(scope_id),
         stop: Some(stop),
         worker: Some(worker),
+        wakeup,
         retry_after_epoch_ms: 0,
     })
 }
@@ -5144,9 +5550,6 @@ fn run_local_port_forward_listener(
                 drop(registry);
                 reap_completed_local_port_forward_workers(&strong_inner);
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(12));
-            }
             Err(error) => {
                 if let Some(inner) = inner.upgrade() {
                     set_port_forward_state(
@@ -5225,6 +5628,8 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
 ) -> Result<(), String> {
     let mut left_buf = [0_u8; 16 * 1024];
     let mut right_buf = [0_u8; 16 * 1024];
+    let idle_wait_lock = Mutex::new(());
+    let idle_wakeup = Condvar::new();
     loop {
         if should_stop() {
             break;
@@ -5276,7 +5681,9 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
         }
 
         if !made_progress {
-            thread::sleep(Duration::from_millis(2));
+            if let Ok(guard) = idle_wait_lock.lock() {
+                let _ = idle_wakeup.wait_timeout(guard, Duration::from_millis(2));
+            }
         }
     }
     Ok(())
@@ -5413,7 +5820,17 @@ fn join_native_connection_workers_before_generation(
     }
 }
 
-fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
+fn run_listener(
+    inner: Arc<RemoteHostInner>,
+    native_runtime_generation: u64,
+    lease: Option<ListenerLease>,
+) {
+    let Some(lease) = lease else {
+        return;
+    };
+    if !lease.is_current() {
+        return;
+    }
     let config = inner
         .config
         .read()
@@ -5436,11 +5853,34 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
             return;
         }
     };
+    if !lease.is_current() {
+        let _ = listener.set_nonblocking(false);
+        return;
+    }
     inner.listener_running.store(true, Ordering::Relaxed);
     if let Ok(mut slot) = inner.listener_error.write() {
         *slot = None;
     }
-    let _ = listener.set_nonblocking(true);
+    let _ = listener.set_nonblocking(false);
+    if let Ok(local_addr) = listener.local_addr() {
+        let wake_addr = match local_addr {
+            SocketAddr::V4(addr) if addr.ip().is_unspecified() => SocketAddr::V4(
+                std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, addr.port()),
+            ),
+            SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    Ipv6Addr::LOCALHOST,
+                    addr.port(),
+                    addr.flowinfo(),
+                    addr.scope_id(),
+                ))
+            }
+            addr => addr,
+        };
+        if let Ok(mut slot) = inner.native_listener_wakeup.lock() {
+            *slot = Some(wake_addr);
+        }
+    }
     #[cfg(test)]
     notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ListenerStarted);
 
@@ -5448,6 +5888,10 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
         reap_completed_native_connection_workers(&inner);
         match listener.accept() {
             Ok((stream, _)) => {
+                if native_connection_should_stop(&inner, native_runtime_generation) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
                 let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 spawn_native_connection_worker(
                     &inner,
@@ -5456,11 +5900,19 @@ fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
                     native_runtime_generation,
                 );
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                if !native_connection_should_stop(&inner, native_runtime_generation) {
+                    if let Ok(mut slot) = inner.listener_error.write() {
+                        *slot = Some(format!("Remote listener accept failed: {error}"));
+                    }
+                }
+                break;
             }
-            Err(_) => thread::sleep(Duration::from_millis(20)),
         }
+    }
+    if let Ok(mut slot) = inner.native_listener_wakeup.lock() {
+        *slot = None;
     }
     inner.listener_running.store(false, Ordering::Relaxed);
 }
@@ -5479,7 +5931,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
             .map(|clients| clients.len())
             .unwrap_or(0);
         if connected_clients == 0 {
-            thread::sleep(IDLE_BROADCAST_INTERVAL);
+            wait_for_broadcaster_signal(&inner, IDLE_BROADCAST_INTERVAL);
             continue;
         }
 
@@ -5503,7 +5955,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
         if snapshot_revision == last_snapshot_revision
             && controller_client_id == last_controller_client_id
         {
-            thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
+            wait_for_broadcaster_signal(&inner, SNAPSHOT_BROADCAST_INTERVAL);
             continue;
         }
 
@@ -5522,12 +5974,19 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
             .read()
             .map(|slot| slot.clone())
             .unwrap_or_default();
+        let port_authorities = inner
+            .port_authorities
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
         let app_hash = stable_hash(&app_state);
         let runtime_hash = stable_hash(&runtime_state);
         let port_hash = stable_hash(&port_statuses);
+        let authority_hash = stable_hash(&port_authorities);
+        let combined_port_hash = port_hash ^ authority_hash;
 
         let Ok(mut clients) = inner.clients.lock() else {
-            thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
+            wait_for_broadcaster_signal(&inner, SNAPSHOT_BROADCAST_INTERVAL);
             continue;
         };
         let mut deliveries = Vec::new();
@@ -5537,7 +5996,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
                 controller_client_id.as_deref() == Some(client.client_id.as_str());
             let app_changed = client.last_app_hash != app_hash;
             let runtime_changed = client.last_runtime_hash != runtime_hash;
-            let port_changed = client.last_port_hash != port_hash;
+            let port_changed = client.last_port_hash != combined_port_hash;
             let controller_changed = client.last_controller_client_id != controller_client_id
                 || client.last_you_have_control != you_have_control;
             let web_revision_changed =
@@ -5556,13 +6015,14 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
                 app_state: app_changed.then_some(app_state.clone()),
                 runtime_state: runtime_changed.then_some(runtime_state.clone()),
                 port_statuses: port_changed.then_some(port_statuses.clone()),
+                port_authorities: port_changed.then_some(port_authorities.clone()),
                 controller_client_id: controller_client_id.clone(),
                 you_have_control,
             };
 
             client.last_app_hash = app_hash;
             client.last_runtime_hash = runtime_hash;
-            client.last_port_hash = port_hash;
+            client.last_port_hash = combined_port_hash;
             client.last_controller_client_id = controller_client_id.clone();
             client.last_you_have_control = you_have_control;
             client.last_snapshot_revision = snapshot_revision;
@@ -5580,7 +6040,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) 
         last_snapshot_revision = snapshot_revision;
         last_controller_client_id = controller_client_id;
 
-        thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
+        wait_for_broadcaster_signal(&inner, SNAPSHOT_BROADCAST_INTERVAL);
     }
 }
 
@@ -5779,6 +6239,66 @@ fn run_bounded_bootstrap_provider(
     }
 }
 
+fn run_bounded_remote_callback<T, F>(
+    inner: &Arc<RemoteHostInner>,
+    native_runtime_generation: u64,
+    name: impl Into<String>,
+    callback: F,
+) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if native_connection_should_stop(inner, native_runtime_generation) {
+        return None;
+    }
+    let Some(permit) = inner.host_work_limiter.try_acquire() else {
+        set_last_connection_note(
+            inner,
+            "Remote callback capacity is exhausted; callback was deferred.".to_string(),
+            true,
+        );
+        return None;
+    };
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let worker = RemoteWorker::spawn(name, None, move || {
+        let result = permit.run(callback);
+        let _ = result_tx.try_send(result);
+    });
+    match result_rx.recv_timeout(REMOTE_CALLBACK_TIMEOUT) {
+        Ok(result) => {
+            settle_remote_worker(
+                inner,
+                worker,
+                Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+            );
+            if native_connection_should_stop(inner, native_runtime_generation) {
+                None
+            } else {
+                Some(result)
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            set_last_connection_note(
+                inner,
+                "Remote callback exceeded its bounded deadline; worker remains owned for cooperative shutdown."
+                    .to_string(),
+                true,
+            );
+            settle_remote_worker(inner, worker, Instant::now());
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            settle_remote_worker(
+                inner,
+                worker,
+                Instant::now() + REMOTE_WORKER_SHUTDOWN_TIMEOUT,
+            );
+            None
+        }
+    }
+}
+
 fn handle_client_connection(
     inner: Arc<RemoteHostInner>,
     connection_id: u64,
@@ -5795,28 +6315,37 @@ fn handle_client_connection(
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-    let mut stream = match transport::accept_tls(stream, &config, || {
-        native_connection_should_stop(&inner, native_runtime_generation)
-    }) {
-        Ok(stream) => stream,
-        Err(error) => {
-            if native_connection_should_stop(&inner, native_runtime_generation) {
+    let handshake_deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream =
+        match transport::accept_tls_with_deadline(stream, &config, handshake_deadline, || {
+            native_connection_should_stop(&inner, native_runtime_generation)
+        }) {
+            Ok(result) => result.stream,
+            Err(error) => {
+                if native_connection_should_stop(&inner, native_runtime_generation) {
+                    return;
+                }
+                set_last_connection_note(
+                    &inner,
+                    format!("TLS handshake from {peer_label} failed: {error}"),
+                    true,
+                );
+                eprintln!("[remote] tls accept failed for connection {connection_id}: {error}");
                 return;
             }
-            set_last_connection_note(
-                &inner,
-                format!("TLS handshake from {peer_label} failed: {error}"),
-                true,
-            );
-            eprintln!("[remote] tls accept failed for connection {connection_id}: {error}");
-            return;
-        }
-    };
+        };
     let mut read_buffer = Vec::new();
 
-    let hello = match read_message_until_cancelled::<ClientMessage, _, _>(&mut stream, || {
-        native_connection_should_stop(&inner, native_runtime_generation)
-    }) {
+    let _ = stream.sock.set_read_timeout(Some(
+        handshake_deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100)),
+    ));
+    let hello = match read_message_until_deadline_cancelled::<ClientMessage, _, _>(
+        &mut stream,
+        handshake_deadline,
+        || native_connection_should_stop(&inner, native_runtime_generation),
+    ) {
         Ok(message) => message,
         Err(error) => {
             if native_connection_should_stop(&inner, native_runtime_generation) {
@@ -5843,13 +6372,19 @@ fn handle_client_connection(
             &mut stream,
             hello,
             native_runtime_generation,
+            handshake_deadline,
         ) {
             set_last_connection_note(
                 &inner,
                 format!("Rejected port forward from {peer_label}: {message}"),
                 true,
             );
-            let _ = write_message(&mut stream, &ServerMessage::HelloErr { message });
+            let _ = set_server_handshake_write_deadline(&mut stream, handshake_deadline);
+            let _ = write_message_until_deadline(
+                &mut stream,
+                &ServerMessage::HelloErr { message },
+                handshake_deadline,
+            );
         }
         return;
     }
@@ -5871,7 +6406,12 @@ fn handle_client_connection(
             eprintln!(
                 "[remote] handshake rejected for connection {connection_id} from {peer_label}: {message}"
             );
-            let _ = write_message(&mut stream, &ServerMessage::HelloErr { message });
+            let _ = set_server_handshake_write_deadline(&mut stream, handshake_deadline);
+            let _ = write_message_until_deadline(
+                &mut stream,
+                &ServerMessage::HelloErr { message },
+                handshake_deadline,
+            );
             return;
         }
     };
@@ -5889,6 +6429,7 @@ fn handle_client_connection(
     let app_hash = stable_hash(&snapshot.app_state);
     let runtime_hash = stable_hash(&snapshot.runtime_state);
     let port_hash = stable_hash(&snapshot.port_statuses);
+    let authority_hash = stable_hash(&snapshot.port_authorities);
     let _registered = if let Ok(mut clients) = inner.clients.lock() {
         clients.insert(
             connection_id,
@@ -5904,7 +6445,7 @@ fn handle_client_connection(
                 focused_session_id: snapshot.runtime_state.active_session_id.clone(),
                 last_app_hash: app_hash,
                 last_runtime_hash: runtime_hash,
-                last_port_hash: port_hash,
+                last_port_hash: port_hash ^ authority_hash,
                 last_controller_client_id: controller_client_id.clone(),
                 last_you_have_control: you_have_control,
                 last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
@@ -5914,6 +6455,9 @@ fn handle_client_connection(
     } else {
         false
     };
+    if _registered {
+        notify_broadcaster(&inner);
+    }
     #[cfg(test)]
     if _registered {
         notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRegistered);
@@ -5929,7 +6473,8 @@ fn handle_client_connection(
         you_have_control,
         snapshot,
     };
-    if let Err(error) = write_message(&mut stream, &hello_ok) {
+    let _ = set_server_handshake_write_deadline(&mut stream, handshake_deadline);
+    if let Err(error) = write_message_until_deadline(&mut stream, &hello_ok, handshake_deadline) {
         set_last_connection_note(
             &inner,
             format!(
@@ -5943,6 +6488,9 @@ fn handle_client_connection(
         if let Ok(mut clients) = inner.clients.lock() {
             let _removed = clients.remove(&connection_id).is_some();
             drop(clients);
+            if _removed {
+                notify_broadcaster(&inner);
+            }
             #[cfg(test)]
             if _removed {
                 notify_native_lifecycle(&inner, NativeLifecycleTestEvent::ClientRemoved);
@@ -5996,7 +6544,12 @@ fn handle_client_connection(
                         .ok()
                         .and_then(|slot| slot.clone());
                     if let Some(handler) = handler {
-                        handler(session_id);
+                        let _ = run_bounded_remote_callback(
+                            &inner,
+                            native_runtime_generation,
+                            "remote-focused-session-callback",
+                            move || handler(session_id),
+                        );
                     }
                 }
             }
@@ -6064,7 +6617,12 @@ fn handle_client_connection(
                         .ok()
                         .and_then(|slot| slot.clone());
                     if let Some(handler) = handler {
-                        let _ = handler(input, enqueued_at_epoch_ms);
+                        let _ = run_bounded_remote_callback(
+                            &inner,
+                            native_runtime_generation,
+                            "remote-terminal-input-callback",
+                            move || handler(input, enqueued_at_epoch_ms),
+                        );
                     }
                 }
             }
@@ -6079,7 +6637,12 @@ fn handle_client_connection(
                         .ok()
                         .and_then(|slot| slot.clone());
                     if let Some(handler) = handler {
-                        handler(session_id, dimensions);
+                        let _ = run_bounded_remote_callback(
+                            &inner,
+                            native_runtime_generation,
+                            "remote-terminal-resize-callback",
+                            move || handler(session_id, dimensions),
+                        );
                     }
                 }
             }
@@ -6119,9 +6682,16 @@ fn handle_client_connection(
             }
             Ok(Some(ClientMessage::Disconnect)) => break,
             Ok(Some(ClientMessage::Hello { .. } | ClientMessage::PortForwardHello { .. })) => break,
-            Ok(None) => {
-                thread::sleep(Duration::from_millis(12));
-            }
+            Ok(None) => match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(message) => {
+                    let is_disconnect = matches!(message, ServerMessage::Disconnected { .. });
+                    if write_message(&mut stream, &message).is_err() || is_disconnect {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
             Err(_) => break,
         }
     }
@@ -6132,6 +6702,9 @@ fn handle_client_connection(
         .lock()
         .map(|mut clients| clients.remove(&connection_id).is_some())
         .unwrap_or(false);
+    if _removed {
+        notify_broadcaster(&inner);
+    }
     if let Ok(mut controller) = inner.controller_client_id.write() {
         if controller.as_deref() == Some(client_id.as_str()) {
             *controller = None;
@@ -6300,6 +6873,7 @@ fn handle_port_forward_connection(
     stream: &mut transport::ServerTlsStream,
     hello: ClientMessage,
     native_runtime_generation: u64,
+    handshake_deadline: Instant,
 ) -> Result<(), String> {
     let (client_id, auth_token, requested_port) = authenticate_port_forward(inner, hello)?;
     let mut last_connect_error = None;
@@ -6311,7 +6885,16 @@ fn handle_port_forward_connection(
         if native_connection_should_stop(inner, native_runtime_generation) {
             return Err("Remote host stopped before the port forward connected.".to_string());
         }
-        match TcpStream::connect_timeout(&address, PORT_FORWARD_CONNECT_TIMEOUT) {
+        let remaining = handshake_deadline
+            .saturating_duration_since(Instant::now())
+            .min(PORT_FORWARD_CONNECT_TIMEOUT);
+        if remaining.is_zero() {
+            return Err(
+                "Remote port-forward handshake deadline expired before upstream connect."
+                    .to_string(),
+            );
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
             Ok(stream) => {
                 upstream = Some(stream);
                 break;
@@ -6330,7 +6913,8 @@ fn handle_port_forward_connection(
     let _ = upstream.set_nodelay(true);
     let _ = upstream.set_read_timeout(Some(Duration::from_millis(40)));
     let _ = upstream.set_write_timeout(Some(Duration::from_secs(5)));
-    write_message(stream, &ServerMessage::PortForwardOk)
+    set_server_handshake_write_deadline(stream, handshake_deadline)?;
+    write_message_until_deadline(stream, &ServerMessage::PortForwardOk, handshake_deadline)
         .map_err(|error| format!("Could not start port forward: {error}"))?;
     if let Err(error) = copy_bidirectional(&mut upstream, stream, || {
         native_connection_should_stop(inner, native_runtime_generation)
@@ -6424,8 +7008,9 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-    let port_statuses = inner
-        .port_statuses
+    let now_epoch_ms = now_epoch_ms();
+    let port_authorities = inner
+        .port_authorities
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
@@ -6439,16 +7024,33 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
                 let Some(session) = runtime_state.sessions.get(&command.id) else {
                     continue;
                 };
-                let Some(status) = port_statuses.get(&requested_port) else {
+                let Some(authority) = port_authorities.get(&requested_port) else {
                     continue;
                 };
-                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                if session.status.is_live()
+                    && remote_authority_allows_forward(
+                        authority,
+                        requested_port,
+                        session,
+                        now_epoch_ms,
+                    )
+                {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn remote_authority_allows_forward(
+    authority: &RemotePortAuthority,
+    requested_port: u16,
+    session: &SessionRuntimeState,
+    now_epoch_ms: u64,
+) -> bool {
+    authority.is_fresh_at(now_epoch_ms)
+        && authority.has_exact_managed_fence_for(requested_port, session)
 }
 
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
@@ -7094,7 +7696,17 @@ fn run_client_connection(
                 | ServerMessage::Error { .. }
                 | ServerMessage::Pong,
             )) => {}
-            Ok(None) => thread::sleep(Duration::from_millis(12)),
+            Ok(None) => match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(message) => {
+                    let is_disconnect = matches!(message, ClientMessage::Disconnect);
+                    if write_message(&mut stream, &message).is_err() || is_disconnect {
+                        let _ = stream.sock.shutdown(Shutdown::Both);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
             Err(_) => {
                 if let Ok(mut disconnected) = inner.disconnected_message.write() {
                     *disconnected = Some("Remote host connection was lost.".to_string());
@@ -7134,6 +7746,31 @@ fn write_message<T: Serialize, W: Write>(stream: &mut W, message: &T) -> Result<
         .map_err(|error| format!("Write failed: {error}"))
 }
 
+fn write_message_until_deadline<T: Serialize, W: Write>(
+    stream: &mut W,
+    message: &T,
+    deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("Remote handshake write deadline expired.".to_string());
+    }
+    write_message(stream, message)
+}
+
+fn set_server_handshake_write_deadline(
+    stream: &mut transport::ServerTlsStream,
+    deadline: Instant,
+) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("Remote handshake write deadline expired.".to_string());
+    }
+    stream
+        .sock
+        .set_write_timeout(Some(remaining.min(Duration::from_secs(5))))
+        .map_err(|error| format!("Failed to configure remote handshake write deadline: {error}"))
+}
+
 fn read_message<T: for<'de> Deserialize<'de>, R: Read>(stream: &mut R) -> Result<T, String> {
     read_message_until_cancelled(stream, || false)
 }
@@ -7150,7 +7787,44 @@ fn read_message_until_cancelled<T: for<'de> Deserialize<'de>, R: Read, C: FnMut(
         if let Some(message) = try_read_message(stream, &mut buffer)? {
             return Ok(message);
         }
-        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_message_until_deadline<T: for<'de> Deserialize<'de>, R: Read>(
+    stream: &mut R,
+    deadline: Instant,
+) -> Result<T, String> {
+    let mut buffer = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Remote handshake read deadline expired.".to_string());
+        }
+        if let Some(message) = try_read_message(stream, &mut buffer)? {
+            return Ok(message);
+        }
+    }
+}
+
+fn read_message_until_deadline_cancelled<
+    T: for<'de> Deserialize<'de>,
+    R: Read,
+    C: FnMut() -> bool,
+>(
+    stream: &mut R,
+    deadline: Instant,
+    mut is_cancelled: C,
+) -> Result<T, String> {
+    let mut buffer = Vec::new();
+    loop {
+        if is_cancelled() {
+            return Err("Remote handshake read cancelled.".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err("Remote handshake read deadline expired.".to_string());
+        }
+        if let Some(message) = try_read_message(stream, &mut buffer)? {
+            return Ok(message);
+        }
     }
 }
 
@@ -7228,6 +7902,11 @@ fn base_snapshot_without_session_views(
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
     let config = inner
         .config
         .read()
@@ -7244,6 +7923,7 @@ fn base_snapshot_without_session_views(
         runtime_state,
         session_views: HashMap::new(),
         port_statuses,
+        port_authorities,
         you_have_control: controller_client_id.as_deref() == Some(client_id),
         controller_client_id,
         server_id: config.server_id,
@@ -7297,6 +7977,9 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
     }
     if let Some(port_statuses) = delta.port_statuses {
         snapshot.port_statuses = port_statuses;
+    }
+    if let Some(port_authorities) = delta.port_authorities {
+        snapshot.port_authorities = port_authorities;
     }
     snapshot.controller_client_id = delta.controller_client_id;
     snapshot.you_have_control = delta.you_have_control;
@@ -7395,11 +8078,14 @@ mod tests {
         LocalPortForwardLifecycleTestEvent, LocalPortForwardManager, PairedRemoteClient,
         PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorker,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
-        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteListenerIdentity,
+        RemoteMachineState, RemotePortAuthority, RemotePortAuthorityKind, RemoteSessionBootstrap,
+        RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorker, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage, HOST_CONFIG_PERSISTENCE_TEST_HOOK,
+        MAX_PENDING_REMOTE_REQUESTS, REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK,
     };
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
         JournalLimits, SemanticAdapterHealth, SemanticAttention, SemanticEventDraft,
@@ -7423,7 +8109,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::io::{ErrorKind, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
@@ -7451,6 +8137,27 @@ mod tests {
     impl Drop for HostConfigPersistenceHookGuard {
         fn drop(&mut self) {
             *HOST_CONFIG_PERSISTENCE_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    struct RemoteStatePermissionVerifyHookGuard;
+
+    impl RemoteStatePermissionVerifyHookGuard {
+        fn install(hook: Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>) -> Self {
+            let mut slot = REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(slot.is_none(), "remote state permission hook leaked");
+            *slot = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for RemoteStatePermissionVerifyHookGuard {
+        fn drop(&mut self) {
+            *REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
@@ -8208,6 +8915,49 @@ mod tests {
     }
 
     #[test]
+    fn post_rename_permission_failure_restores_disk_bytes_and_memory() {
+        let _profile = TestProfileGuard::new("remote-state-post-rename-rollback");
+        let mut old_state = RemoteMachineState::default();
+        old_state.host.server_id = "old-server".to_string();
+        save_remote_machine_state(&old_state).expect("seed remote state");
+        let path = super::remote_state_path().expect("remote state path");
+        let old_bytes = std::fs::read(&path).expect("read seeded remote state");
+        let service = RemoteHostService::new(old_state.host.clone());
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let _verify_hook = RemoteStatePermissionVerifyHookGuard::install({
+            let fail_once = fail_once.clone();
+            Arc::new(move |path| {
+                if fail_once.swap(false, Ordering::SeqCst) {
+                    Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected post-rename permission verification failure",
+                    ))
+                } else {
+                    super::verify_remote_state_file_permissions(path)
+                }
+            })
+        });
+
+        let error = super::mutate_host_config(&service.inner, |config| {
+            config.server_id = "new-server".to_string();
+        })
+        .expect_err("post-rename permission failure must reject the mutation");
+        assert!(error.contains("permission"));
+        assert_eq!(
+            std::fs::read(&path).expect("read restored remote state"),
+            old_bytes
+        );
+        assert_eq!(service.config().server_id, "old-server");
+        assert_eq!(
+            load_remote_machine_state()
+                .expect("load restored remote state")
+                .host
+                .server_id,
+            "old-server"
+        );
+    }
+
+    #[test]
     fn concurrent_remote_state_saves_do_not_race_on_temp_file() {
         let _profile = TestProfileGuard::new("concurrent-remote-save");
 
@@ -8843,6 +9593,7 @@ mod tests {
                 ("keep".to_string(), session_view("keep")),
             ]),
             port_statuses: HashMap::new(),
+            port_authorities: HashMap::new(),
             controller_client_id: None,
             you_have_control: false,
             server_id: "host-1".to_string(),
@@ -10395,6 +11146,44 @@ mod tests {
     }
 
     #[test]
+    fn remote_delta_carries_typed_port_authorities_alongside_legacy_statuses() {
+        let delta = RemoteWorkspaceDelta {
+            app_state: None,
+            runtime_state: None,
+            port_statuses: Some(HashMap::new()),
+            port_authorities: None,
+            controller_client_id: None,
+            you_have_control: false,
+        };
+        let encoded = serde_json::to_value(delta).expect("remote delta should serialize");
+        assert!(
+            encoded.get("portAuthorities").is_some(),
+            "remote delta must preserve the typed port authority field"
+        );
+    }
+
+    #[test]
+    fn listener_generation_lease_rejects_overlap_and_releases_exact_owner() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::Acquire);
+        let first = super::acquire_listener_lease(&service.inner, 43871, generation)
+            .expect("first listener lease should install");
+        assert!(first.is_current());
+        assert!(super::acquire_listener_lease(&service.inner, 43871, generation).is_err());
+        drop(first);
+        let second = super::acquire_listener_lease(&service.inner, 43871, generation)
+            .expect("released listener lease should be reusable");
+        service
+            .inner
+            .native_runtime_generation
+            .fetch_add(1, Ordering::SeqCst);
+        assert!(!second.is_current(), "stale generation must lose its lease");
+    }
+
+    #[test]
     fn current_snapshot_only_includes_open_tab_sessions() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         if let Ok(mut shared_state) = service.inner.shared_state.write() {
@@ -11463,6 +12252,113 @@ mod tests {
         client.client.disconnect();
         config.enabled = false;
         service.apply_config(config);
+    }
+
+    #[test]
+    fn production_tls_forward_requires_and_uses_typed_port_authority() {
+        let _profile = TestProfileGuard::new("production-typed-port-authority-forward");
+        let host_port = reserve_free_tcp_port();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("upstream should bind");
+        let server_port = upstream.local_addr().expect("upstream address").port();
+        let mut config = RemoteHostConfig {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port: host_port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config.clone());
+        let (listener_started_tx, listener_started_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .native_lifecycle_test_hook
+            .write()
+            .expect("native lifecycle hook lock") = Some(Arc::new(move |event| {
+            if event == super::NativeLifecycleTestEvent::ListenerStarted {
+                let _ = listener_started_tx.send(());
+            }
+        }));
+        config.enabled = true;
+        service.apply_config(config.clone());
+        listener_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("production listener should start");
+
+        let app = managed_server_state(server_port);
+        let runtime = managed_server_runtime("command-web", 4242);
+        let authority = RemotePortAuthority {
+            port: server_port,
+            kind: RemotePortAuthorityKind::Managed,
+            resource: Some(ResourceFence::new(ResourceId::new(), 1)),
+            listeners: vec![RemoteListenerIdentity {
+                pid: 4242,
+                creation_time_100ns: 1,
+                executable_proven: true,
+            }],
+            membership_revision: 1,
+            observation_sequence: 1,
+            publication_sequence: 1,
+            observed_at_epoch_ms: now_epoch_ms(),
+            freshness_deadline_epoch_ms: now_epoch_ms()
+                .saturating_add(super::REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+            error: None,
+        };
+        service.update_snapshot_parts_with_authorities(
+            Some(app),
+            Some(runtime),
+            Some(HashMap::from([(
+                server_port,
+                PortStatus {
+                    port: server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )])),
+            Some(HashMap::from([(server_port, authority)])),
+        );
+
+        let (upstream_done_tx, upstream_done_rx) = mpsc::sync_channel(1);
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().expect("forward should reach upstream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("upstream read timeout");
+            let mut request = [0_u8; 4];
+            stream
+                .read_exact(&mut request)
+                .expect("upstream should receive request");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").expect("upstream response");
+            stream.flush().expect("upstream response flush");
+            upstream_done_tx.send(()).expect("upstream observer");
+        });
+
+        let client = RemoteClientHandle::connect(
+            "127.0.0.1",
+            host_port,
+            "Typed authority client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("native client should connect through the real listener");
+        let mut forward = client
+            .client
+            .open_port_forward(server_port)
+            .expect("typed authority should authorize production TLS forward");
+        forward.write_all(b"ping").expect("forward request");
+        forward.flush().expect("forward request flush");
+        let mut response = [0_u8; 4];
+        forward.read_exact(&mut response).expect("forward response");
+        assert_eq!(&response, b"pong");
+        upstream_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("upstream should finish production forward");
+        drop(forward);
+        client.client.disconnect();
+        config.enabled = false;
+        service.apply_config(config);
+        upstream_thread.join().expect("upstream should stop");
     }
 
     #[test]
@@ -12587,6 +13483,7 @@ mod tests {
         RemoteClientHandle {
             connection: Arc::new(super::RemoteClientConnectionOwner {
                 outgoing: tx,
+                socket_wakeup: Mutex::new(None),
                 reader: Mutex::new(None),
                 inner: Arc::downgrade(&inner),
             }),

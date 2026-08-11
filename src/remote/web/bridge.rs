@@ -419,6 +419,11 @@ fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorksp
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
     let controller_client_id = inner
         .controller_client_id
         .read()
@@ -435,6 +440,7 @@ fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorksp
         runtime_state,
         session_views: HashMap::new(),
         port_statuses,
+        port_authorities,
         controller_client_id,
         you_have_control,
         server_id,
@@ -459,6 +465,11 @@ fn register_browser_client(
         .unwrap_or_default();
     let port_statuses = inner
         .port_statuses
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let port_authorities = inner
+        .port_authorities
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
@@ -497,7 +508,7 @@ fn register_browser_client(
             focused_session_id: None,
             last_app_hash: stable_hash(&app_state),
             last_runtime_hash: stable_hash(&runtime_state),
-            last_port_hash: stable_hash(&port_statuses),
+            last_port_hash: stable_hash(&port_statuses) ^ stable_hash(&port_authorities),
             last_controller_client_id: controller_client_id,
             last_you_have_control: you_have_control,
             last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
