@@ -10,16 +10,56 @@ use crate::domain::{
 };
 use crate::kernel::semantic_journal::{SemanticJournalAuthorityRecord, SemanticJournalFactRow};
 use crate::kernel::{KernelStore, StoreError};
-use crate::protocol::{FrameLimits, MessagePackCodec, MessagePackError};
+use crate::protocol::{FrameLimits, MessagePackCodec, MessagePackError, MAX_MESSAGEPACK_DEPTH};
 use crate::providers::capabilities::ProviderKind;
 use hmac::{Hmac, Mac};
 use serde::de::{self, Deserializer, Visitor};
+use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_PAGE_EVENT_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static JOURNAL_PAGE_FACT_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn debug_reset_journal_page_materialization_counters() {
+    JOURNAL_PAGE_EVENT_MATERIALIZATIONS.with(|counter| counter.set(0));
+    JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn debug_journal_page_materialization_counters() -> (usize, usize) {
+    (
+        JOURNAL_PAGE_EVENT_MATERIALIZATIONS.with(Cell::get),
+        JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn debug_record_page_event_materialization() {
+    JOURNAL_PAGE_EVENT_MATERIALIZATIONS.with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
+}
+
+#[cfg(test)]
+fn debug_record_page_fact_materialization() {
+    JOURNAL_PAGE_FACT_MATERIALIZATIONS.with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
+}
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const MAX_JOURNAL_DOCUMENT_BYTES: usize = 64 * 1024;
@@ -1327,6 +1367,8 @@ impl JournalEvent {
     }
 
     pub fn to_snapshot_fact(&self) -> SemanticJournalFact {
+        #[cfg(test)]
+        debug_record_page_fact_materialization();
         SemanticJournalFact {
             id: self.id,
             sequence: self.sequence,
@@ -1858,7 +1900,7 @@ impl SemanticJournal {
             .semantic_journal_validate(&self.authority_digest, |row| {
                 validate_restored_row(self.authority, row)
             })
-            .and_then(|(count, _)| usize::try_from(count).map_err(|_| StoreError::Corruption))
+            .and_then(|(count, _, _)| usize::try_from(count).map_err(|_| StoreError::Corruption))
             .map_err(|_| JournalIngestOutcome::NeedsResync)
     }
 
@@ -1908,7 +1950,10 @@ impl SemanticJournal {
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
             .map_err(|_| JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget))?;
         let mut expected = after_sequence.saturating_add(1);
-        let mut candidates = Vec::with_capacity(usize::try_from(limits.max_items).unwrap_or(0));
+        // Do not reserve candidate storage until a row passes the byte
+        // preflight below; a tiny page budget must not allocate a page-sized
+        // fact buffer just to reject its first row.
+        let mut candidates = Vec::new();
         let mut overflow_sequence = None;
         let mut scanned_through = after_sequence;
         let mut stream_error = None;
@@ -1937,19 +1982,47 @@ impl SemanticJournal {
                         overflow_sequence = Some(sequence);
                         return Ok(false);
                     }
-                    // The persisted body contains the typed payload plus its
-                    // envelope. A first body already at the complete page
-                    // budget cannot fit after page/fact metadata is added.
-                    // Reject it before restoring/materializing a candidate;
-                    // the bounded serializer below remains authoritative for
-                    // all rows that pass this cheap preflight.
-                    if candidates.is_empty()
-                        && row.payload.len()
-                            >= usize::try_from(limits.max_encoded_bytes).unwrap_or(usize::MAX)
-                    {
-                        overflow_sequence = Some(sequence);
-                        return Ok(false);
+                    if !persist_only && row.visibility == JournalVisibility::RuntimeOnly.as_str() {
+                        return Ok(true);
                     }
+                    let candidate = match page_fact_projection(&row, self.authority.provider) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(false);
+                        }
+                    };
+                    let next_sequence = (sequence < high_water)
+                        .then(|| sequence.checked_add(1))
+                        .flatten();
+                    // Measure the exact projected page before restoring the
+                    // candidate event or allocating its owned fact. The
+                    // borrowed projection reuses the durable payload's
+                    // canonical MessagePack shape and bounded counting writer;
+                    // no oversized page buffer is built.
+                    let encoded_bytes = match page_encoded_len_with_candidate(
+                        &codec,
+                        after_sequence,
+                        sequence,
+                        high_water,
+                        next_sequence,
+                        &candidates,
+                        &candidate,
+                        limits.max_encoded_bytes,
+                    ) {
+                        Ok(encoded_bytes) => encoded_bytes,
+                        Err(PageMeasureError::TooLarge) => {
+                            overflow_sequence = Some(sequence);
+                            return Ok(false);
+                        }
+                        Err(PageMeasureError::Encode) => {
+                            stream_error = Some(JournalIngestOutcome::Backpressure(
+                                JournalBackpressure::PageBudget,
+                            ));
+                            return Ok(false);
+                        }
+                    };
+                    drop(candidate);
                     let event = match restore_event(&self.authority, row) {
                         Ok(event) => event,
                         Err(_) => {
@@ -1962,7 +2035,6 @@ impl SemanticJournal {
                     }
                     let candidate = event.to_snapshot_fact();
                     candidates.push(candidate);
-                    let next_sequence = (event.sequence < high_water).then_some(event.sequence + 1);
                     let mut page = SemanticJournalPage {
                         after_sequence,
                         through_sequence: event.sequence,
@@ -1971,26 +2043,9 @@ impl SemanticJournal {
                         next_sequence,
                         facts: std::mem::take(&mut candidates),
                     };
-                    match page_encoded_len(&codec, &mut page, limits.max_encoded_bytes) {
-                        Ok(encoded_bytes) => {
-                            page.encoded_bytes = encoded_bytes;
-                            candidates = page.facts;
-                            Ok(true)
-                        }
-                        Err(PageMeasureError::TooLarge) => {
-                            let removed = page.facts.pop().expect("candidate just pushed");
-                            candidates = page.facts;
-                            overflow_sequence = Some(removed.sequence);
-                            Ok(false)
-                        }
-                        Err(PageMeasureError::Encode) => {
-                            candidates = page.facts;
-                            stream_error = Some(JournalIngestOutcome::Backpressure(
-                                JournalBackpressure::PageBudget,
-                            ));
-                            Ok(false)
-                        }
-                    }
+                    page.encoded_bytes = encoded_bytes;
+                    candidates = page.facts;
+                    Ok(true)
                 },
             )
             .map_err(|_| JournalIngestOutcome::NeedsResync)?;
@@ -2242,6 +2297,208 @@ fn page_encoded_len(
     Err(PageMeasureError::Encode)
 }
 
+/// Borrowed page payload used only for the byte preflight.  The durable row's
+/// payload has the same canonical MessagePack representation as the projected
+/// fact payload, so this probe can measure the exact wire shape without first
+/// allocating a `JournalEvent` or an owned `SemanticJournalFact`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SemanticJournalPayloadRef<'a> {
+    UserMessage {
+        text: Cow<'a, str>,
+    },
+    AssistantText {
+        text: Cow<'a, str>,
+    },
+    ReasoningSummary {
+        text: Cow<'a, str>,
+    },
+    ToolCall {
+        tool_name: Cow<'a, str>,
+        call_id: Cow<'a, str>,
+    },
+    ToolResult {
+        call_id: Cow<'a, str>,
+        status: Cow<'a, str>,
+    },
+    ApprovalRequest {
+        request_id: Cow<'a, str>,
+        summary: Cow<'a, str>,
+    },
+    ApprovalResult {
+        request_id: Cow<'a, str>,
+        decision: Cow<'a, str>,
+    },
+    Question {
+        question_id: Cow<'a, str>,
+        prompt: Cow<'a, str>,
+        options: Vec<Cow<'a, str>>,
+    },
+    PlanStep {
+        step_id: Cow<'a, str>,
+        title: Cow<'a, str>,
+        status: Cow<'a, str>,
+    },
+    UsageObservation {
+        remaining_percent: Option<u8>,
+    },
+    Error {
+        code: Cow<'a, str>,
+        message: Cow<'a, str>,
+    },
+    TurnState {
+        state: Cow<'a, str>,
+    },
+    SessionState {
+        state: Cow<'a, str>,
+    },
+    ArtifactReference {
+        label: Cow<'a, str>,
+    },
+    Unknown {
+        provider: Cow<'a, str>,
+        source_type: Cow<'a, str>,
+        schema_version: u32,
+        diagnostic_ref: Cow<'a, str>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedJournalPayloadProbe<'a> {
+    #[serde(borrow)]
+    payload: SemanticJournalPayloadRef<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct JournalFactProjection<'a> {
+    id: EventId,
+    sequence: u64,
+    provider: &'a str,
+    schema_version: u32,
+    kind: &'a str,
+    visibility: &'a str,
+    privacy_class: PrivacyClass,
+    redacted: bool,
+    payload: SemanticJournalPayloadRef<'a>,
+}
+
+struct JournalFactSequence<'a, 'b> {
+    existing: &'a [SemanticJournalFact],
+    candidate: &'a JournalFactProjection<'b>,
+}
+
+impl Serialize for JournalFactSequence<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.existing.len() + 1))?;
+        for fact in self.existing {
+            sequence.serialize_element(fact)?;
+        }
+        sequence.serialize_element(self.candidate)?;
+        sequence.end()
+    }
+}
+
+struct JournalPageProjection<'a, 'b> {
+    after_sequence: u64,
+    through_sequence: u64,
+    high_water: u64,
+    encoded_bytes: u32,
+    next_sequence: Option<u64>,
+    facts: JournalFactSequence<'a, 'b>,
+}
+
+impl Serialize for JournalPageProjection<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut page = serializer.serialize_struct("SemanticJournalPage", 6)?;
+        page.serialize_field("after_sequence", &self.after_sequence)?;
+        page.serialize_field("through_sequence", &self.through_sequence)?;
+        page.serialize_field("high_water", &self.high_water)?;
+        page.serialize_field("encoded_bytes", &self.encoded_bytes)?;
+        page.serialize_field("next_sequence", &self.next_sequence)?;
+        page.serialize_field("facts", &self.facts)?;
+        page.end()
+    }
+}
+
+fn page_fact_projection<'a>(
+    row: &'a SemanticJournalFactRow,
+    provider: ProviderKind,
+) -> Result<JournalFactProjection<'a>, JournalError> {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
+        .map_err(|_| JournalError::Store)?;
+    if row.payload.is_empty() || row.payload.len() > codec.max_document_bytes() as usize {
+        return Err(JournalError::Store);
+    }
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&row.payload));
+    deserializer.set_max_depth(usize::from(MAX_MESSAGEPACK_DEPTH) + 1);
+    let body: PersistedJournalPayloadProbe<'a> =
+        Deserialize::deserialize(&mut deserializer).map_err(|_| JournalError::Store)?;
+    let position = usize::try_from(deserializer.position()).unwrap_or(usize::MAX);
+    if position != row.payload.len() {
+        return Err(JournalError::Store);
+    }
+    let schema_version = u32::try_from(row.schema_version).map_err(|_| JournalError::Store)?;
+    let sequence = u64::try_from(row.sequence).map_err(|_| JournalError::Store)?;
+    let privacy_class = match row.privacy_class.as_str() {
+        "local_only" => PrivacyClass::LocalOnly,
+        "shareable" => PrivacyClass::Shareable,
+        _ => return Err(JournalError::Store),
+    };
+    Ok(JournalFactProjection {
+        id: EventId::from_bytes(row.event_id).map_err(|_| JournalError::Store)?,
+        sequence,
+        provider: provider_kind_sql(provider),
+        schema_version,
+        kind: &row.kind,
+        visibility: &row.visibility,
+        privacy_class,
+        redacted: row.redaction_class != JournalRedactionClass::Persistable.as_str(),
+        payload: body.payload,
+    })
+}
+
+fn page_encoded_len_with_candidate(
+    codec: &MessagePackCodec,
+    after_sequence: u64,
+    through_sequence: u64,
+    high_water: u64,
+    next_sequence: Option<u64>,
+    existing: &[SemanticJournalFact],
+    candidate: &JournalFactProjection<'_>,
+    maximum: u32,
+) -> Result<u32, PageMeasureError> {
+    let mut encoded_bytes = 0_u32;
+    for _ in 0..8 {
+        let page = JournalPageProjection {
+            after_sequence,
+            through_sequence,
+            high_water,
+            encoded_bytes,
+            next_sequence,
+            facts: JournalFactSequence {
+                existing,
+                candidate,
+            },
+        };
+        let measured = match codec.encoded_len_bounded(&page, maximum) {
+            Ok(measured) => measured,
+            Err(MessagePackError::Oversized { .. }) => return Err(PageMeasureError::TooLarge),
+            Err(_) => return Err(PageMeasureError::Encode),
+        };
+        if measured == encoded_bytes {
+            return Ok(measured);
+        }
+        encoded_bytes = measured;
+    }
+    Err(PageMeasureError::Encode)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedJournalBody {
@@ -2309,6 +2566,16 @@ fn restore_event(
     authority: &JournalSessionAuthority,
     row: SemanticJournalFactRow,
 ) -> Result<JournalEvent, JournalError> {
+    #[cfg(test)]
+    debug_record_page_event_materialization();
+    restore_event_internal(authority, &row, true)?.ok_or(JournalError::Store)
+}
+
+fn restore_event_internal(
+    authority: &JournalSessionAuthority,
+    row: &SemanticJournalFactRow,
+    materialize: bool,
+) -> Result<Option<JournalEvent>, JournalError> {
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
         .map_err(|_| JournalError::Store)?;
     let mut body: PersistedJournalBody = codec
@@ -2411,7 +2678,10 @@ fn restore_event(
             }
         }
     }
-    Ok(JournalEvent {
+    if !materialize {
+        return Ok(None);
+    }
+    Ok(Some(JournalEvent {
         id: EventId::from_bytes(row.event_id).map_err(|_| JournalError::Store)?,
         schema_version,
         provider: authority.provider,
@@ -2419,7 +2689,7 @@ fn restore_event(
             .provider_event_id
             .map(ProviderEventId::new)
             .transpose()?,
-        delivery_id: RelayDeliveryId::new(row.delivery_id)?,
+        delivery_id: RelayDeliveryId::new(row.delivery_id.clone())?,
         task_id: authority.task_id,
         agent_session_id: authority.agent_session_id,
         resource_id: authority.resource_id,
@@ -2444,14 +2714,17 @@ fn restore_event(
             }),
         payload: body.payload,
         payload_hash: row.content_hash,
-    })
+    }))
 }
 
 fn validate_restored_row(
     authority: JournalSessionAuthority,
     row: &SemanticJournalFactRow,
 ) -> Result<(), StoreError> {
-    restore_event(&authority, row.clone())
+    // The store's global integrity pass must decode and validate every row,
+    // but it must not allocate a page event. Page materialization is gated by
+    // the byte preflight in `page_from_store` below.
+    restore_event_internal(&authority, row, false)
         .map(|_| ())
         .map_err(|_| StoreError::Corruption)
 }

@@ -415,7 +415,7 @@ impl KernelStore {
         validate_row: impl FnMut(
             &crate::kernel::semantic_journal::SemanticJournalFactRow,
         ) -> Result<(), StoreError>,
-    ) -> Result<(u64, Option<i64>), StoreError> {
+    ) -> Result<(u64, Option<i64>, Option<i64>), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let result = crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
         tx.commit()?;
@@ -479,7 +479,7 @@ impl KernelStore {
         ) -> Result<bool, StoreError>,
     ) -> Result<u64, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let (count, _) =
+        let (count, _, _) =
             crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
         let next_sequence = count.checked_add(1).ok_or(StoreError::Corruption)?;
         let high_water = next_sequence.checked_sub(1).ok_or(StoreError::Corruption)?;

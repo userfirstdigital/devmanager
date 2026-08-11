@@ -566,6 +566,52 @@ fn journal_two_handles_reject_new_older_timestamp_in_write_transaction() {
 }
 
 #[test]
+fn journal_rejects_ingested_timestamp_regression_when_occurred_timestamp_advances() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("kernel.sqlite3");
+    let mut first_handle = open_on(&path, ProviderKind::ClaudeCode);
+    let mut second_handle = open_on(&path, ProviderKind::ClaudeCode);
+    let first = first_handle.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_ingested_high_water_1"),
+        &fixture_at("claude_user_message.json", NOW_MS),
+        NOW_MS + 100,
+    );
+    assert!(first.accepted().is_some(), "first outcome: {first:?}");
+    let second = second_handle.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_ingested_high_water_2"),
+        &fixture_at("claude_tool_call.json", NOW_MS + 100),
+        NOW_MS,
+    );
+    assert!(matches!(
+        second,
+        JournalIngestOutcome::Rejected(JournalRejectReason::TimestampRegression)
+    ));
+    assert_eq!(second_handle.retained_len().expect("retained"), 1);
+}
+
+#[test]
+fn journal_older_ingested_duplicate_retries_before_timestamp_regression() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let first = journal.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_ingested_duplicate"),
+        &fixture_at("claude_user_message.json", NOW_MS),
+        NOW_MS + 100,
+    );
+    let first_id = first
+        .accepted()
+        .unwrap_or_else(|| panic!("first outcome: {first:?}"))
+        .id();
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_ingested_duplicate"),
+            &fixture_at("claude_user_message.json", NOW_MS),
+            NOW_MS,
+        ),
+        JournalIngestOutcome::Duplicate { existing_id } if existing_id == first_id
+    ));
+}
+
+#[test]
 fn journal_crash_before_commit_then_reopen_uses_new_sqlite_connection() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kernel.sqlite3");
@@ -1057,6 +1103,7 @@ fn journal_pages_replay_by_durable_sequence_and_canonical_bytes() {
         "an exact encoded page cap must accept the complete page"
     );
     if first.encoded_bytes > 1 {
+        debug_reset_journal_page_materialization_counters();
         let under = journal
             .projected_page(
                 0,
@@ -1070,6 +1117,11 @@ fn journal_pages_replay_by_durable_sequence_and_canonical_bytes() {
         assert_eq!(under.encoded_bytes as usize, under_bytes.len());
         assert_eq!(under.through_sequence, 0);
         assert_eq!(under.next_sequence, Some(1));
+        assert_eq!(
+            debug_journal_page_materialization_counters(),
+            (0, 0),
+            "an oversized first candidate must be rejected before event/fact materialization"
+        );
     }
     let second = journal
         .projected_page(
@@ -1354,12 +1406,54 @@ fn journal_oversized_first_page_fails_before_returning_materialized_facts() {
         "relay_oversized_first",
         "claude_user_message.json",
     );
+    debug_reset_journal_page_materialization_counters();
     assert!(matches!(
         journal.projected_page(0, None, PageLimits::new(1, 1).expect("minimum cap")),
         Err(JournalIngestOutcome::Backpressure(
             JournalBackpressure::PageBudget
         ))
     ));
+    assert_eq!(
+        debug_journal_page_materialization_counters(),
+        (0, 0),
+        "an oversized first candidate must not restore or allocate a fact"
+    );
+}
+
+#[test]
+fn journal_page_cap_blocks_continuation_restore_before_owned_fact_copy() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_page_counter_first",
+        "claude_user_message.json",
+    );
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_page_counter_second",
+        "claude_tool_call.json",
+    );
+    let first = journal
+        .projected_page(0, None, PageLimits::new(1, 8 * 1024).expect("limits"))
+        .expect("first page");
+    debug_reset_journal_page_materialization_counters();
+    let bounded = journal
+        .projected_page(
+            0,
+            None,
+            PageLimits::new(2, first.encoded_bytes).expect("exact first-page cap"),
+        )
+        .expect("bounded continuation");
+    assert_eq!(bounded.facts.len(), 1);
+    assert_eq!(bounded.next_sequence, Some(2));
+    assert!(bounded.encoded_bytes <= first.encoded_bytes);
+    assert_eq!(
+        debug_journal_page_materialization_counters(),
+        (1, 1),
+        "the continuation row must be rejected before restore and owned-copy"
+    );
 }
 
 #[test]

@@ -248,7 +248,7 @@ pub(crate) fn high_water(
     conn: &Connection,
     digest: &[u8; 32],
 ) -> Result<(u64, Option<i64>), StoreError> {
-    let (count, last_occurred_at_ms) = validate_facts(conn, digest, |_| Ok(()))?;
+    let (count, last_occurred_at_ms, _) = validate_facts(conn, digest, |_| Ok(()))?;
     let next = if count == 0 {
         1
     } else {
@@ -261,7 +261,7 @@ pub(crate) fn high_water(
 }
 
 pub(crate) fn retained_len(conn: &Connection, digest: &[u8; 32]) -> Result<usize, StoreError> {
-    let (count, _) = validate_facts(conn, digest, |_| Ok(()))?;
+    let (count, _, _) = validate_facts(conn, digest, |_| Ok(()))?;
     usize::try_from(count).map_err(|_| StoreError::IntegerOutOfRange {
         field: "semantic_journal.count",
         value: u64::MAX,
@@ -277,7 +277,10 @@ pub(crate) fn validate_facts(
     conn: &Connection,
     digest: &[u8; 32],
     mut validate_row: impl FnMut(&SemanticJournalFactRow) -> Result<(), StoreError>,
-) -> Result<(u64, Option<i64>), StoreError> {
+) -> Result<(u64, Option<i64>, Option<i64>), StoreError> {
+    // Return both timestamp high-waters from this same ordered scan. Writers
+    // use the pair inside their IMMEDIATE transaction, after dedupe lookups,
+    // so neither stream can regress around a concurrent handle.
     let mut stmt = conn.prepare(
         "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
                 kind, visibility, privacy_class, redaction_class, occurred_at_ms,
@@ -327,7 +330,7 @@ pub(crate) fn validate_facts(
         last_ingested_at_ms = Some(fact.ingested_at_ms);
         validate_row(&fact)?;
     }
-    Ok((count, last_occurred_at_ms))
+    Ok((count, last_occurred_at_ms, last_ingested_at_ms))
 }
 
 pub(crate) fn lookup_delivery(
@@ -378,7 +381,8 @@ pub(crate) fn write_fact(
     // Validate the complete pinned journal before any write decision. Dedupe
     // lookups then precede the candidate timestamp check, so an older retry
     // remains a duplicate rather than becoming a timestamp regression.
-    let (count, last_occurred_at_ms) = validate_facts(tx, digest, &mut validate_row)?;
+    let (count, last_occurred_at_ms, last_ingested_at_ms) =
+        validate_facts(tx, digest, &mut validate_row)?;
     let next_sequence = if count == 0 {
         1
     } else {
@@ -404,6 +408,9 @@ pub(crate) fn write_fact(
         return Ok(classify_hit(hit, payload_hash));
     }
     if last_occurred_at_ms.is_some_and(|last| row.occurred_at_ms < last) {
+        return Ok(SemanticJournalWrite::TimestampRegression);
+    }
+    if last_ingested_at_ms.is_some_and(|last| row.ingested_at_ms < last) {
         return Ok(SemanticJournalWrite::TimestampRegression);
     }
     if count as u32 >= max_events {
