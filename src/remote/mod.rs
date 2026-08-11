@@ -28,7 +28,7 @@ use crate::models::{
 };
 use crate::persistence::{self, PersistenceError};
 use crate::process::ports::{
-    ManagedResourceSnapshot, PortStatus as RichPortStatus, PortStatusKind as RichPortStatusKind,
+    ManagedResourceCapability, PortStatus as RichPortStatus, PortStatusKind as RichPortStatusKind,
 };
 use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
@@ -209,6 +209,7 @@ pub struct RemoteWorkspaceDelta {
 #[serde(rename_all = "camelCase")]
 pub enum RemotePortAuthorityKind {
     Managed,
+    ManagedUnready,
     ProvenExternal,
     Unknown,
     ProbeError,
@@ -292,9 +293,8 @@ impl RemotePortAuthority {
 
     pub fn from_rich(status: &RichPortStatus, now_epoch_ms: u64) -> Self {
         let kind = match status.kind() {
-            RichPortStatusKind::ManagedHealthy | RichPortStatusKind::ManagedUnready => {
-                RemotePortAuthorityKind::Managed
-            }
+            RichPortStatusKind::ManagedHealthy => RemotePortAuthorityKind::Managed,
+            RichPortStatusKind::ManagedUnready => RemotePortAuthorityKind::ManagedUnready,
             RichPortStatusKind::ProvenExternal => RemotePortAuthorityKind::ProvenExternal,
             RichPortStatusKind::ProbeError => RemotePortAuthorityKind::ProbeError,
             RichPortStatusKind::Occupied => RemotePortAuthorityKind::Occupied,
@@ -302,7 +302,11 @@ impl RemotePortAuthority {
             RichPortStatusKind::Starting => RemotePortAuthorityKind::Unknown,
             RichPortStatusKind::Unknown => RemotePortAuthorityKind::Unknown,
         };
-        let resource = (kind == RemotePortAuthorityKind::Managed).then_some(status.resource);
+        let resource = matches!(
+            kind,
+            RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+        )
+        .then_some(status.resource);
         Self {
             port: status.port,
             kind,
@@ -333,7 +337,7 @@ impl RemotePortAuthority {
         }
     }
 
-    pub fn with_snapshot_metadata(
+    pub(crate) fn with_snapshot_metadata(
         mut self,
         publication_sequence: u64,
         membership_revision: u64,
@@ -345,12 +349,16 @@ impl RemotePortAuthority {
         self
     }
 
-    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+    pub(crate) fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
     }
 
-    pub fn with_managed_snapshot(mut self, managed: &ManagedResourceSnapshot) -> Self {
+    pub(crate) fn with_managed_capability(
+        mut self,
+        capability: &ManagedResourceCapability,
+    ) -> Self {
+        let managed = capability.snapshot();
         self.managed_fence_fingerprint = Some(managed.authority_fingerprint());
         self.root = Some(RemoteListenerIdentity {
             pid: managed.root().id().pid(),
@@ -392,8 +400,10 @@ impl RemotePortAuthority {
     /// may describe a managed authority as exact. Session/root matching is
     /// checked separately when a local runtime session is available.
     fn has_complete_wire_authority(&self) -> bool {
-        if self.kind != RemotePortAuthorityKind::Managed
-            || self.resource.is_none()
+        if !matches!(
+            self.kind,
+            RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+        ) || self.resource.is_none()
             || self
                 .resource
                 .is_some_and(|resource| resource.runtime_generation == 0)
@@ -433,11 +443,11 @@ impl RemotePortAuthority {
     /// Every identity-bearing comparison is made against the caller-owned
     /// observation timestamp and deadline; no method-local clock read may
     /// widen the proof window.
-    pub fn has_exact_managed_fence_for(
+    pub(crate) fn has_exact_managed_fence_for(
         &self,
         requested_port: u16,
         session: &SessionRuntimeState,
-        live: &ManagedResourceSnapshot,
+        live: &ManagedResourceCapability,
         now_epoch_ms: u64,
         observation_time: Instant,
         deadline: Instant,
@@ -454,12 +464,12 @@ impl RemotePortAuthority {
                 .as_ref()
                 .and_then(|launch| launch.port)
                 != Some(requested_port)
-            || live.state() != crate::process::registry::ManagedProcessState::Running
-            || !live.is_fresh_at(observation_time)
-            || self.membership_revision != live.membership_revision()
-            || self.observation_sequence != live.observation_sequence()
-            || self.managed_fence_fingerprint != Some(live.authority_fingerprint())
-            || self.resource != Some(live.resource())
+            || live.snapshot().state() != crate::process::registry::ManagedProcessState::Running
+            || !live.snapshot().is_fresh_at(observation_time)
+            || self.membership_revision != live.snapshot().membership_revision()
+            || self.observation_sequence != live.snapshot().observation_sequence()
+            || self.managed_fence_fingerprint != Some(live.snapshot().authority_fingerprint())
+            || self.resource != Some(live.snapshot().resource())
         {
             return false;
         }
@@ -469,7 +479,7 @@ impl RemotePortAuthority {
         let Some(root) = self.root.as_ref() else {
             return false;
         };
-        let live_root = live.root();
+        let live_root = live.snapshot().root();
         if session_pid != live_root.id().pid()
             || root.pid != live_root.id().pid()
             || root.creation_time_100ns != live_root.id().creation_time_100ns()
@@ -485,7 +495,7 @@ impl RemotePortAuthority {
                 return false;
             };
             listener_ids.insert((listener.pid, listener.creation_time_100ns))
-                && live.member_identities().iter().any(|member| {
+                && live.snapshot().member_identities().iter().any(|member| {
                     member.id().pid() == listener.pid
                         && member.id().creation_time_100ns() == listener.creation_time_100ns
                         && executable_fingerprint(member.canonical_executable())
@@ -500,11 +510,12 @@ fn remote_authority_projection_fingerprint(authority: &RemotePortAuthority) -> u
     authority.port.hash(&mut hasher);
     let kind = match authority.kind {
         RemotePortAuthorityKind::Managed => 0u8,
-        RemotePortAuthorityKind::ProvenExternal => 1,
-        RemotePortAuthorityKind::Unknown => 2,
-        RemotePortAuthorityKind::ProbeError => 3,
-        RemotePortAuthorityKind::Free => 4,
-        RemotePortAuthorityKind::Occupied => 5,
+        RemotePortAuthorityKind::ManagedUnready => 1,
+        RemotePortAuthorityKind::ProvenExternal => 2,
+        RemotePortAuthorityKind::Unknown => 3,
+        RemotePortAuthorityKind::ProbeError => 4,
+        RemotePortAuthorityKind::Free => 5,
+        RemotePortAuthorityKind::Occupied => 6,
     };
     kind.hash(&mut hasher);
     authority
@@ -558,7 +569,7 @@ fn executable_fingerprint(path: &Path) -> u64 {
 pub(crate) fn host_verified_port_authorities_at(
     authorities: &HashMap<u16, RemotePortAuthority>,
     runtime: &RuntimeState,
-    managed_snapshots: &HashMap<u16, ManagedResourceSnapshot>,
+    managed_snapshots: &HashMap<u16, Arc<ManagedResourceCapability>>,
     now_epoch_ms: u64,
     observation_time: Instant,
     deadline: Instant,
@@ -568,32 +579,35 @@ pub(crate) fn host_verified_port_authorities_at(
         .map(|(port, authority)| {
             let mut candidate = authority.clone();
             candidate.verified = None;
-            let verified = (candidate.kind == RemotePortAuthorityKind::Managed)
-                .then(|| {
-                    let session = runtime.sessions.values().find(|session| {
-                        session.session_id == candidate.session_id.as_deref().unwrap_or_default()
-                            && session
-                                .server_launch
-                                .as_ref()
-                                .and_then(|launch| launch.port)
-                                == Some(*port)
-                    })?;
-                    let live = managed_snapshots.get(port)?;
-                    candidate
-                        .has_exact_managed_fence_for(
-                            *port,
-                            session,
-                            live,
-                            now_epoch_ms,
-                            observation_time,
-                            deadline,
-                        )
-                        .then(|| {
-                            candidate.verified = Some(VerifiedPortAuthority::new(&candidate));
-                            candidate.clone()
-                        })
-                })
-                .flatten();
+            let verified = matches!(
+                candidate.kind,
+                RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+            )
+            .then(|| {
+                let session = runtime.sessions.values().find(|session| {
+                    session.session_id == candidate.session_id.as_deref().unwrap_or_default()
+                        && session
+                            .server_launch
+                            .as_ref()
+                            .and_then(|launch| launch.port)
+                            == Some(*port)
+                })?;
+                let live = managed_snapshots.get(port)?;
+                candidate
+                    .has_exact_managed_fence_for(
+                        *port,
+                        session,
+                        live,
+                        now_epoch_ms,
+                        observation_time,
+                        deadline,
+                    )
+                    .then(|| {
+                        candidate.verified = Some(VerifiedPortAuthority::new(&candidate));
+                        candidate.clone()
+                    })
+            })
+            .flatten();
             (*port, verified.unwrap_or(candidate.clone()))
         })
         .collect()
@@ -2049,7 +2063,7 @@ pub(crate) struct RemoteHostInner {
     /// Task3.4 supplies this exact registry snapshot when the host can prove
     /// a managed forwarding request. Empty is intentional until that union
     /// seam is wired; it makes every managed wire label fail closed.
-    managed_port_snapshots: RwLock<HashMap<u16, ManagedResourceSnapshot>>,
+    managed_port_snapshots: RwLock<HashMap<u16, Arc<ManagedResourceCapability>>>,
     semantic_journals: Mutex<SemanticJournalStore>,
     /// Serializes semantic writers while the generation below gives browser
     /// capture a lock-free indication that publication is in progress.
@@ -2467,7 +2481,10 @@ impl RemoteHostService {
     /// normal host path leaves this empty until the registry handoff is
     /// available; tests and the eventual union adapter provide exact,
     /// independently reconciled snapshots here.
-    pub fn update_managed_port_snapshots(&self, snapshots: HashMap<u16, ManagedResourceSnapshot>) {
+    pub(crate) fn update_managed_port_capabilities(
+        &self,
+        snapshots: HashMap<u16, Arc<ManagedResourceCapability>>,
+    ) {
         if let Ok(mut slot) = self.inner.managed_port_snapshots.write() {
             *slot = snapshots;
         }
@@ -2486,6 +2503,13 @@ impl RemoteHostService {
             .snapshot_state_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime_state.is_some() {
+            // Runtime/session generations are part of the managed capability
+            // predicate. A runtime publication invalidates every prior
+            // capability; the registry union must issue a fresh one after
+            // publishing the matching runtime generation.
+            self.update_managed_port_capabilities(HashMap::new());
+        }
         let mut changed = false;
         if let Some(app_state) = app_state {
             if let Ok(mut slot) = self.inner.shared_state.write() {
@@ -5659,7 +5683,9 @@ fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> b
                         requested_port,
                         session,
                         now_epoch_ms,
-                        managed_port_snapshots.get(&requested_port),
+                        managed_port_snapshots
+                            .get(&requested_port)
+                            .map(|capability| capability.as_ref()),
                         observation_time,
                         deadline,
                     )
@@ -5694,7 +5720,7 @@ fn remote_authority_allows_forward_with_live(
     requested_port: u16,
     session: &SessionRuntimeState,
     now_epoch_ms: u64,
-    live: Option<&ManagedResourceSnapshot>,
+    live: Option<&ManagedResourceCapability>,
 ) -> bool {
     let observation_time = Instant::now();
     let deadline = observation_time
@@ -5716,11 +5742,12 @@ fn remote_authority_allows_forward_with_live_at(
     requested_port: u16,
     session: &SessionRuntimeState,
     now_epoch_ms: u64,
-    live: Option<&ManagedResourceSnapshot>,
+    live: Option<&ManagedResourceCapability>,
     observation_time: Instant,
     deadline: Instant,
 ) -> bool {
-    authority.is_fresh_at(now_epoch_ms)
+    authority.kind() == RemotePortAuthorityKind::Managed
+        && authority.is_fresh_at(now_epoch_ms)
         && live.is_some_and(|live| {
             authority.has_exact_managed_fence_for(
                 requested_port,
@@ -6712,7 +6739,9 @@ mod tests {
     use crate::domain::operation::ResourceFence;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
-    use crate::process::ports::{ManagedResourceSnapshot, RegistryMembershipSnapshot};
+    use crate::process::ports::{
+        test_capability_from_snapshot, ManagedResourceSnapshot, RegistryMembershipSnapshot,
+    };
     use crate::process::registry::ManagedProcessState;
     use crate::remote::presentation::{
         JournalLimits, SemanticAdapterHealth, SemanticAttention, SemanticEventDraft,
@@ -9362,6 +9391,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_projection_preserves_managed_unready_health() {
+        let status = crate::process::ports::PortStatus {
+            port: 43123,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ManagedUnready,
+            listeners: Arc::from([]),
+            error: None,
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::ManagedUnready);
+        assert_eq!(authority.resource, Some(status.resource));
+    }
+
+    #[test]
     fn legacy_pid_only_port_status_cannot_prove_remote_forward_authority() {
         let mut session = SessionRuntimeState::new(
             "remote-port-authority",
@@ -9463,7 +9507,7 @@ mod tests {
         )
         .unwrap();
         let resource = ResourceFence::new(crate::domain::id::ResourceId::new(), 7);
-        let live = ManagedResourceSnapshot::new(
+        let live = Arc::new(test_capability_from_snapshot(ManagedResourceSnapshot::new(
             crate::process::registry::ManagedProcessFence::new(
                 resource,
                 ProcessOwner::Host,
@@ -9472,7 +9516,7 @@ mod tests {
             ManagedProcessState::Running,
             vec![root],
             RegistryMembershipSnapshot::valid(9, 11, Instant::now(), Duration::from_secs(5)),
-        );
+        )));
         let now = super::now_epoch_ms();
         let authority = RemotePortAuthority {
             port: 43123,
@@ -9496,11 +9540,11 @@ mod tests {
             publication_sequence: 13,
             observed_at_epoch_ms: now,
             freshness_deadline_epoch_ms: now + REMOTE_PORT_AUTHORITY_MAX_AGE_MS,
-            managed_fence_fingerprint: Some(live.authority_fingerprint()),
+            managed_fence_fingerprint: Some(live.snapshot().authority_fingerprint()),
             verified: None,
             error: None,
         }
-        .with_managed_snapshot(&live);
+        .with_managed_capability(live.as_ref());
 
         let mut runtime = RuntimeState::default();
         runtime
@@ -9539,8 +9583,20 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
+        let mut unready = authority.clone();
+        unready.kind = RemotePortAuthorityKind::ManagedUnready;
+        assert!(
+            !super::remote_authority_allows_forward_with_live(
+                &unready,
+                43123,
+                &session,
+                now,
+                Some(live.as_ref()),
+            ),
+            "managed-unready authority may describe health but cannot authorize forwarding"
+        );
         let mut missing_session = authority.clone();
         missing_session.session_id = None;
         assert!(!super::remote_authority_allows_forward_with_live(
@@ -9548,7 +9604,7 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut forged_session = authority.clone();
         forged_session.session_id = Some("forged-session-id".to_string());
@@ -9557,7 +9613,7 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut wrong_root = authority.clone();
         wrong_root.root.as_mut().expect("root identity").pid += 1;
@@ -9566,16 +9622,17 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut shape_only = authority.clone();
-        shape_only.managed_fence_fingerprint = Some(live.authority_fingerprint().wrapping_add(1));
+        shape_only.managed_fence_fingerprint =
+            Some(live.snapshot().authority_fingerprint().wrapping_add(1));
         assert!(!super::remote_authority_allows_forward_with_live(
             &shape_only,
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut errored = authority.clone();
         errored.error = Some("membership probe failed".to_string());
@@ -9584,7 +9641,7 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut forged_listener_executable = authority.clone();
         forged_listener_executable.listeners[0].executable_fingerprint = Some(
@@ -9598,7 +9655,7 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut forged_member = authority.clone();
         forged_member.listeners[0].pid += 1;
@@ -9607,7 +9664,7 @@ mod tests {
             43123,
             &session,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let mut wrong_session_port = session.clone();
         wrong_session_port
@@ -9620,7 +9677,7 @@ mod tests {
             43123,
             &wrong_session_port,
             now,
-            Some(&live),
+            Some(live.as_ref()),
         ));
         let observation_time = Instant::now();
         assert!(!authority.has_exact_managed_fence_for(

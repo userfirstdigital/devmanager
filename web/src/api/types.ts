@@ -123,6 +123,7 @@ export interface WebPortStatus {
 
 export type WebPortAuthorityKind =
   | "managed"
+  | "managedUnready"
   | "provenExternal"
   | "unknown"
   | "probeError"
@@ -131,6 +132,7 @@ export type WebPortAuthorityKind =
 
 export type WebPortControlReason =
   | "exactManagedFence"
+  | "managedUnready"
   | "provenExternalNoControl"
   | "starting"
   | "free"
@@ -157,6 +159,8 @@ export interface WebPortAuthority {
   observedAtEpochMs: number;
   freshnessDeadlineEpochMs: number;
   fresh: boolean;
+  /** Older hosts may omit this; absence is fail-closed for URL actions. */
+  reapIncomplete?: boolean;
   controlReason: WebPortControlReason;
   error: string | null;
 }

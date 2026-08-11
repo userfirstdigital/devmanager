@@ -21,6 +21,7 @@ import {
   type SessionRuntimeState,
   type SessionStatus,
   type SessionTab,
+  type WebPortAuthority,
 } from "../api/types";
 import { useStore } from "../store";
 import {
@@ -45,21 +46,144 @@ function findSessionForCommand(
   return null;
 }
 
-function statusDotClass(status: SessionStatus | undefined): string {
+function authorityDotState(
+  authority: WebPortAuthority | undefined,
+  sessionId: string | undefined,
+): "managed" | "managedUnready" | "external" | "unknown" {
+  if (
+    !authority ||
+    authority.fresh !== true ||
+    authority.reapIncomplete !== false ||
+    authority.error !== null ||
+    authority.listeners.length === 0 ||
+    !authority.listeners.every(
+      (listener) =>
+        listener.pid > 0 &&
+        listener.creationTime100ns > 0 &&
+        listener.executableProven,
+    )
+  ) {
+    return "unknown";
+  }
+  if (
+    authority.kind === "managed" &&
+    authority.controlReason === "exactManagedFence" &&
+    authority.sessionId != null &&
+    authority.sessionId === sessionId
+  ) {
+    return "managed";
+  }
+  if (
+    authority.kind === "managedUnready" &&
+    authority.controlReason === "managedUnready" &&
+    authority.sessionId != null &&
+    authority.sessionId === sessionId
+  ) {
+    return "managedUnready";
+  }
+  if (
+    authority.kind === "provenExternal" &&
+    authority.controlReason === "provenExternalNoControl"
+  ) {
+    return "external";
+  }
+  return "unknown";
+}
+
+function statusDotClass(
+  status: SessionStatus | undefined,
+  sessionId: string | undefined,
+  authority: WebPortAuthority | undefined = undefined,
+  authorityRequired = false,
+): string {
+  if (!status && authorityRequired) {
+    switch (authorityDotState(authority, sessionId)) {
+      case "managed":
+        return "bg-emerald-400 dot-live";
+      case "managedUnready":
+        return "bg-amber-400 dot-live";
+      case "external":
+        return "bg-sky-400 dot-live";
+      case "unknown":
+        return "bg-zinc-500";
+    }
+  }
   if (!status || status === "Stopped" || status === "Exited") {
     return "bg-zinc-600";
   }
-  if (status === "Running") return "bg-emerald-400 dot-live";
+  if (status === "Running") {
+    if (!authorityRequired) return "bg-emerald-400 dot-live";
+    switch (authorityDotState(authority, sessionId)) {
+      case "managed":
+        return "bg-emerald-400 dot-live";
+      case "managedUnready":
+        return "bg-amber-400 dot-live";
+      case "external":
+        return "bg-sky-400 dot-live";
+      case "unknown":
+        return "bg-zinc-500";
+    }
+  }
   if (status === "Starting") return "bg-amber-400 dot-live";
   if (status === "Stopping") return "bg-amber-400";
   if (status === "Crashed" || status === "Failed") return "bg-red-400";
   return "bg-zinc-600";
 }
 
+function statusDotLabel(
+  status: SessionStatus | undefined,
+  sessionId: string | undefined,
+  authority: WebPortAuthority | undefined,
+  authorityRequired = false,
+): string {
+  if (!status && authorityRequired) {
+    switch (authorityDotState(authority, sessionId)) {
+      case "managed":
+        return "Managed server ready";
+      case "managedUnready":
+        return "Managed server not ready";
+      case "external":
+        return "External listener";
+      case "unknown":
+        return "Port authority unknown";
+    }
+  }
+  if (status === "Running" && authorityRequired) {
+    switch (authorityDotState(authority, sessionId)) {
+      case "managed":
+        return "Managed server ready";
+      case "managedUnready":
+        return "Managed server not ready";
+      case "external":
+        return "External listener";
+      case "unknown":
+        return "Port authority unknown";
+    }
+  }
+  switch (status) {
+    case "Running":
+      return "Running";
+    case "Starting":
+      return "Starting";
+    case "Stopping":
+      return "Stopping";
+    case "Crashed":
+      return "Crashed";
+    case "Failed":
+      return "Failed";
+    case "Exited":
+      return "Exited";
+    case "Stopped":
+    case undefined:
+      return "Stopped";
+  }
+}
+
 interface ServerActionButtonsProps {
   command: RunCommand;
   live: boolean;
   session: SessionRuntimeState | null;
+  authority: WebPortAuthority | undefined;
   onOpenSite(e: React.MouseEvent): void;
   onStart(e: React.MouseEvent): void;
   onStop(e: React.MouseEvent): void;
@@ -70,6 +194,7 @@ function ServerActionButtons({
   command,
   live,
   session,
+  authority,
   onOpenSite,
   onStart,
   onStop,
@@ -93,7 +218,7 @@ function ServerActionButtons({
 
   return (
     <div className={ACTION_REVEAL_CLASS}>
-      {canOpenRemoteSite(command, session) && (
+      {canOpenRemoteSite(command, session, authority) && (
         <button
           type="button"
           data-sidebar-action="true"
@@ -129,10 +254,11 @@ function ServerActionButtons({
 interface CommandRowProps {
   command: RunCommand;
   session: SessionRuntimeState | null;
+  authority: WebPortAuthority | undefined;
   indent: number;
 }
 
-function CommandRow({ command, session, indent }: CommandRowProps) {
+function CommandRow({ command, session, authority, indent }: CommandRowProps) {
   const activeSessionId = useStore(
     (s) => s.rawTerminal.activeStreamSessionId,
   );
@@ -180,6 +306,16 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
   const onOpenSite = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (command.port == null) return;
+    const currentState = useStore.getState();
+    const currentAuthority = currentState.workspace?.portAuthorities?.find(
+      (candidate) => candidate.port === command.port,
+    );
+    const currentSession = currentState.workspace?.sessions.find(
+      (candidate) => candidate.commandId === command.id,
+    );
+    if (!canOpenRemoteSite(command, currentSession ?? null, currentAuthority)) {
+      return;
+    }
     openRemoteSiteInNewTab(window.open, window.location, command.port);
   };
 
@@ -203,7 +339,23 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
       <span
         className={`inline-block size-2 rounded-full shrink-0 ${statusDotClass(
           session?.status,
+          session?.session_id,
+          authority,
+          command.port != null,
         )}`}
+        role="img"
+        aria-label={statusDotLabel(
+          session?.status,
+          session?.session_id,
+          authority,
+          command.port != null,
+        )}
+        title={statusDotLabel(
+          session?.status,
+          session?.session_id,
+          authority,
+          command.port != null,
+        )}
       />
       <TerminalIcon className="size-3.5 text-zinc-500 shrink-0" />
       <span className="flex-1 truncate text-[11px] text-zinc-300">
@@ -218,6 +370,7 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
         command={command}
         live={live}
         session={session}
+        authority={authority}
         onOpenSite={onOpenSite}
         onStart={onStart}
         onStop={onStop}
@@ -230,10 +383,11 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
 interface FolderSectionProps {
   folder: ProjectFolder;
   sessions: Record<string, SessionRuntimeState>;
+  authorities: WebPortAuthority[];
   indent: number;
 }
 
-function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
+function FolderSection({ folder, sessions, authorities, indent }: FolderSectionProps) {
   const [expanded, setExpanded] = useState(true);
   const activeSessionId = useStore(
     (s) => s.rawTerminal.activeStreamSessionId,
@@ -248,6 +402,7 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
 
   if (presentation.kind === "single-command" && command) {
     const session = findSessionForCommand(sessions, command.id);
+    const authority = authorities.find((candidate) => candidate.port === command.port);
     const live = isLiveStatus(session?.status);
     const rowSessionId = session?.session_id ?? command.id;
     const isActive = activeSessionId === rowSessionId;
@@ -289,6 +444,16 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
     const onOpenSite = (e: React.MouseEvent) => {
       e.stopPropagation();
       if (command.port == null) return;
+      const currentState = useStore.getState();
+      const currentAuthority = currentState.workspace?.portAuthorities?.find(
+        (candidate) => candidate.port === command.port,
+      );
+      const currentSession = currentState.workspace?.sessions.find(
+        (candidate) => candidate.commandId === command.id,
+      );
+      if (!canOpenRemoteSite(command, currentSession ?? null, currentAuthority)) {
+        return;
+      }
       openRemoteSiteInNewTab(window.open, window.location, command.port);
     };
 
@@ -312,7 +477,23 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
         <span
           className={`inline-block size-2 rounded-full shrink-0 ${statusDotClass(
             session?.status,
+            session?.session_id,
+            authority,
+            command.port != null,
           )}`}
+          role="img"
+          aria-label={statusDotLabel(
+            session?.status,
+            session?.session_id,
+            authority,
+            command.port != null,
+          )}
+          title={statusDotLabel(
+            session?.status,
+            session?.session_id,
+            authority,
+            command.port != null,
+          )}
         />
         <Folder className="size-3.5 text-zinc-500 shrink-0" />
         <div className="min-w-0 flex-1">
@@ -332,6 +513,7 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
           command={command}
           live={live}
           session={session}
+          authority={authority}
           onOpenSite={onOpenSite}
           onStart={onStart}
           onStop={onStop}
@@ -368,6 +550,9 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
             key={nestedCommand.id}
             command={nestedCommand}
             session={findSessionForCommand(sessions, nestedCommand.id)}
+            authority={authorities.find(
+              (candidate) => candidate.port === nestedCommand.port,
+            )}
             indent={indent + 14}
           />
         ))}
@@ -425,6 +610,7 @@ function AiTabRow({ tab, session, indent }: AiTabRowProps) {
       <span
         className={`inline-block size-2 rounded-full shrink-0 ${statusDotClass(
           session?.status,
+          undefined,
         )}`}
       />
       <Icon className={`size-3.5 shrink-0 ${tone}`} />
@@ -448,9 +634,10 @@ interface ProjectSectionProps {
   project: Project;
   sessions: Record<string, SessionRuntimeState>;
   tabs: SessionTab[];
+  authorities: WebPortAuthority[];
 }
 
-function ProjectSection({ project, sessions, tabs }: ProjectSectionProps) {
+function ProjectSection({ project, sessions, tabs, authorities }: ProjectSectionProps) {
   const activeProjectId = useStore((s) => s.activeProjectId);
   const setActiveProject = useStore((s) => s.setActiveProject);
   const collapsed = useStore((s) => s.collapsedProjects.has(project.id));
@@ -552,6 +739,7 @@ function ProjectSection({ project, sessions, tabs }: ProjectSectionProps) {
               key={folder.id}
               folder={folder}
               sessions={sessions}
+              authorities={authorities}
               indent={18}
             />
           ))}
@@ -578,11 +766,13 @@ function ProjectGroup({
   projects,
   sessions,
   tabs,
+  authorities,
 }: {
   title?: string;
   projects: Project[];
   sessions: Record<string, SessionRuntimeState>;
   tabs: SessionTab[];
+  authorities: WebPortAuthority[];
 }) {
   if (projects.length === 0) return null;
 
@@ -599,6 +789,7 @@ function ProjectGroup({
           project={project}
           sessions={sessions}
           tabs={tabs}
+          authorities={authorities}
         />
       ))}
     </div>
@@ -607,6 +798,7 @@ function ProjectGroup({
 
 export function ProjectTree() {
   const snapshot = useStore((s) => s.snapshot);
+  const authorities = useStore((s) => s.workspace?.portAuthorities ?? []);
   if (!snapshot) return null;
 
   const projects = snapshot.appState?.config?.projects ?? [];
@@ -627,12 +819,14 @@ export function ProjectTree() {
         projects={pinned}
         sessions={sessions}
         tabs={tabs}
+        authorities={authorities}
       />
       <ProjectGroup
         title={pinned.length > 0 && standard.length > 0 ? "Projects" : undefined}
         projects={standard}
         sessions={sessions}
         tabs={tabs}
+        authorities={authorities}
       />
     </div>
   );

@@ -13,15 +13,15 @@ use devmanager::process::ports::{
     classify_port_authority, classify_port_authority_from_snapshot, ensure_managed_start_allowed,
     launch_if_port_free, launch_if_port_free_with_revalidation, project_port_status,
     project_port_status_at, project_port_status_from_snapshot,
-    project_port_status_from_snapshot_with_membership_reconciliation_at,
-    registered_resource_snapshot_with_membership, ListenerIdentity, ManagedPortHealth,
-    ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority, PortInventorySnapshot,
-    PortObservation, PortObservationIssue, PortScanError, PortStartError, PortStatusKind,
-    PortTarget, RegistryMembershipSnapshot, ScanCancellation, TcpAddressFamily, TcpEndpoint,
-    TcpEndpointRecord, TcpProtocol, MAX_SCAN_WAITERS,
+    project_port_status_from_snapshot_with_membership_reconciliation_at, ListenerIdentity,
+    ManagedPortHealth, ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority,
+    PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError, PortStartError,
+    PortStatusKind, PortTarget, ScanCancellation, TcpAddressFamily, TcpEndpoint, TcpEndpointRecord,
+    TcpProtocol, MAX_SCAN_WAITERS,
 };
 use devmanager::process::registry::{
-    JobMembership, ManagedProcessFence, ManagedProcessState, ProcessRegistry, RegisteredProcess,
+    JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership, ManagedProcessFence,
+    ManagedProcessState, ProcessRegistry, RegisteredProcess,
 };
 use devmanager::services::ports_service::{
     legacy_statuses_from_snapshot, scan_listener_inventory, scan_listener_inventory_with,
@@ -77,11 +77,29 @@ fn free_scan(ports: &[u16]) -> PortInventorySnapshot {
 #[derive(Debug, Clone)]
 struct TestJob {
     root_pid: u32,
+    root_creation_time_100ns: u64,
+    inspectable: bool,
+    active: Arc<AtomicBool>,
 }
 
 impl JobMembership for TestJob {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
-        Ok(vec![self.root_pid])
+        Ok(self
+            .active
+            .load(Ordering::Acquire)
+            .then_some(self.root_pid)
+            .into_iter()
+            .collect())
+    }
+
+    fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+        if !self.inspectable || pid != self.root_pid {
+            return Err(format!("process identity for PID {pid} is inaccessible"));
+        }
+        Ok(JobMemberInfo::new(
+            identity(self.root_pid, self.root_creation_time_100ns, &executable()),
+            None,
+        ))
     }
 }
 
@@ -90,18 +108,74 @@ fn registry_with_root(
     root_pid: u32,
     root_creation_time_100ns: u64,
 ) -> (ProcessRegistry<TestJob>, ManagedProcessFence) {
+    let (registry, fence, _) =
+        registry_with_root_control(resource, root_pid, root_creation_time_100ns, true, true);
+    (registry, fence)
+}
+
+fn registry_with_root_config(
+    resource: ResourceFence,
+    root_pid: u32,
+    root_creation_time_100ns: u64,
+    inspectable: bool,
+) -> (ProcessRegistry<TestJob>, ManagedProcessFence) {
+    let (registry, fence, _) = registry_with_root_control(
+        resource,
+        root_pid,
+        root_creation_time_100ns,
+        inspectable,
+        true,
+    );
+    (registry, fence)
+}
+
+fn registry_with_root_control(
+    resource: ResourceFence,
+    root_pid: u32,
+    root_creation_time_100ns: u64,
+    inspectable: bool,
+    active: bool,
+) -> (
+    ProcessRegistry<TestJob>,
+    ManagedProcessFence,
+    Arc<AtomicBool>,
+) {
     let root = identity(root_pid, root_creation_time_100ns, &executable());
     let mut registry = ProcessRegistry::new();
+    let active = Arc::new(AtomicBool::new(active));
     let registered = RegisteredProcess::new(
         resource,
         ProcessOwner::Host,
         root,
         devmanager::process::registry::ProcessDisplayLabel::new("port test")
             .expect("display label"),
-        TestJob { root_pid },
+        TestJob {
+            root_pid,
+            root_creation_time_100ns,
+            inspectable,
+            active: active.clone(),
+        },
     );
     let managed_fence = registry.register(registered).expect("register process");
-    (registry, managed_fence)
+    (registry, managed_fence, active)
+}
+
+fn registry_snapshot(
+    registry: &ProcessRegistry<TestJob>,
+    resource: ResourceFence,
+    observed_at: Instant,
+    max_age: Duration,
+) -> ManagedResourceSnapshot {
+    registry
+        .managed_resource_snapshot(resource, observed_at, max_age)
+        .expect("current resource snapshot")
+}
+
+fn current_registry_snapshot(
+    registry: &ProcessRegistry<TestJob>,
+    resource: ResourceFence,
+) -> ManagedResourceSnapshot {
+    registry_snapshot(registry, resource, Instant::now(), Duration::from_secs(10))
 }
 
 fn target(resource: ResourceFence) -> PortTarget {
@@ -119,12 +193,7 @@ fn reserve_ephemeral_port() -> u16 {
 fn starting_resource_is_orange_even_before_a_listener_appears() {
     let resource = fence(1, 1);
     let (registry, _) = registry_with_root(resource, 11_001, 101);
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
 
     let status = project_port_status(&target(resource), &PortObservation::Free, Some(&managed));
 
@@ -135,12 +204,7 @@ fn starting_resource_is_orange_even_before_a_listener_appears() {
 fn stale_starting_observation_remains_orange_with_probe_detail() {
     let resource = fence(111, 1);
     let (registry, _) = registry_with_root(resource, 11_111, 1_111);
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current starting resource");
+    let managed = current_registry_snapshot(&registry, resource);
     let observed_at = Instant::now() - Duration::from_secs(60);
     let deadline = Instant::now() + Duration::from_secs(1);
 
@@ -211,17 +275,12 @@ fn stale_managed_listener_snapshot_is_unknown_instead_of_green() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot_with_membership(
+    let managed = registry_snapshot(
         &registry,
         resource,
-        RegistryMembershipSnapshot::valid(
-            1,
-            1,
-            Instant::now() - Duration::from_secs(60),
-            Duration::from_secs(5),
-        ),
-    )
-    .expect("current resource");
+        Instant::now() - Duration::from_secs(60),
+        Duration::from_secs(5),
+    );
     let port = 43_100;
     let listener = listener(11_110, 1_110);
     let snapshot = PortInventorySnapshot::from_parts(
@@ -245,12 +304,7 @@ fn stale_managed_listener_snapshot_is_unknown_instead_of_green() {
 fn starting_resource_wins_over_a_stale_probe_fault() {
     let resource = fence(101, 1);
     let (registry, managed_fence) = registry_with_root(resource, 12_101, 10_101);
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
     let snapshot = PortInventorySnapshot::from_parts(
         BTreeMap::from([(43001, PortObservation::ProbeError("stale".to_string()))]),
         BTreeMap::new(),
@@ -320,12 +374,7 @@ fn public_snapshot_bounds_and_sanitizes_diagnostic_strings() {
 fn probe_failure_remains_visible_while_managed_resource_is_starting() {
     let resource = fence(10, 1);
     let (registry, _) = registry_with_root(resource, 11_013, 1_013);
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
 
     let status = project_port_status(
         &target(resource),
@@ -344,12 +393,7 @@ fn matching_managed_ready_listener_is_green() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
 
     let status = project_port_status(
         &target(resource),
@@ -367,12 +411,7 @@ fn matching_managed_listener_without_readiness_is_orange_unready() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
     let target = PortTarget::new(43001, resource, ManagedPortHealth::NotReady);
 
     let status = project_port_status(
@@ -408,12 +447,7 @@ fn mixed_managed_and_ownership_unverified_listeners_are_preserved_and_fail_close
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
     let managed_listener = listener(11_009, 909);
     let ownership_unverified_listener = listener(11_010, 910);
     let observation = PortObservation::Listeners(Arc::from(
@@ -437,16 +471,11 @@ fn mixed_managed_and_ownership_unverified_listeners_are_preserved_and_fail_close
 #[test]
 fn valid_registry_snapshot_can_prove_a_listener_external() {
     let resource = fence(18, 1);
-    let managed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(
-            resource,
-            ProcessOwner::Host,
-            identity(11_018, 1_818, &executable()),
-        ),
-        ManagedProcessState::Running,
-        vec![identity(11_018, 1_818, &executable())],
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    );
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_018, 1_818);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = current_registry_snapshot(&registry, resource);
     let target = PortTarget::new(43_018, resource, ManagedPortHealth::Ready);
     let snapshot = PortInventorySnapshot::with_endpoints(
         BTreeMap::from([(target.port, single_listener(listener(11_019, 1_919)))]),
@@ -477,18 +506,8 @@ fn membership_change_after_listener_scan_cannot_paint_external_blue() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let first = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("first membership snapshot");
-    let second = ManagedResourceSnapshot::new(
-        first.fence().clone(),
-        first.state(),
-        first.member_identities().to_vec(),
-        RegistryMembershipSnapshot::valid(2, 2, Instant::now(), Duration::from_secs(10)),
-    );
+    let first = current_registry_snapshot(&registry, resource);
+    let second = current_registry_snapshot(&registry, resource);
     let port = 43_019;
     let snapshot = PortInventorySnapshot::with_endpoints(
         BTreeMap::from([(port, single_listener(listener(11_020, 2_020)))]),
@@ -531,13 +550,11 @@ fn membership_change_after_listener_scan_cannot_paint_external_blue() {
 #[test]
 fn pid_and_creation_without_executable_proof_cannot_be_external() {
     let resource = fence(181, 1);
-    let managed_identity = identity(11_181, 1_881, &executable());
-    let managed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(resource, ProcessOwner::Host, managed_identity.clone()),
-        ManagedProcessState::Running,
-        vec![managed_identity],
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    );
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_181, 1_881);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = current_registry_snapshot(&registry, resource);
     let unverifiable = ListenerIdentity::new(11_999, 1_999).expect("listener identity");
 
     assert_eq!(
@@ -584,12 +601,7 @@ fn pid_reuse_does_not_make_a_reused_pid_managed() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let managed = registered_resource_snapshot_with_membership(
-        &registry,
-        resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource");
+    let managed = current_registry_snapshot(&registry, resource);
 
     let status = project_port_status(
         &target(resource),
@@ -609,12 +621,7 @@ fn a_stale_resource_generation_cannot_claim_a_current_listener() {
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
 
-    let current_snapshot = registered_resource_snapshot_with_membership(
-        &registry,
-        current_resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current resource snapshot");
+    let current_snapshot = current_registry_snapshot(&registry, current_resource);
     let status = project_port_status(
         &target(stale_resource),
         &single_listener(listener(11_007, 707)),
@@ -632,12 +639,7 @@ fn direct_projection_requires_the_exact_target_fence() {
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
-    let current = registered_resource_snapshot_with_membership(
-        &registry,
-        current_resource,
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    )
-    .expect("current");
+    let current = current_registry_snapshot(&registry, current_resource);
 
     let status = project_port_status(
         &PortTarget::new(43_020, stale_resource, ManagedPortHealth::Ready),
@@ -739,29 +741,45 @@ fn probe_error_cannot_invoke_the_server_launch_callback() {
 #[test]
 fn stale_or_failed_membership_never_proves_managed_ownership() {
     let resource = fence(12, 1);
-    let member = identity(11_012, 1_212, &executable());
-    let stale = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
-        ManagedProcessState::Running,
-        vec![member.clone()],
-        RegistryMembershipSnapshot::stale(7, 9, Instant::now() - Duration::from_secs(10)),
+    let (mut stale_registry, stale_fence) = registry_with_root(resource, 11_012, 1_212);
+    stale_registry
+        .commit_resumed_exact(&stale_fence)
+        .expect("resume generation");
+    let stale = registry_snapshot(
+        &stale_registry,
+        resource,
+        Instant::now() - Duration::from_secs(10),
+        Duration::from_secs(5),
     );
     let stale_authority =
         classify_port_authority(&single_listener(listener(11_012, 1_212)), Some(&stale));
     assert_eq!(stale_authority, PortAuthority::Unknown);
 
-    let failed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
-        ManagedProcessState::Running,
-        vec![member],
-        RegistryMembershipSnapshot::failed(7, 10, "membership access denied"),
+    let (failed_registry, _) = registry_with_root_config(resource, 11_012, 1_212, false);
+    let failed = registry_snapshot(
+        &failed_registry,
+        resource,
+        Instant::now(),
+        Duration::from_secs(5),
     );
     let failed_authority =
         classify_port_authority(&single_listener(listener(11_012, 1_212)), Some(&failed));
     assert_eq!(failed_authority, PortAuthority::Unknown);
-    assert_eq!(failed.membership_revision(), 7);
-    assert_eq!(failed.observation_sequence(), 10);
+    assert!(failed.membership_revision() > 0);
+    assert!(failed.observation_sequence() > 0);
     assert_eq!(failed.validity(), ManagedProcessSnapshotValidity::Failed);
+}
+
+#[test]
+fn registry_snapshot_requires_the_root_to_remain_in_the_live_job() {
+    let resource = fence(121, 1);
+    let (registry, _, active) = registry_with_root_control(resource, 11_121, 1_221, true, true);
+    active.store(false, Ordering::Release);
+
+    let snapshot = current_registry_snapshot(&registry, resource);
+
+    assert_eq!(snapshot.validity(), ManagedProcessSnapshotValidity::Failed);
+    assert!(!snapshot.is_fresh_at(Instant::now()));
 }
 
 #[test]
@@ -774,16 +792,36 @@ fn inactive_managed_states_never_prove_an_external_listener() {
         ManagedProcessState::Failed,
         ManagedProcessState::Leaked,
     ] {
-        let managed = ManagedResourceSnapshot::new(
-            ManagedProcessFence::new(
-                resource,
-                ProcessOwner::Host,
-                identity(12_103, 1_203, &executable()),
-            ),
-            state,
-            vec![identity(12_103, 1_203, &executable())],
-            RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-        );
+        let (mut registry, fence, active) =
+            registry_with_root_control(resource, 12_103, 1_203, true, true);
+        match state {
+            ManagedProcessState::Stopping => {
+                assert!(registry.begin_stopping_exact(&fence));
+            }
+            ManagedProcessState::Stopped => {
+                active.store(false, Ordering::Release);
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::ActiveProcessZero,
+                )));
+            }
+            ManagedProcessState::Failed => {
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::AbnormalExitProcess { pid: 12_103 },
+                )));
+            }
+            ManagedProcessState::Leaked => {
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::MonitorFailed {
+                        detail: "test leak".to_string(),
+                    },
+                )));
+            }
+            ManagedProcessState::Starting | ManagedProcessState::Running => unreachable!(),
+        }
+        let managed = current_registry_snapshot(&registry, resource);
         let target = PortTarget::new(43_103, resource, ManagedPortHealth::Ready);
         let observation = single_listener(managed_identity.clone());
         assert_eq!(
@@ -807,22 +845,16 @@ fn inactive_managed_states_never_prove_an_external_listener() {
 #[test]
 fn executable_mismatch_for_the_same_pid_and_creation_is_unknown() {
     let resource = fence(104, 1);
-    let managed_executable = executable();
     let other_executable = if cfg!(windows) {
         PathBuf::from(r"C:\Windows\System32\cmd.exe")
     } else {
         PathBuf::from("/bin/sh")
     };
-    let managed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(
-            resource,
-            ProcessOwner::Host,
-            identity(12_104, 1_204, &managed_executable),
-        ),
-        ManagedProcessState::Running,
-        vec![identity(12_104, 1_204, &managed_executable)],
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    );
+    let (mut registry, managed_fence) = registry_with_root(resource, 12_104, 1_204);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = current_registry_snapshot(&registry, resource);
     let listener = ListenerIdentity::with_executable(12_104, 1_204, &other_executable)
         .expect("alternate executable identity");
 
@@ -834,9 +866,11 @@ fn executable_mismatch_for_the_same_pid_and_creation_is_unknown() {
 
 #[test]
 fn missing_membership_revision_or_observation_sequence_is_not_fresh() {
-    let now = Instant::now();
-    assert!(!RegistryMembershipSnapshot::valid(0, 1, now, Duration::from_secs(5)).is_fresh_at(now));
-    assert!(!RegistryMembershipSnapshot::valid(1, 0, now, Duration::from_secs(5)).is_fresh_at(now));
+    let resource = fence(106, 1);
+    let (registry, _) = registry_with_root(resource, 12_106, 1_206);
+    let snapshot = current_registry_snapshot(&registry, resource);
+    assert!(snapshot.membership_revision() > 0);
+    assert!(snapshot.observation_sequence() > 0);
 }
 
 #[test]
@@ -870,18 +904,40 @@ fn invalid_endpoint_rows_make_the_snapshot_unusable() {
 #[test]
 fn stopped_failed_and_leaked_generations_cannot_be_managed() {
     let resource = fence(13, 1);
-    let member = identity(11_013, 1_313, &executable());
     for state in [
         ManagedProcessState::Stopped,
         ManagedProcessState::Failed,
         ManagedProcessState::Leaked,
     ] {
-        let managed = ManagedResourceSnapshot::new(
-            ManagedProcessFence::new(resource, ProcessOwner::Host, member.clone()),
-            state,
-            vec![member.clone()],
-            RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-        );
+        let (mut registry, fence, active) =
+            registry_with_root_control(resource, 11_013, 1_313, true, true);
+        match state {
+            ManagedProcessState::Stopped => {
+                active.store(false, Ordering::Release);
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::ActiveProcessZero,
+                )));
+            }
+            ManagedProcessState::Failed => {
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::AbnormalExitProcess { pid: 11_013 },
+                )));
+            }
+            ManagedProcessState::Leaked => {
+                assert!(registry.apply_job_completion(JobCompletionMessage::new(
+                    fence.clone(),
+                    JobCompletionEvent::MonitorFailed {
+                        detail: "test leak".to_string(),
+                    },
+                )));
+            }
+            ManagedProcessState::Starting
+            | ManagedProcessState::Running
+            | ManagedProcessState::Stopping => unreachable!(),
+        }
+        let managed = current_registry_snapshot(&registry, resource);
         assert_ne!(
             classify_port_authority(&single_listener(listener(11_013, 1_313)), Some(&managed)),
             PortAuthority::Managed,
@@ -894,24 +950,19 @@ fn stopped_failed_and_leaked_generations_cannot_be_managed() {
 fn registered_snapshot_requires_the_exact_fence_and_carries_membership_contract() {
     let resource = fence(14, 3);
     let (registry, _) = registry_with_root(resource, 11_014, 1_414);
-    let membership =
-        RegistryMembershipSnapshot::valid(22, 31, Instant::now(), Duration::from_secs(5));
-    let snapshot =
-        registered_resource_snapshot_with_membership(&registry, resource, membership.clone())
-            .expect("exact current registry generation");
+    let snapshot = registry_snapshot(&registry, resource, Instant::now(), Duration::from_secs(5));
 
     assert_eq!(snapshot.resource(), resource);
-    assert_eq!(snapshot.membership_revision(), 22);
-    assert_eq!(snapshot.observation_sequence(), 31);
+    assert!(snapshot.membership_revision() > 0);
+    assert!(snapshot.observation_sequence() > 0);
     assert_eq!(
         snapshot.member_identities(),
         &[identity(11_014, 1_414, &executable())]
     );
     assert!(snapshot.is_fresh_at(Instant::now()));
-    assert!(
-        registered_resource_snapshot_with_membership(&registry, fence(14, 2), membership,)
-            .is_none()
-    );
+    assert!(registry
+        .managed_resource_snapshot(fence(14, 2), Instant::now(), Duration::from_secs(5))
+        .is_none());
 }
 
 #[test]
@@ -919,16 +970,11 @@ fn mixed_managed_and_external_endpoints_are_unknown_even_when_the_pid_list_looks
     let resource = fence(15, 1);
     let managed_identity = listener(11_015, 1_515);
     let external_identity = listener(11_016, 1_616);
-    let managed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(
-            resource,
-            ProcessOwner::Host,
-            identity(11_015, 1_515, &executable()),
-        ),
-        ManagedProcessState::Running,
-        vec![identity(11_015, 1_515, &executable())],
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
-    );
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_015, 1_515);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = current_registry_snapshot(&registry, resource);
     let port = 43_001;
     let observations = BTreeMap::from([(
         port,
@@ -1147,24 +1193,15 @@ fn endpoint_observation_preserves_tcp_family_bind_and_dual_stack_rows() {
         .any(|endpoint| endpoint.is_ipv6() && endpoint.is_wildcard()));
 
     let resource = fence(19, 1);
-    let managed = ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(
-            resource,
-            ProcessOwner::Host,
-            identity(
-                listener_identity.pid(),
-                listener_identity.creation_time_100ns(),
-                &executable(),
-            ),
-        ),
-        ManagedProcessState::Running,
-        vec![identity(
-            listener_identity.pid(),
-            listener_identity.creation_time_100ns(),
-            &executable(),
-        )],
-        RegistryMembershipSnapshot::valid(1, 1, Instant::now(), Duration::from_secs(10)),
+    let (mut registry, managed_fence) = registry_with_root(
+        resource,
+        listener_identity.pid(),
+        listener_identity.creation_time_100ns(),
     );
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let managed = current_registry_snapshot(&registry, resource);
     assert_eq!(
         classify_port_authority_from_snapshot(
             &PortTarget::new(port, resource, ManagedPortHealth::Ready),

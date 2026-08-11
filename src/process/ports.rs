@@ -766,7 +766,7 @@ pub struct RegistryMembershipSnapshot {
 }
 
 impl RegistryMembershipSnapshot {
-    pub fn valid(
+    pub(crate) fn valid(
         membership_revision: u64,
         observation_sequence: u64,
         observed_at: Instant,
@@ -782,7 +782,7 @@ impl RegistryMembershipSnapshot {
         }
     }
 
-    pub fn stale(
+    pub(crate) fn stale(
         membership_revision: u64,
         observation_sequence: u64,
         observed_at: Instant,
@@ -797,7 +797,7 @@ impl RegistryMembershipSnapshot {
         }
     }
 
-    pub fn failed(
+    pub(crate) fn failed(
         membership_revision: u64,
         observation_sequence: u64,
         detail: impl Into<String>,
@@ -851,7 +851,7 @@ pub struct ManagedResourceSnapshot {
 }
 
 impl ManagedResourceSnapshot {
-    pub fn new(
+    pub(crate) fn new(
         fence: ManagedProcessFence,
         state: ManagedProcessState,
         mut members: Vec<ManagedProcessIdentity>,
@@ -1004,60 +1004,43 @@ impl ManagedResourceSnapshot {
     }
 }
 
-/// Copy only the identity-bearing, read-only part of one exact registry entry.
+/// Opaque host authority issued only from a live process-registry observation.
 ///
-/// The membership metadata is deliberately supplied by the registry owner.
-/// This boundary no longer invents a `1/1` revision or sequence: a caller that
-/// cannot provide a current registry-issued observation must not prove
-/// ownership or externality from this snapshot.
-pub fn registered_resource_snapshot_with_membership<J>(
-    registry: &ProcessRegistry<J>,
-    resource: ResourceFence,
-    membership: RegistryMembershipSnapshot,
-) -> Option<ManagedResourceSnapshot> {
-    let current = registry.current(resource.resource_id)?;
-    if current.fence() != resource {
-        return None;
-    }
-
-    let mut members = Vec::with_capacity(1 + current.known_members().len());
-    members.push(current.root().clone());
-    members.extend(
-        current
-            .known_members()
-            .iter()
-            .map(|member| member.identity().clone()),
-    );
-    members.sort_unstable_by_key(|identity| {
-        (
-            identity.id().pid(),
-            identity.id().creation_time_100ns(),
-            identity.canonical_executable().to_path_buf(),
-        )
-    });
-    members.dedup();
-
-    let membership = if current.unknown_member_pids().is_empty() {
-        membership
-    } else {
-        RegistryMembershipSnapshot::failed(
-            membership.membership_revision(),
-            membership.observation_sequence(),
-            format!(
-                "{} managed Job member PIDs have unverified identity",
-                current.unknown_member_pids().len()
-            ),
-        )
-    };
-
-    Some(ManagedResourceSnapshot::new(
-        ManagedProcessFence::new(resource, current.owner(), current.root().clone()),
-        current.state(),
-        members,
-        membership,
-    ))
+/// The inner snapshot is intentionally private and this capability is not
+/// cloneable. Host publication may retain it behind an `Arc`, but callers can
+/// never construct a capability from a DTO or an arbitrary snapshot shape.
+#[derive(Debug)]
+pub(crate) struct ManagedResourceCapability {
+    snapshot: ManagedResourceSnapshot,
 }
 
+impl ManagedResourceCapability {
+    pub(crate) fn snapshot(&self) -> &ManagedResourceSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Issue one opaque authority from the current registry/Job observation. This
+/// is the only production constructor for [`ManagedResourceCapability`].
+pub(crate) fn issue_managed_resource_capability<J: crate::process::registry::JobMembership>(
+    registry: &mut ProcessRegistry<J>,
+    resource: ResourceFence,
+    observed_at: Instant,
+    max_age: Duration,
+) -> Option<ManagedResourceCapability> {
+    registry
+        .managed_resource_snapshot(resource, observed_at, max_age)
+        .map(|snapshot| ManagedResourceCapability { snapshot })
+}
+
+#[cfg(test)]
+pub(crate) fn test_capability_from_snapshot(
+    snapshot: ManagedResourceSnapshot,
+) -> ManagedResourceCapability {
+    ManagedResourceCapability { snapshot }
+}
+
+/// Classification-only result for one listener observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortAuthority {
     Managed,

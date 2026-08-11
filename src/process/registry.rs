@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
@@ -239,7 +241,11 @@ pub struct ManagedProcessFence {
 }
 
 impl ManagedProcessFence {
-    pub fn new(resource: ResourceFence, owner: ProcessOwner, root: ManagedProcessIdentity) -> Self {
+    pub(crate) fn new(
+        resource: ResourceFence,
+        owner: ProcessOwner,
+        root: ManagedProcessIdentity,
+    ) -> Self {
         Self {
             resource,
             owner,
@@ -445,6 +451,8 @@ impl<J: fmt::Debug> std::error::Error for ProcessRegistrationFailure<J> {
 pub struct ProcessRegistry<J> {
     runtime: RuntimeRegistry,
     current: BTreeMap<ResourceId, RegisteredProcess<J>>,
+    membership_revision: AtomicU64,
+    observation_sequence: AtomicU64,
 }
 
 impl<J> Default for ProcessRegistry<J> {
@@ -458,6 +466,8 @@ impl<J> ProcessRegistry<J> {
         Self {
             runtime: RuntimeRegistry::new(),
             current: BTreeMap::new(),
+            membership_revision: AtomicU64::new(0),
+            observation_sequence: AtomicU64::new(0),
         }
     }
 
@@ -569,6 +579,87 @@ impl<J> ProcessRegistry<J> {
 }
 
 impl<J: JobMembership> ProcessRegistry<J> {
+    /// Capture the current Job membership and mint a registry-owned snapshot.
+    /// The caller supplies only the observation clock and freshness bound;
+    /// revision, sequence, member identities, and validity come from this
+    /// live registry/Job query.
+    pub fn managed_resource_snapshot(
+        &self,
+        resource: ResourceFence,
+        observed_at: Instant,
+        max_age: Duration,
+    ) -> Option<crate::process::ports::ManagedResourceSnapshot> {
+        let resource_id = resource.resource_id;
+        if self
+            .current(resource_id)
+            .is_none_or(|current| current.fence() != resource)
+        {
+            return None;
+        }
+
+        let membership_revision = self
+            .membership_revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let observation_sequence = self
+            .observation_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let current = self.current(resource_id)?;
+        let mut members = Vec::with_capacity(1 + current.known_members().len());
+        let membership = match current.job().active_process_ids() {
+            Ok(mut active_pids) => {
+                active_pids.sort_unstable();
+                active_pids.dedup();
+                let mut unknown_member_pids = Vec::new();
+                let root_pid = current.root().id().pid();
+                if !active_pids.contains(&root_pid) {
+                    unknown_member_pids.push(root_pid);
+                }
+                for pid in active_pids {
+                    match current.job().inspect_process(pid) {
+                        Ok(member)
+                            if member.identity().id().pid() == pid
+                                && (pid != root_pid || member.identity() == current.root()) =>
+                        {
+                            members.push(member.identity().clone())
+                        }
+                        Ok(_) | Err(_) => unknown_member_pids.push(pid),
+                    }
+                }
+                members.push(current.root().clone());
+                if unknown_member_pids.is_empty() {
+                    crate::process::ports::RegistryMembershipSnapshot::valid(
+                        membership_revision,
+                        observation_sequence,
+                        observed_at,
+                        max_age,
+                    )
+                } else {
+                    crate::process::ports::RegistryMembershipSnapshot::failed(
+                        membership_revision,
+                        observation_sequence,
+                        format!(
+                            "{} managed Job member PIDs have unverified identity",
+                            unknown_member_pids.len()
+                        ),
+                    )
+                }
+            }
+            Err(error) => crate::process::ports::RegistryMembershipSnapshot::failed(
+                membership_revision,
+                observation_sequence,
+                error,
+            ),
+        };
+        Some(crate::process::ports::ManagedResourceSnapshot::new(
+            ManagedProcessFence::from_process(current),
+            current.state(),
+            members,
+            membership,
+        ))
+    }
+
     pub fn register(
         &mut self,
         mut process: RegisteredProcess<J>,

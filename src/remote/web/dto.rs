@@ -210,6 +210,7 @@ pub struct WebPortStatus {
 #[serde(rename_all = "camelCase")]
 pub enum WebPortAuthorityKind {
     Managed,
+    ManagedUnready,
     ProvenExternal,
     Unknown,
     ProbeError,
@@ -221,6 +222,7 @@ impl From<RemotePortAuthorityKind> for WebPortAuthorityKind {
     fn from(value: RemotePortAuthorityKind) -> Self {
         match value {
             RemotePortAuthorityKind::Managed => Self::Managed,
+            RemotePortAuthorityKind::ManagedUnready => Self::ManagedUnready,
             RemotePortAuthorityKind::ProvenExternal => Self::ProvenExternal,
             RemotePortAuthorityKind::Unknown => Self::Unknown,
             RemotePortAuthorityKind::ProbeError => Self::ProbeError,
@@ -234,6 +236,7 @@ impl From<RemotePortAuthorityKind> for WebPortAuthorityKind {
 #[serde(rename_all = "camelCase")]
 pub enum WebPortControlReason {
     ExactManagedFence,
+    ManagedUnready,
     ProvenExternalNoControl,
     Starting,
     Free,
@@ -257,6 +260,9 @@ pub struct WebPortAuthority {
     pub observed_at_epoch_ms: u64,
     pub freshness_deadline_epoch_ms: u64,
     pub fresh: bool,
+    /// The matching host session must not still be waiting for exact process
+    /// cleanup before a browser action can use this authority.
+    pub reap_incomplete: bool,
     pub control_reason: WebPortControlReason,
     pub error: Option<String>,
 }
@@ -270,15 +276,51 @@ pub struct WebPortListenerIdentity {
 }
 
 impl WebPortAuthority {
-    fn from_remote(authority: &RemotePortAuthority, now_epoch_ms: u64) -> Self {
+    fn from_remote(
+        authority: &RemotePortAuthority,
+        runtime: &RuntimeState,
+        now_epoch_ms: u64,
+    ) -> Self {
         let kind = WebPortAuthorityKind::from(authority.kind);
         let fresh = authority.is_fresh_at(now_epoch_ms);
+        let matching_session = authority
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                runtime
+                    .sessions
+                    .values()
+                    .find(|session| session.session_id == session_id)
+            })
+            .or_else(|| {
+                runtime.sessions.values().find(|session| {
+                    session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port)
+                        == Some(authority.port)
+                })
+            });
+        let host_verified_for_current_session = authority.is_host_verified()
+            && matching_session.is_some_and(|session| {
+                session.status == SessionStatus::Running
+                    && !session.reap_incomplete
+                    && authority.session_id.as_deref() == Some(session.session_id.as_str())
+                    && session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port)
+                        == Some(authority.port)
+            });
         let control_reason = if !fresh {
             WebPortControlReason::Stale
         } else {
             match authority.kind {
-                RemotePortAuthorityKind::Managed if authority.is_host_verified() => {
+                RemotePortAuthorityKind::Managed if host_verified_for_current_session => {
                     WebPortControlReason::ExactManagedFence
+                }
+                RemotePortAuthorityKind::ManagedUnready if host_verified_for_current_session => {
+                    WebPortControlReason::ManagedUnready
                 }
                 RemotePortAuthorityKind::ProvenExternal => {
                     WebPortControlReason::ProvenExternalNoControl
@@ -287,7 +329,9 @@ impl WebPortAuthority {
                 RemotePortAuthorityKind::ProbeError => WebPortControlReason::ProbeFault,
                 RemotePortAuthorityKind::Unknown => WebPortControlReason::MixedOrUnverified,
                 RemotePortAuthorityKind::Occupied => WebPortControlReason::MixedOrUnverified,
-                RemotePortAuthorityKind::Managed => WebPortControlReason::MixedOrUnverified,
+                RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready => {
+                    WebPortControlReason::MixedOrUnverified
+                }
             }
         };
         Self {
@@ -317,6 +361,12 @@ impl WebPortAuthority {
             observed_at_epoch_ms: authority.observed_at_epoch_ms,
             freshness_deadline_epoch_ms: authority.freshness_deadline_epoch_ms,
             fresh,
+            reap_incomplete: matching_session
+                .map(|session| session.reap_incomplete)
+                .unwrap_or(matches!(
+                    authority.kind,
+                    RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
+                )),
             control_reason,
             error: authority.error.clone(),
         }
@@ -448,7 +498,7 @@ impl WebWorkspaceSnapshot {
         let now_epoch_ms = crate::remote::now_epoch_ms();
         let mut port_authorities = authorities
             .values()
-            .map(|authority| WebPortAuthority::from_remote(authority, now_epoch_ms))
+            .map(|authority| WebPortAuthority::from_remote(authority, runtime, now_epoch_ms))
             .collect::<Vec<_>>();
         port_authorities.sort_by_key(|authority| authority.port);
 

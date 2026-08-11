@@ -124,9 +124,19 @@ fn registration(
     root: ManagedProcessIdentity,
     job: ScriptedJob,
 ) -> RegisteredProcess<ScriptedJob> {
+    registration_with_owner(resource, generation, root, ProcessOwner::Host, job)
+}
+
+fn registration_with_owner(
+    resource: ResourceId,
+    generation: u64,
+    root: ManagedProcessIdentity,
+    owner: ProcessOwner,
+    job: ScriptedJob,
+) -> RegisteredProcess<ScriptedJob> {
     RegisteredProcess::new(
         ResourceFence::new(resource, generation),
-        ProcessOwner::Host,
+        owner,
         root,
         ProcessDisplayLabel::new("membership test").expect("display label"),
         job,
@@ -323,22 +333,32 @@ fn membership_stale_completion_cannot_mutate_replacement_generation() {
     ));
     assert_eq!(registry.drain_job_completions(resource), 1);
 
-    let wrong_owner = ManagedProcessFence::new(
-        replacement_fence.resource(),
-        ProcessOwner::Task(TaskId::new()),
-        replacement_fence.root().clone(),
-    );
+    let mut wrong_owner_registry = ProcessRegistry::new();
+    let wrong_owner = wrong_owner_registry
+        .register(registration_with_owner(
+            resource,
+            2,
+            replacement_fence.root().clone(),
+            ProcessOwner::Task(TaskId::new()),
+            ScriptedJob::with_root(4_002),
+        ))
+        .expect("wrong-owner fixture registration");
     assert!(!registry.apply_job_completion(completion(
         wrong_owner,
         JobCompletionEvent::MonitorFailed {
             detail: "wrong owner".to_string(),
         },
     )));
-    let wrong_root = ManagedProcessFence::new(
-        replacement_fence.resource(),
-        replacement_fence.owner(),
-        identity(4_002, 49_999, &executable()),
-    );
+    let mut wrong_root_registry = ProcessRegistry::new();
+    let wrong_root = wrong_root_registry
+        .register(registration_with_owner(
+            resource,
+            2,
+            identity(4_002, 49_999, &executable()),
+            replacement_fence.owner(),
+            ScriptedJob::with_root(4_002),
+        ))
+        .expect("wrong-root fixture registration");
     assert!(!registry.apply_job_completion(completion(
         wrong_root,
         JobCompletionEvent::AbnormalExitProcess { pid: 4_002 },

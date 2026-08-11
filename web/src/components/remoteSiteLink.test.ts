@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { WebPortAuthority } from "../api/types";
 
 import {
   buildRemoteSiteUrl,
@@ -7,17 +8,124 @@ import {
 } from "./remoteSiteLink";
 
 describe("remoteSiteLink", () => {
+  const authority = (
+    overrides: Partial<
+      Pick<
+        WebPortAuthority,
+        "kind" | "controlReason" | "fresh" | "listeners" | "reapIncomplete" | "error" | "sessionId"
+      >
+    > = {},
+  ): Pick<
+    WebPortAuthority,
+    "kind" | "controlReason" | "fresh" | "listeners" | "reapIncomplete" | "error" | "sessionId"
+  > => ({
+    kind: "managed",
+    controlReason: "exactManagedFence",
+    fresh: true,
+    sessionId: "session-1",
+    reapIncomplete: false,
+    error: null,
+    listeners: [
+      { pid: 42, creationTime100ns: 123, executableProven: true },
+    ],
+    ...overrides,
+  });
+
   it("derives the site URL from the current browser host and target port", () => {
     expect(
       buildRemoteSiteUrl("http://192.168.1.50:43871/remote?tab=web#hash", 3000),
     ).toBe("http://192.168.1.50:3000/");
   });
 
-  it("only exposes the remote-site action for running servers with a known port", () => {
-    expect(canOpenRemoteSite({ port: 3000 }, { status: "Running" })).toBe(true);
-    expect(canOpenRemoteSite({ port: 3000 }, { status: "Starting" })).toBe(false);
-    expect(canOpenRemoteSite({ port: null }, { status: "Running" })).toBe(false);
-    expect(canOpenRemoteSite({ port: 3000 }, null)).toBe(false);
+  it("only exposes the remote-site action for fresh typed authority", () => {
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority(),
+      ),
+    ).toBe(true);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ listeners: [] }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ error: "listener probe failed" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ kind: "unknown", controlReason: "mixedOrUnverified" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ fresh: false, controlReason: "stale" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ kind: "managed", controlReason: "starting" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ kind: "managedUnready", controlReason: "managedUnready" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ kind: "provenExternal", controlReason: "provenExternalNoControl" }),
+      ),
+    ).toBe(true);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ reapIncomplete: true }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite({ port: null }, { status: "Running", session_id: "session-1" }, authority()),
+    ).toBe(false);
+    expect(canOpenRemoteSite({ port: 3000 }, null, authority())).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ reapIncomplete: undefined }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-2" },
+        authority(),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        undefined,
+      ),
+    ).toBe(false);
   });
 
   it("opens the derived site URL in a new tab", () => {
