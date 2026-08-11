@@ -148,6 +148,7 @@ public static class DevManagerPreviewArtifactNative
     }
 
     private const uint FILE_SHARE_NONE = 0;
+    private const uint FILE_SHARE_READ = 0x00000001;
     private const uint FILE_SHARE_READ_WRITE = 0x00000003;
     private const uint FILE_READ_ATTRIBUTES = 0x00000080;
     private const uint FILE_TRAVERSE = 0x00000020;
@@ -261,7 +262,8 @@ public static class DevManagerPreviewArtifactNative
         SafeFileHandle parentDirectory,
         string fileName,
         uint desiredAccess,
-        uint createDisposition)
+        uint createDisposition,
+        uint shareAccess)
     {
         if (parentDirectory == null || parentDirectory.IsInvalid || string.IsNullOrWhiteSpace(fileName) ||
             fileName.IndexOf('\\') >= 0 || fileName.IndexOf('/') >= 0 || fileName.IndexOf('\0') >= 0)
@@ -303,7 +305,7 @@ public static class DevManagerPreviewArtifactNative
                 out ioStatus,
                 IntPtr.Zero,
                 FileAttributeNormal,
-                ShareRead | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                shareAccess,
                 createDisposition,
                 FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | OpenReparsePoint,
                 IntPtr.Zero,
@@ -328,7 +330,8 @@ public static class DevManagerPreviewArtifactNative
             parentDirectory,
             fileName,
             FILE_READ_DATA | FILE_WRITE_DATA | DELETE_ACCESS | SYNCHRONIZE,
-            FILE_CREATE);
+            FILE_CREATE,
+            FILE_SHARE_NONE);
     }
 
     public static SafeFileHandle OpenReadRelativeNoFollow(SafeFileHandle parentDirectory, string fileName)
@@ -337,7 +340,8 @@ public static class DevManagerPreviewArtifactNative
             parentDirectory,
             fileName,
             GenericRead | FILE_READ_DATA | SYNCHRONIZE,
-            FILE_OPEN);
+            FILE_OPEN,
+            FILE_SHARE_READ);
         if (IsReparsePoint(handle))
         {
             handle.Dispose();
@@ -2123,6 +2127,23 @@ function Assert-PreviewOutputAuthorityStable {
     $hash
 }
 
+function Assert-PreviewOutputAuthorityIdentityBeforeManifest {
+    param(
+        [object]$Authority,
+        [datetime]$Deadline
+    )
+
+    if ($Deadline -eq [datetime]::MinValue) {
+        $Deadline = New-PreviewIoDeadline
+    }
+    Assert-PreviewDeadline -Deadline $Deadline
+    Assert-PreviewDirectoryAuthorityStable -Authority $Authority.Parent
+    if ([DevManagerPreviewArtifactNative]::Identity($Authority.Stream.SafeFileHandle) -ne $Authority.FileIdentity -or
+        [int64][DevManagerPreviewArtifactNative]::Length($Authority.Stream.SafeFileHandle) -ne [int64]$Authority.Length) {
+        throw 'preview.output.identity-changed-before-manifest; final-name swap cannot replace retained output handle'
+    }
+}
+
 function Assert-PreviewJsonValueBounded {
     param(
         [object]$Value,
@@ -3846,6 +3867,7 @@ public static class DevManagerPreviewWindow {
                 if ($dimensions.Width -ne 640 -or $dimensions.Height -ne 360) {
                     throw 'preview.png.dimension-mismatch'
                 }
+                Assert-PreviewOutputAuthorityIdentityBeforeManifest -Authority $outputAuthority -Deadline $validationDeadline
                 [void]$manifest.Add([pscustomobject]@{
                     Fixture = $baseName
                     Page = $suffix

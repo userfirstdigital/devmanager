@@ -843,6 +843,129 @@ fn preview_capture_new_rust_fixture_json_is_lexically_bounded_before_serde() {
 }
 
 #[test]
+fn preview_capture_new_deadline_cleanup_requires_retained_published_output_handle() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let start = source
+        .find("pub fn cleanup_output_after_deadline")
+        .expect("deadline cleanup helper");
+    let end = source[start..]
+        .find("fn cleanup_authorized_output_after_deadline")
+        .map(|offset| start + offset)
+        .expect("authorized cleanup helper");
+    let cleanup = &source[start..end];
+    assert!(
+        source.contains("delete_published_output_by_handle")
+            && source.contains("published output handle is unavailable")
+            && source.contains("output residue is unresolved"),
+        "deadline cleanup must retain the attempt-owned output inode or expose unresolved residue"
+    );
+    assert!(
+        !cleanup.contains("remove_output_relative")
+            && !cleanup.contains("remove_name_relative")
+            && !cleanup.contains("CaptureOutputAuthority::new"),
+        "deadline cleanup must never re-resolve and delete by the final output name"
+    );
+}
+
+#[test]
+fn preview_capture_new_unix_publication_fails_closed_before_final_name_commit_barrier() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let start = source
+        .find("fn atomic_publish_temp_unix")
+        .expect("Unix publication helper");
+    let end = source[start..]
+        .find("\n#[cfg(windows)]\nfn atomic_publish_temp_windows")
+        .map(|offset| start + offset)
+        .expect("Unix publication helper end");
+    let unix_publication = &source[start..end];
+    for marker in [
+        "final-name publication cannot prove ownership",
+        "final-name swap barrier",
+        "visual capture HOLD",
+        "output residue is unresolved",
+    ] {
+        assert!(
+            source.contains(marker),
+            "Unix publication must expose {marker}"
+        );
+    }
+    assert!(
+        !unix_publication.contains("Ok(AtomicPublishOutcome::Published)"),
+        "Unix publication must not report success after a check-then-commit race"
+    );
+}
+
+#[test]
+fn preview_capture_new_script_output_handle_fences_swap_before_manifest() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    let read_start = script
+        .find("OpenReadRelativeNoFollow")
+        .expect("relative output reader");
+    let read_end = script[read_start..]
+        .find("public static Task<string>")
+        .map(|offset| read_start + offset)
+        .expect("relative output reader end");
+    let read_helper = &script[read_start..read_end];
+    assert!(
+        read_helper.contains("FILE_SHARE_READ")
+            && !read_helper.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE"),
+        "output reader must exclude write/delete sharing"
+    );
+    for marker in [
+        "Assert-PreviewOutputAuthorityIdentityBeforeManifest",
+        "final-name swap cannot replace retained output handle",
+    ] {
+        assert!(
+            script.contains(marker),
+            "output swap fence must provide {marker}"
+        );
+    }
+    let capture = script
+        .find("$outputAuthority = Open-PreviewOutputAuthority")
+        .expect("regular output authority");
+    let barrier = script[capture..]
+        .find("Assert-PreviewOutputAuthorityIdentityBeforeManifest")
+        .map(|offset| capture + offset)
+        .expect("manifest identity barrier");
+    let manifest = script[capture..]
+        .find("[void]$manifest.Add([pscustomobject]@{")
+        .map(|offset| capture + offset)
+        .expect("manifest publication");
+    assert!(
+        barrier < manifest,
+        "final-name identity must be revalidated immediately before manifest publication"
+    );
+}
+
+#[test]
+fn preview_capture_new_rust_fixture_scanner_covers_exact_boundary_and_8k_continuation() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    for marker in [
+        "fixture_json_exact_256k_boundary",
+        "fixture_json_token_continuation_across_8k",
+        "MAX_FIXTURE_BYTES",
+        "8192",
+    ] {
+        assert!(
+            source.contains(marker),
+            "fixture scanner adversary must cover {marker}"
+        );
+    }
+}
+
+#[test]
 fn preview_script_minimized_transition_requires_is_iconic_readback() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -652,8 +652,14 @@ impl CaptureOutputAuthority {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn remove_output_relative(&self) -> Result<(), PreviewCaptureError> {
-        self.remove_name_relative(&self.output_name)
+        // A final name is not an ownership proof.  Deadline/cancellation
+        // cleanup may only delete a retained PublishedOutput handle; callers
+        // that have no such handle must leave the residue visible.
+        Err(PreviewCaptureError::OutputFailed(
+            "published output handle is unavailable; output residue is unresolved".into(),
+        ))
     }
 
     fn output_identity_relative(&self) -> Result<CaptureFileIdentity, PreviewCaptureError> {
@@ -1913,14 +1919,13 @@ mod publication_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn atomic_publish_temp_linux_rejects_named_temp_replacement() {
-        use std::os::unix::fs::MetadataExt;
-
         let root = tempfile::tempdir().expect("publication test temp root");
         let output = root.path().join("published.png");
         let named = root.path().join(".published.tmp");
         let moved = root.path().join(".published-moved.tmp");
         let authority = CaptureOutputAuthority::new(&output, root.path())
             .expect("publication test authority should open");
+        fs::write(&output, b"attacker final replacement").expect("attacker final replacement");
         fs::write(&named, b"trusted named source").expect("named source");
         fs::rename(&named, &moved).expect("rename trusted named source");
         fs::write(&named, b"attacker replacement").expect("attacker replacement");
@@ -1941,17 +1946,24 @@ mod publication_tests {
             temp_name.is_none(),
             "Linux publication must never create a named temporary entry"
         );
-        let trusted_inode = file.metadata().expect("anonymous source metadata").ino();
         std::io::Write::write_all(&mut file, b"trusted anonymous source")
             .expect("anonymous source");
         file.sync_all().expect("anonymous source sync");
-        atomic_publish_temp(temp_name.as_deref(), &authority, &file)
-            .expect("anonymous handle-relative publication");
+        match atomic_publish_temp(temp_name.as_deref(), &authority, &file) {
+            Err(error) => assert!(
+                error.to_string().contains("HOLD"),
+                "Unix final-name publication must remain an explicit HOLD: {error}"
+            ),
+            Ok(_) => panic!(
+                "preview temporary inode identity changed during an unsafe final-name publication"
+            ),
+        }
         drop(file);
 
         assert_eq!(
-            fs::read(&output).expect("published output"),
-            b"trusted anonymous source"
+            fs::read(&output).expect("attacker final replacement remains"),
+            b"attacker final replacement",
+            "preview temporary inode identity changed during final-name publication"
         );
         assert_eq!(
             fs::read(&named).expect("attacker replacement remains isolated"),
@@ -1960,13 +1972,6 @@ mod publication_tests {
         assert_eq!(
             fs::read(&moved).expect("renamed named source remains isolated"),
             b"trusted named source"
-        );
-        assert_eq!(
-            fs::metadata(&output)
-                .expect("published output metadata")
-                .ino(),
-            trusted_inode,
-            "preview temporary inode identity changed during named-path replacement",
         );
     }
 }
@@ -1977,82 +1982,43 @@ pub(crate) fn bounded_redacted_diagnostic(value: &str) -> String {
     diagnostic.rendered
 }
 
+/// No retained `PublishedOutput` handle is available at this generic deadline
+/// boundary, so the final name is never resolved or deleted here.
 #[doc(hidden)]
 pub fn cleanup_output_after_deadline(
     output: &Path,
     primary: PreviewCaptureError,
     deadline: CaptureDeadline,
 ) -> PreviewCaptureError {
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let authority = match CaptureOutputAuthority::new(output, parent) {
-        Ok(authority) => Arc::new(authority),
-        Err(error) => {
-            return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
-                primary,
-                "remove output",
-                error,
-            ));
-        }
-    };
-    if in_capture_executor_worker() {
-        let cleanup = authority.remove_output_relative();
-        return match cleanup {
-            Ok(()) => primary,
-            Err(error) => PreviewCaptureError::CleanupFailed(
-                CleanupFailureContext::from_settlement(primary, "remove output", error),
-            ),
-        };
-    }
-    let task = match spawn_cleanup_worker(move || authority.remove_output_relative()) {
-        Ok(task) => task,
-        Err(error) => {
-            return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
-                primary,
-                "remove output",
-                error,
-            ));
-        }
-    };
-    match wait_for_worker_result(task, deadline) {
-        Ok(()) => primary,
-        Err(error) => PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
-            primary,
-            "remove output",
-            error,
-        )),
-    }
+    let _ = (output, deadline);
+    unresolved_published_output_cleanup(primary, "remove output")
 }
 
-/// Cleanup for a validated capture request.  The generic cleanup seam above
-/// remains useful for isolated tests and callers without an authority, but a
-/// live capture must revalidate the retained root/parent identities before it
-/// ever resolves the output path for removal.  A substituted directory is
-/// therefore left untouched and surfaced as a typed cleanup failure.
+fn unresolved_published_output_cleanup(
+    primary: PreviewCaptureError,
+    operation: &'static str,
+) -> PreviewCaptureError {
+    PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+        primary,
+        operation,
+        PreviewCaptureError::OutputFailed(
+            "published output handle is unavailable; output residue is unresolved".into(),
+        ),
+    ))
+}
+
+/// Deadline cleanup for a validated capture request deliberately has no
+/// final-name fallback.  The live attempt's `TempOutput` owns the retained
+/// `PublishedOutput` handle and performs the only permitted final cleanup;
+/// this supervisor path has no inode proof and therefore exposes unresolved
+/// residue instead of resolving the output name again.
 fn cleanup_authorized_output_after_deadline(
     authority: Arc<CaptureOutputAuthority>,
     primary: PreviewCaptureError,
     deadline: CaptureDeadline,
 ) -> PreviewCaptureError {
-    let cleanup = move || authority.remove_output_relative();
-    let cleanup_result = if in_capture_executor_worker() {
-        cleanup()
-    } else {
-        match spawn_cleanup_worker(cleanup) {
-            Ok(task) => wait_for_worker_result(task, deadline),
-            Err(error) => Err(error),
-        }
-    };
-    match cleanup_result {
-        Ok(()) => primary,
-        Err(error) => PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
-            primary,
-            "remove output",
-            error,
-        )),
-    }
+    let _ = (authority, deadline);
+    unresolved_published_output_cleanup(primary, "remove output")
 }
 
 fn preserve_capture_error_after_authorized_cleanup(
@@ -3117,10 +3083,9 @@ fn next_temp_name(stem: &str, counter: usize) -> OsString {
 
 /// Publish a fully synced temporary PNG without following a reparse point at
 /// the final file boundary. Windows uses the open temporary-file handle and a
-/// no-follow parent handle. Linux uses the held parent descriptor plus the
-/// open inode (`linkat(AT_EMPTY_PATH)`) so a swapped temporary path cannot
-/// replace the source. Other Unix platforms fail closed rather than resolving
-/// an absolute parent path after validation.
+/// no-follow parent handle. Unix currently fails closed: the tempting
+/// `linkat(AT_EMPTY_PATH)` protocol does not lock the final name through the
+/// identity check and generation commit, so it cannot claim success safely.
 #[allow(dead_code)]
 enum AtomicPublishOutcome {
     Published,
@@ -3154,62 +3119,22 @@ fn atomic_publish_temp(
 
 #[cfg(unix)]
 fn atomic_publish_temp_unix(
-    _temp: Option<&std::ffi::OsStr>,
+    temp: Option<&std::ffi::OsStr>,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<AtomicPublishOutcome> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let parent = authority.reopen_parent_for_publication().map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
-    })?;
-    let output_name = CString::new(authority.output_name.as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "preview output name is invalid",
-        )
-    })?;
-
-    #[cfg(target_os = "linux")]
-    {
-        // Link the held inode directly into the held directory. This is the
-        // no-follow equivalent of renaming the open temp handle and refuses
-        // to replace a destination created after validation.
-        let empty = [0_i8];
-        let result = unsafe {
-            libc::linkat(
-                file.as_raw_fd(),
-                empty.as_ptr(),
-                parent.as_raw_fd(),
-                output_name.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(code) if
-                code == libc::EPERM || code == libc::EOPNOTSUPP || code == libc::EINVAL)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "anonymous Linux preview publication is unavailable; visual capture HOLD",
-                ));
-            }
-            return Err(error);
-        }
-        return Ok(AtomicPublishOutcome::Published);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "handle-relative preview publication is unsupported on this Unix platform",
-        ))
-    }
+    let _ = (temp, authority, file);
+    // A Linux linkat(AT_EMPTY_PATH) publication is atomic with respect to the
+    // destination lookup, but it does not lock the final name through the
+    // identity check and generation commit.  Without an OS-enforced private
+    // publication directory, a final-name swap can occur after the check and
+    // before success is reported.  Fail closed instead of claiming a barrier
+    // that Unix cannot provide here; the caller retains the inode and exposes
+    // any unresolved residue through its typed cleanup path.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix final-name publication cannot prove ownership across the final-name swap barrier; visual capture HOLD",
+    ))
 }
 
 #[cfg(windows)]

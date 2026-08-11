@@ -2071,6 +2071,35 @@ mod fixture_json_scanner_tests {
         let bytes = br#"{"schema":"devmanager.ui.preview/v1","id":"ok","title":"line\n\u2603","root":{"kind":"minimal","label":"ok","capability":"exact","output_written":true,"host_started":false},"capture":{"cursor":"excluded","border":"excluded"}}"#;
         assert_eq!(validate_fixture_json_bytes(bytes), Ok(()));
     }
+
+    #[test]
+    fn fixture_json_exact_256k_boundary() {
+        let exact_length = usize::try_from(MAX_FIXTURE_BYTES).expect("fixture byte cap fits");
+        let mut exact = vec![b' '; exact_length - 2];
+        exact.extend_from_slice(b"{}");
+        assert_eq!(exact.len() as u64, MAX_FIXTURE_BYTES);
+        assert_eq!(validate_fixture_json_bytes(&exact), Ok(()));
+
+        exact.push(b' ');
+        assert_eq!(
+            validate_fixture_json_bytes(&exact),
+            Err(FixtureJsonScanError::BytesExceeded {
+                bytes: MAX_FIXTURE_BYTES + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn fixture_json_token_continuation_across_8k() {
+        let mut bytes = Vec::with_capacity(8194);
+        bytes.push(b'"');
+        for _ in 0..8191 {
+            bytes.push(b'a');
+        }
+        bytes.push(b'"');
+        assert_eq!(bytes.len(), 8193);
+        assert_eq!(validate_fixture_json_bytes(&bytes), Ok(()));
+    }
 }
 
 fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, PreviewError> {
