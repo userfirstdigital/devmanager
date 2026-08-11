@@ -12,13 +12,13 @@ use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{HostEpochSnapshot, PointerButton, Shell, ShellAttachmentError};
 use devmanager::ui::task_cockpit::header::{AgentRoleProjection, CpuInputUnit, TitleLayout};
 use devmanager::ui::task_cockpit::{
-    HeaderField, NativeNextActionDispatcher, NativeNextTaskCockpit,
+    native_next_host_channel, HeaderField, HostSnapshot, NativeNextDispatchStatus,
+    NativeNextHostCommand, NativeNextHostEvent, NativeNextTaskCockpit,
     NativeNextTaskCockpitProjection, PrimaryAgentProjection, TaskHeaderModel, TopBarModel,
     TopBarProjectionController, TopBarProjectionInput, WorkspaceProjection, MAX_HEADER_SPECIALISTS,
     PROVIDER_QUOTA_MAX_AGE_MS,
 };
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize)]
 struct HeaderFixture {
@@ -56,6 +56,23 @@ fn project_header(model: &ClientModel, task_id: TaskId) -> TaskHeaderModel {
     shell
         .task_header(model)
         .expect("selected task must project")
+}
+
+fn native_cockpit(
+    model: ClientModel,
+    shell: Shell,
+    top_bar: TopBarProjectionInput,
+) -> (
+    NativeNextTaskCockpit,
+    devmanager::ui::task_cockpit::NativeNextHostWorker,
+) {
+    let snapshot = HostSnapshot::try_from_host(1, 1, model, shell, top_bar)
+        .expect("test host snapshot must be valid");
+    let (client, worker) = native_next_host_channel(32);
+    (
+        NativeNextTaskCockpit::from_host_snapshot(snapshot, client),
+        worker,
+    )
 }
 
 #[test]
@@ -448,6 +465,25 @@ fn top_bar_suppresses_missing_stale_future_and_wrong_generation_facts() {
 }
 
 #[test]
+fn empty_top_bar_snapshot_exposes_typed_unavailable_state_instead_of_blank_text() {
+    let input = TopBarProjectionInput {
+        now_ms: 1,
+        generation: 1,
+        host: None,
+        connect: None,
+        update: None,
+        quotas: Vec::new(),
+        resources: None,
+    };
+    let model = TopBarModel::from_input(&input);
+    assert!(!model.unavailable.is_empty());
+    assert!(!model.accessible_description.is_empty());
+    assert!(model
+        .accessible_description
+        .contains("observations are unavailable"));
+}
+
+#[test]
 fn header_and_top_bar_actions_share_one_descriptor_and_reject_stale_identity() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
@@ -821,6 +857,37 @@ fn visible_and_accessible_text_redacts_key_name_separator_variants() {
 }
 
 #[test]
+fn separated_secret_key_and_token_forms_never_reach_public_header_text() {
+    let fixture = fixture();
+    for secret_form in [
+        "API KEY ordinary_value",
+        "ACCESS KEY ordinary_value",
+        "PRIVATE KEY ordinary_value",
+        "API - KEY ordinary_value",
+        "ACCESS / PRIVATE / KEY ordinary_value",
+        "TOKEN ordinary_value",
+        "token: ordinary_value",
+    ] {
+        let mut pages = fixture.snapshot_pages.clone();
+        for page in &mut pages {
+            for item in &mut page.items {
+                if let SnapshotItem::Task(task) = item {
+                    task.task.title = secret_form.to_string();
+                }
+            }
+        }
+        let header = project_header(&model_from_pages(&pages), fixture.selected_task_id);
+        let debug = format!("{header:?}");
+        assert!(!header.title.contains("ordinary_value"), "{secret_form}");
+        assert!(
+            !header.accessible_description.contains("ordinary_value"),
+            "{secret_form}"
+        );
+        assert!(!debug.contains("ordinary_value"), "{secret_form}");
+    }
+}
+
+#[test]
 fn agent_projection_exposes_only_a_bounded_sanitized_role() {
     let fixture = fixture();
     let mut pages = fixture.snapshot_pages.clone();
@@ -969,11 +1036,7 @@ fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
     let model = model_from_pages(&fixture.snapshot_pages);
     let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
     assert!(shell.sync_client_epoch(model.last_applied_sequence()));
-    let controller = TopBarProjectionController::new(fixture.top_bar)
-        .expect("fixture top bar must pass controller preflight");
-    let dispatcher = RecordingDispatcher::default();
-    let actions = dispatcher.actions.clone();
-    let mut cockpit = NativeNextTaskCockpit::from_host(model, shell, controller, dispatcher);
+    let (mut cockpit, worker) = native_cockpit(model, shell, fixture.top_bar.clone());
 
     let surface = cockpit.render_surface(360);
     assert_eq!(
@@ -993,17 +1056,29 @@ fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
     );
 
     assert!(cockpit.activate_open_task_details());
-    let action = actions
-        .lock()
-        .unwrap()
-        .first()
-        .cloned()
+    let NativeNextHostCommand::Dispatch(action) = worker
+        .try_recv()
         .expect("activation must dispatch the projected action");
     assert_eq!(action.id(), action::ACTION_TASK_SHOW);
     assert!(matches!(
         action.target(),
         devmanager::ui::task_cockpit::header::ActionTarget::Task(_)
     ));
+
+    let (mut wide_cockpit, wide_worker) = native_cockpit(
+        model_from_pages(&fixture.snapshot_pages),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model_from_pages(&fixture.snapshot_pages).last_applied_sequence(),
+        ),
+        fixture.top_bar,
+    );
+    assert!(wide_cockpit.render_surface(720).overflow_menu.is_none());
+    assert!(wide_cockpit.activate_open_task_details());
+    let NativeNextHostCommand::Dispatch(action) = wide_worker
+        .try_recv()
+        .expect("Ctrl+M must dispatch at wide width too");
+    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
 }
 
 #[test]
@@ -1013,10 +1088,7 @@ fn native_next_surface_has_one_top_bar_projection_truth() {
     let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
     assert!(shell.sync_client_epoch(model.last_applied_sequence()));
     let top_bar = TopBarModel::from_input(&fixture.top_bar);
-    let controller = TopBarProjectionController::new(fixture.top_bar)
-        .expect("fixture top bar must pass controller preflight");
-    let cockpit =
-        NativeNextTaskCockpit::from_host(model, shell, controller, RecordingDispatcher::default());
+    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
 
     let surface = cockpit.render_surface(720);
     assert_eq!(surface.top_bar, top_bar);
@@ -1029,15 +1101,15 @@ fn native_next_projection_consumes_controller_and_keeps_controller_debug_opaque(
     let model = model_from_pages(&fixture.snapshot_pages);
     let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
     assert!(shell.sync_client_epoch(model.last_applied_sequence()));
-    let controller = TopBarProjectionController::new(fixture.top_bar.clone())
-        .expect("fixture top bar must pass controller preflight");
-
-    let projection = NativeNextTaskCockpitProjection::from_client_model_with_controller(
+    let projection = NativeNextTaskCockpitProjection::from_client_model(
         &model,
         &shell,
-        &controller,
+        TopBarModel::from_input(&fixture.top_bar),
     );
-    assert_eq!(projection.top_bar, controller.model());
+    assert_eq!(
+        projection.top_bar,
+        TopBarModel::from_input(&fixture.top_bar)
+    );
 
     let mut controller_input = fixture.top_bar;
     controller_input.quotas[0].identity.provider = "PROVIDER_KEY_SECRET_SENTINEL".into();
@@ -1061,20 +1133,36 @@ fn native_next_dispatch_rechecks_shell_epochs_after_projection() {
     assert!(cockpit_shell.sync_client_epoch(model.last_applied_sequence()));
     let mut stale_shell = attached_shell(Some(fixture.selected_task_id), 1);
     assert!(stale_shell.sync_client_epoch(model.last_applied_sequence()));
-    let controller = TopBarProjectionController::new(fixture.top_bar)
-        .expect("fixture top bar must pass controller preflight");
-    let dispatcher = RecordingDispatcher::default();
-    let actions = dispatcher.actions.clone();
-    let mut cockpit =
-        NativeNextTaskCockpit::from_host(model.clone(), cockpit_shell, controller, dispatcher);
+    let (mut cockpit, worker) =
+        native_cockpit(model.clone(), cockpit_shell, fixture.top_bar.clone());
 
+    let captured_action = cockpit
+        .projection()
+        .header
+        .as_ref()
+        .expect("header")
+        .status
+        .action
+        .clone();
     assert!(cockpit.activate_open_task_details());
-    assert_eq!(actions.lock().unwrap().len(), 1);
+    assert!(matches!(
+        worker.try_recv(),
+        Ok(NativeNextHostCommand::Dispatch(_))
+    ));
 
     assert!(stale_shell.advance_focus_epoch());
-    cockpit.update_shell_state(stale_shell);
-    assert!(!cockpit.activate_open_task_details());
-    assert_eq!(actions.lock().unwrap().len(), 1);
+    let stale_snapshot =
+        HostSnapshot::try_from_host(2, 2, model.clone(), stale_shell, fixture.top_bar)
+            .expect("stale shell snapshot");
+    assert!(cockpit.apply_host_snapshot(stale_snapshot).is_ok());
+    assert_eq!(
+        cockpit.dispatch_action(&captured_action),
+        NativeNextDispatchStatus::Rejected
+    );
+    assert!(matches!(
+        worker.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
 }
 
 #[test]
@@ -1083,6 +1171,18 @@ fn quota_controller_rejects_late_observations_by_provider_generation_and_authori
     let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
         .expect("fixture top bar must pass controller preflight");
     let current_detail = controller.model().quotas[0].detail.clone();
+    let cached_before = controller.cached_quota_count();
+
+    let mut stale_high_sequence = fixture.top_bar.clone();
+    stale_high_sequence.quotas[0].identity.observation_id = u64::MAX;
+    stale_high_sequence.quotas[0].observed_at_ms =
+        Some(stale_high_sequence.now_ms - PROVIDER_QUOTA_MAX_AGE_MS);
+    stale_high_sequence.quotas[0].detail = Some("0% remaining".into());
+    assert!(!controller
+        .apply(stale_high_sequence)
+        .expect("stale observation must be handled"));
+    assert_eq!(controller.cached_quota_count(), cached_before);
+    assert_eq!(controller.model().quotas[0].detail, current_detail);
 
     let mut late_same_generation = fixture.top_bar.clone();
     late_same_generation.quotas[0].detail = Some("1% remaining".into());
@@ -1191,10 +1291,7 @@ fn native_next_renderer_uses_header_layout_inline_and_accessible_overflow_at_all
         Some(fixture.selected_task_id),
         model.last_applied_sequence(),
     );
-    let controller = TopBarProjectionController::new(fixture.top_bar.clone())
-        .expect("fixture top bar must pass controller preflight");
-    let cockpit =
-        NativeNextTaskCockpit::from_host(model, shell, controller, RecordingDispatcher::default());
+    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
 
     let narrow = cockpit.render_surface(320);
     let narrow_layout = narrow.header_layout.as_ref().expect("narrow layout");
@@ -1255,18 +1352,6 @@ fn native_next_renderer_uses_header_layout_inline_and_accessible_overflow_at_all
         .contains("worktree codex/header"));
 }
 
-#[derive(Clone, Default)]
-struct RecordingDispatcher {
-    actions: Arc<Mutex<Vec<devmanager::ui::task_cockpit::ProjectedAction>>>,
-}
-
-impl NativeNextActionDispatcher for RecordingDispatcher {
-    fn dispatch(&mut self, action: devmanager::ui::task_cockpit::ProjectedAction) -> bool {
-        self.actions.lock().unwrap().push(action);
-        true
-    }
-}
-
 #[test]
 fn native_next_host_attachment_updates_bounded_controller_and_dispatches_typed_actions() {
     let fixture = fixture();
@@ -1275,17 +1360,24 @@ fn native_next_host_attachment_updates_bounded_controller_and_dispatches_typed_a
         Some(fixture.selected_task_id),
         model.last_applied_sequence(),
     );
-    let controller = TopBarProjectionController::new(fixture.top_bar.clone())
-        .expect("fixture top bar must pass controller preflight");
-    let dispatcher = RecordingDispatcher::default();
-    let actions = dispatcher.actions.clone();
-    let mut cockpit = NativeNextTaskCockpit::from_host(model, shell, controller, dispatcher);
+    let (mut cockpit, worker) = native_cockpit(model.clone(), shell, fixture.top_bar.clone());
 
     let mut newer = fixture.top_bar;
     newer.quotas[0].identity.observation_id += 1;
     newer.quotas[0].detail = Some("61% remaining".into());
+    let snapshot = HostSnapshot::try_from_host(
+        2,
+        2,
+        model,
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model_from_pages(&fixture.snapshot_pages).last_applied_sequence(),
+        ),
+        newer,
+    )
+    .expect("bounded atomic update");
     assert!(cockpit
-        .apply_top_bar_projection(newer)
+        .apply_host_snapshot(snapshot)
         .expect("bounded controller update"));
     assert_eq!(
         cockpit.render_surface(720).top_bar.quotas[0].detail,
@@ -1293,8 +1385,8 @@ fn native_next_host_attachment_updates_bounded_controller_and_dispatches_typed_a
     );
 
     assert!(cockpit.activate_open_task_details());
-    assert_eq!(actions.lock().unwrap().len(), 1);
-    assert_eq!(actions.lock().unwrap()[0].id(), action::ACTION_TASK_SHOW);
+    let NativeNextHostCommand::Dispatch(action) = worker.try_recv().expect("dispatch");
+    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
 }
 
 #[test]
@@ -1366,4 +1458,520 @@ fn quota_controller_bounds_cache_under_provider_churn_before_insertion() {
         .expect("older full-cache observation must be rejected"));
     assert_eq!(controller.cached_quota_count(), cached_count);
     assert!(controller.model().quotas.len() <= 8);
+}
+
+#[test]
+fn quota_ordering_survives_bounded_cache_eviction_for_same_session() {
+    let fixture = fixture();
+    let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+
+    let mut advanced_clock = fixture.top_bar.clone();
+    advanced_clock.now_ms += PROVIDER_QUOTA_MAX_AGE_MS;
+    assert!(controller
+        .apply(advanced_clock.clone())
+        .expect("clock advance must be admitted"));
+    assert_eq!(controller.cached_quota_count(), 0);
+
+    let mut delayed = advanced_clock;
+    delayed.quotas[0].identity.observation_id = fixture.top_bar.quotas[0]
+        .identity
+        .observation_id
+        .saturating_sub(1);
+    delayed.quotas[0].observed_at_ms = Some(delayed.now_ms);
+    delayed.quotas[0].detail = Some("99% remaining".into());
+    assert!(!controller
+        .apply(delayed)
+        .expect("delayed same-session observation must be handled"));
+    assert_eq!(controller.cached_quota_count(), 0);
+    assert!(controller.model().quotas.is_empty());
+}
+
+#[test]
+fn native_next_render_tree_contains_real_top_bar_resources_quota_overflow_and_unavailable_state() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let mut top_bar = fixture.top_bar;
+    top_bar.quotas = (0..10)
+        .map(|index| devmanager::ui::task_cockpit::QuotaObservation {
+            identity: devmanager::ui::task_cockpit::QuotaObservationIdentity {
+                provider: format!("provider-{index}"),
+                provider_session_id: format!("session-{index}"),
+                observation_id: index,
+            },
+            detail: Some(format!("{}% remaining", 90 - index)),
+            observed_at_ms: Some(top_bar.now_ms),
+            generation: Some(top_bar.generation),
+        })
+        .collect();
+    let (cockpit, _worker) = native_cockpit(model, shell, top_bar);
+
+    let tree = cockpit.render_tree(320);
+    assert!(tree
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.id == "native-next-top-bar-cpu"));
+    assert!(tree
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.id == "native-next-top-bar-memory"));
+    assert!(tree
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.id == "native-next-top-bar-quota-overflow"));
+    assert!(tree.top_bar.children.iter().all(|node| {
+        !node.accessible_description.is_empty()
+            && (node.focusable || node.role == AccessibleRole::Status)
+    }));
+
+    let unavailable = NativeNextTaskCockpit::unavailable().render_tree(320);
+    assert!(unavailable
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.role == AccessibleRole::Status));
+    assert!(!unavailable.top_bar.accessible_description.is_empty());
+    let unavailable_header = unavailable.header.expect("header-unavailable node");
+    assert_eq!(unavailable_header.role, AccessibleRole::Status);
+    assert!(!unavailable_header.accessible_description.is_empty());
+}
+
+#[test]
+fn native_next_render_tree_wraps_title_and_virtualizes_specialists_at_all_widths() {
+    let fixture = fixture();
+    let mut pages = fixture.snapshot_pages.clone();
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let SnapshotItem::Task(task) = item {
+                task.task.title = "title ".repeat(80);
+            }
+        }
+    }
+    let model = model_from_pages(&pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
+
+    for width in [360, 480, 720] {
+        let tree = cockpit.render_tree(width);
+        if width == 360 {
+            assert!(
+                tree.title_lines.len() >= 2,
+                "title must remain separate lines at {width}"
+            );
+        } else {
+            assert_eq!(tree.title_lines.len(), 1);
+        }
+        let specialists = tree
+            .header
+            .as_ref()
+            .expect("header")
+            .children
+            .iter()
+            .find(|node| node.id == "native-next-task-specialists")
+            .expect("specialist semantic node");
+        assert!(
+            specialists.virtualized,
+            "specialists must be virtualized at {width}"
+        );
+        assert!(specialists.children.len() <= 32);
+    }
+}
+
+#[test]
+fn native_next_host_channel_is_bounded_nonblocking_and_receipts_project_back() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let snapshot = HostSnapshot::try_from_host(1, 1, model, shell, fixture.top_bar.clone())
+        .expect("atomic host snapshot");
+    let (client, worker) = devmanager::ui::task_cockpit::native_next_host_channel(1);
+    let action = snapshot
+        .shell()
+        .task_header(snapshot.model())
+        .expect("header")
+        .status
+        .action
+        .clone();
+    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
+
+    assert_eq!(
+        cockpit.dispatch_action(&action),
+        NativeNextDispatchStatus::Queued
+    );
+    assert!(matches!(
+        worker.try_recv(),
+        Ok(NativeNextHostCommand::Dispatch(_))
+    ));
+    worker
+        .send_event(NativeNextHostEvent::Accepted {
+            action_id: action.id(),
+        })
+        .expect("receipt event");
+    assert_eq!(cockpit.poll_host_events(), 1);
+    assert!(cockpit.last_receipt().is_some());
+}
+
+#[test]
+fn native_next_host_channel_reports_backpressure_and_typed_unavailable_without_local_queue() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let snapshot =
+        HostSnapshot::try_from_host(1, 1, model, shell, fixture.top_bar).expect("snapshot");
+    let (client, _worker) = native_next_host_channel(1);
+    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
+    let action = cockpit
+        .projection()
+        .header
+        .as_ref()
+        .expect("header")
+        .status
+        .action
+        .clone();
+    assert_eq!(
+        cockpit.dispatch_action(&action),
+        NativeNextDispatchStatus::Queued
+    );
+    assert_eq!(
+        cockpit.dispatch_action(&action),
+        NativeNextDispatchStatus::Backpressured
+    );
+    assert_eq!(
+        cockpit.host_state(),
+        devmanager::ui::task_cockpit::NativeNextHostState::Backpressured
+    );
+    assert!(cockpit
+        .render_tree(720)
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.id == "native-next-host-state" && node.role == AccessibleRole::Status));
+}
+
+#[test]
+fn native_next_host_event_poll_collapses_contiguous_snapshots_and_reports_disconnect() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let snapshot =
+        HostSnapshot::try_from_host(1, 1, model.clone(), shell.clone(), fixture.top_bar.clone())
+            .expect("snapshot");
+    let (client, worker) = native_next_host_channel(4);
+    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
+
+    let mut second_top_bar = fixture.top_bar.clone();
+    second_top_bar.quotas[0].identity.observation_id = 9;
+    second_top_bar.quotas[0].detail = Some("60% remaining".into());
+    let second = HostSnapshot::try_from_host(2, 2, model.clone(), shell.clone(), second_top_bar)
+        .expect("second snapshot");
+    let mut third_top_bar = fixture.top_bar;
+    third_top_bar.quotas[0].identity.observation_id = 10;
+    third_top_bar.quotas[0].detail = Some("50% remaining".into());
+    let third =
+        HostSnapshot::try_from_host(3, 3, model, shell, third_top_bar).expect("third snapshot");
+
+    worker
+        .send_event(NativeNextHostEvent::Snapshot(second))
+        .expect("second event");
+    worker
+        .send_event(NativeNextHostEvent::Snapshot(third))
+        .expect("third event");
+    assert_eq!(cockpit.poll_host_events(), 1);
+    assert_eq!(
+        cockpit.projection().top_bar.quotas[0].detail,
+        "50% remaining"
+    );
+
+    drop(worker);
+    assert_eq!(cockpit.poll_host_events(), 0);
+    assert_eq!(
+        cockpit.host_state(),
+        devmanager::ui::task_cockpit::NativeNextHostState::Unavailable
+    );
+    assert!(cockpit
+        .render_tree(720)
+        .top_bar
+        .children
+        .iter()
+        .any(|node| node.id == "native-next-host-state" && node.label.contains("unavailable")));
+}
+
+#[test]
+fn native_next_atomic_snapshot_rejects_sequence_revision_and_partial_epoch_regressions() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let (client, _worker) = devmanager::ui::task_cockpit::native_next_host_channel(4);
+    let snapshot = HostSnapshot::try_from_host(2, 2, model.clone(), shell, fixture.top_bar.clone())
+        .expect("atomic host snapshot");
+    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot.clone(), client);
+
+    let same_sequence = HostSnapshot::try_from_host(
+        2,
+        3,
+        model.clone(),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        fixture.top_bar.clone(),
+    )
+    .expect("snapshot");
+    assert!(cockpit.apply_host_snapshot(same_sequence).is_err());
+    assert_eq!(
+        cockpit.host_state(),
+        devmanager::ui::task_cockpit::NativeNextHostState::Rejected
+    );
+
+    let older_sequence = HostSnapshot::try_from_host(
+        1,
+        1,
+        model.clone(),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        fixture.top_bar.clone(),
+    )
+    .expect("snapshot");
+    assert!(cockpit.apply_host_snapshot(older_sequence).is_err());
+
+    let mut older_top_bar = fixture.top_bar.clone();
+    older_top_bar.generation -= 1;
+    let older_top_bar_snapshot = HostSnapshot::try_from_host(
+        3,
+        3,
+        model.clone(),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        older_top_bar,
+    )
+    .expect("older top-bar generation is structurally valid");
+    assert!(cockpit.apply_host_snapshot(older_top_bar_snapshot).is_err());
+
+    let mut older_top_bar_clock = fixture.top_bar.clone();
+    older_top_bar_clock.now_ms -= 1;
+    let older_top_bar_clock_snapshot = HostSnapshot::try_from_host(
+        3,
+        3,
+        model.clone(),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        older_top_bar_clock,
+    )
+    .expect("older top-bar clock is structurally valid");
+    assert!(cockpit
+        .apply_host_snapshot(older_top_bar_clock_snapshot)
+        .is_err());
+
+    let mut partial = fixture.top_bar;
+    partial.generation = 0;
+    assert!(HostSnapshot::try_from_host(
+        3,
+        3,
+        model,
+        attached_shell(Some(fixture.selected_task_id), 1),
+        partial,
+    )
+    .is_err());
+}
+
+#[test]
+fn native_next_atomic_snapshot_rejects_each_current_epoch_and_action_regression() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let baseline_shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let baseline = HostSnapshot::try_from_host(
+        10,
+        10,
+        model.clone(),
+        baseline_shell,
+        fixture.top_bar.clone(),
+    )
+    .expect("baseline snapshot");
+
+    for (dimension, index) in [
+        ("resource", 0),
+        ("connection", 1),
+        ("focus", 2),
+        ("navigation", 4),
+    ] {
+        let mut epochs = [3, 5, 7, model.last_applied_sequence(), 11];
+        epochs[index] -= 1;
+        let incoming_shell = Shell::attach(
+            Some(fixture.selected_task_id),
+            Some(
+                HostEpochSnapshot::try_from_host(
+                    epochs[0], epochs[1], epochs[2], epochs[3], epochs[4],
+                )
+                .expect("nonzero regressed epoch"),
+            ),
+        )
+        .expect("incoming shell");
+        let (client, _worker) = native_next_host_channel(2);
+        let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline.clone(), client);
+        let incoming = HostSnapshot::try_from_host(
+            11,
+            11,
+            model.clone(),
+            incoming_shell,
+            fixture.top_bar.clone(),
+        )
+        .expect("incoming snapshot");
+        assert!(matches!(
+            cockpit.apply_host_snapshot(incoming),
+            Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression {
+                dimension: actual
+            }) if actual == dimension
+        ));
+    }
+
+    for (dimension, mutate) in [("task", true), ("action", false)] {
+        let mut pages = fixture.snapshot_pages.clone();
+        for page in &mut pages {
+            for item in &mut page.items {
+                if let SnapshotItem::Task(task) = item {
+                    if mutate {
+                        task.task.revision -= 1;
+                    } else {
+                        task.task.action_epoch -= 1;
+                    }
+                }
+            }
+        }
+        let incoming_model = model_from_pages(&pages);
+        let (client, _worker) = native_next_host_channel(2);
+        let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline.clone(), client);
+        let incoming = HostSnapshot::try_from_host(
+            11,
+            11,
+            incoming_model,
+            attached_shell(
+                Some(fixture.selected_task_id),
+                model.last_applied_sequence(),
+            ),
+            fixture.top_bar.clone(),
+        )
+        .expect("incoming task snapshot");
+        assert!(matches!(
+            cockpit.apply_host_snapshot(incoming),
+            Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression {
+                dimension: actual
+            }) if actual == dimension
+        ));
+    }
+}
+
+#[test]
+fn native_next_atomic_snapshot_rejects_non_selected_task_revision_regression() {
+    let fixture = fixture();
+    let mut pages = fixture.snapshot_pages.clone();
+    let mut extra_task = pages
+        .iter_mut()
+        .flat_map(|page| page.items.iter_mut())
+        .find_map(|item| match item {
+            SnapshotItem::Task(task) => Some(task.clone()),
+            _ => None,
+        })
+        .expect("fixture task");
+    extra_task.task.id = TaskId::new();
+    extra_task.task.title = "Second task".to_string();
+    extra_task.primary_agent_id = None;
+    extra_task.task.revision = 9;
+    extra_task.task.action_epoch = 4;
+    pages[0].items.push(SnapshotItem::Task(extra_task));
+    let model = model_from_pages(&pages);
+    let baseline = HostSnapshot::try_from_host(
+        10,
+        10,
+        model.clone(),
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        fixture.top_bar.clone(),
+    )
+    .expect("baseline snapshot");
+
+    let mut regressed_pages = pages;
+    for page in &mut regressed_pages {
+        for item in &mut page.items {
+            if let SnapshotItem::Task(task) = item {
+                if task.task.id != fixture.selected_task_id {
+                    task.task.revision -= 1;
+                }
+            }
+        }
+    }
+    let incoming_model = model_from_pages(&regressed_pages);
+    let (client, _worker) = native_next_host_channel(2);
+    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline, client);
+    let incoming = HostSnapshot::try_from_host(
+        11,
+        11,
+        incoming_model,
+        attached_shell(
+            Some(fixture.selected_task_id),
+            model.last_applied_sequence(),
+        ),
+        fixture.top_bar,
+    )
+    .expect("incoming snapshot");
+    assert!(matches!(
+        cockpit.apply_host_snapshot(incoming),
+        Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression { dimension: "task" })
+    ));
+}
+
+#[test]
+fn quota_session_replacement_accepts_reset_counter_only_from_current_host_snapshot() {
+    let fixture = fixture();
+    let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+    let mut replacement = fixture.top_bar.clone();
+    replacement.quotas[0].identity.provider_session_id = "replacement".into();
+    replacement.quotas[0].identity.observation_id = 0;
+    replacement.quotas[0].observed_at_ms = Some(replacement.now_ms);
+    replacement.quotas[0].detail = Some("40% remaining".into());
+    assert!(controller.apply(replacement.clone()).expect("replacement"));
+
+    let mut delayed_old = replacement.clone();
+    delayed_old.quotas[0].identity.provider_session_id = fixture.top_bar.quotas[0]
+        .identity
+        .provider_session_id
+        .clone();
+    delayed_old.quotas[0].identity.observation_id = u64::MAX;
+    delayed_old.quotas[0].observed_at_ms = Some(delayed_old.now_ms);
+    delayed_old.quotas[0].detail = Some("99% remaining".into());
+    assert!(!controller.apply(delayed_old).expect("delayed old session"));
+    assert_eq!(controller.model().quotas[0].detail, "40% remaining");
 }

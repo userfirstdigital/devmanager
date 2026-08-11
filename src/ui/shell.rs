@@ -163,7 +163,7 @@ impl PartialEq for PointerOwner {
 
 impl Eq for PointerOwner {}
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PointerCapture {
     identity: Arc<()>,
     pointer_id: u64,
@@ -186,7 +186,7 @@ impl PointerCapture {
 
 pub type TerminalPointerOwner = PointerOwner;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Shell {
     selected_task: Option<TaskId>,
     resource_generation: u64,

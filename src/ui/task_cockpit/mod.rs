@@ -23,7 +23,11 @@ pub use inbox::{
 };
 
 pub use native::{
-    bind_native_next_actions, is_task_details_action, run_native_next, NativeNextActionDispatcher,
-    NativeNextHeaderMenu, NativeNextHeaderMenuItem, NativeNextHostAttachment,
-    NativeNextTaskCockpit, NativeNextTaskCockpitProjection, NativeNextTaskCockpitSurface,
+    bind_native_next_actions, is_task_details_action, native_next_host_channel, run_native_next,
+    HostSnapshot, HostSnapshotError, NativeNextDispatchStatus, NativeNextHeaderMenu,
+    NativeNextHeaderMenuItem, NativeNextHostAttachment, NativeNextHostClient,
+    NativeNextHostCommand, NativeNextHostEvent, NativeNextHostReceipt, NativeNextHostState,
+    NativeNextHostWorker, NativeNextRenderNode, NativeNextRenderTree, NativeNextTaskCockpit,
+    NativeNextTaskCockpitProjection, NativeNextTaskCockpitSurface, NativeNextUnavailable,
+    NATIVE_NEXT_HOST_CHANNEL_CAPACITY, NATIVE_NEXT_HOST_EVENT_DRAIN_LIMIT,
 };

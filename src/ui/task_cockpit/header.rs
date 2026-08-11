@@ -4,7 +4,7 @@
 //! bounded observations supplied by the caller. They do not probe the host,
 //! filesystem, network, provider sessions, or process state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -1261,6 +1261,25 @@ impl TopBarModel {
             }
         }
 
+        // An attached snapshot may legitimately contain no usable
+        // observations yet. Keep that state explicit for both assistive
+        // consumers and the native renderer instead of returning a blank
+        // region that looks like a successful empty projection.
+        if descriptions.is_empty() {
+            unavailable.extend([
+                TopBarUnavailable::HostStatus,
+                TopBarUnavailable::ConnectionStatus,
+                TopBarUnavailable::UpdateStatus,
+                TopBarUnavailable::Quota,
+                TopBarUnavailable::Cpu,
+                TopBarUnavailable::Memory,
+            ]);
+            descriptions.push(
+                "Host, connection, update, resource, and quota observations are unavailable."
+                    .to_string(),
+            );
+        }
+
         Self {
             host,
             connect,
@@ -1311,7 +1330,17 @@ impl TopBarModel {
 #[derive(Clone)]
 pub struct TopBarProjectionController {
     input: TopBarProjectionInput,
-    quota_cache: BTreeMap<String, QuotaObservation>,
+    quota_cache: BTreeMap<QuotaCacheKey, QuotaObservation>,
+    quota_high_water: BTreeMap<QuotaCacheKey, (u64, i64)>,
+    active_quota_sessions: BTreeMap<(String, u64), String>,
+    retired_quota_sessions: BTreeSet<(String, u64, String)>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QuotaCacheKey {
+    provider: String,
+    provider_session_id: String,
     generation: u64,
 }
 
@@ -1321,6 +1350,7 @@ impl fmt::Debug for TopBarProjectionController {
             .debug_struct("TopBarProjectionController")
             .field("input", &self.input)
             .field("quota_count", &self.quota_cache.len())
+            .field("quota_high_water_count", &self.quota_high_water.len())
             .field("generation", &self.generation)
             .finish()
     }
@@ -1339,10 +1369,14 @@ impl TopBarProjectionController {
         let mut controller = Self {
             input,
             quota_cache: BTreeMap::new(),
+            quota_high_water: BTreeMap::new(),
+            active_quota_sessions: BTreeMap::new(),
+            retired_quota_sessions: BTreeSet::new(),
             generation,
         };
         let observations = controller.input.quotas.clone();
-        controller.admit_quota_observations(&observations, generation);
+        let input = controller.input.clone();
+        controller.admit_quota_observations(&observations, &input, generation);
         controller.sync_cached_quotas();
         Ok(controller)
     }
@@ -1377,7 +1411,18 @@ impl TopBarProjectionController {
         if generation_changed {
             self.generation = input.generation;
             self.quota_cache.clear();
+            self.quota_high_water.clear();
+            self.active_quota_sessions.clear();
+            self.retired_quota_sessions.clear();
         }
+
+        // The cache is a projection boundary too: observations that are no
+        // longer fresh must leave it before a new input can be admitted. This
+        // keeps stale values from consuming the 64-entry budget or blocking
+        // an authorized session replacement later in the same generation.
+        self.quota_cache.retain(|_, observation| {
+            fresh_stamp(observation.observed_at_ms, observation.generation, &input).is_some()
+        });
 
         let mut changed = generation_changed
             || self.input.now_ms != input.now_ms
@@ -1385,7 +1430,7 @@ impl TopBarProjectionController {
             || self.input.connect != input.connect
             || self.input.update != input.update
             || self.input.resources != input.resources;
-        changed |= self.admit_quota_observations(&input.quotas, input.generation);
+        changed |= self.admit_quota_observations(&input.quotas, &input, input.generation);
 
         self.input.now_ms = input.now_ms;
         self.input.generation = self.generation;
@@ -1400,6 +1445,7 @@ impl TopBarProjectionController {
     fn admit_quota_observations(
         &mut self,
         observations: &[QuotaObservation],
+        input: &TopBarProjectionInput,
         generation: u64,
     ) -> bool {
         let mut changed = false;
@@ -1407,16 +1453,78 @@ impl TopBarProjectionController {
             if observation.generation != Some(generation) {
                 continue;
             }
-            let key = provider_key(&observation.identity.provider);
-            let replace = match self.quota_cache.get(&key) {
+            if fresh_stamp(observation.observed_at_ms, observation.generation, input).is_none() {
+                continue;
+            }
+            let provider = provider_key(&observation.identity.provider);
+            let session = observation.identity.provider_session_id.clone();
+            if self.retired_quota_sessions.contains(&(
+                provider.clone(),
+                generation,
+                session.clone(),
+            )) {
+                continue;
+            }
+            let provider_generation = (provider.clone(), generation);
+            let key = QuotaCacheKey {
+                provider: provider.clone(),
+                provider_session_id: session.clone(),
+                generation,
+            };
+            let active_session = self
+                .active_quota_sessions
+                .get(&provider_generation)
+                .cloned();
+            let replace = match active_session.as_deref() {
                 None => true,
-                Some(current) => quota_authority(observation) > quota_authority(current),
+                Some(active) if active == session => self
+                    .quota_high_water
+                    .get(&key)
+                    .is_none_or(|current| quota_authority(observation) > *current),
+                Some(active) => {
+                    let active_key = QuotaCacheKey {
+                        provider: provider.clone(),
+                        provider_session_id: active.to_string(),
+                        generation,
+                    };
+                    let Some(current_authority) = self.quota_high_water.get(&active_key) else {
+                        continue;
+                    };
+                    let Some(observed_at_ms) = observation.observed_at_ms else {
+                        continue;
+                    };
+                    // A session reset is admitted only from the current host
+                    // clock/freshness window, never by a cross-session counter.
+                    observed_at_ms >= current_authority.1
+                        && fresh_stamp(observation.observed_at_ms, observation.generation, input)
+                            .is_some()
+                }
             };
             if replace && !self.quota_cache.contains_key(&key) {
-                if self.quota_cache.len() >= MAX_TOP_BAR_QUOTA_CACHE {
+                // A host-authorized session reset replaces the previous
+                // session's slot before enforcing the global cache bound. If
+                // we evict against the pre-replacement length, a full cache
+                // can incorrectly reject a valid reset merely because the
+                // new observation is older than an unrelated provider.
+                let replacing_keys: BTreeSet<QuotaCacheKey> = match active_session.as_deref() {
+                    Some(active) if active != session => self
+                        .quota_cache
+                        .keys()
+                        .filter(|cache_key| {
+                            cache_key.provider == provider
+                                && cache_key.generation == generation
+                                && cache_key.provider_session_id == active
+                        })
+                        .cloned()
+                        .collect(),
+                    _ => BTreeSet::new(),
+                };
+                let projected_len = self.quota_cache.len().saturating_sub(replacing_keys.len());
+                if projected_len >= MAX_TOP_BAR_QUOTA_CACHE {
                     let Some(eviction_key) = self
                         .quota_cache
                         .iter()
+                        .filter(|(cache_key, _)| !replacing_keys.contains(*cache_key))
                         .min_by(|(left_key, left), (right_key, right)| {
                             quota_authority(left)
                                 .cmp(&quota_authority(right))
@@ -1436,7 +1544,32 @@ impl TopBarProjectionController {
                 }
             }
             if replace {
+                if let Some(previous) = self
+                    .active_quota_sessions
+                    .insert(provider_generation.clone(), session.clone())
+                {
+                    if previous != session {
+                        self.retired_quota_sessions.insert((
+                            provider.clone(),
+                            generation,
+                            previous.clone(),
+                        ));
+                        self.quota_cache.retain(|cache_key, _| {
+                            !(cache_key.provider == provider
+                                && cache_key.generation == generation
+                                && cache_key.provider_session_id == previous)
+                        });
+                    }
+                }
                 self.quota_cache.insert(key, observation.clone());
+                self.quota_high_water.insert(
+                    QuotaCacheKey {
+                        provider,
+                        provider_session_id: session,
+                        generation,
+                    },
+                    quota_authority(observation),
+                );
                 changed = true;
             }
         }
@@ -1822,6 +1955,15 @@ fn fresh_quotas<'a>(
 }
 
 fn quota_is_newer(candidate: &QuotaObservation, current: &QuotaObservation) -> bool {
+    if provider_key(&candidate.identity.provider) != provider_key(&current.identity.provider) {
+        return quota_authority(candidate) > quota_authority(current);
+    }
+    if candidate.identity.provider_session_id != current.identity.provider_session_id {
+        return candidate
+            .observed_at_ms
+            .zip(current.observed_at_ms)
+            .is_some_and(|(candidate, current)| candidate > current);
+    }
     quota_authority(candidate) > quota_authority(current)
 }
 
