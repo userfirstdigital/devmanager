@@ -2,14 +2,18 @@
 //!
 //! This module deliberately owns no persistence adapter and has no UI/runtime
 //! dependencies. A later store adapter supplies [`ExactPromptVersionLoader`],
-//! while a host worker calls [`PromptDiffService::diff_exact`] away from paint
-//! and input handling. The cache contains only the body-free public projection;
+//! while a host worker calls its actor-confined exact computation away from
+//! paint and input handling. The cache contains only the body-free public projection;
 //! any text view is transient in the worker response and is never serialized or
 //! retained by the service cache.
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -22,40 +26,26 @@ use super::diff::{
     TruncationMarker, UnicodeRange, MAX_PROMPT_DIFF_PAYLOAD_BYTES, PROMPT_DIFF_ALGORITHM_VERSION,
     PROMPT_DIFF_NORMALIZATION_POLICY, PROMPT_DIFF_PUBLIC_PROJECTION_VERSION,
 };
+use super::model::MAX_PROMPT_BODY_BYTES;
 
-/// An exact immutable version snapshot supplied by a host loader.
+/// Metadata returned before any prompt body bytes are allocated or copied.
 ///
-/// `body` is intentionally private and this type has no serde implementation.
-/// The service validates both the supplied fingerprint and the body bytes
-/// before passing the body to the bounded diff worker.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PromptVersionSnapshot {
+/// A host/store adapter must provide this exact record first. The worker rejects
+/// a body larger than [`MAX_PROMPT_BODY_BYTES`] before it creates a body writer,
+/// so a corrupt multi-megabyte row cannot become a service-owned allocation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ExactPromptVersionMetadata {
     id: PromptVersionId,
+    body_bytes: usize,
     body_sha256: [u8; 32],
-    body: String,
 }
 
-impl PromptVersionSnapshot {
-    /// Build a snapshot and derive its fingerprint from the supplied body.
-    pub fn from_body(id: PromptVersionId, body: String) -> Self {
-        let body_sha256 = sha256(body.as_bytes());
+impl ExactPromptVersionMetadata {
+    pub fn new(id: PromptVersionId, body_bytes: usize, body_sha256: [u8; 32]) -> Self {
         Self {
             id,
+            body_bytes,
             body_sha256,
-            body,
-        }
-    }
-
-    /// Build a loader snapshot with an independently supplied fingerprint.
-    ///
-    /// Host adapters normally use [`Self::from_body`]. This constructor keeps
-    /// corruption tests and adapters that read a stored digest explicit; the
-    /// service rejects a mismatched body before diffing.
-    pub fn with_body_sha256(id: PromptVersionId, body: String, body_sha256: [u8; 32]) -> Self {
-        Self {
-            id,
-            body_sha256,
-            body,
         }
     }
 
@@ -63,34 +53,88 @@ impl PromptVersionSnapshot {
         self.id
     }
 
-    pub fn body_sha256(&self) -> &[u8; 32] {
-        &self.body_sha256
+    pub fn body_bytes(&self) -> usize {
+        self.body_bytes
     }
 
-    pub(crate) fn body(&self) -> &str {
-        &self.body
+    pub fn body_sha256(&self) -> [u8; 32] {
+        self.body_sha256
     }
 }
 
-impl fmt::Debug for PromptVersionSnapshot {
+impl fmt::Debug for ExactPromptVersionMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PromptVersionSnapshot")
+        f.debug_struct("ExactPromptVersionMetadata")
             .field("id", &self.id)
-            .field("body_bytes", &self.body.len())
+            .field("body_bytes", &self.body_bytes)
             .field("body_sha256", &self.body_sha256)
             .finish()
     }
 }
 
+/// Bounded destination supplied to an exact loader's streaming read.
+///
+/// The adapter can append chunks but cannot extract, serialize, or retain the
+/// body through this public transport boundary. The worker creates this writer
+/// only after validating metadata length against the 256 KiB body cap.
+pub struct PromptVersionBodyWriter {
+    expected_bytes: usize,
+    bytes: Vec<u8>,
+}
+
+impl PromptVersionBodyWriter {
+    fn new(expected_bytes: usize) -> Self {
+        Self {
+            expected_bytes,
+            bytes: Vec::with_capacity(expected_bytes),
+        }
+    }
+
+    pub fn bytes_written(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), PromptDiffServiceError> {
+        let Some(next) = self.bytes.len().checked_add(chunk.len()) else {
+            return Err(PromptDiffServiceError::BodyBytesExceeded {
+                expected_bytes: self.expected_bytes,
+                attempted_bytes: usize::MAX,
+            });
+        };
+        if next > self.expected_bytes || next > MAX_PROMPT_BODY_BYTES {
+            return Err(PromptDiffServiceError::BodyBytesExceeded {
+                expected_bytes: self.expected_bytes,
+                attempted_bytes: next,
+            });
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 /// Exact-version loading authority injected by the host/store integration.
 ///
-/// The sole operation takes a requested immutable ID. There is deliberately no
-/// `latest`, `current`, cwd, timestamp, or transcript fallback in this trait.
-pub trait ExactPromptVersionLoader {
-    fn load_exact(
-        &self,
+/// This is the sealed worker seam for the f06e6ee prompt-store adapter: first
+/// return metadata, then stream the exact immutable body into the worker-owned
+/// bounded writer. There is deliberately no `latest`, `current`, cwd,
+/// timestamp, or transcript fallback in this trait.
+pub trait ExactPromptVersionLoader: Send + 'static {
+    fn load_exact_metadata(
+        &mut self,
         id: PromptVersionId,
-    ) -> Result<PromptVersionSnapshot, PromptDiffServiceError>;
+    ) -> Result<ExactPromptVersionMetadata, PromptDiffServiceError>;
+
+    fn read_exact_body(
+        &mut self,
+        id: PromptVersionId,
+        writer: &mut PromptVersionBodyWriter,
+        cancellation: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<(), PromptDiffServiceError>;
 }
 
 /// A pair of exact immutable IDs and their expected body fingerprints.
@@ -139,6 +183,10 @@ impl ExactPromptDiffRequest {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    fn with_generation(self, generation: u64) -> Self {
+        Self { generation, ..self }
+    }
 }
 
 impl fmt::Debug for ExactPromptDiffRequest {
@@ -162,6 +210,15 @@ pub enum PromptDiffServiceError {
     CorruptVersion {
         id: PromptVersionId,
     },
+    OversizedVersion {
+        id: PromptVersionId,
+        body_bytes: usize,
+        max_bytes: usize,
+    },
+    BodyBytesExceeded {
+        expected_bytes: usize,
+        attempted_bytes: usize,
+    },
     StaleVersion {
         id: PromptVersionId,
     },
@@ -182,6 +239,21 @@ impl fmt::Display for PromptDiffServiceError {
         match self {
             Self::MissingVersion { id } => write!(f, "prompt version {id} is missing"),
             Self::CorruptVersion { id } => write!(f, "prompt version {id} is corrupt"),
+            Self::OversizedVersion {
+                id,
+                body_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "prompt version {id} is {body_bytes} bytes; maximum is {max_bytes}"
+            ),
+            Self::BodyBytesExceeded {
+                expected_bytes,
+                attempted_bytes,
+            } => write!(
+                f,
+                "prompt body stream wrote {attempted_bytes} bytes; expected {expected_bytes}"
+            ),
             Self::StaleVersion { id } => write!(f, "prompt version {id} is stale"),
             Self::Cancelled => f.write_str("prompt diff was cancelled"),
             Self::DeadlineExceeded => f.write_str("prompt diff deadline expired"),
@@ -288,6 +360,358 @@ impl fmt::Debug for PromptDiffServiceResponse {
             .field("public_projection_bytes", &self.public_projection.len())
             .field("cache_hit", &self.cache_hit)
             .finish()
+    }
+}
+
+/// Exactly one request may wait behind the request currently being executed.
+/// A newer accepted request cancels and fences the active request.
+pub const PROMPT_DIFF_WORKER_QUEUE_CAPACITY: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDiffWorkerError {
+    QueueFull { generation: u64 },
+    Closed,
+    JoinFailed,
+}
+
+impl fmt::Display for PromptDiffWorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueFull { generation } => {
+                write!(
+                    f,
+                    "prompt diff worker queue is full for generation {generation}"
+                )
+            }
+            Self::Closed => f.write_str("prompt diff worker is closed"),
+            Self::JoinFailed => f.write_str("prompt diff worker did not join cleanly"),
+        }
+    }
+}
+
+impl std::error::Error for PromptDiffWorkerError {}
+
+/// A submitted request's cancellation handle. The handle is independent of
+/// the worker's generation fence, so callers can cancel one request without
+/// mutating another request's identity or result metadata.
+pub struct PromptDiffWorkerSubmission {
+    request: ExactPromptDiffRequest,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl PromptDiffWorkerSubmission {
+    pub fn request(&self) -> ExactPromptDiffRequest {
+        self.request
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.request.generation
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for PromptDiffWorkerSubmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptDiffWorkerSubmission")
+            .field("request", &self.request)
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+/// A body-free result envelope. The response's crate-local projection is
+/// still owned by the worker result and is never placed in the worker cache or
+/// exposed through this envelope's debug/serialization surface.
+pub struct PromptDiffWorkerResult {
+    request: ExactPromptDiffRequest,
+    outcome: Result<PromptDiffServiceResponse, PromptDiffServiceError>,
+}
+
+impl PromptDiffWorkerResult {
+    pub fn request(&self) -> ExactPromptDiffRequest {
+        self.request
+    }
+
+    pub fn before_id(&self) -> PromptVersionId {
+        self.request.before_id
+    }
+
+    pub fn after_id(&self) -> PromptVersionId {
+        self.request.after_id
+    }
+
+    pub fn before_body_sha256(&self) -> &[u8; 32] {
+        &self.request.before_body_sha256
+    }
+
+    pub fn after_body_sha256(&self) -> &[u8; 32] {
+        &self.request.after_body_sha256
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.request.generation
+    }
+
+    pub fn outcome(self) -> Result<PromptDiffServiceResponse, PromptDiffServiceError> {
+        self.outcome
+    }
+}
+
+impl fmt::Debug for PromptDiffWorkerResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let outcome = match &self.outcome {
+            Ok(response) => format!("Ok(status={:?})", response.status()),
+            Err(error) => format!("Err({error:?})"),
+        };
+        f.debug_struct("PromptDiffWorkerResult")
+            .field("request", &self.request)
+            .field("outcome", &outcome)
+            .finish()
+    }
+}
+
+struct WorkerRequest {
+    request: ExactPromptDiffRequest,
+    cancellation: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+struct WorkerShared {
+    shutdown: AtomicBool,
+    next_generation: AtomicU64,
+    latest_generation: AtomicU64,
+    fence: Mutex<()>,
+    active_cancellation: Mutex<Option<ActiveCancellation>>,
+}
+
+struct ActiveCancellation {
+    generation: u64,
+    token: Arc<AtomicBool>,
+}
+
+impl WorkerShared {
+    fn new() -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            next_generation: AtomicU64::new(0),
+            latest_generation: AtomicU64::new(0),
+            fence: Mutex::new(()),
+            active_cancellation: Mutex::new(None),
+        }
+    }
+
+    fn cancel_active_except(&self, generation: u64) {
+        if let Ok(active) = self.active_cancellation.lock() {
+            if let Some(active) = active.as_ref() {
+                if active.generation != generation {
+                    active.token.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn cancel_active(&self) {
+        if let Ok(active) = self.active_cancellation.lock() {
+            if let Some(active) = active.as_ref() {
+                active.token.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn set_active(&self, generation: u64, cancellation: Arc<AtomicBool>) {
+        *self
+            .active_cancellation
+            .lock()
+            .expect("prompt diff active cancellation lock poisoned") = Some(ActiveCancellation {
+            generation,
+            token: cancellation,
+        });
+    }
+
+    fn clear_active(&self) {
+        *self
+            .active_cancellation
+            .lock()
+            .expect("prompt diff active cancellation lock poisoned") = None;
+    }
+}
+
+/// Owned host worker for exact prompt diffs.
+///
+/// The public submission/result surface is asynchronous. The synchronous
+/// service and all prompt body storage live exclusively on the actor thread;
+/// callers from paint/input code can only enqueue, cancel, and poll.
+pub struct PromptDiffWorker<L> {
+    sender: Option<SyncSender<WorkerRequest>>,
+    results: Mutex<Receiver<PromptDiffWorkerResult>>,
+    shared: Arc<WorkerShared>,
+    join: Option<JoinHandle<()>>,
+    _loader: PhantomData<L>,
+}
+
+impl<L: ExactPromptVersionLoader> PromptDiffWorker<L> {
+    pub fn spawn(loader: L, max_items: usize, max_bytes: usize) -> Self {
+        let (sender, requests) = mpsc::sync_channel(PROMPT_DIFF_WORKER_QUEUE_CAPACITY);
+        let (results_sender, results) = mpsc::channel();
+        let shared = Arc::new(WorkerShared::new());
+        let worker_shared = Arc::clone(&shared);
+        let join = thread::spawn(move || {
+            worker_loop(
+                loader,
+                requests,
+                results_sender,
+                worker_shared,
+                max_items,
+                max_bytes,
+            );
+        });
+        Self {
+            sender: Some(sender),
+            results: Mutex::new(results),
+            shared,
+            join: Some(join),
+            _loader: PhantomData,
+        }
+    }
+
+    pub fn submit(
+        &self,
+        request: ExactPromptDiffRequest,
+        deadline: Option<Instant>,
+    ) -> Result<PromptDiffWorkerSubmission, PromptDiffWorkerError> {
+        let _fence = self
+            .shared
+            .fence
+            .lock()
+            .map_err(|_| PromptDiffWorkerError::Closed)?;
+        if self.shared.shutdown.load(Ordering::Acquire) {
+            return Err(PromptDiffWorkerError::Closed);
+        }
+        let generation = self
+            .shared
+            .next_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let request = request.with_generation(generation);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let work = WorkerRequest {
+            request,
+            cancellation: Arc::clone(&cancellation),
+            deadline,
+        };
+        let sender = self.sender.as_ref().ok_or(PromptDiffWorkerError::Closed)?;
+        match sender.try_send(work) {
+            Ok(()) => {
+                update_latest_generation(&self.shared.latest_generation, generation);
+                self.shared.cancel_active_except(generation);
+                Ok(PromptDiffWorkerSubmission {
+                    request,
+                    cancellation,
+                })
+            }
+            Err(TrySendError::Full(_)) => Err(PromptDiffWorkerError::QueueFull { generation }),
+            Err(TrySendError::Disconnected(_)) => Err(PromptDiffWorkerError::Closed),
+        }
+    }
+}
+
+impl<L> PromptDiffWorker<L> {
+    pub fn try_recv(&self) -> Result<Option<PromptDiffWorkerResult>, PromptDiffWorkerError> {
+        let results = self
+            .results
+            .lock()
+            .map_err(|_| PromptDiffWorkerError::Closed)?;
+        match results.try_recv() {
+            Ok(result) => Ok(Some(result)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(PromptDiffWorkerError::Closed),
+        }
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), PromptDiffWorkerError> {
+        {
+            let _fence = self
+                .shared
+                .fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.shared.shutdown.store(true, Ordering::Release);
+            self.shared.cancel_active();
+            self.sender.take();
+        }
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join().map_err(|_| PromptDiffWorkerError::JoinFailed)
+    }
+}
+
+impl<L> Drop for PromptDiffWorker<L> {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn update_latest_generation(latest: &AtomicU64, generation: u64) {
+    let mut current = latest.load(Ordering::Acquire);
+    while current < generation {
+        match latest.compare_exchange_weak(current, generation, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn worker_loop<L: ExactPromptVersionLoader>(
+    loader: L,
+    requests: Receiver<WorkerRequest>,
+    results: mpsc::Sender<PromptDiffWorkerResult>,
+    shared: Arc<WorkerShared>,
+    max_items: usize,
+    max_bytes: usize,
+) {
+    let mut service = PromptDiffService::new(loader, max_items, max_bytes);
+    while let Ok(work) = requests.recv() {
+        if shared.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        shared.set_active(work.request.generation, Arc::clone(&work.cancellation));
+        let current_generation = match shared.fence.lock() {
+            Ok(_fence) => shared.latest_generation.load(Ordering::Acquire),
+            Err(_) => break,
+        };
+        if work.request.generation != current_generation {
+            shared.clear_active();
+            continue;
+        }
+        let outcome =
+            service.compute_exact_with_deadline(work.request, &work.cancellation, work.deadline);
+        shared.clear_active();
+        let Ok(_fence) = shared.fence.lock() else {
+            break;
+        };
+        if shared.shutdown.load(Ordering::Acquire)
+            || work.request.generation != shared.latest_generation.load(Ordering::Acquire)
+        {
+            continue;
+        }
+        if results
+            .send(PromptDiffWorkerResult {
+                request: work.request,
+                outcome,
+            })
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -536,76 +960,75 @@ fn local_inline_span(
     })
 }
 
-/// Exact-version diff worker facade with an entry- and byte-bounded LRU.
-///
-/// `diff_exact` is synchronous by design so an executor can own the call on a
-/// host worker. It never touches UI paint/input state and retains only the
-/// body-free projection in its cache. The `generation` fence must be advanced
-/// by the host before publishing a newly selected request.
-pub struct PromptDiffService<L> {
+/// Validated body that exists only for the duration of one actor request.
+/// There is no public constructor, Debug, serde implementation, or cache path
+/// for this type.
+struct BoundedPromptBody {
+    #[allow(dead_code)]
+    id: PromptVersionId,
+    #[allow(dead_code)]
+    body_sha256: [u8; 32],
+    body: String,
+}
+
+impl BoundedPromptBody {
+    fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+/// Actor-confined exact-version diff service with an entry- and byte-bounded
+/// LRU. It is intentionally private: UI-facing code uses [`PromptDiffWorker`]
+/// and cannot synchronously invoke `diff_exact` from paint or input handling.
+struct PromptDiffService<L> {
     loader: L,
     max_items: usize,
     max_bytes: usize,
     cache_bytes: usize,
     cache: VecDeque<CachedProjection>,
-    generation: u64,
 }
 
 impl<L> PromptDiffService<L> {
-    pub fn new(loader: L, max_items: usize, max_bytes: usize) -> Self {
+    fn new(loader: L, max_items: usize, max_bytes: usize) -> Self {
         Self {
             loader,
             max_items,
             max_bytes,
             cache_bytes: 0,
             cache: VecDeque::new(),
-            generation: 0,
         }
-    }
-
-    pub fn cache_len(&self) -> usize {
-        self.cache.len()
-    }
-
-    pub fn cache_bytes(&self) -> usize {
-        self.cache_bytes
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Advance the delivery fence. Responses for older generations fail even
-    /// when their exact IDs happen to be present in the cache.
-    pub fn begin_generation(&mut self, generation: u64) {
-        self.generation = self.generation.max(generation);
     }
 }
 
 impl<L: ExactPromptVersionLoader> PromptDiffService<L> {
-    pub fn diff_exact(
-        &mut self,
-        request: ExactPromptDiffRequest,
-        cancellation: &AtomicBool,
-    ) -> Result<PromptDiffServiceResponse, PromptDiffServiceError> {
-        self.diff_exact_with_deadline(request, cancellation, None)
-    }
-
     /// Run an exact diff with a host-owned deadline. The same fence is checked
     /// before loading, after loading, after diffing, and immediately before
     /// delivery so an expired worker result cannot reach a newer UI request.
-    pub fn diff_exact_with_deadline(
+    fn compute_exact_with_deadline(
         &mut self,
         request: ExactPromptDiffRequest,
         cancellation: &AtomicBool,
         deadline: Option<Instant>,
     ) -> Result<PromptDiffServiceResponse, PromptDiffServiceError> {
-        self.check_delivery_fence(request, cancellation, deadline)?;
+        self.check_delivery_fence(cancellation, deadline)?;
 
-        let before = self.load_and_validate(request.before_id, request.before_body_sha256)?;
-        self.check_delivery_fence(request, cancellation, deadline)?;
-        let after = self.load_and_validate(request.after_id, request.after_body_sha256)?;
-        self.check_delivery_fence(request, cancellation, deadline)?;
+        let before_metadata = self.load_metadata(
+            request.before_id,
+            request.before_body_sha256,
+            cancellation,
+            deadline,
+        )?;
+        let after_metadata = self.load_metadata(
+            request.after_id,
+            request.after_body_sha256,
+            cancellation,
+            deadline,
+        )?;
+        self.check_delivery_fence(cancellation, deadline)?;
+        let before = self.read_validated_body(before_metadata, cancellation, deadline)?;
+        self.check_delivery_fence(cancellation, deadline)?;
+        let after = self.read_validated_body(after_metadata, cancellation, deadline)?;
+        self.check_delivery_fence(cancellation, deadline)?;
 
         let key = ServiceCacheKey {
             before_id: request.before_id,
@@ -617,7 +1040,7 @@ impl<L: ExactPromptVersionLoader> PromptDiffService<L> {
             normalization: PROMPT_DIFF_NORMALIZATION_POLICY,
         };
         if let Some((status, bytes)) = self.cache_get(key) {
-            self.check_delivery_fence(request, cancellation, deadline)?;
+            self.check_delivery_fence(cancellation, deadline)?;
             return Ok(PromptDiffServiceResponse {
                 request,
                 status,
@@ -635,12 +1058,12 @@ impl<L: ExactPromptVersionLoader> PromptDiffService<L> {
         let status = diff.status();
         let bytes = encode_public_diff(&diff)?;
         let local_projection = LocalPromptDiffProjection::from_diff(&diff, cancellation)?;
-        self.check_delivery_fence(request, cancellation, deadline)?;
+        self.check_delivery_fence(cancellation, deadline)?;
 
         if status == DiffStatus::Complete {
             self.cache_insert(key, status, bytes.clone());
         }
-        self.check_delivery_fence(request, cancellation, deadline)?;
+        self.check_delivery_fence(cancellation, deadline)?;
         Ok(PromptDiffServiceResponse {
             request,
             status,
@@ -650,36 +1073,70 @@ impl<L: ExactPromptVersionLoader> PromptDiffService<L> {
         })
     }
 
-    fn load_and_validate(
-        &self,
+    fn load_metadata(
+        &mut self,
         id: PromptVersionId,
         expected_body_sha256: [u8; 32],
-    ) -> Result<PromptVersionSnapshot, PromptDiffServiceError> {
-        let snapshot = self.loader.load_exact(id)?;
-        if snapshot.id() != id {
+        cancellation: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<ExactPromptVersionMetadata, PromptDiffServiceError> {
+        self.check_delivery_fence(cancellation, deadline)?;
+        let metadata = self.loader.load_exact_metadata(id)?;
+        if metadata.id() != id {
             return Err(PromptDiffServiceError::CorruptVersion { id });
         }
-        if sha256(snapshot.body().as_bytes()) != *snapshot.body_sha256() {
-            return Err(PromptDiffServiceError::CorruptVersion { id });
+        if metadata.body_bytes() > MAX_PROMPT_BODY_BYTES {
+            return Err(PromptDiffServiceError::OversizedVersion {
+                id,
+                body_bytes: metadata.body_bytes(),
+                max_bytes: MAX_PROMPT_BODY_BYTES,
+            });
         }
-        if expected_body_sha256 != *snapshot.body_sha256() {
+        if expected_body_sha256 != metadata.body_sha256() {
             return Err(PromptDiffServiceError::StaleVersion { id });
         }
-        Ok(snapshot)
+        self.check_delivery_fence(cancellation, deadline)?;
+        Ok(metadata)
+    }
+
+    fn read_validated_body(
+        &mut self,
+        metadata: ExactPromptVersionMetadata,
+        cancellation: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<BoundedPromptBody, PromptDiffServiceError> {
+        let id = metadata.id();
+        self.check_delivery_fence(cancellation, deadline)?;
+        let mut writer = PromptVersionBodyWriter::new(metadata.body_bytes());
+        self.loader
+            .read_exact_body(id, &mut writer, cancellation, deadline)
+            .map_err(|error| match error {
+                PromptDiffServiceError::BodyBytesExceeded { .. } => {
+                    PromptDiffServiceError::CorruptVersion { id }
+                }
+                error => error,
+            })?;
+        self.check_delivery_fence(cancellation, deadline)?;
+        if writer.bytes_written() != metadata.body_bytes() {
+            return Err(PromptDiffServiceError::CorruptVersion { id });
+        }
+        let body = String::from_utf8(writer.into_bytes())
+            .map_err(|_| PromptDiffServiceError::CorruptVersion { id })?;
+        if sha256(body.as_bytes()) != metadata.body_sha256() {
+            return Err(PromptDiffServiceError::CorruptVersion { id });
+        }
+        Ok(BoundedPromptBody {
+            id,
+            body_sha256: metadata.body_sha256(),
+            body,
+        })
     }
 
     fn check_delivery_fence(
         &self,
-        request: ExactPromptDiffRequest,
         cancellation: &AtomicBool,
         deadline: Option<Instant>,
     ) -> Result<(), PromptDiffServiceError> {
-        if request.generation != self.generation {
-            return Err(PromptDiffServiceError::StaleGeneration {
-                requested: request.generation,
-                current: self.generation,
-            });
-        }
         if cancellation.load(Ordering::Relaxed) {
             return Err(PromptDiffServiceError::Cancelled);
         }

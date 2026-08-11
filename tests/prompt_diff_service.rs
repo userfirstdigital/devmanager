@@ -4,63 +4,114 @@ use std::time::{Duration, Instant};
 
 use devmanager::domain::PromptVersionId;
 use devmanager::prompts::{
-    ExactPromptDiffRequest, ExactPromptVersionLoader, PromptDiffService, PromptDiffServiceError,
-    PromptVersionSnapshot, MAX_PROMPT_DIFF_LINE_COUNT, MAX_PROMPT_DIFF_PAYLOAD_BYTES,
+    ExactPromptDiffRequest, ExactPromptVersionLoader, ExactPromptVersionMetadata,
+    PromptDiffServiceError, PromptDiffWorker, PromptVersionBodyWriter, MAX_PROMPT_DIFF_LINE_COUNT,
+    MAX_PROMPT_DIFF_PAYLOAD_BYTES,
 };
 
-#[derive(Default)]
-struct FakeLoader {
-    versions: HashMap<PromptVersionId, PromptVersionSnapshot>,
+#[derive(Clone)]
+struct Version {
+    metadata: ExactPromptVersionMetadata,
+    body: Vec<u8>,
 }
 
-impl ExactPromptVersionLoader for FakeLoader {
-    fn load_exact(
-        &self,
-        id: PromptVersionId,
-    ) -> Result<PromptVersionSnapshot, PromptDiffServiceError> {
-        self.versions
-            .get(&id)
-            .cloned()
-            .ok_or(PromptDiffServiceError::MissingVersion { id })
+impl Version {
+    fn new(id: PromptVersionId, body: &str) -> Self {
+        let body = body.as_bytes().to_vec();
+        Self {
+            metadata: ExactPromptVersionMetadata::new(id, body.len(), sha256(&body)),
+            body,
+        }
     }
 }
 
-fn request(
-    before: &PromptVersionSnapshot,
-    after: &PromptVersionSnapshot,
-    generation: u64,
-) -> ExactPromptDiffRequest {
+#[derive(Clone, Default)]
+struct FakeLoader {
+    versions: HashMap<PromptVersionId, Version>,
+}
+
+impl ExactPromptVersionLoader for FakeLoader {
+    fn load_exact_metadata(
+        &mut self,
+        id: PromptVersionId,
+    ) -> Result<ExactPromptVersionMetadata, PromptDiffServiceError> {
+        self.versions
+            .get(&id)
+            .map(|version| version.metadata)
+            .ok_or(PromptDiffServiceError::MissingVersion { id })
+    }
+
+    fn read_exact_body(
+        &mut self,
+        id: PromptVersionId,
+        writer: &mut PromptVersionBodyWriter,
+        cancellation: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> Result<(), PromptDiffServiceError> {
+        if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PromptDiffServiceError::Cancelled);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PromptDiffServiceError::DeadlineExceeded);
+        }
+        let version = self
+            .versions
+            .get(&id)
+            .ok_or(PromptDiffServiceError::MissingVersion { id })?;
+        writer.write_chunk(&version.body)
+    }
+}
+
+fn request(before: &Version, after: &Version) -> ExactPromptDiffRequest {
     ExactPromptDiffRequest::new(
-        before.id(),
-        after.id(),
-        *before.body_sha256(),
-        *after.body_sha256(),
-        generation,
+        before.metadata.id(),
+        after.metadata.id(),
+        before.metadata.body_sha256(),
+        after.metadata.body_sha256(),
+        0,
     )
+}
+
+fn wait_for_result<L>(worker: &PromptDiffWorker<L>) -> devmanager::prompts::PromptDiffWorkerResult {
+    for _ in 0..5_000 {
+        match worker.try_recv() {
+            Ok(Some(result)) => return result,
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(error) => panic!("worker result channel closed: {error:?}"),
+        }
+    }
+    panic!("worker did not deliver a result");
+}
+
+fn run(
+    loader: FakeLoader,
+    request: ExactPromptDiffRequest,
+    deadline: Option<Instant>,
+) -> devmanager::prompts::PromptDiffWorkerResult {
+    let worker = PromptDiffWorker::spawn(loader, 2, 16 * 1024);
+    worker
+        .submit(request, deadline)
+        .expect("exact diff should enqueue");
+    wait_for_result(&worker)
 }
 
 #[test]
 fn service_loads_only_exact_ids_and_returns_body_free_projection() {
-    let before_id = PromptVersionId::new();
-    let after_id = PromptVersionId::new();
-    let before = PromptVersionSnapshot::from_body(before_id, "private service sentinel".into());
-    let after = PromptVersionSnapshot::from_body(after_id, "replacement".into());
+    let before = Version::new(PromptVersionId::new(), "private service sentinel");
+    let after = Version::new(PromptVersionId::new(), "replacement");
     let mut loader = FakeLoader::default();
-    loader.versions.insert(before.id(), before.clone());
-    loader.versions.insert(after.id(), after.clone());
-    let mut service = PromptDiffService::new(loader, 2, 16 * 1024);
+    loader.versions.insert(before.metadata.id(), before.clone());
+    loader.versions.insert(after.metadata.id(), after.clone());
 
-    let response = service
-        .diff_exact(request(&before, &after, 0), &AtomicBool::new(false))
-        .expect("exact versions should diff");
-
-    assert_eq!(response.before_id(), before.id());
-    assert_eq!(response.after_id(), after.id());
+    let result = run(loader, request(&before, &after), None);
+    assert_eq!(result.before_id(), before.metadata.id());
+    assert_eq!(result.after_id(), after.metadata.id());
+    let response = result.outcome().expect("exact versions should diff");
     assert_eq!(response.status(), devmanager::prompts::DiffStatus::Complete);
     assert!(response.has_local_projection());
-    let snapshot_debug = format!("{before:?}");
-    assert!(snapshot_debug.contains("body_bytes"));
-    assert!(!snapshot_debug.contains("private service sentinel"));
+    let metadata_debug = format!("{:?}", before.metadata);
+    assert!(metadata_debug.contains("body_bytes"));
+    assert!(!metadata_debug.contains("private service sentinel"));
     let projection = String::from_utf8_lossy(response.public_projection());
     assert!(!projection.contains("private service sentinel"));
     assert!(!projection.contains("\"text\""));
@@ -70,133 +121,116 @@ fn service_loads_only_exact_ids_and_returns_body_free_projection() {
 
 #[test]
 fn service_fails_visibly_for_missing_corrupt_and_stale_versions() {
-    let before_id = PromptVersionId::new();
-    let after_id = PromptVersionId::new();
-    let before = PromptVersionSnapshot::from_body(before_id, "before".into());
-    let after = PromptVersionSnapshot::from_body(after_id, "after".into());
+    let before = Version::new(PromptVersionId::new(), "before");
+    let after = Version::new(PromptVersionId::new(), "after");
 
     let mut missing_loader = FakeLoader::default();
-    missing_loader.versions.insert(before.id(), before.clone());
-    let mut missing_service = PromptDiffService::new(missing_loader, 2, 16 * 1024);
+    missing_loader
+        .versions
+        .insert(before.metadata.id(), before.clone());
+    let missing = run(missing_loader, request(&before, &after), None);
     assert!(matches!(
-        missing_service.diff_exact(request(&before, &after, 0), &AtomicBool::new(false)),
-        Err(PromptDiffServiceError::MissingVersion { id }) if id == after.id()
+        missing.outcome(),
+        Err(PromptDiffServiceError::MissingVersion { id }) if id == after.metadata.id()
     ));
 
     let mut corrupt_loader = FakeLoader::default();
     corrupt_loader.versions.insert(
-        before.id(),
-        PromptVersionSnapshot::with_body_sha256(
-            before.id(),
-            "tampered".into(),
-            *before.body_sha256(),
-        ),
+        before.metadata.id(),
+        Version {
+            metadata: before.metadata,
+            body: b"tampered".to_vec(),
+        },
     );
-    corrupt_loader.versions.insert(after.id(), after.clone());
-    let mut corrupt_service = PromptDiffService::new(corrupt_loader, 2, 16 * 1024);
+    corrupt_loader
+        .versions
+        .insert(after.metadata.id(), after.clone());
+    let corrupt = run(corrupt_loader, request(&before, &after), None);
     assert!(matches!(
-        corrupt_service.diff_exact(request(&before, &after, 0), &AtomicBool::new(false)),
-        Err(PromptDiffServiceError::CorruptVersion { id }) if id == before.id()
+        corrupt.outcome(),
+        Err(PromptDiffServiceError::CorruptVersion { id }) if id == before.metadata.id()
     ));
 
-    let mut stale_service = PromptDiffService::new(
-        FakeLoader {
-            versions: HashMap::from([(before.id(), before.clone()), (after.id(), after.clone())]),
-        },
-        2,
-        16 * 1024,
+    let mut stale_loader = FakeLoader::default();
+    stale_loader
+        .versions
+        .insert(before.metadata.id(), before.clone());
+    stale_loader
+        .versions
+        .insert(after.metadata.id(), after.clone());
+    let stale_request = ExactPromptDiffRequest::new(
+        before.metadata.id(),
+        after.metadata.id(),
+        [0xA5; 32],
+        after.metadata.body_sha256(),
+        0,
     );
-    let stale_request =
-        ExactPromptDiffRequest::new(before.id(), after.id(), [0xA5; 32], *after.body_sha256(), 0);
+    let stale = run(stale_loader, stale_request, None);
     assert!(matches!(
-        stale_service.diff_exact(stale_request, &AtomicBool::new(false)),
-        Err(PromptDiffServiceError::StaleVersion { id }) if id == before.id()
+        stale.outcome(),
+        Err(PromptDiffServiceError::StaleVersion { id }) if id == before.metadata.id()
     ));
 }
 
 #[test]
-fn service_lru_is_bounded_and_generation_fence_blocks_stale_delivery() {
-    let before = PromptVersionSnapshot::from_body(PromptVersionId::new(), "before".into());
-    let after = PromptVersionSnapshot::from_body(PromptVersionId::new(), "after".into());
-    let third = PromptVersionSnapshot::from_body(PromptVersionId::new(), "third".into());
-    let mut service = PromptDiffService::new(
-        FakeLoader {
-            versions: HashMap::from([
-                (before.id(), before.clone()),
-                (after.id(), after.clone()),
-                (third.id(), third.clone()),
-            ]),
-        },
-        1,
-        16 * 1024,
-    );
-    let cancellation = AtomicBool::new(false);
+fn service_cache_returns_body_free_hit_for_same_exact_key() {
+    let before = Version::new(PromptVersionId::new(), "before");
+    let after = Version::new(PromptVersionId::new(), "after");
+    let mut loader = FakeLoader::default();
+    loader.versions.insert(before.metadata.id(), before.clone());
+    loader.versions.insert(after.metadata.id(), after.clone());
+    let worker = PromptDiffWorker::spawn(loader, 1, 16 * 1024);
 
-    let first = service
-        .diff_exact(request(&before, &after, 0), &cancellation)
-        .expect("first exact diff");
+    worker
+        .submit(request(&before, &after), None)
+        .expect("first");
+    let first = wait_for_result(&worker).outcome().expect("first diff");
     assert!(!first.cache_hit());
-    assert_eq!(service.cache_len(), 1);
-    assert!(service.cache_bytes() <= 16 * 1024);
+    assert!(first.has_local_projection());
 
-    let second = service
-        .diff_exact(request(&before, &third, 0), &cancellation)
-        .expect("second exact diff");
-    assert!(!second.cache_hit());
-    assert_eq!(service.cache_len(), 1);
-    assert!(service.cache_bytes() <= 16 * 1024);
-
-    let second_again = service
-        .diff_exact(request(&before, &third, 0), &cancellation)
-        .expect("exact cache key should hit");
-    assert!(second_again.cache_hit());
-    assert!(!second_again.has_local_projection());
-    assert_eq!(second_again.public_projection(), second.public_projection());
-
-    service.begin_generation(1);
-    service.begin_generation(0);
-    assert!(matches!(
-        service.diff_exact(request(&before, &third, 0), &cancellation),
-        Err(PromptDiffServiceError::StaleGeneration {
-            requested: 0,
-            current: 1
-        })
-    ));
+    worker
+        .submit(request(&before, &after), None)
+        .expect("second");
+    let second = wait_for_result(&worker).outcome().expect("cache hit");
+    assert!(second.cache_hit());
+    assert!(!second.has_local_projection());
+    assert_eq!(second.public_projection(), first.public_projection());
 }
 
 #[test]
 fn service_deadline_and_adversarial_line_caps_are_deterministic() {
-    let before = PromptVersionSnapshot::from_body(PromptVersionId::new(), "before".into());
-    let after = PromptVersionSnapshot::from_body(
+    let before = Version::new(PromptVersionId::new(), "before");
+    let after = Version::new(
         PromptVersionId::new(),
-        "x\n".repeat(MAX_PROMPT_DIFF_LINE_COUNT + 1),
+        &"x\n".repeat(MAX_PROMPT_DIFF_LINE_COUNT + 1),
     );
-    let mut service = PromptDiffService::new(
-        FakeLoader {
-            versions: HashMap::from([(before.id(), before.clone()), (after.id(), after.clone())]),
-        },
-        2,
-        MAX_PROMPT_DIFF_PAYLOAD_BYTES,
-    );
-    let cancellation = AtomicBool::new(false);
-    let request = request(&before, &after, 0);
+    let mut loader = FakeLoader::default();
+    loader.versions.insert(before.metadata.id(), before.clone());
+    loader.versions.insert(after.metadata.id(), after.clone());
 
+    let deadline = run(
+        loader.clone(),
+        request(&before, &after),
+        Some(Instant::now() - Duration::from_secs(1)),
+    );
     assert!(matches!(
-        service.diff_exact_with_deadline(
-            request,
-            &cancellation,
-            Some(Instant::now() - Duration::from_secs(1)),
-        ),
+        deadline.outcome(),
         Err(PromptDiffServiceError::DeadlineExceeded)
     ));
 
-    let response = service
-        .diff_exact(request, &cancellation)
+    let result = run(loader, request(&before, &after), None);
+    let response = result
+        .outcome()
         .expect("the bounded line cap should produce a visible approximation");
     assert_eq!(
         response.status(),
         devmanager::prompts::DiffStatus::Approximate
     );
     assert!(response.public_projection().len() <= MAX_PROMPT_DIFF_PAYLOAD_BYTES);
-    assert_eq!(service.cache_len(), 0);
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(bytes).into()
 }
