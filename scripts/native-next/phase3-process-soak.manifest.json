@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "revision": "phase3.10-supervisor-v2",
+  "gitRevision": "ddd6c55",
+  "buildId": "phase3.10-supervisor-build-v2",
+  "supervisorExecutable": "target\\debug\\devmanager-process-test-helper.exe",
+  "supervisorSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
+  "helperExecutable": "target\\debug\\devmanager-process-test-helper.exe",
+  "helperSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
+  "cycleExecutable": "target\\debug\\devmanager-process-test-helper.exe",
+  "cycleSha256": "db8b8f62d0efc401d002f8bc7e9fef55a57b5f0a3ac6dc026fd3ffbfff7e2580",
+  "workingDirectory": ".",
+  "evidenceRoot": ".devmanager-next\\evidence",
+  "environment": {
+    "systemRoot": "C:\\WINDOWS",
+    "tempDirectory": ".tmp-phase3-soak",
+    "pathDirectories": [
+      "C:\\WINDOWS\\System32",
+      "target\\debug"
+    ],
+    "allowlist": {}
+  },
+  "ansiCorpus": {
+    "path": "tests\\fixtures\\ansi\\phase3-v1.json",
+    "sha256": "3cac840e8b807e00fb58bd6e75fae45f62183d5a566473a014f9a65d4dbbea5d",
+    "revision": "phase3.10-ansi-v1"
+  },
+  "seed": 3403,
+  "iterations": 100,
+  "budgets": {
+    "suiteDeadlineMs": 600000,
+    "cycleDeadlineMs": 5000,
+    "cleanupDeadlineMs": 5000,
+    "stdoutBytes": 65536,
+    "stderrBytes": 16384,
+    "resultBytes": 262144
+  },
+  "scenarioCatalog": [
+    {
+      "name": "natural",
+      "arguments": ["cycle", "natural"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "ansi-corpus",
+      "arguments": ["cycle", "ansi-corpus"],
+      "expectedExitCode": 0
+    },
+    {
+      "name": "restart-resume",
+      "arguments": ["cycle", "restart-resume"],
+      "expectedExitCode": 0
+    }
+  ]
+}

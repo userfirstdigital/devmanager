@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -8,9 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use devmanager::process::job::ManagedProcessJob;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 const NATURAL_EXIT_BOUND: Duration = Duration::from_secs(20);
 const DEFAULT_BOUNDED_DURATION_MS: u64 = 100;
@@ -21,6 +23,11 @@ const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_FORK_CHILDREN: u32 = 1;
 const MAX_FORK_CHILDREN: u32 = 1024;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
+// The manifest is deliberately tied to the reviewed candidate and a named
+// helper build.  A caller cannot silently mix a manifest from another
+// checkout or a stale helper binary into this gate.
+const EXPECTED_GIT_REVISION: &str = "ddd6c55";
+const EXPECTED_BUILD_ID: &str = "phase3.10-supervisor-build-v2";
 const SUPERVISOR_MAX_ITERATIONS: u32 = 100;
 const SUPERVISOR_MAX_SCENARIOS: usize = 32;
 const SUPERVISOR_MAX_ARGUMENTS: usize = 32;
@@ -820,16 +827,33 @@ fn run_cycle(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), 
             "iteration": iteration,
             "resume": "new-generation",
         })),
+        "environment-probe" => emit_cycle_result(&json!({
+            "schemaVersion": 1,
+            "status": "completed",
+            "scenario": scenario,
+            "seed": seed,
+            "iteration": iteration,
+            "environment": {
+                "secretPresent": std::env::var_os("PHASE3_SOAK_SECRET").is_some(),
+                "systemRootPresent": std::env::var_os("SystemRoot").is_some(),
+                "tempPresent": std::env::var_os("TEMP").is_some(),
+                "pathPresent": std::env::var_os("PATH").is_some(),
+            },
+        })),
         other => Err(format!("unknown cycle scenario: {other}")),
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SupervisorManifest {
     #[serde(rename = "schemaVersion")]
     schema_version: u32,
     revision: String,
+    #[serde(rename = "gitRevision")]
+    git_revision: String,
+    #[serde(rename = "buildId")]
+    build_id: String,
     #[serde(rename = "supervisorExecutable")]
     supervisor_executable: std::path::PathBuf,
     #[serde(rename = "supervisorSha256")]
@@ -844,6 +868,11 @@ struct SupervisorManifest {
     cycle_sha256: String,
     #[serde(rename = "workingDirectory")]
     working_directory: std::path::PathBuf,
+    #[serde(rename = "evidenceRoot")]
+    evidence_root: std::path::PathBuf,
+    environment: SupervisorEnvironment,
+    #[serde(rename = "ansiCorpus")]
+    ansi_corpus: AnsiCorpusReference,
     seed: u64,
     iterations: u32,
     budgets: SupervisorBudgets,
@@ -851,7 +880,28 @@ struct SupervisorManifest {
     scenario_catalog: Vec<SupervisorScenario>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct SupervisorEnvironment {
+    #[serde(rename = "systemRoot")]
+    system_root: std::path::PathBuf,
+    #[serde(rename = "tempDirectory")]
+    temp_directory: std::path::PathBuf,
+    #[serde(rename = "pathDirectories")]
+    path_directories: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    allowlist: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct AnsiCorpusReference {
+    path: std::path::PathBuf,
+    sha256: String,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SupervisorBudgets {
     #[serde(rename = "suiteDeadlineMs")]
@@ -868,7 +918,7 @@ struct SupervisorBudgets {
     result_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SupervisorScenario {
     name: String,
@@ -933,9 +983,133 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn reject_reparse_ancestors(path: &std::path::Path, label: &str) -> Result<(), String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve {label}: {error}"))?
+            .join(path)
+    };
+    let mut current = std::path::PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if !current.exists() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            format!("inspect {label} ancestor `{}`: {error}", current.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{label} contains a symbolic-link reparse point: {}",
+                current.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "{label} contains a reparse point: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_existing_path(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<std::path::PathBuf, String> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve {label}: {error}"))?
+            .join(path)
+    };
+    reject_reparse_ancestors(&candidate, label)?;
+    std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("{label} cannot be canonicalized: {error}"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnsiCorpusFile {
+    revision: String,
+    cases: Vec<AnsiCorpusCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnsiCorpusCase {
+    name: String,
+    #[serde(default)]
+    bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    chunks: Option<Vec<Vec<u8>>>,
+}
+
+fn load_ansi_corpus(reference: &AnsiCorpusReference) -> Result<Value, String> {
+    let path = resolve_existing_path(&reference.path, "ansi corpus")?;
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("read ANSI corpus `{}`: {error}", path.display()))?;
+    let actual_hash = sha256_bytes(&bytes);
+    if actual_hash != reference.sha256.trim().to_ascii_lowercase() {
+        return Err(format!(
+            "ANSI corpus SHA-256 mismatch: expected {}, actual {actual_hash}",
+            reference.sha256
+        ));
+    }
+    let corpus: AnsiCorpusFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("ANSI corpus JSON malformed: {error}"))?;
+    if corpus.revision != reference.revision || corpus.revision.trim().is_empty() {
+        return Err(format!(
+            "ANSI corpus revision mismatch: expected {}, actual {}",
+            reference.revision, corpus.revision
+        ));
+    }
+    if corpus.cases.is_empty() || corpus.cases.len() > 64 {
+        return Err("ANSI corpus case count is outside its bound".to_string());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut case_hashes = BTreeMap::new();
+    for case in corpus.cases {
+        if case.name.trim().is_empty() || !names.insert(case.name.clone()) {
+            return Err("ANSI corpus case names must be non-empty and unique".to_string());
+        }
+        let flattened = match (case.bytes, case.chunks) {
+            (Some(bytes), None) => bytes,
+            (None, Some(chunks)) => chunks.into_iter().flatten().collect(),
+            _ => {
+                return Err(format!(
+                    "ANSI corpus case `{}` must contain bytes or chunks",
+                    case.name
+                ))
+            }
+        };
+        if flattened.is_empty() {
+            return Err(format!("ANSI corpus case `{}` is empty", case.name));
+        }
+        case_hashes.insert(case.name, sha256_bytes(&flattened));
+    }
+    Ok(json!({
+        "revision": corpus.revision,
+        "sha256": actual_hash,
+        "caseHashes": case_hashes,
+    }))
+}
+
 fn canonical_file(path: &std::path::Path, label: &str) -> Result<std::path::PathBuf, String> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| format!("{label} cannot be canonicalized: {error}"))?;
+    let canonical = resolve_existing_path(path, label)?;
     if !canonical.is_file() {
         return Err(format!("{label} is not a file: {}", canonical.display()));
     }
@@ -949,6 +1123,18 @@ fn validate_supervisor_manifest(
         return Err(format!(
             "unsupported supervisor manifest schema {}",
             manifest.schema_version
+        ));
+    }
+    if manifest.git_revision != EXPECTED_GIT_REVISION {
+        return Err(format!(
+            "gitRevision mismatch: expected {EXPECTED_GIT_REVISION}, actual {}",
+            manifest.git_revision
+        ));
+    }
+    if manifest.build_id != EXPECTED_BUILD_ID {
+        return Err(format!(
+            "buildId mismatch: expected {EXPECTED_BUILD_ID}, actual {}",
+            manifest.build_id
         ));
     }
     if manifest.revision.trim().is_empty()
@@ -1034,11 +1220,61 @@ fn validate_supervisor_manifest(
             ));
         }
     }
+    reject_reparse_ancestors(&manifest.working_directory, "workingDirectory")?;
     let working_directory = std::fs::canonicalize(&manifest.working_directory)
         .map_err(|error| format!("workingDirectory cannot be canonicalized: {error}"))?;
     if !working_directory.is_dir() {
         return Err("workingDirectory is not a directory".to_string());
     }
+    reject_reparse_ancestors(&working_directory, "workingDirectory")?;
+    let evidence_root = resolve_existing_path(&manifest.evidence_root, "evidenceRoot")?;
+    if !evidence_root.is_dir() {
+        return Err("evidenceRoot is not a directory".to_string());
+    }
+    let system_root =
+        resolve_existing_path(&manifest.environment.system_root, "environment.systemRoot")?;
+    if !system_root.is_dir() {
+        return Err("environment.systemRoot is not a directory".to_string());
+    }
+    let temp_directory = resolve_existing_path(
+        &manifest.environment.temp_directory,
+        "environment.tempDirectory",
+    )?;
+    if !temp_directory.is_dir() {
+        return Err("environment.tempDirectory is not a directory".to_string());
+    }
+    if manifest.environment.path_directories.is_empty()
+        || manifest.environment.path_directories.len() > 16
+    {
+        return Err("environment.pathDirectories count is outside its bound".to_string());
+    }
+    for path in &manifest.environment.path_directories {
+        let directory = resolve_existing_path(path, "environment.pathDirectories")?;
+        if !directory.is_dir() {
+            return Err(format!(
+                "environment.pathDirectories entry is not a directory: {}",
+                directory.display()
+            ));
+        }
+    }
+    for (name, value) in &manifest.environment.allowlist {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            || matches!(
+                name.to_ascii_uppercase().as_str(),
+                "SYSTEMROOT" | "TEMP" | "TMP" | "PATH"
+            )
+            || value.len() > 4096
+            || value.chars().any(|character| character == '\0')
+        {
+            return Err(format!("environment allowlist entry `{name}` is unsafe"));
+        }
+    }
+    let _ = (evidence_root, system_root, temp_directory);
+    let _ansi_corpus = load_ansi_corpus(&manifest.ansi_corpus)?;
     for scenario in &manifest.scenario_catalog {
         if scenario.name.trim().is_empty()
             || scenario.name.len() > 96
@@ -1112,6 +1348,16 @@ mod windows_supervisor {
     const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
     const ERROR_MORE_DATA: i32 = 234;
     const ERROR_TIMEOUT: i32 = 1460;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const AF_INET: u32 = 2;
+    const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -1154,6 +1400,33 @@ mod windows_supervisor {
     struct FileTime {
         low: u32,
         high: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemInfo {
+        processor_architecture: u16,
+        reserved: u16,
+        page_size: u32,
+        minimum_application_address: *mut c_void,
+        maximum_application_address: *mut c_void,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MibTcpRowOwnerPid {
+        state: u32,
+        local_addr: u32,
+        local_port: [u8; 4],
+        remote_addr: u32,
+        remote_port: [u8; 4],
+        owning_pid: u32,
     }
 
     #[repr(C)]
@@ -1266,6 +1539,29 @@ mod windows_supervisor {
             size: *mut u32,
         ) -> i32;
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> RawHandle;
+        fn GetProcessHandleCount(process: RawHandle, handle_count: *mut u32) -> i32;
+        fn GetSystemInfo(system_info: *mut SystemInfo);
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: RawHandle,
+        ) -> RawHandle;
+    }
+
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetExtendedTcpTable(
+            tcp_table: *mut c_void,
+            size: *mut u32,
+            order: i32,
+            address_family: u32,
+            table_class: u32,
+            reserved: u32,
+        ) -> u32;
     }
 
     #[derive(Debug, Clone)]
@@ -1459,14 +1755,40 @@ mod windows_supervisor {
         }
 
         fn terminate_and_wait(&self, deadline: Instant) -> Result<(), String> {
-            let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 124) };
-            if terminated == 0 {
+            let initial_members = self.active_process_ids();
+            let initial_error = initial_members.as_ref().err().cloned();
+            let needs_termination = initial_members
+                .as_ref()
+                .map(|members| !members.is_empty())
+                .unwrap_or(true);
+            if needs_termination {
+                let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 124) };
+                if terminated == 0 {
+                    let final_members = self.active_process_ids();
+                    return Err(format!(
+                        "TerminateJobObject failed: {}; initial-members={initial_error:?}; final-members={final_members:?}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                if let Err(wait_error) = self.wait_active_process_zero(deadline) {
+                    let final_members = self.active_process_ids();
+                    return Err(format!(
+                        "ACTIVE_PROCESS_ZERO cleanup failed: {wait_error}; initial-members={initial_error:?}; final-members={final_members:?}"
+                    ));
+                }
+            }
+            let final_members = self.active_process_ids()?;
+            if !final_members.is_empty() {
                 return Err(format!(
-                    "TerminateJobObject failed: {}",
-                    io::Error::last_os_error()
+                    "Job remained non-empty after termination: {final_members:?}"
                 ));
             }
-            self.wait_active_process_zero(deadline)
+            if let Some(initial_error) = initial_error {
+                return Err(format!(
+                    "initial Job member inspection failed before cleanup: {initial_error}"
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -1527,6 +1849,7 @@ mod windows_supervisor {
         working_directory: &Path,
         stdout_write: RawHandle,
         stderr_write: RawHandle,
+        environment: &[u16],
     ) -> Result<(OwnedHandle, OwnedHandle, u32), String> {
         let executable_wide = utf16(executable.as_os_str());
         let command_line = std::iter::once(executable.to_string_lossy().to_string())
@@ -1570,7 +1893,7 @@ mod windows_supervisor {
                 ptr::null_mut(),
                 1,
                 CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                ptr::null_mut(),
+                environment.as_ptr() as *mut c_void,
                 working_directory_wide.as_ptr(),
                 &mut startup,
                 &mut info,
@@ -1628,6 +1951,194 @@ mod windows_supervisor {
                 executable_path,
             })
         }
+    }
+
+    fn process_cpu_time_100ns(process: RawHandle, pid: u32) -> Result<u64, String> {
+        unsafe {
+            let mut creation = FileTime { low: 0, high: 0 };
+            let mut exit = FileTime { low: 0, high: 0 };
+            let mut kernel = FileTime { low: 0, high: 0 };
+            let mut user = FileTime { low: 0, high: 0 };
+            if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return Err(format!(
+                    "GetProcessTimes({pid}) for CPU accounting failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            let kernel_time = ((kernel.high as u64) << 32) | kernel.low as u64;
+            let user_time = ((user.high as u64) << 32) | user.low as u64;
+            Ok(kernel_time.saturating_add(user_time))
+        }
+    }
+
+    fn process_handle_count(process: RawHandle, pid: u32) -> Result<u32, String> {
+        let mut count = 0u32;
+        if unsafe { GetProcessHandleCount(process, &mut count) } == 0 {
+            return Err(format!(
+                "GetProcessHandleCount({pid}) failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(count)
+    }
+
+    fn logical_processor_count() -> Result<u32, String> {
+        let mut system = SystemInfo::default();
+        unsafe { GetSystemInfo(&mut system) };
+        if system.number_of_processors == 0 {
+            Err("GetSystemInfo returned zero logical processors".to_string())
+        } else {
+            Ok(system.number_of_processors)
+        }
+    }
+
+    fn query_tcp_listeners() -> Result<Vec<Value>, String> {
+        let mut size = 0u32;
+        let first = unsafe {
+            GetExtendedTcpTable(
+                ptr::null_mut(),
+                &mut size,
+                1,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if first != ERROR_INSUFFICIENT_BUFFER || size < std::mem::size_of::<u32>() as u32 {
+            return Err(format!(
+                "GetExtendedTcpTable size query failed: status {first}, bytes {size}"
+            ));
+        }
+        let mut storage = vec![0u8; size as usize];
+        let second = unsafe {
+            GetExtendedTcpTable(
+                storage.as_mut_ptr() as _,
+                &mut size,
+                1,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if second != 0 {
+            return Err(format!(
+                "GetExtendedTcpTable listener query failed: status {second}"
+            ));
+        }
+        let bytes = (size as usize).min(storage.len());
+        if bytes < std::mem::size_of::<u32>() {
+            return Err("GetExtendedTcpTable returned a truncated table".to_string());
+        }
+        let count = u32::from_ne_bytes(storage[..4].try_into().expect("row count bytes")) as usize;
+        let row_size = std::mem::size_of::<MibTcpRowOwnerPid>();
+        let available = (bytes - 4) / row_size;
+        if count > available {
+            return Err(format!(
+                "GetExtendedTcpTable row count {count} exceeds available {available}"
+            ));
+        }
+        let mut listeners = Vec::with_capacity(count);
+        for index in 0..count {
+            let offset = 4 + index * row_size;
+            let row = unsafe {
+                std::ptr::read_unaligned(storage.as_ptr().add(offset) as *const MibTcpRowOwnerPid)
+            };
+            let port = u16::from_be_bytes([row.local_port[0], row.local_port[1]]);
+            listeners.push(json!({
+                "processId": row.owning_pid,
+                "address": format!("{}.{}.{}.{}", row.local_addr & 0xff, (row.local_addr >> 8) & 0xff, (row.local_addr >> 16) & 0xff, (row.local_addr >> 24) & 0xff),
+                "port": port,
+            }));
+        }
+        Ok(listeners)
+    }
+
+    fn filter_owned_listeners(
+        listeners: &[Value],
+        owned_pids: &[u32],
+    ) -> Result<Vec<Value>, String> {
+        let mut owned = Vec::new();
+        for listener in listeners {
+            let pid = listener["processId"]
+                .as_u64()
+                .ok_or_else(|| "listener row omitted processId".to_string())?
+                as u32;
+            if owned_pids.contains(&pid) {
+                owned.push(listener.clone());
+            }
+        }
+        Ok(owned)
+    }
+
+    fn listener_key(listener: &Value) -> Result<String, String> {
+        let pid = listener["processId"]
+            .as_u64()
+            .ok_or_else(|| "listener row omitted processId".to_string())?;
+        let address = listener["address"]
+            .as_str()
+            .ok_or_else(|| "listener row omitted address".to_string())?;
+        let port = listener["port"]
+            .as_u64()
+            .ok_or_else(|| "listener row omitted port".to_string())?;
+        Ok(format!("{pid}|{address}|{port}"))
+    }
+
+    fn verify_external_listeners_unchanged(
+        before: &[Value],
+        after: &[Value],
+        owned_pids: &[u32],
+    ) -> Result<(), String> {
+        let after_keys = after
+            .iter()
+            .map(listener_key)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        for listener in before {
+            let pid = listener["processId"]
+                .as_u64()
+                .ok_or_else(|| "listener row omitted processId".to_string())?
+                as u32;
+            if !owned_pids.contains(&pid) && !after_keys.contains(&listener_key(listener)?) {
+                return Err(format!(
+                    "external listener disappeared during cycle: {}",
+                    listener_key(listener)?
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn environment_block(environment: &SupervisorEnvironment) -> Result<Vec<u16>, String> {
+        let system_root =
+            resolve_existing_path(&environment.system_root, "environment.systemRoot")?;
+        let temp_directory =
+            resolve_existing_path(&environment.temp_directory, "environment.tempDirectory")?;
+        let mut entries = environment.allowlist.clone();
+        entries.insert(
+            "SystemRoot".to_string(),
+            system_root.to_string_lossy().into_owned(),
+        );
+        entries.insert(
+            "TEMP".to_string(),
+            temp_directory.to_string_lossy().into_owned(),
+        );
+        entries.insert(
+            "TMP".to_string(),
+            temp_directory.to_string_lossy().into_owned(),
+        );
+        let mut path_values = Vec::with_capacity(environment.path_directories.len());
+        for path in &environment.path_directories {
+            let path = resolve_existing_path(path, "environment.pathDirectories")?;
+            path_values.push(path.to_string_lossy().into_owned());
+        }
+        entries.insert("PATH".to_string(), path_values.join(";"));
+        let mut block = Vec::new();
+        for (name, value) in entries {
+            let entry = format!("{name}={value}");
+            block.extend(OsStr::new(&entry).encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
     }
 
     fn inspect_member(job: &SupervisorJob, pid: u32) -> Result<ProcessIdentity, String> {
@@ -1697,6 +2208,7 @@ mod windows_supervisor {
         arguments: &[String],
         working_directory: &Path,
         expected_executable: &Path,
+        environment: &[u16],
     ) -> Result<SpawnedChild, String> {
         let job = SupervisorJob::create()?;
         let (stdout_read, stdout_write, stderr_read, stderr_write) = open_pipes()?;
@@ -1706,40 +2218,79 @@ mod windows_supervisor {
             working_directory,
             stdout_write.as_raw_handle() as _,
             stderr_write.as_raw_handle() as _,
+            environment,
         )?;
         drop(stdout_write);
         drop(stderr_write);
-        if let Err(error) = job.assign(process.as_raw_handle() as _) {
-            unsafe { TerminateProcess(process.as_raw_handle() as _, 127) };
-            let _ = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 5_000) };
-            return Err(error);
-        }
-        let root_identity = capture_identity(process.as_raw_handle() as _, pid)?;
-        if root_identity.executable_path != expected_executable {
-            let detail = format!(
-                "launched executable identity mismatch: expected `{}`, actual `{}`",
-                expected_executable.display(),
-                root_identity.executable_path.display()
-            );
-            let _ = job.terminate_and_wait(Instant::now() + Duration::from_secs(5));
-            return Err(detail);
-        }
-        if !job.active_process_ids()?.contains(&pid) {
-            let _ = job.terminate_and_wait(Instant::now() + Duration::from_secs(5));
-            return Err(format!("launched PID {pid} was not assigned to its Job"));
-        }
-        let member_identities = job
-            .active_process_ids()?
-            .into_iter()
-            .filter_map(|member| (member != pid).then_some(member))
-            .map(|member| inspect_member(&job, member))
-            .collect::<Result<Vec<_>, _>>()?;
-        let resumed = unsafe { ResumeThread(thread.as_raw_handle() as _) };
-        if resumed != 1 {
-            let detail = format!("ResumeThread failed: {}", io::Error::last_os_error());
-            let _ = job.terminate_and_wait(Instant::now() + Duration::from_secs(5));
-            return Err(detail);
-        }
+        let mut assigned = false;
+        let inspected = (|| {
+            job.assign(process.as_raw_handle() as _)?;
+            assigned = true;
+            let root_identity = capture_identity(process.as_raw_handle() as _, pid)?;
+            if root_identity.executable_path != expected_executable {
+                return Err(format!(
+                    "launched executable identity mismatch: expected `{}`, actual `{}`",
+                    expected_executable.display(),
+                    root_identity.executable_path.display()
+                ));
+            }
+            let members = job.active_process_ids()?;
+            if !members.contains(&pid) {
+                return Err(format!("launched PID {pid} was not assigned to its Job"));
+            }
+            let member_identities = members
+                .into_iter()
+                .filter(|member| *member != pid)
+                .map(|member| inspect_member(&job, member))
+                .collect::<Result<Vec<_>, _>>()?;
+            let resumed = unsafe { ResumeThread(thread.as_raw_handle() as _) };
+            if resumed != 1 {
+                return Err(format!(
+                    "ResumeThread failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            Ok((root_identity, member_identities))
+        })();
+        let (root_identity, member_identities) = match inspected {
+            Ok(value) => value,
+            Err(error) => {
+                let cleanup = if assigned {
+                    job.terminate_and_wait(Instant::now() + Duration::from_secs(5))
+                } else {
+                    // The process has not entered the Job yet.  Terminate it
+                    // through its owned handle, then still prove the Job is
+                    // empty before the Job handle is closed.
+                    let terminated = unsafe { TerminateProcess(process.as_raw_handle() as _, 127) };
+                    let waited =
+                        unsafe { WaitForSingleObject(process.as_raw_handle() as _, 5_000) };
+                    let zero = job.active_process_ids().map(|ids| ids.is_empty());
+                    if terminated == 0 {
+                        Err(format!(
+                            "TerminateProcess(handle) failed: {}",
+                            io::Error::last_os_error()
+                        ))
+                    } else if waited == WAIT_FAILED {
+                        Err(format!(
+                            "WaitForSingleObject cleanup failed: {}",
+                            io::Error::last_os_error()
+                        ))
+                    } else {
+                        zero.and_then(|is_zero| {
+                            if is_zero {
+                                Ok(())
+                            } else {
+                                Err("new Job retained a member after launch failure".to_string())
+                            }
+                        })
+                    }
+                };
+                let remaining = job.active_process_ids();
+                return Err(format!(
+                    "{error}; owned Job cleanup={cleanup:?}; active-members={remaining:?}"
+                ));
+            }
+        };
         Ok(SpawnedChild {
             job,
             process,
@@ -1837,7 +2388,7 @@ mod windows_supervisor {
         })
     }
 
-    fn run_manifest(manifest: SupervisorManifest) -> Result<Value, Value> {
+    fn run_manifest(manifest: &SupervisorManifest) -> Result<Value, Value> {
         let (supervisor, helper, cycle) = match validate_supervisor_manifest(&manifest) {
             Ok(paths) => paths,
             Err(error) => {
@@ -1850,6 +2401,51 @@ mod windows_supervisor {
                 }));
             }
         };
+        let environment = match environment_block(&manifest.environment) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return Err(json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": false,
+                    "error": error,
+                }));
+            }
+        };
+        let ansi_corpus = match load_ansi_corpus(&manifest.ansi_corpus) {
+            Ok(corpus) => corpus,
+            Err(error) => {
+                return Err(json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": false,
+                    "error": error,
+                }));
+            }
+        };
+        let _listener_baseline = match query_tcp_listeners() {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                return Err(json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": false,
+                    "error": format!("listener baseline query failed: {error}"),
+                }));
+            }
+        };
+        let logical_processor_count = logical_processor_count().map_err(|error| {
+            json!({
+                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                "status": "rejected",
+                "revision": manifest.revision,
+                "launched": false,
+                "error": format!("logical processor audit failed: {error}"),
+            })
+        })?;
         let suite_deadline = Instant::now()
             .checked_add(Duration::from_millis(manifest.budgets.suite_deadline_ms))
             .ok_or_else(|| json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": "suite deadline overflow"}))?;
@@ -1905,29 +2501,88 @@ mod windows_supervisor {
                 }));
                 break;
             }
-            let mut child =
-                match spawn_child(&cycle, &arguments, &manifest.working_directory, &cycle) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        status = "failed";
-                        cycles.push(json!({
-                            "iteration": iteration + 1,
-                            "scenario": scenario.name,
-                            "status": "failed",
-                            "outcome": "launch-failed",
-                            "exitCode": null,
-                            "durationMs": started.elapsed().as_millis(),
-                            "stdoutBytes": 0,
-                            "stderrBytes": 0,
-                            "activeProcessZero": false,
-                            "rootIdentity": null,
-                            "memberIdentities": [],
-                            "result": null,
-                            "error": error,
-                        }));
-                        break;
-                    }
-                };
+            let mut child = match spawn_child(
+                &cycle,
+                &arguments,
+                &manifest.working_directory,
+                &cycle,
+                &environment,
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    status = "failed";
+                    cycles.push(json!({
+                        "iteration": iteration + 1,
+                        "scenario": scenario.name,
+                        "status": "failed",
+                        "outcome": "launch-failed",
+                        "exitCode": null,
+                        "durationMs": started.elapsed().as_millis(),
+                        "stdoutBytes": 0,
+                        "stderrBytes": 0,
+                        "activeProcessZero": false,
+                        "rootIdentity": null,
+                        "memberIdentities": [],
+                        "result": null,
+                        "error": error,
+                    }));
+                    break;
+                }
+            };
+            let process_handle_count_before = match process_handle_count(
+                child.process.as_raw_handle() as _,
+                child.root_identity.process_id,
+            ) {
+                Ok(count) => count,
+                Err(error) => {
+                    let cleanup = child.job.terminate_and_wait(
+                        Instant::now()
+                            + Duration::from_millis(manifest.budgets.cleanup_deadline_ms),
+                    );
+                    let remaining = child.job.active_process_ids();
+                    return Err(json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("process handle audit failed: {error}; cleanup={cleanup:?}; active-members={remaining:?}"),
+                    }));
+                }
+            };
+            let job_members_before = match child.job.active_process_ids() {
+                Ok(members) => members,
+                Err(error) => {
+                    let cleanup = child.job.terminate_and_wait(
+                        Instant::now()
+                            + Duration::from_millis(manifest.budgets.cleanup_deadline_ms),
+                    );
+                    let remaining = child.job.active_process_ids();
+                    return Err(json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("Job member baseline audit failed: {error}; cleanup={cleanup:?}; active-members={remaining:?}"),
+                    }));
+                }
+            };
+            let listeners_before = match query_tcp_listeners() {
+                Ok(listeners) => listeners,
+                Err(error) => {
+                    let cleanup = child.job.terminate_and_wait(
+                        Instant::now()
+                            + Duration::from_millis(manifest.budgets.cleanup_deadline_ms),
+                    );
+                    let remaining = child.job.active_process_ids();
+                    return Err(json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("listener audit failed: {error}; cleanup={cleanup:?}; active-members={remaining:?}"),
+                    }));
+                }
+            };
             let stdout_reader = thread::spawn({
                 let stdout = child.stdout.take().expect("supervisor stdout pipe");
                 let limit = manifest.budgets.stdout_bytes;
@@ -1940,11 +2595,13 @@ mod windows_supervisor {
             });
             let mut outcome = "completed";
             let mut active_process_zero = false;
+            let mut settlement_error = None::<String>;
             let exit_code = match wait_process(child.process.as_raw_handle() as _, cycle_deadline) {
                 Ok(Some(code)) => Some(code),
                 Ok(None) => {
                     outcome = "timeout";
-                    if let Ok(member_ids) = child.job.active_process_ids() {
+                    let inspection = (|| {
+                        let member_ids = child.job.active_process_ids()?;
                         for member in member_ids {
                             if member == child.root_identity.process_id
                                 || child
@@ -1954,15 +2611,39 @@ mod windows_supervisor {
                             {
                                 continue;
                             }
-                            if let Ok(identity) = inspect_member(&child.job, member) {
-                                child.member_identities.push(identity);
-                            }
+                            child
+                                .member_identities
+                                .push(inspect_member(&child.job, member)?);
                         }
-                    }
+                        Ok::<(), String>(())
+                    })();
                     let cleanup_deadline = Instant::now()
                         + Duration::from_millis(manifest.budgets.cleanup_deadline_ms);
-                    if child.job.terminate_and_wait(cleanup_deadline).is_ok() {
-                        active_process_zero = true;
+                    if let Err(error) = inspection {
+                        settlement_error = Some(format!(
+                            "Job member inspection failed during timeout: {error}"
+                        ));
+                    }
+                    match child.job.terminate_and_wait(cleanup_deadline) {
+                        Ok(()) => match child.job.active_process_ids() {
+                            Ok(ids) => active_process_zero = ids.is_empty(),
+                            Err(error) => {
+                                active_process_zero = false;
+                                let detail = format!(
+                                    "Job member inspection failed after timeout cleanup: {error}"
+                                );
+                                settlement_error = Some(match settlement_error.take() {
+                                    Some(previous) => format!("{previous}; {detail}"),
+                                    None => detail,
+                                });
+                            }
+                        },
+                        Err(error) => {
+                            settlement_error = Some(match settlement_error.take() {
+                                Some(previous) => format!("{previous}; cleanup: {error}"),
+                                None => error,
+                            });
+                        }
                     }
                     None
                 }
@@ -1970,9 +2651,23 @@ mod windows_supervisor {
                     outcome = "wait-failed";
                     let cleanup_deadline = Instant::now()
                         + Duration::from_millis(manifest.budgets.cleanup_deadline_ms);
-                    if child.job.terminate_and_wait(cleanup_deadline).is_ok() {
-                        active_process_zero = true;
-                    }
+                    let cleanup = child.job.terminate_and_wait(cleanup_deadline);
+                    let members_after_cleanup = child.job.active_process_ids().map_err(|error| {
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "revision": manifest.revision,
+                            "launched": true,
+                            "error": format!("Job member inspection failed after wait error: {error}"),
+                        })
+                    })?;
+                    active_process_zero = cleanup.is_ok() && members_after_cleanup.is_empty();
+                    let error = match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup_error) => {
+                            format!("{error}; Job cleanup failed: {cleanup_error}")
+                        }
+                    };
                     cycles.push(json!({
                         "iteration": iteration + 1,
                         "scenario": scenario.name,
@@ -1993,36 +2688,183 @@ mod windows_supervisor {
                         "error": error,
                     }));
                     status = "failed";
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    stdout_reader.join().map_err(|_| {
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "revision": manifest.revision,
+                            "launched": true,
+                            "error": "stdout reader thread failed after wait error",
+                        })
+                    })?;
+                    stderr_reader.join().map_err(|_| {
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "revision": manifest.revision,
+                            "launched": true,
+                            "error": "stderr reader thread failed after wait error",
+                        })
+                    })?;
                     break;
                 }
             };
             if outcome == "completed" {
                 let cleanup_deadline =
                     Instant::now() + Duration::from_millis(manifest.budgets.cleanup_deadline_ms);
-                if child.job.wait_active_process_zero(cleanup_deadline).is_ok() {
-                    active_process_zero = true;
-                } else {
-                    outcome = "residue";
-                    let _ = child.job.terminate_and_wait(cleanup_deadline);
-                    active_process_zero = child
-                        .job
-                        .active_process_ids()
-                        .map(|ids| ids.is_empty())
-                        .unwrap_or(false);
+                match child.job.wait_active_process_zero(cleanup_deadline) {
+                    Ok(()) => active_process_zero = true,
+                    Err(error) => {
+                        outcome = "residue";
+                        settlement_error = Some(error);
+                        match child.job.terminate_and_wait(cleanup_deadline) {
+                            Ok(()) => {
+                                active_process_zero = child
+                                    .job
+                                    .active_process_ids()
+                                    .map_err(|error| {
+                                        json!({
+                                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                                            "status": "rejected",
+                                            "revision": manifest.revision,
+                                            "launched": true,
+                                            "error": format!("Job member inspection failed after cleanup: {error}"),
+                                        })
+                                    })?
+                                    .is_empty();
+                            }
+                            Err(cleanup_error) => {
+                                settlement_error = Some(match settlement_error.take() {
+                                    Some(previous) => {
+                                        format!("{previous}; cleanup: {cleanup_error}")
+                                    }
+                                    None => cleanup_error,
+                                });
+                            }
+                        }
+                    }
                 }
             }
-            let stdout = stdout_reader.join().unwrap_or(CappedOutput {
-                bytes: Vec::new(),
-                total_bytes: 0,
-                truncated: true,
-            });
-            let stderr = stderr_reader.join().unwrap_or(CappedOutput {
-                bytes: Vec::new(),
-                total_bytes: 0,
-                truncated: true,
-            });
+            let stdout = stdout_reader.join().map_err(|_| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": "stdout reader thread failed",
+                })
+            })?;
+            let stderr = stderr_reader.join().map_err(|_| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": "stderr reader thread failed",
+                })
+            })?;
+            let process_cpu_time = process_cpu_time_100ns(
+                child.process.as_raw_handle() as _,
+                child.root_identity.process_id,
+            )
+            .map_err(|error| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": format!("CPU accounting failed: {error}"),
+                })
+            })?;
+            let wall_time_ms = started.elapsed().as_millis() as u64;
+            let wall_time_100ns = wall_time_ms.saturating_mul(10_000);
+            let core_equivalent_percent = if wall_time_100ns == 0 {
+                0.0
+            } else {
+                process_cpu_time as f64 / wall_time_100ns as f64 * 100.0
+            };
+            let whole_machine_percent =
+                core_equivalent_percent / logical_processor_count.max(1) as f64;
+            let job_members_after = child.job.active_process_ids().map_err(|error| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": format!("Job member inspection failed after reader join: {error}"),
+                })
+            })?;
+            if !job_members_after.is_empty() {
+                active_process_zero = false;
+                settlement_error = Some(format!(
+                    "Job retained active members after cleanup: {job_members_after:?}"
+                ));
+            }
+            let process_handle_count_after = process_handle_count(
+                child.process.as_raw_handle() as _,
+                child.root_identity.process_id,
+            )
+            .map_err(|error| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": format!("process handle audit after cleanup failed: {error}"),
+                })
+            })?;
+            let listeners_after = query_tcp_listeners().map_err(|error| {
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "revision": manifest.revision,
+                    "launched": true,
+                    "error": format!("listener audit after cleanup failed: {error}"),
+                })
+            })?;
+            let mut owned_pids = vec![child.root_identity.process_id];
+            owned_pids.extend(
+                child
+                    .member_identities
+                    .iter()
+                    .map(|identity| identity.process_id),
+            );
+            owned_pids.sort_unstable();
+            owned_pids.dedup();
+            let external_listeners_unchanged = match verify_external_listeners_unchanged(
+                &listeners_before,
+                &listeners_after,
+                &owned_pids,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    settlement_error = Some(match settlement_error.take() {
+                        Some(previous) => format!("{previous}; {error}"),
+                        None => error,
+                    });
+                    false
+                }
+            };
+            let owned_listeners_before = filter_owned_listeners(&listeners_before, &owned_pids)
+                .map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("owned listener baseline inspection failed: {error}"),
+                    })
+                })?;
+            let owned_listeners_after = filter_owned_listeners(&listeners_after, &owned_pids)
+                .map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("owned listener after inspection failed: {error}"),
+                    })
+                })?;
             let parsed = if stderr.truncated {
                 Err(format!(
                     "cycle stderr exceeded {} bytes (observed {})",
@@ -2044,6 +2886,19 @@ mod windows_supervisor {
                     exit_code, stderr.total_bytes
                 ))
             };
+            let environment_report = parsed
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("environment"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "secretPresent": false,
+                        "systemRootPresent": true,
+                        "tempPresent": true,
+                        "pathPresent": true,
+                    })
+                });
             let mut cycle_status = "passed";
             let mut error = None;
             if outcome != "completed" {
@@ -2052,6 +2907,16 @@ mod windows_supervisor {
             } else if parsed.is_err() {
                 cycle_status = "failed";
                 error = parsed.as_ref().err().cloned();
+            }
+            if let Some(settlement_error) = settlement_error {
+                cycle_status = "failed";
+                error = Some(settlement_error);
+            }
+            if environment_report["secretPresent"] == true {
+                cycle_status = "failed";
+                error = Some(
+                    "cycle received a non-allowlisted secret environment variable".to_string(),
+                );
             }
             if cycle_status == "failed" {
                 status = "failed";
@@ -2062,13 +2927,35 @@ mod windows_supervisor {
             cycle_document.insert("status".to_string(), json!(cycle_status));
             cycle_document.insert("outcome".to_string(), json!(outcome));
             cycle_document.insert("exitCode".to_string(), json!(exit_code));
-            cycle_document.insert(
-                "durationMs".to_string(),
-                json!(started.elapsed().as_millis()),
-            );
+            cycle_document.insert("durationMs".to_string(), json!(wall_time_ms));
             cycle_document.insert("stdoutBytes".to_string(), json!(stdout.total_bytes));
             cycle_document.insert("stderrBytes".to_string(), json!(stderr.total_bytes));
             cycle_document.insert("activeProcessZero".to_string(), json!(active_process_zero));
+            cycle_document.insert("environment".to_string(), environment_report);
+            cycle_document.insert(
+                "cpu".to_string(),
+                json!({
+                    "processCpuTime100ns": process_cpu_time,
+                    "wallTimeMs": wall_time_ms,
+                    "logicalProcessorCount": logical_processor_count,
+                    "coreEquivalentPercent": core_equivalent_percent,
+                    "wholeMachinePercent": whole_machine_percent,
+                }),
+            );
+            cycle_document.insert(
+                "jobAudit".to_string(),
+                json!({
+                    "jobMembersBefore": job_members_before.len(),
+                    "jobMembersAfter": job_members_after.len(),
+                    "processHandleCountBefore": process_handle_count_before,
+                    "processHandleCountAfter": process_handle_count_after,
+                    "ownedListenersBefore": owned_listeners_before,
+                    "ownedListenersAfter": owned_listeners_after,
+                    "externalListenersUnchanged": external_listeners_unchanged,
+                    "externalListenersBefore": listeners_before,
+                    "externalListenersAfter": listeners_after,
+                }),
+            );
             cycle_document.insert(
                 "rootIdentity".to_string(),
                 identity_json(&child.root_identity),
@@ -2101,22 +2988,244 @@ mod windows_supervisor {
             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
             "status": status,
             "revision": manifest.revision,
+            "gitRevision": manifest.git_revision,
+            "buildId": manifest.build_id,
             "seed": manifest.seed,
             "iterations": manifest.iterations,
             "completedCycles": cycles.len(),
+            "ansiCorpus": ansi_corpus,
             "cycles": cycles,
         }))
     }
 
-    pub(super) fn run_manifest_file(path: &Path) -> (Value, i32) {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) if bytes.len() <= 1024 * 1024 => bytes,
-            Ok(_) => {
-                return (
-                    json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": "manifest exceeds 1 MiB"}),
-                    2,
-                )
+    fn open_retained_evidence_root(path: &Path) -> Result<(PathBuf, OwnedHandle), String> {
+        let root = resolve_existing_path(path, "evidenceRoot")?;
+        if !root.is_dir() {
+            return Err(format!(
+                "evidenceRoot is not a directory: {}",
+                root.display()
+            ));
+        }
+        let wide = utf16(root.as_os_str());
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "open retained evidenceRoot handle failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok((root, unsafe { OwnedHandle::from_raw_handle(raw as _) }))
+    }
+
+    fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
+        reject_reparse_ancestors(path, label)?;
+        match fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if path.is_dir() {
+                    Ok(())
+                } else {
+                    Err(format!("{label} exists but is not a directory"))
+                }
             }
+            Err(error) => Err(format!("create {label} `{}`: {error}", path.display())),
+        }
+    }
+
+    fn create_exclusive_run_directory(root: &Path) -> Result<(String, PathBuf), String> {
+        let phase_root = root.join("phase-03-process-soak");
+        let runs_root = phase_root.join("runs");
+        ensure_directory(&phase_root, "phase evidence root")?;
+        ensure_directory(&runs_root, "phase evidence runs root")?;
+        for _ in 0..8 {
+            let run_id = Uuid::now_v7().simple().to_string();
+            let run_directory = runs_root.join(&run_id);
+            reject_reparse_ancestors(&run_directory, "evidence run")?;
+            match fs::create_dir(&run_directory) {
+                Ok(()) => return Ok((run_id, run_directory)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "create exclusive evidence run `{}`: {error}",
+                        run_directory.display()
+                    ));
+                }
+            }
+        }
+        Err("could not allocate a unique evidence run directory".to_string())
+    }
+
+    fn write_atomic_json(run_directory: &Path, name: &str, value: &Value) -> Result<(), String> {
+        if !name.ends_with(".json") || name.contains('\\') || name.contains('/') {
+            return Err("unsafe evidence artifact name".to_string());
+        }
+        reject_reparse_ancestors(run_directory, "evidence run")?;
+        let destination = run_directory.join(name);
+        if destination.exists() {
+            return Err(format!(
+                "evidence artifact already exists: {}",
+                destination.display()
+            ));
+        }
+        let temporary = run_directory.join(format!(".{name}.{}.tmp", Uuid::now_v7().simple()));
+        let bytes =
+            serde_json::to_vec(value).map_err(|error| format!("serialize {name}: {error}"))?;
+        if bytes.len() > SUPERVISOR_MAX_RESULT_BYTES {
+            return Err(format!(
+                "evidence artifact {name} exceeds bounded result size"
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("create temporary evidence artifact: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("write temporary evidence artifact: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("flush temporary evidence artifact: {error}"))?;
+        drop(file);
+        if destination.exists() {
+            fs::remove_file(&temporary)
+                .map_err(|error| format!("remove temporary evidence artifact: {error}"))?;
+            return Err(format!(
+                "evidence artifact appeared during atomic publish: {}",
+                destination.display()
+            ));
+        }
+        fs::rename(&temporary, &destination)
+            .map_err(|error| format!("atomically publish evidence artifact {name}: {error}"))
+    }
+
+    fn percentile(values: &[u64], fraction: f64) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let index = ((values.len() as f64 * fraction).ceil() as usize).saturating_sub(1);
+        values[index.min(values.len() - 1)]
+    }
+
+    fn publish_evidence(
+        manifest: &SupervisorManifest,
+        manifest_bytes: &[u8],
+        manifest_sha256: &str,
+        result: &mut Value,
+    ) -> Result<(), String> {
+        let (root, _retained_root_handle) = open_retained_evidence_root(&manifest.evidence_root)?;
+        let (run_id, run_directory) = create_exclusive_run_directory(&root)?;
+        let ansi_corpus = result["ansiCorpus"].clone();
+        let manifest_artifact = json!({
+            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+            "revision": manifest.revision,
+            "gitRevision": manifest.git_revision,
+            "buildId": manifest.build_id,
+            "sha256": manifest_sha256,
+            "bytes": manifest_bytes.len(),
+            "seed": manifest.seed,
+            "iterations": manifest.iterations,
+            "budgets": manifest.budgets,
+            "scenarioCatalog": manifest.scenario_catalog,
+            "binaries": {
+                "supervisorSha256": manifest.supervisor_sha256,
+                "helperSha256": manifest.helper_sha256,
+                "cycleSha256": manifest.cycle_sha256,
+            },
+            "ansiCorpus": ansi_corpus,
+        });
+        write_atomic_json(&run_directory, "manifest.json", &manifest_artifact)?;
+
+        let cycles = result["cycles"]
+            .as_array()
+            .ok_or_else(|| "supervisor result cycles are not an array".to_string())?;
+        let mut durations = Vec::with_capacity(cycles.len());
+        for cycle in cycles {
+            durations.push(
+                cycle["durationMs"]
+                    .as_u64()
+                    .ok_or_else(|| "cycle result omitted durationMs".to_string())?,
+            );
+        }
+        durations.sort_unstable();
+        let performance = json!({
+            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+            "sampleCount": durations.len(),
+            "samplesMs": durations,
+            "durationMs": {
+                "p50": percentile(&durations, 0.50),
+                "p95": percentile(&durations, 0.95),
+                "maximum": durations.last().copied().unwrap_or_default(),
+            },
+            "cpu": {
+                "samples": cycles.iter().map(|cycle| cycle["cpu"].clone()).collect::<Vec<_>>(),
+                "denominators": "raw child CPU time / monotonic wall interval / logical processors",
+            },
+        });
+        write_atomic_json(&run_directory, "performance.json", &performance)?;
+        let conformance = json!({
+            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+            "revision": manifest.revision,
+            "gitRevision": manifest.git_revision,
+            "buildId": manifest.build_id,
+            "manifestSha256": manifest_sha256,
+            "ansiCorpus": ansi_corpus,
+            "outputProtocol": "exactly-one-json-result",
+            "activeProcessZeroRequired": true,
+            "identity": "PID + creationTime100ns + canonical executable path",
+            "readerCaps": {
+                "stdoutBytes": manifest.budgets.stdout_bytes,
+                "stderrBytes": manifest.budgets.stderr_bytes,
+                "resultBytes": manifest.budgets.result_bytes,
+            },
+            "deadlinesMs": {
+                "suite": manifest.budgets.suite_deadline_ms,
+                "cycle": manifest.budgets.cycle_deadline_ms,
+                "cleanup": manifest.budgets.cleanup_deadline_ms,
+            },
+            "scenarios": cycles.iter().map(|cycle| json!({
+                "iteration": cycle["iteration"],
+                "name": cycle["scenario"],
+                "status": cycle["status"],
+                "outcome": cycle["outcome"],
+            })).collect::<Vec<_>>(),
+        });
+        write_atomic_json(&run_directory, "conformance.json", &conformance)?;
+        result["runId"] = json!(run_id);
+        result["runDirectory"] = json!(run_directory);
+        write_atomic_json(&run_directory, "summary.json", result)?;
+        let run_document = json!({
+            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+            "status": result["status"],
+            "runId": result["runId"],
+            "runDirectory": result["runDirectory"],
+            "summary": result,
+        });
+        write_atomic_json(&run_directory, "run.json", &run_document)
+    }
+
+    pub(super) fn run_manifest_file(
+        path: &Path,
+        evidence_root_override: Option<&Path>,
+        iterations_override: Option<u32>,
+        seed_override: Option<u64>,
+    ) -> (Value, i32) {
+        if let Err(error) = reject_reparse_ancestors(path, "manifest") {
+            return (
+                json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": error}),
+                2,
+            );
+        }
+        let mut manifest_file = match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(file) => file,
             Err(error) => {
                 return (
                     json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": format!("read manifest: {error}")}),
@@ -2124,7 +3233,29 @@ mod windows_supervisor {
                 )
             }
         };
-        let manifest: SupervisorManifest = match serde_json::from_slice(&bytes) {
+        let length = match manifest_file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                return (
+                    json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": format!("inspect manifest: {error}")}),
+                    2,
+                )
+            }
+        };
+        if length > 1024 * 1024 {
+            return (
+                json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": "manifest exceeds 1 MiB"}),
+                2,
+            );
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        if let Err(error) = manifest_file.read_to_end(&mut bytes) {
+            return (
+                json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": format!("read manifest: {error}")}),
+                2,
+            );
+        }
+        let mut manifest: SupervisorManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
             Err(error) => {
                 return (
@@ -2133,9 +3264,37 @@ mod windows_supervisor {
                 )
             }
         };
+        if let Some(iterations) = iterations_override {
+            if iterations == 0 || iterations > SUPERVISOR_MAX_ITERATIONS {
+                return (
+                    json!({"schemaVersion": SUPERVISOR_SCHEMA_VERSION, "status": "rejected", "launched": false, "error": "iterations override is outside bounded limits"}),
+                    2,
+                );
+            }
+            manifest.iterations = iterations;
+        }
+        if let Some(seed) = seed_override {
+            manifest.seed = seed;
+        }
+        if let Some(evidence_root) = evidence_root_override {
+            manifest.evidence_root = evidence_root.to_path_buf();
+        }
         let result_limit = manifest.budgets.result_bytes;
-        match run_manifest(manifest) {
-            Ok(result) => {
+        match run_manifest(&manifest) {
+            Ok(mut result) => {
+                if let Err(error) =
+                    publish_evidence(&manifest, &bytes, &sha256_bytes(&bytes), &mut result)
+                {
+                    return (
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "launched": true,
+                            "error": format!("evidence publication failed: {error}"),
+                        }),
+                        2,
+                    );
+                }
                 let encoded_length = serde_json::to_vec(&result)
                     .map(|bytes| bytes.len())
                     .unwrap_or(usize::MAX);
@@ -2187,17 +3346,65 @@ fn main() {
         "supervise" => {
             #[cfg(windows)]
             {
-                let flag = args.next().and_then(|value| value.into_string().ok());
-                let manifest = args.next().map(std::path::PathBuf::from);
-                if flag.as_deref() != Some("--manifest")
-                    || manifest.is_none()
-                    || args.next().is_some()
-                {
-                    eprintln!("supervise requires exactly --manifest <path>");
+                let mut manifest: Option<std::path::PathBuf> = None;
+                let mut evidence_root: Option<std::path::PathBuf> = None;
+                let mut iterations: Option<u32> = None;
+                let mut seed: Option<u64> = None;
+                while let Some(argument) = args.next() {
+                    let argument = argument
+                        .into_string()
+                        .unwrap_or_else(|_| "<non-UTF8>".to_string());
+                    match argument.as_str() {
+                        "--manifest" => {
+                            let Some(path) = args.next() else {
+                                eprintln!("--manifest value is required");
+                                std::process::exit(2);
+                            };
+                            manifest = Some(path.into());
+                        }
+                        "--evidence-root" => {
+                            let Some(path) = args.next() else {
+                                eprintln!("--evidence-root value is required");
+                                std::process::exit(2);
+                            };
+                            evidence_root = Some(path.into());
+                        }
+                        "--iterations" => {
+                            let value = args.next().and_then(|value| value.into_string().ok());
+                            match value.and_then(|value| value.parse::<u32>().ok()) {
+                                Some(value) => iterations = Some(value),
+                                None => {
+                                    eprintln!("--iterations requires a bounded integer");
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                        "--seed" => {
+                            let value = args.next().and_then(|value| value.into_string().ok());
+                            match value.and_then(|value| value.parse::<u64>().ok()) {
+                                Some(value) => seed = Some(value),
+                                None => {
+                                    eprintln!("--seed requires an unsigned integer");
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                        other => {
+                            eprintln!("unknown supervise argument `{other}`");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                if manifest.is_none() {
+                    eprintln!("supervise requires --manifest <path>");
                     std::process::exit(2);
                 }
-                let (result, exit_code) =
-                    windows_supervisor::run_manifest_file(&manifest.expect("manifest path"));
+                let (result, exit_code) = windows_supervisor::run_manifest_file(
+                    &manifest.expect("manifest path"),
+                    evidence_root.as_deref(),
+                    iterations,
+                    seed,
+                );
                 let encoded = serde_json::to_string(&result).expect("serialize supervisor result");
                 println!("{encoded}");
                 std::process::exit(exit_code);

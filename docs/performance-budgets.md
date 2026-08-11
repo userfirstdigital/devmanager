@@ -8,33 +8,37 @@ production profile, `config.json`, `remote.json`, or `session.json`.
 
 ## Immutable run input
 
-`Invoke-ProcessSoak.ps1` accepts one UTF-8 JSON manifest (maximum 1 MiB) and
-rejects unknown or missing fields. The manifest contains `schemaVersion`, an
-immutable `revision`, SHA-256 plus canonical paths for the supervisor, helper,
-and cycle executables, a temporary working directory, `seed`, bounded
-`iterations` (at most 100), bounded suite/cycle/cleanup deadlines and stdout,
-stderr, and result byte caps, and a finite `scenarioCatalog`. Every scenario
-is an argument array beginning with the fixed `cycle` protocol and has an
-expected exit code. The script hashes every executable before dispatch and the
-Rust supervisor repeats canonical identity and hash validation before launch.
-The run records bounded manifest content, and the original input hash is
-verified unchanged after execution; the retained `manifest.json` artifact records
-the revision, seed, budgets, scenario catalog, binary hashes, byte count, and
-source name without persisting an absolute source path.
+`Invoke-ProcessSoak.ps1` accepts one manifest path and documented bounded
+`-Iterations 100 -Seed 3403` overrides. The fixed Rust supervisor opens the
+UTF-8 manifest once under a retained no-reparse root, enforces a maximum of 1
+MiB, rejects unknown or missing fields, and hashes the exact bytes it read. The
+manifest contains `schemaVersion`, `revision`, pinned `gitRevision` and
+`buildId`, SHA-256 plus canonical paths for the supervisor, helper, and cycle
+executables, an explicit minimal environment allowlist, an ANSI corpus
+revision/hash, a temporary working directory, `seed`, bounded `iterations` (at
+most 100), bounded suite/cycle/cleanup deadlines and stdout, stderr, and result
+byte caps, and a finite `scenarioCatalog`. Every scenario is an argument array
+beginning with the fixed `cycle` protocol and has an expected exit code. The
+Rust supervisor repeats canonical identity and hash validation immediately
+before launch; PowerShell never reopens or hashes the manifest. The retained
+`manifest.json` artifact records the exact input hash and bounded protocol
+fields without persisting absolute source paths.
 
 ## Fixed Rust supervisor
 
-The PowerShell layer starts the allowlisted supervisor as a child with an
-argument array. It never dot-sources a callback, imports worktree code, uses
-`Start-Process`, polls with sleeps, or terminates a raw PID. On Windows the
-Rust supervisor creates and owns one Job Object per cycle, launches the exact
-cycle executable suspended with the validated argument array, assigns it to
+The PowerShell layer starts the fixed supervisor as a child with an argument
+array and an explicit `SystemRoot`/`TEMP`/`TMP`/exact-tool-directory `PATH`
+block. Its stdout and stderr pumps are bounded and deadline-limited. It never
+dot-sources a callback, imports worktree code, uses `Start-Process`, polls with
+sleeps, or terminates a raw PID. On Windows the Rust supervisor creates and
+owns one Job Object per cycle, launches the exact cycle executable suspended
+with the validated argument array and explicit environment block, assigns it to
 the Job before resuming it, and records a live process creation time and
 canonical executable path. It reads stdout and stderr concurrently under hard
 caps and parses exactly one bounded JSON result. Per-cycle and suite deadlines
 use monotonic clocks. On timeout, interruption, malformed/multiple/oversized
-output, crash, nonzero exit, or residue it terminates the owned Job, joins
-both readers, and independently proves `ACTIVE_PROCESS_ZERO` through the Job
+output, crash, nonzero exit, or residue it terminates the owned Job, joins both
+readers, and independently proves `ACTIVE_PROCESS_ZERO` through the Job
 completion port and active-member query. A raw PID is never a termination
 authority. Every reported member identity is obtained by opening the live Job
 member and querying its creation time and executable path; self-reported PIDs
@@ -49,7 +53,7 @@ never false passes.
 
 ## Evidence publication
 
-Evidence is written only beneath the validated temporary root:
+Evidence is written by Rust only beneath the validated temporary root:
 
 ```text
 .devmanager-next/evidence/phase-03-process-soak/runs/<unique-run>/
@@ -60,13 +64,16 @@ Evidence is written only beneath the validated temporary root:
   run.json
 ```
 
-The root and run name are canonicalized and checked for reparse points. Each
-artifact is serialized to a same-directory temporary file and atomically moved
-into its previously absent final name. Run IDs are unique and append-only;
-existing files are never overwritten. `performance.json` contains each cycle
-duration plus p50, p95, maximum, and count. `conformance.json` records the
-manifest revision/hash, scenario outcomes, exact-one-JSON validation, reader
-caps, real identities, cleanup deadline, and Job zero proof.
+The root is opened and retained with no-reparse semantics, and the unique run
+directory is created exclusively. Each artifact is serialized to a
+same-directory temporary file and atomically moved into its previously absent
+final name. Existing files are never overwritten. `performance.json` contains
+each cycle duration plus p50, p95, maximum, and count, together with raw child
+CPU time, monotonic wall interval, logical processors, core-equivalent percent,
+and whole-machine percent. `conformance.json` records the manifest
+revision/hash, pinned build, ANSI corpus case hashes, scenario outcomes,
+exact-one-JSON validation, reader caps, real identities, listener and handle
+audits, cleanup deadline, and Job zero proof.
 
 ## Budgets and measurements
 
@@ -92,10 +99,9 @@ whole-machine % = processMs / (sampleMs × logical) × 100
 core-equivalent % = processMs / sampleMs × 100
 ```
 
-The first is capped at 100% for a single process on a whole-machine display;
-the second can exceed 100% when multiple logical processors are consumed.
-The evidence records the logical-processor count and both values, not an
-ambiguous “CPU percent.”
+Both values are published from the raw measured interval; neither is replaced
+with a formula-only estimate or silently capped. The evidence records the
+logical-processor count and both values, not an ambiguous “CPU percent.”
 
 ## Conformance corpus
 

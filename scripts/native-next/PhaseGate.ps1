@@ -288,6 +288,64 @@ function Set-DevManagerPhaseGateProcessEnvironment {
     }
 }
 
+function Invoke-DevManagerPhaseGateBoundedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [int]$TimeoutMilliseconds = 120000,
+        [int]$StdoutBytes = 256KB,
+        [int]$StderrBytes = 64KB
+    )
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $StartInfo
+    $stdout = [pscustomobject]@{ reader = $null; task = $null; buffer = (New-Object char[] 8192); text = [Text.StringBuilder]::new(); totalBytes = 0L; truncated = $false; done = $false }
+    $stderr = [pscustomobject]@{ reader = $null; task = $null; buffer = (New-Object char[] 8192); text = [Text.StringBuilder]::new(); totalBytes = 0L; truncated = $false; done = $false }
+    $started = $false
+    $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64]($TimeoutMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000)
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw 'bounded phase-gate command did not start.' }
+        $stdout.reader = $process.StandardOutput
+        $stderr.reader = $process.StandardError
+        $stdout.task = $stdout.reader.ReadAsync($stdout.buffer, 0, $stdout.buffer.Length)
+        $stderr.task = $stderr.reader.ReadAsync($stderr.buffer, 0, $stderr.buffer.Length)
+        while (-not ($stdout.done -and $stderr.done -and $process.HasExited)) {
+            $remaining = [int](($deadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
+            if ($remaining -le 0) {
+                $process.Kill($true)
+                [void]$process.WaitForExit(5000)
+                throw 'bounded phase-gate command exceeded its absolute deadline.'
+            }
+            $tasks = @(@($stdout.task, $stderr.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
+            if ($tasks.Count -gt 0) { [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, [Math]::Max(1, $remaining)) }
+            foreach ($state in @($stdout, $stderr)) {
+                if ($state.done -or -not $state.task.IsCompleted) { continue }
+                $count = $state.task.GetAwaiter().GetResult()
+                if ($count -eq 0) { $state.done = $true; continue }
+                $state.totalBytes += [Text.Encoding]::UTF8.GetByteCount($state.buffer, 0, $count)
+                $cap = if ($state -eq $stdout) { $StdoutBytes } else { $StderrBytes }
+                if ($state.text.Length -lt $cap) { [void]$state.text.Append($state.buffer, 0, [Math]::Min($count, $cap - $state.text.Length)) }
+                if ($state.totalBytes -gt $cap) { $state.truncated = $true }
+                $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
+            }
+        }
+        [void]$process.WaitForExit(1000)
+        if ($stdout.truncated -or $stderr.truncated) { throw 'bounded phase-gate command exceeded its output cap.' }
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Stdout = $stdout.text.ToString()
+            Stderr = $stderr.text.ToString()
+            StdoutBytes = $stdout.totalBytes
+            StderrBytes = $stderr.totalBytes
+        }
+    }
+    finally {
+        if ($started -and -not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(1000) }
+        $process.Dispose()
+    }
+}
+
 function New-DevManagerPhaseGateRunDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -798,9 +856,9 @@ function Wait-DevManagerPhaseGateQuietWindow {
     if ($QuietMilliseconds -lt 1000) {
         throw "QuietMilliseconds must be at least 1000."
     }
-    $requiredCleanPolls = [Math]::Max(2, [int][Math]::Ceiling($QuietMilliseconds / [double]$PollMilliseconds))
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
-    $cleanStreak = 0
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $deadlineMilliseconds = [Math]::Max(1, $TimeoutMilliseconds)
+    $lastDirtyElapsedMilliseconds = 0L
     $lastResidue = @()
 
     while ($true) {
@@ -819,23 +877,22 @@ function Wait-DevManagerPhaseGateQuietWindow {
                 -CimProcesses $CimProcesses)
 
         if ($lastResidue.Count -eq 0) {
-            $cleanStreak++
-            if ($cleanStreak -ge $requiredCleanPolls) {
+            if (($stopwatch.ElapsedMilliseconds - $lastDirtyElapsedMilliseconds) -ge $QuietMilliseconds) {
                 return ,([object[]]@())
             }
         }
         else {
-            $cleanStreak = 0
+            $lastDirtyElapsedMilliseconds = $stopwatch.ElapsedMilliseconds
         }
 
-        if ([DateTime]::UtcNow -ge $deadline) {
+        if ($stopwatch.ElapsedMilliseconds -ge $deadlineMilliseconds) {
             return ,([object[]]$lastResidue)
         }
-        if ($null -ne $CimProcesses) {
-            if ($cleanStreak -ge $requiredCleanPolls) { return ,([object[]]@()) }
+        if ($null -ne $CimProcesses -and $lastResidue.Count -gt 0) {
             return ,([object[]]$lastResidue)
         }
-        Start-Sleep -Milliseconds $PollMilliseconds
+        $remainingMilliseconds = $deadlineMilliseconds - $stopwatch.ElapsedMilliseconds
+        Start-Sleep -Milliseconds ([Math]::Min($PollMilliseconds, [Math]::Max(1, $remainingMilliseconds)))
     }
 }
 

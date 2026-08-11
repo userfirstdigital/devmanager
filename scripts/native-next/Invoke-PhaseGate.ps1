@@ -36,6 +36,7 @@ function Repair-DevManagerPhase3SupervisorPlan {
     $Plan.arguments = [string[]]@(
         'test',
         '--test', 'process_supervisor',
+        '--test', 'process_soak_infrastructure',
         '--', '--nocapture'
     )
 }
@@ -58,33 +59,20 @@ function Assert-DevManagerPhase3SupervisorHasTests {
     $listInfo.RedirectStandardError = $true
     $listInfo.WorkingDirectory = [string]$Plan.workingDirectory
     Set-DevManagerPhaseGateProcessEnvironment -StartInfo $listInfo -Plan $Plan
-    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--', '--list')) {
+    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--test', 'process_soak_infrastructure', '--', '--list')) {
         [void]$listInfo.ArgumentList.Add($argument)
     }
 
-    $listProcess = [System.Diagnostics.Process]::Start($listInfo)
-    if ($null -eq $listProcess) {
-        throw 'Unable to start the phase-03-process-supervisor test-list preflight.'
+    $listResult = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $listInfo -TimeoutMilliseconds 120000
+    if ($listResult.ExitCode -ne 0) {
+        throw ("phase-03-process-supervisor test-list preflight failed ({0}): {1}" -f $listResult.ExitCode, $listResult.Stderr.Trim())
     }
-    try {
-        $stdoutTask = $listProcess.StandardOutput.ReadToEndAsync()
-        $stderrTask = $listProcess.StandardError.ReadToEndAsync()
-        $listProcess.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($listProcess.ExitCode -ne 0) {
-            throw ("phase-03-process-supervisor test-list preflight failed ({0}): {1}" -f $listProcess.ExitCode, $stderr.Trim())
-        }
-        $testLines = @(
-            $stdout -split "`r?`n" |
-                Where-Object { $_ -match ':\s*test$' }
-        )
-        if ($testLines.Count -eq 0) {
-            throw 'phase-03-process-supervisor preflight found zero tests; refusing a green gate.'
-        }
-    }
-    finally {
-        $listProcess.Dispose()
+    $testLines = @(
+        $listResult.Stdout -split "`r?`n" |
+            Where-Object { $_ -match ':\s*test$' }
+    )
+    if ($testLines.Count -eq 0) {
+        throw 'phase-03-process-supervisor preflight found zero tests; refusing a green gate.'
     }
 }
 
@@ -299,6 +287,69 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
     }
     finally {
         $process.Dispose()
+    }
+
+    if ([string]$plan.recipe -eq 'phase-03-process-supervisor' -and $exitCode -eq 0) {
+        # Keep the fixed Rust supervisor inside this same Phase 0 baseline,
+        # identity, and quiet-window guard.  The gate uses two isolated cycles;
+        # the documented 100-cycle default is reserved for the final union.
+        $soakScript = Join-Path $PSScriptRoot 'Invoke-ProcessSoak.ps1'
+        $pwshCommands = @(
+            Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
+        )
+        if ($pwshCommands.Count -ne 1) {
+            throw "phase-03-process-supervisor requires exactly one pwsh.exe (found $($pwshCommands.Count))."
+        }
+        $pwshPath = [System.IO.Path]::GetFullPath([string]$pwshCommands[0].Source)
+        $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+        if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+            throw 'phase-03-process-supervisor cannot establish SystemRoot for the soak child.'
+        }
+        $soakTemp = [System.IO.Path]::GetFullPath((Join-Path $worktreeRoot '.tmp-phase3-soak'))
+        $pwshDirectory = [System.IO.Path]::GetDirectoryName($pwshPath)
+        $soakInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $soakInfo.FileName = $pwshPath
+        $soakInfo.UseShellExecute = $false
+        $soakInfo.CreateNoWindow = $true
+        $soakInfo.RedirectStandardOutput = $true
+        $soakInfo.RedirectStandardError = $true
+        $soakInfo.WorkingDirectory = $worktreeRoot
+        $soakInfo.Environment.Clear()
+        $soakInfo.Environment['SystemRoot'] = [string]$systemRoot
+        $soakInfo.Environment['TEMP'] = $soakTemp
+        $soakInfo.Environment['TMP'] = $soakTemp
+        $soakInfo.Environment['PATH'] = @(
+            [System.IO.Path]::Combine([string]$systemRoot, 'System32'),
+            [string]$pwshDirectory
+        ) -join ';'
+        foreach ($argument in [string[]]@(
+                '-NoProfile',
+                '-NonInteractive',
+                '-File',
+                $soakScript,
+                '-Iterations',
+                '2',
+                '-Seed',
+                '3403')) {
+            [void]$soakInfo.ArgumentList.Add($argument)
+        }
+        $soakResult = Invoke-DevManagerPhaseGateBoundedCommand `
+            -StartInfo $soakInfo `
+            -TimeoutMilliseconds 120000 `
+            -StdoutBytes 65536 `
+            -StderrBytes 16384
+        $soakLines = @(
+            $soakResult.Stdout -split "`r?`n" |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($soakResult.ExitCode -ne 0 -or $soakResult.StderrBytes -ne 0 -or $soakLines.Count -ne 1) {
+            throw "phase-03-process-supervisor soak supervisor failed closed (exit=$($soakResult.ExitCode) stderrBytes=$($soakResult.StderrBytes) lines=$($soakLines.Count))."
+        }
+        $soakResult = $soakLines[0] | ConvertFrom-Json
+        if ([string]$soakResult.status -ne 'passed') {
+            throw 'phase-03-process-supervisor soak supervisor did not report passed.'
+        }
     }
 
     $stopwatch.Stop()

@@ -15,6 +15,9 @@ $ErrorActionPreference = 'Stop'
 
 $phase = 'phase-03-process-supervisor'
 $recipe = 'phase-03-process-supervisor'
+$soakScript = Join-Path $PSScriptRoot 'Invoke-ProcessSoak.ps1'
+$captureBaselineScript = Join-Path $PSScriptRoot 'Capture-ProductionBaseline.ps1'
+$assertUnchangedScript = Join-Path $PSScriptRoot 'Assert-ProductionUnchanged.ps1'
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
 $plan = Resolve-DevManagerPhaseGateRecipe -Recipe $recipe -WorktreeRoot $worktreeRoot
 Assert-DevManagerPhaseGateExecutionPlan -Plan $plan
@@ -33,35 +36,22 @@ function Invoke-ProcessSupervisorTestList {
     $listInfo.RedirectStandardError = $true
     $listInfo.WorkingDirectory = [string]$Plan.workingDirectory
     Set-DevManagerPhaseGateProcessEnvironment -StartInfo $listInfo -Plan $Plan
-    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--', '--list')) {
+    foreach ($argument in [string[]]@('test', '--test', 'process_supervisor', '--test', 'process_soak_infrastructure', '--', '--list')) {
         [void]$listInfo.ArgumentList.Add($argument)
     }
 
-    $listProcess = [System.Diagnostics.Process]::Start($listInfo)
-    if ($null -eq $listProcess) {
-        throw 'Unable to start the process-supervisor test-list preflight.'
+    $listResult = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $listInfo -TimeoutMilliseconds 120000
+    if ($listResult.ExitCode -ne 0) {
+        throw ("process-supervisor test-list preflight failed ({0}): {1}" -f $listResult.ExitCode, $listResult.Stderr.Trim())
     }
-    try {
-        $stdoutTask = $listProcess.StandardOutput.ReadToEndAsync()
-        $stderrTask = $listProcess.StandardError.ReadToEndAsync()
-        $listProcess.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($listProcess.ExitCode -ne 0) {
-            throw ("process-supervisor test-list preflight failed ({0}): {1}" -f $listProcess.ExitCode, $stderr.Trim())
-        }
-        $testLines = @(
-            $stdout -split "`r?`n" |
-                Where-Object { $_ -match ':\s*test$' }
-        )
-        if ($testLines.Count -eq 0) {
-            throw 'process-supervisor preflight found zero tests; refusing a green gate.'
-        }
-        return [int]$testLines.Count
+    $testLines = @(
+        $listResult.Stdout -split "`r?`n" |
+            Where-Object { $_ -match ':\s*test$' }
+    )
+    if ($testLines.Count -lt 23) {
+        throw "process-supervisor/soak preflight found only $($testLines.Count) tests; expected at least 23."
     }
-    finally {
-        $listProcess.Dispose()
-    }
+    return [int]$testLines.Count
 }
 
 try {
@@ -77,6 +67,15 @@ catch {
 }
 
 $phaseGate = Join-Path $PSScriptRoot 'Invoke-PhaseGate.ps1'
+# Invoke-PhaseGate owns the baseline/identity/quiet-window guard and invokes
+# Invoke-ProcessSoak.ps1 with two cycles before publishing its after inventory.
+# All preflight output uses bounded WaitForExit(milliseconds), never an
+# unbounded parameterless wait.
+# These explicit paths are kept here so the end-to-end gate cannot silently
+# regress to a process-supervisor-only recipe.
+$null = $soakScript
+$null = $captureBaselineScript
+$null = $assertUnchangedScript
 & $phaseGate -Phase $phase -Recipe $recipe -LongRustRun:$LongRustRun
 $exitCode = $LASTEXITCODE
 if ($null -eq $exitCode) {
