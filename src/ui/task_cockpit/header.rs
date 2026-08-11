@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -1348,12 +1349,87 @@ pub struct ObservationStamp {
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ActionTarget {
+/// Opaque authority minted by a rendered header model.  The dispatch target
+/// carries this token internally so a caller cannot manufacture a matching
+/// target from the public task identity fields alone.
+#[derive(Clone)]
+struct HeaderDispatchAuthority(Arc<()>);
+
+impl HeaderDispatchAuthority {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl fmt::Debug for HeaderDispatchAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("header-dispatch-authority[opaque]")
+    }
+}
+
+impl PartialEq for HeaderDispatchAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HeaderDispatchAuthority {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionTargetView {
     Task(TaskIdentity),
     Host(ObservationStamp),
     Remote(ObservationStamp),
     Quota(ObservationStamp),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ActionTarget {
+    view: ActionTargetView,
+    authority: HeaderDispatchAuthority,
+}
+
+impl fmt::Debug for ActionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActionTarget")
+            .field("view", &self.view)
+            .finish()
+    }
+}
+
+impl ActionTarget {
+    fn task(identity: TaskIdentity, authority: HeaderDispatchAuthority) -> Self {
+        Self {
+            view: ActionTargetView::Task(identity),
+            authority,
+        }
+    }
+
+    fn host(stamp: ObservationStamp, authority: HeaderDispatchAuthority) -> Self {
+        Self {
+            view: ActionTargetView::Host(stamp),
+            authority,
+        }
+    }
+
+    fn remote(stamp: ObservationStamp, authority: HeaderDispatchAuthority) -> Self {
+        Self {
+            view: ActionTargetView::Remote(stamp),
+            authority,
+        }
+    }
+
+    fn quota(stamp: ObservationStamp, authority: HeaderDispatchAuthority) -> Self {
+        Self {
+            view: ActionTargetView::Quota(stamp),
+            authority,
+        }
+    }
+
+    pub fn view(&self) -> ActionTargetView {
+        self.view
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1372,8 +1448,10 @@ pub struct HeaderActionEnvelope {
 }
 
 impl HeaderActionEnvelope {
-    pub fn target(&self) -> &ActionTarget {
-        &self.target
+    /// Return only a diagnostic view.  The opaque authority required for
+    /// dispatch never leaves the envelope.
+    pub fn target(&self) -> ActionTargetView {
+        self.target.view()
     }
 
     /// Consume the capture only when the canonical shell presents the exact
@@ -1430,18 +1508,20 @@ impl std::error::Error for HeaderActionError {}
 
 impl ProjectedAction {
     fn checked(request: ActionRequest, target: ActionTarget) -> Result<Self, HeaderActionError> {
-        let matches = match (&request, &target) {
-            (ActionRequest::TaskShow { task_id }, ActionTarget::Task(identity)) => {
+        let matches = match (&request, target.view()) {
+            (ActionRequest::TaskShow { task_id }, ActionTargetView::Task(identity)) => {
                 *task_id == identity.task_id
             }
-            (ActionRequest::TaskRename(arguments), ActionTarget::Task(identity)) => {
+            (ActionRequest::TaskRename(arguments), ActionTargetView::Task(identity)) => {
                 arguments.task_id == identity.task_id
             }
             // Host status is the catalog request for all read-only status
             // projections, including remote and provider-quota status.
             (
                 ActionRequest::HostStatus,
-                ActionTarget::Host(_) | ActionTarget::Remote(_) | ActionTarget::Quota(_),
+                ActionTargetView::Host(_)
+                | ActionTargetView::Remote(_)
+                | ActionTargetView::Quota(_),
             ) => true,
             _ => false,
         };
@@ -1455,11 +1535,18 @@ impl ProjectedAction {
     }
 
     pub fn task_show(identity: TaskIdentity) -> Self {
+        Self::task_show_with_authority(identity, HeaderDispatchAuthority::new())
+    }
+
+    fn task_show_with_authority(
+        identity: TaskIdentity,
+        authority: HeaderDispatchAuthority,
+    ) -> Self {
         Self::checked(
             ActionRequest::TaskShow {
                 task_id: identity.task_id,
             },
-            ActionTarget::Task(identity),
+            ActionTarget::task(identity, authority),
         )
         .expect("task-show factory always captures a matching task identity")
     }
@@ -1467,6 +1554,14 @@ impl ProjectedAction {
     pub fn task_rename(
         identity: TaskIdentity,
         title: impl AsRef<str>,
+    ) -> Result<Self, HeaderActionError> {
+        Self::task_rename_with_authority(identity, title, HeaderDispatchAuthority::new())
+    }
+
+    fn task_rename_with_authority(
+        identity: TaskIdentity,
+        title: impl AsRef<str>,
+        authority: HeaderDispatchAuthority,
     ) -> Result<Self, HeaderActionError> {
         let title = title.as_ref();
         let actual = scalar_count_up_to(title, MAX_LABEL_SCALARS);
@@ -1484,27 +1579,36 @@ impl ProjectedAction {
                 task_id: identity.task_id,
                 title: title.to_owned(),
             }),
-            ActionTarget::Task(identity),
+            ActionTarget::task(identity, authority),
         )
     }
 
     pub fn host_status(stamp: ObservationStamp) -> Self {
-        Self::checked(ActionRequest::HostStatus, ActionTarget::Host(stamp))
-            .expect("host-status factory always captures a matching host stamp")
+        Self::checked(
+            ActionRequest::HostStatus,
+            ActionTarget::host(stamp, HeaderDispatchAuthority::new()),
+        )
+        .expect("host-status factory always captures a matching host stamp")
     }
 
     pub fn remote_status(stamp: ObservationStamp) -> Self {
-        Self::checked(ActionRequest::HostStatus, ActionTarget::Remote(stamp))
-            .expect("remote-status factory always captures a matching remote stamp")
+        Self::checked(
+            ActionRequest::HostStatus,
+            ActionTarget::remote(stamp, HeaderDispatchAuthority::new()),
+        )
+        .expect("remote-status factory always captures a matching remote stamp")
     }
 
     pub fn quota_status(stamp: ObservationStamp) -> Self {
-        Self::checked(ActionRequest::HostStatus, ActionTarget::Quota(stamp))
-            .expect("quota-status factory always captures a matching quota stamp")
+        Self::checked(
+            ActionRequest::HostStatus,
+            ActionTarget::quota(stamp, HeaderDispatchAuthority::new()),
+        )
+        .expect("quota-status factory always captures a matching quota stamp")
     }
 
-    pub fn target(&self) -> &ActionTarget {
-        &self.target
+    pub fn target(&self) -> ActionTargetView {
+        self.target.view()
     }
 
     pub fn into_envelope(self) -> HeaderActionEnvelope {
@@ -3892,6 +3996,7 @@ impl Default for TaskProjectionContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskHeaderModel {
     identity: TaskIdentity,
+    dispatch_authority: HeaderDispatchAuthority,
     title: String,
     project: ProjectProjection,
     workspace: WorkspaceProjection,
@@ -3992,6 +4097,7 @@ impl TaskHeaderModel {
     ) -> Self {
         Self {
             identity,
+            dispatch_authority: HeaderDispatchAuthority::new(),
             title: bounded_label(title.as_ref(), MAX_LABEL_SCALARS),
             project: ProjectProjection::new(project.id, project.label),
             workspace: workspace.bounded(),
@@ -4006,6 +4112,13 @@ impl TaskHeaderModel {
 
     pub fn identity(&self) -> TaskIdentity {
         self.identity
+    }
+
+    /// Return the current model's opaque dispatch target.  Callers can pass
+    /// this to the shell, but cannot construct an equivalent target from the
+    /// public identity fields or extract the authority from an action capture.
+    pub fn dispatch_target(&self) -> ActionTarget {
+        ActionTarget::task(self.identity, self.dispatch_authority.clone())
     }
 
     pub fn title(&self) -> &str {
@@ -4097,7 +4210,20 @@ impl TaskHeaderModel {
     }
 
     pub fn task_show_action(&self) -> HeaderAction {
-        ProjectedAction::task_show(self.identity).into_envelope()
+        ProjectedAction::task_show_with_authority(self.identity, self.dispatch_authority.clone())
+            .into_envelope()
+    }
+
+    pub fn task_rename_action(
+        &self,
+        title: impl AsRef<str>,
+    ) -> Result<HeaderAction, HeaderActionError> {
+        ProjectedAction::task_rename_with_authority(
+            self.identity,
+            title,
+            self.dispatch_authority.clone(),
+        )
+        .map(ProjectedAction::into_envelope)
     }
 
     pub fn layout(&self, width_px: u16) -> HeaderLayout {
@@ -4431,16 +4557,31 @@ fn header_field_label(model: &TaskHeaderModel, field: HeaderField) -> String {
 }
 
 fn truncate_with_ellipsis(value: &str, max_scalars: usize) -> String {
-    let graphemes = grapheme_slices(value);
-    if graphemes.len() <= max_scalars {
-        return value.to_string();
+    if max_scalars == 0 {
+        return String::new();
     }
-    if max_scalars <= 1 {
-        return "…".to_string();
+    let mut scalar_count = 0_usize;
+    let mut bounded = String::new();
+    for grapheme in value.graphemes(true) {
+        let grapheme_scalars = grapheme.chars().count();
+        if scalar_count.saturating_add(grapheme_scalars) > max_scalars {
+            let mut truncated = String::new();
+            let mut truncated_scalars = 0_usize;
+            for prefix in value.graphemes(true) {
+                let prefix_scalars = prefix.chars().count();
+                if truncated_scalars.saturating_add(prefix_scalars) > max_scalars - 1 {
+                    break;
+                }
+                truncated.push_str(prefix);
+                truncated_scalars += prefix_scalars;
+            }
+            truncated.push('…');
+            return truncated;
+        }
+        bounded.push_str(grapheme);
+        scalar_count += grapheme_scalars;
     }
-    let mut truncated: String = graphemes[..max_scalars - 1].concat();
-    truncated.push('…');
-    truncated
+    bounded
 }
 
 fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
@@ -4449,33 +4590,51 @@ fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_scalars = 0_usize;
     for word in value.split_whitespace() {
-        let word_len = grapheme_slices(word).len();
-        if word_len > max_line_scalars {
+        let graphemes = grapheme_slices(word);
+        let word_scalars: usize = graphemes.iter().map(|part| part.chars().count()).sum();
+        if word_scalars > max_line_scalars {
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
+                current_scalars = 0;
             }
             let mut chunk = String::new();
-            for grapheme in grapheme_slices(word) {
-                chunk.push_str(grapheme);
-                if grapheme_slices(&chunk).len() == max_line_scalars {
-                    lines.push(std::mem::take(&mut chunk));
+            let mut chunk_scalars = 0_usize;
+            for grapheme in graphemes {
+                let grapheme_scalars = grapheme.chars().count();
+                if grapheme_scalars > max_line_scalars {
+                    if !chunk.is_empty() {
+                        lines.push(std::mem::take(&mut chunk));
+                        chunk_scalars = 0;
+                    }
+                    lines.push("…".to_string());
+                    continue;
                 }
+                if chunk_scalars.saturating_add(grapheme_scalars) > max_line_scalars {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_scalars = 0;
+                }
+                chunk.push_str(grapheme);
+                chunk_scalars += grapheme_scalars;
             }
             if !chunk.is_empty() {
                 current = chunk;
+                current_scalars = chunk_scalars;
             }
             continue;
         }
-        let proposed =
-            grapheme_slices(&current).len() + usize::from(!current.is_empty()) + word_len;
+        let proposed = current_scalars + usize::from(!current.is_empty()) + word_scalars;
         if proposed > max_line_scalars && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
+            current_scalars = 0;
         }
         if !current.is_empty() {
             current.push(' ');
+            current_scalars += 1;
         }
         current.push_str(word);
+        current_scalars += word_scalars;
     }
     if !current.is_empty() {
         lines.push(current);

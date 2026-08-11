@@ -9,7 +9,7 @@ use devmanager::ui::components::{AccessibleRole, ActionRequest};
 use devmanager::ui::components::{ActivationSource, KeyboardKey};
 use devmanager::ui::native_shell::NativeInteraction;
 use devmanager::ui::task_cockpit::header::{
-    presentation_text, ActionTarget, AgentObservation, AgentResourceField, ConnectObservation,
+    presentation_text, ActionTargetView, AgentObservation, AgentResourceField, ConnectObservation,
     ConnectState, HeaderActionEnvelope, HeaderActionError, HeaderFieldKey, HeaderHighWaterLedger,
     HeaderLayout, HeaderObservation, HighWaterDecision, HostHealth, HostObservation,
     HostObservationIdentity, HostResourceObservation, OpaqueProviderSessionRef,
@@ -38,6 +38,18 @@ fn agent_id(index: u32) -> AgentSessionId {
         bytes[2], bytes[3],
     ])
     .expect("fixed UUIDv7 agent id")
+}
+
+fn task_header_model(identity: TaskIdentity) -> TaskHeaderModel {
+    TaskHeaderModel::new(
+        identity,
+        "Task",
+        ProjectProjection::new(ProjectId::new(), "Project"),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_observations(&[]),
+        VisibleTaskStatus::Working,
+        "Accessible task header",
+    )
 }
 
 fn observation(
@@ -500,14 +512,14 @@ fn top_bar_actions_keep_actual_observation_stamps() {
     };
     let model = TopBarModel::try_from_input(&input).unwrap();
     let host = model.host.unwrap();
-    let ActionTarget::Host(host_stamp) = host.action.target() else {
+    let ActionTargetView::Host(host_stamp) = host.action.target() else {
         panic!("host action target")
     };
     assert_eq!(host_stamp.observed_at_ms, 9_000);
     assert_eq!(host_stamp.generation, 9);
     assert_eq!(host_stamp.revision, 7);
     let quota = &model.quotas[0];
-    let ActionTarget::Quota(quota_stamp) = quota.action.target() else {
+    let ActionTargetView::Quota(quota_stamp) = quota.action.target() else {
         panic!("quota action target")
     };
     assert_eq!(quota_stamp.observed_at_ms, 9_300);
@@ -834,10 +846,10 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     let huge_title = "untrusted ".repeat(10_000);
     let bounded = ProjectedAction::task_rename(identity, huge_title);
     assert!(bounded.is_err());
-    let bounded = ProjectedAction::task_rename(identity, "bounded title").unwrap();
-    let bounded_envelope = bounded.into_envelope();
+    let header = task_header_model(identity);
+    let bounded_envelope = header.task_rename_action("bounded title").unwrap();
     let ActionRequest::TaskRename(arguments) = bounded_envelope
-        .into_request_if_current(&ActionTarget::Task(identity))
+        .into_request_if_current(&header.dispatch_target())
         .unwrap()
     else {
         panic!("rename action")
@@ -850,7 +862,7 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
         revision: 3,
     };
     let remote = ProjectedAction::remote_status(stamp);
-    assert!(matches!(remote.target(), ActionTarget::Remote(captured) if *captured == stamp));
+    assert!(matches!(remote.target(), ActionTargetView::Remote(captured) if captured == stamp));
     assert_eq!(
         PendingHeaderActionOutcome::from_high_water(HighWaterDecision::RejectedConflict),
         PendingHeaderActionOutcome::Conflict
@@ -865,7 +877,7 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     let envelopes = typed_queue.drain_envelopes_for_tick(1);
     assert!(matches!(
         envelopes.first().map(HeaderActionEnvelope::target),
-        Some(ActionTarget::Task(captured)) if *captured == identity
+        Some(ActionTargetView::Task(captured)) if captured == identity
     ));
 }
 
@@ -882,13 +894,11 @@ fn projected_action_exposes_only_a_fenced_typed_envelope() {
         request_epoch: 7,
         action_epoch: 8,
     };
-    let envelope: HeaderActionEnvelope = ProjectedAction::task_show(identity).into_envelope();
+    let model = task_header_model(identity);
+    let envelope: HeaderActionEnvelope = model.task_show_action();
+    assert_eq!(envelope.target(), ActionTargetView::Task(identity));
     assert!(matches!(
-        envelope.target(),
-        ActionTarget::Task(captured) if *captured == identity
-    ));
-    assert!(matches!(
-        envelope.into_request_if_current(&ActionTarget::Task(identity)),
+        envelope.into_request_if_current(&model.dispatch_target()),
         Ok(ActionRequest::TaskShow { task_id }) if task_id == identity.task_id
     ));
 }
@@ -908,15 +918,17 @@ fn header_envelope_requires_the_exact_current_target_to_extract_a_request() {
     };
     let mut stale = identity;
     stale.revision += 1;
-    let envelope = ProjectedAction::task_show(identity).into_envelope();
+    let model = task_header_model(identity);
+    let stale_model = task_header_model(stale);
+    let envelope = model.task_show_action();
     assert_eq!(
         envelope
             .clone()
-            .into_request_if_current(&ActionTarget::Task(stale)),
+            .into_request_if_current(&stale_model.dispatch_target()),
         Err(HeaderActionError::StaleTarget)
     );
     assert!(matches!(
-        envelope.into_request_if_current(&ActionTarget::Task(identity)),
+        envelope.into_request_if_current(&model.dispatch_target()),
         Ok(ActionRequest::TaskShow { task_id }) if task_id == identity.task_id
     ));
 }
@@ -936,12 +948,14 @@ fn native_shell_header_dispatch_consumes_only_a_current_envelope() {
     };
     let mut stale = identity;
     stale.focus_epoch += 1;
+    let model = task_header_model(identity);
+    let stale_model = task_header_model(stale);
     let mut interaction = NativeInteraction::new(Some(identity.task_id));
-    let envelope = ProjectedAction::task_show(identity).into_envelope();
+    let envelope = model.task_show_action();
     assert!(interaction
         .action_from_header_envelope(
             envelope.clone(),
-            &ActionTarget::Task(stale),
+            &stale_model.dispatch_target(),
             ActivationSource::Keyboard {
                 key: KeyboardKey::Enter,
             },
@@ -950,7 +964,7 @@ fn native_shell_header_dispatch_consumes_only_a_current_envelope() {
     let record = interaction
         .action_from_header_envelope(
             envelope,
-            &ActionTarget::Task(identity),
+            &model.dispatch_target(),
             ActivationSource::Keyboard {
                 key: KeyboardKey::Enter,
             },
@@ -1517,7 +1531,7 @@ fn narrow_layout_provides_a_focusable_overflow_control_with_the_task_fence() {
     let layout = HeaderLayout::for_model(&model, 320);
     let overflow = layout.overflow_control.as_ref().expect("overflow control");
     assert!(overflow.focusable);
-    assert_eq!(overflow.action.target(), &ActionTarget::Task(identity));
+    assert_eq!(overflow.action.target(), ActionTargetView::Task(identity));
     assert!(overflow.label.chars().count() <= 256);
     assert_eq!(layout.overflow_items.len(), layout.overflow.len());
     assert!(layout
@@ -1538,7 +1552,7 @@ fn narrow_layout_provides_a_focusable_overflow_control_with_the_task_fence() {
     assert!(menu.focusable);
     assert_eq!(
         menu.action.as_ref().map(|action| action.target()),
-        Some(&ActionTarget::Task(identity))
+        Some(ActionTargetView::Task(identity))
     );
     assert_eq!(menu.children.len(), layout.overflow_items.len());
     assert!(menu
@@ -1583,6 +1597,112 @@ fn header_layout_does_not_split_grapheme_clusters_and_accepts_scale() {
     assert!(lines
         .iter()
         .all(|line| !line.starts_with('\u{200d}') && !line.ends_with('\u{200d}')));
+}
+
+#[test]
+fn header_layout_truncation_bounds_a_large_combining_cluster_by_scalars() {
+    let identity = TaskIdentity {
+        task_id: task_id(46),
+        revision: 1,
+        resource_generation: 1,
+        connection_epoch: 1,
+        focus_epoch: 1,
+        client_epoch: 1,
+        navigation_epoch: 1,
+        request_epoch: 1,
+        action_epoch: 1,
+    };
+    let title = format!("a{}", "\u{0301}".repeat(100));
+    let model = TaskHeaderModel::new(
+        identity,
+        title,
+        devmanager::ui::task_cockpit::header::ProjectProjection::new(
+            devmanager::domain::id::ProjectId::new(),
+            "Project",
+        ),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_observations(&[]),
+        VisibleTaskStatus::Working,
+        "Accessible task header",
+    );
+
+    let HeaderLayout {
+        title: TitleLayout::Truncated(title),
+        ..
+    } = HeaderLayout::for_model(&model, 240)
+    else {
+        panic!("expected narrow title truncation")
+    };
+    assert!(title.chars().count() <= 28);
+    assert!(title.ends_with('…'));
+}
+
+#[test]
+fn header_layout_wrapping_bounds_a_large_combining_cluster_by_scalars() {
+    let identity = TaskIdentity {
+        task_id: task_id(47),
+        revision: 1,
+        resource_generation: 1,
+        connection_epoch: 1,
+        focus_epoch: 1,
+        client_epoch: 1,
+        navigation_epoch: 1,
+        request_epoch: 1,
+        action_epoch: 1,
+    };
+    let title = format!("a{}", "\u{0301}".repeat(100));
+    let model = TaskHeaderModel::new(
+        identity,
+        title,
+        devmanager::ui::task_cockpit::header::ProjectProjection::new(
+            devmanager::domain::id::ProjectId::new(),
+            "Project",
+        ),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_observations(&[]),
+        VisibleTaskStatus::Working,
+        "Accessible task header",
+    );
+
+    let HeaderLayout {
+        title: TitleLayout::Wrapped(lines),
+        ..
+    } = HeaderLayout::for_model(&model, 400)
+    else {
+        panic!("expected wrapped title")
+    };
+    assert!(!lines.is_empty());
+    assert!(lines.iter().all(|line| line.chars().count() <= 28));
+}
+
+#[test]
+fn header_dispatch_rejects_same_identity_capture_without_authority() {
+    let identity = TaskIdentity {
+        task_id: task_id(48),
+        revision: 10,
+        resource_generation: 2,
+        connection_epoch: 3,
+        focus_epoch: 4,
+        client_epoch: 5,
+        navigation_epoch: 6,
+        request_epoch: 7,
+        action_epoch: 8,
+    };
+    let model = task_header_model(identity);
+    let other_model = task_header_model(identity);
+    let envelope = model.task_show_action();
+
+    assert_eq!(
+        envelope
+            .clone()
+            .into_request_if_current(&other_model.dispatch_target()),
+        Err(HeaderActionError::StaleTarget),
+        "same task/revision/action/request identity is insufficient without the model authority"
+    );
+    assert!(matches!(
+        envelope.into_request_if_current(&model.dispatch_target()),
+        Ok(ActionRequest::TaskShow { task_id }) if task_id == identity.task_id
+    ));
 }
 
 #[test]
