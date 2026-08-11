@@ -11,6 +11,9 @@ use crate::domain::task::TaskLifecycle;
 pub const FIXED_VIRTUAL_OVERSCAN: usize = 32;
 pub const DEFAULT_VISIBLE_ROWS: usize = 40;
 pub const MAX_VIRTUAL_WINDOW_ROWS: usize = 128;
+/// Maximum identity-bearing task source retained by the native uniform list.
+/// Validate this bound before allocating duplicate-detection state.
+pub const MAX_TASK_SOURCE_IDS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskListOverflow {
@@ -153,12 +156,17 @@ impl TaskList {
     /// the model owner remains the source of truth and the GPUI viewport only
     /// materializes its bounded visible range.
     pub fn from_model(model: &ClientModel) -> Self {
-        let task_ids: Vec<TaskId> = model
+        let mut task_ids = Vec::with_capacity(model.tasks().len().min(MAX_TASK_SOURCE_IDS));
+        for (task_id, _task) in model
             .tasks()
             .iter()
             .filter(|(_, task)| task.task.lifecycle != TaskLifecycle::Archived)
-            .map(|(task_id, _)| *task_id)
-            .collect();
+        {
+            if task_ids.len() == MAX_TASK_SOURCE_IDS {
+                return Self::overflowed(MAX_TASK_SOURCE_IDS.saturating_add(1), false);
+            }
+            task_ids.push(*task_id);
+        }
         let viewport = VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, task_ids.len());
         Self {
             task_ids: Arc::new(task_ids),
@@ -173,7 +181,17 @@ impl TaskList {
     /// creates row elements for its current viewport.
     pub fn from_virtual_task_ids(task_ids: Vec<TaskId>) -> Result<Self, TaskListOverflow> {
         let total_count = task_ids.len();
-        let mut seen = HashSet::with_capacity(task_ids.len());
+        // Reject over-cap sources before allocating any duplicate-detection
+        // state. The caller-provided Vec is already owned by this API; no
+        // second unbounded collection is permitted here.
+        if total_count > MAX_TASK_SOURCE_IDS {
+            return Err(TaskListOverflow {
+                limit: MAX_TASK_SOURCE_IDS,
+                total_count,
+                retained_count: 0,
+            });
+        }
+        let mut seen = HashSet::new();
         if task_ids.iter().any(|task_id| !seen.insert(*task_id)) {
             return Err(TaskListOverflow {
                 // A duplicate source cannot be safely truncated or repaired:
@@ -197,13 +215,35 @@ impl TaskList {
     /// immutable client model is available. This path never materializes row
     /// elements outside the current viewport.
     pub fn from_client_model_virtual(model: &ClientModel) -> Result<Self, TaskListOverflow> {
-        let task_ids = model
+        let mut task_ids = Vec::with_capacity(model.tasks().len().min(MAX_TASK_SOURCE_IDS));
+        for (task_id, _task) in model
             .tasks()
             .iter()
             .filter(|(_, task)| task.task.lifecycle != TaskLifecycle::Archived)
-            .map(|(task_id, _)| *task_id)
-            .collect();
+        {
+            if task_ids.len() == MAX_TASK_SOURCE_IDS {
+                return Err(TaskListOverflow {
+                    limit: MAX_TASK_SOURCE_IDS,
+                    total_count: MAX_TASK_SOURCE_IDS.saturating_add(1),
+                    retained_count: 0,
+                });
+            }
+            task_ids.push(*task_id);
+        }
         Self::from_virtual_task_ids(task_ids)
+    }
+
+    fn overflowed(total_count: usize, virtual_source: bool) -> Self {
+        Self {
+            task_ids: Arc::new(Vec::new()),
+            viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, 0),
+            overflow: Some(TaskListOverflow {
+                limit: MAX_TASK_SOURCE_IDS,
+                total_count,
+                retained_count: 0,
+            }),
+            virtual_source,
+        }
     }
 
     pub fn task_ids(&self) -> &[TaskId] {
@@ -369,11 +409,11 @@ impl Inbox {
         &self.task_list
     }
 
-    pub fn task_list_mut(&mut self) -> &mut TaskList {
+    pub(crate) fn task_list_mut(&mut self) -> &mut TaskList {
         &mut self.task_list
     }
 
-    pub fn from_task_list(task_list: TaskList) -> Self {
+    pub(crate) fn from_task_list(task_list: TaskList) -> Self {
         Self { task_list }
     }
 }

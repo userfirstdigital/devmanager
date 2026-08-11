@@ -9,10 +9,12 @@ use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
     headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment,
-    NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeStub,
-    NativeHostState, NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
+    NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeEpochs,
+    NativeHostRuntimeStub, NativeHostState, NativeInteraction, NativeShell, NativeShellError,
+    TerminalDockState, MAX_STUB_ACTION_HISTORY,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
+use devmanager::ui::task_cockpit::inbox::MAX_TASK_SOURCE_IDS;
 use devmanager::ui::task_cockpit::TaskList;
 use devmanager::ui::tokens::{Density, RuntimePreferencesSnapshot, Scale, ThemeMode};
 use gpui::AppContext;
@@ -305,6 +307,86 @@ fn injected_host_projection_drain_is_bounded_and_keeps_live_kinds_typed() {
             | NativeHostProjectionKind::Replay
             | NativeHostProjectionKind::Live
     )));
+}
+
+#[test]
+fn controller_epoch_changes_fence_actions_without_public_interaction_setters() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let model = Arc::new(model_with_tasks(&[task_id(41)]));
+    let mut fake = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    fake.push_model_projection(model);
+    let fake_handle = fake.handle();
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(fake),
+                RuntimePreferencesSnapshot::default(),
+                cx,
+            )
+        });
+        let result = entity.update(cx, |shell, _cx| {
+            shell.controller_tick_for_test(32);
+            shell.dispatch_action_for_test(ActionRequest::HostStatus);
+            fake_handle.set_epochs(NativeHostRuntimeEpochs {
+                connection_epoch: 2,
+                resource_generation: 2,
+                runtime_generation: 2,
+            });
+            shell.controller_tick_for_test(32);
+            fake_handle.executed_count()
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
+        cx.quit();
+    });
+    assert_eq!(
+        report_slot.borrow_mut().take().expect("epoch report"),
+        0,
+        "the controller must advance the interaction fence from runtime epochs"
+    );
+}
+
+#[test]
+fn injected_stub_caps_executed_action_history() {
+    use devmanager::ui::native_shell::NativeHostRuntimePort;
+
+    let mut stub = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    let mut interaction = NativeInteraction::new(None);
+    for _ in 0..(128 * 4) {
+        let action = interaction
+            .action(ActionRequest::HostStatus)
+            .expect("host status action");
+        assert_eq!(
+            stub.dispatch_pending(action),
+            devmanager::ui::native_shell::NativeHostActionResult::Queued
+        );
+    }
+    assert!(stub.executed_count() <= MAX_STUB_ACTION_HISTORY);
+}
+
+#[test]
+fn virtual_task_source_rejects_cap_plus_one_before_duplicate_set_allocation() {
+    let source = (0..=MAX_TASK_SOURCE_IDS)
+        .map(task_id_index)
+        .collect::<Vec<_>>();
+    let overflow = TaskList::from_virtual_task_ids(source).expect_err("source cap");
+    assert_eq!(overflow.limit, MAX_TASK_SOURCE_IDS);
+    assert_eq!(overflow.retained_count, 0);
 }
 
 #[test]

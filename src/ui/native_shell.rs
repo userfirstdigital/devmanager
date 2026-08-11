@@ -65,9 +65,12 @@ const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERS
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
+pub const MAX_STUB_ACTION_HISTORY: usize = 64;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
+const MAX_RETAINED_WORKERS: usize = 8;
+const MAX_RETAINED_CHILDREN: usize = 8;
 
 /// One absolute budget shared by worker, subscription, child, and runtime
 /// cleanup.  A fresh timeout for each phase would allow a hung phase to turn
@@ -97,59 +100,127 @@ impl NativeShutdownDeadline {
     }
 }
 
-fn retained_workers() -> &'static Mutex<Vec<JoinHandle<()>>> {
-    static RETAINED: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaperKind {
+    Worker,
+    Child,
+}
+
+#[derive(Debug, Default)]
+struct ReaperCounts {
+    workers: usize,
+    children: usize,
+}
+
+#[derive(Debug)]
+struct ReaperPermit {
+    kind: ReaperKind,
+}
+
+fn reaper_counts() -> &'static Mutex<ReaperCounts> {
+    static COUNTS: OnceLock<Mutex<ReaperCounts>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(ReaperCounts::default()))
+}
+
+fn acquire_reaper_permit(kind: ReaperKind) -> Option<ReaperPermit> {
+    let mut counts = reaper_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (count, limit) = match kind {
+        ReaperKind::Worker => (&mut counts.workers, MAX_RETAINED_WORKERS),
+        ReaperKind::Child => (&mut counts.children, MAX_RETAINED_CHILDREN),
+    };
+    if *count >= limit {
+        return None;
+    }
+    *count += 1;
+    Some(ReaperPermit { kind })
+}
+
+impl Drop for ReaperPermit {
+    fn drop(&mut self) {
+        let mut counts = reaper_counts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.kind {
+            ReaperKind::Worker => counts.workers = counts.workers.saturating_sub(1),
+            ReaperKind::Child => counts.children = counts.children.saturating_sub(1),
+        }
+    }
+}
+
+struct OwnedWorker {
+    handle: JoinHandle<()>,
+    _permit: ReaperPermit,
+}
+
+struct OwnedChild {
+    child: Child,
+    _permit: ReaperPermit,
+}
+
+fn retained_workers() -> &'static Mutex<Vec<OwnedWorker>> {
+    static RETAINED: OnceLock<Mutex<Vec<OwnedWorker>>> = OnceLock::new();
     RETAINED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn retained_children() -> &'static Mutex<Vec<Child>> {
-    static RETAINED: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+fn retained_children() -> &'static Mutex<Vec<OwnedChild>> {
+    static RETAINED: OnceLock<Mutex<Vec<OwnedChild>>> = OnceLock::new();
     RETAINED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn reap_retained_workers() {
-    if let Ok(mut workers) = retained_workers().lock() {
-        let mut pending = Vec::with_capacity(workers.len());
-        for worker in workers.drain(..) {
-            if worker.is_finished() {
-                // Joining an already finished worker cannot block and proves
-                // ownership was reaped rather than detached.
-                let _ = worker.join();
-            } else {
-                pending.push(worker);
-            }
+    let mut workers = retained_workers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut pending = Vec::with_capacity(workers.len());
+    for worker in workers.drain(..) {
+        if worker.handle.is_finished() {
+            // Joining an already finished worker cannot block and proves
+            // ownership was reaped rather than detached.
+            let _ = worker.handle.join();
+        } else {
+            pending.push(worker);
         }
-        *workers = pending;
     }
+    *workers = pending;
 }
 
 fn reap_retained_children() {
-    if let Ok(mut children) = retained_children().lock() {
-        children.retain_mut(|child| match child.try_wait() {
-            Ok(Some(_)) | Err(_) => false,
-            Ok(None) => true,
-        });
-    }
+    let mut children = retained_children()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    children.retain_mut(|child| match child.child.try_wait() {
+        Ok(Some(_)) | Err(_) => false,
+        Ok(None) => true,
+    });
 }
 
-fn retain_worker(worker: JoinHandle<()>) {
-    if let Ok(mut workers) = retained_workers().lock() {
-        workers.push(worker);
-    }
+fn retain_worker(worker: OwnedWorker) {
+    let mut workers = retained_workers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    debug_assert!(workers.len() < MAX_RETAINED_WORKERS);
+    workers.push(worker);
 }
 
-fn retain_child(child: Child) {
-    if let Ok(mut children) = retained_children().lock() {
-        children.push(child);
-    }
+fn retain_child(child: OwnedChild) {
+    let mut children = retained_children()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    debug_assert!(children.len() < MAX_RETAINED_CHILDREN);
+    children.push(child);
 }
 
-fn join_worker_with_deadline(worker: JoinHandle<()>, deadline: NativeShutdownDeadline) {
+fn join_worker_with_deadline(worker: OwnedWorker, deadline: NativeShutdownDeadline) {
     reap_retained_workers();
     let mut worker = Some(worker);
     while !deadline.expired() {
-        if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
-            let _ = worker.take().expect("finished worker handle").join();
+        if worker
+            .as_ref()
+            .is_some_and(|worker| worker.handle.is_finished())
+        {
+            let _ = worker.take().expect("finished worker handle").handle.join();
             return;
         }
         std::thread::sleep(Duration::from_millis(2).min(deadline.remaining()));
@@ -159,11 +230,11 @@ fn join_worker_with_deadline(worker: JoinHandle<()>, deadline: NativeShutdownDea
     }
 }
 
-fn terminate_child_with_deadline(mut child: Child, deadline: NativeShutdownDeadline) {
+fn terminate_child_with_deadline(mut child: OwnedChild, deadline: NativeShutdownDeadline) {
     reap_retained_children();
-    let _ = child.kill();
+    let _ = child.child.kill();
     while !deadline.expired() {
-        match child.try_wait() {
+        match child.child.try_wait() {
             Ok(Some(_)) | Err(_) => return,
             Ok(None) => std::thread::sleep(Duration::from_millis(2).min(deadline.remaining())),
         }
@@ -386,7 +457,7 @@ fn native_host_executable() -> PathBuf {
 }
 
 enum NativeHostProcessKind {
-    Child(Child),
+    Child(OwnedChild),
     Empty,
 }
 
@@ -426,75 +497,46 @@ impl NativeHostProcess {
     }
 }
 
-pub trait NativeHostBootstrap {
-    fn start(
-        &mut self,
-        profile: &IsolatedDevProfile,
-    ) -> Result<NativeHostRuntimeAttachment, NativeShellError>;
-
-    fn start_with_budget(
-        &mut self,
-        profile: &IsolatedDevProfile,
-        _budget: Duration,
-    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
-        self.start(profile)
-    }
-
+pub(crate) trait NativeHostBootstrap {
     fn start_until(
         &mut self,
         profile: &IsolatedDevProfile,
-        _deadline: Instant,
-    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
-        self.start(profile)
-    }
+        deadline: Instant,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError>;
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ProcessNativeHostBootstrap;
 
 impl NativeHostBootstrap for ProcessNativeHostBootstrap {
-    fn start(
-        &mut self,
-        profile: &IsolatedDevProfile,
-    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
-        self.start_with_budget(profile, NATIVE_STARTUP_BUDGET)
-    }
-
-    fn start_with_budget(
-        &mut self,
-        profile: &IsolatedDevProfile,
-        budget: Duration,
-    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
-        let deadline = NativeShutdownDeadline::from_now(budget);
-        ensure_isolated_host_config_base(profile)?;
-        let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
-        let mut command = Command::new(&spec.executable);
-        command.args(spec.arguments());
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command
-            .spawn()
-            .map_err(|error| NativeShellError::HostConnect {
-                message: format!("isolated devmanager-host launch failed: {error}"),
-            })?;
-        let process = NativeHostProcess {
-            kind: NativeHostProcessKind::Child(child),
-        };
-        let runtime =
-            NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
-        Ok(NativeHostRuntimeAttachment::Client(runtime))
-    }
-
     fn start_until(
         &mut self,
         profile: &IsolatedDevProfile,
         deadline: Instant,
     ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
         let deadline = NativeShutdownDeadline::until(deadline);
+        if deadline.expired() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host startup deadline expired before launch".to_string(),
+            });
+        }
         ensure_isolated_host_config_base(profile)?;
+        if deadline.expired() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host startup deadline expired before launch".to_string(),
+            });
+        }
         let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
+        let permit = acquire_reaper_permit(ReaperKind::Child).ok_or_else(|| {
+            NativeShellError::HostConnect {
+                message: "native host child reaper capacity exhausted".to_string(),
+            }
+        })?;
+        if deadline.expired() {
+            return Err(NativeShellError::HostConnect {
+                message: "native host startup deadline expired before launch".to_string(),
+            });
+        }
         let mut command = Command::new(&spec.executable);
         command.args(spec.arguments());
         command
@@ -507,7 +549,10 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
                 message: format!("isolated devmanager-host launch failed: {error}"),
             })?;
         let process = NativeHostProcess {
-            kind: NativeHostProcessKind::Child(child),
+            kind: NativeHostProcessKind::Child(OwnedChild {
+                child,
+                _permit: permit,
+            }),
         };
         let runtime =
             NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
@@ -723,12 +768,55 @@ pub enum NativeHostProjectionKind {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeHostRuntimeEpochs {
+    pub connection_epoch: u64,
+    pub resource_generation: u64,
+    pub runtime_generation: u64,
+}
+
+impl NativeHostRuntimeEpochs {
+    fn initial() -> Self {
+        Self {
+            connection_epoch: 1,
+            resource_generation: 1,
+            runtime_generation: 1,
+        }
+    }
+}
+
+fn current_runtime_epochs(epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>) -> NativeHostRuntimeEpochs {
+    epochs
+        .lock()
+        .map(|epochs| *epochs)
+        .unwrap_or_else(|poisoned| *poisoned.into_inner())
+}
+
+fn bump_connection_epoch(epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>) -> NativeHostRuntimeEpochs {
+    let mut current = epochs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    current.connection_epoch = current.connection_epoch.saturating_add(1);
+    current.runtime_generation = current.runtime_generation.saturating_add(1);
+    *current
+}
+
+fn bump_resource_generation(
+    epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
+) -> NativeHostRuntimeEpochs {
+    let mut current = epochs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    current.resource_generation = current.resource_generation.saturating_add(1);
+    *current
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeHostProjection {
     pub kind: NativeHostProjectionKind,
     pub client_model: Option<Arc<ClientModel>>,
-    pub task_list: Option<TaskList>,
     pub error: Option<String>,
+    pub epochs: Option<NativeHostRuntimeEpochs>,
 }
 
 enum NativeHostWorkerCommand {
@@ -814,17 +902,8 @@ impl NativeHostProjection {
         Self {
             kind,
             client_model: None,
-            task_list: None,
             error: None,
-        }
-    }
-
-    pub fn task_list(task_list: TaskList) -> Self {
-        Self {
-            kind: NativeHostProjectionKind::Snapshot,
-            client_model: None,
-            task_list: Some(task_list),
-            error: None,
+            epochs: None,
         }
     }
 
@@ -832,13 +911,18 @@ impl NativeHostProjection {
         Self {
             kind,
             client_model: Some(model),
-            task_list: None,
             error: None,
+            epochs: None,
         }
     }
 
     pub fn client_model(model: Arc<ClientModel>) -> Self {
         Self::model(NativeHostProjectionKind::Snapshot, model)
+    }
+
+    fn at_epochs(mut self, epochs: NativeHostRuntimeEpochs) -> Self {
+        self.epochs = Some(epochs);
+        self
     }
 }
 
@@ -859,17 +943,26 @@ pub struct NativeHostClientRuntime {
     ready_projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
     command_tx: SyncSender<NativeHostWorkerCommand>,
     cancellation: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<OwnedWorker>,
+    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
     runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     host_process: Option<NativeHostProcess>,
+}
+
+mod native_host_runtime_sealed {
+    pub trait Sealed {}
 }
 
 /// Injectable runtime seam used by deterministic shell tests. Production uses
 /// [`NativeHostClientRuntime`] as the only concrete transport owner; tests can
 /// supply this port without opening a named pipe or starting another client.
-pub trait NativeHostRuntimePort: Send {
+/// The trait is sealed so callers cannot add another unbounded transport owner.
+pub trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Send {
     fn endpoint(&self) -> &str;
     fn host_state(&self) -> NativeHostState;
+    fn epochs(&self) -> NativeHostRuntimeEpochs {
+        NativeHostRuntimeEpochs::default()
+    }
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
     fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
@@ -892,6 +985,7 @@ pub struct NativeHostRuntimeStub {
     pending: VecDeque<NativeActionRecord>,
     projections: VecDeque<NativeHostProjection>,
     executed: Arc<Mutex<Vec<NativeActionRecord>>>,
+    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
 }
 
 impl NativeHostRuntimeStub {
@@ -902,6 +996,7 @@ impl NativeHostRuntimeStub {
             pending: VecDeque::new(),
             projections: VecDeque::new(),
             executed: Arc::new(Mutex::new(Vec::new())),
+            epochs: Arc::new(Mutex::new(NativeHostRuntimeEpochs::initial())),
         }
     }
 
@@ -926,6 +1021,7 @@ impl NativeHostRuntimeStub {
     pub fn handle(&self) -> NativeHostRuntimeStubHandle {
         NativeHostRuntimeStubHandle {
             executed: Arc::clone(&self.executed),
+            epochs: Arc::clone(&self.epochs),
         }
     }
 }
@@ -933,6 +1029,7 @@ impl NativeHostRuntimeStub {
 #[derive(Clone, Debug)]
 pub struct NativeHostRuntimeStubHandle {
     executed: Arc<Mutex<Vec<NativeActionRecord>>>,
+    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
 }
 
 impl NativeHostRuntimeStubHandle {
@@ -942,7 +1039,15 @@ impl NativeHostRuntimeStubHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
+
+    pub fn set_epochs(&self, epochs: NativeHostRuntimeEpochs) {
+        if let Ok(mut current) = self.epochs.lock() {
+            *current = epochs;
+        }
+    }
 }
+
+impl native_host_runtime_sealed::Sealed for NativeHostRuntimeStub {}
 
 impl NativeHostRuntimePort for NativeHostRuntimeStub {
     fn endpoint(&self) -> &str {
@@ -951,6 +1056,13 @@ impl NativeHostRuntimePort for NativeHostRuntimeStub {
 
     fn host_state(&self) -> NativeHostState {
         self.state.clone()
+    }
+
+    fn epochs(&self) -> NativeHostRuntimeEpochs {
+        self.epochs
+            .lock()
+            .map(|epochs| *epochs)
+            .unwrap_or_else(|poisoned| *poisoned.into_inner())
     }
 
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
@@ -985,10 +1097,13 @@ impl NativeHostRuntimePort for NativeHostRuntimeStub {
     }
 
     fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        self.executed
+        let mut executed = self
+            .executed
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(action);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if executed.len() < MAX_STUB_ACTION_HISTORY {
+            executed.push(action);
+        }
         NativeHostActionResult::Queued
     }
 
@@ -1046,7 +1161,7 @@ impl NativeHostClientRuntime {
         .map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
-        let mut runtime = Self::new(client);
+        let mut runtime = Self::new(client)?;
         tokio::time::timeout(deadline.remaining(), runtime.bootstrap_projection())
             .await
             .map_err(|_| NativeShellError::HostConnect {
@@ -1080,7 +1195,15 @@ impl NativeHostClientRuntime {
         let client = client.map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
-        let mut runtime_owner = Self::new_with_runtime(client, runtime.clone());
+        let mut runtime_owner = match Self::new_with_runtime(client, runtime.clone()) {
+            Ok(runtime_owner) => runtime_owner,
+            Err(error) => {
+                if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                    runtime.shutdown_timeout(deadline.remaining());
+                }
+                return Err(error);
+            }
+        };
         runtime
             .block_on(tokio::time::timeout(
                 deadline.remaining(),
@@ -1125,7 +1248,13 @@ impl NativeHostClientRuntime {
             }
         };
         let mut runtime_owner =
-            Self::new_with_runtime_and_process(client, runtime.clone(), process);
+            match Self::new_with_runtime_and_process(client, runtime.clone(), process) {
+                Ok(runtime_owner) => runtime_owner,
+                Err((error, mut process)) => {
+                    process.terminate(deadline);
+                    return Err(error);
+                }
+            };
         let bootstrap = runtime
             .block_on(tokio::time::timeout(
                 deadline.remaining(),
@@ -1148,25 +1277,30 @@ impl NativeHostClientRuntime {
         Ok(runtime_owner)
     }
 
-    pub fn new(client: HostClient) -> Self {
+    pub fn new(client: HostClient) -> Result<Self, NativeShellError> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
                 .build()
-                .expect("native host runtime must be constructible"),
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("runtime bootstrap failed: {error}"),
+                })?,
         );
         Self::new_with_runtime(client, runtime)
     }
 
-    fn new_with_runtime(client: HostClient, runtime: Arc<tokio::runtime::Runtime>) -> Self {
+    fn new_with_runtime(
+        client: HostClient,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, NativeShellError> {
         Self::new_with_runtime_guard(client, Some(runtime))
     }
 
     fn new_with_runtime_guard(
         client: HostClient,
         runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
-    ) -> Self {
+    ) -> Result<Self, NativeShellError> {
         let endpoint = client.endpoint().to_string();
         let client = Arc::new(Mutex::new(client));
         let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
@@ -1174,30 +1308,48 @@ impl NativeHostClientRuntime {
         let bootstrapped = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = std::sync::mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
+        let epochs = Arc::new(Mutex::new(NativeHostRuntimeEpochs::initial()));
         let client_for_worker = Arc::clone(&client);
         let subscription_for_worker = Arc::clone(&subscription);
         let client_model_for_worker = Arc::clone(&client_model);
         let bootstrapped_for_worker = Arc::clone(&bootstrapped);
         let runtime_for_worker = runtime_guard.clone();
         let cancellation_for_worker = Arc::clone(&cancellation);
+        let epochs_for_worker = Arc::clone(&epochs);
         let projections_for_worker = Arc::new(Mutex::new(VecDeque::new()));
         let projections_for_worker_thread = Arc::clone(&projections_for_worker);
-        let worker = std::thread::Builder::new()
-            .name("devmanager-native-host-worker".to_string())
-            .spawn(move || {
-                native_host_worker_loop(
-                    client_for_worker,
-                    subscription_for_worker,
-                    client_model_for_worker,
-                    bootstrapped_for_worker,
-                    runtime_for_worker,
-                    cancellation_for_worker,
-                    command_rx,
-                    projections_for_worker_thread,
-                )
+        let worker = if runtime_guard.is_some() {
+            let permit = acquire_reaper_permit(ReaperKind::Worker).ok_or_else(|| {
+                NativeShellError::HostConnect {
+                    message: "native host worker reaper capacity exhausted".to_string(),
+                }
+            })?;
+            let handle = std::thread::Builder::new()
+                .name("devmanager-native-host-worker".to_string())
+                .spawn(move || {
+                    native_host_worker_loop(
+                        client_for_worker,
+                        subscription_for_worker,
+                        client_model_for_worker,
+                        bootstrapped_for_worker,
+                        runtime_for_worker,
+                        cancellation_for_worker,
+                        epochs_for_worker,
+                        command_rx,
+                        projections_for_worker_thread,
+                    )
+                })
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("native host worker spawn failed: {error}"),
+                })?;
+            Some(OwnedWorker {
+                handle,
+                _permit: permit,
             })
-            .ok();
-        Self {
+        } else {
+            None
+        };
+        Ok(Self {
             endpoint,
             client,
             subscription,
@@ -1208,19 +1360,23 @@ impl NativeHostClientRuntime {
             command_tx,
             cancellation,
             worker,
+            epochs,
             runtime_guard,
             host_process: None,
-        }
+        })
     }
 
     fn new_with_runtime_and_process(
         client: HostClient,
         runtime: Arc<tokio::runtime::Runtime>,
         process: NativeHostProcess,
-    ) -> Self {
-        let mut runtime_owner = Self::new_with_runtime_guard(client, Some(runtime));
+    ) -> Result<Self, (NativeShellError, NativeHostProcess)> {
+        let mut runtime_owner = match Self::new_with_runtime_guard(client, Some(runtime)) {
+            Ok(runtime_owner) => runtime_owner,
+            Err(error) => return Err((error, process)),
+        };
         runtime_owner.host_process = Some(process);
-        runtime_owner
+        Ok(runtime_owner)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1333,15 +1489,19 @@ impl NativeHostClientRuntime {
             if let Ok(mut current) = self.client_model.lock() {
                 *current = Some(Arc::clone(&model));
             }
+            let epochs = current_runtime_epochs(&self.epochs);
             if let Ok(mut projections) = self.ready_projections.lock() {
                 if projections.len() < MAX_HOST_PROJECTIONS {
-                    projections.push_back(NativeHostProjection::client_model(Arc::clone(&model)));
+                    projections.push_back(
+                        NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
+                    );
                 }
                 let remaining = MAX_HOST_PROJECTIONS.saturating_sub(projections.len());
                 projections.extend(
                     std::iter::once(NativeHostProjectionKind::Replay)
                         .take(remaining)
-                        .map(NativeHostProjection::kind),
+                        .map(NativeHostProjection::kind)
+                        .map(|projection| projection.at_epochs(epochs)),
                 );
             }
             self.bootstrapped.store(true, Ordering::Release);
@@ -1381,6 +1541,10 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         }
     }
 
+    fn epochs(&self) -> NativeHostRuntimeEpochs {
+        current_runtime_epochs(&self.epochs)
+    }
+
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
         NativeHostClientRuntime::enqueue(self, action)
     }
@@ -1401,6 +1565,8 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         NativeHostClientRuntime::dispatch_pending(self, action)
     }
 }
+
+impl native_host_runtime_sealed::Sealed for NativeHostClientRuntime {}
 
 impl Drop for NativeHostClientRuntime {
     fn drop(&mut self) {
@@ -1492,6 +1658,7 @@ fn native_host_worker_loop(
     bootstrapped: Arc<AtomicBool>,
     runtime: Option<Arc<tokio::runtime::Runtime>>,
     cancellation: Arc<AtomicBool>,
+    epochs: Arc<Mutex<NativeHostRuntimeEpochs>>,
     command_rx: Receiver<NativeHostWorkerCommand>,
     projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
 ) {
@@ -1522,16 +1689,17 @@ fn native_host_worker_loop(
                         Some(Err(error)) => NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
                             client_model: None,
-                            task_list: None,
                             error: Some(bounded_host_error(error.to_string())),
+                            epochs: None,
                         },
                         None => NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
                             client_model: None,
-                            task_list: None,
                             error: Some("native host client lock poisoned".to_string()),
+                            epochs: None,
                         },
-                    };
+                    }
+                    .at_epochs(current_runtime_epochs(&epochs));
                     if let Ok(mut queue) = projections.lock() {
                         if queue.len() < MAX_HOST_PROJECTIONS {
                             queue.push_back(projection);
@@ -1555,6 +1723,7 @@ fn native_host_worker_loop(
             &client_model,
             &runtime,
             &cancellation,
+            &epochs,
             &projections,
         );
     }
@@ -1566,6 +1735,7 @@ fn pump_subscription_once(
     client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
+    epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
     projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
 ) {
     if cancellation.load(Ordering::Acquire) {
@@ -1578,9 +1748,10 @@ fn pump_subscription_once(
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
-                    task_list: None,
                     error: Some("native host client lock poisoned".to_string()),
-                },
+                    epochs: None,
+                }
+                .at_epochs(current_runtime_epochs(epochs)),
             );
             return;
         };
@@ -1590,9 +1761,10 @@ fn pump_subscription_once(
                 NativeHostProjection {
                     kind: NativeHostProjectionKind::Error,
                     client_model: None,
-                    task_list: None,
                     error: Some("native host subscription lock poisoned".to_string()),
-                },
+                    epochs: None,
+                }
+                .at_epochs(current_runtime_epochs(epochs)),
             );
             return;
         };
@@ -1616,6 +1788,10 @@ fn pump_subscription_once(
                     | crate::client::SubscriptionError::IncompleteSnapshot
                     | crate::client::SubscriptionError::MissingCapabilities
             ) {
+                let was_connected = client
+                    .lock()
+                    .map(|client| client.is_connected())
+                    .unwrap_or(false);
                 match resynchronize_subscription(
                     client,
                     subscription,
@@ -1623,14 +1799,22 @@ fn pump_subscription_once(
                     cancellation,
                     NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
                 ) {
-                    Ok(model) => {
+                    Ok((model, reconnected)) => {
+                        if reconnected || !was_connected {
+                            bump_connection_epoch(epochs);
+                        }
+                        let current_epochs = bump_resource_generation(epochs);
                         if let Ok(mut current) = client_model.lock() {
                             *current = Some(Arc::clone(&model));
                         }
-                        publish_projection(projections, NativeHostProjection::client_model(model));
                         publish_projection(
                             projections,
-                            NativeHostProjection::kind(NativeHostProjectionKind::Replay),
+                            NativeHostProjection::client_model(model).at_epochs(current_epochs),
+                        );
+                        publish_projection(
+                            projections,
+                            NativeHostProjection::kind(NativeHostProjectionKind::Replay)
+                                .at_epochs(current_epochs),
                         );
                     }
                     Err(resync_error)
@@ -1641,9 +1825,10 @@ fn pump_subscription_once(
                             NativeHostProjection {
                                 kind: NativeHostProjectionKind::Error,
                                 client_model: None,
-                                task_list: None,
                                 error: Some(resync_error),
-                            },
+                                epochs: None,
+                            }
+                            .at_epochs(current_runtime_epochs(epochs)),
                         );
                     }
                     Err(_) => {}
@@ -1666,11 +1851,16 @@ fn pump_subscription_once(
                 }
                 publish_projection(
                     projections,
-                    NativeHostProjection::model(NativeHostProjectionKind::Live, model),
+                    NativeHostProjection::model(NativeHostProjectionKind::Live, model)
+                        .at_epochs(current_runtime_epochs(epochs)),
                 );
             }
         }
         SubscriptionUpdate::ResyncRequired { .. } => {
+            let was_connected = client
+                .lock()
+                .map(|client| client.is_connected())
+                .unwrap_or(false);
             let model = resynchronize_subscription(
                 client,
                 subscription,
@@ -1679,14 +1869,22 @@ fn pump_subscription_once(
                 NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
             );
             match model {
-                Ok(model) => {
+                Ok((model, reconnected)) => {
+                    if reconnected || !was_connected {
+                        bump_connection_epoch(epochs);
+                    }
+                    let current_epochs = bump_resource_generation(epochs);
                     if let Ok(mut current) = client_model.lock() {
                         *current = Some(Arc::clone(&model));
                     }
-                    publish_projection(projections, NativeHostProjection::client_model(model));
                     publish_projection(
                         projections,
-                        NativeHostProjection::kind(NativeHostProjectionKind::Replay),
+                        NativeHostProjection::client_model(model).at_epochs(current_epochs),
+                    );
+                    publish_projection(
+                        projections,
+                        NativeHostProjection::kind(NativeHostProjectionKind::Replay)
+                            .at_epochs(current_epochs),
                     );
                 }
                 Err(error) => publish_projection(
@@ -1694,16 +1892,18 @@ fn pump_subscription_once(
                     NativeHostProjection {
                         kind: NativeHostProjectionKind::Error,
                         client_model: None,
-                        task_list: None,
                         error: Some(error),
-                    },
+                        epochs: None,
+                    }
+                    .at_epochs(current_runtime_epochs(epochs)),
                 ),
             }
         }
         SubscriptionUpdate::Stream(_) => {
             publish_projection(
                 projections,
-                NativeHostProjection::kind(NativeHostProjectionKind::Live),
+                NativeHostProjection::kind(NativeHostProjectionKind::Live)
+                    .at_epochs(current_runtime_epochs(epochs)),
             );
         }
     }
@@ -1715,21 +1915,30 @@ fn resynchronize_subscription(
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
     deadline: NativeShutdownDeadline,
-) -> Result<Arc<ClientModel>, String> {
+) -> Result<(Arc<ClientModel>, bool), String> {
     let mut client_guard = client
         .lock()
         .map_err(|_| "native host client lock poisoned".to_string())?;
     let mut subscription_guard = subscription
         .lock()
         .map_err(|_| "native host subscription lock poisoned".to_string())?;
+    let was_connected = client_guard.is_connected();
     let result = runtime.block_on(async {
         tokio::time::timeout(deadline.remaining(), async {
             tokio::select! {
                 result = async {
-                    subscription_guard
-                        .release(&mut client_guard)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    if client_guard.is_connected() {
+                        subscription_guard
+                            .release(&mut client_guard)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if !client_guard.is_connected() {
+                        client_guard
+                            .reconnect()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
                     *subscription_guard = ClientSubscription::new();
                     subscription_guard
                         .synchronize(&mut client_guard)
@@ -1745,11 +1954,12 @@ fn resynchronize_subscription(
         .map_err(|_| "native host subscription resync deadline expired".to_string())?
     });
     result?;
-    subscription_guard
+    let model = subscription_guard
         .model()
         .cloned()
         .map(Arc::new)
-        .ok_or_else(|| "native host resync produced no client model".to_string())
+        .ok_or_else(|| "native host resync produced no client model".to_string())?;
+    Ok((model, !was_connected))
 }
 
 fn publish_projection(
@@ -1922,6 +2132,21 @@ impl NativeInteraction {
 
     pub fn set_runtime_generation(&mut self, generation: u64) {
         self.runtime_generation = generation;
+    }
+
+    pub(crate) fn sync_host_epochs(&mut self, epochs: NativeHostRuntimeEpochs) -> bool {
+        let changed = self.connection_epoch != epochs.connection_epoch
+            || self.resource_generation != epochs.resource_generation
+            || self.runtime_generation != epochs.runtime_generation;
+        if changed {
+            self.connection_epoch = epochs.connection_epoch;
+            self.resource_generation = epochs.resource_generation;
+            self.runtime_generation = epochs.runtime_generation;
+            self.pending_keyboard = None;
+            self.pointer_capture = None;
+            self.pointer_owner = None;
+        }
+        changed
     }
 
     pub fn accepts_action_record(&self, record: &NativeActionRecord) -> bool {
@@ -2908,6 +3133,15 @@ impl NativeShell {
             &header_attachment,
         );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
+        let mut interaction = NativeInteraction::new(None);
+        let initial_epochs = host_runtime
+            .as_ref()
+            .map(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.epochs(),
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
+            })
+            .unwrap_or_default();
+        interaction.sync_host_epochs(initial_epochs);
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -2917,7 +3151,7 @@ impl NativeShell {
             header_attachment,
             client_model: None,
             inbox,
-            interaction: NativeInteraction::new(None),
+            interaction,
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
             accessibility_tree,
@@ -3034,6 +3268,16 @@ impl NativeShell {
             self.terminal.set_preferences(preferences);
         }
 
+        let runtime_epochs = self
+            .host_runtime
+            .as_ref()
+            .map(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.epochs(),
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
+            })
+            .unwrap_or_default();
+        self.interaction.sync_host_epochs(runtime_epochs);
+
         let projections = match self.host_runtime.as_mut() {
             Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
                 runtime.drain_projection_messages(max)
@@ -3043,23 +3287,27 @@ impl NativeShell {
             }
             None => Vec::new(),
         };
-        if !projections.is_empty() {
-            self.last_projection_kinds = projections
-                .iter()
-                .map(|projection| projection.kind)
-                .collect();
-        }
+        let had_projections = !projections.is_empty();
+        let mut accepted_projection_kinds = Vec::with_capacity(projections.len());
         for projection in projections {
+            if projection
+                .epochs
+                .is_some_and(|epochs| epochs != runtime_epochs)
+            {
+                continue;
+            }
+            accepted_projection_kinds.push(projection.kind);
             if let Some(model) = projection.client_model {
                 if let Err(error) = self.apply_client_model(model) {
                     self.host_state = NativeHostState::Error { message: error };
                 }
-            } else if let Some(task_list) = projection.task_list {
-                self.apply_task_list(task_list);
             }
             if let Some(error) = projection.error {
                 self.host_state = NativeHostState::Error { message: error };
             }
+        }
+        if had_projections {
+            self.last_projection_kinds = accepted_projection_kinds;
         }
 
         let pending = match self.host_runtime.as_mut() {
@@ -3208,6 +3456,7 @@ impl NativeShell {
         if self.host_runtime.is_some() {
             return Err(host_runtime);
         }
+        self.interaction.sync_host_epochs(host_runtime.epochs());
         self.host_runtime = Some(NativeHostRuntimeAttachment::Client(host_runtime));
         self.host_state = NativeHostState::Connected {
             endpoint: self
@@ -3231,6 +3480,7 @@ impl NativeShell {
             return Err(host_runtime);
         }
         self.host_state = host_runtime.host_state();
+        self.interaction.sync_host_epochs(host_runtime.epochs());
         self.host_runtime = Some(NativeHostRuntimeAttachment::Injected(host_runtime));
         Ok(())
     }
@@ -3249,7 +3499,7 @@ impl NativeShell {
     /// Replace the bounded host projection supplied by the inbox attachment.
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
-    pub fn apply_task_list(&mut self, task_list: TaskList) {
+    fn apply_task_list(&mut self, task_list: TaskList) {
         self.client_model = None;
         self.interaction.set_client_model(None);
         let selected_task = self
@@ -3388,14 +3638,15 @@ impl NativeShell {
                     })
                     .map(|(_index, task_id)| {
                         let shell_for_mouse = shell_entity.clone();
+                        let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
                                   app: &mut gpui::App| {
-                                if event.button == MouseButton::Left {
-                                    let _ = shell_for_mouse.update(app, |shell, cx| {
-                                        cx.stop_propagation();
+                                let _ = shell_for_mouse.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    if event.button == MouseButton::Left {
                                         shell.focus_handle.focus(window);
                                         let _ = shell.interaction.navigation_mouse_down(
                                             task_id,
@@ -3410,8 +3661,16 @@ impl NativeShell {
                                         shell
                                             .platform_accessibility
                                             .sync(&shell.accessibility_tree);
-                                    });
-                                }
+                                    }
+                                });
+                            };
+                        let mouse_up_handler =
+                            move |_event: &MouseUpEvent,
+                                  _window: &mut Window,
+                                  app: &mut gpui::App| {
+                                let _ = shell_for_mouse_up.update(app, |_shell, cx| {
+                                    cx.stop_propagation();
+                                });
                             };
                         let key_handler =
                             move |event: &KeyDownEvent,
@@ -3451,6 +3710,7 @@ impl NativeShell {
                             // still navigates only on the explicit primary
                             // button.
                             .capture_any_mouse_down(mouse_handler)
+                            .capture_any_mouse_up(mouse_up_handler)
                             .on_key_down(key_handler)
                             .child(format!("Task {task_id}"))
                             .into_any_element()
@@ -3779,11 +4039,12 @@ pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeSh
     run_native_shell_with_bootstrap(profile, &mut bootstrap)
 }
 
-pub fn run_native_shell_with_bootstrap(
+pub(crate) fn run_native_shell_with_bootstrap(
     profile: IsolatedDevProfile,
     bootstrap: &mut dyn NativeHostBootstrap,
 ) -> Result<(), NativeShellError> {
-    let (host_runtime, host_state) = match bootstrap.start(&profile) {
+    let deadline = Instant::now() + NATIVE_STARTUP_BUDGET;
+    let (host_runtime, host_state) = match bootstrap.start_until(&profile, deadline) {
         Ok(runtime) => {
             let endpoint = match &runtime {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.endpoint().to_string(),
