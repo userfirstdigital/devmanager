@@ -216,6 +216,21 @@ impl PromptStore {
         Ok(Self { conn })
     }
 
+    /// Run a public read against one SQLite snapshot. A deferred transaction
+    /// starts at the first statement, then keeps that snapshot for every
+    /// nested row, tag, variable, context, and validation query. Mutation and
+    /// projection-rebuild callers already own their Immediate transaction and
+    /// call the same helpers directly rather than nesting a read transaction.
+    fn with_read_transaction<T>(
+        &self,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, PromptStoreError>,
+    ) -> Result<T, PromptStoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let value = body(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     pub fn execute(
         &mut self,
         command_id: CommandId,
@@ -381,7 +396,7 @@ impl PromptStore {
         &self,
         chain_id: PromptChainId,
     ) -> Result<Option<PromptChain>, PromptStoreError> {
-        load_chain(&self.conn, chain_id)
+        self.with_read_transaction(|tx| load_chain(tx, chain_id))
     }
 
     pub fn get_prompt_chain(
@@ -395,12 +410,14 @@ impl PromptStore {
         &self,
         chain_id: PromptChainId,
     ) -> Result<Vec<PromptChainLink>, PromptStoreError> {
-        if load_chain(&self.conn, chain_id)?.is_none() {
-            return Err(PromptStoreError::NotFound);
-        }
-        let links = load_chain_links(&self.conn, chain_id)?;
-        validate_chain_links(&self.conn, chain_id, &links)?;
-        Ok(links)
+        self.with_read_transaction(|tx| {
+            if load_chain(tx, chain_id)?.is_none() {
+                return Err(PromptStoreError::NotFound);
+            }
+            let links = load_chain_links(tx, chain_id)?;
+            validate_chain_links(tx, chain_id, &links)?;
+            Ok(links)
+        })
     }
 
     pub fn list_prompt_chain_links(
@@ -415,47 +432,57 @@ impl PromptStore {
         chain_id: PromptChainId,
         link_id: PromptChainLinkId,
     ) -> Result<Option<PromptChainLinkContext>, PromptStoreError> {
-        let links = self.list_chain_links(chain_id)?;
-        let Some(index) = links.iter().position(|link| link.id() == link_id) else {
-            return Ok(None);
-        };
-        let link = links[index].clone();
-        let current_version = load_prompt(&self.conn, link.prompt_id())?
-            .ok_or_else(|| {
-                PromptStoreError::Corruption("chain link references missing prompt".into())
-            })?
-            .current_version_id;
-        Ok(Some(PromptChainLinkContext {
-            link,
-            previous_link_id: index.checked_sub(1).map(|i| links[i].id()),
-            next_link_id: links.get(index + 1).map(|link| link.id()),
-            update_available: current_version != links[index].prompt_version_id(),
-        }))
+        self.with_read_transaction(|tx| {
+            if load_chain(tx, chain_id)?.is_none() {
+                return Err(PromptStoreError::NotFound);
+            }
+            let links = load_chain_links(tx, chain_id)?;
+            validate_chain_links(tx, chain_id, &links)?;
+            let Some(index) = links.iter().position(|link| link.id() == link_id) else {
+                return Ok(None);
+            };
+            let link = links[index].clone();
+            let current_version = load_prompt(tx, link.prompt_id())?
+                .ok_or_else(|| {
+                    PromptStoreError::Corruption("chain link references missing prompt".into())
+                })?
+                .current_version_id;
+            Ok(Some(PromptChainLinkContext {
+                link,
+                previous_link_id: index.checked_sub(1).map(|i| links[i].id()),
+                next_link_id: links.get(index + 1).map(|link| link.id()),
+                update_available: current_version != links[index].prompt_version_id(),
+            }))
+        })
     }
 
     pub fn count_chain_events(&self) -> Result<u64, PromptStoreError> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM prompt_chain_events", [], |row| {
+        self.with_read_transaction(|tx| {
+            let count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM prompt_chain_events", [], |row| {
                     row.get(0)
                 })?;
-        u64::try_from(count)
-            .map_err(|_| PromptStoreError::Corruption("negative prompt chain event count".into()))
+            u64::try_from(count).map_err(|_| {
+                PromptStoreError::Corruption("negative prompt chain event count".into())
+            })
+        })
     }
 
     pub fn get_prompt(&self, prompt_id: PromptId) -> Result<Option<SavedPrompt>, PromptStoreError> {
-        let prompt = load_prompt(&self.conn, prompt_id)?;
-        if let Some(prompt) = &prompt {
-            validate_saved_prompt_record(&self.conn, prompt)?;
-        }
-        Ok(prompt)
+        self.with_read_transaction(|tx| {
+            let prompt = load_prompt(tx, prompt_id)?;
+            if let Some(prompt) = &prompt {
+                validate_saved_prompt_record(tx, prompt)?;
+            }
+            Ok(prompt)
+        })
     }
 
     pub fn get_version(
         &self,
         version_id: PromptVersionId,
     ) -> Result<Option<PromptVersion>, PromptStoreError> {
-        load_version(&self.conn, version_id)
+        self.with_read_transaction(|tx| load_version(tx, version_id))
     }
 
     pub fn list_prompts(
@@ -463,42 +490,7 @@ impl PromptStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SavedPrompt>, PromptStoreError> {
-        validate_page(limit)?;
-        let mut statement = self.conn.prepare(
-            "SELECT prompt_id, title, description, current_version_id, revision,
-                    archived_at_ms
-             FROM saved_prompts
-             ORDER BY CASE WHEN archived_at_ms IS NULL THEN 0 ELSE 1 END,
-                      title COLLATE NOCASE ASC, prompt_id ASC
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows =
-            statement.query_map(rusqlite::params![to_i64(limit)?, to_i64(offset)?], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            })?;
-        let mut prompts = Vec::new();
-        for row in rows {
-            let (id, title, description, current_version_id, revision, archived_at_ms) = row?;
-            let prompt = SavedPrompt {
-                id: prompt_id_from_bytes(&id)?,
-                title,
-                description,
-                tags: load_tags(&self.conn, &id)?,
-                current_version_id: version_id_from_bytes(&current_version_id)?,
-                revision: from_i64("saved_prompts.revision", revision)?,
-                archived_at_ms,
-            };
-            validate_saved_prompt_record(&self.conn, &prompt)?;
-            prompts.push(prompt);
-        }
-        Ok(prompts)
+        self.with_read_transaction(|tx| list_prompts_tx(tx, offset, limit))
     }
 
     pub fn snapshot(
@@ -506,11 +498,13 @@ impl PromptStore {
         offset: usize,
         limit: usize,
     ) -> Result<PromptSnapshot, PromptStoreError> {
-        let prompts = self.list_prompts(offset, limit)?;
-        let next_offset = (prompts.len() == limit).then_some(offset + prompts.len());
-        Ok(PromptSnapshot {
-            prompts,
-            next_offset,
+        self.with_read_transaction(|tx| {
+            let prompts = list_prompts_tx(tx, offset, limit)?;
+            let next_offset = (prompts.len() == limit).then_some(offset + prompts.len());
+            Ok(PromptSnapshot {
+                prompts,
+                next_offset,
+            })
         })
     }
 
@@ -528,75 +522,25 @@ impl PromptStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<PromptVersion>, PromptStoreError> {
-        validate_page(limit)?;
-        let Some(prompt) = load_prompt(&self.conn, prompt_id)? else {
-            return Err(PromptStoreError::NotFound);
-        };
-        validate_saved_prompt_record(&self.conn, &prompt)?;
-        let mut statement = self.conn.prepare(
-            "SELECT prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms,
-                    variables_sealed
-             FROM prompt_versions
-             WHERE prompt_id = ?1
-             ORDER BY version DESC
-             LIMIT ?2 OFFSET ?3",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![
-                prompt_id.as_bytes().as_slice(),
-                to_i64(limit)?,
-                to_i64(offset)?,
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                ))
-            },
-        )?;
-        rows.map(|row| {
-            let (id, owner, version, body, body_sha256, created_at_ms, variables_sealed) = row?;
-            if variables_sealed != 1 {
-                return Err(PromptStoreError::Corruption(
-                    "prompt version variables are not sealed".into(),
-                ));
-            }
-            let version = PromptVersion {
-                id: version_id_from_bytes(&id)?,
-                prompt_id: prompt_id_from_bytes(&owner)?,
-                version: u32::try_from(version).map_err(|_| {
-                    PromptStoreError::Corruption("prompt version number is out of range".into())
-                })?,
-                body,
-                variables: load_version_variables(&self.conn, &id)?,
-                body_sha256: digest_from_bytes(&body_sha256)?,
-                created_at_ms,
-            };
-            validate_version_record(&version)?;
-            Ok(version)
-        })
-        .collect()
+        self.with_read_transaction(|tx| list_versions_tx(tx, prompt_id, offset, limit))
     }
 
     pub fn count_prompts(&self) -> Result<u64, PromptStoreError> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM saved_prompts", [], |row| row.get(0))?;
-        u64::try_from(count)
-            .map_err(|_| PromptStoreError::Corruption("negative prompt count".into()))
+        self.with_read_transaction(|tx| {
+            let count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM saved_prompts", [], |row| row.get(0))?;
+            u64::try_from(count)
+                .map_err(|_| PromptStoreError::Corruption("negative prompt count".into()))
+        })
     }
 
     pub fn count_prompt_events(&self) -> Result<u64, PromptStoreError> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM prompt_events", [], |row| row.get(0))?;
-        u64::try_from(count)
-            .map_err(|_| PromptStoreError::Corruption("negative prompt event count".into()))
+        self.with_read_transaction(|tx| {
+            let count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM prompt_events", [], |row| row.get(0))?;
+            u64::try_from(count)
+                .map_err(|_| PromptStoreError::Corruption("negative prompt event count".into()))
+        })
     }
 
     pub fn rebuild_projection(&mut self) -> Result<PromptProjectionRebuild, PromptStoreError> {
@@ -749,6 +693,109 @@ impl PromptStore {
             })?,
         })
     }
+}
+
+fn list_prompts_tx(
+    tx: &Transaction<'_>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<SavedPrompt>, PromptStoreError> {
+    validate_page(limit)?;
+    let mut statement = tx.prepare(
+        "SELECT prompt_id, title, description, current_version_id, revision,
+                archived_at_ms
+         FROM saved_prompts
+         ORDER BY CASE WHEN archived_at_ms IS NULL THEN 0 ELSE 1 END,
+                  title COLLATE NOCASE ASC, prompt_id ASC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![to_i64(limit)?, to_i64(offset)?], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    let mut prompts = Vec::new();
+    for row in rows {
+        let (id, title, description, current_version_id, revision, archived_at_ms) = row?;
+        let prompt = SavedPrompt {
+            id: prompt_id_from_bytes(&id)?,
+            title,
+            description,
+            tags: load_tags(tx, &id)?,
+            current_version_id: version_id_from_bytes(&current_version_id)?,
+            revision: from_i64("saved_prompts.revision", revision)?,
+            archived_at_ms,
+        };
+        validate_saved_prompt_record(tx, &prompt)?;
+        prompts.push(prompt);
+    }
+    Ok(prompts)
+}
+
+fn list_versions_tx(
+    tx: &Transaction<'_>,
+    prompt_id: PromptId,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<PromptVersion>, PromptStoreError> {
+    validate_page(limit)?;
+    let Some(prompt) = load_prompt(tx, prompt_id)? else {
+        return Err(PromptStoreError::NotFound);
+    };
+    validate_saved_prompt_record(tx, &prompt)?;
+    let mut statement = tx.prepare(
+        "SELECT prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms,
+                variables_sealed
+         FROM prompt_versions
+         WHERE prompt_id = ?1
+         ORDER BY version DESC
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            prompt_id.as_bytes().as_slice(),
+            to_i64(limit)?,
+            to_i64(offset)?,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let (id, owner, version, body, body_sha256, created_at_ms, variables_sealed) = row?;
+        if variables_sealed != 1 {
+            return Err(PromptStoreError::Corruption(
+                "prompt version variables are not sealed".into(),
+            ));
+        }
+        let version = PromptVersion {
+            id: version_id_from_bytes(&id)?,
+            prompt_id: prompt_id_from_bytes(&owner)?,
+            version: u32::try_from(version).map_err(|_| {
+                PromptStoreError::Corruption("prompt version number is out of range".into())
+            })?,
+            body,
+            variables: load_version_variables(tx, &id)?,
+            body_sha256: digest_from_bytes(&body_sha256)?,
+            created_at_ms,
+        };
+        validate_version_record(&version)?;
+        Ok(version)
+    })
+    .collect()
 }
 
 fn bounded_count(tx: &Transaction<'_>, table: &str) -> Result<usize, PromptStoreError> {
@@ -2804,7 +2851,7 @@ fn renumber_links(links: &mut [PromptChainLink]) -> Result<(), PromptStoreError>
 }
 
 fn validate_chain_links(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     chain_id: PromptChainId,
     links: &[PromptChainLink],
 ) -> Result<(), PromptStoreError> {
@@ -5200,7 +5247,7 @@ fn validate_chain_receipt_command(
 }
 
 fn load_prompt(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     prompt_id: PromptId,
 ) -> Result<Option<SavedPrompt>, PromptStoreError> {
     let row: Option<(String, Option<String>, Vec<u8>, i64, Option<i64>)> = conn
@@ -5236,7 +5283,7 @@ fn load_prompt(
 }
 
 fn validate_saved_prompt_record(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     prompt: &SavedPrompt,
 ) -> Result<(), PromptStoreError> {
     if prompt.revision == 0 {
@@ -5337,7 +5384,7 @@ fn validate_version_record(version: &PromptVersion) -> Result<(), PromptStoreErr
 }
 
 fn load_chain(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     chain_id: PromptChainId,
 ) -> Result<Option<PromptChain>, PromptStoreError> {
     let row: Option<(String, Option<String>, i64, Option<i64>)> = conn
@@ -5385,7 +5432,7 @@ fn load_chain(
 }
 
 fn load_chain_links(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     chain_id: PromptChainId,
 ) -> Result<Vec<PromptChainLink>, PromptStoreError> {
     let sql = format!(
@@ -5451,7 +5498,7 @@ fn load_chain_links(
 }
 
 fn load_version(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     version_id: PromptVersionId,
 ) -> Result<Option<PromptVersion>, PromptStoreError> {
     let row: Option<(Vec<u8>, i64, String, Vec<u8>, i64, i64)> = conn
@@ -5493,7 +5540,7 @@ fn load_version(
     Ok(Some(version))
 }
 
-fn load_tags(conn: &Connection, prompt_id: &[u8]) -> Result<Vec<String>, PromptStoreError> {
+fn load_tags(conn: &Transaction<'_>, prompt_id: &[u8]) -> Result<Vec<String>, PromptStoreError> {
     let sql = format!(
         "SELECT tag, position FROM prompt_tags
              WHERE prompt_id = ?1 ORDER BY position ASC LIMIT {}",
@@ -5532,7 +5579,7 @@ fn load_tags(conn: &Connection, prompt_id: &[u8]) -> Result<Vec<String>, PromptS
 }
 
 fn load_version_variables(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     version_id: &[u8],
 ) -> Result<Vec<String>, PromptStoreError> {
     let sql = format!(
@@ -5572,7 +5619,7 @@ fn load_version_variables(
     Ok(variables)
 }
 
-fn prompt_exists(conn: &Connection, prompt_id: PromptId) -> Result<bool, PromptStoreError> {
+fn prompt_exists(conn: &Transaction<'_>, prompt_id: PromptId) -> Result<bool, PromptStoreError> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM saved_prompts WHERE prompt_id = ?1)",
         [prompt_id.as_bytes().as_slice()],
@@ -5580,7 +5627,10 @@ fn prompt_exists(conn: &Connection, prompt_id: PromptId) -> Result<bool, PromptS
     )?)
 }
 
-fn next_version_number(conn: &Connection, prompt_id: PromptId) -> Result<u32, PromptStoreError> {
+fn next_version_number(
+    conn: &Transaction<'_>,
+    prompt_id: PromptId,
+) -> Result<u32, PromptStoreError> {
     let value: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE prompt_id = ?1",
         [prompt_id.as_bytes().as_slice()],
@@ -5791,4 +5841,241 @@ fn now_ms() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod coherent_read_tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    use rusqlite::ffi;
+    use tempfile::TempDir;
+
+    struct TraceGate {
+        writer_go: Barrier,
+        writer_done: Barrier,
+        fired: AtomicBool,
+    }
+
+    unsafe extern "C" fn release_writer_after_first_row(
+        trace_code: std::os::raw::c_uint,
+        context: *mut c_void,
+        _statement: *mut c_void,
+        _x: *mut c_void,
+    ) -> std::os::raw::c_int {
+        if trace_code == ffi::SQLITE_TRACE_ROW && !context.is_null() {
+            // SAFETY: the test keeps one Arc strong reference alive until the
+            // trace is unregistered, and SQLite invokes this callback only on
+            // the connection whose handle received that context pointer.
+            let gate = unsafe { &*(context.cast::<TraceGate>()) };
+            if !gate.fired.swap(true, Ordering::AcqRel) {
+                gate.writer_go.wait();
+                gate.writer_done.wait();
+            }
+        }
+        ffi::SQLITE_OK
+    }
+
+    fn read_during_writer_commit<T>(
+        read: impl FnOnce(
+            &PromptStore,
+            PromptId,
+            PromptVersionId,
+            PromptChainId,
+            PromptChainLinkId,
+        ) -> Result<T, PromptStoreError>,
+    ) -> T {
+        let directory = TempDir::new().expect("create isolated prompt database directory");
+        let path = directory.path().join("prompts.sqlite3");
+        let prompt_id = PromptId::new();
+        let first_version_id = PromptVersionId::new();
+        let second_version_id = PromptVersionId::new();
+        let chain_id = PromptChainId::new();
+        let chain_link_id = PromptChainLinkId::new();
+        let mut store = PromptStore::open(&path).expect("open isolated prompt store");
+        store
+            .execute(
+                CommandId::new(),
+                PromptCommand::CreatePrompt(CreatePrompt {
+                    prompt_id,
+                    prompt_version_id: first_version_id,
+                    title: "Concurrent prompt".into(),
+                    description: None,
+                    tags: vec!["old".into()],
+                    variables: Vec::new(),
+                    body: "first version".into(),
+                    created_at_ms: 1,
+                }),
+            )
+            .expect("create initial prompt");
+        store
+            .execute_chain(
+                CommandId::new(),
+                PromptChainCommand::CreatePromptChain(CreatePromptChain {
+                    chain_id,
+                    title: "Concurrent chain".into(),
+                    description: None,
+                    created_at_ms: 1,
+                }),
+            )
+            .expect("create initial chain");
+        store
+            .execute_chain(
+                CommandId::new(),
+                PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
+                    chain_id,
+                    link_id: chain_link_id,
+                    prompt_id,
+                    prompt_version_id: None,
+                    before_link_id: None,
+                    expected_revision: 1,
+                }),
+            )
+            .expect("insert initial chain link");
+
+        let gate = Arc::new(TraceGate {
+            writer_go: Barrier::new(2),
+            writer_done: Barrier::new(2),
+            fired: AtomicBool::new(false),
+        });
+        let writer_ready = Arc::new(Barrier::new(2));
+        let writer_gate = Arc::clone(&gate);
+        let writer_ready_for_thread = Arc::clone(&writer_ready);
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let writer = Connection::open(writer_path).expect("open writer connection");
+            writer
+                .busy_timeout(Duration::from_secs(5))
+                .expect("set writer busy timeout");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("begin writer transaction");
+            let body = "second version";
+            let body_sha256 = body_hash(body);
+            writer
+                .execute(
+                    "INSERT INTO prompt_versions(
+                        prompt_version_id, prompt_id, version, body, body_sha256, created_at_ms
+                     ) VALUES (?1, ?2, 2, ?3, ?4, 2)",
+                    rusqlite::params![
+                        second_version_id.as_bytes().as_slice(),
+                        prompt_id.as_bytes().as_slice(),
+                        body,
+                        body_sha256.as_slice(),
+                    ],
+                )
+                .expect("insert writer version");
+            writer
+                .execute(
+                    "DELETE FROM prompt_tags WHERE prompt_id = ?1",
+                    [prompt_id.as_bytes().as_slice()],
+                )
+                .expect("delete old prompt tags");
+            writer
+                .execute(
+                    "INSERT INTO prompt_tags(prompt_id, tag, position)
+                     VALUES (?1, 'new', 0)",
+                    [prompt_id.as_bytes().as_slice()],
+                )
+                .expect("insert new prompt tag");
+            writer_ready_for_thread.wait();
+            writer_gate.writer_go.wait();
+            writer
+                .execute_batch("COMMIT")
+                .expect("commit writer transaction");
+            writer_gate.writer_done.wait();
+        });
+
+        writer_ready.wait();
+        let context = Arc::into_raw(Arc::clone(&gate)) as *mut c_void;
+        // SAFETY: PromptStore exclusively owns this connection, and the gate
+        // remains alive until the callback is unregistered below.
+        let handle = unsafe { store.conn.handle() };
+        let trace_result = unsafe {
+            ffi::sqlite3_trace_v2(
+                handle,
+                ffi::SQLITE_TRACE_ROW,
+                Some(release_writer_after_first_row),
+                context,
+            )
+        };
+        assert_eq!(trace_result, ffi::SQLITE_OK);
+
+        let result = read(&store, prompt_id, first_version_id, chain_id, chain_link_id);
+
+        // SAFETY: no statement is executing after the read returned, and
+        // unregistering releases SQLite's borrowed callback context.
+        unsafe {
+            ffi::sqlite3_trace_v2(handle, 0, None, ptr::null_mut());
+            drop(Arc::from_raw(context.cast::<TraceGate>()));
+        }
+        writer.join().expect("join writer thread");
+
+        result.expect("read across concurrent commit")
+    }
+
+    #[test]
+    fn multi_query_reads_do_not_mix_rows_across_a_writer_commit() {
+        let (prompt, first_version_id) =
+            read_during_writer_commit(|store, prompt_id, first_version_id, _, _| {
+                store
+                    .get_prompt(prompt_id)
+                    .map(|prompt| (prompt.expect("prompt exists"), first_version_id))
+            });
+        assert_eq!(prompt.current_version_id, first_version_id);
+        assert_eq!(prompt.tags, vec!["old"]);
+
+        let (prompts, first_version_id) =
+            read_during_writer_commit(|store, _, first_version_id, _, _| {
+                store
+                    .list_prompts(0, 10)
+                    .map(|prompts| (prompts, first_version_id))
+            });
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].current_version_id, first_version_id);
+        assert_eq!(prompts[0].tags, vec!["old"]);
+
+        let (snapshot, first_version_id) =
+            read_during_writer_commit(|store, _, first_version_id, _, _| {
+                store
+                    .snapshot(0, 10)
+                    .map(|snapshot| (snapshot, first_version_id))
+            });
+        assert_eq!(snapshot.prompts.len(), 1);
+        assert_eq!(snapshot.prompts[0].current_version_id, first_version_id);
+        assert_eq!(snapshot.prompts[0].tags, vec!["old"]);
+        assert_eq!(snapshot.next_offset, None);
+
+        let (versions, first_version_id) =
+            read_during_writer_commit(|store, prompt_id, first_version_id, _, _| {
+                store
+                    .list_versions(prompt_id, 0, 10)
+                    .map(|versions| (versions, first_version_id))
+            });
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].id, first_version_id);
+        assert_eq!(versions[0].body, "first version");
+
+        let links = read_during_writer_commit(|store, _, first_version_id, chain_id, _| {
+            store
+                .list_chain_links(chain_id)
+                .map(|links| (links, first_version_id))
+        });
+        assert_eq!(links.0.len(), 1);
+        assert_eq!(links.0[0].prompt_version_id(), links.1);
+
+        let (context, first_version_id) =
+            read_during_writer_commit(|store, _, first_version_id, chain_id, chain_link_id| {
+                store
+                    .get_chain_link_context(chain_id, chain_link_id)
+                    .map(|context| (context, first_version_id))
+            });
+        let context = context.expect("chain link context exists");
+        assert_eq!(context.link.prompt_version_id(), first_version_id);
+        assert!(!context.update_available);
+    }
 }
