@@ -11,8 +11,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -369,7 +368,6 @@ pub const PROMPT_DIFF_WORKER_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDiffWorkerError {
-    QueueFull { generation: u64 },
     Closed,
     JoinFailed,
 }
@@ -377,12 +375,6 @@ pub enum PromptDiffWorkerError {
 impl fmt::Display for PromptDiffWorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::QueueFull { generation } => {
-                write!(
-                    f,
-                    "prompt diff worker queue is full for generation {generation}"
-                )
-            }
             Self::Closed => f.write_str("prompt diff worker is closed"),
             Self::JoinFailed => f.write_str("prompt diff worker did not join cleanly"),
         }
@@ -391,12 +383,57 @@ impl fmt::Display for PromptDiffWorkerError {
 
 impl std::error::Error for PromptDiffWorkerError {}
 
+/// Bounded, typed accounting for an accepted request that superseded an
+/// exact older request. The full old/new request identities are retained so
+/// a host can never mistake a same-generation or same-ID result for the one
+/// it selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PromptDiffWorkerCancellationReceipt {
+    superseded: ExactPromptDiffRequest,
+    superseded_by: ExactPromptDiffRequest,
+}
+
+impl PromptDiffWorkerCancellationReceipt {
+    fn new(superseded: ExactPromptDiffRequest, superseded_by: ExactPromptDiffRequest) -> Self {
+        Self {
+            superseded,
+            superseded_by,
+        }
+    }
+
+    pub fn request(&self) -> ExactPromptDiffRequest {
+        self.superseded
+    }
+
+    pub fn by_request(&self) -> ExactPromptDiffRequest {
+        self.superseded_by
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.superseded.generation()
+    }
+
+    pub fn by_generation(&self) -> u64 {
+        self.superseded_by.generation()
+    }
+}
+
+impl fmt::Debug for PromptDiffWorkerCancellationReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptDiffWorkerCancellationReceipt")
+            .field("superseded", &self.superseded)
+            .field("superseded_by", &self.superseded_by)
+            .finish()
+    }
+}
+
 /// A submitted request's cancellation handle. The handle is independent of
 /// the worker's generation fence, so callers can cancel one request without
 /// mutating another request's identity or result metadata.
 pub struct PromptDiffWorkerSubmission {
     request: ExactPromptDiffRequest,
     cancellation: Arc<AtomicBool>,
+    superseded: Vec<PromptDiffWorkerCancellationReceipt>,
 }
 
 impl PromptDiffWorkerSubmission {
@@ -415,6 +452,13 @@ impl PromptDiffWorkerSubmission {
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.load(Ordering::Acquire)
     }
+
+    /// Receipts for every active, queued, or unread-result request replaced by
+    /// this accepted latest-intent submission. The worker bounds this slice to
+    /// the active request, one queued request, and one result mailbox slot.
+    pub fn superseded(&self) -> &[PromptDiffWorkerCancellationReceipt] {
+        &self.superseded
+    }
 }
 
 impl fmt::Debug for PromptDiffWorkerSubmission {
@@ -422,6 +466,7 @@ impl fmt::Debug for PromptDiffWorkerSubmission {
         f.debug_struct("PromptDiffWorkerSubmission")
             .field("request", &self.request)
             .field("cancelled", &self.is_cancelled())
+            .field("superseded_generations", &self.superseded())
             .finish()
     }
 }
@@ -483,17 +528,23 @@ struct WorkerRequest {
     deadline: Option<Instant>,
 }
 
+const CANCELLATION_SUMMARY_CAPACITY: usize = 8;
+const MAX_SUBMISSION_SUPERSEDED_RECEIPTS: usize = PROMPT_DIFF_WORKER_QUEUE_CAPACITY + 2;
+
 struct WorkerShared {
     shutdown: AtomicBool,
     next_generation: AtomicU64,
     latest_generation: AtomicU64,
     fence: Mutex<()>,
+    latest_request: Mutex<Option<ExactPromptDiffRequest>>,
     active_cancellation: Mutex<Option<ActiveCancellation>>,
+    cancellation_summary: Mutex<Vec<PromptDiffWorkerCancellationReceipt>>,
 }
 
 struct ActiveCancellation {
-    generation: u64,
+    request: ExactPromptDiffRequest,
     token: Arc<AtomicBool>,
+    supersession_accounted: bool,
 }
 
 impl WorkerShared {
@@ -503,18 +554,66 @@ impl WorkerShared {
             next_generation: AtomicU64::new(0),
             latest_generation: AtomicU64::new(0),
             fence: Mutex::new(()),
+            latest_request: Mutex::new(None),
             active_cancellation: Mutex::new(None),
+            cancellation_summary: Mutex::new(Vec::new()),
         }
     }
 
-    fn cancel_active_except(&self, generation: u64) {
-        if let Ok(active) = self.active_cancellation.lock() {
-            if let Some(active) = active.as_ref() {
-                if active.generation != generation {
-                    active.token.store(true, Ordering::Release);
-                }
-            }
+    fn latest_request(&self) -> Option<ExactPromptDiffRequest> {
+        self.latest_request.lock().ok().and_then(|request| *request)
+    }
+
+    fn set_latest_request(&self, request: ExactPromptDiffRequest) {
+        *self
+            .latest_request
+            .lock()
+            .expect("prompt diff latest request lock poisoned") = Some(request);
+        self.latest_generation
+            .store(request.generation(), Ordering::Release);
+    }
+
+    fn supersede_active(
+        &self,
+        superseded_by: ExactPromptDiffRequest,
+    ) -> Option<PromptDiffWorkerCancellationReceipt> {
+        let mut active = self
+            .active_cancellation
+            .lock()
+            .expect("prompt diff active cancellation lock poisoned");
+        let Some(active) = active.as_mut() else {
+            return None;
+        };
+        if active.request == superseded_by {
+            return None;
         }
+        active.token.store(true, Ordering::Release);
+        if active.supersession_accounted {
+            return None;
+        }
+        active.supersession_accounted = true;
+        Some(PromptDiffWorkerCancellationReceipt::new(
+            active.request,
+            superseded_by,
+        ))
+    }
+
+    fn set_active(&self, request: ExactPromptDiffRequest, cancellation: Arc<AtomicBool>) {
+        *self
+            .active_cancellation
+            .lock()
+            .expect("prompt diff active cancellation lock poisoned") = Some(ActiveCancellation {
+            request,
+            token: cancellation,
+            supersession_accounted: false,
+        });
+    }
+
+    fn clear_active(&self) {
+        *self
+            .active_cancellation
+            .lock()
+            .expect("prompt diff active cancellation lock poisoned") = None;
     }
 
     fn cancel_active(&self) {
@@ -525,21 +624,140 @@ impl WorkerShared {
         }
     }
 
-    fn set_active(&self, generation: u64, cancellation: Arc<AtomicBool>) {
-        *self
-            .active_cancellation
+    fn record_stale_result(
+        &self,
+        superseded: ExactPromptDiffRequest,
+        superseded_by: ExactPromptDiffRequest,
+    ) {
+        let receipt = PromptDiffWorkerCancellationReceipt::new(superseded, superseded_by);
+        let mut summary = self
+            .cancellation_summary
             .lock()
-            .expect("prompt diff active cancellation lock poisoned") = Some(ActiveCancellation {
-            generation,
-            token: cancellation,
-        });
+            .expect("prompt diff cancellation summary lock poisoned");
+        if summary.len() == CANCELLATION_SUMMARY_CAPACITY {
+            summary.remove(0);
+        }
+        summary.push(receipt);
     }
 
-    fn clear_active(&self) {
-        *self
-            .active_cancellation
+    fn take_cancellation_summary(&self) -> Vec<PromptDiffWorkerCancellationReceipt> {
+        std::mem::take(
+            &mut *self
+                .cancellation_summary
+                .lock()
+                .expect("prompt diff cancellation summary lock poisoned"),
+        )
+    }
+}
+
+struct RequestMailbox {
+    slot: Mutex<Option<WorkerRequest>>,
+    wake: Condvar,
+    closed: AtomicBool,
+}
+
+impl RequestMailbox {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            wake: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn replace(&self, request: WorkerRequest) -> Result<Option<WorkerRequest>, WorkerRequest> {
+        let mut slot = self
+            .slot
             .lock()
-            .expect("prompt diff active cancellation lock poisoned") = None;
+            .expect("prompt diff request mailbox lock poisoned");
+        if self.closed.load(Ordering::Acquire) {
+            return Err(request);
+        }
+        let previous = slot.replace(request);
+        self.wake.notify_one();
+        Ok(previous)
+    }
+
+    fn wait_for_work(&self, shutdown: &AtomicBool) -> bool {
+        let mut slot = self
+            .slot
+            .lock()
+            .expect("prompt diff request mailbox lock poisoned");
+        while slot.is_none()
+            && !self.closed.load(Ordering::Acquire)
+            && !shutdown.load(Ordering::Acquire)
+        {
+            slot = self
+                .wake
+                .wait(slot)
+                .expect("prompt diff request mailbox lock poisoned");
+        }
+        slot.is_some() && !self.closed.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire)
+    }
+
+    fn take_now(&self) -> Option<WorkerRequest> {
+        self.slot
+            .lock()
+            .expect("prompt diff request mailbox lock poisoned")
+            .take()
+    }
+
+    fn close(&self) -> Option<WorkerRequest> {
+        self.closed.store(true, Ordering::Release);
+        let pending = self
+            .slot
+            .lock()
+            .expect("prompt diff request mailbox lock poisoned")
+            .take();
+        if let Some(request) = pending.as_ref() {
+            request.cancellation.store(true, Ordering::Release);
+        }
+        self.wake.notify_all();
+        pending
+    }
+
+    fn pending_count(&self) -> usize {
+        usize::from(
+            self.slot
+                .lock()
+                .expect("prompt diff request mailbox lock poisoned")
+                .is_some(),
+        )
+    }
+}
+
+struct ResultMailbox {
+    slot: Mutex<Option<PromptDiffWorkerResult>>,
+}
+
+impl ResultMailbox {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    fn take(&self) -> Option<PromptDiffWorkerResult> {
+        self.slot
+            .lock()
+            .expect("prompt diff result mailbox lock poisoned")
+            .take()
+    }
+
+    fn replace(&self, result: PromptDiffWorkerResult) -> Option<PromptDiffWorkerResult> {
+        self.slot
+            .lock()
+            .expect("prompt diff result mailbox lock poisoned")
+            .replace(result)
+    }
+
+    fn pending_count(&self) -> usize {
+        usize::from(
+            self.slot
+                .lock()
+                .expect("prompt diff result mailbox lock poisoned")
+                .is_some(),
+        )
     }
 }
 
@@ -549,8 +767,8 @@ impl WorkerShared {
 /// service and all prompt body storage live exclusively on the actor thread;
 /// callers from paint/input code can only enqueue, cancel, and poll.
 pub struct PromptDiffWorker<L> {
-    sender: Option<SyncSender<WorkerRequest>>,
-    results: Mutex<Receiver<PromptDiffWorkerResult>>,
+    mailbox: Arc<RequestMailbox>,
+    results: Arc<ResultMailbox>,
     shared: Arc<WorkerShared>,
     join: Option<JoinHandle<()>>,
     _loader: PhantomData<L>,
@@ -558,23 +776,25 @@ pub struct PromptDiffWorker<L> {
 
 impl<L: ExactPromptVersionLoader> PromptDiffWorker<L> {
     pub fn spawn(loader: L, max_items: usize, max_bytes: usize) -> Self {
-        let (sender, requests) = mpsc::sync_channel(PROMPT_DIFF_WORKER_QUEUE_CAPACITY);
-        let (results_sender, results) = mpsc::channel();
+        let mailbox = Arc::new(RequestMailbox::new());
+        let results = Arc::new(ResultMailbox::new());
         let shared = Arc::new(WorkerShared::new());
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker_results = Arc::clone(&results);
         let worker_shared = Arc::clone(&shared);
         let join = thread::spawn(move || {
             worker_loop(
                 loader,
-                requests,
-                results_sender,
+                worker_mailbox,
+                worker_results,
                 worker_shared,
                 max_items,
                 max_bytes,
             );
         });
         Self {
-            sender: Some(sender),
-            results: Mutex::new(results),
+            mailbox,
+            results,
             shared,
             join: Some(join),
             _loader: PhantomData,
@@ -606,33 +826,72 @@ impl<L: ExactPromptVersionLoader> PromptDiffWorker<L> {
             cancellation: Arc::clone(&cancellation),
             deadline,
         };
-        let sender = self.sender.as_ref().ok_or(PromptDiffWorkerError::Closed)?;
-        match sender.try_send(work) {
-            Ok(()) => {
-                update_latest_generation(&self.shared.latest_generation, generation);
-                self.shared.cancel_active_except(generation);
-                Ok(PromptDiffWorkerSubmission {
-                    request,
-                    cancellation,
-                })
-            }
-            Err(TrySendError::Full(_)) => Err(PromptDiffWorkerError::QueueFull { generation }),
-            Err(TrySendError::Disconnected(_)) => Err(PromptDiffWorkerError::Closed),
+        let mut superseded = Vec::with_capacity(MAX_SUBMISSION_SUPERSEDED_RECEIPTS);
+        if let Some(receipt) = self.shared.supersede_active(request) {
+            superseded.push(receipt);
         }
+        let previous = self
+            .mailbox
+            .replace(work)
+            .map_err(|_| PromptDiffWorkerError::Closed)?;
+        if let Some(previous) = previous {
+            previous.cancellation.store(true, Ordering::Release);
+            superseded.push(PromptDiffWorkerCancellationReceipt::new(
+                previous.request,
+                request,
+            ));
+        }
+        if let Some(previous) = self.results.take() {
+            if previous.request() != request {
+                superseded.push(PromptDiffWorkerCancellationReceipt::new(
+                    previous.request(),
+                    request,
+                ));
+            }
+        }
+        self.shared.set_latest_request(request);
+        Ok(PromptDiffWorkerSubmission {
+            request,
+            cancellation,
+            superseded,
+        })
     }
 }
 
 impl<L> PromptDiffWorker<L> {
     pub fn try_recv(&self) -> Result<Option<PromptDiffWorkerResult>, PromptDiffWorkerError> {
-        let results = self
-            .results
+        let _fence = self
+            .shared
+            .fence
             .lock()
             .map_err(|_| PromptDiffWorkerError::Closed)?;
-        match results.try_recv() {
-            Ok(result) => Ok(Some(result)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(PromptDiffWorkerError::Closed),
+        let Some(latest) = self.shared.latest_request() else {
+            return Ok(None);
+        };
+        let Some(result) = self.results.take() else {
+            return Ok(None);
+        };
+        if result.request() == latest {
+            Ok(Some(result))
+        } else {
+            self.shared.record_stale_result(result.request(), latest);
+            Ok(None)
         }
+    }
+
+    pub fn pending_request_count(&self) -> usize {
+        self.mailbox.pending_count()
+    }
+
+    pub fn pending_result_count(&self) -> usize {
+        self.results.pending_count()
+    }
+
+    pub fn take_cancellation_summary(&self) -> Vec<PromptDiffWorkerCancellationReceipt> {
+        let Ok(_fence) = self.shared.fence.lock() else {
+            return Vec::new();
+        };
+        self.shared.take_cancellation_summary()
     }
 
     pub fn shutdown(&mut self) -> Result<(), PromptDiffWorkerError> {
@@ -644,7 +903,7 @@ impl<L> PromptDiffWorker<L> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.shared.shutdown.store(true, Ordering::Release);
             self.shared.cancel_active();
-            self.sender.take();
+            self.mailbox.close();
         }
         let Some(join) = self.join.take() else {
             return Ok(());
@@ -659,58 +918,57 @@ impl<L> Drop for PromptDiffWorker<L> {
     }
 }
 
-fn update_latest_generation(latest: &AtomicU64, generation: u64) {
-    let mut current = latest.load(Ordering::Acquire);
-    while current < generation {
-        match latest.compare_exchange_weak(current, generation, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => return,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 fn worker_loop<L: ExactPromptVersionLoader>(
     loader: L,
-    requests: Receiver<WorkerRequest>,
-    results: mpsc::Sender<PromptDiffWorkerResult>,
+    mailbox: Arc<RequestMailbox>,
+    results: Arc<ResultMailbox>,
     shared: Arc<WorkerShared>,
     max_items: usize,
     max_bytes: usize,
 ) {
     let mut service = PromptDiffService::new(loader, max_items, max_bytes);
-    while let Ok(work) = requests.recv() {
-        if shared.shutdown.load(Ordering::Acquire) {
+    loop {
+        if !mailbox.wait_for_work(&shared.shutdown) {
             break;
         }
-        shared.set_active(work.request.generation, Arc::clone(&work.cancellation));
-        let current_generation = match shared.fence.lock() {
-            Ok(_fence) => shared.latest_generation.load(Ordering::Acquire),
-            Err(_) => break,
+        let work = {
+            let Ok(_fence) = shared.fence.lock() else {
+                break;
+            };
+            if shared.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(work) = mailbox.take_now() else {
+                continue;
+            };
+            shared.set_active(work.request, Arc::clone(&work.cancellation));
+            if shared.latest_request() != Some(work.request) {
+                shared.clear_active();
+                continue;
+            }
+            work
         };
-        if work.request.generation != current_generation {
-            shared.clear_active();
-            continue;
-        }
         let outcome =
             service.compute_exact_with_deadline(work.request, &work.cancellation, work.deadline);
-        shared.clear_active();
-        let Ok(_fence) = shared.fence.lock() else {
-            break;
-        };
-        if shared.shutdown.load(Ordering::Acquire)
-            || work.request.generation != shared.latest_generation.load(Ordering::Acquire)
         {
-            continue;
-        }
-        if results
-            .send(PromptDiffWorkerResult {
+            let Ok(_fence) = shared.fence.lock() else {
+                break;
+            };
+            let latest = shared.latest_request();
+            if shared.shutdown.load(Ordering::Acquire) || latest != Some(work.request) {
+                shared.clear_active();
+                continue;
+            }
+            let result = PromptDiffWorkerResult {
                 request: work.request,
                 outcome,
-            })
-            .is_err()
-        {
-            break;
+            };
+            if let Some(previous) = results.replace(result) {
+                if previous.request() != work.request {
+                    shared.record_stale_result(previous.request(), work.request);
+                }
+            }
+            shared.clear_active();
         }
     }
 }

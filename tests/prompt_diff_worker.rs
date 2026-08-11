@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -134,6 +134,16 @@ fn wait_until(flag: &AtomicBool) {
     panic!("worker did not reach the expected state");
 }
 
+fn wait_until_pending_result<L>(worker: &PromptDiffWorker<L>) {
+    for _ in 0..5_000 {
+        if worker.pending_result_count() == 1 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("worker did not publish a result into its bounded mailbox");
+}
+
 fn wait_for_result<L>(worker: &PromptDiffWorker<L>) -> devmanager::prompts::PromptDiffWorkerResult {
     for _ in 0..5_000 {
         match worker.try_recv() {
@@ -171,7 +181,7 @@ fn worker_delivers_exact_ids_hashes_and_body_free_projection() {
 }
 
 #[test]
-fn worker_assigns_monotonic_generation_and_reports_queue_full() {
+fn worker_assigns_monotonic_generation_and_replaces_queued_intent() {
     let before = Version::new(PromptVersionId::new(), "before");
     let after = Version::new(PromptVersionId::new(), "after");
     let third = Version::new(PromptVersionId::new(), "third");
@@ -201,15 +211,133 @@ fn worker_assigns_monotonic_generation_and_reports_queue_full() {
         .submit(request(&before, &third), None)
         .expect("second queued");
     assert!(second.generation() > first.generation());
-    assert!(matches!(
-        worker.submit(request(&after, &third), None),
-        Err(PromptDiffWorkerError::QueueFull { .. })
-    ));
+    let first_receipt = second
+        .superseded()
+        .iter()
+        .find(|receipt| receipt.generation() == first.generation())
+        .expect("active request cancellation is accounted");
+    assert_eq!(first_receipt.request(), first.request());
+    assert_eq!(first_receipt.by_request(), second.request());
+    let third = worker
+        .submit(request(&after, &third), None)
+        .expect("latest intent replaces the queued request");
+    let superseded: HashSet<_> = third
+        .superseded()
+        .iter()
+        .map(|receipt| receipt.generation())
+        .collect();
+    assert!(superseded.contains(&second.generation()));
+    let queued_receipt = third
+        .superseded()
+        .iter()
+        .find(|receipt| receipt.generation() == second.generation())
+        .expect("queued request replacement is accounted");
+    assert_eq!(queued_receipt.request(), second.request());
+    assert_eq!(queued_receipt.by_request(), third.request());
 
     release.store(true, Ordering::Release);
     let result = wait_for_result(&worker);
-    assert_eq!(result.request(), second.request());
+    assert_eq!(result.request(), third.request());
     assert!(result.outcome().is_ok());
+}
+
+#[test]
+fn accepted_newer_request_drains_unread_completed_result_before_poll() {
+    let before = Version::new(PromptVersionId::new(), "before");
+    let after = Version::new(PromptVersionId::new(), "after");
+    let third = Version::new(PromptVersionId::new(), "third");
+    let mut loader = FakeLoader::default();
+    loader.insert(before.clone());
+    loader.insert(after.clone());
+    loader.insert(third.clone());
+    let worker = PromptDiffWorker::spawn(loader, 2, 16 * 1024);
+
+    let first = worker
+        .submit(request(&before, &after), None)
+        .expect("first");
+    wait_until_pending_result(&worker);
+    let second = worker
+        .submit(request(&before, &third), None)
+        .expect("newer request");
+    assert!(second
+        .superseded()
+        .iter()
+        .any(|receipt| receipt.generation() == first.generation()));
+
+    let maybe_result = worker.try_recv().expect("result channel remains open");
+    if let Some(result) = maybe_result {
+        assert_eq!(result.request(), second.request());
+        return;
+    }
+    let result = wait_for_result(&worker);
+    assert_eq!(result.request(), second.request());
+}
+
+#[test]
+fn latest_intent_flood_keeps_mailboxes_bounded_and_accounts_superseded() {
+    let before = Version::new(PromptVersionId::new(), "before");
+    let after = Version::new(PromptVersionId::new(), "after");
+    let third = Version::new(PromptVersionId::new(), "third");
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut inner = FakeLoader::default();
+    inner.insert(before.clone());
+    inner.insert(after.clone());
+    inner.insert(third.clone());
+    let worker = PromptDiffWorker::spawn(
+        BlockingLoader {
+            inner,
+            started: started.clone(),
+            release: release.clone(),
+            dropped,
+        },
+        2,
+        16 * 1024,
+    );
+
+    let first = worker
+        .submit(request(&before, &after), None)
+        .expect("first");
+    wait_until(&started);
+    let mut submissions = vec![first];
+    for _ in 0..100 {
+        let submission = worker
+            .submit(request(&before, &third), None)
+            .expect("latest intent remains admissible");
+        assert!(worker.pending_request_count() <= 1);
+        assert!(worker.pending_result_count() <= 1);
+        submissions.push(submission);
+    }
+    release.store(true, Ordering::Release);
+    wait_until_pending_result(&worker);
+    for _ in 0..100 {
+        let submission = worker
+            .submit(request(&after, &third), None)
+            .expect("latest intent remains admissible after a result");
+        assert!(worker.pending_request_count() <= 1);
+        assert!(worker.pending_result_count() <= 1);
+        submissions.push(submission);
+    }
+    let latest = submissions.last().expect("flood has a latest request");
+    let mut accounted = HashSet::new();
+    for submission in &submissions {
+        for receipt in submission.superseded() {
+            accounted.insert(receipt.generation());
+        }
+    }
+    for generation in 1..latest.generation() {
+        assert!(
+            accounted.contains(&generation),
+            "superseded generation {generation} had no typed receipt"
+        );
+    }
+
+    let result = wait_for_result(&worker);
+    assert_eq!(result.request(), latest.request());
+    assert!(worker.pending_request_count() <= 1);
+    assert!(worker.pending_result_count() <= 1);
+    assert!(worker.try_recv().expect("channel open").is_none());
 }
 
 #[test]
