@@ -370,6 +370,7 @@ pub const PROMPT_DIFF_WORKER_QUEUE_CAPACITY: usize = 1;
 pub enum PromptDiffWorkerError {
     Closed,
     JoinFailed,
+    GenerationExhausted,
 }
 
 impl fmt::Display for PromptDiffWorkerError {
@@ -377,6 +378,9 @@ impl fmt::Display for PromptDiffWorkerError {
         match self {
             Self::Closed => f.write_str("prompt diff worker is closed"),
             Self::JoinFailed => f.write_str("prompt diff worker did not join cleanly"),
+            Self::GenerationExhausted => {
+                f.write_str("prompt diff worker generation space is exhausted")
+            }
         }
     }
 }
@@ -562,6 +566,24 @@ impl WorkerShared {
 
     fn latest_request(&self) -> Option<ExactPromptDiffRequest> {
         self.latest_request.lock().ok().and_then(|request| *request)
+    }
+
+    fn reserve_generation(&self) -> Result<u64, PromptDiffWorkerError> {
+        let mut current = self.next_generation.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return Err(PromptDiffWorkerError::GenerationExhausted);
+            };
+            match self.next_generation.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn set_latest_request(&self, request: ExactPromptDiffRequest) {
@@ -814,11 +836,7 @@ impl<L: ExactPromptVersionLoader> PromptDiffWorker<L> {
         if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(PromptDiffWorkerError::Closed);
         }
-        let generation = self
-            .shared
-            .next_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
+        let generation = self.shared.reserve_generation()?;
         let request = request.with_generation(generation);
         let cancellation = Arc::new(AtomicBool::new(false));
         let work = WorkerRequest {
@@ -1445,6 +1463,27 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    struct NeverLoader;
+
+    impl ExactPromptVersionLoader for NeverLoader {
+        fn load_exact_metadata(
+            &mut self,
+            id: PromptVersionId,
+        ) -> Result<ExactPromptVersionMetadata, PromptDiffServiceError> {
+            Err(PromptDiffServiceError::MissingVersion { id })
+        }
+
+        fn read_exact_body(
+            &mut self,
+            id: PromptVersionId,
+            _writer: &mut PromptVersionBodyWriter,
+            _cancellation: &AtomicBool,
+            _deadline: Option<Instant>,
+        ) -> Result<(), PromptDiffServiceError> {
+            Err(PromptDiffServiceError::MissingVersion { id })
+        }
+    }
+
     #[test]
     fn local_projection_debug_redacts_nested_text() {
         let cancellation = AtomicBool::new(false);
@@ -1461,5 +1500,54 @@ mod tests {
         ] {
             assert!(!debug.contains(sentinel), "local text leaked: {debug}");
         }
+    }
+
+    #[test]
+    fn generation_exhaustion_is_typed_and_has_no_submit_side_effects() {
+        let mailbox = Arc::new(RequestMailbox::new());
+        let results = Arc::new(ResultMailbox::new());
+        let shared = Arc::new(WorkerShared::new());
+        shared
+            .next_generation
+            .store(u64::MAX - 1, Ordering::Release);
+        let join = thread::spawn(|| {});
+        let worker = PromptDiffWorker::<NeverLoader> {
+            mailbox: Arc::clone(&mailbox),
+            results: Arc::clone(&results),
+            shared: Arc::clone(&shared),
+            join: Some(join),
+            _loader: PhantomData,
+        };
+        let request = ExactPromptDiffRequest::new(
+            PromptVersionId::new(),
+            PromptVersionId::new(),
+            [0x11; 32],
+            [0x22; 32],
+            0,
+        );
+
+        let first = worker.submit(request, None).expect("MAX is issuable once");
+        assert_eq!(first.generation(), u64::MAX);
+        results.replace(PromptDiffWorkerResult {
+            request: first.request(),
+            outcome: Err(PromptDiffServiceError::Cancelled),
+        });
+        let latest_before = shared.latest_request();
+        let error = worker
+            .submit(request, None)
+            .expect_err("generation exhaustion must be typed");
+        assert_eq!(error, PromptDiffWorkerError::GenerationExhausted);
+        assert_eq!(shared.latest_request(), latest_before);
+        assert_eq!(worker.pending_request_count(), 1);
+        assert_eq!(worker.pending_result_count(), 1);
+        assert_eq!(
+            worker
+                .submit(request, None)
+                .expect_err("exhaustion is permanent"),
+            PromptDiffWorkerError::GenerationExhausted
+        );
+        assert_eq!(shared.latest_request(), latest_before);
+        assert_eq!(worker.pending_request_count(), 1);
+        assert_eq!(worker.pending_result_count(), 1);
     }
 }
