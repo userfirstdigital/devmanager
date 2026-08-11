@@ -13,7 +13,7 @@ use image::GenericImageView;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 
@@ -54,6 +54,15 @@ fn valid_request(policy: &PreviewPathPolicy, name: &str) -> PreviewRequest {
         policy,
     )
     .expect("valid preview request")
+}
+
+static CAPTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn capture_test_guard() -> MutexGuard<'static, ()> {
+    CAPTURE_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
@@ -177,7 +186,12 @@ fn capture_manifest_decodes_ihdr_and_layout_contract_is_exact() {
             "native capture must assert the exact client/frame width contract ({marker})"
         );
     }
-    for marker in ["ReadAllBytes", "IHDR", "ExpectedWidth", "ExpectedHeight"] {
+    for marker in [
+        "Get-PngDimensions -Authority",
+        "IHDR",
+        "ExpectedWidth",
+        "ExpectedHeight",
+    ] {
         assert!(
             script.contains(marker),
             "capture manifest must derive and record decoded PNG IHDR dimensions ({marker})"
@@ -311,11 +325,105 @@ fn capture_script_never_path_deletes_outputs_and_uses_unique_retry_names() {
         "OutputEvidence",
         "output-name-unique-per-attempt",
         "BinaryPath",
-        "warm isolated binary",
+        "caller-supplied warm binary paths are disabled",
     ] {
         assert!(
             script.contains(required),
             "capture retries must retain unique output evidence via {required}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_bounds_every_external_reader_on_one_deadline() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "MAX_PREVIEW_ARTIFACT_BYTES",
+        "MAX_PREVIEW_RECEIPT_BYTES",
+        "MAX_PREVIEW_MANIFEST_BYTES",
+        "MAX_PREVIEW_PNG_BYTES",
+        "PREVIEW_HASH_CHUNK_BYTES",
+        "Assert-PreviewDeadline",
+        "TransformBlock",
+        "Read-PreviewUtf8Text",
+        "Get-PreviewArtifactSha256 -Stream",
+        "Get-PreviewEmbeddedBuildIdentity -Stream",
+        "Get-PngDimensions -Authority",
+    ] {
+        assert!(
+            script.contains(marker),
+            "preview readers must be bounded by the shared deadline and byte caps: {marker}"
+        );
+    }
+    for forbidden in ["ComputeHash($Stream)", "ReadToEnd()", "ReadAllBytes($Path)"] {
+        assert!(
+            !script.contains(forbidden),
+            "preview readers must not use an unbounded {forbidden} path"
+        );
+    }
+}
+
+#[test]
+fn preview_script_retains_output_authority_through_validation_and_manifest_publication() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Open-PreviewOutputAuthority",
+        "Assert-PreviewOutputAuthorityStable",
+        "retainedOutputAuthorities",
+        "outputRootAuthority",
+        "Assert-PreviewDirectoryAuthorityStable",
+        "Write-PreviewAtomicJson",
+        "manifestSha256",
+        "OutputSha256",
+    ] {
+        assert!(
+            script.contains(marker),
+            "capture validation/publication must retain and recheck {marker}"
+        );
+    }
+    for forbidden in [
+        "Get-Item -LiteralPath $output",
+        "Get-Item -LiteralPath $output -ErrorAction Stop",
+        "File.Exists($Path)",
+        "Set-Content -LiteralPath $manifestPath",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "capture publication must not re-resolve output paths through {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_rejects_tool_wrappers_and_target_specific_build_overrides() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTC_BOOTSTRAP",
+        "RUSTDOCFLAGS",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_TARGET_.+_(RUSTFLAGS|RUSTC|LINKER)",
+        "Open-PreviewToolAuthority",
+        "ToolAuthorities",
+    ] {
+        assert!(
+            script.contains(marker),
+            "cold-build provenance must fence {marker}"
         );
     }
 }
@@ -748,6 +856,17 @@ fn preview_matrix_script_is_isolated_and_captures_every_gallery_page() {
         !script.contains("DEVMANAGER_PROFILE") && !script.contains("session.json"),
         "preview matrix must not touch a profile or session state"
     );
+    for deferred in [
+        "os-monitor-dpi-deferred",
+        "external-desktop-occlusion-deferred",
+        "disposable-vm-required-for-physical-monitor-dpi",
+        "disposable-vm-required-for-external-occlusion-race",
+    ] {
+        assert!(
+            script.contains(deferred),
+            "unavailable physical matrix evidence must remain visibly deferred: {deferred}"
+        );
+    }
 }
 
 #[test]
@@ -1060,6 +1179,7 @@ fn first_frame_wait_consumes_one_absolute_capture_deadline() {
 
 #[test]
 fn settle_cleanup_failure_is_bounded_and_keeps_primary_typed() {
+    let _capture_guard = capture_test_guard();
     let (started_tx, started_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1309,6 +1429,7 @@ fn preview_rejects_junction_ancestors_before_fixture_or_output_io() {
 #[cfg(windows)]
 #[test]
 fn trusted_output_root_identity_blocks_a_junction_swap_after_validation() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy, "swap.png");
     let original_root = policy.output_root().to_path_buf();
@@ -1330,6 +1451,7 @@ fn trusted_output_root_identity_blocks_a_junction_swap_after_validation() {
 #[cfg(windows)]
 #[test]
 fn trusted_output_parent_identity_blocks_regular_directory_substitution() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let parent = policy.output_root().join("nested");
     fs::create_dir_all(&parent).expect("nested output parent");
@@ -1352,6 +1474,7 @@ fn trusted_output_parent_identity_blocks_regular_directory_substitution() {
 #[cfg(windows)]
 #[test]
 fn output_cleanup_refuses_a_parent_junction_substitution() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let parent = policy.output_root().join("cleanup-parent");
     fs::create_dir_all(&parent).expect("cleanup parent");
@@ -1396,6 +1519,7 @@ fn diagnostics_redact_a_complete_secret_bearing_line_before_bounding() {
 
 #[test]
 fn cancelled_capture_generation_cannot_publish_after_a_replacement_attempt() {
+    let _capture_guard = capture_test_guard();
     let generations = CaptureGeneration::new();
     let stale = generations.begin();
     stale.cancel();
@@ -1410,6 +1534,7 @@ fn cancelled_capture_generation_cannot_publish_after_a_replacement_attempt() {
 
 #[test]
 fn injected_blocking_capture_stage_returns_at_the_shared_deadline_and_keeps_ownership() {
+    let _capture_guard = capture_test_guard();
     let lease = CaptureGeneration::new().begin();
     let error = run_cancellable_stage(
         CaptureDeadline::from_now(Duration::from_millis(10)),
@@ -1448,6 +1573,7 @@ fn capture_error_display_and_debug_redact_control_sequences_and_window_handles()
 
 #[test]
 fn cleanup_timeout_is_reported_as_a_typed_deadline_failure() {
+    let _capture_guard = capture_test_guard();
     let error = settle_capture_with_cleanup(
         Ok::<_, PreviewCaptureError>(()),
         CaptureDeadline::from_now(Duration::ZERO),
@@ -1464,6 +1590,7 @@ fn cleanup_timeout_is_reported_as_a_typed_deadline_failure() {
 
 #[test]
 fn late_cleanup_remains_owned_after_shared_deadline() {
+    let _capture_guard = capture_test_guard();
     let (started_tx, started_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1503,6 +1630,7 @@ fn late_cleanup_remains_owned_after_shared_deadline() {
 
 #[test]
 fn cleanup_worker_panics_are_reported_without_unwinding_the_capture_caller() {
+    let _capture_guard = capture_test_guard();
     let error = settle_capture_with_cleanup(
         Err::<(), _>(PreviewCaptureError::CaptureClosed),
         CaptureDeadline::from_now(Duration::from_secs(1)),
@@ -1526,6 +1654,7 @@ fn cleanup_worker_panics_are_reported_without_unwinding_the_capture_caller() {
 
 #[test]
 fn late_output_cleanup_is_owned_and_leaves_no_residue() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("late-output.png");
     fs::write(&output, b"late output").expect("late output fixture");
@@ -1556,6 +1685,7 @@ fn late_output_cleanup_is_owned_and_leaves_no_residue() {
 
 #[test]
 fn final_capture_settlement_fences_a_late_success_and_cleans_output() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("late-success.png");
     fs::write(&output, b"late success").expect("late output fixture");
@@ -1591,6 +1721,7 @@ fn final_capture_settlement_fences_a_late_success_and_cleans_output() {
 
 #[test]
 fn expired_png_encoding_is_bounded_and_leaves_no_temp_residue() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("expired.png");
     let error = encode_bgra_png_atomic(
@@ -1612,6 +1743,7 @@ fn expired_png_encoding_is_bounded_and_leaves_no_temp_residue() {
 
 #[test]
 fn png_dimension_overflow_is_rejected_without_output_or_temp_residue() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("overflow.png");
     let error = encode_bgra_png_atomic(
@@ -1746,6 +1878,7 @@ fn render_error_mapping_preserves_actionable_capture_categories() {
 
 #[test]
 fn validated_request_owns_the_only_public_bgra_output_boundary() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy, "policy-bound.png");
     let bgra = [0x1e, 0x14, 0x0a, 0xff];
@@ -1762,6 +1895,7 @@ fn validated_request_owns_the_only_public_bgra_output_boundary() {
 
 #[test]
 fn bgra_png_is_decodable_physical_sized_and_preserves_rgb_alpha_without_temp_residue() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let output = policy.output_root().join("encoded.png");
     let bgra = vec![
@@ -1795,6 +1929,7 @@ fn bgra_png_is_decodable_physical_sized_and_preserves_rgb_alpha_without_temp_res
 
 #[test]
 fn asymmetric_bgra_capture_seam_preserves_exact_rgba_channels() {
+    let _capture_guard = capture_test_guard();
     let (_root, policy) = temporary_policy();
     let request = valid_request(&policy, "asymmetric.png");
     let bgra = [0xd4, 0x2b, 0x91, 0xe7];
@@ -1836,6 +1971,7 @@ fn invalid_and_foreign_hwnds_are_rejected_before_capture() {
 fn visible_capture_uses_isolated_process_and_decodes_exact_sentinel() {
     use devmanager::ui::preview_capture::foreground_hwnd;
 
+    let _capture_guard = capture_test_guard();
     const EXPECTED_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".devmanager-next/evidence/phase-05/screenshots")
