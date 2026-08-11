@@ -1,0 +1,7 @@
+{
+  "cli": "codex-cli",
+  "version": "0.147.0",
+  "captured_at": "2026-08-11",
+  "commands": ["codex --version", "codex --help", "codex resume --help", "codex login --help"],
+  "notes": "Sanitized capability fixtures only. No credentials, user paths, prompts, or authenticated launch."
+}

@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "unknown",
+  "cwd": "/fixture/workspace",
+  "transcript_path": "/fixture/codex/sessions/rollout-fixture.jsonl"
+}

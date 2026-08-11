@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "019f-fixture-codex-session",
+  "prompt": "[redacted fixture prompt]"
+}

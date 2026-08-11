@@ -3,15 +3,19 @@
 //! Mirrors the Claude hooks relay (`claude_hooks.rs`).
 
 use crate::ai::claude_hooks::is_valid_loopback_relay_url_for;
+use crate::domain::{AgentSessionId, TaskId};
+use crate::process::identity::ManagedProcessId;
 use crate::remote::presentation::{
     SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, SemanticToolState,
     StableSessionKey,
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const CODEX_HOOK_RELAY_PATH: &str = "/internal/codex-hook";
@@ -269,6 +273,61 @@ pub struct CodexHookRegistration {
     pub generation: u64,
 }
 
+/// Registry-issued launch authority. Production callers cannot mint the
+/// enclosed nonce or generation; dropping an unused permit unregisters it.
+pub struct CodexLaunchPermit {
+    registry: Arc<CodexHookRegistry>,
+    registration: CodexHookRegistration,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    process_root: ManagedProcessId,
+    live: bool,
+}
+
+impl fmt::Debug for CodexLaunchPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexLaunchPermit")
+            .field("generation", &self.registration.generation)
+            .field("live", &self.live)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexLaunchPermit {
+    pub(crate) fn registration(&self) -> &CodexHookRegistration {
+        &self.registration
+    }
+
+    pub(crate) fn registry(&self) -> Arc<CodexHookRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub(crate) fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub(crate) fn agent_session_id(&self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub(crate) fn process_root(&self) -> ManagedProcessId {
+        self.process_root
+    }
+
+    pub(crate) fn into_registration(mut self) -> CodexHookRegistration {
+        self.live = false;
+        self.registration.clone()
+    }
+}
+
+impl Drop for CodexLaunchPermit {
+    fn drop(&mut self) {
+        if self.live {
+            self.registry.unregister(&self.registration.nonce);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CodexRegistryEvent {
     Semantic(SemanticEventDraft),
@@ -378,6 +437,45 @@ impl CodexHookRegistry {
             nonce,
             stable_session_key,
             generation,
+        })
+    }
+
+    pub fn issue_launch_permit(
+        registry: Arc<Self>,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        process_root: ManagedProcessId,
+    ) -> Result<CodexLaunchPermit, String> {
+        let registration =
+            registry.register(StableSessionKey::from_tab(agent_session_id.to_string()))?;
+        if registration.generation == 0 || registration.nonce.is_empty() {
+            registry.unregister(&registration.nonce);
+            return Err("Codex launch permit rejected empty nonce or zero generation".to_string());
+        }
+        Ok(CodexLaunchPermit {
+            registry,
+            registration,
+            task_id,
+            agent_session_id,
+            process_root,
+            live: true,
+        })
+    }
+
+    pub fn current_registration(&self, nonce: &str) -> Option<CodexHookRegistration> {
+        let state = self.state.lock().ok()?;
+        let session = state.registrations.get(nonce)?;
+        if state
+            .latest_generation_by_key
+            .get(&session.stable_session_key)
+            != Some(&session.generation)
+        {
+            return None;
+        }
+        Some(CodexHookRegistration {
+            nonce: nonce.to_string(),
+            stable_session_key: session.stable_session_key.clone(),
+            generation: session.generation,
         })
     }
 
@@ -635,6 +733,33 @@ pub fn build_codex_hooks_command(
     if tokens.is_empty() {
         return Err("Codex command is empty".to_string());
     }
+    for override_value in config {
+        tokens.push("--config".to_string());
+        tokens.push(override_value.argument());
+    }
+    tokens.extend(codex_hook_argument_tokens(
+        devmanager_executable,
+        endpoint,
+        nonce,
+    )?);
+    Ok(crate::ai::codex_cli::quote_command_for_shell(
+        &tokens,
+        shell_program,
+    ))
+}
+
+/// Stock CLI argv suffix that registers the authenticated loopback relay.
+pub fn codex_hook_argument_tokens(
+    devmanager_executable: &std::path::Path,
+    endpoint: &str,
+    nonce: &str,
+) -> Result<Vec<String>, String> {
+    if !is_valid_loopback_relay_url_for(endpoint, CODEX_HOOK_RELAY_PATH) {
+        return Err("Codex hook relay endpoint is not an exact loopback URL".to_string());
+    }
+    if nonce.is_empty() || !nonce.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("Codex hook relay nonce must be non-empty hex".to_string());
+    }
     // Codex runs hook commands through a shell; double quotes around the
     // executable path are safe on cmd, PowerShell, and sh alike.
     // Forward-slash the relay executable only: Windows backslashes become
@@ -649,20 +774,14 @@ pub fn build_codex_hooks_command(
         "& '{}' codex-hook-relay --url {endpoint} --nonce {nonce}",
         relay_executable.replace('\'', "''")
     );
-    for override_value in config {
-        tokens.push("--config".to_string());
-        tokens.push(override_value.argument());
-    }
+    let mut tokens = Vec::new();
     for event in CODEX_HOOK_EVENTS {
         let override_value = codex_hook_override(event, &relay_command, &relay_command_windows);
         tokens.push("-c".to_string());
         tokens.push(override_value);
     }
     tokens.push(CODEX_HOOK_TRUST_FLAG.to_string());
-    Ok(crate::ai::codex_cli::quote_command_for_shell(
-        &tokens,
-        shell_program,
-    ))
+    Ok(tokens)
 }
 
 fn codex_hook_override(event: &str, command: &str, command_windows: &str) -> String {
