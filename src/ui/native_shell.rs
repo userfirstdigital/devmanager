@@ -15,9 +15,9 @@ use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, point, px, size, uniform_list, AnyElement, AppContext, Application, ClickEvent, Context,
@@ -52,7 +52,7 @@ use crate::ui::components::{
 use crate::ui::shell::{
     NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
 };
-use crate::ui::task_cockpit::{TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
+use crate::ui::task_cockpit::{Inbox, TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
@@ -66,11 +66,124 @@ const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
+const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
+
+/// One absolute budget shared by worker, subscription, child, and runtime
+/// cleanup.  A fresh timeout for each phase would allow a hung phase to turn
+/// shutdown into an unbounded chain of waits.
+#[derive(Clone, Copy, Debug)]
+struct NativeShutdownDeadline {
+    at: Instant,
+}
+
+impl NativeShutdownDeadline {
+    fn from_now(budget: Duration) -> Self {
+        Self {
+            at: Instant::now() + budget,
+        }
+    }
+
+    fn until(at: Instant) -> Self {
+        Self { at }
+    }
+
+    fn remaining(self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
+    }
+
+    fn expired(self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
+fn retained_workers() -> &'static Mutex<Vec<JoinHandle<()>>> {
+    static RETAINED: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
+    RETAINED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retained_children() -> &'static Mutex<Vec<Child>> {
+    static RETAINED: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+    RETAINED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn reap_retained_workers() {
+    if let Ok(mut workers) = retained_workers().lock() {
+        let mut pending = Vec::with_capacity(workers.len());
+        for worker in workers.drain(..) {
+            if worker.is_finished() {
+                // Joining an already finished worker cannot block and proves
+                // ownership was reaped rather than detached.
+                let _ = worker.join();
+            } else {
+                pending.push(worker);
+            }
+        }
+        *workers = pending;
+    }
+}
+
+fn reap_retained_children() {
+    if let Ok(mut children) = retained_children().lock() {
+        children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) | Err(_) => false,
+            Ok(None) => true,
+        });
+    }
+}
+
+fn retain_worker(worker: JoinHandle<()>) {
+    if let Ok(mut workers) = retained_workers().lock() {
+        workers.push(worker);
+    }
+}
+
+fn retain_child(child: Child) {
+    if let Ok(mut children) = retained_children().lock() {
+        children.push(child);
+    }
+}
+
+fn join_worker_with_deadline(worker: JoinHandle<()>, deadline: NativeShutdownDeadline) {
+    reap_retained_workers();
+    let mut worker = Some(worker);
+    while !deadline.expired() {
+        if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            let _ = worker.take().expect("finished worker handle").join();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2).min(deadline.remaining()));
+    }
+    if let Some(worker) = worker {
+        retain_worker(worker);
+    }
+}
+
+fn terminate_child_with_deadline(mut child: Child, deadline: NativeShutdownDeadline) {
+    reap_retained_children();
+    let _ = child.kill();
+    while !deadline.expired() {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(2).min(deadline.remaining())),
+        }
+    }
+    retain_child(child);
+}
 
 fn stable_task_element_id(task_id: TaskId) -> ElementId {
     // GPUI has a UUID element identity, so retain all 128 bits of the domain
     // TaskId instead of collapsing it to an offset or a lossy hash.
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
+}
+
+fn pointer_button(button: MouseButton) -> Option<PointerButton> {
+    match button {
+        MouseButton::Left => Some(PointerButton::Primary),
+        MouseButton::Right => Some(PointerButton::Secondary),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::Navigate(_) => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +387,7 @@ fn native_host_executable() -> PathBuf {
 
 enum NativeHostProcessKind {
     Child(Child),
+    Empty,
 }
 
 /// Owns the one host child for the native shell. Drop always joins the child
@@ -290,6 +404,7 @@ impl std::fmt::Debug for NativeHostProcess {
                 "kind",
                 &match self.kind {
                     NativeHostProcessKind::Child(_) => "child",
+                    NativeHostProcessKind::Empty => "empty",
                 },
             )
             .finish()
@@ -298,9 +413,16 @@ impl std::fmt::Debug for NativeHostProcess {
 
 impl Drop for NativeHostProcess {
     fn drop(&mut self) {
-        let NativeHostProcessKind::Child(child) = &mut self.kind;
-        let _ = child.kill();
-        let _ = child.wait();
+        self.terminate(NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET));
+    }
+}
+
+impl NativeHostProcess {
+    fn terminate(&mut self, deadline: NativeShutdownDeadline) {
+        let kind = std::mem::replace(&mut self.kind, NativeHostProcessKind::Empty);
+        if let NativeHostProcessKind::Child(child) = kind {
+            terminate_child_with_deadline(child, deadline);
+        }
     }
 }
 
@@ -309,6 +431,22 @@ pub trait NativeHostBootstrap {
         &mut self,
         profile: &IsolatedDevProfile,
     ) -> Result<NativeHostRuntimeAttachment, NativeShellError>;
+
+    fn start_with_budget(
+        &mut self,
+        profile: &IsolatedDevProfile,
+        _budget: Duration,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        self.start(profile)
+    }
+
+    fn start_until(
+        &mut self,
+        profile: &IsolatedDevProfile,
+        _deadline: Instant,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        self.start(profile)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +457,15 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         &mut self,
         profile: &IsolatedDevProfile,
     ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        self.start_with_budget(profile, NATIVE_STARTUP_BUDGET)
+    }
+
+    fn start_with_budget(
+        &mut self,
+        profile: &IsolatedDevProfile,
+        budget: Duration,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        let deadline = NativeShutdownDeadline::from_now(budget);
         ensure_isolated_host_config_base(profile)?;
         let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
         let mut command = Command::new(&spec.executable);
@@ -335,7 +482,35 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let process = NativeHostProcess {
             kind: NativeHostProcessKind::Child(child),
         };
-        let runtime = NativeHostClientRuntime::connect_blocking_with_process(profile, process)?;
+        let runtime =
+            NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
+        Ok(NativeHostRuntimeAttachment::Client(runtime))
+    }
+
+    fn start_until(
+        &mut self,
+        profile: &IsolatedDevProfile,
+        deadline: Instant,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        let deadline = NativeShutdownDeadline::until(deadline);
+        ensure_isolated_host_config_base(profile)?;
+        let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
+        let mut command = Command::new(&spec.executable);
+        command.args(spec.arguments());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|error| NativeShellError::HostConnect {
+                message: format!("isolated devmanager-host launch failed: {error}"),
+            })?;
+        let process = NativeHostProcess {
+            kind: NativeHostProcessKind::Child(child),
+        };
+        let runtime =
+            NativeHostClientRuntime::connect_blocking_with_process(profile, process, deadline)?;
         Ok(NativeHostRuntimeAttachment::Client(runtime))
     }
 }
@@ -441,6 +616,21 @@ pub struct HandlerTrace {
     pub propagation_stopped: bool,
 }
 
+/// All identities that make a native action valid.  The shell captures these
+/// values at the event boundary and compares every value again on dispatch;
+/// matching only a focus or request counter permits stale actions to cross a
+/// reconnect, task resync, or runtime replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeActionEpochs {
+    pub connection_epoch: u64,
+    pub client_epoch: u64,
+    pub navigation_epoch: u64,
+    pub resource_generation: u64,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub focus_epoch: FocusEpoch,
+}
+
 #[derive(Debug)]
 pub struct NavigationHandlerOutcome {
     pub focus_epoch: FocusEpoch,
@@ -478,6 +668,11 @@ pub struct NativeActionRecord {
     pub request_generation: u64,
     /// Monotonic UI action capture. A later action invalidates an older one.
     pub action_epoch: u64,
+    pub connection_epoch: u64,
+    pub client_epoch: u64,
+    pub navigation_epoch: u64,
+    pub resource_generation: u64,
+    pub runtime_generation: u64,
     /// Task identity captured at activation time, never reconstructed by the
     /// transport worker from mutable selection state.
     pub task_id: Option<TaskId>,
@@ -839,13 +1034,24 @@ impl NativeHostClientRuntime {
     /// isolated config base. No production/default profile lookup is performed
     /// and no second connection is created by this type.
     pub async fn connect(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
-        let client = HostClient::connect(profile.host_client_config())
-            .await
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })?;
+        let deadline = NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET);
+        let client = tokio::time::timeout(
+            deadline.remaining(),
+            HostClient::connect(profile.host_client_config()),
+        )
+        .await
+        .map_err(|_| NativeShellError::HostConnect {
+            message: "native host connection deadline expired".to_string(),
+        })?
+        .map_err(|error| NativeShellError::HostConnect {
+            message: error.to_string(),
+        })?;
         let mut runtime = Self::new(client);
-        runtime.bootstrap_projection().await?;
+        tokio::time::timeout(deadline.remaining(), runtime.bootstrap_projection())
+            .await
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host bootstrap deadline expired".to_string(),
+            })??;
         Ok(runtime)
     }
 
@@ -854,6 +1060,7 @@ impl NativeHostClientRuntime {
     /// reader/writer tasks continue draining while GPUI paints and handles
     /// input. A failed attempt becomes a typed shell error at the call site.
     pub fn connect_blocking(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
+        let deadline = NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET);
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -863,13 +1070,25 @@ impl NativeHostClientRuntime {
                     message: format!("runtime bootstrap failed: {error}"),
                 })?,
         );
-        let client = runtime.block_on(HostClient::connect(profile.host_client_config()));
+        let client = runtime.block_on(tokio::time::timeout(
+            deadline.remaining(),
+            HostClient::connect(profile.host_client_config()),
+        ));
+        let client = client.map_err(|_| NativeShellError::HostConnect {
+            message: "native host connection deadline expired".to_string(),
+        })?;
         let client = client.map_err(|error| NativeShellError::HostConnect {
             message: error.to_string(),
         })?;
         let mut runtime_owner = Self::new_with_runtime(client, runtime.clone());
         runtime
-            .block_on(runtime_owner.bootstrap_projection())
+            .block_on(tokio::time::timeout(
+                deadline.remaining(),
+                runtime_owner.bootstrap_projection(),
+            ))
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host bootstrap deadline expired".to_string(),
+            })?
             .map_err(|error| NativeShellError::HostConnect {
                 message: error.to_string(),
             })?;
@@ -879,27 +1098,53 @@ impl NativeHostClientRuntime {
     fn connect_blocking_with_process(
         profile: &IsolatedDevProfile,
         process: NativeHostProcess,
+        deadline: NativeShutdownDeadline,
     ) -> Result<Self, NativeShellError> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .map_err(|error| NativeShellError::HostConnect {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => Arc::new(runtime),
+            Err(error) => {
+                let mut process = process;
+                process.terminate(deadline);
+                return Err(NativeShellError::HostConnect {
                     message: format!("runtime bootstrap failed: {error}"),
-                })?,
-        );
-        let client = runtime.block_on(connect_with_startup_retry(profile));
-        let client = client.map_err(|error| NativeShellError::HostConnect {
-            message: error.to_string(),
-        })?;
+                });
+            }
+        };
+        let client = match runtime.block_on(connect_with_startup_retry(profile, deadline)) {
+            Ok(client) => client,
+            Err(error) => {
+                let mut process = process;
+                process.terminate(deadline);
+                return Err(NativeShellError::HostConnect {
+                    message: error.to_string(),
+                });
+            }
+        };
         let mut runtime_owner =
             Self::new_with_runtime_and_process(client, runtime.clone(), process);
-        runtime
-            .block_on(runtime_owner.bootstrap_projection())
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })?;
+        let bootstrap = runtime
+            .block_on(tokio::time::timeout(
+                deadline.remaining(),
+                runtime_owner.bootstrap_projection(),
+            ))
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host bootstrap deadline expired".to_string(),
+            })
+            .and_then(|result| {
+                result.map_err(|error| NativeShellError::HostConnect {
+                    message: error.to_string(),
+                })
+            });
+        if let Err(error) = bootstrap {
+            if let Some(process) = runtime_owner.host_process.as_mut() {
+                process.terminate(deadline);
+            }
+            return Err(error);
+        }
         Ok(runtime_owner)
     }
 
@@ -1159,6 +1404,9 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
 
 impl Drop for NativeHostClientRuntime {
     fn drop(&mut self) {
+        let deadline = NativeShutdownDeadline::from_now(NATIVE_SHUTDOWN_BUDGET);
+        reap_retained_workers();
+        reap_retained_children();
         self.cancellation.store(true, Ordering::Release);
         if self.worker.is_some() {
             // The bounded queue must never make shutdown wait behind pending
@@ -1167,34 +1415,71 @@ impl Drop for NativeHostClientRuntime {
             let _ = self.command_tx.try_send(NativeHostWorkerCommand::Shutdown);
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            join_worker_with_deadline(worker, deadline);
         }
         if let Some(runtime) = self.runtime_guard.as_ref() {
+            // A worker retained past the join budget may still own either
+            // mutex while it observes cancellation. Never block on those
+            // locks after the shared deadline has started; the retained
+            // worker keeps the client/subscription ownership alive for its
+            // eventual reaper.
             if let (Ok(mut client), Ok(mut subscription)) =
-                (self.client.lock(), self.subscription.lock())
+                (self.client.try_lock(), self.subscription.try_lock())
             {
-                let _ = runtime.block_on(async {
-                    tokio::time::timeout(
-                        Duration::from_millis(100),
-                        subscription.release(&mut client),
-                    )
-                    .await
-                });
+                let remaining = deadline.remaining();
+                if !remaining.is_zero() {
+                    let _ = runtime.block_on(async {
+                        tokio::time::timeout(remaining, subscription.release(&mut client)).await
+                    });
+                }
+            }
+        }
+        if let Some(process) = self.host_process.as_mut() {
+            let kind = std::mem::replace(&mut process.kind, NativeHostProcessKind::Empty);
+            if let NativeHostProcessKind::Child(child) = kind {
+                terminate_child_with_deadline(child, deadline);
+            }
+        }
+        if let Some(runtime) = self.runtime_guard.take() {
+            // The worker owns the only other runtime reference.  If it has
+            // exited, take the runtime value and use Tokio's bounded shutdown
+            // rather than allowing Runtime::drop to wait indefinitely.
+            if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                runtime.shutdown_timeout(deadline.remaining());
             }
         }
     }
 }
 
-async fn connect_with_startup_retry(profile: &IsolatedDevProfile) -> Result<HostClient, IpcError> {
+async fn connect_with_startup_retry(
+    profile: &IsolatedDevProfile,
+    deadline: NativeShutdownDeadline,
+) -> Result<HostClient, IpcError> {
     let config = profile.host_client_config();
     let mut last_error = None;
     for _ in 0..40 {
-        match HostClient::connect(config.clone()).await {
-            Ok(client) => return Ok(client),
-            Err(error) => {
+        if deadline.expired() {
+            return Err(last_error.unwrap_or(IpcError::Unavailable));
+        }
+        match tokio::time::timeout(deadline.remaining(), HostClient::connect(config.clone())).await
+        {
+            Ok(Ok(client)) => return Ok(client),
+            Ok(Err(error)) => {
                 last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            Err(_) => return Err(last_error.unwrap_or(IpcError::Unavailable)),
+        }
+        if deadline.expired() {
+            return Err(last_error.unwrap_or(IpcError::Unavailable));
+        }
+        match tokio::time::timeout(
+            deadline.remaining(),
+            tokio::time::sleep(Duration::from_millis(25)),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => return Err(last_error.unwrap_or(IpcError::Unavailable)),
         }
     }
     Err(last_error.unwrap_or(IpcError::Unavailable))
@@ -1331,7 +1616,13 @@ fn pump_subscription_once(
                     | crate::client::SubscriptionError::IncompleteSnapshot
                     | crate::client::SubscriptionError::MissingCapabilities
             ) {
-                match resynchronize_subscription(client, subscription, runtime, cancellation) {
+                match resynchronize_subscription(
+                    client,
+                    subscription,
+                    runtime,
+                    cancellation,
+                    NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
+                ) {
                     Ok(model) => {
                         if let Ok(mut current) = client_model.lock() {
                             *current = Some(Arc::clone(&model));
@@ -1380,7 +1671,13 @@ fn pump_subscription_once(
             }
         }
         SubscriptionUpdate::ResyncRequired { .. } => {
-            let model = resynchronize_subscription(client, subscription, runtime, cancellation);
+            let model = resynchronize_subscription(
+                client,
+                subscription,
+                runtime,
+                cancellation,
+                NativeShutdownDeadline::from_now(NATIVE_STARTUP_BUDGET),
+            );
             match model {
                 Ok(model) => {
                     if let Ok(mut current) = client_model.lock() {
@@ -1417,6 +1714,7 @@ fn resynchronize_subscription(
     subscription: &Arc<Mutex<ClientSubscription>>,
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
+    deadline: NativeShutdownDeadline,
 ) -> Result<Arc<ClientModel>, String> {
     let mut client_guard = client
         .lock()
@@ -1424,24 +1722,29 @@ fn resynchronize_subscription(
     let mut subscription_guard = subscription
         .lock()
         .map_err(|_| "native host subscription lock poisoned".to_string())?;
-    runtime.block_on(async {
-        tokio::select! {
-            result = async {
-                subscription_guard
-                    .release(&mut client_guard)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                *subscription_guard = ClientSubscription::new();
-                subscription_guard
-                    .synchronize(&mut client_guard)
-                    .await
-                    .map_err(|error| error.to_string())
-            } => result,
-            _ = wait_for_cancellation(Arc::clone(cancellation)) => {
-                Err("native host subscription resync cancelled".to_string())
+    let result = runtime.block_on(async {
+        tokio::time::timeout(deadline.remaining(), async {
+            tokio::select! {
+                result = async {
+                    subscription_guard
+                        .release(&mut client_guard)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    *subscription_guard = ClientSubscription::new();
+                    subscription_guard
+                        .synchronize(&mut client_guard)
+                        .await
+                        .map_err(|error| error.to_string())
+                } => result,
+                _ = wait_for_cancellation(Arc::clone(cancellation)) => {
+                    Err("native host subscription resync cancelled".to_string())
+                }
             }
-        }
-    })?;
+        })
+        .await
+        .map_err(|_| "native host subscription resync deadline expired".to_string())?
+    });
+    result?;
     subscription_guard
         .model()
         .cloned()
@@ -1544,8 +1847,13 @@ pub struct NativeInteraction {
     interaction: InteractionStateModel,
     request_generation: u64,
     action_epoch: u64,
+    connection_epoch: u64,
+    client_epoch: u64,
+    resource_generation: u64,
+    runtime_generation: u64,
     client_model: Option<Arc<ClientModel>>,
     pointer_owner: Option<PointerOwner>,
+    pointer_capture: Option<(u64, PointerButton)>,
     last_handler: Option<HandlerTrace>,
     keyboard_state: NativeKeyboardState,
     pending_keyboard: Option<(FocusEpoch, u64, KeyboardAction)>,
@@ -1559,8 +1867,13 @@ impl NativeInteraction {
             interaction: InteractionStateModel::default(),
             request_generation: 0,
             action_epoch: 0,
+            connection_epoch: 0,
+            client_epoch: 0,
+            resource_generation: 0,
+            runtime_generation: 0,
             client_model: None,
             pointer_owner: None,
+            pointer_capture: None,
             last_handler: None,
             keyboard_state: NativeKeyboardState::default(),
             pending_keyboard: None,
@@ -1579,14 +1892,68 @@ impl NativeInteraction {
         self.last_handler.as_ref()
     }
 
+    pub fn action_epochs(&self) -> NativeActionEpochs {
+        NativeActionEpochs {
+            connection_epoch: self.connection_epoch,
+            client_epoch: self.client_epoch,
+            navigation_epoch: self.shell.navigation_epoch(),
+            resource_generation: self.resource_generation,
+            runtime_generation: self.runtime_generation,
+            action_epoch: self.action_epoch,
+            focus_epoch: self
+                .last_handler
+                .as_ref()
+                .map(|trace| trace.focus_epoch)
+                .unwrap_or_else(|| self.current_focus_epoch()),
+        }
+    }
+
+    pub fn set_connection_epoch(&mut self, epoch: u64) {
+        self.connection_epoch = epoch;
+    }
+
+    pub fn set_client_epoch(&mut self, epoch: u64) {
+        self.client_epoch = epoch;
+    }
+
+    pub fn set_resource_generation(&mut self, generation: u64) {
+        self.resource_generation = generation;
+    }
+
+    pub fn set_runtime_generation(&mut self, generation: u64) {
+        self.runtime_generation = generation;
+    }
+
     pub fn accepts_action_record(&self, record: &NativeActionRecord) -> bool {
-        self.last_handler.as_ref().is_some_and(|trace| {
-            trace.focus_epoch == record.focus_epoch
-                && trace.request_generation == record.request_generation
-                && trace.action_epoch == record.action_epoch
-                && trace.consumed
-                && trace.propagation_stopped
-        })
+        let epochs_match = record.connection_epoch == self.connection_epoch
+            && record.client_epoch == self.client_epoch
+            && record.navigation_epoch == self.shell.navigation_epoch()
+            && record.resource_generation == self.resource_generation
+            && record.runtime_generation == self.runtime_generation;
+        let task_match = record.task_id.is_none_or(|task_id| {
+            self.last_handler.as_ref().and_then(|trace| trace.task_id) == Some(task_id)
+        }) && record.task_id.is_none_or(|task_id| {
+            match record.expected_task_revision {
+                None => true,
+                Some(expected_revision) => self
+                    .client_model
+                    .as_ref()
+                    .and_then(|model| model.tasks().get(&task_id))
+                    .is_some_and(|task| {
+                        expected_revision == task.task.revision
+                            && record.captured_task_action_epoch == Some(task.task.action_epoch)
+                    }),
+            }
+        });
+        epochs_match
+            && task_match
+            && self.last_handler.as_ref().is_some_and(|trace| {
+                trace.focus_epoch == record.focus_epoch
+                    && trace.request_generation == record.request_generation
+                    && trace.action_epoch == record.action_epoch
+                    && trace.consumed
+                    && trace.propagation_stopped
+            })
     }
 
     /// Provide the immutable transport projection used to capture mutation
@@ -1594,6 +1961,7 @@ impl NativeInteraction {
     /// rename cannot be synthesized with revision zero.
     pub fn set_client_model(&mut self, model: Option<Arc<ClientModel>>) {
         self.client_model = model;
+        self.client_epoch = self.client_epoch.saturating_add(1);
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
@@ -1684,6 +2052,7 @@ impl NativeInteraction {
         let capture = match capture {
             Ok(owner) => {
                 self.pointer_owner = Some(owner);
+                self.pointer_capture = Some((pointer_id, button));
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1698,10 +2067,42 @@ impl NativeInteraction {
         }
     }
 
-    pub fn terminal_mouse_up(&mut self) -> TerminalReleaseOutcome {
+    pub fn terminal_mouse_up_for(
+        &mut self,
+        pointer_id: u64,
+        button: PointerButton,
+    ) -> TerminalReleaseOutcome {
+        self.terminal_mouse_up_checked(pointer_id, Some(button))
+    }
+
+    /// Consume a release for a GPUI button that has no terminal mapping. It is
+    /// deliberately not coerced to the primary button: an unsupported event
+    /// must never authorize a different captured button.
+    pub fn terminal_mouse_up_unmapped(&mut self, pointer_id: u64) -> TerminalReleaseOutcome {
+        self.terminal_mouse_up_checked(pointer_id, None)
+    }
+
+    fn terminal_mouse_up_checked(
+        &mut self,
+        pointer_id: u64,
+        button: Option<PointerButton>,
+    ) -> TerminalReleaseOutcome {
         let task_id = self.selected_task();
         let (focus_epoch, request_generation) = self.begin_handler(task_id);
-        let release = self.shell.terminal_mouse_up(self.pointer_owner.take());
+        let release = match (self.pointer_capture, self.pointer_owner.as_ref()) {
+            (Some(capture), Some(_)) if button == Some(capture.1) && capture.0 == pointer_id => {
+                self.pointer_capture = None;
+                self.shell.terminal_mouse_up(self.pointer_owner.take())
+            }
+            (Some(_), _) => {
+                TerminalRelease::Rejected(crate::ui::shell::ReleaseRejection::MismatchedOwner)
+            }
+            _ => {
+                self.pointer_capture = None;
+                self.pointer_owner.take();
+                self.shell.terminal_mouse_up(None)
+            }
+        };
         TerminalReleaseOutcome {
             focus_epoch,
             task_id,
@@ -1710,6 +2111,16 @@ impl NativeInteraction {
             propagation_stopped: true,
             release,
         }
+    }
+
+    /// Compatibility seam for callers that already hold the shell-owned
+    /// native pointer id/button. New GPUI paths must use
+    /// [`Self::terminal_mouse_up_for`] so the event button is checked.
+    pub fn terminal_mouse_up(&mut self) -> TerminalReleaseOutcome {
+        let (pointer_id, button) = self
+            .pointer_capture
+            .unwrap_or((NATIVE_POINTER_ID, PointerButton::Primary));
+        self.terminal_mouse_up_for(pointer_id, button)
     }
 
     pub fn keyboard(
@@ -1825,6 +2236,11 @@ impl NativeInteraction {
             focus_epoch,
             request_generation,
             action_epoch: self.action_epoch,
+            connection_epoch: self.connection_epoch,
+            client_epoch: self.client_epoch,
+            navigation_epoch: self.shell.navigation_epoch(),
+            resource_generation: self.resource_generation,
+            runtime_generation: self.runtime_generation,
             task_id: request_task,
             expected_task_revision,
             captured_task_action_epoch,
@@ -2068,11 +2484,17 @@ impl AccessibilityTree {
 
 struct NativePlatformAccessibilityBridge {
     tree: Arc<Mutex<accesskit::TreeUpdate>>,
-    pending_actions: Arc<Mutex<VecDeque<accesskit::ActionRequest>>>,
+    pending_actions: Arc<Mutex<VecDeque<NativeAccessibilityAction>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
     node_count: usize,
     attached: bool,
     #[cfg(windows)]
     adapter: Option<accesskit_windows::SubclassingAdapter>,
+}
+
+struct NativeAccessibilityAction {
+    request: accesskit::ActionRequest,
+    tree_generation: u64,
 }
 
 impl NativePlatformAccessibilityBridge {
@@ -2081,6 +2503,7 @@ impl NativePlatformAccessibilityBridge {
         Self {
             tree: Arc::new(Mutex::new(update)),
             pending_actions: Arc::new(Mutex::new(VecDeque::new())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             node_count: tree.nodes().len(),
             attached: false,
             #[cfg(windows)]
@@ -2092,7 +2515,7 @@ impl NativePlatformAccessibilityBridge {
         self.attached
     }
 
-    fn take_actions(&mut self, max: usize) -> Vec<accesskit::ActionRequest> {
+    fn take_actions(&mut self, max: usize) -> Vec<NativeAccessibilityAction> {
         self.pending_actions
             .lock()
             .map(|mut actions| {
@@ -2104,6 +2527,14 @@ impl NativePlatformAccessibilityBridge {
 
     fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn is_current_generation(&self, generation: u64) -> bool {
+        generation == self.generation()
     }
 
     fn tree_update(&self) -> accesskit::TreeUpdate {
@@ -2132,6 +2563,7 @@ impl NativePlatformAccessibilityBridge {
             };
             let action_handler = NativeAccessKitActionHandler {
                 pending: Arc::clone(&self.pending_actions),
+                generation: Arc::clone(&self.generation),
             };
             self.adapter = Some(accesskit_windows::SubclassingAdapter::new(
                 hwnd,
@@ -2146,6 +2578,11 @@ impl NativePlatformAccessibilityBridge {
 
     fn sync(&mut self, tree: &AccessibilityTree) {
         self.node_count = tree.nodes().len();
+        let _ = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            });
         let update = accesskit_tree_update(tree);
         if let Ok(mut current) = self.tree.lock() {
             *current = update.clone();
@@ -2187,6 +2624,33 @@ fn accesskit_tree_update(tree: &AccessibilityTree) -> accesskit::TreeUpdate {
         node.set_label(source.name().to_string());
         node.set_description(source.description().to_string());
         node.set_author_id(source.element_id().to_string());
+        if matches!(source.role(), AccessibleRole::Button) {
+            // A Button role alone does not advertise invokable/focusable
+            // semantics to every AccessKit consumer.  Keep these actions on
+            // the same node that the GPUI row uses; no parallel action model
+            // is introduced.
+            node.add_action(accesskit::Action::Click);
+            node.add_action(accesskit::Action::Focus);
+        }
+        let metadata = source.metadata();
+        if metadata.disabled {
+            node.set_disabled();
+        }
+        if metadata.busy {
+            node.set_busy();
+        }
+        if metadata.read_only {
+            node.set_read_only();
+        }
+        if metadata.invalid {
+            node.set_invalid(accesskit::Invalid::Grammar);
+        }
+        if let Some(value) = metadata.value.as_ref() {
+            node.set_value(value.clone());
+        }
+        if let Some(error) = metadata.error.as_ref() {
+            node.set_description(format!("{} {}", source.description(), error));
+        }
         if source.metadata().focused {
             node.set_selected(true);
             *focused = Some(id);
@@ -2221,7 +2685,8 @@ impl accesskit::ActivationHandler for NativeAccessKitActivation {
 
 #[cfg(windows)]
 struct NativeAccessKitActionHandler {
-    pending: Arc<Mutex<VecDeque<accesskit::ActionRequest>>>,
+    pending: Arc<Mutex<VecDeque<NativeAccessibilityAction>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(windows)]
@@ -2229,7 +2694,10 @@ impl accesskit::ActionHandler for NativeAccessKitActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
         if let Ok(mut pending) = self.pending.lock() {
             if pending.len() < MAX_ACCESSIBILITY_ACTIONS {
-                pending.push_back(request);
+                pending.push_back(NativeAccessibilityAction {
+                    request,
+                    tree_generation: self.generation.load(Ordering::Acquire),
+                });
             }
         }
     }
@@ -2309,7 +2777,7 @@ pub struct NativeShell {
     preferences: RuntimePreferencesSnapshot,
     header_attachment: NativeHeaderAttachment,
     client_model: Option<Arc<ClientModel>>,
-    task_list: TaskList,
+    inbox: Inbox,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
@@ -2432,10 +2900,13 @@ impl NativeShell {
         cx: &mut Context<Self>,
         start_controller: bool,
     ) -> Self {
-        let task_list = TaskList::empty();
+        let inbox = Inbox::empty();
         let header_attachment = NativeHeaderAttachment::default();
-        let accessibility_tree =
-            AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
+        let accessibility_tree = AccessibilityTree::for_task_list_with_header(
+            inbox.task_list(),
+            None,
+            &header_attachment,
+        );
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut shell = Self {
             host_connection: profile.host_connection(),
@@ -2445,7 +2916,7 @@ impl NativeShell {
             preferences,
             header_attachment,
             client_model: None,
-            task_list,
+            inbox,
             interaction: NativeInteraction::new(None),
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
@@ -2502,7 +2973,7 @@ impl NativeShell {
     pub fn attach_header_projection(&mut self, attachment: NativeHeaderAttachment) {
         self.header_attachment = attachment;
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            &self.task_list,
+            self.inbox.task_list(),
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -2619,7 +3090,17 @@ impl NativeShell {
         // The handler only queues bounded requests; this controller tick is
         // the sole GPUI/input owner that resolves them against the current
         // rendered tree and focus capture.
-        for request in self.platform_accessibility.take_actions(max) {
+        for queued in self.platform_accessibility.take_actions(max) {
+            if !self
+                .platform_accessibility
+                .is_current_generation(queued.tree_generation)
+            {
+                // Node ids are only meaningful within the tree generation
+                // that produced them.  A reorder/removal must never route an
+                // old assistive-technology action to a new row.
+                continue;
+            }
+            let request = queued.request;
             if !matches!(
                 request.action,
                 accesskit::Action::Click | accesskit::Action::Focus
@@ -2634,18 +3115,18 @@ impl NativeShell {
             };
             let _ = self
                 .interaction
-                .navigation_mouse_down(task_id, &self.task_list);
+                .navigation_mouse_down(task_id, self.inbox.task_list());
         }
 
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
         let metrics = self.preferences.tokens().density.physical();
-        let _ = self.task_list.set_scroll_offset_pixels(
+        let _ = self.inbox.task_list_mut().set_scroll_offset_pixels(
             -offset,
             metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
             metrics.row_height as f32,
         );
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            &self.task_list,
+            self.inbox.task_list(),
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -2776,9 +3257,9 @@ impl NativeShell {
             .selected_task()
             .filter(|task_id| task_list.task_ids().contains(task_id));
         self.interaction.sync_selected_task(selected_task);
-        self.task_list = task_list;
+        self.inbox = Inbox::from_task_list(task_list);
         self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-            &self.task_list,
+            self.inbox.task_list(),
             self.interaction.selected_task(),
             &self.header_attachment,
         );
@@ -2799,11 +3280,16 @@ impl NativeShell {
     }
 
     pub fn task_list(&self) -> &TaskList {
-        &self.task_list
+        self.inbox.task_list()
+    }
+
+    pub fn inbox(&self) -> &Inbox {
+        &self.inbox
     }
 
     pub fn rendered_task_count(&self) -> usize {
-        self.task_list
+        self.inbox
+            .task_list()
             .rendered_task_ids()
             .len()
             .min(MAX_RENDERED_TASK_ROWS)
@@ -2890,7 +3376,7 @@ impl NativeShell {
     fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
         let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
-        let task_ids = self.task_list.shared_task_ids();
+        let task_ids = self.inbox.task_list().shared_task_ids();
         let shell_entity = cx.entity().downgrade();
         let task_list_element = uniform_list(
             "native-task-uniform-list",
@@ -2911,12 +3397,13 @@ impl NativeShell {
                                     let _ = shell_for_mouse.update(app, |shell, cx| {
                                         cx.stop_propagation();
                                         shell.focus_handle.focus(window);
-                                        let _ = shell
-                                            .interaction
-                                            .navigation_mouse_down(task_id, &shell.task_list);
+                                        let _ = shell.interaction.navigation_mouse_down(
+                                            task_id,
+                                            shell.inbox.task_list(),
+                                        );
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
-                                                &shell.task_list,
+                                                shell.inbox.task_list(),
                                                 shell.interaction.selected_task(),
                                                 &shell.header_attachment,
                                             );
@@ -2933,12 +3420,13 @@ impl NativeShell {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
-                                        let _ = shell
-                                            .interaction
-                                            .navigation_mouse_down(task_id, &shell.task_list);
+                                        let _ = shell.interaction.navigation_mouse_down(
+                                            task_id,
+                                            shell.inbox.task_list(),
+                                        );
                                         shell.accessibility_tree =
                                             AccessibilityTree::for_task_list_with_header(
-                                                &shell.task_list,
+                                                shell.inbox.task_list(),
                                                 shell.interaction.selected_task(),
                                                 &shell.header_attachment,
                                             );
@@ -2957,7 +3445,12 @@ impl NativeShell {
                             .border_b_1()
                             .border_color(tokens.borders.subtle.to_gpui())
                             .whitespace_normal()
-                            .on_mouse_down(MouseButton::Left, mouse_handler)
+                            // Capture every button at the row boundary so a
+                            // right/middle click cannot fall through to the
+                            // terminal dock behind the list. The handler
+                            // still navigates only on the explicit primary
+                            // button.
+                            .capture_any_mouse_down(mouse_handler)
                             .on_key_down(key_handler)
                             .child(format!("Task {task_id}"))
                             .into_any_element()
@@ -2971,19 +3464,26 @@ impl NativeShell {
             cx.stop_propagation();
             shell.focus_handle.focus(window);
             let selected = shell.interaction.selected_task();
-            if let Some(task_id) = selected {
+            if let (Some(task_id), Some(button)) = (selected, pointer_button(event.button)) {
                 shell.interaction.terminal_mouse_down(
                     NATIVE_POINTER_ID,
                     task_id,
-                    PointerButton::Primary,
+                    button,
                     Some(task_id),
                 );
             }
-            let _ = event;
         });
-        let terminal_up = cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
+        let terminal_up = cx.listener(|shell, event: &MouseUpEvent, _window, cx| {
             cx.stop_propagation();
-            shell.interaction.terminal_mouse_up();
+            if let Some(button) = pointer_button(event.button) {
+                shell
+                    .interaction
+                    .terminal_mouse_up_for(NATIVE_POINTER_ID, button);
+            } else {
+                shell
+                    .interaction
+                    .terminal_mouse_up_unmapped(NATIVE_POINTER_ID);
+            }
         });
         let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
@@ -2995,7 +3495,7 @@ impl NativeShell {
                 .base_handle
                 .set_offset(point(offset.x, offset.y - delta));
             shell.accessibility_tree = AccessibilityTree::for_task_list_with_header(
-                &shell.task_list,
+                shell.inbox.task_list(),
                 shell.interaction.selected_task(),
                 &shell.header_attachment,
             );
@@ -3396,7 +3896,10 @@ fn bounded_host_error(message: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_isolated_host_config_base, isolated_dev_profile, wait_for_cancellation};
+    use super::{
+        ensure_isolated_host_config_base, isolated_dev_profile, wait_for_cancellation,
+        AccessibilityTree, NativePlatformAccessibilityBridge, NativeShutdownDeadline,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -3430,6 +3933,30 @@ mod tests {
         runtime.block_on(wait_for_cancellation(cancellation));
         setter.join().expect("cancellation setter");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn native_shutdown_deadline_is_one_absolute_budget() {
+        let deadline = NativeShutdownDeadline::from_now(Duration::from_millis(25));
+        let first = deadline.remaining();
+        std::thread::sleep(Duration::from_millis(3));
+        let second = deadline.remaining();
+        assert!(second < first);
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(deadline.expired());
+        assert_eq!(deadline.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn accessibility_actions_from_an_old_tree_generation_are_not_current() {
+        let tree =
+            AccessibilityTree::for_task_list(&crate::ui::task_cockpit::TaskList::empty(), None);
+        let mut bridge = NativePlatformAccessibilityBridge::new(&tree);
+        let old_generation = bridge.generation();
+        bridge.sync(&tree);
+        assert!(!bridge.is_current_generation(old_generation));
+        assert!(bridge.is_current_generation(bridge.generation()));
     }
 }
 

@@ -59,6 +59,10 @@ impl CaptureDeadline {
             .checked_duration_since(Instant::now())
             .ok_or(PreviewCaptureError::DeadlineExceeded)
     }
+
+    pub(crate) fn instant(self) -> Instant {
+        self.deadline
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1190,7 +1194,7 @@ mod windows_capture_impl {
         let run_result = catch_unwind(AssertUnwindSafe(|| {
             application.run(move |cx| {
                 crate::ui::preview::register_preview_environment(cx);
-                let root = match root.instantiate_native_shell_for_capture(cx) {
+                let root = match root.instantiate_native_shell_for_capture(cx, deadline.instant()) {
                     Ok(root) => root,
                     Err(error) => {
                         let _ = result_for_app.lock().unwrap().replace(Err(

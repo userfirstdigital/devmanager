@@ -561,6 +561,7 @@ impl PreviewRoot {
     pub(crate) fn instantiate_native_shell_for_capture(
         mut self,
         cx: &mut gpui::App,
+        deadline: std::time::Instant,
     ) -> Result<Self, PreviewError> {
         if self.snapshot.root_kind != "task-cockpit" {
             return Ok(self);
@@ -571,12 +572,11 @@ impl PreviewRoot {
             }
         })?;
         let mut bootstrap = ProcessNativeHostBootstrap;
-        let attachment =
-            bootstrap
-                .start(&profile)
-                .map_err(|error| PreviewError::ApplicationFailed {
-                    reason: error.to_string(),
-                })?;
+        let attachment = bootstrap.start_until(&profile, deadline).map_err(|error| {
+            PreviewError::ApplicationFailed {
+                reason: error.to_string(),
+            }
+        })?;
         let shell = match attachment {
             NativeHostRuntimeAttachment::Client(runtime) => {
                 cx.new(|cx| NativeShell::new_with_host_runtime(profile, Some(runtime), cx))

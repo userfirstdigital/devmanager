@@ -285,6 +285,12 @@ fn task_list_consumes_only_model_ids_and_keeps_deterministic_order() {
 }
 
 #[test]
+fn duplicate_task_ids_are_rejected_before_uniform_list_keys_collide() {
+    let task = task_id_from_index(7);
+    assert!(TaskList::from_virtual_task_ids(vec![task, task]).is_err());
+}
+
+#[test]
 fn task_list_retains_all_model_ids_instead_of_using_a_5000_cap() {
     let fixture = fixture("task-list-5000.json");
     let mut ids = fixture.task_ids;

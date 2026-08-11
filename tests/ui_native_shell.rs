@@ -374,6 +374,11 @@ fn native_action_dispatch_is_selection_and_interaction_fenced() {
         pointer_action.event.source,
         ActivationSource::Pointer { pointer_id: 17 }
     ));
+
+    let show = interaction
+        .action(ActionRequest::TaskShow { task_id: selected })
+        .expect("selected task show should remain dispatchable without a mutation revision");
+    assert!(interaction.accepts_action_record(&show));
 }
 
 #[test]
@@ -411,6 +416,67 @@ fn native_mutating_action_captures_model_revision_and_epochs() {
         .expect("new action should be accepted");
     assert!(!interaction.accepts_action_record(&record));
     assert!(interaction.accepts_action_record(&newer));
+}
+
+#[test]
+fn native_action_rejects_foreign_connection_and_runtime_epochs() {
+    let selected = task_id(32);
+    let mut interaction = NativeInteraction::new(Some(selected));
+    let record = interaction
+        .action(ActionRequest::HostStatus)
+        .expect("host status action should be captured");
+
+    interaction.set_connection_epoch(7);
+    assert!(!interaction.accepts_action_record(&record));
+
+    let replacement = interaction
+        .action(ActionRequest::HostStatus)
+        .expect("new host status action should be captured");
+    interaction.set_runtime_generation(4);
+    assert!(!interaction.accepts_action_record(&replacement));
+}
+
+#[test]
+fn native_pointer_release_requires_the_captured_pointer_and_button() {
+    let selected = task_id(33);
+    let mut interaction = NativeInteraction::new(Some(selected));
+    let down = interaction.terminal_mouse_down(7, selected, PointerButton::Primary, Some(selected));
+    assert!(down.capture.is_ok());
+
+    let wrong_button = interaction.terminal_mouse_up_for(7, PointerButton::Secondary);
+    assert_eq!(
+        wrong_button.release,
+        devmanager::ui::shell::TerminalRelease::Rejected(
+            devmanager::ui::shell::ReleaseRejection::MismatchedOwner
+        )
+    );
+    let release = interaction.terminal_mouse_up_for(7, PointerButton::Primary);
+    assert_eq!(
+        release.release,
+        devmanager::ui::shell::TerminalRelease::Authorized
+    );
+}
+
+#[test]
+fn native_pointer_release_rejects_unmapped_button_without_releasing_capture() {
+    let selected = task_id(34);
+    let mut interaction = NativeInteraction::new(Some(selected));
+    let down = interaction.terminal_mouse_down(8, selected, PointerButton::Primary, Some(selected));
+    assert!(down.capture.is_ok());
+
+    let unsupported = interaction.terminal_mouse_up_unmapped(8);
+    assert_eq!(
+        unsupported.release,
+        devmanager::ui::shell::TerminalRelease::Rejected(
+            devmanager::ui::shell::ReleaseRejection::MismatchedOwner
+        )
+    );
+
+    let release = interaction.terminal_mouse_up_for(8, PointerButton::Primary);
+    assert_eq!(
+        release.release,
+        devmanager::ui::shell::TerminalRelease::Authorized
+    );
 }
 
 #[test]
@@ -607,4 +673,6 @@ fn platform_accessibility_tree_exposes_the_focused_task_node() {
         .expect("focused platform node");
     assert_eq!(focused.is_selected(), Some(true));
     assert_eq!(focused.label(), Some(format!("Task {task}").as_str()));
+    assert!(focused.supports_action(accesskit::Action::Click));
+    assert!(focused.supports_action(accesskit::Action::Focus));
 }

@@ -1,5 +1,6 @@
 //! Bounded, deterministic task-list projection and local virtual viewport.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -172,6 +173,18 @@ impl TaskList {
     /// creates row elements for its current viewport.
     pub fn from_virtual_task_ids(task_ids: Vec<TaskId>) -> Result<Self, TaskListOverflow> {
         let total_count = task_ids.len();
+        let mut seen = HashSet::with_capacity(task_ids.len());
+        if task_ids.iter().any(|task_id| !seen.insert(*task_id)) {
+            return Err(TaskListOverflow {
+                // A duplicate source cannot be safely truncated or repaired:
+                // stable row identity would become ambiguous.  Keep the
+                // existing overflow error seam and report that no source was
+                // retained.
+                limit: usize::MAX,
+                total_count,
+                retained_count: 0,
+            });
+        }
         Ok(Self {
             task_ids: Arc::new(task_ids),
             viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, total_count),
@@ -340,6 +353,12 @@ pub struct Inbox {
 }
 
 impl Inbox {
+    pub fn empty() -> Self {
+        Self {
+            task_list: TaskList::empty(),
+        }
+    }
+
     pub fn from_model(model: &ClientModel) -> Self {
         Self {
             task_list: TaskList::from_model(model),
@@ -352,5 +371,9 @@ impl Inbox {
 
     pub fn task_list_mut(&mut self) -> &mut TaskList {
         &mut self.task_list
+    }
+
+    pub fn from_task_list(task_list: TaskList) -> Self {
+        Self { task_list }
     }
 }
