@@ -5,23 +5,20 @@ use devmanager::client::{ClientModel, ClientModelBuilder};
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::id::AgentSessionId;
 use devmanager::domain::id::TaskId;
-use devmanager::domain::snapshot::{SnapshotItem, SnapshotPage};
+use devmanager::domain::snapshot::{SnapshotItem, SnapshotItemKey, SnapshotPage};
 use devmanager::domain::task::{TaskActivity, VisibleTaskStatus};
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{HostEpochSnapshot, PointerButton, Shell, ShellAttachmentError};
 use devmanager::ui::task_cockpit::header::{
-    AgentRoleProjection, CpuInputUnit, RemoteHealth, RemoteObservation, RemoteObservationIdentity,
+    AgentRoleProjection, CpuInputUnit, HeaderFieldKey, HeaderHighWaterLedger, HighWaterDecision,
+    PendingHeaderActionQueue, RemoteHealth, RemoteObservation, RemoteObservationIdentity,
     TitleLayout,
 };
 use devmanager::ui::task_cockpit::{
-    native_next_host_channel, HeaderField, HostSnapshot, NativeNextDispatchStatus,
-    NativeNextHostCommand, NativeNextHostEvent, NativeNextTaskCockpit,
-    NativeNextTaskCockpitProjection, PrimaryAgentProjection, TaskHeaderModel, TopBarModel,
-    TopBarProjectionController, TopBarProjectionInput, WorkspaceProjection, MAX_HEADER_SPECIALISTS,
-    PROVIDER_QUOTA_MAX_AGE_MS,
+    HeaderField, PrimaryAgentProjection, TaskHeaderModel, TopBarModel, TopBarProjectionController,
+    TopBarProjectionInput, WorkspaceProjection, MAX_HEADER_SPECIALISTS, PROVIDER_QUOTA_MAX_AGE_MS,
 };
-use devmanager::ui::tokens::Scale;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -60,23 +57,6 @@ fn project_header(model: &ClientModel, task_id: TaskId) -> TaskHeaderModel {
     shell
         .task_header(model)
         .expect("selected task must project")
-}
-
-fn native_cockpit(
-    model: ClientModel,
-    shell: Shell,
-    top_bar: TopBarProjectionInput,
-) -> (
-    NativeNextTaskCockpit,
-    devmanager::ui::task_cockpit::NativeNextHostWorker,
-) {
-    let snapshot = HostSnapshot::try_from_host(1, 1, model, shell, top_bar)
-        .expect("test host snapshot must be valid");
-    let (client, worker) = native_next_host_channel(32);
-    (
-        NativeNextTaskCockpit::from_host_snapshot(snapshot, client),
-        worker,
-    )
 }
 
 #[test]
@@ -757,12 +737,12 @@ fn specialist_cap_announces_total_hidden_count_and_orders_by_agent_id() {
     let model = model_from_pages(&pages);
     let header = project_header(&model, task_id);
     assert_eq!(header.specialist_total, 34);
-    assert_eq!(header.specialists.len(), MAX_HEADER_SPECIALISTS);
-    assert_eq!(header.specialist_hidden_count, 2);
-    assert!(header.specialists_truncated);
+    assert_eq!(header.specialists.len(), 34);
+    assert_eq!(header.specialist_hidden_count, 0);
+    assert!(!header.specialists_truncated);
     assert!(header
         .accessible_description
-        .contains("34 specialists shown, 2 hidden"));
+        .contains("34 specialists shown, 0 hidden"));
 
     let ids: Vec<_> = header
         .specialists
@@ -1037,146 +1017,264 @@ fn public_identity_input_and_action_debug_display_are_opaque() {
 }
 
 #[test]
-fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
-    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
-    let (mut cockpit, worker) = native_cockpit(model, shell, fixture.top_bar.clone());
+fn header_high_water_tombstones_block_removed_revival_and_equal_generation_conflicts() {
+    let task_id = fixture().selected_task_id;
+    let agent_id =
+        AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000023").expect("fixture agent id");
+    let mut ledger = HeaderHighWaterLedger::new(32, 1_000);
 
-    let surface = cockpit.render_surface(360);
     assert_eq!(
-        surface.header.as_ref().expect("task header").title,
-        "Ship the native cockpit"
+        ledger.observe(HeaderFieldKey::Task(task_id), 7, 1, 100, 11, false,),
+        HighWaterDecision::Accepted
     );
-    let details = surface
-        .overflow_control
-        .as_ref()
-        .expect("narrow header must expose a details control");
-    assert_eq!(details.role, AccessibleRole::Button);
-    assert!(details.focusable);
-    assert!(!details.tooltip.is_empty());
     assert_eq!(
-        details.keyboard_action,
-        devmanager::ui::actions::KeyboardAction::OpenTaskDetails
-    );
-
-    assert!(cockpit.activate_open_task_details());
-    cockpit.tick();
-    let NativeNextHostCommand::Dispatch(action) = worker
-        .try_recv()
-        .expect("activation must dispatch the projected action");
-    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
-    assert!(matches!(
-        action.target(),
-        devmanager::ui::task_cockpit::header::ActionTarget::Task(_)
-    ));
-
-    let (mut wide_cockpit, wide_worker) = native_cockpit(
-        model_from_pages(&fixture.snapshot_pages),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model_from_pages(&fixture.snapshot_pages).last_applied_sequence(),
+        ledger.observe(
+            HeaderFieldKey::Agent { task_id, agent_id },
+            7,
+            1,
+            101,
+            21,
+            false,
         ),
-        fixture.top_bar,
-    );
-    assert!(wide_cockpit.render_surface(720).overflow_menu.is_none());
-    assert!(wide_cockpit.activate_open_task_details());
-    wide_cockpit.tick();
-    let NativeNextHostCommand::Dispatch(action) = wide_worker
-        .try_recv()
-        .expect("Ctrl+M must dispatch at wide width too");
-    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
-}
-
-#[test]
-fn native_next_surface_has_one_top_bar_projection_truth() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
-    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
-    let top_bar = TopBarModel::from_input(&fixture.top_bar);
-    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
-
-    let surface = cockpit.render_surface(720);
-    assert_eq!(surface.top_bar, top_bar);
-    assert!(surface.header.is_some());
-}
-
-#[test]
-fn native_next_projection_consumes_controller_and_keeps_controller_debug_opaque() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let mut shell = attached_shell(Some(fixture.selected_task_id), 1);
-    assert!(shell.sync_client_epoch(model.last_applied_sequence()));
-    let projection = NativeNextTaskCockpitProjection::from_client_model(
-        &model,
-        &shell,
-        TopBarModel::from_input(&fixture.top_bar),
+        HighWaterDecision::Accepted
     );
     assert_eq!(
-        projection.top_bar,
-        TopBarModel::from_input(&fixture.top_bar)
+        ledger.observe(HeaderFieldKey::Task(task_id), 7, 2, 102, 22, true,),
+        HighWaterDecision::Accepted
     );
-
-    let mut controller_input = fixture.top_bar;
-    controller_input.quotas[0].identity.provider = "PROVIDER_KEY_SECRET_SENTINEL".into();
-    controller_input.quotas[0].identity.provider_session_id =
-        "PROVIDER_SESSION_SECRET_SENTINEL".into();
-    let controller = TopBarProjectionController::new(controller_input)
-        .expect("bounded provider values must pass controller preflight");
-    let debug = format!("{controller:?}");
-    let display = format!("{controller}");
-    assert!(!debug.contains("PROVIDER_KEY_SECRET_SENTINEL"));
-    assert!(!debug.contains("PROVIDER_SESSION_SECRET_SENTINEL"));
-    assert!(!display.contains("PROVIDER_KEY_SECRET_SENTINEL"));
-    assert!(!display.contains("PROVIDER_SESSION_SECRET_SENTINEL"));
+    assert_eq!(
+        ledger.observe(HeaderFieldKey::Task(task_id), 7, 1, 103, 11, false,),
+        HighWaterDecision::IgnoredStale
+    );
+    assert_eq!(
+        ledger.observe(HeaderFieldKey::Task(task_id), 7, 2, 104, 99, false,),
+        HighWaterDecision::RejectedConflict
+    );
+    assert_eq!(
+        ledger.observe(HeaderFieldKey::Task(task_id), 7, 3, 105, 33, false,),
+        HighWaterDecision::Accepted
+    );
 }
 
 #[test]
-fn native_next_dispatch_rechecks_shell_epochs_after_projection() {
+fn header_high_water_fences_nested_provider_resource_quota_and_remote_fields() {
+    let task_id = fixture().selected_task_id;
+    let agent_id =
+        AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000023").expect("fixture agent id");
+    let mut ledger = HeaderHighWaterLedger::new(32, 1_000);
+    let keys = [
+        HeaderFieldKey::AgentProvider { task_id, agent_id },
+        HeaderFieldKey::AgentResource {
+            task_id,
+            agent_id,
+            field: devmanager::ui::task_cockpit::header::AgentResourceField::Cpu,
+        },
+        HeaderFieldKey::Quota {
+            provider: "claude".to_string(),
+            provider_session_id: "session".to_string(),
+        },
+        HeaderFieldKey::Remote {
+            source_id: "remote".to_string(),
+        },
+    ];
+
+    for (index, key) in keys.into_iter().enumerate() {
+        assert_eq!(
+            ledger.observe(key.clone(), 7, 4, 200 + index as i64, 40, false),
+            HighWaterDecision::Accepted
+        );
+        assert_eq!(
+            ledger.observe(key, 7, 4, 210 + index as i64, 41, false),
+            HighWaterDecision::RejectedConflict
+        );
+    }
+}
+
+#[test]
+fn header_high_water_expiry_and_capacity_rules_bound_tombstone_memory() {
+    let task_id = fixture().selected_task_id;
+    let agent_id =
+        AgentSessionId::parse("018f60b0-9c1a-7001-8000-000000000023").expect("fixture agent id");
+    let mut ledger = HeaderHighWaterLedger::new(2, 10);
+    let task_key = HeaderFieldKey::Task(task_id);
+    let agent_key = HeaderFieldKey::Agent { task_id, agent_id };
+    let quota_key = HeaderFieldKey::Quota {
+        provider: "claude".to_string(),
+        provider_session_id: "session".to_string(),
+    };
+
+    assert_eq!(
+        ledger.observe(task_key.clone(), 7, 1, 100, 1, false),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        ledger.observe(agent_key, 7, 1, 101, 2, false),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        ledger.observe(quota_key, 7, 1, 102, 3, false),
+        HighWaterDecision::RejectedCapacity
+    );
+    assert_eq!(
+        ledger.observe(task_key.clone(), 7, 2, 112, 4, true),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(ledger.tombstone_count(), 1);
+    assert!(ledger.contains_tombstone(&task_key));
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger.observe(task_key, 7, 1, 122, 1, false),
+        HighWaterDecision::Accepted,
+        "expired tombstones may be replaced only after the explicit TTL"
+    );
+    assert_eq!(ledger.tombstone_count(), 0);
+}
+
+#[test]
+fn specialist_projection_retains_plan_cap_and_exposes_bounded_stable_keyed_window() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
-    let mut cockpit_shell = attached_shell(Some(fixture.selected_task_id), 1);
-    assert!(cockpit_shell.sync_client_epoch(model.last_applied_sequence()));
-    let mut stale_shell = attached_shell(Some(fixture.selected_task_id), 1);
-    assert!(stale_shell.sync_client_epoch(model.last_applied_sequence()));
-    let (mut cockpit, worker) =
-        native_cockpit(model.clone(), cockpit_shell, fixture.top_bar.clone());
+    let header = project_header(&model, fixture.selected_task_id);
 
-    let captured_action = cockpit
-        .projection()
-        .header
-        .as_ref()
-        .expect("header")
+    assert!(MAX_HEADER_SPECIALISTS >= 5_000);
+    assert_eq!(header.specialist_total, header.specialists.len());
+    let window = header.specialist_window(0, usize::MAX);
+    assert!(window.items.len() <= 128);
+    assert_eq!(window.total, header.specialists.len());
+    assert_eq!(
+        window
+            .items
+            .iter()
+            .map(|agent| agent.identity.agent_id)
+            .collect::<Vec<_>>(),
+        header
+            .specialists
+            .iter()
+            .take(window.items.len())
+            .map(|agent| agent.identity.agent_id)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn specialist_projection_retains_5000_and_stable_window_keys_across_page_reorder() {
+    let fixture = fixture();
+    let task_id = fixture.selected_task_id;
+    let mut base_pages = fixture.snapshot_pages.clone();
+    let agent_page_index = base_pages
+        .iter()
+        .position(|page| {
+            matches!(
+                page.section,
+                devmanager::domain::snapshot::SnapshotSection::AgentSessions
+            )
+        })
+        .expect("agent page");
+    let agent_page = base_pages.remove(agent_page_index);
+    let mut extra_items = Vec::new();
+    for index in 0..5_001 {
+        extra_items.push(SnapshotItem::AgentSession(AgentSessionFacts {
+            id: AgentSessionId::new(),
+            task_id,
+            role: AgentRole::Specialist {
+                name: format!("extra-{index:05}"),
+            },
+            provider_kind: "codex".to_string(),
+            provider_session_id: Some(format!("extra-session-{index:05}")),
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 1,
+            revision: 1,
+        }));
+    }
+    let mut all_items = agent_page.items.clone();
+    all_items.extend(extra_items.clone());
+
+    let make_pages = |items: Vec<SnapshotItem>| {
+        let mut pages = base_pages.clone();
+        let mut replacement = Vec::new();
+        let mut previous_id = None;
+        let chunks: Vec<Vec<SnapshotItem>> = items.chunks(900).map(ToOwned::to_owned).collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last_id = match chunk.last().expect("non-empty chunk") {
+                SnapshotItem::AgentSession(agent) => agent.id,
+                other => panic!("unexpected agent page item: {other:?}"),
+            };
+            replacement.push(SnapshotPage {
+                snapshot_id: agent_page.snapshot_id,
+                through_sequence: agent_page.through_sequence,
+                section: agent_page.section,
+                after_item: previous_id.map(SnapshotItemKey::AgentSession),
+                items: chunk.clone(),
+                encoded_bytes: agent_page.encoded_bytes,
+                next_cursor: (index + 1 < chunks.len()).then(|| vec![index as u8]),
+            });
+            previous_id = Some(last_id);
+        }
+        pages.splice(agent_page_index..agent_page_index, replacement);
+        pages
+    };
+
+    let first = model_from_pages(&make_pages(all_items.clone()));
+    all_items.reverse();
+    let reordered = model_from_pages(&make_pages(all_items));
+    let first_header = project_header(&first, task_id);
+    let reordered_header = project_header(&reordered, task_id);
+
+    assert_eq!(first_header.specialist_total, 5_002);
+    assert_eq!(first_header.specialists.len(), 5_000);
+    assert_eq!(first_header.specialist_hidden_count, 2);
+    assert!(first_header.specialists_truncated);
+    let first_window = first_header.specialist_window(4_990, 200);
+    let reordered_window = reordered_header.specialist_window(4_990, 200);
+    assert_eq!(first_window.items.len(), 10);
+    assert_eq!(first_window, reordered_window);
+    assert!(first_window
+        .items
+        .windows(2)
+        .all(|agents| agents[0].identity.agent_id != agents[1].identity.agent_id));
+}
+
+#[test]
+fn top_bar_model_contains_explicit_remote_projection_and_one_quota_projection() {
+    let fixture = fixture();
+    let remote = RemoteObservation {
+        identity: RemoteObservationIdentity {
+            source_id: "remote-host".to_string(),
+            revision: 2,
+        },
+        health: RemoteHealth::Healthy,
+        label: "Remote host".to_string(),
+        observed_at_ms: Some(fixture.top_bar.now_ms - 10),
+        generation: Some(fixture.top_bar.generation),
+    };
+    let controller = TopBarProjectionController::new_with_remote(fixture.top_bar, Some(remote))
+        .expect("remote projection");
+    let model = controller.model();
+
+    let remote = model.remote.as_ref().expect("remote must be rendered");
+    assert_eq!(remote.health, RemoteHealth::Healthy);
+    assert_eq!(remote.label, "Remote host");
+    assert_eq!(model.quotas.len(), 1);
+    assert!(model.accessible_description.contains("Remote host"));
+}
+
+#[test]
+fn pending_header_actions_are_bounded_and_preserve_captured_focus_epoch() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let action = project_header(&model, fixture.selected_task_id)
         .status
         .action
         .clone();
-    assert!(cockpit.activate_open_task_details());
-    cockpit.tick();
-    assert!(matches!(
-        worker.try_recv(),
-        Ok(NativeNextHostCommand::Dispatch(_))
-    ));
+    let mut queue = PendingHeaderActionQueue::new(1);
 
-    assert!(stale_shell.advance_focus_epoch());
-    let stale_snapshot =
-        HostSnapshot::try_from_host(2, 2, model.clone(), stale_shell, fixture.top_bar)
-            .expect("stale shell snapshot");
-    assert!(cockpit.apply_host_snapshot(stale_snapshot).is_ok());
+    queue.push(action.clone()).expect("first action fits");
     assert_eq!(
-        cockpit.queue_action(&captured_action),
-        NativeNextDispatchStatus::Queued
+        queue.push(action.clone()),
+        Err(devmanager::ui::task_cockpit::header::PendingHeaderActionError::Full)
     );
-    cockpit.tick();
-    assert_eq!(
-        cockpit.host_state(),
-        devmanager::ui::task_cockpit::NativeNextHostState::Rejected
-    );
-    assert!(matches!(
-        worker.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    ));
+    assert_eq!(queue.drain_for_tick(1), vec![action]);
+    assert!(queue.is_empty());
 }
 
 #[test]
@@ -1421,17 +1519,12 @@ fn top_bar_input_is_preflight_bounded_before_projection_copy_or_truncation() {
 }
 
 #[test]
-fn native_next_renderer_uses_header_layout_inline_and_accessible_overflow_at_all_widths() {
+fn header_layout_contract_is_bounded_and_accessible_at_all_widths() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
+    let header = project_header(&model, fixture.selected_task_id);
 
-    let narrow = cockpit.render_surface(320);
-    let narrow_layout = narrow.header_layout.as_ref().expect("narrow layout");
+    let narrow_layout = header.responsive_layout(320);
     assert_eq!(
         narrow_layout.inline,
         vec![HeaderField::Title, HeaderField::TurnStatus]
@@ -1445,23 +1538,16 @@ fn native_next_renderer_uses_header_layout_inline_and_accessible_overflow_at_all
             HeaderField::Specialists,
         ]
     );
-    let narrow_menu = narrow.overflow_menu.as_ref().expect("narrow menu");
-    assert_eq!(narrow_menu.role, AccessibleRole::Menu);
-    assert!(narrow_menu.focusable);
-    assert!(narrow_menu
+    assert_eq!(
+        narrow_layout.overflow_control.as_ref().unwrap().role,
+        AccessibleRole::Button
+    );
+    assert!(narrow_layout.overflow_control.as_ref().unwrap().focusable);
+    assert!(narrow_layout
         .accessible_description
         .contains("Ship the native cockpit"));
-    assert!(narrow_menu
-        .items
-        .iter()
-        .any(|item| item.field == HeaderField::Project && item.label.contains("Project")));
-    assert!(narrow_menu
-        .items
-        .iter()
-        .any(|item| item.field == HeaderField::Workspace && item.label.contains("Workspace")));
 
-    let medium = cockpit.render_surface(480);
-    let medium_layout = medium.header_layout.as_ref().expect("medium layout");
+    let medium_layout = header.responsive_layout(480);
     assert_eq!(
         medium_layout.inline,
         vec![
@@ -1475,56 +1561,15 @@ fn native_next_renderer_uses_header_layout_inline_and_accessible_overflow_at_all
         medium_layout.overflow,
         vec![HeaderField::Workspace, HeaderField::Specialists]
     );
-    assert_eq!(medium.overflow_menu.as_ref().unwrap().items.len(), 2);
 
-    let wide = cockpit.render_surface(720);
-    let wide_layout = wide.header_layout.as_ref().expect("wide layout");
+    let wide_layout = header.responsive_layout(720);
     assert!(wide_layout.overflow.is_empty());
-    assert!(wide.overflow_menu.is_none());
     assert!(wide_layout
         .accessible_description
         .contains("Project 018f60b0-9c1a-7001-8000-000000000011"));
     assert!(wide_layout
         .accessible_description
         .contains("worktree codex/header"));
-}
-
-#[test]
-fn native_next_host_attachment_updates_bounded_controller_and_dispatches_typed_actions() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (mut cockpit, worker) = native_cockpit(model.clone(), shell, fixture.top_bar.clone());
-
-    let mut newer = fixture.top_bar;
-    newer.quotas[0].identity.observation_id += 1;
-    newer.quotas[0].detail = Some("61% remaining".into());
-    let snapshot = HostSnapshot::try_from_host(
-        2,
-        2,
-        model,
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model_from_pages(&fixture.snapshot_pages).last_applied_sequence(),
-        ),
-        newer,
-    )
-    .expect("bounded atomic update");
-    assert!(cockpit
-        .apply_host_snapshot(snapshot)
-        .expect("bounded controller update"));
-    assert_eq!(
-        cockpit.render_surface(720).top_bar.quotas[0].detail,
-        "61% remaining"
-    );
-
-    assert!(cockpit.activate_open_task_details());
-    cockpit.tick();
-    let NativeNextHostCommand::Dispatch(action) = worker.try_recv().expect("dispatch");
-    assert_eq!(action.id(), action::ACTION_TASK_SHOW);
 }
 
 #[test]
@@ -1623,551 +1668,6 @@ fn quota_ordering_survives_bounded_cache_eviction_for_same_session() {
         .expect("delayed same-session observation must be handled"));
     assert_eq!(controller.cached_quota_count(), 0);
     assert!(controller.model().quotas.is_empty());
-}
-
-#[test]
-fn native_next_render_tree_contains_real_top_bar_resources_quota_overflow_and_unavailable_state() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let mut top_bar = fixture.top_bar;
-    top_bar.quotas = (0..10)
-        .map(|index| devmanager::ui::task_cockpit::QuotaObservation {
-            identity: devmanager::ui::task_cockpit::QuotaObservationIdentity {
-                provider: format!("provider-{index}"),
-                provider_session_id: format!("session-{index}"),
-                observation_id: index,
-            },
-            detail: Some(format!("{}% remaining", 90 - index)),
-            observed_at_ms: Some(top_bar.now_ms),
-            generation: Some(top_bar.generation),
-        })
-        .collect();
-    let (cockpit, _worker) = native_cockpit(model, shell, top_bar);
-
-    let tree = cockpit.render_tree(320);
-    assert!(tree
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.id == "native-next-top-bar-cpu"));
-    assert!(tree
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.id == "native-next-top-bar-memory"));
-    assert!(tree
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.id == "native-next-top-bar-quota-overflow"));
-    assert!(tree.top_bar.children.iter().all(|node| {
-        !node.accessible_description.is_empty()
-            && (node.focusable || node.role == AccessibleRole::Status)
-    }));
-
-    let unavailable = NativeNextTaskCockpit::unavailable().render_tree(320);
-    assert!(unavailable
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.role == AccessibleRole::Status));
-    assert!(!unavailable.top_bar.accessible_description.is_empty());
-    let unavailable_header = unavailable.header.expect("header-unavailable node");
-    assert_eq!(unavailable_header.role, AccessibleRole::Status);
-    assert!(!unavailable_header.accessible_description.is_empty());
-}
-
-#[test]
-fn native_next_render_tree_wraps_title_and_virtualizes_specialists_at_all_widths() {
-    let fixture = fixture();
-    let mut pages = fixture.snapshot_pages.clone();
-    for page in &mut pages {
-        for item in &mut page.items {
-            if let SnapshotItem::Task(task) = item {
-                task.task.title = "title ".repeat(80);
-            }
-        }
-    }
-    let model = model_from_pages(&pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
-
-    for width in [360, 480, 720] {
-        let tree = cockpit.render_tree(width);
-        if width == 360 {
-            assert!(
-                tree.title_lines.len() >= 2,
-                "title must remain separate lines at {width}"
-            );
-        } else {
-            assert_eq!(tree.title_lines.len(), 1);
-        }
-        let specialists = tree
-            .header
-            .as_ref()
-            .expect("header")
-            .children
-            .iter()
-            .find(|node| node.id == "native-next-task-specialists")
-            .expect("specialist semantic node");
-        assert!(
-            specialists.virtualized,
-            "specialists must be virtualized at {width}"
-        );
-        assert!(specialists.children.len() <= 32);
-    }
-}
-
-#[test]
-fn native_next_render_waits_for_bounded_background_tick_and_input_only_queues() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (mut cockpit, worker) =
-        native_cockpit(model.clone(), shell.clone(), fixture.top_bar.clone());
-
-    let mut newer_top_bar = fixture.top_bar.clone();
-    newer_top_bar.quotas[0].identity.observation_id += 1;
-    newer_top_bar.quotas[0].detail = Some("61% remaining".into());
-    let newer =
-        HostSnapshot::try_from_host(2, 2, model, shell, newer_top_bar).expect("newer snapshot");
-    worker
-        .send_event(NativeNextHostEvent::Snapshot(newer))
-        .expect("snapshot event");
-
-    let before_paint = cockpit.projection().clone();
-    let _tree = cockpit.render_tree_with_scale(320, Scale::Scale200);
-    assert_eq!(cockpit.projection(), &before_paint);
-
-    let tick = cockpit.tick();
-    assert_eq!(tick.events_drained, 1);
-    assert_eq!(
-        cockpit.projection().top_bar.quotas[0].detail,
-        "61% remaining"
-    );
-
-    assert!(cockpit.activate_open_task_details());
-    assert!(matches!(
-        worker.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    ));
-    assert_eq!(cockpit.tick().actions_drained, 1);
-    assert!(matches!(
-        worker.try_recv(),
-        Ok(NativeNextHostCommand::Dispatch(_))
-    ));
-}
-
-#[test]
-fn native_next_top_bar_layout_is_bounded_and_accessible_at_each_windows_scale() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
-
-    for scale in [
-        Scale::Scale100,
-        Scale::Scale125,
-        Scale::Scale150,
-        Scale::Scale200,
-    ] {
-        let layout = cockpit.top_bar_layout(320, scale);
-        assert!(layout.rows >= 1, "top bar must occupy a row at {:?}", scale);
-        assert!(layout.logical_width_px <= 320);
-        assert_eq!(layout.visible_item_count, layout.item_count);
-        assert!(layout.hidden_item_count <= layout.item_count);
-        assert!(layout.virtualized_quota_count <= layout.item_count);
-
-        let tree = cockpit.render_tree_with_scale(320, scale);
-        assert_eq!(tree.top_bar.role, AccessibleRole::Region);
-        assert!(!tree.top_bar.accessible_description.is_empty());
-        for node in tree.top_bar.children.iter().filter(|node| node.focusable) {
-            assert_eq!(node.role, AccessibleRole::Button);
-            assert!(!node.label.is_empty());
-            assert!(!node.keyboard_shortcut.is_empty());
-        }
-    }
-}
-
-#[test]
-fn native_next_host_channel_is_bounded_nonblocking_and_receipts_project_back() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let snapshot = HostSnapshot::try_from_host(1, 1, model, shell, fixture.top_bar.clone())
-        .expect("atomic host snapshot");
-    let (client, worker) = devmanager::ui::task_cockpit::native_next_host_channel(1);
-    let action = snapshot
-        .shell()
-        .task_header(snapshot.model())
-        .expect("header")
-        .status
-        .action
-        .clone();
-    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
-
-    assert_eq!(
-        cockpit.queue_action(&action),
-        NativeNextDispatchStatus::Queued
-    );
-    assert_eq!(cockpit.tick().actions_drained, 1);
-    assert!(matches!(
-        worker.try_recv(),
-        Ok(NativeNextHostCommand::Dispatch(_))
-    ));
-    worker
-        .send_event(NativeNextHostEvent::Accepted {
-            action_id: action.id(),
-        })
-        .expect("receipt event");
-    assert_eq!(cockpit.tick().events_drained, 1);
-    assert!(cockpit.last_receipt().is_some());
-}
-
-#[test]
-fn native_next_host_channel_reports_backpressure_and_typed_unavailable_without_local_queue() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let snapshot =
-        HostSnapshot::try_from_host(1, 1, model, shell, fixture.top_bar).expect("snapshot");
-    let (client, _worker) = native_next_host_channel(1);
-    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
-    let action = cockpit
-        .projection()
-        .header
-        .as_ref()
-        .expect("header")
-        .status
-        .action
-        .clone();
-    assert_eq!(
-        cockpit.queue_action(&action),
-        NativeNextDispatchStatus::Queued
-    );
-    assert_eq!(cockpit.tick().actions_drained, 1);
-    assert_eq!(
-        cockpit.queue_action(&action),
-        NativeNextDispatchStatus::Queued
-    );
-    assert_eq!(cockpit.tick().actions_drained, 1);
-    assert_eq!(
-        cockpit.host_state(),
-        devmanager::ui::task_cockpit::NativeNextHostState::Backpressured
-    );
-    assert!(cockpit
-        .render_tree(720)
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.id == "native-next-host-state" && node.role == AccessibleRole::Status));
-}
-
-#[test]
-fn native_next_host_event_tick_collapses_contiguous_snapshots_and_reports_disconnect() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let snapshot =
-        HostSnapshot::try_from_host(1, 1, model.clone(), shell.clone(), fixture.top_bar.clone())
-            .expect("snapshot");
-    let (client, worker) = native_next_host_channel(4);
-    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
-
-    let mut second_top_bar = fixture.top_bar.clone();
-    second_top_bar.quotas[0].identity.observation_id = 9;
-    second_top_bar.quotas[0].detail = Some("60% remaining".into());
-    let second = HostSnapshot::try_from_host(2, 2, model.clone(), shell.clone(), second_top_bar)
-        .expect("second snapshot");
-    let mut third_top_bar = fixture.top_bar;
-    third_top_bar.quotas[0].identity.observation_id = 10;
-    third_top_bar.quotas[0].detail = Some("50% remaining".into());
-    let third =
-        HostSnapshot::try_from_host(3, 3, model, shell, third_top_bar).expect("third snapshot");
-
-    worker
-        .send_event(NativeNextHostEvent::Snapshot(second))
-        .expect("second event");
-    worker
-        .send_event(NativeNextHostEvent::Snapshot(third))
-        .expect("third event");
-    assert_eq!(cockpit.tick().events_drained, 1);
-    assert_eq!(
-        cockpit.projection().top_bar.quotas[0].detail,
-        "50% remaining"
-    );
-
-    drop(worker);
-    assert_eq!(cockpit.tick().events_drained, 0);
-    assert_eq!(
-        cockpit.host_state(),
-        devmanager::ui::task_cockpit::NativeNextHostState::Unavailable
-    );
-    assert!(cockpit
-        .render_tree(720)
-        .top_bar
-        .children
-        .iter()
-        .any(|node| node.id == "native-next-host-state" && node.label.contains("unavailable")));
-}
-
-#[test]
-fn native_next_atomic_snapshot_rejects_sequence_revision_and_partial_epoch_regressions() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let (client, _worker) = devmanager::ui::task_cockpit::native_next_host_channel(4);
-    let snapshot = HostSnapshot::try_from_host(2, 2, model.clone(), shell, fixture.top_bar.clone())
-        .expect("atomic host snapshot");
-    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot.clone(), client);
-
-    let same_sequence = HostSnapshot::try_from_host(
-        2,
-        3,
-        model.clone(),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        fixture.top_bar.clone(),
-    )
-    .expect("snapshot");
-    assert!(cockpit.apply_host_snapshot(same_sequence).is_err());
-    assert_eq!(
-        cockpit.host_state(),
-        devmanager::ui::task_cockpit::NativeNextHostState::Rejected
-    );
-
-    let older_sequence = HostSnapshot::try_from_host(
-        1,
-        1,
-        model.clone(),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        fixture.top_bar.clone(),
-    )
-    .expect("snapshot");
-    assert!(cockpit.apply_host_snapshot(older_sequence).is_err());
-
-    let mut older_top_bar = fixture.top_bar.clone();
-    older_top_bar.generation -= 1;
-    let older_top_bar_snapshot = HostSnapshot::try_from_host(
-        3,
-        3,
-        model.clone(),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        older_top_bar,
-    )
-    .expect("older top-bar generation is structurally valid");
-    assert!(cockpit.apply_host_snapshot(older_top_bar_snapshot).is_err());
-
-    let mut older_top_bar_clock = fixture.top_bar.clone();
-    older_top_bar_clock.now_ms -= 1;
-    let older_top_bar_clock_snapshot = HostSnapshot::try_from_host(
-        3,
-        3,
-        model.clone(),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        older_top_bar_clock,
-    )
-    .expect("older top-bar clock is structurally valid");
-    assert!(cockpit
-        .apply_host_snapshot(older_top_bar_clock_snapshot)
-        .is_err());
-
-    let mut partial = fixture.top_bar;
-    partial.generation = 0;
-    assert!(HostSnapshot::try_from_host(
-        3,
-        3,
-        model,
-        attached_shell(Some(fixture.selected_task_id), 1),
-        partial,
-    )
-    .is_err());
-}
-
-#[test]
-fn native_next_atomic_snapshot_rejects_each_current_epoch_and_action_regression() {
-    let fixture = fixture();
-    let model = model_from_pages(&fixture.snapshot_pages);
-    let baseline_shell = attached_shell(
-        Some(fixture.selected_task_id),
-        model.last_applied_sequence(),
-    );
-    let baseline = HostSnapshot::try_from_host(
-        10,
-        10,
-        model.clone(),
-        baseline_shell,
-        fixture.top_bar.clone(),
-    )
-    .expect("baseline snapshot");
-
-    for (dimension, index) in [
-        ("resource", 0),
-        ("connection", 1),
-        ("focus", 2),
-        ("navigation", 4),
-    ] {
-        let mut epochs = [3, 5, 7, model.last_applied_sequence(), 11];
-        epochs[index] -= 1;
-        let incoming_shell = Shell::attach(
-            Some(fixture.selected_task_id),
-            Some(
-                HostEpochSnapshot::try_from_host(
-                    epochs[0], epochs[1], epochs[2], epochs[3], epochs[4],
-                )
-                .expect("nonzero regressed epoch"),
-            ),
-        )
-        .expect("incoming shell");
-        let (client, _worker) = native_next_host_channel(2);
-        let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline.clone(), client);
-        let incoming = HostSnapshot::try_from_host(
-            11,
-            11,
-            model.clone(),
-            incoming_shell,
-            fixture.top_bar.clone(),
-        )
-        .expect("incoming snapshot");
-        assert!(matches!(
-            cockpit.apply_host_snapshot(incoming),
-            Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression {
-                dimension: actual
-            }) if actual == dimension
-        ));
-    }
-
-    for (dimension, mutate) in [("task", true), ("action", false)] {
-        let mut pages = fixture.snapshot_pages.clone();
-        for page in &mut pages {
-            for item in &mut page.items {
-                if let SnapshotItem::Task(task) = item {
-                    if mutate {
-                        task.task.revision -= 1;
-                    } else {
-                        task.task.action_epoch -= 1;
-                    }
-                }
-            }
-        }
-        let incoming_model = model_from_pages(&pages);
-        let (client, _worker) = native_next_host_channel(2);
-        let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline.clone(), client);
-        let incoming = HostSnapshot::try_from_host(
-            11,
-            11,
-            incoming_model,
-            attached_shell(
-                Some(fixture.selected_task_id),
-                model.last_applied_sequence(),
-            ),
-            fixture.top_bar.clone(),
-        )
-        .expect("incoming task snapshot");
-        assert!(matches!(
-            cockpit.apply_host_snapshot(incoming),
-            Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression {
-                dimension: actual
-            }) if actual == dimension
-        ));
-    }
-}
-
-#[test]
-fn native_next_atomic_snapshot_rejects_non_selected_task_revision_regression() {
-    let fixture = fixture();
-    let mut pages = fixture.snapshot_pages.clone();
-    let mut extra_task = pages
-        .iter_mut()
-        .flat_map(|page| page.items.iter_mut())
-        .find_map(|item| match item {
-            SnapshotItem::Task(task) => Some(task.clone()),
-            _ => None,
-        })
-        .expect("fixture task");
-    extra_task.task.id = TaskId::new();
-    extra_task.task.title = "Second task".to_string();
-    extra_task.primary_agent_id = None;
-    extra_task.task.revision = 9;
-    extra_task.task.action_epoch = 4;
-    pages[0].items.push(SnapshotItem::Task(extra_task));
-    let model = model_from_pages(&pages);
-    let baseline = HostSnapshot::try_from_host(
-        10,
-        10,
-        model.clone(),
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        fixture.top_bar.clone(),
-    )
-    .expect("baseline snapshot");
-
-    let mut regressed_pages = pages;
-    for page in &mut regressed_pages {
-        for item in &mut page.items {
-            if let SnapshotItem::Task(task) = item {
-                if task.task.id != fixture.selected_task_id {
-                    task.task.revision -= 1;
-                }
-            }
-        }
-    }
-    let incoming_model = model_from_pages(&regressed_pages);
-    let (client, _worker) = native_next_host_channel(2);
-    let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(baseline, client);
-    let incoming = HostSnapshot::try_from_host(
-        11,
-        11,
-        incoming_model,
-        attached_shell(
-            Some(fixture.selected_task_id),
-            model.last_applied_sequence(),
-        ),
-        fixture.top_bar,
-    )
-    .expect("incoming snapshot");
-    assert!(matches!(
-        cockpit.apply_host_snapshot(incoming),
-        Err(devmanager::ui::task_cockpit::HostSnapshotError::EpochRegression { dimension: "task" })
-    ));
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! bounded observations supplied by the caller. They do not probe the host,
 //! filesystem, network, provider sessions, or process state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -26,7 +26,19 @@ pub const PROVIDER_QUOTA_MAX_AGE_MS: i64 = 60 * 60 * 1_000;
 /// All top-bar observations use the same canonical freshness window.
 pub const MAX_OBSERVATION_AGE_MS: i64 = PROVIDER_QUOTA_MAX_AGE_MS;
 /// Keep the header bounded even when a task has many specialist sessions.
-pub const MAX_HEADER_SPECIALISTS: usize = 32;
+///
+/// Retention is intentionally separate from the renderer's virtual window:
+/// identities remain available for captured actions and reorder reconciliation
+/// while callers only materialize a small bounded slice per tick.
+pub const MAX_HEADER_SPECIALISTS: usize = 5_000;
+/// Maximum specialist rows materialized for one projection window.
+pub const MAX_SPECIALIST_VIRTUAL_WINDOW: usize = 128;
+/// Pending actions are handed to the canonical runtime on its next tick.
+pub const MAX_PENDING_HEADER_ACTIONS: usize = 64;
+/// Bounded high-water/tombstone memory shared by nested header fields.
+pub const MAX_HEADER_HIGH_WATER_ENTRIES: usize = 4_096;
+/// High-water marks are durable only across the same bounded freshness epoch.
+pub const HEADER_HIGH_WATER_TTL_MS: i64 = 60 * 60 * 1_000;
 /// Keep the top bar bounded if a caller has not already provider-deduplicated.
 pub const MAX_TOP_BAR_QUOTAS: usize = 8;
 /// Bound retained provider observations before projection truncation.
@@ -336,6 +348,16 @@ impl fmt::Display for AgentProjection {
     }
 }
 
+/// A bounded materialization of the retained specialist projection. The
+/// `AgentProjection::identity.agent_id` is the only row identity; callers
+/// must not derive identity from the window offset or a vector index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecialistWindow {
+    pub offset: usize,
+    pub total: usize,
+    pub items: Vec<AgentProjection>,
+}
+
 /// Bounded public role data. The provider/domain role remains private to the
 /// projection boundary; specialist names are sanitized before they can leave
 /// this module.
@@ -536,6 +558,22 @@ impl TaskHeaderModel {
             | ActionTarget::Update { .. }
             | ActionTarget::QuotaSummary { .. }
             | ActionTarget::Quota { .. } => false,
+        }
+    }
+
+    /// Materialize at most [`MAX_SPECIALIST_VIRTUAL_WINDOW`] retained rows.
+    /// The retained model remains bounded by [`MAX_HEADER_SPECIALISTS`], and
+    /// each returned row carries its stable `AgentSessionId` identity.
+    pub fn specialist_window(&self, offset: usize, limit: usize) -> SpecialistWindow {
+        let bounded_offset = offset.min(self.specialists.len());
+        let bounded_limit = limit.min(MAX_SPECIALIST_VIRTUAL_WINDOW);
+        let end = bounded_offset
+            .saturating_add(bounded_limit)
+            .min(self.specialists.len());
+        SpecialistWindow {
+            offset: bounded_offset,
+            total: self.specialists.len(),
+            items: self.specialists[bounded_offset..end].to_vec(),
         }
     }
 
@@ -798,6 +836,239 @@ impl RemoteObservation {
     pub fn preflight(&self) -> Result<(), TopBarProjectionError> {
         check_input_text("remote.source_id", &self.identity.source_id)?;
         check_input_text("remote.label", &self.label)
+    }
+}
+
+/// Resource fields have independent high-water marks because a CPU sample
+/// and a memory sample can arrive from different host ticks.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AgentResourceField {
+    Cpu,
+    Memory,
+}
+
+/// Stable key for every nested field that can be replayed independently.
+/// Provider/session/source strings are retained only inside the bounded
+/// ledger and are never included in its debug representation.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub enum HeaderFieldKey {
+    Task(TaskId),
+    Agent {
+        task_id: TaskId,
+        agent_id: AgentSessionId,
+    },
+    AgentProvider {
+        task_id: TaskId,
+        agent_id: AgentSessionId,
+    },
+    AgentResource {
+        task_id: TaskId,
+        agent_id: AgentSessionId,
+        field: AgentResourceField,
+    },
+    Quota {
+        provider: String,
+        provider_session_id: String,
+    },
+    Remote {
+        source_id: String,
+    },
+}
+
+impl fmt::Debug for HeaderFieldKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task(_) => formatter.write_str("Task([redacted])"),
+            Self::Agent { .. } => formatter.write_str("Agent([redacted])"),
+            Self::AgentProvider { .. } => formatter.write_str("AgentProvider([redacted])"),
+            Self::AgentResource { field, .. } => formatter
+                .debug_struct("AgentResource")
+                .field("field", field)
+                .finish(),
+            Self::Quota { .. } => formatter.write_str("Quota([redacted])"),
+            Self::Remote { .. } => formatter.write_str("Remote([redacted])"),
+        }
+    }
+}
+
+/// Result of applying one source observation to the reusable header ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HighWaterDecision {
+    Accepted,
+    IgnoredStale,
+    RejectedConflict,
+    RejectedCapacity,
+    RejectedInvalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderWaterMark {
+    generation: u64,
+    revision: u64,
+    observed_at_ms: i64,
+    fingerprint: u64,
+    removed: bool,
+}
+
+/// Bounded, source-independent high-water state for task, nested agent,
+/// provider/resource, quota, and remote fields. A removed observation is a
+/// tombstone: a late lower revision cannot resurrect it. Equal-generation,
+/// equal-revision payload conflicts fail closed, even when one is a removal.
+#[derive(Clone)]
+pub struct HeaderHighWaterLedger {
+    marks: BTreeMap<HeaderFieldKey, HeaderWaterMark>,
+    capacity: usize,
+    ttl_ms: i64,
+}
+
+impl HeaderHighWaterLedger {
+    pub fn new(capacity: usize, ttl_ms: i64) -> Self {
+        Self {
+            marks: BTreeMap::new(),
+            capacity: capacity.clamp(1, MAX_HEADER_HIGH_WATER_ENTRIES),
+            ttl_ms: ttl_ms.max(1),
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        key: HeaderFieldKey,
+        generation: u64,
+        revision: u64,
+        observed_at_ms: i64,
+        fingerprint: u64,
+        removed: bool,
+    ) -> HighWaterDecision {
+        if generation == 0 || observed_at_ms < 0 {
+            return HighWaterDecision::RejectedInvalid;
+        }
+        self.expire(observed_at_ms);
+
+        if let Some(current) = self.marks.get(&key).copied() {
+            if generation < current.generation
+                || (generation == current.generation && revision < current.revision)
+            {
+                return HighWaterDecision::IgnoredStale;
+            }
+            if generation == current.generation && revision == current.revision {
+                return (current.fingerprint == fingerprint && current.removed == removed)
+                    .then_some(HighWaterDecision::IgnoredStale)
+                    .unwrap_or(HighWaterDecision::RejectedConflict);
+            }
+        } else if self.marks.len() >= self.capacity {
+            return HighWaterDecision::RejectedCapacity;
+        }
+
+        self.marks.insert(
+            key,
+            HeaderWaterMark {
+                generation,
+                revision,
+                observed_at_ms,
+                fingerprint,
+                removed,
+            },
+        );
+        HighWaterDecision::Accepted
+    }
+
+    /// Expire both live marks and tombstones together. Once a tombstone ages
+    /// out, a new generation/revision may be admitted explicitly; this is the
+    /// bounded memory contract, not an implicit revival of an active value.
+    pub fn expire(&mut self, now_ms: i64) {
+        let ttl_ms = self.ttl_ms;
+        self.marks
+            .retain(|_, mark| now_ms.saturating_sub(mark.observed_at_ms) < ttl_ms);
+    }
+
+    pub fn len(&self) -> usize {
+        self.marks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.marks.is_empty()
+    }
+
+    pub fn tombstone_count(&self) -> usize {
+        self.marks.values().filter(|mark| mark.removed).count()
+    }
+
+    pub fn contains_tombstone(&self, key: &HeaderFieldKey) -> bool {
+        self.marks.get(key).is_some_and(|mark| mark.removed)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn ttl_ms(&self) -> i64 {
+        self.ttl_ms
+    }
+}
+
+impl fmt::Debug for HeaderHighWaterLedger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeaderHighWaterLedger")
+            .field("entry_count", &self.marks.len())
+            .field("tombstone_count", &self.tombstone_count())
+            .field("capacity", &self.capacity)
+            .field("ttl_ms", &self.ttl_ms)
+            .finish()
+    }
+}
+
+impl fmt::Display for HeaderHighWaterLedger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("header-high-water-ledger[redacted]")
+    }
+}
+
+/// Back-pressure result for actions captured by a projection. The canonical
+/// runtime owns dispatch; this queue only hands immutable actions to its next
+/// bounded tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingHeaderActionError {
+    Full,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingHeaderActionQueue {
+    actions: VecDeque<ProjectedAction>,
+    capacity: usize,
+}
+
+impl PendingHeaderActionQueue {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            actions: VecDeque::new(),
+            capacity: capacity.clamp(1, MAX_PENDING_HEADER_ACTIONS),
+        }
+    }
+
+    pub fn push(&mut self, action: ProjectedAction) -> Result<(), PendingHeaderActionError> {
+        if self.actions.len() >= self.capacity {
+            return Err(PendingHeaderActionError::Full);
+        }
+        self.actions.push_back(action);
+        Ok(())
+    }
+
+    pub fn drain_for_tick(&mut self, limit: usize) -> Vec<ProjectedAction> {
+        let count = limit.min(self.actions.len());
+        self.actions.drain(..count).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.actions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 
@@ -1110,6 +1381,20 @@ pub struct QuotaProjection {
     pub action: TopBarAction,
 }
 
+/// Safe semantic remote state for the top bar. The source identity remains in
+/// the controller's fenced observation; the renderer receives only bounded
+/// presentation text and an explicit accessibility role.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteProjection {
+    pub health: RemoteHealth,
+    pub label: String,
+    pub age_ms: i64,
+    pub role: AccessibleRole,
+    pub focusable: bool,
+    pub tooltip: String,
+    pub accessible_description: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuProjection {
     pub input_unit: CpuInputUnit,
@@ -1149,6 +1434,7 @@ pub struct TopBarModel {
     pub host: Option<TopBarStatusLink>,
     pub connect: Option<TopBarStatusLink>,
     pub update: Option<TopBarStatusLink>,
+    pub remote: Option<RemoteProjection>,
     pub quotas: Vec<QuotaProjection>,
     pub quota_hidden_count: usize,
     pub quotas_truncated: bool,
@@ -1159,13 +1445,14 @@ pub struct TopBarModel {
 }
 
 impl TopBarModel {
-    /// Empty host-client state used before the Phase 4 observation transport
-    /// is attached.  It contains no fabricated generation or quota value.
+    /// Empty state used before the host-owned observation adapter is
+    /// attached. It contains no fabricated generation or quota value.
     pub fn unavailable() -> Self {
         Self {
             host: None,
             connect: None,
             update: None,
+            remote: None,
             quotas: Vec::new(),
             quota_hidden_count: 0,
             quotas_truncated: false,
@@ -1220,6 +1507,7 @@ impl TopBarModel {
             host: None,
             connect: None,
             update: None,
+            remote: None,
             quotas: Vec::new(),
             quota_hidden_count: 0,
             quotas_truncated: false,
@@ -1341,7 +1629,7 @@ impl TopBarModel {
 
         // An attached snapshot may legitimately contain no usable
         // observations yet. Keep that state explicit for both assistive
-        // consumers and the native renderer instead of returning a blank
+        // consumers and the renderer instead of returning a blank
         // region that looks like a successful empty projection.
         if descriptions.is_empty() {
             unavailable.extend([
@@ -1362,6 +1650,7 @@ impl TopBarModel {
             host,
             connect,
             update,
+            remote: None,
             quotas,
             quota_hidden_count,
             quotas_truncated: quota_hidden_count != 0,
@@ -1400,8 +1689,8 @@ impl TopBarModel {
     }
 }
 
-/// Stateful top-bar projection boundary used by the native-next host-client
-/// seam.  Quota observations are retained once, keyed by canonical provider
+/// Stateful top-bar projection boundary used by a host-owned observation
+/// adapter. Quota observations are retained once, keyed by canonical provider
 /// and current host generation.  Within one generation, the host-issued
 /// observation sequence is authoritative and the timestamp only breaks a
 /// sequence tie; late events can never roll the visible value backward.
@@ -1549,11 +1838,25 @@ impl TopBarProjectionController {
     }
 
     pub fn model(&self) -> TopBarModel {
-        TopBarModel::try_from_input(&self.input)
-            .expect("TopBarProjectionController maintains preflighted input")
+        let mut model = TopBarModel::try_from_input(&self.input)
+            .expect("TopBarProjectionController maintains preflighted input");
+        model.remote = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote_projection(remote, &self.input));
+        if let Some(remote) = &model.remote {
+            model.accessible_description = presentation_text(
+                &format!(
+                    "{} {}",
+                    model.accessible_description, remote.accessible_description
+                ),
+                MAX_ACCESSIBLE_SCALARS,
+            );
+        }
+        model
     }
 
-    /// Apply one host-client projection snapshot.  Returning `false` means
+    /// Apply one host-owned projection snapshot. Returning `false` means
     /// that the input was stale or contained only late quota observations;
     /// this is intentionally not an error because replay can deliver those
     /// events after a newer observation.
@@ -1977,6 +2280,7 @@ impl fmt::Debug for TopBarModel {
             .field("host_present", &self.host.is_some())
             .field("connect_present", &self.connect.is_some())
             .field("update_present", &self.update.is_some())
+            .field("remote_present", &self.remote.is_some())
             .field("quota_count", &self.quotas.len())
             .field("quota_hidden_count", &self.quota_hidden_count)
             .field("quotas_truncated", &self.quotas_truncated)
@@ -2403,6 +2707,32 @@ fn cpu_projection(
         input_unit,
         whole_machine_percent: whole_machine_percent.clamp(0.0, 100.0),
         diagnostic,
+    })
+}
+
+fn remote_projection(
+    observation: &RemoteObservation,
+    input: &TopBarProjectionInput,
+) -> Option<RemoteProjection> {
+    let stamp = fresh_stamp(observation.observed_at_ms, observation.generation, input)?;
+    let label = presentation_text(&observation.label, MAX_ROLE_SCALARS);
+    let state = match observation.health {
+        RemoteHealth::Healthy => "healthy",
+        RemoteHealth::Degraded => "degraded",
+        RemoteHealth::Unavailable => "unavailable",
+    };
+    let accessible_description = presentation_text(
+        &format!("{label}: remote connection {state}."),
+        MAX_ACCESSIBLE_SCALARS,
+    );
+    Some(RemoteProjection {
+        health: observation.health,
+        label,
+        age_ms: input.now_ms.saturating_sub(stamp.observed_at_ms),
+        role: AccessibleRole::Status,
+        focusable: false,
+        tooltip: accessible_description.clone(),
+        accessible_description,
     })
 }
 
