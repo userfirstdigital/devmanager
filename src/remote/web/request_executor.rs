@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Instant;
+
+use super::super::{
+    defer_unowned_remote_worker, remote_worker_admission_pool, RemoteWorker,
+    RemoteWorkerAdmissionPool,
+};
 
 const DEFAULT_WORKERS: usize = 8;
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
@@ -24,7 +28,7 @@ struct WebRequestExecutorInner {
     sender: Mutex<Option<mpsc::SyncSender<WebRequestJob>>>,
     workers: usize,
     stopping: Arc<AtomicBool>,
-    handles: Mutex<HashMap<usize, JoinHandle<()>>>,
+    handles: Mutex<HashMap<usize, RemoteWorker>>,
     completion_rx: Mutex<mpsc::Receiver<usize>>,
 }
 
@@ -36,6 +40,14 @@ impl Default for WebRequestExecutor {
 
 impl WebRequestExecutor {
     pub(crate) fn new(worker_count: usize, queue_capacity: usize) -> Self {
+        Self::new_with_worker_pool(worker_count, queue_capacity, remote_worker_admission_pool())
+    }
+
+    fn new_with_worker_pool(
+        worker_count: usize,
+        queue_capacity: usize,
+        worker_pool: Arc<RemoteWorkerAdmissionPool>,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let (completion_tx, completion_rx) = mpsc::channel();
@@ -46,12 +58,14 @@ impl WebRequestExecutor {
             let receiver = receiver.clone();
             let stopping = stopping.clone();
             let completion_tx = completion_tx.clone();
-            if let Ok(handle) = std::thread::Builder::new()
-                .name(format!("web-request-{index}"))
-                .spawn(move || run_worker(receiver, stopping, completion_tx, index))
-            {
+            if let Ok(worker) = RemoteWorker::try_spawn_with_pool(
+                worker_pool.clone(),
+                format!("web-request-{index}"),
+                None,
+                move || run_worker(receiver, stopping, completion_tx, index),
+            ) {
                 workers += 1;
-                handles.insert(index, handle);
+                handles.insert(index, worker);
             }
         }
         Self {
@@ -132,25 +146,25 @@ impl WebRequestExecutor {
         }
     }
 
-    pub(crate) fn take_unfinished_worker_handles(&self) -> Vec<JoinHandle<()>> {
+    pub(in crate::remote) fn take_unfinished_workers(&self) -> Vec<RemoteWorker> {
         self.inner
             .handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
-            .map(|(_, handle)| handle)
+            .map(|(_, worker)| worker)
             .collect()
     }
 
     fn join_worker(&self, index: usize) {
-        let handle = self
+        let worker = self
             .inner
             .handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&index);
-        if let Some(handle) = handle {
-            let _ = handle.join();
+        if let Some(worker) = worker {
+            let _ = worker.join();
         }
     }
 
@@ -169,12 +183,30 @@ impl WebRequestExecutor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
-                .filter_map(|(index, handle)| handle.is_finished().then_some(*index)),
+                .filter_map(|(index, worker)| worker.is_finished().then_some(*index)),
         );
         indexes.sort_unstable();
         indexes.dedup();
         for index in indexes {
             self.join_worker(index);
+        }
+    }
+}
+
+impl Drop for WebRequestExecutorInner {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.sender
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        for (_, worker) in self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+        {
+            defer_unowned_remote_worker(worker);
         }
     }
 }
@@ -258,15 +290,29 @@ mod tests {
             1,
             "paused request worker should remain visible after its owner deadline"
         );
-        let handles = executor.take_unfinished_worker_handles();
+        let workers = executor.take_unfinished_workers();
         assert_eq!(
-            handles.len(),
+            workers.len(),
             1,
             "paused request worker handle must stay owned"
         );
         release_tx.send(()).unwrap();
-        for handle in handles {
-            handle.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn request_workers_fail_closed_when_admission_is_exhausted() {
+        let pool = Arc::new(RemoteWorkerAdmissionPool::new(1));
+        let executor = WebRequestExecutor::new_with_worker_pool(2, 1, pool.clone());
+        assert_eq!(executor.inner.workers, 1);
+        assert_eq!(pool.in_use(), 1);
+
+        assert_eq!(
+            executor.shutdown_until(Instant::now() + std::time::Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(pool.in_use(), 0);
     }
 }

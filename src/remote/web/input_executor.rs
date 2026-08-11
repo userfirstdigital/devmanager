@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::super::{
+    defer_unowned_remote_worker, remote_worker_admission_pool, RemoteWorker,
+    RemoteWorkerAdmissionPool,
+};
 use crate::remote::presentation::StableSessionKey;
 
 const DEFAULT_MAX_WORKERS: usize = 64;
@@ -29,7 +32,7 @@ pub(crate) struct WebInputExecutor {
 
 struct WebInputExecutorInner {
     workers: Mutex<HashMap<StableSessionKey, WebInputWorker>>,
-    handles: Mutex<HashMap<u64, JoinHandle<()>>>,
+    handles: Mutex<HashMap<u64, RemoteWorker>>,
     completion_tx: mpsc::Sender<u64>,
     completion_rx: Mutex<mpsc::Receiver<u64>>,
     stopping: AtomicBool,
@@ -38,6 +41,7 @@ struct WebInputExecutorInner {
     idle_timeout: Duration,
     next_worker_id: AtomicU64,
     budget: Arc<WebInputBudget>,
+    worker_pool: Arc<RemoteWorkerAdmissionPool>,
 }
 
 #[derive(Clone)]
@@ -126,6 +130,24 @@ impl WebInputExecutor {
         max_bytes: usize,
         idle_timeout: Duration,
     ) -> Self {
+        Self::with_budget_and_worker_pool(
+            max_workers,
+            queue_capacity,
+            max_items,
+            max_bytes,
+            idle_timeout,
+            remote_worker_admission_pool(),
+        )
+    }
+
+    fn with_budget_and_worker_pool(
+        max_workers: usize,
+        queue_capacity: usize,
+        max_items: usize,
+        max_bytes: usize,
+        idle_timeout: Duration,
+        worker_pool: Arc<RemoteWorkerAdmissionPool>,
+    ) -> Self {
         let (completion_tx, completion_rx) = mpsc::channel();
         Self {
             inner: Arc::new(WebInputExecutorInner {
@@ -143,6 +165,7 @@ impl WebInputExecutor {
                     max_items: max_items.max(1),
                     max_bytes: max_bytes.max(1),
                 }),
+                worker_pool,
             }),
         }
     }
@@ -201,12 +224,13 @@ impl WebInputExecutor {
             let worker_key = key.clone();
             let idle_timeout = self.inner.idle_timeout;
             let completion_tx = self.inner.completion_tx.clone();
-            let spawn = std::thread::Builder::new()
-                .name(format!("web-input-{id}"))
-                .spawn(move || {
-                    run_worker(weak, worker_key, id, receiver, idle_timeout, completion_tx)
-                });
-            let Ok(handle) = spawn else {
+            let spawn = RemoteWorker::try_spawn_with_pool(
+                self.inner.worker_pool.clone(),
+                format!("web-input-{id}"),
+                None,
+                move || run_worker(weak, worker_key, id, receiver, idle_timeout, completion_tx),
+            );
+            let Ok(worker) = spawn else {
                 return Err(WebInputDispatchError::WorkerUnavailable);
             };
             workers.insert(key.clone(), WebInputWorker { id, sender });
@@ -214,7 +238,7 @@ impl WebInputExecutor {
                 .handles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id, handle);
+                .insert(id, worker);
         }
         Err(WebInputDispatchError::WorkerUnavailable)
     }
@@ -237,13 +261,13 @@ impl WebInputExecutor {
         self.join_completed_until(deadline)
     }
 
-    pub(crate) fn take_unfinished_worker_handles(&self) -> Vec<JoinHandle<()>> {
+    pub(in crate::remote) fn take_unfinished_workers(&self) -> Vec<RemoteWorker> {
         self.inner
             .handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
-            .map(|(_, handle)| handle)
+            .map(|(_, worker)| worker)
             .collect()
     }
 
@@ -270,14 +294,14 @@ impl WebInputExecutor {
                 .recv_timeout(wait);
             match event {
                 Ok(id) => {
-                    if let Some(handle) = self
+                    if let Some(worker) = self
                         .inner
                         .handles
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&id)
                     {
-                        let _ = handle.join();
+                        let _ = worker.join();
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -315,19 +339,19 @@ impl WebInputExecutor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
-                .filter_map(|(id, handle)| handle.is_finished().then_some(*id)),
+                .filter_map(|(id, worker)| worker.is_finished().then_some(*id)),
         );
         ids.sort_unstable();
         ids.dedup();
         for id in ids {
-            if let Some(handle) = self
+            if let Some(worker) = self
                 .inner
                 .handles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&id)
             {
-                let _ = handle.join();
+                let _ = worker.join();
             }
         }
     }
@@ -349,6 +373,24 @@ impl WebInputExecutor {
             .lock()
             .map(|usage| (usage.items, usage.bytes))
             .unwrap_or_default()
+    }
+}
+
+impl Drop for WebInputExecutorInner {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.workers
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        for (_, worker) in self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+        {
+            defer_unowned_remote_worker(worker);
+        }
     }
 }
 
@@ -564,15 +606,52 @@ mod tests {
             1,
             "paused input worker should remain visible after its owner deadline"
         );
-        let handles = executor.take_unfinished_worker_handles();
+        let workers = executor.take_unfinished_workers();
         assert_eq!(
-            handles.len(),
+            workers.len(),
             1,
             "paused input worker handle must stay owned"
         );
         release_tx.send(()).unwrap();
-        for handle in handles {
-            handle.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn worker_admission_is_reserved_before_input_thread_spawn() {
+        let pool = Arc::new(RemoteWorkerAdmissionPool::new(1));
+        let executor = WebInputExecutor::with_budget_and_worker_pool(
+            2,
+            1,
+            2,
+            2,
+            Duration::from_secs(60),
+            pool.clone(),
+        );
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        executor
+            .dispatch(StableSessionKey::from_tab("first"), 0, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("admitted input worker should start");
+
+        assert_eq!(
+            executor.dispatch(StableSessionKey::from_tab("second"), 0, || {}),
+            Err(WebInputDispatchError::WorkerUnavailable)
+        );
+        assert_eq!(pool.in_use(), 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            executor.shutdown_until(Instant::now() + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(pool.in_use(), 0);
     }
 }

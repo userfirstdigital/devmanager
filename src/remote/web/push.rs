@@ -456,11 +456,8 @@ fn push_worker_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let Some(inner) = inner.upgrade() else {
-            break;
-        };
-        let Some((current_config, current_subscription)) =
-            inner.config.read().ok().and_then(|config| {
+        let Some((current_config, current_subscription)) = inner.upgrade().and_then(|host| {
+            host.config.read().ok().and_then(|config| {
                 let current = &config.web.push;
                 if current.vapid_private_key_base64 != delivery.config.vapid_private_key_base64
                     || current.vapid_public_key_base64 != delivery.config.vapid_public_key_base64
@@ -475,7 +472,7 @@ fn push_worker_loop(
                     .cloned()
                     .map(|subscription| (current.clone(), subscription))
             })
-        else {
+        }) else {
             // Pairing revocation, host reset, key rotation, and a replacement
             // subscription all invalidate already-queued delivery work.
             continue;
@@ -492,15 +489,17 @@ fn push_worker_loop(
         if classify_push_status(status) != PushDeliveryOutcome::Expired {
             continue;
         }
-        let _ = crate::remote::mutate_host_config(&inner, |config| {
-            // A browser can replace a subscription while an old request is in
-            // flight. A terminal response for the old request must not delete
-            // that newer registration merely because the endpoint was reused.
-            config
-                .web
-                .push
-                .expire_subscription_if_matches(&current_subscription)
-        });
+        if let Some(host) = inner.upgrade() {
+            let _ = crate::remote::mutate_host_config(&host, |config| {
+                // A browser can replace a subscription while an old request is in
+                // flight. A terminal response for the old request must not delete
+                // that newer registration merely because the endpoint was reused.
+                config
+                    .web
+                    .push
+                    .expire_subscription_if_matches(&current_subscription)
+            });
+        }
     }
 }
 

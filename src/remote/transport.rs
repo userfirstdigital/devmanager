@@ -28,6 +28,7 @@ pub type ServerTlsStream = StreamOwned<ServerConnection, TcpStream>;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_TLS_NAME: &str = "devmanager.remote";
 
 fn tls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -215,6 +216,39 @@ impl Drop for ResolverCapacityGuard {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiveWaitError {
+    Cancelled,
+    DeadlineExpired,
+    Disconnected,
+}
+
+fn receive_with_deadline_and_cancel<T, F>(
+    receiver: &mpsc::Receiver<T>,
+    deadline: Instant,
+    should_cancel: &mut F,
+) -> Result<T, ReceiveWaitError>
+where
+    F: FnMut() -> bool,
+{
+    loop {
+        if should_cancel() {
+            return Err(ReceiveWaitError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ReceiveWaitError::DeadlineExpired);
+        }
+        match receiver.recv_timeout(remaining.min(CANCELLATION_POLL_INTERVAL)) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ReceiveWaitError::Disconnected)
+            }
+        }
+    }
+}
+
 /*
  * A DNS request is an owned operation, not a detached future. Capacity is
  * acquired before queueing and released only after the native resolver call
@@ -228,6 +262,21 @@ fn resolve_with_deadline(
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, String> {
+    resolve_with_deadline_and_cancel(address, port, deadline, || false)
+}
+
+fn resolve_with_deadline_and_cancel<F>(
+    address: &str,
+    port: u16,
+    deadline: Instant,
+    mut should_cancel: F,
+) -> Result<Vec<SocketAddr>, String>
+where
+    F: FnMut() -> bool,
+{
+    if should_cancel() {
+        return Err(format!("DNS resolution cancelled for {address}:{port}"));
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(format!(
@@ -237,6 +286,9 @@ fn resolve_with_deadline(
     let pool = resolver_pool();
     let mut active = pool.active.load(Ordering::Acquire);
     loop {
+        if should_cancel() {
+            return Err(format!("DNS resolution cancelled for {address}:{port}"));
+        }
         if active >= MAX_RESOLVER_OPERATIONS {
             return Err(format!(
                 "DNS resolver capacity is exhausted for {address}:{port}; active resolution remains owned until completion"
@@ -272,19 +324,25 @@ fn resolve_with_deadline(
                 "DNS resolver capacity is exhausted for {address}:{port}; resolution remains owned by the bounded resolver pool"
             )
         })?;
-    match result_rx.recv_timeout(remaining) {
+    match receive_with_deadline_and_cancel(&result_rx, deadline, &mut should_cancel) {
         Ok(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
         Ok(Ok(_)) => Err(format!(
             "DNS resolution returned no addresses for {address}:{port}"
         )),
         Ok(Err(error)) => Err(format!("Could not resolve {address}:{port}: {error}")),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        Err(ReceiveWaitError::Cancelled) => {
+            cancelled.cancel();
+            Err(format!(
+                "DNS resolution cancelled for {address}:{port}; the bounded resolver worker remains owned until native completion"
+            ))
+        }
+        Err(ReceiveWaitError::DeadlineExpired) => {
             cancelled.cancel();
             Err(format!(
                 "DNS resolution exceeded its absolute deadline for {address}:{port}; the bounded resolver worker remains owned until native completion"
             ))
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
+        Err(ReceiveWaitError::Disconnected) => {
             Err("DNS resolver pool disconnected unexpectedly".to_string())
         }
     }
@@ -647,20 +705,6 @@ pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), Str
     Ok(())
 }
 
-pub fn accept_tls(
-    stream: TcpStream,
-    config: &RemoteHostConfig,
-    should_stop: impl FnMut() -> bool,
-) -> Result<ServerTlsStream, String> {
-    return accept_tls_with_deadline(
-        stream,
-        config,
-        Instant::now() + HANDSHAKE_TIMEOUT,
-        should_stop,
-    )
-    .map(|result| result.stream);
-}
-
 pub fn accept_tls_with_deadline(
     stream: TcpStream,
     config: &RemoteHostConfig,
@@ -710,36 +754,89 @@ pub fn accept_tls_with_deadline(
     })
 }
 
+fn connect_socket_with_deadline<F>(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    connect_deadline: Instant,
+    should_cancel: &mut F,
+) -> Result<TcpStream, String>
+where
+    F: FnMut() -> bool,
+{
+    let mut last_error = None;
+    for socket_address in addresses {
+        loop {
+            if should_cancel() {
+                return Err("Remote TLS connection cancelled.".to_string());
+            }
+            let remaining = connect_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(
+                &socket_address,
+                remaining.min(CANCELLATION_POLL_INTERVAL),
+            ) {
+                Ok(connected) => return Ok(connected),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::Interrupted | ErrorKind::TimedOut | ErrorKind::WouldBlock
+                    ) =>
+                {
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+    if should_cancel() {
+        return Err("Remote TLS connection cancelled.".to_string());
+    }
+    Err(format!(
+        "Connect failed: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "connection attempt timed out".to_string())
+    ))
+}
+
 pub fn connect_tls_with_deadline(
     address: &str,
     port: u16,
     expected_fingerprint: Option<&str>,
     connect_deadline: Instant,
 ) -> Result<TlsConnectResult, String> {
-    let addresses = resolve_with_deadline(address, port, connect_deadline)?;
-    let mut socket = None;
-    let mut last_error = None;
-    for socket_address in addresses {
-        let remaining = connect_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match TcpStream::connect_timeout(&socket_address, remaining) {
-            Ok(connected) => {
-                socket = Some(connected);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
+    connect_tls_with_deadline_and_cancel(
+        address,
+        port,
+        expected_fingerprint,
+        connect_deadline,
+        || false,
+    )
+}
+
+pub fn connect_tls_with_deadline_and_cancel<F>(
+    address: &str,
+    port: u16,
+    expected_fingerprint: Option<&str>,
+    connect_deadline: Instant,
+    mut should_cancel: F,
+) -> Result<TlsConnectResult, String>
+where
+    F: FnMut() -> bool,
+{
+    if should_cancel() {
+        return Err("Remote TLS connection cancelled.".to_string());
     }
-    let mut socket = socket.ok_or_else(|| {
-        format!(
-            "Connect failed: {}",
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "connection attempt timed out".to_string())
-        )
-    })?;
+    let addresses =
+        resolve_with_deadline_and_cancel(address, port, connect_deadline, &mut should_cancel)?;
+    let mut socket = connect_socket_with_deadline(addresses, connect_deadline, &mut should_cancel)?;
+    if should_cancel() {
+        return Err("Remote TLS connection cancelled.".to_string());
+    }
     socket
         .set_nonblocking(false)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
@@ -751,10 +848,10 @@ pub fn connect_tls_with_deadline(
         return Err("Remote TLS handshake deadline expired before setup.".to_string());
     }
     socket
-        .set_read_timeout(Some(remaining))
+        .set_read_timeout(Some(remaining.min(CANCELLATION_POLL_INTERVAL)))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
-        .set_write_timeout(Some(remaining.min(WRITE_TIMEOUT)))
+        .set_write_timeout(Some(remaining.min(CANCELLATION_POLL_INTERVAL)))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
 
     let verifier = Arc::new(PinnedFingerprintVerifier::new(expected_fingerprint));
@@ -769,24 +866,34 @@ pub fn connect_tls_with_deadline(
     let mut connection = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
     while connection.is_handshaking() {
+        if should_cancel() {
+            return Err("Remote TLS connection cancelled.".to_string());
+        }
         let remaining = connect_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("Remote TLS handshake timed out.".to_string());
         }
         socket
-            .set_read_timeout(Some(remaining))
+            .set_read_timeout(Some(remaining.min(CANCELLATION_POLL_INTERVAL)))
             .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
         socket
-            .set_write_timeout(Some(remaining.min(WRITE_TIMEOUT)))
+            .set_write_timeout(Some(remaining.min(CANCELLATION_POLL_INTERVAL)))
             .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
         match connection.complete_io(&mut socket) {
             Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::TimedOut => {
-                return Err("Remote TLS handshake timed out.".to_string())
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::TimedOut | ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
             }
             Err(error) => return Err(format!("Remote TLS handshake failed: {error}")),
         }
+    }
+    if should_cancel() {
+        return Err("Remote TLS connection cancelled.".to_string());
     }
     let certificate_fingerprint = verifier
         .observed_fingerprint()
@@ -965,6 +1072,71 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn cancellable_receive_wakes_when_a_barrier_coordinated_cancel_arrives() {
+        let barrier = Arc::new(Barrier::new(2));
+        let (cancel_tx, cancel_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel::<()>(1);
+        let worker_barrier = barrier.clone();
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            cancel_tx
+                .send(())
+                .expect("cancellation observer should remain connected");
+        });
+
+        barrier.wait();
+        let mut is_cancelled = || cancel_rx.try_recv().is_ok();
+        let outcome = receive_with_deadline_and_cancel(
+            &result_rx,
+            Instant::now() + Duration::from_secs(1),
+            &mut is_cancelled,
+        );
+
+        assert_eq!(outcome, Err(ReceiveWaitError::Cancelled));
+        drop(result_tx);
+        worker.join().expect("cancellation worker should stop");
+    }
+
+    #[test]
+    fn cancellable_receive_returns_a_barrier_coordinated_result() {
+        let barrier = Arc::new(Barrier::new(2));
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker_barrier = barrier.clone();
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            result_tx
+                .send(7_u8)
+                .expect("result observer should remain connected");
+        });
+
+        barrier.wait();
+        let mut is_cancelled = || false;
+        let outcome = receive_with_deadline_and_cancel(
+            &result_rx,
+            Instant::now() + Duration::from_secs(1),
+            &mut is_cancelled,
+        );
+
+        assert_eq!(outcome, Ok(7));
+        worker.join().expect("result worker should stop");
+    }
+
+    #[test]
+    fn cancellable_connector_rejects_cancellation_before_dns_lookup() {
+        let error = connect_tls_with_deadline_and_cancel(
+            "localhost",
+            443,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        )
+        .expect_err("pre-cancelled connector should not start DNS");
+
+        assert_eq!(error, "Remote TLS connection cancelled.");
+    }
 
     #[test]
     fn bounded_resolver_completes_owned_localhost_lookup() {

@@ -17,7 +17,7 @@ use self::command_catalog::{
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use axum::body::Bytes;
@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::{
-    now_epoch_ms, ListenerBindFailure, ListenerLease, RemoteAccessActivityEvent,
-    RemoteAccessActivityKind, RemoteAccessSource, RemoteHostInner,
+    now_epoch_ms, remote_worker_admission_pool, ListenerBindFailure, ListenerLease,
+    RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteHostInner,
+    RemoteWorkerAdmissionPool, RemoteWorkerPermit,
 };
 use crate::remote::presentation::StableSessionKey;
 use crate::state::SessionKind;
@@ -371,9 +372,22 @@ pub fn discover_lan_ip() -> Option<IpAddr> {
 pub struct WebListenerHandle {
     runtime: Option<tokio::runtime::Runtime>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_permit: Option<RemoteWorkerPermit>,
     push_inner: std::sync::Weak<RemoteHostInner>,
     push_dispatcher: Option<push::PushDispatcher>,
     pub bind_info: String,
+}
+
+fn reserve_web_listener_shutdown_permit(
+    worker_pool: &Arc<RemoteWorkerAdmissionPool>,
+    bind: &str,
+) -> Result<RemoteWorkerPermit, ListenerBindFailure> {
+    worker_pool
+        .try_acquire()
+        .ok_or_else(|| ListenerBindFailure::Other {
+            bind: bind.to_string(),
+            detail: "web listener cleanup admission is exhausted".to_string(),
+        })
 }
 
 impl WebListenerHandle {
@@ -382,24 +396,42 @@ impl WebListenerHandle {
         config: WebConfig,
         lease: ListenerLease,
     ) -> Result<Self, ListenerBindFailure> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        Self::start_with_worker_pool(inner, config, lease, remote_worker_admission_pool())
+    }
+
+    fn start_with_worker_pool(
+        inner: Arc<RemoteHostInner>,
+        config: WebConfig,
+        lease: ListenerLease,
+        worker_pool: Arc<RemoteWorkerAdmissionPool>,
+    ) -> Result<Self, ListenerBindFailure> {
+        let listener_generation = lease.generation;
+        let bind = format!("{}:{}", config.bind_address, config.port);
+        let shutdown_permit = reserve_web_listener_shutdown_permit(&worker_pool, &bind)?;
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("devmanager-web")
             .build()
-            .map_err(|error| ListenerBindFailure::Other {
-                bind: format!("{}:{}", config.bind_address, config.port),
-                detail: format!("failed to build tokio runtime: {error}"),
-            })?;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                shutdown_permit.release();
+                return Err(ListenerBindFailure::Other {
+                    bind,
+                    detail: format!("failed to build tokio runtime: {error}"),
+                });
+            }
+        };
 
-        let bind = format!("{}:{}", config.bind_address, config.port);
         let bind_info = bind.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (bind_result_tx, bind_result_rx) =
             std::sync::mpsc::channel::<Result<(), ListenerBindFailure>>();
 
         let router_state = Arc::new(WebState {
-            inner: inner.clone(),
+            inner: Arc::downgrade(&inner),
+            listener_generation,
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
         });
 
@@ -455,17 +487,34 @@ impl WebListenerHandle {
                 Ok(Self {
                     runtime: Some(runtime),
                     shutdown_tx: Some(shutdown_tx),
+                    shutdown_permit: Some(shutdown_permit),
                     push_inner,
                     push_dispatcher,
                     bind_info,
                 })
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(ListenerBindFailure::Other {
-                bind: bind_info,
-                detail: "web listener failed to report bind status in time".to_string(),
-            }),
+            Ok(Err(error)) => {
+                let _ = shutdown_tx.send(());
+                drop(runtime);
+                shutdown_permit.release();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = shutdown_tx.send(());
+                drop(runtime);
+                shutdown_permit.release();
+                Err(ListenerBindFailure::Other {
+                    bind: bind_info,
+                    detail: "web listener failed to report bind status in time".to_string(),
+                })
+            }
         }
+    }
+
+    pub(super) fn take_shutdown_permit(&mut self) -> RemoteWorkerPermit {
+        self.shutdown_permit
+            .take()
+            .expect("active web listener must retain cleanup admission")
     }
 
     pub fn shutdown(mut self) {
@@ -479,6 +528,9 @@ impl WebListenerHandle {
             // want here — we are called from a std thread, not from inside
             // the runtime itself.
             drop(runtime);
+        }
+        if let Some(permit) = self.shutdown_permit.take() {
+            permit.release();
         }
     }
 
@@ -501,13 +553,40 @@ impl Drop for WebListenerHandle {
         if let Some(runtime) = self.runtime.take() {
             drop(runtime);
         }
+        if let Some(permit) = self.shutdown_permit.take() {
+            permit.release();
+        }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct WebState {
-    pub(crate) inner: Arc<RemoteHostInner>,
+    pub(crate) inner: Weak<RemoteHostInner>,
+    pub(crate) listener_generation: u64,
     pub(crate) pairing_attempts: Arc<std::sync::Mutex<PairingAttemptTracker>>,
+}
+
+impl WebState {
+    fn upgrade_inner(&self) -> Option<Arc<RemoteHostInner>> {
+        self.inner.upgrade()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebAuthError {
+    Unauthorized,
+    Durability,
+}
+
+fn web_auth_error_response(error: WebAuthError) -> Response {
+    match error {
+        WebAuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "not paired").into_response(),
+        WebAuthError::Durability => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication state unavailable",
+        )
+            .into_response(),
+    }
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
@@ -587,6 +666,9 @@ async fn pair_handler(
     headers: HeaderMap,
     Query(query): Query<PairQuery>,
 ) -> Response {
+    let Some(inner) = state.upgrade_inner() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
+    };
     let client_ip = addr.ip();
     let provided = match query.t {
         Some(token) if !token.is_empty() => token,
@@ -617,7 +699,7 @@ async fn pair_handler(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
     let paired = match super::mutate_host_config_if(
-        &state.inner,
+        &inner,
         |config| config.web.enabled && provided == config.web.pairing_token,
         |config| {
             let client_id = if let Some(browser_install_id) = browser_install_id.as_deref() {
@@ -706,7 +788,7 @@ async fn pair_handler(
     ) {
         Ok(Some(paired)) => paired,
         Ok(None) => {
-            let web_enabled = match state.inner.config.read() {
+            let web_enabled = match inner.config.read() {
                 Ok(config) => config.web.enabled,
                 Err(_) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable")
@@ -803,15 +885,23 @@ fn auth_cookie_header(cookie_name: &str, signed: &str, headers: &HeaderMap) -> S
     cookie
 }
 
-fn request_auth_cookie(state: &WebState, headers: &HeaderMap) -> Option<(String, String)> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+fn request_auth_cookie(
+    inner: &Arc<RemoteHostInner>,
+    headers: &HeaderMap,
+) -> Result<(String, String), WebAuthError> {
+    let cookie_header = headers
+        .get(header::COOKIE)
+        .ok_or(WebAuthError::Unauthorized)?
+        .to_str()
+        .map_err(|_| WebAuthError::Unauthorized)?;
     let current_cookie_name = {
-        let config = state.inner.config.read().ok()?;
+        let config = inner.config.read().map_err(|_| WebAuthError::Durability)?;
         cookie_name_for_server_id(&config.server_id)
     };
     let cookie_value = extract_cookie(cookie_header, &current_cookie_name)
-        .or_else(|| extract_cookie(cookie_header, WEB_COOKIE_NAME))?;
-    Some((current_cookie_name, cookie_value))
+        .or_else(|| extract_cookie(cookie_header, WEB_COOKIE_NAME))
+        .ok_or(WebAuthError::Unauthorized)?;
+    Ok((current_cookie_name, cookie_value))
 }
 
 /// `/api/me` — returns 200 with the paired-client id if the dm_web cookie is
@@ -819,25 +909,32 @@ fn request_auth_cookie(state: &WebState, headers: &HeaderMap) -> Option<(String,
 /// whether to show the "not paired yet" screen or start connecting.
 async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     match authenticate_request(&state, &headers) {
-        Some(client_id) => {
+        Ok(client_id) => {
             let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
                 format!(r#"{{"clientId":{:?},"ok":true}}"#, client_id),
             )
                 .into_response();
-            if let Some((cookie_name, cookie_value)) = request_auth_cookie(&state, &headers) {
-                let cookie = auth_cookie_header(&cookie_name, &cookie_value, &headers);
-                if let Ok(value) = cookie.parse() {
-                    response.headers_mut().insert(header::SET_COOKIE, value);
+            if let Some(inner) = state.upgrade_inner() {
+                if let Ok((cookie_name, cookie_value)) = request_auth_cookie(&inner, &headers) {
+                    let cookie = auth_cookie_header(&cookie_name, &cookie_value, &headers);
+                    if let Ok(value) = cookie.parse() {
+                        response.headers_mut().insert(header::SET_COOKIE, value);
+                    }
                 }
             }
             response
         }
-        None => (
+        Err(WebAuthError::Unauthorized) => (
             StatusCode::UNAUTHORIZED,
             [(header::CONTENT_TYPE, "application/json")],
             r#"{"ok":false}"#,
+        )
+            .into_response(),
+        Err(WebAuthError::Durability) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication state unavailable",
         )
             .into_response(),
     }
@@ -861,8 +958,8 @@ async fn slash_commands_handler(
     headers: HeaderMap,
     Query(query): Query<SlashCommandQuery>,
 ) -> Response {
-    if authenticate_request(&state, &headers).is_none() {
-        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    if let Err(error) = authenticate_request(&state, &headers) {
+        return web_auth_error_response(error);
     }
     let Some(session_key) = query
         .session_key
@@ -873,14 +970,17 @@ async fn slash_commands_handler(
         return (StatusCode::BAD_REQUEST, "invalid session key").into_response();
     };
 
+    let Some(inner) = state.upgrade_inner() else {
+        return web_auth_error_response(WebAuthError::Durability);
+    };
     let resolved = {
-        let app = match state.inner.shared_state.read() {
+        let app = match inner.shared_state.read() {
             Ok(app) => app,
             Err(_) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "workspace unavailable").into_response()
             }
         };
-        let runtime = match state.inner.runtime_state.read() {
+        let runtime = match inner.runtime_state.read() {
             Ok(runtime) => runtime,
             Err(_) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "runtime unavailable").into_response()
@@ -1047,10 +1147,14 @@ fn validate_push_mutation_request(headers: &HeaderMap) -> Result<(), StatusCode>
 }
 
 async fn push_status_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    let client_id = match authenticate_request(&state, &headers) {
+        Ok(client_id) => client_id,
+        Err(error) => return web_auth_error_response(error),
     };
-    let Ok(config) = state.inner.config.read() else {
+    let Some(inner) = state.upgrade_inner() else {
+        return web_auth_error_response(WebAuthError::Durability);
+    };
+    let Ok(config) = inner.config.read() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable").into_response();
     };
     let enabled = config.web.push.notifications_enabled(&client_id);
@@ -1075,8 +1179,9 @@ async fn push_subscribe_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    let client_id = match authenticate_request(&state, &headers) {
+        Ok(client_id) => client_id,
+        Err(error) => return web_auth_error_response(error),
     };
     if let Err(status) = validate_push_mutation_request(&headers) {
         return status.into_response();
@@ -1090,7 +1195,10 @@ async fn push_subscribe_handler(
         Ok(validated) => validated,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
-    let registered = match super::mutate_host_config(&state.inner, |config| {
+    let Some(inner) = state.upgrade_inner() else {
+        return web_auth_error_response(WebAuthError::Durability);
+    };
+    let registered = match super::mutate_host_config(&inner, |config| {
         if !config
             .web
             .paired_clients
@@ -1146,8 +1254,9 @@ async fn push_unsubscribe_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    let client_id = match authenticate_request(&state, &headers) {
+        Ok(client_id) => client_id,
+        Err(error) => return web_auth_error_response(error),
     };
     if let Err(status) = validate_push_mutation_request(&headers) {
         return status.into_response();
@@ -1164,7 +1273,10 @@ async fn push_unsubscribe_handler(
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
     }
-    match super::mutate_host_config(&state.inner, |config| {
+    let Some(inner) = state.upgrade_inner() else {
+        return web_auth_error_response(WebAuthError::Durability);
+    };
+    match super::mutate_host_config(&inner, |config| {
         let legacy_endpoint_matches = request.endpoint.as_deref().is_some_and(|endpoint| {
             config.web.push.subscriptions.iter().any(|subscription| {
                 subscription.client_id == client_id && subscription.endpoint == endpoint
@@ -1184,17 +1296,23 @@ async fn push_unsubscribe_handler(
     }
 }
 
-/// Shared helper: returns `Some(client_id)` when the request carries a valid
-/// `dm_web` cookie that matches a currently-paired web client and verifies
-/// against the host's cookie secret. Used by `/api/me` and (later) the
-/// WebSocket upgrade handler.
-pub(crate) fn authenticate_request(state: &WebState, headers: &HeaderMap) -> Option<String> {
-    let (_, cookie_value) = request_auth_cookie(state, headers)?;
+/// Shared helper: authenticates a browser cookie and durably advances the
+/// paired client's `last_seen` timestamp before returning the client id.
+///
+/// A valid signature is not enough to authorize a request: if the host config
+/// cannot be read or the `last_seen` update cannot be persisted, this returns
+/// `WebAuthError::Durability` and callers fail closed with a server error.
+pub(crate) fn authenticate_request(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<String, WebAuthError> {
+    let inner = state.upgrade_inner().ok_or(WebAuthError::Durability)?;
+    let (_, cookie_value) = request_auth_cookie(&inner, headers)?;
 
     let (cookie_secret_hex, paired_ids) = {
-        let config = state.inner.config.read().ok()?;
+        let config = inner.config.read().map_err(|_| WebAuthError::Durability)?;
         if !config.web.enabled {
-            return None;
+            return Err(WebAuthError::Unauthorized);
         }
         let ids: Vec<String> = config
             .web
@@ -1205,22 +1323,39 @@ pub(crate) fn authenticate_request(state: &WebState, headers: &HeaderMap) -> Opt
         (config.web.cookie_secret_hex.clone(), ids)
     };
 
-    let client_id = verify_cookie(&cookie_secret_hex, &cookie_value)?;
+    let client_id =
+        verify_cookie(&cookie_secret_hex, &cookie_value).ok_or(WebAuthError::Unauthorized)?;
     if !paired_ids.iter().any(|id| id == &client_id) {
-        return None;
+        return Err(WebAuthError::Unauthorized);
     }
     let now = now_epoch_ms();
-    let _ = super::mutate_host_config(&state.inner, |config| {
-        if let Some(client) = config
-            .web
-            .paired_clients
-            .iter_mut()
-            .find(|client| client.client_id == client_id)
-        {
-            client.last_seen_epoch_ms = Some(now);
-        }
-    });
-    Some(client_id)
+    let updated = super::mutate_host_config_if(
+        &inner,
+        |config| {
+            config.web.enabled
+                && config.web.cookie_secret_hex == cookie_secret_hex
+                && config
+                    .web
+                    .paired_clients
+                    .iter()
+                    .any(|client| client.client_id == client_id)
+        },
+        |config| {
+            if let Some(client) = config
+                .web
+                .paired_clients
+                .iter_mut()
+                .find(|client| client.client_id == client_id)
+            {
+                client.last_seen_epoch_ms = Some(now);
+            }
+        },
+    )
+    .map_err(|_| WebAuthError::Durability)?;
+    if updated.is_none() {
+        return Err(WebAuthError::Unauthorized);
+    }
+    Ok(client_id)
 }
 
 #[cfg(test)]
@@ -1261,9 +1396,89 @@ mod tests {
         assert!(sign_cookie(&config.cookie_secret_hex, "client").is_some());
     }
 
+    #[test]
+    fn web_listener_reserves_cleanup_admission_before_runtime_start() {
+        let pool = Arc::new(RemoteWorkerAdmissionPool::new(1));
+        let occupied = pool.try_acquire().expect("test admission");
+
+        let failure = match reserve_web_listener_shutdown_permit(&pool, "127.0.0.1:0") {
+            Err(failure) => failure,
+            Ok(reserved) => {
+                reserved.release();
+                panic!("listener started without cleanup ownership")
+            }
+        };
+        assert!(
+            failure
+                .to_string()
+                .contains("cleanup admission is exhausted"),
+            "typed listener failure should explain the lifecycle boundary"
+        );
+        assert_eq!(pool.in_use(), 1);
+
+        occupied.release();
+        let reserved = reserve_web_listener_shutdown_permit(&pool, "127.0.0.1:0")
+            .expect("released admission should be reusable");
+        assert_eq!(pool.in_use(), 1);
+        reserved.release();
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn web_state_does_not_retain_host_runtime_after_listener_shutdown() {
+        let service = test_service("web-state-weak");
+        let host = Arc::downgrade(&service.inner);
+        let state = test_state(&service);
+
+        drop(service);
+
+        assert!(host.upgrade().is_none());
+        assert!(state.inner.upgrade().is_none());
+    }
+
+    #[test]
+    fn authenticated_request_fails_closed_when_last_seen_persistence_fails() {
+        let _profile = TestProfileGuard::new("web-auth-last-seen-failure");
+        let service = test_service("web-auth-last-seen-failure");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let headers = runtime.block_on(pair_cookie_headers(state.clone(), "durability-failure"));
+
+        let mut persistence_hook = super::super::HOST_CONFIG_PERSISTENCE_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            persistence_hook.is_none(),
+            "persistence hook leaked into test"
+        );
+        *persistence_hook = Some(Arc::new(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test persistence failure",
+            ))
+        }));
+        drop(persistence_hook);
+
+        let response = runtime.block_on(me_handler(State(state), headers));
+
+        *super::super::HOST_CONFIG_PERSISTENCE_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     fn test_state(service: &RemoteHostService) -> Arc<WebState> {
         Arc::new(WebState {
-            inner: service.inner.clone(),
+            inner: Arc::downgrade(&service.inner),
+            listener_generation: service
+                .inner
+                .native_runtime_generation
+                .load(std::sync::atomic::Ordering::Acquire),
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
         })
     }
@@ -1322,8 +1537,8 @@ mod tests {
     }
 
     async fn pair_cookie_headers(state: Arc<WebState>, install_id: &str) -> HeaderMap {
-        let pairing_token = state
-            .inner
+        let inner = state.upgrade_inner().expect("host runtime");
+        let pairing_token = inner
             .config
             .read()
             .expect("host config")
@@ -2736,8 +2951,10 @@ mod tests {
             .next()
             .expect("cookie name/value")
             .to_string();
-        if let Ok(mut config) = state.inner.config.write() {
-            config.web.paired_clients.clear();
+        if let Some(inner) = state.upgrade_inner() {
+            if let Ok(mut config) = inner.config.write() {
+                config.web.paired_clients.clear();
+            }
         }
 
         let mut headers = HeaderMap::new();
