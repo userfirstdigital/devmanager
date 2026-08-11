@@ -258,12 +258,13 @@ fn inline_grapheme_work_honors_mid_operation_cancellation() {
     let old = "aX".repeat(10_000);
     let new = "bX".repeat(10_000);
 
-    // Hashing and normalized line scanning consume 80,192 units for these
-    // inputs; the next checkpoint is the first grapheme in inline work.
+    // Hashing, line-count preflight, and normalized line scanning consume
+    // 120,128 units for these inputs. The first line comparison consumes 65;
+    // the next checkpoint is the first grapheme in inline work.
     let diff = diff_versions_with_budget(
         &old,
         &new,
-        DiffBudget::default().with_cancellation_after_work(&cancellation, 80_193),
+        DiffBudget::default().with_cancellation_after_work(&cancellation, 120_194),
     );
 
     assert_eq!(diff.status(), DiffStatus::Cancelled);
@@ -337,7 +338,7 @@ fn inline_spans_share_the_encoded_payload_cap() {
 #[test]
 fn work_limit_after_partial_hunk_does_not_duplicate_mismatch_tail() {
     let diff =
-        diff_versions_with_budget("old\n", "new\n", DiffBudget::default().with_work_limit(20));
+        diff_versions_with_budget("old\n", "new\n", DiffBudget::default().with_work_limit(30));
 
     assert_eq!(diff.status(), DiffStatus::Approximate);
     assert_eq!(diff.hunks().len(), 1);
@@ -495,6 +496,75 @@ fn diff_preserves_crlf_policy_and_does_not_unicode_normalize() {
     let composed = diff_versions("caf\u{00e9}\n", "cafe\u{301}\n");
     assert_eq!(composed.status(), DiffStatus::Complete);
     assert!(!composed.hunks().is_empty());
+}
+
+#[test]
+fn line_count_is_bounded_before_line_storage() {
+    let old = "x\n".repeat(MAX_PROMPT_DIFF_LINE_COUNT + 1);
+    let new = "y\n".repeat(MAX_PROMPT_DIFF_LINE_COUNT + 1);
+
+    let diff = diff_versions(&old, &new);
+
+    assert_eq!(diff.status(), DiffStatus::Approximate);
+    assert_eq!(
+        diff.truncation().expect("line cap must be marked").reason,
+        devmanager::prompts::TruncationReason::ComplexityLimit
+    );
+    assert!(diff.hunks().is_empty());
+}
+
+#[test]
+fn grapheme_count_is_bounded_before_inline_storage() {
+    let old = "a".repeat(MAX_PROMPT_DIFF_GRAPHEME_COUNT + 1);
+    let new = "b".repeat(MAX_PROMPT_DIFF_GRAPHEME_COUNT + 1);
+
+    let diff = diff_versions(&old, &new);
+
+    assert_eq!(diff.status(), DiffStatus::Approximate);
+    assert_eq!(
+        diff.truncation()
+            .expect("grapheme cap must be marked")
+            .reason,
+        devmanager::prompts::TruncationReason::ComplexityLimit
+    );
+    assert!(diff.inline_spans().len() <= MAX_PROMPT_DIFF_INLINE_SPANS);
+}
+
+#[test]
+fn length_mismatch_comparison_is_budgeted_before_anchor_search() {
+    let cancellation = AtomicBool::new(false);
+    let old = "a\n";
+    let new = "longer\n";
+
+    // Hashing and the two bounded line-count/scan passes consume 24 units for
+    // these inputs; the first length-mismatch comparison must charge one more.
+    let diff = diff_versions_with_budget(
+        old,
+        new,
+        DiffBudget::default().with_cancellation_after_work(&cancellation, 25),
+    );
+
+    assert_eq!(diff.status(), DiffStatus::Cancelled);
+    assert!(cancellation.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn empty_grapheme_comparison_is_budgeted_in_inline_anchor_search() {
+    let cancellation = AtomicBool::new(false);
+    let old = "a\n";
+    let new = "b\n";
+
+    // Hashing and the two line passes consume 8 units. The line mismatch then
+    // charges one unit and the first empty/length-mismatch grapheme comparison
+    // must charge another before it can enter anchor search.
+    let diff = diff_versions_with_budget(
+        old,
+        new,
+        DiffBudget::default().with_cancellation_after_work(&cancellation, 10),
+    );
+
+    assert_eq!(diff.status(), DiffStatus::Cancelled);
+    assert!(cancellation.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 #[test]

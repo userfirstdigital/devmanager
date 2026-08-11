@@ -11,6 +11,14 @@ use super::model::MAX_PROMPT_BODY_BYTES;
 
 /// Maximum number of inline spans retained in a prompt diff.
 pub const MAX_PROMPT_DIFF_INLINE_SPANS: usize = 20_000;
+/// Maximum normalized lines examined before comparison storage is allocated.
+///
+/// The preflight pass rejects a larger input as an explicit approximation so a
+/// 256 KiB body containing tiny lines cannot force an unbounded line-slice
+/// allocation.
+pub const MAX_PROMPT_DIFF_LINE_COUNT: usize = 50_000;
+/// Maximum grapheme clusters materialized for one changed line.
+pub const MAX_PROMPT_DIFF_GRAPHEME_COUNT: usize = 65_536;
 /// Maximum estimated encoded size of a prompt diff.
 pub const MAX_PROMPT_DIFF_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 /// Conservative encoded-size allowance for a truncation/approximation marker.
@@ -20,7 +28,7 @@ const DEFAULT_DIFF_WORK_UNITS: usize = 4 * 1024 * 1024;
 const LINE_ANCHOR_WINDOW: usize = 32;
 const INLINE_ANCHOR_WINDOW: usize = 32;
 const LARGE_HEURISTIC_LINE_COUNT: usize = 512;
-const MAX_INLINE_GRAPHEMES: usize = 65_536;
+const MAX_INLINE_GRAPHEMES: usize = MAX_PROMPT_DIFF_GRAPHEME_COUNT;
 const WORK_CHUNK_BYTES: usize = 64;
 const MAX_JSON_NUMBER_BYTES: usize = 20;
 const MAX_JSON_BYTE_BYTES: usize = 3;
@@ -911,8 +919,9 @@ fn scan_normalized_lines<'a>(
     body: &'a str,
     budget: &mut DiffBudget<'_>,
 ) -> Result<Vec<LineSlice<'a>>, BudgetStop> {
+    let line_count = count_normalized_lines(body, budget)?;
     let bytes = body.as_bytes();
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(line_count);
     let mut start = 0;
 
     for (index, &byte) in bytes.iter().enumerate() {
@@ -943,11 +952,44 @@ fn scan_normalized_lines<'a>(
     Ok(lines)
 }
 
+/// Count normalized lines without allocating line slices. This pass is kept
+/// separate from materialization so the hard line cap is checked before a
+/// vector can reserve capacity proportional to an adversarial body.
+fn count_normalized_lines(body: &str, budget: &mut DiffBudget<'_>) -> Result<usize, BudgetStop> {
+    if body.is_empty() {
+        return Ok(0);
+    }
+
+    let bytes = body.as_bytes();
+    let mut count = 0usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if index % WORK_CHUNK_BYTES == 0 {
+            budget.checkpoint((bytes.len() - index).min(WORK_CHUNK_BYTES))?;
+        }
+        if byte == b'\n' {
+            count = count.saturating_add(1);
+            if count > MAX_PROMPT_DIFF_LINE_COUNT {
+                return Err(BudgetStop::WorkLimit);
+            }
+        }
+    }
+    if !bytes.ends_with(b"\n") {
+        count = count.saturating_add(1);
+    }
+    if count > MAX_PROMPT_DIFF_LINE_COUNT {
+        return Err(BudgetStop::WorkLimit);
+    }
+    Ok(count)
+}
+
 fn lines_equal(
     old: &LineSlice<'_>,
     new: &LineSlice<'_>,
     budget: &mut DiffBudget<'_>,
 ) -> Result<bool, BudgetStop> {
+    // Every candidate comparison has a non-zero charge, including empty
+    // lines and the length/termination fast paths below.
+    budget.checkpoint(1)?;
     if old.terminated != new.terminated || old.text.len() != new.text.len() {
         return Ok(false);
     }
@@ -985,6 +1027,10 @@ fn find_line_anchor(
         let old_offset_max = score.min(old_span.saturating_sub(1));
         for old_offset in old_offset_min..=old_offset_max {
             let new_offset = score - old_offset;
+            // Charge the anchor candidate itself in addition to the bounded
+            // line comparison so a long adversarial search cannot hide behind
+            // an early return in that comparison.
+            budget.checkpoint(1)?;
             if lines_equal(
                 &old_lines[old_start + old_offset],
                 &new_lines[new_start + new_offset],
@@ -1174,11 +1220,9 @@ fn collect_graphemes<'a>(
     line: &'a str,
     budget: &mut DiffBudget<'_>,
 ) -> Result<Vec<GraphemeSlice<'a>>, BudgetStop> {
-    let mut graphemes = Vec::new();
+    let grapheme_count = count_graphemes(line, budget)?;
+    let mut graphemes = Vec::with_capacity(grapheme_count);
     for (start, text) in line.grapheme_indices(true) {
-        if graphemes.len() >= MAX_INLINE_GRAPHEMES {
-            return Err(BudgetStop::WorkLimit);
-        }
         budget.checkpoint(text.len())?;
         graphemes.push(GraphemeSlice {
             text,
@@ -1188,11 +1232,29 @@ fn collect_graphemes<'a>(
     Ok(graphemes)
 }
 
+/// Count grapheme clusters before allocating the comparison vector. The
+/// count is bounded independently of the line byte limit so a single Unicode
+/// line cannot grow an unbounded materialization buffer.
+fn count_graphemes(line: &str, budget: &mut DiffBudget<'_>) -> Result<usize, BudgetStop> {
+    let mut count = 0usize;
+    for (_, text) in line.grapheme_indices(true) {
+        budget.checkpoint(text.len().max(1))?;
+        count = count.saturating_add(1);
+        if count > MAX_INLINE_GRAPHEMES {
+            return Err(BudgetStop::WorkLimit);
+        }
+    }
+    Ok(count)
+}
+
 fn graphemes_equal(
     old: &GraphemeSlice<'_>,
     new: &GraphemeSlice<'_>,
     budget: &mut DiffBudget<'_>,
 ) -> Result<bool, BudgetStop> {
+    // Do not let empty clusters or a length mismatch bypass cancellation and
+    // work accounting before the byte loop.
+    budget.checkpoint(1)?;
     if old.text.len() != new.text.len() {
         return Ok(false);
     }
@@ -1230,6 +1292,7 @@ fn find_grapheme_anchor(
         let old_offset_max = score.min(old_span.saturating_sub(1));
         for old_offset in old_offset_min..=old_offset_max {
             let new_offset = score - old_offset;
+            budget.checkpoint(1)?;
             if graphemes_equal(
                 &old_graphemes[old_start + old_offset],
                 &new_graphemes[new_start + new_offset],
@@ -1397,13 +1460,13 @@ fn finish_approximate<'a>(mut result: PromptDiff<'a>, output: OutputBudget) -> P
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct LineSlice<'a> {
     text: &'a str,
     terminated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct GraphemeSlice<'a> {
     text: &'a str,
     range: Range<usize>,
