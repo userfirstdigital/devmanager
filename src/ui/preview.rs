@@ -16,50 +16,18 @@ use std::rc::Rc;
 use crate::assets::AppAssets;
 use crate::client::action;
 use crate::terminal::terminal_font;
+use crate::ui::actions::{register_task_cockpit_bindings, TASK_COCKPIT_ACTION_NAMES};
 use crate::ui::preview_capture;
+use crate::ui::tokens::{theme, Density, Scale, ThemeMode, PREVIEW_SENTINEL};
 
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
-const PREVIEW_SENTINEL_RGB: u32 = 0x912bd4;
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
 const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
 
 gpui::actions!(devmanager_next, [PreviewDismiss]);
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "host.actions")]
-pub struct HostActions;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "host.status")]
-pub struct HostStatus;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "task.list")]
-pub struct TaskList;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "task.show")]
-pub struct TaskShow;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "task.create")]
-pub struct TaskCreate;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "task.rename")]
-pub struct TaskRename;
-
-const TASK_COCKPIT_ACTION_NAMES: [&str; 6] = [
-    action::ACTION_HOST_ACTIONS,
-    action::ACTION_HOST_STATUS,
-    action::ACTION_TASK_LIST,
-    action::ACTION_TASK_SHOW,
-    action::ACTION_TASK_CREATE,
-    action::ACTION_TASK_RENAME,
-];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -502,15 +470,8 @@ impl PreviewApplication {
 
 pub(crate) fn register_preview_environment(cx: &mut gpui::App) {
     crate::ui::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("ctrl-alt-1", HostActions, None),
-        KeyBinding::new("ctrl-alt-2", HostStatus, None),
-        KeyBinding::new("ctrl-alt-3", TaskList, None),
-        KeyBinding::new("ctrl-alt-4", TaskShow, None),
-        KeyBinding::new("ctrl-alt-5", TaskCreate, None),
-        KeyBinding::new("ctrl-alt-6", TaskRename, None),
-        KeyBinding::new("escape", PreviewDismiss, None),
-    ]);
+    register_task_cockpit_bindings(cx);
+    cx.bind_keys([KeyBinding::new("escape", PreviewDismiss, None)]);
 }
 
 #[derive(Debug, Clone)]
@@ -524,17 +485,18 @@ impl PreviewRoot {
     }
 
     pub fn element(&self) -> impl IntoElement {
+        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
         div()
             .size_full()
             .p(px(16.0))
-            .bg(gpui::rgb(0x202124))
-            .text_color(gpui::rgb(0xf1f3f4))
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .text_color(tokens.text.primary.to_gpui())
             .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
             .child(
                 div()
                     .flex_none()
                     .size(px(PREVIEW_SENTINEL_SIZE))
-                    .bg(gpui::rgb(PREVIEW_SENTINEL_RGB)),
+                    .bg(PREVIEW_SENTINEL.to_gpui()),
             )
             .child(self.snapshot.body.clone())
     }

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "content": {
+    "long_text": "A long task title demonstrates wrapping without clipping while the token gallery exercises status, controls, terminal text, and focus affordances at every approved Windows scale.",
+    "unicode": "Résumé • 日本語 • العربية • Ελληνικά • 🚀",
+    "disabled_text": "Unavailable until the host reconnects"
+  },
+  "interaction_bindings": [
+    { "state": "default", "content_key": "long_text" },
+    { "state": "hover", "content_key": "long_text" },
+    { "state": "focus", "content_key": "unicode" },
+    { "state": "selected", "content_key": "long_text" },
+    { "state": "disabled", "content_key": "disabled_text" }
+  ],
+  "status_bindings": [
+    { "status": "external", "content_key": "unicode" },
+    { "status": "attention", "content_key": "long_text" },
+    { "status": "success", "content_key": "long_text" },
+    { "status": "warning", "content_key": "disabled_text" },
+    { "status": "destructive", "content_key": "long_text" },
+    { "status": "inactive", "content_key": "disabled_text" }
+  ],
+  "cases": [
+    { "theme": "dark", "density": "compact", "scale": "100%" },
+    { "theme": "dark", "density": "compact", "scale": "125%" },
+    { "theme": "dark", "density": "compact", "scale": "150%" },
+    { "theme": "dark", "density": "compact", "scale": "200%" },
+    { "theme": "dark", "density": "comfortable", "scale": "100%" },
+    { "theme": "dark", "density": "comfortable", "scale": "125%" },
+    { "theme": "dark", "density": "comfortable", "scale": "150%" },
+    { "theme": "dark", "density": "comfortable", "scale": "200%" },
+    { "theme": "light", "density": "compact", "scale": "100%" },
+    { "theme": "light", "density": "compact", "scale": "125%" },
+    { "theme": "light", "density": "compact", "scale": "150%" },
+    { "theme": "light", "density": "compact", "scale": "200%" },
+    { "theme": "light", "density": "comfortable", "scale": "100%" },
+    { "theme": "light", "density": "comfortable", "scale": "125%" },
+    { "theme": "light", "density": "comfortable", "scale": "150%" },
+    { "theme": "light", "density": "comfortable", "scale": "200%" }
+  ]
+}
