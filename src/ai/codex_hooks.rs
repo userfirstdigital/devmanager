@@ -10,6 +10,7 @@ use crate::remote::presentation::{
     StableSessionKey,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
@@ -21,6 +22,8 @@ use std::time::Duration;
 pub const CODEX_HOOK_RELAY_PATH: &str = "/internal/codex-hook";
 pub const MAX_CODEX_HOOK_BODY_BYTES: usize = 256 * 1024;
 const MAX_CODEX_HOOK_TEXT_BYTES: usize = 64 * 1024;
+const MAX_CODEX_HOOK_PATH_BYTES: usize = 4 * 1024;
+const MAX_CODEX_TOOL_NAME_BYTES: usize = 256;
 const TRUNCATION_SUFFIX: &str = "\n[truncated by DevManager]";
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -43,7 +46,35 @@ fn bounded_hook_text(value: &str) -> String {
 }
 
 fn bounded_identifier(value: &str) -> String {
-    value.chars().take(256).collect()
+    let mut bounded = String::with_capacity(value.len().min(MAX_CODEX_TOOL_NAME_BYTES));
+    for character in value.chars() {
+        if character.is_control()
+            || bounded.len().saturating_add(character.len_utf8()) > MAX_CODEX_TOOL_NAME_BYTES
+        {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn bounded_tool_name(value: &str, fallback: &str) -> String {
+    let bounded = bounded_identifier(value);
+    if bounded.is_empty() {
+        fallback.to_string()
+    } else {
+        bounded
+    }
+}
+
+fn bounded_path(value: &str) -> Option<PathBuf> {
+    if value.is_empty()
+        || value.len() > MAX_CODEX_HOOK_PATH_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(PathBuf::from(value))
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -104,9 +135,10 @@ impl CodexHookReducer {
                 let binding = CodexSessionBinding {
                     session_id: session_id.clone(),
                     transcript_path: string_field(payload, "transcript_path")
-                        .filter(|path| !path.is_empty())
-                        .map(PathBuf::from),
-                    cwd: PathBuf::from(string_field(payload, "cwd").unwrap_or_default()),
+                        .and_then(bounded_path),
+                    cwd: string_field(payload, "cwd")
+                        .and_then(bounded_path)
+                        .unwrap_or_default(),
                 };
                 CodexHookReduction {
                     drafts: vec![self.event(
@@ -145,7 +177,9 @@ impl CodexHookReducer {
                 self.tool_reduction(payload, occurred_at_epoch_ms, SemanticToolState::Completed)
             }
             "PermissionRequest" => {
-                let tool_name = string_field(payload, "tool_name").unwrap_or("a tool");
+                let tool_name = string_field(payload, "tool_name")
+                    .map(|name| bounded_tool_name(name, "a tool"))
+                    .unwrap_or_else(|| "a tool".to_string());
                 let tool_use_id = string_field(payload, "tool_use_id")
                     .map(bounded_identifier)
                     .unwrap_or_else(|| "unknown".to_string());
@@ -195,7 +229,9 @@ impl CodexHookReducer {
         let Some(tool_use_id) = string_field(payload, "tool_use_id").map(bounded_identifier) else {
             return CodexHookReduction::default();
         };
-        let tool_name = string_field(payload, "tool_name").unwrap_or("Tool");
+        let tool_name = string_field(payload, "tool_name")
+            .map(|name| bounded_tool_name(name, "Tool"))
+            .unwrap_or_else(|| "Tool".to_string());
         let current = self
             .tool_states
             .get(&tool_use_id)
@@ -215,7 +251,7 @@ impl CodexHookReducer {
                 occurred_at_epoch_ms,
                 SemanticEventKind::Tool {
                     tool_id: tool_use_id.clone(),
-                    name: tool_name.to_string(),
+                    name: tool_name,
                     state: requested,
                     summary: tool_input_summary(payload),
                 },
@@ -266,11 +302,19 @@ fn unix_epoch_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodexHookRegistration {
-    pub nonce: String,
-    pub stable_session_key: StableSessionKey,
-    pub generation: u64,
+    pub(crate) nonce: String,
+    pub(crate) stable_session_key: StableSessionKey,
+    pub(crate) generation: u64,
+}
+
+impl fmt::Debug for CodexHookRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexHookRegistration")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Registry-issued launch authority. Production callers cannot mint the
@@ -345,6 +389,65 @@ pub enum CodexRelayIngestStatus {
     Malformed,
 }
 
+/// The registry's authenticated observation of one exact relay request.
+///
+/// The body digest and current registration are intentionally private. A
+/// caller may inspect the status, but admission must consume this value with
+/// the same body that the relay authenticated; a status cannot be paired with
+/// a different payload or launch generation.
+pub struct CodexRelayIngestObservation {
+    status: CodexRelayIngestStatus,
+    body_digest: Option<[u8; 32]>,
+    registration: Option<CodexHookRegistration>,
+}
+
+impl fmt::Debug for CodexRelayIngestObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexRelayIngestObservation")
+            .field("status", &self.status)
+            .field("authenticated", &self.registration.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq<CodexRelayIngestStatus> for CodexRelayIngestObservation {
+    fn eq(&self, other: &CodexRelayIngestStatus) -> bool {
+        self.status == *other
+    }
+}
+
+impl CodexRelayIngestObservation {
+    fn new(
+        status: CodexRelayIngestStatus,
+        body: &[u8],
+        registration: Option<CodexHookRegistration>,
+    ) -> Self {
+        Self {
+            status,
+            body_digest: (body.len() <= MAX_CODEX_HOOK_BODY_BYTES)
+                .then(|| Sha256::digest(body).into()),
+            registration,
+        }
+    }
+
+    pub const fn status(&self) -> CodexRelayIngestStatus {
+        self.status
+    }
+
+    pub(crate) fn authenticates(&self, registration: &CodexHookRegistration, body: &[u8]) -> bool {
+        self.status == CodexRelayIngestStatus::Accepted
+            && self.registration.as_ref().is_some_and(|current| {
+                current.nonce == registration.nonce
+                    && current.stable_session_key == registration.stable_session_key
+                    && current.generation == registration.generation
+            })
+            && self.body_digest.is_some_and(|digest| {
+                let computed: [u8; 32] = Sha256::digest(body).into();
+                computed == digest
+            })
+    }
+}
+
 struct RegisteredCodexSession {
     stable_session_key: StableSessionKey,
     generation: u64,
@@ -392,7 +495,7 @@ impl CodexHookRegistry {
         }
     }
 
-    pub fn register(
+    pub(crate) fn register(
         &self,
         stable_session_key: StableSessionKey,
     ) -> Result<CodexHookRegistration, String> {
@@ -408,7 +511,17 @@ impl CodexHookRegistry {
             let Some(oldest) = state.order.pop_front() else {
                 break;
             };
-            state.registrations.remove(&oldest);
+            if let Some(removed) = state.registrations.remove(&oldest) {
+                if state
+                    .latest_generation_by_key
+                    .get(&removed.stable_session_key)
+                    == Some(&removed.generation)
+                {
+                    state
+                        .latest_generation_by_key
+                        .remove(&removed.stable_session_key);
+                }
+            }
         }
         let nonce = loop {
             let candidate = random_codex_nonce()?;
@@ -462,7 +575,7 @@ impl CodexHookRegistry {
         })
     }
 
-    pub fn current_registration(&self, nonce: &str) -> Option<CodexHookRegistration> {
+    pub(crate) fn current_registration(&self, nonce: &str) -> Option<CodexHookRegistration> {
         let state = self.state.lock().ok()?;
         let session = state.registrations.get(nonce)?;
         if state
@@ -479,7 +592,7 @@ impl CodexHookRegistry {
         })
     }
 
-    pub fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
+    pub(crate) fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
         let _publication = self.publication_gate.write().ok()?;
         let mut state = self.state.lock().ok()?;
         let removed = state.registrations.remove(nonce)?;
@@ -496,32 +609,44 @@ impl CodexHookRegistry {
         Some(removed.stable_session_key)
     }
 
-    pub fn ingest(
+    pub(crate) fn ingest(
         &self,
         peer: std::net::SocketAddr,
         nonce: &str,
         body: &[u8],
         occurred_at_epoch_ms: u64,
-    ) -> CodexRelayIngestStatus {
+    ) -> CodexRelayIngestObservation {
         if !peer.ip().is_loopback() {
-            return CodexRelayIngestStatus::Rejected;
+            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Rejected, body, None);
         }
         if body.len() > MAX_CODEX_HOOK_BODY_BYTES {
-            return CodexRelayIngestStatus::BodyTooLarge;
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::BodyTooLarge,
+                body,
+                None,
+            );
         }
         let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-            return CodexRelayIngestStatus::Malformed;
+            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Malformed, body, None);
         };
         let Ok(_publication) = self.publication_gate.read() else {
-            return CodexRelayIngestStatus::Rejected;
+            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Rejected, body, None);
         };
         let (registration, reduction) = {
             let Ok(mut state) = self.state.lock() else {
-                return CodexRelayIngestStatus::Rejected;
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                );
             };
             let latest = {
                 let Some(session) = state.registrations.get(nonce) else {
-                    return CodexRelayIngestStatus::Rejected;
+                    return CodexRelayIngestObservation::new(
+                        CodexRelayIngestStatus::Rejected,
+                        body,
+                        None,
+                    );
                 };
                 state
                     .latest_generation_by_key
@@ -531,10 +656,18 @@ impl CodexHookRegistry {
             if !latest {
                 state.registrations.remove(nonce);
                 state.order.retain(|candidate| candidate != nonce);
-                return CodexRelayIngestStatus::Rejected;
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                );
             }
             let Some(session) = state.registrations.get_mut(nonce) else {
-                return CodexRelayIngestStatus::Rejected;
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                );
             };
             let registration = CodexHookRegistration {
                 nonce: nonce.to_string(),
@@ -558,7 +691,7 @@ impl CodexHookRegistry {
                 handler(registration.clone(), CodexRegistryEvent::Semantic(draft));
             }
         }
-        CodexRelayIngestStatus::Accepted
+        CodexRelayIngestObservation::new(CodexRelayIngestStatus::Accepted, body, Some(registration))
     }
 }
 
@@ -646,7 +779,10 @@ async fn handle_codex_hook(
     else {
         return axum::http::StatusCode::UNAUTHORIZED;
     };
-    match registry.ingest(peer, nonce, &body, unix_epoch_ms()) {
+    match registry
+        .ingest(peer, nonce, &body, unix_epoch_ms())
+        .status()
+    {
         CodexRelayIngestStatus::Accepted | CodexRelayIngestStatus::Malformed => {
             axum::http::StatusCode::NO_CONTENT
         }
@@ -1022,6 +1158,37 @@ mod reducer_tests {
             other => panic!("expected tool, got {other:?}"),
         }
     }
+
+    #[test]
+    fn semantic_storage_bounds_tool_name_and_session_paths() {
+        let mut reducer = test_reducer();
+        let oversized_path = "x".repeat(MAX_CODEX_HOOK_TEXT_BYTES + 1);
+        let binding_payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "SessionStart",
+            "cwd": oversized_path,
+            "transcript_path": oversized_path
+        });
+        let binding = reducer
+            .apply_json(&binding_payload, 1)
+            .session_binding
+            .expect("session binding");
+        assert!(binding.cwd.as_os_str().is_empty());
+        assert!(binding.transcript_path.is_none());
+
+        let oversized_tool = "tool-".to_string() + &"x".repeat(MAX_CODEX_HOOK_TEXT_BYTES);
+        let tool_payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "PreToolUse",
+            "tool_name": oversized_tool, "tool_use_id": "call-bounded",
+            "tool_input": {}
+        });
+        let out = reducer.apply_json(&tool_payload, 2);
+        match &out.drafts[0].kind {
+            SemanticEventKind::Tool { name, .. } => {
+                assert!(name.len() <= MAX_CODEX_TOOL_NAME_BYTES);
+            }
+            other => panic!("expected tool, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1061,9 +1228,24 @@ mod registry_tests {
         let _events = collecting_handler(&registry);
         let _registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(loopback_peer(), "deadbeef", &session_start_body("s"), 1),
+            registry
+                .ingest(loopback_peer(), "deadbeef", &session_start_body("s"), 1)
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
+    }
+
+    #[test]
+    fn latest_generation_index_is_bounded_with_registration_eviction() {
+        let registry = CodexHookRegistry::default();
+        for index in 0..(MAX_CODEX_REGISTRATIONS + 32) {
+            registry
+                .register(StableSessionKey::from_tab(format!("tab-{index}")))
+                .unwrap();
+        }
+        let state = registry.state.lock().unwrap();
+        assert!(state.registrations.len() <= MAX_CODEX_REGISTRATIONS);
+        assert!(state.latest_generation_by_key.len() <= MAX_CODEX_REGISTRATIONS);
     }
 
     #[test]
@@ -1073,12 +1255,14 @@ mod registry_tests {
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         registry.unregister(&registration.nonce);
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &registration.nonce,
-                &session_start_body("s"),
-                1
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("s"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
     }
@@ -1090,17 +1274,21 @@ mod registry_tests {
         let first = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         let second = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(loopback_peer(), &first.nonce, &session_start_body("old"), 1),
+            registry
+                .ingest(loopback_peer(), &first.nonce, &session_start_body("old"), 1)
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &second.nonce,
-                &session_start_body("new"),
-                2
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &second.nonce,
+                    &session_start_body("new"),
+                    2
+                )
+                .status(),
             CodexRelayIngestStatus::Accepted
         );
         let published = events.lock().unwrap();
@@ -1115,12 +1303,14 @@ mod registry_tests {
         let events = collecting_handler(&registry);
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         assert_eq!(
-            registry.ingest(
-                loopback_peer(),
-                &registration.nonce,
-                &session_start_body("s-9"),
-                1
-            ),
+            registry
+                .ingest(
+                    loopback_peer(),
+                    &registration.nonce,
+                    &session_start_body("s-9"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Accepted
         );
         let published = events.lock().unwrap();
@@ -1139,12 +1329,14 @@ mod registry_tests {
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         let remote_peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
         assert_eq!(
-            registry.ingest(
-                remote_peer,
-                &registration.nonce,
-                &session_start_body("s"),
-                1
-            ),
+            registry
+                .ingest(
+                    remote_peer,
+                    &registration.nonce,
+                    &session_start_body("s"),
+                    1
+                )
+                .status(),
             CodexRelayIngestStatus::Rejected
         );
     }

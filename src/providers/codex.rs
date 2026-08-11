@@ -7,7 +7,7 @@
 
 use crate::ai::codex_hooks::{
     codex_hook_argument_tokens, CodexHookRegistration, CodexHookRegistry, CodexLaunchPermit,
-    CodexRelayIngestStatus, MAX_CODEX_HOOK_BODY_BYTES,
+    CodexRelayIngestObservation, MAX_CODEX_HOOK_BODY_BYTES,
 };
 use crate::domain::{
     AgentSessionId, ProviderSessionId, ProviderSessionIdError, TaskId,
@@ -108,7 +108,7 @@ impl CodexAdapter {
             .unwrap_or(CodexSemanticLaunchState::TerminalOnly)
     }
 
-    pub async fn probe_attested(
+    async fn probe_attested(
         &self,
         identity: &ProviderExecutable,
     ) -> Result<ProviderCapabilities, ProviderError> {
@@ -121,13 +121,10 @@ impl CodexAdapter {
                 .probed
                 .lock()
                 .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-            if pinned.as_ref().is_some_and(|current| current != identity)
-                || probed
-                    .as_ref()
-                    .is_some_and(|surface| surface.identity != *identity)
-            {
-                *probed = None;
-            }
+            // A reprobe is a new attestation, even when the path and digest
+            // are unchanged. Never leave a prior capability surface usable
+            // while a current-generation probe is in flight or failed.
+            *probed = None;
             *pinned = Some(identity.clone());
         }
 
@@ -534,7 +531,7 @@ impl CodexCorrelatedLaunch {
         peer: SocketAddr,
         body: &[u8],
         occurred_at_epoch_ms: u64,
-    ) -> CodexRelayIngestStatus {
+    ) -> CodexRelayIngestObservation {
         self.authority.registry.ingest(
             peer,
             &self.authority.registration.nonce,
@@ -545,10 +542,10 @@ impl CodexCorrelatedLaunch {
 
     pub fn admit_ingest(
         &mut self,
-        status: CodexRelayIngestStatus,
+        observation: CodexRelayIngestObservation,
         body: &[u8],
     ) -> Result<CodexAdmission, CodexIdentityError> {
-        self.authority.admit_ingest(status, body)
+        self.authority.admit_ingest(observation, body)
     }
 }
 
@@ -600,14 +597,14 @@ impl CodexIdentityAuthority {
 
     fn admit_ingest(
         &mut self,
-        status: CodexRelayIngestStatus,
+        observation: CodexRelayIngestObservation,
         body: &[u8],
     ) -> Result<CodexAdmission, CodexIdentityError> {
         self.verify_live()?;
         if body.len() > MAX_CODEX_HOOK_BODY_BYTES || body.len() > MAX_ADMIT_JSON_BYTES {
             return Err(CodexIdentityError::Rejected);
         }
-        if status != CodexRelayIngestStatus::Accepted {
+        if !observation.authenticates(&self.registration, body) {
             return Err(CodexIdentityError::Rejected);
         }
         let outcome = preflight_hook_json(body)?;
@@ -1013,8 +1010,13 @@ fn preflight_hook_json(body: &[u8]) -> Result<PreflightOutcome, CodexIdentityErr
         nodes: 0,
         hook: PreflightHook::Other,
         session_id: None,
+        hook_seen: false,
     };
-    parser.parse_value(1)?;
+    parser.skip_ws();
+    if parser.bytes.get(parser.index) != Some(&b'{') {
+        return Err(CodexIdentityError::Rejected);
+    }
+    parser.parse_object(1, true)?;
     parser.skip_ws();
     if parser.index != parser.bytes.len() {
         return Err(CodexIdentityError::Rejected);
@@ -1044,6 +1046,7 @@ struct JsonPreflight<'a> {
     nodes: u32,
     hook: PreflightHook,
     session_id: Option<BoundedSessionId>,
+    hook_seen: bool,
 }
 
 impl JsonPreflight<'_> {
@@ -1066,15 +1069,19 @@ impl JsonPreflight<'_> {
         Ok(())
     }
 
-    fn parse_value(&mut self, depth: u32) -> Result<(), CodexIdentityError> {
+    fn parse_value(
+        &mut self,
+        depth: u32,
+        capture_top_level_identity: bool,
+    ) -> Result<(), CodexIdentityError> {
         if depth > MAX_ADMIT_JSON_DEPTH {
             return Err(CodexIdentityError::Rejected);
         }
         self.skip_ws();
         self.bump_node()?;
         match self.bytes.get(self.index).copied() {
-            Some(b'{') => self.parse_object(depth),
-            Some(b'[') => self.parse_array(depth),
+            Some(b'{') => self.parse_object(depth, capture_top_level_identity),
+            Some(b'[') => self.parse_array(depth, capture_top_level_identity),
             Some(b'"') => self.parse_string(StringCapture::Other).map(|_| ()),
             Some(b't') => self.parse_literal(b"true"),
             Some(b'f') => self.parse_literal(b"false"),
@@ -1084,7 +1091,11 @@ impl JsonPreflight<'_> {
         }
     }
 
-    fn parse_object(&mut self, depth: u32) -> Result<(), CodexIdentityError> {
+    fn parse_object(
+        &mut self,
+        depth: u32,
+        capture_top_level_identity: bool,
+    ) -> Result<(), CodexIdentityError> {
         self.index += 1;
         self.skip_ws();
         if self.bytes.get(self.index) == Some(&b'}') {
@@ -1100,7 +1111,7 @@ impl JsonPreflight<'_> {
             }
             self.index += 1;
             match key {
-                ParsedString::SessionIdKey => {
+                ParsedString::SessionIdKey if capture_top_level_identity => {
                     self.skip_ws();
                     self.bump_node()?;
                     if self.session_id.is_some() {
@@ -1108,9 +1119,13 @@ impl JsonPreflight<'_> {
                     }
                     self.session_id = Some(self.parse_bounded_session_id()?);
                 }
-                ParsedString::HookEventNameKey => {
+                ParsedString::HookEventNameKey if capture_top_level_identity => {
                     self.skip_ws();
                     self.bump_node()?;
+                    if self.hook_seen {
+                        return Err(CodexIdentityError::Rejected);
+                    }
+                    self.hook_seen = true;
                     if matches!(
                         self.parse_string(StringCapture::HookEvent)?,
                         ParsedString::SessionStart
@@ -1118,8 +1133,14 @@ impl JsonPreflight<'_> {
                         self.hook = PreflightHook::SessionStart;
                     }
                 }
+                ParsedString::SessionIdKey | ParsedString::HookEventNameKey => {
+                    // Session identity is accepted only in the stock
+                    // top-level object. Reject nested/array copies instead
+                    // of recursively discovering an attacker-controlled ID.
+                    return Err(CodexIdentityError::Rejected);
+                }
                 _ => {
-                    self.parse_value(depth + 1)?;
+                    self.parse_value(depth + 1, false)?;
                 }
             }
             self.skip_ws();
@@ -1137,7 +1158,11 @@ impl JsonPreflight<'_> {
         }
     }
 
-    fn parse_array(&mut self, depth: u32) -> Result<(), CodexIdentityError> {
+    fn parse_array(
+        &mut self,
+        depth: u32,
+        capture_top_level_identity: bool,
+    ) -> Result<(), CodexIdentityError> {
         self.index += 1;
         self.skip_ws();
         if self.bytes.get(self.index) == Some(&b']') {
@@ -1145,7 +1170,7 @@ impl JsonPreflight<'_> {
             return Ok(());
         }
         loop {
-            self.parse_value(depth + 1)?;
+            self.parse_value(depth + 1, capture_top_level_identity)?;
             self.skip_ws();
             match self.bytes.get(self.index) {
                 Some(b',') => {
@@ -1326,6 +1351,10 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(1)
         .max(1)
 }
+
+#[cfg(test)]
+#[path = "codex_identity_tests.rs"]
+mod codex_identity_tests;
 
 #[cfg(test)]
 mod authority_seal_tests {
