@@ -1909,14 +1909,28 @@ enum DeferredRemoteWorkerOwner {
     Unowned,
 }
 
+const REMOTE_WORKER_REAPER_QUEUE_CAPACITY: usize = 64;
+const REMOTE_WORKER_REAPER_FALLBACK_CAPACITY: usize = 64;
+const REMOTE_WORKER_REAPER_PENDING_CAPACITY: usize =
+    REMOTE_WORKER_REAPER_QUEUE_CAPACITY + REMOTE_WORKER_REAPER_FALLBACK_CAPACITY;
+
 struct RemoteWorkerReaper {
-    sender: Mutex<mpsc::Sender<DeferredRemoteWorker>>,
+    sender: Mutex<Option<mpsc::SyncSender<DeferredRemoteWorker>>>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
+    fallback: Arc<Mutex<VecDeque<DeferredRemoteWorker>>>,
     signal: Arc<(Mutex<u64>, Condvar)>,
+    lifecycle: Mutex<()>,
 }
 
 static REMOTE_WORKER_REAPER: OnceLock<RemoteWorkerReaper> = OnceLock::new();
 static REMOTE_WORKER_REAPER_SIGNAL: OnceLock<Arc<(Mutex<u64>, Condvar)>> = OnceLock::new();
+
+enum DeferredRemoteWorkerAdmission {
+    Accepted,
+    Full(DeferredRemoteWorker),
+    Closed(DeferredRemoteWorker),
+    Unavailable(DeferredRemoteWorker),
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1929,33 +1943,53 @@ fn remote_worker_reaper_signal() -> &'static Arc<(Mutex<u64>, Condvar)> {
     REMOTE_WORKER_REAPER_SIGNAL.get_or_init(|| Arc::new((Mutex::new(0), Condvar::new())))
 }
 
-fn notify_remote_worker_reaper() {
-    let signal = remote_worker_reaper_signal();
+fn notify_remote_worker_reaper_signal(signal: &Arc<(Mutex<u64>, Condvar)>) {
     if let Ok(mut sequence) = signal.0.lock() {
         *sequence = sequence.wrapping_add(1);
-        signal.1.notify_one();
+        // Test-owned restart reapers share the completion signal with the
+        // process-global reaper. Wake every waiter so a local reaper cannot
+        // remain asleep while another owner consumes the single notification.
+        signal.1.notify_all();
+    }
+}
+
+fn notify_remote_worker_reaper() {
+    notify_remote_worker_reaper_signal(remote_worker_reaper_signal());
+}
+
+fn drain_deferred_worker_fallback(
+    fallback: &Arc<Mutex<VecDeque<DeferredRemoteWorker>>>,
+    pending: &mut Vec<DeferredRemoteWorker>,
+) {
+    let mut fallback = fallback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while pending.len() < REMOTE_WORKER_REAPER_PENDING_CAPACITY {
+        let Some(worker) = fallback.pop_front() else {
+            break;
+        };
+        pending.push(worker);
     }
 }
 
 fn spawn_remote_worker_reaper(
     receiver: mpsc::Receiver<DeferredRemoteWorker>,
     signal: Arc<(Mutex<u64>, Condvar)>,
+    fallback: Arc<Mutex<VecDeque<DeferredRemoteWorker>>>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("remote-worker-reaper".to_string())
         .spawn(move || {
-            let mut pending = Vec::<DeferredRemoteWorker>::new();
+            let mut pending = Vec::with_capacity(REMOTE_WORKER_REAPER_PENDING_CAPACITY);
             let mut observed_sequence = 0_u64;
+            let mut receiver_closed = false;
             loop {
-                while let Ok(worker) = receiver.try_recv() {
-                    pending.push(worker);
-                }
-
-                if pending.is_empty() {
+                drain_deferred_worker_fallback(&fallback, &mut pending);
+                while !receiver_closed && pending.len() < REMOTE_WORKER_REAPER_PENDING_CAPACITY {
                     match receiver.try_recv() {
                         Ok(worker) => pending.push(worker),
-                        Err(mpsc::TryRecvError::Disconnected) => break,
-                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => receiver_closed = true,
                     }
                 }
 
@@ -1966,6 +2000,17 @@ fn spawn_remote_worker_reaper(
                     } else {
                         index += 1;
                     }
+                }
+
+                if receiver_closed && pending.is_empty() {
+                    let fallback_empty = fallback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty();
+                    if fallback_empty {
+                        break;
+                    }
+                    continue;
                 }
 
                 let guard = signal
@@ -1986,43 +2031,148 @@ fn spawn_remote_worker_reaper(
 }
 
 fn remote_worker_reaper() -> &'static RemoteWorkerReaper {
-    REMOTE_WORKER_REAPER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<DeferredRemoteWorker>();
-        let signal = remote_worker_reaper_signal().clone();
-        let handle = spawn_remote_worker_reaper(receiver, signal.clone())
-            .expect("remote worker reaper should start");
-        RemoteWorkerReaper {
-            sender: Mutex::new(sender),
-            handle: Mutex::new(Some(handle)),
-            signal,
-        }
-    })
+    REMOTE_WORKER_REAPER.get_or_init(RemoteWorkerReaper::new)
 }
 
 impl RemoteWorkerReaper {
-    fn send(&self, worker: DeferredRemoteWorker) -> Result<(), DeferredRemoteWorker> {
+    fn new() -> Self {
+        let reaper = Self {
+            sender: Mutex::new(None),
+            handle: Mutex::new(None),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
+            signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
+        };
+        if let Err(error) = reaper.start() {
+            eprintln!("[remote] deferred worker reaper could not start: {error}");
+        }
+        reaper
+    }
+
+    fn start(&self) -> std::io::Result<()> {
+        let (sender, receiver) =
+            mpsc::sync_channel::<DeferredRemoteWorker>(REMOTE_WORKER_REAPER_QUEUE_CAPACITY);
+        let handle =
+            spawn_remote_worker_reaper(receiver, self.signal.clone(), self.fallback.clone())?;
+        *self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        *self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        Ok(())
+    }
+
+    fn send(&self, worker: DeferredRemoteWorker) -> DeferredRemoteWorkerAdmission {
         let sender = self
             .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        sender.send(worker).map_err(|error| error.0)
+        let Some(sender) = sender else {
+            return DeferredRemoteWorkerAdmission::Unavailable(worker);
+        };
+        match sender.try_send(worker) {
+            Ok(()) => DeferredRemoteWorkerAdmission::Accepted,
+            Err(mpsc::TrySendError::Full(worker)) => DeferredRemoteWorkerAdmission::Full(worker),
+            Err(mpsc::TrySendError::Disconnected(worker)) => {
+                DeferredRemoteWorkerAdmission::Closed(worker)
+            }
+        }
     }
 
     fn restart(&self) -> std::io::Result<()> {
-        let (sender, receiver) = mpsc::channel::<DeferredRemoteWorker>();
-        let handle = spawn_remote_worker_reaper(receiver, self.signal.clone())?;
-        *self
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_sender = self
             .sender
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sender;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(previous_sender);
+        notify_remote_worker_reaper_signal(&self.signal);
         let previous_handle = self
             .handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(handle);
-        drop(previous_handle);
-        Ok(())
+            .take();
+        if let Some(previous_handle) = previous_handle {
+            if previous_handle.join().is_err() {
+                eprintln!("[remote] deferred worker reaper exited while restarting");
+            }
+        }
+        self.start()
+    }
+
+    fn has_live_handle(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    fn retain_after_failure(&self, worker: DeferredRemoteWorker, detail: &str) {
+        report_deferred_worker_reaper_failure(&worker, detail);
+        let has_live_handle = self.has_live_handle();
+        if has_live_handle {
+            let mut fallback = self
+                .fallback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if fallback.len() < REMOTE_WORKER_REAPER_FALLBACK_CAPACITY {
+                fallback.push_back(worker);
+                drop(fallback);
+                notify_remote_worker_reaper_signal(&self.signal);
+                return;
+            }
+        }
+
+        if has_live_handle {
+            report_deferred_worker_reaper_failure(
+                &worker,
+                "the bounded fallback registry was full; joining this worker synchronously",
+            );
+        } else {
+            report_deferred_worker_reaper_failure(
+                &worker,
+                "no running reaper owns the bounded fallback registry; joining this worker synchronously",
+            );
+        }
+        finish_deferred_remote_worker(worker);
+    }
+}
+
+impl Drop for RemoteWorkerReaper {
+    fn drop(&mut self) {
+        let sender = self
+            .sender
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+        notify_remote_worker_reaper_signal(&self.signal);
+        if let Some(handle) = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            if handle.join().is_err() {
+                eprintln!("[remote] deferred worker reaper exited while being dropped");
+            }
+        }
+        let mut fallback = self
+            .fallback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Some(worker) = fallback.pop_front() {
+            finish_deferred_remote_worker(worker);
+        }
     }
 }
 
@@ -2030,26 +2180,65 @@ fn enqueue_deferred_remote_worker(worker: DeferredRemoteWorker) {
     enqueue_deferred_remote_worker_with_reaper(remote_worker_reaper(), worker);
 }
 
+fn enqueue_after_reaper_restart(
+    reaper: &RemoteWorkerReaper,
+    worker: DeferredRemoteWorker,
+    context: &str,
+) {
+    match reaper.send(worker) {
+        DeferredRemoteWorkerAdmission::Accepted => {
+            notify_remote_worker_reaper_signal(&reaper.signal);
+        }
+        DeferredRemoteWorkerAdmission::Full(worker) => reaper.retain_after_failure(
+            worker,
+            &format!("{context} reaper queue was full; explicit backpressure retained the residue"),
+        ),
+        DeferredRemoteWorkerAdmission::Closed(worker) => reaper.retain_after_failure(
+            worker,
+            &format!("{context} reaper channel was already closed; residue retained"),
+        ),
+        DeferredRemoteWorkerAdmission::Unavailable(worker) => reaper.retain_after_failure(
+            worker,
+            &format!("{context} reaper was unavailable; residue retained"),
+        ),
+    }
+}
+
 fn enqueue_deferred_remote_worker_with_reaper(
     reaper: &RemoteWorkerReaper,
-    mut worker: DeferredRemoteWorker,
+    worker: DeferredRemoteWorker,
 ) {
-    if let Err(returned_worker) = reaper.send(worker) {
-        worker = returned_worker;
-        report_deferred_worker_reaper_failure(&worker, "the reaper channel was closed");
-        if reaper.restart().is_ok() {
-            match reaper.send(worker) {
-                Ok(()) => {
-                    notify_remote_worker_reaper();
-                    return;
-                }
-                Err(returned_worker) => worker = returned_worker,
+    match reaper.send(worker) {
+        DeferredRemoteWorkerAdmission::Accepted => {
+            notify_remote_worker_reaper_signal(&reaper.signal);
+        }
+        DeferredRemoteWorkerAdmission::Full(worker) => {
+            reaper.retain_after_failure(
+                worker,
+                "the bounded reaper queue was full; explicit backpressure retained the residue",
+            );
+        }
+        DeferredRemoteWorkerAdmission::Closed(worker) => {
+            report_deferred_worker_reaper_failure(&worker, "the reaper channel was closed");
+            match reaper.restart() {
+                Ok(()) => enqueue_after_reaper_restart(reaper, worker, "restarted"),
+                Err(error) => reaper.retain_after_failure(
+                    worker,
+                    &format!("the reaper could not be restarted: {error}"),
+                ),
             }
         }
-        report_deferred_worker_reaper_failure(&worker, "the reaper could not be restarted");
-        retain_deferred_worker_after_reaper_failure(worker);
-    } else {
-        notify_remote_worker_reaper();
+        DeferredRemoteWorkerAdmission::Unavailable(worker) => {
+            report_deferred_worker_reaper_failure(
+                &worker,
+                "the reaper has no running worker and startup was unavailable",
+            );
+            match reaper.restart() {
+                Ok(()) => enqueue_after_reaper_restart(reaper, worker, "newly started"),
+                Err(error) => reaper
+                    .retain_after_failure(worker, &format!("the reaper could not start: {error}")),
+            }
+        }
     }
 }
 
@@ -2160,35 +2349,6 @@ fn report_deferred_worker_reaper_failure(worker: &DeferredRemoteWorker, detail: 
                 "[remote] deferred worker {} retained because {detail}",
                 worker.name
             );
-        }
-    }
-}
-
-fn retain_deferred_worker_after_reaper_failure(worker: DeferredRemoteWorker) {
-    let slot = Arc::new(Mutex::new(Some(worker)));
-    let thread_slot = slot.clone();
-    let fallback = thread::Builder::new()
-        .name("remote-worker-fallback-reaper".to_string())
-        .spawn(move || {
-            let worker = thread_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(worker) = worker {
-                finish_deferred_remote_worker(worker);
-            }
-        });
-    match fallback {
-        Ok(_handle) => {}
-        Err(error) => {
-            eprintln!("[remote] fallback worker reaper could not start: {error}");
-            if let Some(worker) = slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
-                finish_deferred_remote_worker(worker);
-            }
         }
     }
 }
@@ -8829,23 +8989,23 @@ mod tests {
         apply_remote_session_output, apply_workspace_delta, authenticate_client,
         current_controller_allows, current_snapshot, deliver_live_semantic_events,
         deliver_pending_bootstraps, drain_web_clients_for_restart,
-        enqueue_deferred_remote_worker_with_reaper, format_handshake_stage_error,
-        generate_pairing_token, handle_client_connection, light_snapshot,
-        load_remote_machine_state, native_connection_should_stop, now_epoch_ms,
+        enqueue_deferred_remote_worker_with_reaper, finish_deferred_remote_worker,
+        format_handshake_stage_error, generate_pairing_token, handle_client_connection,
+        light_snapshot, load_remote_machine_state, native_connection_should_stop, now_epoch_ms,
         publish_semantic_event, read_message, read_message_until_cancelled, remote_state_path,
         remote_worker_reaper_signal, request_timeout_for_action, requires_control, run_broadcaster,
         save_remote_known_hosts, save_remote_machine_state, set_last_connection_note,
         spawn_native_connection_worker, try_enqueue_pending_request, upsert_known_host,
         write_message, ClientAuth, ClientMessage, ConnectedRemoteClient, DeferredRemoteWorker,
-        DeferredRemoteWorkerOwner, HostConfigPersistenceTestPhase, KnownRemoteHost,
-        LocalPortForwardLifecycleTestEvent, LocalPortForwardManager, PairedRemoteClient,
-        PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
-        RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemotePortAuthority, RemoteSessionBootstrap, RemoteSessionStreamEvent,
-        RemoteStatePersistenceIoTestPhase, RemoteTerminalInput, RemoteWorker, RemoteWorkerReaper,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
-        HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS,
+        DeferredRemoteWorkerAdmission, DeferredRemoteWorkerOwner, HostConfigPersistenceTestPhase,
+        KnownRemoteHost, LocalPortForwardLifecycleTestEvent, LocalPortForwardManager,
+        PairedRemoteClient, PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent,
+        RemoteAccessActivityKind, RemoteAccessSource, RemoteAction, RemoteClientHandle,
+        RemoteClientInner, RemoteHostConfig, RemoteHostService, RemoteHostWorkLimiter,
+        RemoteLatencyStats, RemoteMachineState, RemotePortAuthority, RemoteSessionBootstrap,
+        RemoteSessionStreamEvent, RemoteStatePersistenceIoTestPhase, RemoteTerminalInput,
+        RemoteWorker, RemoteWorkerReaper, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot,
+        ServerMessage, HOST_CONFIG_PERSISTENCE_TEST_HOOK, MAX_PENDING_REMOTE_REQUESTS,
         REMOTE_STATE_PERMISSION_VERIFY_TEST_HOOK, REMOTE_STATE_PERSISTENCE_IO_TEST_HOOK,
     };
     use crate::domain::id::ResourceId;
@@ -8870,7 +9030,7 @@ mod tests {
         TerminalSessionView,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::{ErrorKind, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
@@ -11998,7 +12158,261 @@ mod tests {
     }
 
     #[test]
+    fn restarting_reaper_joins_prior_handle_before_replacement() {
+        let (sender, receiver) = mpsc::sync_channel::<DeferredRemoteWorker>(1);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let prior_handle = thread::spawn(move || {
+            entered_tx
+                .send(())
+                .expect("prior reaper should report that it started");
+            release_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("prior reaper should be released");
+            drop(receiver);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("prior reaper should start before restart");
+
+        let reaper = Arc::new(RemoteWorkerReaper {
+            sender: Mutex::new(Some(sender)),
+            handle: Mutex::new(Some(prior_handle)),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
+            signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
+        });
+        let (restart_done_tx, restart_done_rx) = mpsc::sync_channel(1);
+        let restart_reaper = Arc::clone(&reaper);
+        let restart_thread = thread::spawn(move || {
+            let result = restart_reaper.restart();
+            restart_done_tx
+                .send(result)
+                .expect("restart result receiver should remain available");
+        });
+
+        let first_restart_result = restart_done_rx.recv_timeout(Duration::from_millis(250));
+        let returned_before_prior_exit = first_restart_result.is_ok();
+        release_tx
+            .send(())
+            .expect("prior reaper should be released for the join");
+        let restart_result = match first_restart_result {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => restart_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("restart should finish after the prior reaper exits"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("restart thread exited without reporting a result")
+            }
+        };
+        assert!(
+            restart_result.is_ok(),
+            "reaper restart failed: {restart_result:?}"
+        );
+        restart_thread
+            .join()
+            .expect("restart thread should join cleanly");
+
+        drop(reaper);
+        assert!(
+            !returned_before_prior_exit,
+            "restart replaced and discarded the prior reaper before joining it"
+        );
+    }
+
+    #[test]
+    fn bounded_reaper_admission_reports_full_without_blocking() {
+        let (sender, _receiver) = mpsc::sync_channel::<DeferredRemoteWorker>(0);
+        let reaper = RemoteWorkerReaper {
+            sender: Mutex::new(Some(sender)),
+            handle: Mutex::new(None),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
+            signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
+        };
+        let mut worker = RemoteWorker::spawn("test-full-reaper-admission", None, || {});
+        let handle = worker.handle.take().expect("worker handle");
+        let admission = reaper.send(DeferredRemoteWorker {
+            name: worker.name,
+            generation: 0,
+            handle,
+            owner: DeferredRemoteWorkerOwner::Unowned,
+            reap_observer: None,
+        });
+        let worker = match admission {
+            DeferredRemoteWorkerAdmission::Full(worker) => worker,
+            DeferredRemoteWorkerAdmission::Accepted => {
+                panic!("zero-capacity reaper admission unexpectedly accepted a worker")
+            }
+            DeferredRemoteWorkerAdmission::Closed(worker)
+            | DeferredRemoteWorkerAdmission::Unavailable(worker) => {
+                finish_deferred_remote_worker(worker);
+                panic!("zero-capacity reaper admission did not report Full")
+            }
+        };
+        finish_deferred_remote_worker(worker);
+    }
+
+    #[test]
+    fn unavailable_reaper_finishes_residue_without_detached_worker() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = Some(reaped_tx.clone());
+
+        let mut worker = RemoteWorker::spawn("test-unavailable-reaper", None, || {});
+        let handle = worker.handle.take().expect("worker handle");
+        service
+            .inner
+            .worker_residue_count
+            .fetch_add(1, Ordering::AcqRel);
+        set_last_connection_note(
+            &service.inner,
+            "Remote worker residue: test-unavailable-reaper".to_string(),
+            true,
+        );
+        let reaper = RemoteWorkerReaper {
+            sender: Mutex::new(None),
+            handle: Mutex::new(None),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
+            signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
+        };
+        let worker = match reaper.send(DeferredRemoteWorker {
+            name: worker.name,
+            generation: service
+                .inner
+                .native_runtime_generation
+                .load(Ordering::Acquire),
+            handle,
+            owner: DeferredRemoteWorkerOwner::Host(Arc::downgrade(&service.inner)),
+            reap_observer: Some(reaped_tx),
+        }) {
+            DeferredRemoteWorkerAdmission::Unavailable(worker) => worker,
+            DeferredRemoteWorkerAdmission::Accepted
+            | DeferredRemoteWorkerAdmission::Full(_)
+            | DeferredRemoteWorkerAdmission::Closed(_) => {
+                panic!("inert reaper did not report an unavailable admission")
+            }
+        };
+        reaper.retain_after_failure(worker, "test reaper startup failure");
+        let reaped = reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("unavailable reaper must retain ownership until it joins the worker");
+        assert_eq!(reaped.name, "test-unavailable-reaper");
+        assert_eq!(
+            service.inner.worker_residue_count.load(Ordering::Acquire),
+            0,
+            "unavailable reaper path left residue unjoined"
+        );
+        assert!(
+            reaper
+                .fallback
+                .lock()
+                .expect("fallback registry lock")
+                .is_empty(),
+            "unavailable reaper path created an unowned fallback entry"
+        );
+        *service
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = None;
+    }
+
+    #[test]
+    fn full_reaper_admission_retains_worker_in_owned_bounded_registry() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
+        *service
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = Some(reaped_tx.clone());
+
+        let mut worker = RemoteWorker::spawn("test-full-reaper-residue", None, || {});
+        let handle = worker.handle.take().expect("worker handle");
+        service
+            .inner
+            .worker_residue_count
+            .fetch_add(1, Ordering::AcqRel);
+        set_last_connection_note(
+            &service.inner,
+            "Remote worker residue: test-full-reaper-residue".to_string(),
+            true,
+        );
+
+        let (sender, receiver) = mpsc::sync_channel::<DeferredRemoteWorker>(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let reaper_handle = thread::spawn(move || {
+            release_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("test reaper owner should be released");
+        });
+        let reaper = RemoteWorkerReaper {
+            sender: Mutex::new(Some(sender)),
+            handle: Mutex::new(Some(reaper_handle)),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
+            signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
+        };
+
+        enqueue_deferred_remote_worker_with_reaper(
+            &reaper,
+            DeferredRemoteWorker {
+                name: worker.name,
+                generation: service
+                    .inner
+                    .native_runtime_generation
+                    .load(Ordering::Acquire),
+                handle,
+                owner: DeferredRemoteWorkerOwner::Host(Arc::downgrade(&service.inner)),
+                reap_observer: Some(reaped_tx),
+            },
+        );
+        assert_eq!(
+            reaper
+                .fallback
+                .lock()
+                .expect("fallback registry lock")
+                .len(),
+            1,
+            "Full admission must retain the worker in the bounded owner registry"
+        );
+        assert!(
+            reaped_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a fallback worker was joined outside the owned registry"
+        );
+
+        drop(receiver);
+        release_tx
+            .send(())
+            .expect("owned fallback reaper should be released");
+        drop(reaper);
+        let reaped = reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("owned fallback worker should be joined during reaper drop");
+        assert_eq!(reaped.name, "test-full-reaper-residue");
+        assert_eq!(
+            service.inner.worker_residue_count.load(Ordering::Acquire),
+            0,
+            "owned fallback worker remained reported as residue after joining"
+        );
+        *service
+            .inner
+            .worker_reaped_test_hook
+            .write()
+            .expect("reaper hook lock") = None;
+    }
+
+    #[test]
     fn closed_deferred_worker_reaper_channel_restarts_without_losing_residue() {
+        // Exercise the restart-owned reaper while the process-global reaper
+        // is also waiting on the shared event signal.
+        let _global_reaper = super::remote_worker_reaper();
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
         *service
@@ -12019,12 +12433,14 @@ mod tests {
             true,
         );
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         drop(receiver);
         let reaper = RemoteWorkerReaper {
-            sender: Mutex::new(sender),
+            sender: Mutex::new(Some(sender)),
             handle: Mutex::new(None),
+            fallback: Arc::new(Mutex::new(VecDeque::new())),
             signal: remote_worker_reaper_signal().clone(),
+            lifecycle: Mutex::new(()),
         };
         enqueue_deferred_remote_worker_with_reaper(
             &reaper,
@@ -12055,9 +12471,6 @@ mod tests {
             .write()
             .expect("reaper hook lock") = None;
         drop(reaper);
-        // The test-owned replacement reaper is not process-global. Wake it
-        // after its sender is dropped so it observes channel closure and exits.
-        super::notify_remote_worker_reaper();
     }
 
     #[test]
