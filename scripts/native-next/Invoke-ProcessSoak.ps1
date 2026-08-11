@@ -13,13 +13,19 @@ param(
     [ValidateRange(0, [int]::MaxValue)]
     [int]$Seed = 3403,
 
-    [switch]$SyntheticOnly
+    [switch]$SyntheticOnly,
+
+    [AllowNull()][string]$HostExecutable,
+    [AllowNull()][string]$HostSha256,
+    [AllowNull()][string]$ClientExecutable,
+    [AllowNull()][string]$ClientSha256
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Isolation.ps1')
+. (Join-Path $PSScriptRoot 'PhaseGate.ps1')
 
 $phase = 'phase-03-process-soak'
 $schemaVersion = 1
@@ -42,8 +48,14 @@ function New-SoakSummary {
         phase = $phase
         status = $Status
         launched = $Launched
-        error = $Error
-        supervisor = $Supervisor
+        error = ConvertTo-BoundedError $Error
+        supervisor = ConvertTo-RedactedBoundedValue $Supervisor
+        isolation = [ordered]@{
+            profile = 'native-next-dev'
+            runtimeKind = 'native-next'
+            instanceLabel = 'Next'
+            productionGuard = 'phase-gate-capture-and-assert'
+        }
         runId = $RunId
         runDirectory = $RunDirectory
     }
@@ -57,6 +69,55 @@ function ConvertTo-BoundedError {
     $text = [regex]::Replace($text, '(?i)([A-Z]:[\\/][^\s"'']+)', '<path>')
     if ($text.Length -gt 512) { $text = $text.Substring(0, 512) }
     [regex]::Replace($text, '[\x00-\x1f\x7f]', '_')
+}
+
+function ConvertTo-RedactedBoundedValue {
+    param(
+        [AllowNull()][object]$Value,
+        [int]$Depth = 0
+    )
+    if ($null -eq $Value) { return $null }
+    if ($Depth -ge 8) { return '<redacted-depth>' }
+    if ($Value -is [string]) { return ConvertTo-BoundedError $Value }
+    if ($Value -is [ValueType]) { return $Value }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $object = [ordered]@{}
+        $count = 0
+        foreach ($key in $Value.Keys) {
+            if ($count++ -ge 128) { break }
+            $name = [string]$key
+            if ($name -match '(?i)(password|token|secret|api[_-]?key|private[_-]?key)$') {
+                $object[$name] = '<redacted>'
+            }
+            else {
+                $object[$name] = ConvertTo-RedactedBoundedValue -Value $Value[$key] -Depth ($Depth + 1)
+            }
+        }
+        return [pscustomobject]$object
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) {
+            if ($items.Count -ge 128) { break }
+            [void]$items.Add((ConvertTo-RedactedBoundedValue -Value $item -Depth ($Depth + 1)))
+        }
+        return $items.ToArray()
+    }
+    $properties = @($Value.PSObject.Properties)
+    if ($properties.Count -gt 0) {
+        $object = [ordered]@{}
+        foreach ($property in ($properties | Select-Object -First 128)) {
+            $name = [string]$property.Name
+            if ($name -match '(?i)(password|token|secret|api[_-]?key|private[_-]?key)$') {
+                $object[$name] = '<redacted>'
+            }
+            else {
+                $object[$name] = ConvertTo-RedactedBoundedValue -Value $property.Value -Depth ($Depth + 1)
+            }
+        }
+        return [pscustomobject]$object
+    }
+    ConvertTo-BoundedError ([string]$Value)
 }
 
 function Get-ExternalSha256 {
@@ -75,6 +136,29 @@ function Get-ExternalSha256 {
         if ($null -ne $stream) { $stream.Dispose() }
         $hasher.Dispose()
     }
+}
+
+function Resolve-CallerPinnedExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$WorktreeRoot
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        throw "$Label caller pin requires both a canonical executable path and SHA-256."
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label caller-pinned executable is absent." }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $Path
+    $canonical = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $canonical -AncestorPath $WorktreeRoot)) {
+        throw "$Label caller-pinned executable escapes the worktree."
+    }
+    $actual = Get-ExternalSha256 -Path $canonical
+    if ($actual -cne $ExpectedSha256.Trim().ToLowerInvariant()) {
+        throw "$Label caller-pinned SHA-256 mismatch."
+    }
+    [pscustomobject]@{ path = $canonical; sha256 = $actual }
 }
 
 function Resolve-ExternalGitDirectory {
@@ -202,11 +286,17 @@ function Invoke-BoundedRustSupervisor {
     $startInfo.Environment['TEMP'] = $TempDirectory
     $startInfo.Environment['TMP'] = $TempDirectory
     $startInfo.Environment['PATH'] = ($pathDirectories -join ';')
+    $startInfo.Environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+    $startInfo.Environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+    $startInfo.Environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
     [void]$startInfo.ArgumentList.Add('bounded-supervise')
     [void]$startInfo.ArgumentList.Add('--manifest')
     [void]$startInfo.ArgumentList.Add($Manifest)
     [void]$startInfo.ArgumentList.Add('--timeout-ms')
     [void]$startInfo.ArgumentList.Add([string]($supervisorDeadlineMilliseconds - 5000))
+    if ($SyntheticOnly) {
+        [void]$startInfo.ArgumentList.Add('--synthetic')
+    }
     if ($HasIterations) {
         [void]$startInfo.ArgumentList.Add('--iterations')
         [void]$startInfo.ArgumentList.Add([string]$Iterations)
@@ -223,101 +313,47 @@ function Invoke-BoundedRustSupervisor {
         [void]$startInfo.ArgumentList.Add([string]$pair[0])
         [void]$startInfo.ArgumentList.Add([string]$pair[1])
     }
-
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    $stdoutState = [pscustomobject]@{
-        reader = $null
-        task = $null
-        buffer = New-Object char[] 8192
-        text = [Text.StringBuilder]::new()
-        totalBytes = 0L
-        truncated = $false
-        done = $false
-    }
-    $stderrState = [pscustomobject]@{
-        reader = $null
-        task = $null
-        buffer = New-Object char[] 8192
-        text = [Text.StringBuilder]::new()
-        totalBytes = 0L
-        truncated = $false
-        done = $false
-    }
-
-    $started = $false
-    $timedOut = $false
-    $deadline = [Diagnostics.Stopwatch]::GetTimestamp() +
-        [int64]($supervisorDeadlineMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000)
-    try {
-        $started = $process.Start()
-        if (-not $started) { throw 'unable to start Rust supervisor.' }
-        $stdoutState.reader = $process.StandardOutput
-        $stderrState.reader = $process.StandardError
-        $stdoutState.task = $stdoutState.reader.ReadAsync($stdoutState.buffer, 0, $stdoutState.buffer.Length)
-        $stderrState.task = $stderrState.reader.ReadAsync($stderrState.buffer, 0, $stderrState.buffer.Length)
-        while (-not ($stdoutState.done -and $stderrState.done -and $process.HasExited)) {
-            $now = [Diagnostics.Stopwatch]::GetTimestamp()
-            $remaining = [int](($deadline - $now) * 1000 / [Diagnostics.Stopwatch]::Frequency)
-            if ($remaining -le 0 -and -not $timedOut) {
-                $timedOut = $true
-                throw 'Rust-owned supervisor wrapper exceeded the absolute deadline; no pass is inferred.'
-            }
-            $tasks = @(@($stdoutState.task, $stderrState.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
-            if ($tasks.Count -gt 0) {
-                [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, [Math]::Max(1, $remaining))
-            }
-            foreach ($state in @($stdoutState, $stderrState)) {
-                if ($state.done -or $null -eq $state.task -or -not $state.task.IsCompleted) { continue }
-                $count = $state.task.GetAwaiter().GetResult()
-                if ($count -eq 0) {
-                    $state.done = $true
-                    continue
-                }
-                $state.totalBytes += [Text.Encoding]::UTF8.GetByteCount($state.buffer, 0, $count)
-                $cap = if ($state -eq $stdoutState) { $stdoutByteCap } else { $stderrByteCap }
-                if ($state.text.Length -lt $cap) {
-                    $remainingChars = $cap - $state.text.Length
-                    [void]$state.text.Append($state.buffer, 0, [Math]::Min($count, $remainingChars))
-                }
-                if ($state.totalBytes -gt $cap) { $state.truncated = $true }
-                $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
-            }
-        }
-        $remaining = [int](([Diagnostics.Stopwatch]::GetTimestamp() - $deadline) * -1000 / [Diagnostics.Stopwatch]::Frequency)
-        if ($remaining -le 0) { throw 'Rust supervisor did not settle before the absolute deadline.' }
-        [void]$process.WaitForExit([Math]::Min(1000, $remaining))
-        if ($timedOut) { throw 'Rust supervisor exceeded the absolute deadline.' }
-        $stdoutText = $stdoutState.text.ToString()
-        $stderrText = $stderrState.text.ToString()
-        if ($stdoutState.truncated -or $stdoutState.totalBytes -gt $stdoutByteCap) {
-            throw 'Rust supervisor stdout exceeded the bounded protocol cap.'
-        }
-        if ($stderrState.truncated -or $stderrState.totalBytes -gt $stderrByteCap) {
-            throw 'Rust supervisor stderr exceeded the bounded protocol cap.'
-        }
-        $lines = @($stdoutText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($lines.Count -ne 1) { throw "Rust supervisor emitted $($lines.Count) JSON results; exactly one is required." }
-        $result = $lines[0] | ConvertFrom-Json
-        if ([int]$result.schemaVersion -ne $schemaVersion) { throw 'Rust supervisor result schema mismatch.' }
-        if ([string]$result.status -notin @('passed', 'failed', 'rejected')) { throw 'Rust supervisor result status is invalid.' }
-        $wrapperTimedOut = if ($null -ne $result.PSObject.Properties['wrapperTimedOut']) { [string]$result.wrapperTimedOut } else { 'False' }
-        $jobZero = if ($null -ne $result.PSObject.Properties['jobZero']) { [string]$result.jobZero } else { 'True' }
-        if ($wrapperTimedOut -eq 'True' -and $jobZero -ne 'True') {
-            throw 'Rust supervisor wrapper timed out without proving Job zero.'
-        }
-        if ($process.ExitCode -eq 0 -and [string]$result.status -ne 'passed') { throw 'zero exit with a non-passing supervisor result.' }
-        [pscustomobject][ordered]@{
-            result = $result
-            exitCode = [int]$process.ExitCode
-            stderr = (ConvertTo-BoundedError $stderrText)
+    if ($null -ne $Attestation.PSObject.Properties['hostExecutable']) {
+        foreach ($pair in @(
+                @('--expected-host-executable', [string]$Attestation.hostExecutable),
+                @('--expected-host-sha256', [string]$Attestation.hostSha256),
+                @('--expected-client-executable', [string]$Attestation.clientExecutable),
+                @('--expected-client-sha256', [string]$Attestation.clientSha256))) {
+            [void]$startInfo.ArgumentList.Add([string]$pair[0])
+            [void]$startInfo.ArgumentList.Add([string]$pair[1])
         }
     }
-    finally {
-        if ($started -and -not $process.HasExited) {
-            throw 'Rust-owned supervisor wrapper returned before its child settled.'
-        }
-        $process.Dispose()
+    # The shared PhaseGate helper owns this PowerShell child in a kill-on-close
+    # Job, drains both capped readers, and proves the child tree has settled on
+    # every timeout/cancel path.  Its bounded WaitForExit(milliseconds) pump
+    # is the only process wait here; the Rust wrapper then owns the cycle Job.
+    $bounded = Invoke-DevManagerPhaseGateBoundedCommand `
+        -StartInfo $startInfo `
+        -TimeoutMilliseconds $supervisorDeadlineMilliseconds `
+        -StdoutBytes $stdoutByteCap `
+        -StderrBytes $stderrByteCap
+    $stdoutText = [string]$bounded.Stdout
+    $stderrText = [string]$bounded.Stderr
+    $lines = @($stdoutText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -ne 1) { throw "Rust supervisor emitted $($lines.Count) JSON results; exactly one is required." }
+    $result = $lines[0] | ConvertFrom-Json
+    if ([int]$result.schemaVersion -ne $schemaVersion) { throw 'Rust supervisor result schema mismatch.' }
+    if ([string]$result.status -notin @('passed', 'failed', 'rejected')) { throw 'Rust supervisor result status is invalid.' }
+    foreach ($required in @('completedCycles', 'iterations', 'realLifecycle', 'releaseEligible')) {
+        if ($null -eq $result.PSObject.Properties[$required]) { throw "Rust supervisor result is missing required field '$required'." }
+    }
+    if ($SyntheticOnly -and [bool]$result.releaseEligible) { throw 'synthetic infrastructure can never be release-eligible.' }
+    if ([int]$result.completedCycles -gt [int]$result.iterations -or [int]$result.iterations -gt 100) { throw 'Rust supervisor cycle counts exceed the strict bounded schema.' }
+    $wrapperTimedOut = if ($null -ne $result.PSObject.Properties['wrapperTimedOut']) { [string]$result.wrapperTimedOut } else { 'False' }
+    $jobZero = if ($null -ne $result.PSObject.Properties['jobZero']) { [string]$result.jobZero } else { 'True' }
+    if ($wrapperTimedOut -eq 'True' -and $jobZero -ne 'True') {
+        throw 'Rust supervisor wrapper timed out without proving Job zero.'
+    }
+    if ($bounded.ExitCode -eq 0 -and [string]$result.status -ne 'passed') { throw 'zero exit with a non-passing supervisor result.' }
+    [pscustomobject][ordered]@{
+        result = $result
+        exitCode = [int]$bounded.ExitCode
+        stderr = ConvertTo-BoundedError $stderrText
     }
 }
 
@@ -325,8 +361,23 @@ function Invoke-BoundedFinalUnion {
     param(
         [Parameter(Mandatory = $true)][string]$Entrypoint,
         [Parameter(Mandatory = $true)][string]$WorktreeRoot,
-        [Parameter(Mandatory = $true)][string]$TempDirectory
+        [Parameter(Mandatory = $true)][string]$TempDirectory,
+        [Parameter(Mandatory = $true)][object]$HostPin,
+        [Parameter(Mandatory = $true)][object]$ClientPin
     )
+    # Revalidate immediately before the union launch so a caller cannot pin a
+    # file, mutate it, and rely on an earlier check.  The child entrypoint then
+    # receives the exact canonical path/hash pair and Rust validates it again.
+    $hostRevalidated = Resolve-CallerPinnedExecutable `
+        -Path ([string]$HostPin.path) `
+        -ExpectedSha256 ([string]$HostPin.sha256) `
+        -Label 'host' `
+        -WorktreeRoot $WorktreeRoot
+    $clientRevalidated = Resolve-CallerPinnedExecutable `
+        -Path ([string]$ClientPin.path) `
+        -ExpectedSha256 ([string]$ClientPin.sha256) `
+        -Label 'client' `
+        -WorktreeRoot $WorktreeRoot
     $pwshCommands = @(
         Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
@@ -342,43 +393,41 @@ function Invoke-BoundedFinalUnion {
     $info.Environment.Clear()
     $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
     if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw 'final host/client union cannot establish SystemRoot.' }
+    if (-not (Test-Path -LiteralPath $Entrypoint -PathType Leaf)) {
+        throw 'final host/client union entrypoint is unavailable.'
+    }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $Entrypoint
+    $canonicalEntrypoint = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Entrypoint -ErrorAction Stop).Path)
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $canonicalEntrypoint -AncestorPath $WorktreeRoot)) {
+        throw 'final host/client union entrypoint escapes the worktree.'
+    }
     $info.Environment['SystemRoot'] = $systemRoot
     $info.Environment['TEMP'] = $TempDirectory
     $info.Environment['TMP'] = $TempDirectory
     $info.Environment['PATH'] = @((Join-Path $systemRoot 'System32'), (Split-Path -Parent $info.FileName)) -join ';'
-    foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $Entrypoint, '-Iterations', '100', '-Seed', [string]$Seed)) {
+    $info.Environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+    $info.Environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+    $info.Environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
+    foreach ($argument in @(
+            '-NoProfile', '-NonInteractive', '-File', $canonicalEntrypoint,
+            '-Iterations', '100', '-Seed', [string]$Seed,
+            '-HostExecutable', [string]$hostRevalidated.path, '-HostSha256', [string]$hostRevalidated.sha256,
+            '-ClientExecutable', [string]$clientRevalidated.path, '-ClientSha256', [string]$clientRevalidated.sha256)) {
         [void]$info.ArgumentList.Add([string]$argument)
     }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $info
-    $stdout = [Text.StringBuilder]::new()
-    $stderr = [Text.StringBuilder]::new()
-    $started = $false
-    try {
-        $started = $process.Start()
-        if (-not $started) { throw 'unable to start final host/client union entrypoint.' }
-        $stdoutTask = $process.StandardOutput.ReadAsync()
-        $stderrTask = $process.StandardError.ReadAsync()
-        $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64](600000 * [Diagnostics.Stopwatch]::Frequency / 1000)
-        while (-not ($stdoutTask.IsCompleted -and $stderrTask.IsCompleted -and $process.HasExited)) {
-            if ([Diagnostics.Stopwatch]::GetTimestamp() -ge $deadline) {
-                throw 'final host/client union exceeded its absolute deadline; dependency must own Rust Job cleanup.'
-            }
-            [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), 250) | Out-Null
-        }
-        $stdout.Append($stdoutTask.GetAwaiter().GetResult()) | Out-Null
-        $stderr.Append($stderrTask.GetAwaiter().GetResult()) | Out-Null
-        if ($stdout.Length -gt $stdoutByteCap -or $stderr.Length -gt $stderrByteCap) { throw 'final host/client union exceeded the bounded protocol caps.' }
-        $lines = @($stdout.ToString() -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($lines.Count -ne 1) { throw "final host/client union emitted $($lines.Count) JSON results; exactly one is required." }
-        $result = $lines[0] | ConvertFrom-Json
-        if ([string]$result.status -ne 'passed' -or [string]$result.jobZero -ne 'True') { throw 'final host/client union did not prove passed + Job zero.' }
-        [pscustomobject][ordered]@{ result = $result; exitCode = [int]$process.ExitCode; stderr = ConvertTo-BoundedError $stderr.ToString() }
+    $bounded = Invoke-DevManagerPhaseGateBoundedCommand `
+        -StartInfo $info `
+        -TimeoutMilliseconds 600000 `
+        -StdoutBytes $stdoutByteCap `
+        -StderrBytes $stderrByteCap
+    if ($bounded.ExitCode -ne 0 -or $bounded.StderrBytes -ne 0) {
+        throw "final host/client union failed closed (exit=$($bounded.ExitCode) stderrBytes=$($bounded.StderrBytes))."
     }
-    finally {
-        if ($started -and -not $process.HasExited) { throw 'final host/client union returned before its owned cleanup settled.' }
-        $process.Dispose()
-    }
+    $lines = @($bounded.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -ne 1) { throw "final host/client union emitted $($lines.Count) JSON results; exactly one is required." }
+    $result = $lines[0] | ConvertFrom-Json
+    if ([string]$result.status -ne 'passed' -or [string]$result.jobZero -ne 'True' -or [string]$result.releaseEligible -ne 'True' -or [string]$result.realLifecycle -ne 'True' -or [int]$result.completedCycles -ne 100) { throw 'final host/client union did not prove 100 real release-eligible cycles + Job zero.' }
+    [pscustomobject][ordered]@{ result = $result; exitCode = [int]$bounded.ExitCode; stderr = ConvertTo-BoundedError $bounded.Stderr }
 }
 
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
@@ -401,6 +450,8 @@ $runId = $null
 $runDirectory = $null
 $attestation = $null
 $unionDependency = $null
+$hostPin = $null
+$clientPin = $null
 
 try {
     if (-not (Test-Path -LiteralPath $manifestResolved -PathType Leaf)) {
@@ -411,16 +462,27 @@ try {
         throw "fixed Rust supervisor is unavailable: $supervisorPath"
     }
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $supervisorPath
+    $callerPinValues = @(@($HostExecutable, $HostSha256, $ClientExecutable, $ClientSha256) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    )
+    if ($callerPinValues.Count -gt 0 -and $callerPinValues.Count -ne 4) {
+        throw 'host/client caller pin requires all four canonical identity/hash arguments.'
+    }
+    if ($callerPinValues.Count -eq 4) {
+        $hostPin = Resolve-CallerPinnedExecutable -Path $HostExecutable -ExpectedSha256 $HostSha256 -Label 'host' -WorktreeRoot $worktreeRoot
+        $clientPin = Resolve-CallerPinnedExecutable -Path $ClientExecutable -ExpectedSha256 $ClientSha256 -Label 'client' -WorktreeRoot $worktreeRoot
+    }
     if (-not $SyntheticOnly -and $Iterations -eq 100) {
         $candidateHost = Join-Path $worktreeRoot 'target-live-native-next\devmanager-host.exe'
         $candidateClient = Join-Path $worktreeRoot 'target-live-native-next\devmanager-next.exe'
         $candidateUnion = Join-Path $PSScriptRoot 'Invoke-HostClientProcessSoak.ps1'
-        if ((Test-Path -LiteralPath $candidateHost -PathType Leaf) -and
-            (Test-Path -LiteralPath $candidateClient -PathType Leaf) -and
-            (Test-Path -LiteralPath $candidateUnion -PathType Leaf)) {
+        if ($null -ne $hostPin -and $null -ne $clientPin -and
+            (Test-Path -LiteralPath $candidateUnion -PathType Leaf) -and
+            ([IO.Path]::GetFullPath($candidateHost) -ieq [string]$hostPin.path) -and
+            ([IO.Path]::GetFullPath($candidateClient) -ieq [string]$clientPin.path)) {
             $unionDependency = [pscustomobject]@{
-                host = $candidateHost
-                client = $candidateClient
+                host = [string]$hostPin.path
+                client = [string]$clientPin.path
                 entrypoint = $candidateUnion
             }
         }
@@ -445,13 +507,21 @@ try {
         throw 'helper changed during external attestation; stale or self-attested input rejected.'
     }
     $attestation | Add-Member -NotePropertyName buildId -NotePropertyValue ('sha256:' + [string]$attestation.helperSha256)
+    if ($null -ne $hostPin -and $null -ne $clientPin) {
+        $attestation | Add-Member -NotePropertyName hostExecutable -NotePropertyValue ([string]$hostPin.path)
+        $attestation | Add-Member -NotePropertyName hostSha256 -NotePropertyValue ([string]$hostPin.sha256)
+        $attestation | Add-Member -NotePropertyName clientExecutable -NotePropertyValue ([string]$clientPin.path)
+        $attestation | Add-Member -NotePropertyName clientSha256 -NotePropertyValue ([string]$clientPin.sha256)
+    }
     $hasIterations = $PSBoundParameters.ContainsKey('Iterations')
     $hasSeed = $PSBoundParameters.ContainsKey('Seed')
     if ($null -ne $unionDependency) {
         $supervisorDocument = Invoke-BoundedFinalUnion `
             -Entrypoint ([string]$unionDependency.entrypoint) `
             -WorktreeRoot $worktreeRoot `
-            -TempDirectory ([System.IO.Path]::GetFullPath($defaultTempDirectory))
+            -TempDirectory ([System.IO.Path]::GetFullPath($defaultTempDirectory)) `
+            -HostPin $hostPin `
+            -ClientPin $clientPin
     }
     else {
         $supervisorDocument = Invoke-BoundedRustSupervisor `

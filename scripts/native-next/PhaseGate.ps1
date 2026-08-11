@@ -1,5 +1,7 @@
 # Phase 0 phase-gate helpers (recipe admission + observe/fail-closed residue).
-# No kill authority. Malicious same-user junction races on evidence dirs are outside
+# The phase command remains observe/fail-closed; bounded helper children use a
+# private kill-on-close Job so timeout cleanup cannot orphan PowerShell trees.
+# Malicious same-user junction races on evidence dirs are outside
 # the Phase 0 accidental-isolation threat model; component/reparse checks still run
 # before creation and publication.
 # Requires Isolation.ps1 to be dot-sourced first.
@@ -299,6 +301,137 @@ function Set-DevManagerPhaseGateProcessEnvironment {
     }
 }
 
+function Ensure-DevManagerPhaseGateJobType {
+    $type = ([System.Management.Automation.PSTypeName]'DevManagerPhaseGateJob').Type
+    if ($null -ne $type) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public sealed class DevManagerPhaseGateJob : IDisposable
+{
+    private IntPtr handle;
+    private const uint BasicProcessIdListInformationClass = 3;
+    private const uint ExtendedLimitInformationClass = 9;
+    private const uint KillOnJobClose = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedLimitInformation
+    {
+        public BasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, uint infoClass, ref ExtendedLimitInformation info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, uint infoClass, IntPtr info, uint length, IntPtr returnLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public DevManagerPhaseGateJob()
+    {
+        handle = CreateJobObject(IntPtr.Zero, null);
+        if (handle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject failed");
+        var limits = new ExtendedLimitInformation();
+        limits.BasicLimitInformation.LimitFlags = KillOnJobClose;
+        if (!SetInformationJobObject(handle, ExtendedLimitInformationClass, ref limits, (uint)Marshal.SizeOf<ExtendedLimitInformation>()))
+        {
+            var error = new Win32Exception(Marshal.GetLastWin32Error(), "SetInformationJobObject failed");
+            CloseHandle(handle);
+            handle = IntPtr.Zero;
+            throw error;
+        }
+    }
+
+    public void Assign(Process process)
+    {
+        if (process == null || process.HasExited) throw new InvalidOperationException("cannot assign an exited process to the owned Job");
+        if (!AssignProcessToJobObject(handle, process.Handle))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+    }
+
+    public void Terminate()
+    {
+        if (handle != IntPtr.Zero && !TerminateJobObject(handle, 124))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject failed");
+    }
+
+    public static void TerminateUnassigned(Process process)
+    {
+        if (process == null || process.HasExited) return;
+        if (!TerminateProcess(process.Handle, 125))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateProcess(handle) failed before Job assignment");
+    }
+
+    public uint ActiveProcessCount()
+    {
+        var capacity = 16;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var bytes = checked(8 + (IntPtr.Size * capacity));
+            var buffer = Marshal.AllocHGlobal(bytes);
+            try
+            {
+                if (QueryInformationJobObject(handle, BasicProcessIdListInformationClass, buffer, (uint)bytes, IntPtr.Zero))
+                    return (uint)Marshal.ReadInt32(buffer, 4);
+                var error = Marshal.GetLastWin32Error();
+                if (error == 234) { capacity = Math.Min(capacity * 2, 4096); continue; }
+                throw new Win32Exception(error, "QueryInformationJobObject(active members) failed");
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+        throw new InvalidOperationException("QueryInformationJobObject(active members) exceeded its retry bound");
+    }
+
+    public void Dispose()
+    {
+        if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+        GC.SuppressFinalize(this);
+    }
+}
+'@
+}
+
 function Invoke-DevManagerPhaseGateBoundedCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -308,15 +441,60 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
         [int]$StderrBytes = 64KB
     )
 
+    Ensure-DevManagerPhaseGateJobType
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $StartInfo
     $stdout = [pscustomobject]@{ reader = $null; task = $null; buffer = (New-Object char[] 8192); text = [Text.StringBuilder]::new(); totalBytes = 0L; truncated = $false; done = $false }
     $stderr = [pscustomobject]@{ reader = $null; task = $null; buffer = (New-Object char[] 8192); text = [Text.StringBuilder]::new(); totalBytes = 0L; truncated = $false; done = $false }
+    $job = [DevManagerPhaseGateJob]::new()
     $started = $false
+    $jobAssigned = $false
     $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64]($TimeoutMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000)
+    $cleanupDeadline = $deadline + [int64](5000 * [Diagnostics.Stopwatch]::Frequency / 1000)
+    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+    $drainReaders = {
+        while ($started -and -not (($stdout.done -or $null -eq $stdout.task) -and
+                ($stderr.done -or $null -eq $stderr.task) -and $process.HasExited)) {
+            $remaining = [int](($cleanupDeadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
+            if ($remaining -le 0) { return $false }
+            $tasks = @(@($stdout.task, $stderr.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
+            if ($tasks.Count -gt 0) { [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, [Math]::Min(1000, $remaining)) }
+            if ($started -and -not $process.HasExited) { [void]$process.WaitForExit([Math]::Min(1000, $remaining)) }
+            foreach ($state in @($stdout, $stderr)) {
+                if ($state.done -or $null -eq $state.task -or -not $state.task.IsCompleted) { continue }
+                $count = $state.task.GetAwaiter().GetResult()
+                if ($count -eq 0) { $state.done = $true; continue }
+                $state.totalBytes += [Text.Encoding]::UTF8.GetByteCount($state.buffer, 0, $count)
+                $cap = if ($state -eq $stdout) { $StdoutBytes } else { $StderrBytes }
+                if ($state.text.Length -lt $cap) { [void]$state.text.Append($state.buffer, 0, [Math]::Min($count, $cap - $state.text.Length)) }
+                if ($state.totalBytes -gt $cap) { $state.truncated = $true }
+                $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
+            }
+        }
+        return (-not $started -or
+            (($stdout.done -or $null -eq $stdout.task) -and
+                ($stderr.done -or $null -eq $stderr.task) -and $process.HasExited))
+    }
+    $terminateOwned = {
+        try {
+            if (-not $started) { return $null }
+            if ($jobAssigned) {
+                # The root may already have exited while a grandchild remains;
+                # terminate the owned Job based on membership, not root PID.
+                $job.Terminate()
+            }
+            elseif (-not $process.HasExited) {
+                [DevManagerPhaseGateJob]::TerminateUnassigned($process)
+            }
+            return $null
+        }
+        catch { return [string]$_.Exception.Message }
+    }
     try {
         $started = $process.Start()
         if (-not $started) { throw 'bounded phase-gate command did not start.' }
+        $job.Assign($process)
+        $jobAssigned = $true
         $stdout.reader = $process.StandardOutput
         $stderr.reader = $process.StandardError
         $stdout.task = $stdout.reader.ReadAsync($stdout.buffer, 0, $stdout.buffer.Length)
@@ -324,7 +502,7 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
         while (-not ($stdout.done -and $stderr.done -and $process.HasExited)) {
             $remaining = [int](($deadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
             if ($remaining -le 0) {
-                throw 'typed-unavailable: bounded phase-gate command exceeded its absolute deadline; Rust supervisor ownership is required for tree cancellation.'
+                throw 'typed-unavailable: bounded phase-gate command exceeded its absolute deadline; owned Job termination is required.'
             }
             $tasks = @(@($stdout.task, $stderr.task) | Where-Object { $null -ne $_ -and -not $_.IsCompleted })
             if ($tasks.Count -gt 0) { [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, [Math]::Max(1, $remaining)) }
@@ -339,9 +517,6 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
                 $state.task = $state.reader.ReadAsync($state.buffer, 0, $state.buffer.Length)
             }
         }
-        $remaining = [int](($deadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000 / [Diagnostics.Stopwatch]::Frequency)
-        if ($remaining -le 0) { throw 'typed-unavailable: bounded phase-gate command did not settle before its absolute deadline.' }
-        [void]$process.WaitForExit([Math]::Min(1000, $remaining))
         if ($stdout.truncated -or $stderr.truncated) { throw 'bounded phase-gate command exceeded its output cap.' }
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
@@ -352,7 +527,60 @@ function Invoke-DevManagerPhaseGateBoundedCommand {
         }
     }
     finally {
-        $process.Dispose()
+        try {
+            $terminationError = & $terminateOwned
+            if (-not [string]::IsNullOrWhiteSpace([string]$terminationError)) {
+                [void]$cleanupErrors.Add("owned Job termination failed: $terminationError")
+            }
+            try {
+                $joined = [bool](& $drainReaders)
+            }
+            catch {
+                $joined = $false
+                [void]$cleanupErrors.Add("capped reader join failed: $($_.Exception.Message)")
+            }
+            if (-not $joined) {
+                # A first termination can race process assignment/exit.  Make
+                # one more bounded kill-and-drain attempt before inspecting or
+                # closing the Job; a reader JoinHandle is never abandoned.
+                $terminationError = & $terminateOwned
+                if (-not [string]::IsNullOrWhiteSpace([string]$terminationError)) {
+                    [void]$cleanupErrors.Add("owned Job retry termination failed: $terminationError")
+                }
+                try {
+                    $joined = [bool](& $drainReaders)
+                }
+                catch {
+                    $joined = $false
+                    [void]$cleanupErrors.Add("capped reader retry join failed: $($_.Exception.Message)")
+                }
+            }
+            if (-not $joined) {
+                [void]$cleanupErrors.Add('owned Job child/readers did not join before the cleanup deadline.')
+            }
+            try {
+                $activeProcesses = [uint32]$job.ActiveProcessCount()
+                if ($activeProcesses -ne 0) {
+                    $terminationError = & $terminateOwned
+                    if (-not [string]::IsNullOrWhiteSpace([string]$terminationError)) {
+                        [void]$cleanupErrors.Add("owned Job final termination failed: $terminationError")
+                    }
+                    $activeProcesses = [uint32]$job.ActiveProcessCount()
+                    if ($activeProcesses -ne 0) {
+                        [void]$cleanupErrors.Add("owned Job retained $activeProcesses active process(es) after termination.")
+                    }
+                }
+            }
+            catch {
+                [void]$cleanupErrors.Add("owned Job member inspection failed: $($_.Exception.Message)")
+            }
+        }
+        catch { [void]$cleanupErrors.Add("owned Job cleanup failed: $($_.Exception.Message)") }
+        finally {
+            if ($null -ne $job) { $job.Dispose() }
+            $process.Dispose()
+        }
+        if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join '; ') }
     }
 }
 

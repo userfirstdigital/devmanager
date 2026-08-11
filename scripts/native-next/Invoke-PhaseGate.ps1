@@ -54,7 +54,8 @@ function Repair-DevManagerPhase3SupervisorPlan {
         'test',
         '--test', 'process_supervisor',
         '--test', 'process_soak_infrastructure',
-        '--', '--nocapture'
+        '--', '--nocapture',
+        '--skip', 'rust_supervisor_100_cycle_summary_is_bounded_and_does_not_retain_listener_tables'
     )
 }
 
@@ -350,6 +351,9 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
             [System.IO.Path]::Combine([string]$systemRoot, 'System32'),
             [string]$pwshDirectory
         ) -join ';'
+        $soakInfo.Environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+        $soakInfo.Environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+        $soakInfo.Environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
         foreach ($argument in [string[]]@(
                 '-NoProfile',
                 '-NonInteractive',

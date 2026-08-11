@@ -660,7 +660,9 @@ fn rust_supervisor_rejects_nonzero_and_crash_and_accepts_restart_resume() {
 #[test]
 fn rust_supervisor_timeout_terminates_job_children_and_grandchildren() {
     let directory = temporary_soak_environment();
-    let manifest = supervisor_manifest(&directory, "tree-hang", 1, 100, 16 * 1024);
+    // Leave enough bounded time for the controlled grandchild to be scheduled
+    // and become an observable real Job member before the timeout sample.
+    let manifest = supervisor_manifest(&directory, "tree-hang", 1, 500, 16 * 1024);
     let output = run_supervisor(&directory, &manifest);
     assert!(!output.status.success(), "timeout must fail closed");
     let result = supervisor_result(&output);
@@ -821,6 +823,8 @@ fn process_soak_contract_documents_task_manager_cpu_and_ansi_corpus() {
 fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     let source = fs::read_to_string("scripts/native-next/Invoke-ProcessSoak.ps1")
         .expect("process soak script");
+    let phase_gate =
+        fs::read_to_string("scripts/native-next/PhaseGate.ps1").expect("phase gate script");
     assert!(source.contains("Iterations"));
     assert!(source.contains("Seed"));
     assert!(source.contains("phase3-process-soak.manifest.json"));
@@ -834,10 +838,10 @@ fn process_soak_script_uses_bounded_io_and_restored_default_interface() {
     assert!(!source.contains("Kill($true)"));
     assert!(!source.contains("target\\debug"));
     assert!(
-        source.find("$deadline =").expect("wrapper deadline")
-            < source
+        phase_gate.find("$deadline =").expect("bounded deadline")
+            < phase_gate
                 .find("$started = $process.Start()")
-                .expect("wrapper process start")
+                .expect("bounded process start")
     );
 }
 
@@ -879,6 +883,9 @@ fn phase3_supervisor_gate_includes_soak_tests_and_fixed_supervisor_entrypoint() 
     assert!(!source.contains("Kill($true)"));
     assert!(source.contains("Iterations"));
     assert!(source.contains("Seed"));
+    assert!(source.contains(
+        "rust_supervisor_100_cycle_summary_is_bounded_and_does_not_retain_listener_tables"
+    ));
 }
 
 #[cfg(windows)]
@@ -1308,4 +1315,49 @@ fn process_soak_wrapper_uses_external_attestation_and_owned_timeout_cleanup() {
     assert!(source.contains("wrapperTimedOut"));
     assert!(source.contains("jobZero"));
     assert!(source.contains("HOLD"));
+}
+
+#[test]
+fn process_soak_release_contract_is_real_and_strictly_attested() {
+    let helper = fs::read_to_string("src/bin/devmanager-process-test-helper.rs")
+        .expect("process supervisor source");
+    let soak = fs::read_to_string("scripts/native-next/Invoke-ProcessSoak.ps1")
+        .expect("process soak script");
+    let gate = fs::read_to_string("scripts/native-next/Invoke-Phase3ProcessSupervisorGate.ps1")
+        .expect("phase3 supervisor gate");
+    assert!(helper.contains("releaseEligible"));
+    assert!(helper.contains("realLifecycle"));
+    assert!(
+        helper.contains("completedCycles == 100") || helper.contains("completed_cycles == 100")
+    );
+    assert!(helper.contains("hostExecutable"));
+    assert!(helper.contains("clientExecutable"));
+    assert!(helper.contains("hostSha256"));
+    assert!(helper.contains("clientSha256"));
+    assert!(soak.contains("HostExecutable"));
+    assert!(soak.contains("HostSha256"));
+    assert!(soak.contains("ClientExecutable"));
+    assert!(soak.contains("ClientSha256"));
+    assert!(gate.contains("hostExecutable") || gate.contains("HostExecutable"));
+    assert!(gate.contains("clientExecutable") || gate.contains("ClientExecutable"));
+}
+
+#[test]
+fn process_soak_powershell_children_have_owned_bounded_cleanup() {
+    let phase_gate =
+        fs::read_to_string("scripts/native-next/PhaseGate.ps1").expect("phase gate source");
+    let soak = fs::read_to_string("scripts/native-next/Invoke-ProcessSoak.ps1")
+        .expect("process soak script");
+    let helper = fs::read_to_string("src/bin/devmanager-process-test-helper.rs")
+        .expect("process supervisor source");
+    assert!(phase_gate.contains("AssignProcessToJobObject"));
+    assert!(phase_gate.contains("TerminateJobObject"));
+    assert!(phase_gate.contains("WaitForExit("));
+    assert!(phase_gate.contains("ReadAsync($stdout.buffer"));
+    assert!(phase_gate.contains("ReadAsync($stderr.buffer"));
+    assert!(soak.contains("Invoke-DevManagerPhaseGateBoundedCommand"));
+    assert!(!soak.contains("ReadAsync()"));
+    assert!(!soak.contains("ReadToEndAsync"));
+    assert!(helper.contains("AF_INET6"));
+    assert!(helper.contains("MibTcp6RowOwnerPid"));
 }

@@ -305,7 +305,7 @@ fn emit_error(mode: &str, error: &str) {
         "identity".to_string(),
         json!(helper_identity(std::process::id())),
     );
-    object.insert("error".to_string(), json!(error));
+    object.insert("error".to_string(), json!(redact_bounded_error(error)));
     eprintln!(
         "{}",
         serde_json::to_string(&Value::Object(object)).expect("serialize helper error")
@@ -905,6 +905,18 @@ struct SupervisorManifest {
     cycle_executable: std::path::PathBuf,
     #[serde(rename = "cycleSha256")]
     cycle_sha256: String,
+    // These are caller-pinned inputs for the real host/client union.  The
+    // fixed cycle runner can be exercised without them, but a result can
+    // never be release-eligible unless all four values are supplied and
+    // independently revalidated below.
+    #[serde(rename = "hostExecutable", default)]
+    host_executable: Option<std::path::PathBuf>,
+    #[serde(rename = "hostSha256", default)]
+    host_sha256: Option<String>,
+    #[serde(rename = "clientExecutable", default)]
+    client_executable: Option<std::path::PathBuf>,
+    #[serde(rename = "clientSha256", default)]
+    client_sha256: Option<String>,
     #[serde(rename = "workingDirectory")]
     working_directory: std::path::PathBuf,
     #[serde(rename = "evidenceRoot")]
@@ -925,6 +937,10 @@ struct ExternalAttestation {
     source_tree_state: String,
     build_id: String,
     binary_sha256: String,
+    host_executable: Option<String>,
+    host_sha256: Option<String>,
+    client_executable: Option<String>,
+    client_sha256: Option<String>,
 }
 
 fn external_attestation_from_parts(
@@ -932,7 +948,22 @@ fn external_attestation_from_parts(
     source_tree_state: Option<String>,
     build_id: Option<String>,
     binary_sha256: Option<String>,
+    host_executable: Option<String>,
+    host_sha256: Option<String>,
+    client_executable: Option<String>,
+    client_sha256: Option<String>,
 ) -> Result<Option<ExternalAttestation>, String> {
+    let host_supplied = [
+        host_executable.is_some(),
+        host_sha256.is_some(),
+        client_executable.is_some(),
+        client_sha256.is_some(),
+    ];
+    if host_supplied.iter().any(|value| *value) && host_supplied.iter().any(|value| !value) {
+        return Err(
+            "host/client attestation requires canonical host/client paths and hashes".to_string(),
+        );
+    }
     let supplied = [
         git_revision.is_some(),
         source_tree_state.is_some(),
@@ -940,6 +971,11 @@ fn external_attestation_from_parts(
         binary_sha256.is_some(),
     ];
     if supplied.iter().all(|value| !value) {
+        if host_supplied.iter().any(|value| *value) {
+            return Err(
+                "host/client attestation requires the fixed supervisor attestation".to_string(),
+            );
+        }
         return Ok(None);
     }
     if supplied.iter().any(|value| !value) {
@@ -953,6 +989,10 @@ fn external_attestation_from_parts(
         source_tree_state: source_tree_state.expect("attestation source tree state"),
         build_id: build_id.expect("attestation build id"),
         binary_sha256: binary_sha256.expect("attestation binary hash"),
+        host_executable,
+        host_sha256,
+        client_executable,
+        client_sha256,
     }))
 }
 
@@ -1072,11 +1112,20 @@ fn finish_capped_reader(
     deadline: Instant,
     label: &str,
 ) -> Result<CappedOutput, String> {
-    let output = receive_capped_reader(&receiver, deadline, label)?;
-    thread
+    // The child Job has already been settled on every timeout/error path
+    // before this function is called.  Always join the capped reader even if
+    // receiving its bounded result failed; dropping a JoinHandle would hide a
+    // blocked/panicked reader and make the cleanup claim unauthoritative.
+    let output = receive_capped_reader(&receiver, deadline, label);
+    let joined = thread
         .join()
-        .map_err(|_| format!("{label} reader thread panicked"))?;
-    Ok(output)
+        .map_err(|_| format!("{label} reader thread panicked"));
+    match (output, joined) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(output_error), Err(join_error)) => Err(format!("{output_error}; {join_error}")),
+    }
 }
 
 fn sha256_file(path: &std::path::Path) -> Result<String, String> {
@@ -1128,6 +1177,73 @@ fn redact_bounded_error(value: &str) -> String {
         text.truncate(512);
     }
     text
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                let normalized_key = key.to_ascii_lowercase();
+                let sensitive = matches!(
+                    normalized_key.as_str(),
+                    "password"
+                        | "token"
+                        | "secret"
+                        | "apikey"
+                        | "api_key"
+                        | "privatekey"
+                        | "private_key"
+                ) || normalized_key.ends_with("password")
+                    || normalized_key.ends_with("token")
+                    || normalized_key.ends_with("secret")
+                    || normalized_key.ends_with("apikey")
+                    || normalized_key.ends_with("api_key")
+                    || normalized_key.ends_with("privatekey")
+                    || normalized_key.ends_with("private_key");
+                if sensitive {
+                    *child = json!("<redacted>");
+                } else {
+                    redact_json_value(child);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                redact_json_value(child);
+            }
+        }
+        Value::String(text) => {
+            *text = redact_bounded_error(text);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn normalize_supervisor_result(value: &mut Value) {
+    let Value::Object(object) = value else {
+        return;
+    };
+    object
+        .entry("schemaVersion".to_string())
+        .or_insert_with(|| json!(SUPERVISOR_SCHEMA_VERSION));
+    object
+        .entry("status".to_string())
+        .or_insert_with(|| json!("rejected"));
+    object
+        .entry("iterations".to_string())
+        .or_insert_with(|| json!(0));
+    object
+        .entry("completedCycles".to_string())
+        .or_insert_with(|| json!(0));
+    object
+        .entry("realLifecycle".to_string())
+        .or_insert_with(|| json!(false));
+    object
+        .entry("releaseEligible".to_string())
+        .or_insert_with(|| json!(false));
+    object
+        .entry("releaseHold".to_string())
+        .or_insert_with(|| json!("result rejected before release eligibility evaluation"));
 }
 
 fn source_tree_digest(root: &std::path::Path) -> Result<String, String> {
@@ -1398,6 +1514,63 @@ fn apply_external_attestation(
     )?;
     apply("helperSha256", &mut manifest.helper_sha256, expected_hash)?;
     apply("cycleSha256", &mut manifest.cycle_sha256, expected_hash)?;
+    let apply_optional_path = |label: &str,
+                               value: &mut Option<std::path::PathBuf>,
+                               expected: Option<&str>| {
+        if let Some(expected) = expected {
+            if expected.trim().is_empty() {
+                return Err(format!("external {label} attestation is empty"));
+            }
+            let expected = std::path::PathBuf::from(expected.trim());
+            if let Some(current) = value {
+                if current != &expected {
+                    return Err(format!(
+                        "external {label} attestation mismatch: manifest is pinned to a different value"
+                    ));
+                }
+            } else {
+                *value = Some(expected);
+            }
+        }
+        Ok::<(), String>(())
+    };
+    let apply_optional_hash = |label: &str, value: &mut Option<String>, expected: Option<&str>| {
+        if let Some(expected) = expected {
+            if expected.trim().is_empty() {
+                return Err(format!("external {label} attestation is empty"));
+            }
+            if let Some(current) = value {
+                if current.trim() != expected.trim() {
+                    return Err(format!(
+                        "external {label} attestation mismatch: manifest is pinned to a different value"
+                    ));
+                }
+            } else {
+                *value = Some(expected.trim().to_string());
+            }
+        }
+        Ok::<(), String>(())
+    };
+    let expected_host = external.and_then(|value| value.host_executable.as_deref());
+    let expected_host_hash = external.and_then(|value| value.host_sha256.as_deref());
+    let expected_client = external.and_then(|value| value.client_executable.as_deref());
+    let expected_client_hash = external.and_then(|value| value.client_sha256.as_deref());
+    apply_optional_path(
+        "hostExecutable",
+        &mut manifest.host_executable,
+        expected_host,
+    )?;
+    apply_optional_hash("hostSha256", &mut manifest.host_sha256, expected_host_hash)?;
+    apply_optional_path(
+        "clientExecutable",
+        &mut manifest.client_executable,
+        expected_client,
+    )?;
+    apply_optional_hash(
+        "clientSha256",
+        &mut manifest.client_sha256,
+        expected_client_hash,
+    )?;
     Ok(())
 }
 
@@ -1693,6 +1866,57 @@ fn validate_supervisor_manifest(
         ));
     }
     let source_root = find_worktree_root(&manifest.working_directory)?;
+    let host_client_values = [
+        manifest.host_executable.is_some(),
+        manifest.host_sha256.is_some(),
+        manifest.client_executable.is_some(),
+        manifest.client_sha256.is_some(),
+    ];
+    if host_client_values.iter().any(|value| *value)
+        && host_client_values.iter().any(|value| !*value)
+    {
+        return Err(
+            "host/client attestation requires canonical host/client paths and hashes".to_string(),
+        );
+    }
+    for (label, executable, expected_hash) in [
+        (
+            "host",
+            manifest.host_executable.as_ref(),
+            manifest.host_sha256.as_ref(),
+        ),
+        (
+            "client",
+            manifest.client_executable.as_ref(),
+            manifest.client_sha256.as_ref(),
+        ),
+    ] {
+        if let (Some(executable), Some(expected_hash)) = (executable, expected_hash) {
+            let executable = canonical_file(executable, &format!("{label}Executable"))?;
+            if !path_is_within(&executable, &source_root) {
+                return Err(format!(
+                    "{label}Executable must remain under the canonical worktree root {}",
+                    source_root.display()
+                ));
+            }
+            let normalized = expected_hash.trim().to_ascii_lowercase();
+            if normalized.len() != 64
+                || !normalized
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "{label}Sha256 must be exactly 64 hexadecimal characters"
+                ));
+            }
+            let actual = sha256_file(&executable)?;
+            if actual != normalized {
+                return Err(format!(
+                    "{label} SHA-256 mismatch: expected {normalized}, actual {actual}"
+                ));
+            }
+        }
+    }
     let current_source_tree_state = source_tree_digest(&source_root)?;
     if source_tree_digest_value != current_source_tree_state {
         return Err(format!(
@@ -1889,6 +2113,7 @@ mod windows_supervisor {
     const ERROR_MORE_DATA: i32 = 234;
     const ERROR_TIMEOUT: i32 = 1460;
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const MAX_JOB_MEMBER_RETRIES: u32 = 8;
     const FILE_LIST_DIRECTORY: u32 = 0x0001;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -1896,6 +2121,7 @@ mod windows_supervisor {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 23;
     const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 
     #[repr(C)]
@@ -1965,6 +2191,19 @@ mod windows_supervisor {
         local_port: [u8; 4],
         remote_addr: u32,
         remote_port: [u8; 4],
+        owning_pid: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MibTcp6RowOwnerPid {
+        local_addr: [u8; 16],
+        local_scope_id: u32,
+        local_port: [u8; 4],
+        remote_addr: [u8; 16],
+        remote_scope_id: u32,
+        remote_port: [u8; 4],
+        state: u32,
         owning_pid: u32,
     }
 
@@ -2285,9 +2524,10 @@ mod windows_supervisor {
             // edge, but a process may have reached zero before this waiter
             // starts; that state must not be reported as residue merely
             // because its edge was already queued.
-            if self.active_process_ids()?.is_empty() {
+            if self.active_process_ids_until(deadline)?.is_empty() {
                 return Ok(());
             }
+            let mut member_query_failures = 0u32;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -2320,11 +2560,40 @@ mod windows_supervisor {
                     continue;
                 }
                 if message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO {
-                    if self.active_process_ids()?.is_empty() {
+                    if self.active_process_ids_until(deadline)?.is_empty() {
                         return Ok(());
                     }
                 }
+                // Completion ports can contain a process-exit edge before
+                // the membership query becomes observable. Retry only a
+                // bounded number of times and keep the same absolute
+                // deadline; never turn a transient query error into a pass.
+                if let Err(error) = self.active_process_ids() {
+                    member_query_failures = member_query_failures.saturating_add(1);
+                    if member_query_failures >= MAX_JOB_MEMBER_RETRIES {
+                        return Err(format!(
+                            "Job member inspection exceeded {MAX_JOB_MEMBER_RETRIES} retries: {error}"
+                        ));
+                    }
+                }
             }
+        }
+
+        fn active_process_ids_until(&self, deadline: Instant) -> Result<Vec<u32>, String> {
+            let mut last_error = None;
+            for _ in 0..MAX_JOB_MEMBER_RETRIES {
+                if Instant::now() >= deadline {
+                    return Err("Job member inspection deadline exceeded".to_string());
+                }
+                match self.active_process_ids() {
+                    Ok(ids) => return Ok(ids),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(format!(
+                "Job member inspection failed after {MAX_JOB_MEMBER_RETRIES} retries: {}",
+                last_error.unwrap_or_else(|| "unknown query error".to_string())
+            ))
         }
 
         fn terminate_and_wait(&self, deadline: Instant) -> Result<(), String> {
@@ -2668,6 +2937,77 @@ mod windows_supervisor {
                 "port": port,
             }));
         }
+        // IPv4-only snapshots miss dual-stack listeners and can falsely
+        // claim an external port was untouched. Query the IPv6 owner table
+        // independently and retain the same PID + creation-time identity.
+        let mut ipv6_size = 0u32;
+        let ipv6_first = unsafe {
+            GetExtendedTcpTable(
+                ptr::null_mut(),
+                &mut ipv6_size,
+                1,
+                AF_INET6,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if ipv6_first != ERROR_INSUFFICIENT_BUFFER || ipv6_size < std::mem::size_of::<u32>() as u32
+        {
+            return Err(format!(
+                "GetExtendedTcpTable IPv6 size query failed: status {ipv6_first}, bytes {ipv6_size}"
+            ));
+        }
+        if ipv6_size > 4 * 1024 * 1024 {
+            return Err(format!(
+                "GetExtendedTcpTable IPv6 listener table exceeds bounded size: {ipv6_size}"
+            ));
+        }
+        let mut ipv6_storage = vec![0u8; ipv6_size as usize];
+        let ipv6_second = unsafe {
+            GetExtendedTcpTable(
+                ipv6_storage.as_mut_ptr() as _,
+                &mut ipv6_size,
+                1,
+                AF_INET6,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if ipv6_second != 0 {
+            return Err(format!(
+                "GetExtendedTcpTable IPv6 listener query failed: status {ipv6_second}"
+            ));
+        }
+        let ipv6_bytes = (ipv6_size as usize).min(ipv6_storage.len());
+        if ipv6_bytes < std::mem::size_of::<u32>() {
+            return Err("GetExtendedTcpTable IPv6 returned a truncated table".to_string());
+        }
+        let ipv6_count =
+            u32::from_ne_bytes(ipv6_storage[..4].try_into().expect("IPv6 row count bytes"))
+                as usize;
+        let ipv6_row_size = std::mem::size_of::<MibTcp6RowOwnerPid>();
+        let ipv6_available = (ipv6_bytes - 4) / ipv6_row_size;
+        if ipv6_count > ipv6_available || ipv6_count > 4096 {
+            return Err(format!(
+                "GetExtendedTcpTable IPv6 row count {ipv6_count} exceeds available/bound {ipv6_available}"
+            ));
+        }
+        for index in 0..ipv6_count {
+            let offset = 4 + index * ipv6_row_size;
+            let row = unsafe {
+                std::ptr::read_unaligned(
+                    ipv6_storage.as_ptr().add(offset) as *const MibTcp6RowOwnerPid
+                )
+            };
+            let port = u16::from_be_bytes([row.local_port[0], row.local_port[1]]);
+            let process_creation_time_100ns = listener_process_creation_time_100ns(row.owning_pid)?;
+            listeners.push(json!({
+                "processId": row.owning_pid,
+                "processCreationTime100ns": process_creation_time_100ns,
+                "address": std::net::Ipv6Addr::from(row.local_addr).to_string(),
+                "port": port,
+            }));
+        }
         Ok(listeners)
     }
 
@@ -2797,15 +3137,15 @@ mod windows_supervisor {
 
     fn filter_owned_listeners(
         listeners: &[Value],
-        owned_pids: &[u32],
+        owned_identities: &[ProcessIdentity],
     ) -> Result<Vec<Value>, String> {
+        let owned_owners = owned_identities
+            .iter()
+            .map(|identity| format!("{}|{}", identity.process_id, identity.creation_time_100ns))
+            .collect::<std::collections::BTreeSet<_>>();
         let mut owned = Vec::new();
         for listener in listeners {
-            let pid = listener["processId"]
-                .as_u64()
-                .ok_or_else(|| "listener row omitted processId".to_string())?
-                as u32;
-            if owned_pids.contains(&pid) {
+            if owned_owners.contains(&listener_owner_key(listener)?) {
                 owned.push(listener.clone());
             }
         }
@@ -3227,6 +3567,24 @@ mod windows_supervisor {
             })
     }
 
+    fn bounded_member_evidence(ids: &[u32]) -> Value {
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let encoded = sorted
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        json!({
+            "count": sorted.len(),
+            "ids": sorted.iter().take(64).copied().collect::<Vec<_>>(),
+            "truncated": sorted.len() > 64,
+            "sha256": sha256_bytes(encoded.as_bytes()),
+            "query": "QueryInformationJobObject(BASIC_PROCESS_ID_LIST)",
+        })
+    }
+
     struct CycleAggregate {
         count: u32,
         passed: u32,
@@ -3270,13 +3628,24 @@ mod windows_supervisor {
                 .push(cycle["durationMs"].as_u64().unwrap_or_default());
             self.cpu_samples
                 .push(cycle.get("cpu").cloned().unwrap_or(Value::Null));
+            let audit = cycle.get("jobAudit").cloned().unwrap_or(Value::Null);
+            let audit_object = audit.as_object();
             self.conformance.push(json!({
                 "iteration": cycle["iteration"],
                 "name": cycle["scenario"],
                 "status": cycle["status"],
                 "outcome": cycle["outcome"],
+                "activeProcessZero": cycle["activeProcessZero"],
+                "jobAudit": {
+                    "memberBefore": audit_object.and_then(|value| value.get("jobMemberEvidenceBefore")).cloned().unwrap_or(Value::Null),
+                    "memberAfter": audit_object.and_then(|value| value.get("jobMemberEvidenceAfter")).cloned().unwrap_or(Value::Null),
+                    "activeProcessZeroVerified": audit_object.and_then(|value| value.get("activeProcessZeroVerified")).cloned().unwrap_or(Value::Null),
+                    "externalListenersUnchanged": audit_object.and_then(|value| value.get("externalListenersUnchanged")).cloned().unwrap_or(Value::Null),
+                    "externalListenerAfterDigest": audit_object.and_then(|value| value.get("externalListenerAfterDigest")).cloned().unwrap_or(Value::Null),
+                    "processHandleCountBefore": audit_object.and_then(|value| value.get("processHandleCountBefore")).cloned().unwrap_or(Value::Null),
+                    "processHandleCountAfter": audit_object.and_then(|value| value.get("processHandleCountAfter")).cloned().unwrap_or(Value::Null),
+                },
             }));
-            let audit = cycle.get("jobAudit").cloned().unwrap_or(Value::Null);
             if let Some(audit_object) = audit.as_object() {
                 self.all_external_listeners_unchanged &= audit_object
                     .get("externalListenersUnchanged")
@@ -3343,7 +3712,7 @@ mod windows_supervisor {
         }
     }
 
-    fn run_manifest(manifest: &SupervisorManifest) -> Result<Value, Value> {
+    fn run_manifest(manifest: &SupervisorManifest, synthetic: bool) -> Result<Value, Value> {
         let (supervisor, helper, cycle) = match validate_supervisor_manifest(&manifest) {
             Ok(paths) => paths,
             Err(error) => {
@@ -3535,6 +3904,11 @@ mod windows_supervisor {
                     break;
                 }
             };
+            // The wall interval used for CPU normalization starts after the
+            // suspended CreateProcessW/Job assignment has resumed the child;
+            // launch, listener inspection, reader join, and evidence work are
+            // not charged as child wall time.
+            let process_started = Instant::now();
             let process_handle_count_before = match process_handle_count(
                 child.process.as_raw_handle() as _,
                 child.root_identity.process_id,
@@ -3797,7 +4171,7 @@ mod windows_supervisor {
                     "error": format!("CPU accounting failed: {error}"),
                 })
             })?;
-            let wall_time_ms = started.elapsed().as_millis().max(1) as u64;
+            let wall_time_ms = process_started.elapsed().as_millis().max(1) as u64;
             let wall_time_100ns = wall_time_ms.saturating_mul(10_000);
             let core_equivalent_percent = if wall_time_100ns == 0 {
                 0.0
@@ -3856,10 +4230,6 @@ mod windows_supervisor {
                     "error": format!("listener audit after cleanup failed: {error}"),
                 })
             })?;
-            let mut owned_pids = vec![root_identity.process_id];
-            owned_pids.extend(member_identities.iter().map(|identity| identity.process_id));
-            owned_pids.sort_unstable();
-            owned_pids.dedup();
             let mut owned_identities = Vec::with_capacity(member_identities.len() + 1);
             owned_identities.push(root_identity.clone());
             owned_identities.extend(member_identities.iter().cloned());
@@ -3879,8 +4249,8 @@ mod windows_supervisor {
                     false
                 }
             };
-            let owned_listeners_before = filter_owned_listeners(&listeners_before, &owned_pids)
-                .map_err(|error| {
+            let owned_listeners_before =
+                filter_owned_listeners(&listeners_before, &owned_identities).map_err(|error| {
                     json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                         "status": "rejected",
@@ -3889,7 +4259,7 @@ mod windows_supervisor {
                         "error": format!("owned listener baseline inspection failed: {error}"),
                     })
                 })?;
-            let owned_listeners_after = filter_owned_listeners(&listeners_after, &owned_pids)
+            let owned_listeners_after = filter_owned_listeners(&listeners_after, &owned_identities)
                 .map_err(|error| {
                     json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
@@ -4028,12 +4398,16 @@ mod windows_supervisor {
                 json!({
                     "jobMembersBefore": job_members_before.len(),
                     "jobMembersAfter": job_members_after.len(),
+                    "jobMemberEvidenceBefore": bounded_member_evidence(&job_members_before),
+                    "jobMemberEvidenceAfter": bounded_member_evidence(&job_members_after),
+                    "activeProcessZeroVerified": active_process_zero,
+                    "readerThreadsJoined": true,
                     "processHandleCountBefore": process_handle_count_before,
                     "processHandleCountAfter": process_handle_count_after,
                     "hostProcessHandleCountBefore": host_process_handle_count_before,
                     "hostProcessHandleCountAfter": host_process_handle_count_after,
                     "ownedListenersBefore": owned_listeners_before,
-                    "ownedListenersDuring": filter_owned_listeners(&listeners_during, &owned_pids)
+                    "ownedListenersDuring": filter_owned_listeners(&listeners_during, &owned_identities)
                         .map_err(|error| json!({
                             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                             "status": "rejected",
@@ -4086,6 +4460,15 @@ mod windows_supervisor {
         }
         let completed_cycles = aggregate.count;
         let cycle_aggregate = aggregate.finish();
+        let real_lifecycle = !synthetic;
+        let release_eligible = real_lifecycle
+            && status == "passed"
+            && manifest.iterations == 100
+            && completed_cycles == 100
+            && manifest.host_executable.is_some()
+            && manifest.host_sha256.is_some()
+            && manifest.client_executable.is_some()
+            && manifest.client_sha256.is_some();
         Ok(json!({
             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
             "status": status,
@@ -4096,6 +4479,9 @@ mod windows_supervisor {
             "seed": manifest.seed,
             "iterations": manifest.iterations,
             "completedCycles": completed_cycles,
+            "realLifecycle": real_lifecycle,
+            "releaseEligible": release_eligible,
+            "releaseHold": if release_eligible { Value::Null } else { json!("requires 100 completed real cycles and caller-pinned host/client identities") },
             "ansiCorpus": ansi_corpus,
             "cycles": cycles,
             "cycleAggregate": cycle_aggregate,
@@ -4245,6 +4631,16 @@ mod windows_supervisor {
         let supervisor = canonical_file(&manifest.supervisor_executable, "supervisorExecutable")?;
         let helper = canonical_file(&manifest.helper_executable, "helperExecutable")?;
         let cycle = canonical_file(&manifest.cycle_executable, "cycleExecutable")?;
+        let host = manifest
+            .host_executable
+            .as_ref()
+            .map(|path| canonical_file(path, "hostExecutable"))
+            .transpose()?;
+        let client = manifest
+            .client_executable
+            .as_ref()
+            .map(|path| canonical_file(path, "clientExecutable"))
+            .transpose()?;
         let target_directory =
             resolve_existing_path(&manifest.target_directory, "targetDirectory")?;
         let (root, _retained_root_handle) = open_retained_evidence_root(&manifest.evidence_root)?;
@@ -4270,6 +4666,14 @@ mod windows_supervisor {
                 "helperSha256": manifest.helper_sha256,
                 "cycleExecutable": redacted_executable_path(&cycle),
                 "cycleSha256": manifest.cycle_sha256,
+                "hostExecutable": host
+                    .as_ref()
+                    .map(|path| redacted_executable_path(path)),
+                "hostSha256": manifest.host_sha256,
+                "clientExecutable": client
+                    .as_ref()
+                    .map(|path| redacted_executable_path(path)),
+                "clientSha256": manifest.client_sha256,
             },
             "ansiCorpus": ansi_corpus,
         });
@@ -4451,7 +4855,7 @@ mod windows_supervisor {
         let Some(attestation) = attestation else {
             return Vec::new();
         };
-        vec![
+        let mut arguments = vec![
             "--expected-git-revision".to_string(),
             attestation.git_revision.clone(),
             "--expected-source-tree-state".to_string(),
@@ -4460,7 +4864,25 @@ mod windows_supervisor {
             attestation.build_id.clone(),
             "--expected-helper-sha256".to_string(),
             attestation.binary_sha256.clone(),
-        ]
+        ];
+        if let (Some(path), Some(hash), Some(client), Some(client_hash)) = (
+            attestation.host_executable.as_ref(),
+            attestation.host_sha256.as_ref(),
+            attestation.client_executable.as_ref(),
+            attestation.client_sha256.as_ref(),
+        ) {
+            arguments.extend([
+                "--expected-host-executable".to_string(),
+                path.clone(),
+                "--expected-host-sha256".to_string(),
+                hash.clone(),
+                "--expected-client-executable".to_string(),
+                client.clone(),
+                "--expected-client-sha256".to_string(),
+                client_hash.clone(),
+            ]);
+        }
+        arguments
     }
 
     pub(super) fn run_bounded_supervisor(
@@ -4469,6 +4891,7 @@ mod windows_supervisor {
         seed_override: Option<u64>,
         attestation: Option<&ExternalAttestation>,
         timeout_ms: u64,
+        synthetic: bool,
     ) -> (Value, i32) {
         let mut manifest = match read_manifest_for_wrapper(path) {
             Ok(manifest) => manifest,
@@ -4548,6 +4971,9 @@ mod windows_supervisor {
         if let Some(seed) = seed_override {
             arguments.extend(["--seed".to_string(), seed.to_string()]);
         }
+        if synthetic {
+            arguments.push("--synthetic".to_string());
+        }
         arguments.extend(wrapper_attestation_arguments(attestation));
         let wrapper_deadline = Instant::now()
             .checked_add(Duration::from_millis(timeout_ms))
@@ -4590,24 +5016,31 @@ mod windows_supervisor {
             Ok(Some(code)) => code,
             Ok(None) => {
                 let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                let job_zero = child
-                    .job
-                    .active_process_ids()
-                    .map(|members| members.is_empty())
-                    .unwrap_or(false)
-                    && cleanup.is_ok();
-                let _ = finish_capped_reader(
+                let members = child.job.active_process_ids();
+                let job_zero = cleanup.is_ok()
+                    && members
+                        .as_ref()
+                        .map(|members| members.is_empty())
+                        .unwrap_or(false);
+                let job_error = match (&cleanup, &members) {
+                    (Ok(()), Ok(members)) if members.is_empty() => None,
+                    (cleanup, members) => Some(format!(
+                        "bounded supervisor timeout Job settlement failed: cleanup={cleanup:?}; active-members={members:?}"
+                    )),
+                };
+                let stdout_join = finish_capped_reader(
                     stdout_receiver,
                     stdout_thread,
                     cleanup_deadline,
                     "bounded supervisor stdout",
                 );
-                let _ = finish_capped_reader(
+                let stderr_join = finish_capped_reader(
                     stderr_receiver,
                     stderr_thread,
                     cleanup_deadline,
                     "bounded supervisor stderr",
                 );
+                let readers_joined = stdout_join.is_ok() && stderr_join.is_ok();
                 drop(child);
                 return (
                     json!({
@@ -4615,26 +5048,46 @@ mod windows_supervisor {
                         "status": "rejected",
                         "launched": true,
                         "wrapperTimedOut": true,
-                        "jobZero": job_zero,
-                        "error": "Rust wrapper deadline exceeded; owned Job was terminated and joined",
+                        "jobZero": job_zero && readers_joined,
+                        "readersJoined": readers_joined,
+                        "error": if !readers_joined {
+                            "Rust wrapper deadline exceeded; capped reader join failed".to_string()
+                        } else if let Some(error) = job_error {
+                            redact_bounded_error(&error)
+                        } else {
+                            "Rust wrapper deadline exceeded; owned Job was terminated and joined".to_string()
+                        },
                     }),
                     1,
                 );
             }
             Err(error) => {
-                let _ = child.job.terminate_and_wait(cleanup_deadline);
-                let _ = finish_capped_reader(
+                let cleanup = child.job.terminate_and_wait(cleanup_deadline);
+                let members = child.job.active_process_ids();
+                let job_zero = cleanup.is_ok()
+                    && members
+                        .as_ref()
+                        .map(|members| members.is_empty())
+                        .unwrap_or(false);
+                let job_error = match (&cleanup, &members) {
+                    (Ok(()), Ok(members)) if members.is_empty() => None,
+                    (cleanup, members) => Some(format!(
+                        "bounded supervisor wait-error Job settlement failed: cleanup={cleanup:?}; active-members={members:?}"
+                    )),
+                };
+                let stdout_join = finish_capped_reader(
                     stdout_receiver,
                     stdout_thread,
                     cleanup_deadline,
                     "bounded supervisor stdout",
                 );
-                let _ = finish_capped_reader(
+                let stderr_join = finish_capped_reader(
                     stderr_receiver,
                     stderr_thread,
                     cleanup_deadline,
                     "bounded supervisor stderr",
                 );
+                let readers_joined = stdout_join.is_ok() && stderr_join.is_ok();
                 drop(child);
                 return (
                     json!({
@@ -4642,18 +5095,35 @@ mod windows_supervisor {
                         "status": "rejected",
                         "launched": true,
                         "wrapperTimedOut": false,
-                        "jobZero": false,
-                        "error": redact_bounded_error(&error),
+                        "jobZero": job_zero && readers_joined,
+                        "readersJoined": readers_joined,
+                        "error": redact_bounded_error(&format!(
+                            "{error}{}",
+                            job_error
+                                .as_deref()
+                                .map(|detail| format!("; {detail}"))
+                                .unwrap_or_default()
+                        )),
                     }),
                     2,
                 );
             }
         };
+        let mut job_settlement_error = None;
         let job_zero = match child.job.wait_active_process_zero(cleanup_deadline) {
             Ok(()) => true,
-            Err(_) => {
-                let _ = child.job.terminate_and_wait(cleanup_deadline);
-                false
+            Err(error) => {
+                let cleanup = child.job.terminate_and_wait(cleanup_deadline);
+                let members = child.job.active_process_ids();
+                let zero = cleanup.is_ok()
+                    && members
+                        .as_ref()
+                        .map(|members| members.is_empty())
+                        .unwrap_or(false);
+                job_settlement_error = Some(format!(
+                    "ACTIVE_PROCESS_ZERO inspection failed: {error}; cleanup={cleanup:?}; active-members={members:?}"
+                ));
+                zero
             }
         };
         let stdout = finish_capped_reader(
@@ -4698,7 +5168,7 @@ mod windows_supervisor {
                 )
             }
         };
-        if stderr.is_err() || !job_zero {
+        if stderr.is_err() || !job_zero || job_settlement_error.is_some() {
             return (
                 json!({
                     "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
@@ -4706,7 +5176,10 @@ mod windows_supervisor {
                     "launched": true,
                     "wrapperTimedOut": false,
                     "jobZero": job_zero,
-                    "error": "bounded supervisor did not settle cleanly",
+                    "error": job_settlement_error
+                        .as_deref()
+                        .map(redact_bounded_error)
+                        .unwrap_or_else(|| "bounded supervisor did not settle cleanly".to_string()),
                 }),
                 2,
             );
@@ -4756,6 +5229,7 @@ mod windows_supervisor {
         iterations_override: Option<u32>,
         seed_override: Option<u64>,
         external_attestation: Option<&ExternalAttestation>,
+        synthetic: bool,
     ) -> (Value, i32) {
         if let Err(error) = reject_reparse_ancestors(path, "manifest") {
             return (
@@ -4827,8 +5301,9 @@ mod windows_supervisor {
             );
         }
         let result_limit = manifest.budgets.result_bytes;
-        match run_manifest(&manifest) {
+        match run_manifest(&manifest, synthetic) {
             Ok(mut result) => {
+                redact_json_value(&mut result);
                 let encoded_length = serde_json::to_vec(&result)
                     .map(|bytes| bytes.len())
                     .unwrap_or(usize::MAX);
@@ -4904,6 +5379,11 @@ fn main() {
                 let mut expected_source_tree_state: Option<String> = None;
                 let mut expected_build_id: Option<String> = None;
                 let mut expected_binary_sha256: Option<String> = None;
+                let mut expected_host_executable: Option<String> = None;
+                let mut expected_host_sha256: Option<String> = None;
+                let mut expected_client_executable: Option<String> = None;
+                let mut expected_client_sha256: Option<String> = None;
+                let mut synthetic = false;
                 while let Some(argument) = args.next() {
                     let argument = argument
                         .into_string()
@@ -4988,6 +5468,59 @@ fn main() {
                                     }),
                             );
                         }
+                        "--expected-host-executable" => {
+                            expected_host_executable = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-host-executable requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-host-sha256" => {
+                            expected_host_sha256 = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-host-sha256 requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-client-executable" => {
+                            expected_client_executable = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-client-executable requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-client-sha256" => {
+                            expected_client_sha256 = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-client-sha256 requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--synthetic" => synthetic = true,
                         other => {
                             eprintln!("unknown supervise argument `{other}`");
                             std::process::exit(2);
@@ -5003,6 +5536,10 @@ fn main() {
                     expected_source_tree_state,
                     expected_build_id,
                     expected_binary_sha256,
+                    expected_host_executable,
+                    expected_host_sha256,
+                    expected_client_executable,
+                    expected_client_sha256,
                 ) {
                     Ok(value) => value,
                     Err(error) => {
@@ -5010,12 +5547,15 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
-                let (result, exit_code) = windows_supervisor::run_manifest_file(
+                let (mut result, exit_code) = windows_supervisor::run_manifest_file(
                     &manifest.expect("manifest path"),
                     iterations,
                     seed,
                     external_attestation.as_ref(),
+                    synthetic,
                 );
+                normalize_supervisor_result(&mut result);
+                redact_json_value(&mut result);
                 let encoded = serde_json::to_string(&result).expect("serialize supervisor result");
                 println!("{encoded}");
                 std::process::exit(exit_code);
@@ -5037,6 +5577,11 @@ fn main() {
                 let mut expected_source_tree_state: Option<String> = None;
                 let mut expected_build_id: Option<String> = None;
                 let mut expected_binary_sha256: Option<String> = None;
+                let mut expected_host_executable: Option<String> = None;
+                let mut expected_host_sha256: Option<String> = None;
+                let mut expected_client_executable: Option<String> = None;
+                let mut expected_client_sha256: Option<String> = None;
+                let mut synthetic = false;
                 while let Some(argument) = args.next() {
                     let argument = argument
                         .into_string()
@@ -5129,6 +5674,45 @@ fn main() {
                                 ),
                             );
                         }
+                        "--synthetic" => synthetic = true,
+                        "--expected-host-executable" => {
+                            expected_host_executable = Some(
+                                next_string(&mut args, "--expected-host-executable")
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-host-sha256" => {
+                            expected_host_sha256 = Some(
+                                next_string(&mut args, "--expected-host-sha256").unwrap_or_else(
+                                    |error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    },
+                                ),
+                            );
+                        }
+                        "--expected-client-executable" => {
+                            expected_client_executable = Some(
+                                next_string(&mut args, "--expected-client-executable")
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-client-sha256" => {
+                            expected_client_sha256 = Some(
+                                next_string(&mut args, "--expected-client-sha256").unwrap_or_else(
+                                    |error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    },
+                                ),
+                            );
+                        }
                         other => {
                             eprintln!("unknown bounded-supervise argument `{other}`");
                             std::process::exit(2);
@@ -5148,6 +5732,10 @@ fn main() {
                     expected_source_tree_state,
                     expected_build_id,
                     expected_binary_sha256,
+                    expected_host_executable,
+                    expected_host_sha256,
+                    expected_client_executable,
+                    expected_client_sha256,
                 ) {
                     Ok(value) => value,
                     Err(error) => {
@@ -5155,13 +5743,16 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
-                let (result, exit_code) = windows_supervisor::run_bounded_supervisor(
+                let (mut result, exit_code) = windows_supervisor::run_bounded_supervisor(
                     &manifest,
                     iterations,
                     seed,
                     external_attestation.as_ref(),
                     timeout_ms,
+                    synthetic,
                 );
+                normalize_supervisor_result(&mut result);
+                redact_json_value(&mut result);
                 println!(
                     "{}",
                     serde_json::to_string(&result).expect("serialize bounded supervisor result")

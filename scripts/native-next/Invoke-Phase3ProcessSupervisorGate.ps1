@@ -109,9 +109,13 @@ function Invoke-ProcessSupervisorTestList {
 
 function Invoke-ProcessSupervisorTestSuite {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+    # The release-only 100-cycle summary is reserved for the final union after
+    # the real host/client inputs are available. Focused Phase 3 infrastructure
+    # must never launch that soak as a preflight side effect.
+    $releaseSoakTest = 'rust_supervisor_100_cycle_summary_is_bounded_and_does_not_retain_listener_tables'
     $result = Invoke-ProcessSupervisorHarness `
         -WorktreeRoot $WorktreeRoot `
-        -Arguments @('--test-threads=1', '--nocapture') `
+        -Arguments @('--test-threads=1', '--nocapture', '--skip', $releaseSoakTest) `
         -TimeoutMilliseconds 600000
     if ($result.ExitCode -ne 0 -or $result.StderrBytes -ne 0) {
         throw ("process-soak focused suite failed ({0}): {1}" -f $result.ExitCode, $result.Stderr.Trim())
@@ -125,6 +129,22 @@ function Invoke-ProcessSupervisorTestSuite {
     return $passed
 }
 
+function Resolve-Phase3CallerPinnedBinary {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$WorktreeRoot
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "final union $Label executable is unavailable." }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $Path
+    $canonical = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
+    if (-not (Test-DevManagerPathEqualsOrBeneath -LiteralPath $canonical -AncestorPath $WorktreeRoot)) {
+        throw "final union $Label executable escapes the worktree."
+    }
+    $hash = (Get-FileHash -LiteralPath $canonical -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    [pscustomobject]@{ path = $canonical; sha256 = $hash }
+}
+
 function Invoke-Phase3FinalUnion {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
     $pwshCommands = @(
@@ -132,6 +152,17 @@ function Invoke-Phase3FinalUnion {
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
     )
     if ($pwshCommands.Count -ne 1) { throw "final union requires exactly one pwsh.exe (found $($pwshCommands.Count))." }
+    $hostPin = Resolve-Phase3CallerPinnedBinary `
+        -Path (Join-Path $WorktreeRoot 'target-live-native-next\devmanager-host.exe') `
+        -Label 'host' `
+        -WorktreeRoot $WorktreeRoot
+    $clientPin = Resolve-Phase3CallerPinnedBinary `
+        -Path (Join-Path $WorktreeRoot 'target-live-native-next\devmanager-next.exe') `
+        -Label 'client' `
+        -WorktreeRoot $WorktreeRoot
+    $unionEntrypoint = Join-Path $PSScriptRoot 'Invoke-HostClientProcessSoak.ps1'
+    if (-not (Test-Path -LiteralPath $unionEntrypoint -PathType Leaf)) { throw 'final union host/client entrypoint is unavailable.' }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $unionEntrypoint
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = [IO.Path]::GetFullPath([string]$pwshCommands[0].Source)
     $info.UseShellExecute = $false
@@ -147,7 +178,13 @@ function Invoke-Phase3FinalUnion {
     $info.Environment['TEMP'] = $temp
     $info.Environment['TMP'] = $temp
     $info.Environment['PATH'] = @((Join-Path $systemRoot 'System32'), (Split-Path -Parent $info.FileName)) -join ';'
-    foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $soakScript, '-Iterations', '100', '-Seed', [string]$Seed)) {
+    $info.Environment['DEVMANAGER_PROFILE'] = 'native-next-dev'
+    $info.Environment['DEVMANAGER_INSTANCE_LABEL'] = 'Next'
+    $info.Environment['DEVMANAGER_RUNTIME_KIND'] = 'native-next'
+    foreach ($argument in @(
+            '-NoProfile', '-NonInteractive', '-File', $soakScript, '-Iterations', '100', '-Seed', [string]$Seed,
+            '-HostExecutable', [string]$hostPin.path, '-HostSha256', [string]$hostPin.sha256,
+            '-ClientExecutable', [string]$clientPin.path, '-ClientSha256', [string]$clientPin.sha256)) {
         [void]$info.ArgumentList.Add([string]$argument)
     }
     $result = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $info -TimeoutMilliseconds 600000 -StdoutBytes 65536 -StderrBytes 16384
@@ -165,6 +202,43 @@ function Invoke-Phase3FinalUnion {
     $document = $lines[0] | ConvertFrom-Json
     if ([string]$document.status -ne 'passed') { throw 'final host/client union did not report passed.' }
     return 0
+}
+
+function Invoke-Phase3GuardedFinalUnion {
+    param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+
+    # The Phase 0 guard surrounds the focused 2-cycle dry run.  The real union
+    # is a separate command, so give it its own production hash/PID baseline
+    # and fail closed if that state changes before publication of a pass.
+    $evidenceRoot = Get-DevManagerNativeNextEvidenceRoot -ScriptRoot $PSScriptRoot
+    $protectedRoot = Get-DevManagerProductionRoot
+    $guardRun = New-DevManagerPhaseGateRunDirectory `
+        -Phase ($phase + '-final-union') `
+        -EvidenceRoot $evidenceRoot `
+        -ProtectedProductionRoot $protectedRoot
+    $baselinePath = Join-Path ([string]$guardRun.runDirectory) 'baseline.json'
+    Assert-DevManagerEvidencePathSafeForIO `
+        -LiteralPath $baselinePath `
+        -ProtectedProductionRoot $protectedRoot `
+        -AllowedEvidenceRoot $evidenceRoot
+    & $captureBaselineScript -OutputPath $baselinePath
+    $unionExitCode = $null
+    $assertionFailure = $null
+    try {
+        $unionExitCode = Invoke-Phase3FinalUnion -WorktreeRoot $WorktreeRoot
+    }
+    finally {
+        try {
+            & $assertUnchangedScript -BaselinePath $baselinePath
+        }
+        catch {
+            $assertionFailure = [string]$_.Exception.Message
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($assertionFailure)) {
+        throw "final union production hash/PID guard failed: $assertionFailure"
+    }
+    return [int]$unionExitCode
 }
 
 try {
@@ -209,7 +283,7 @@ try {
         $exitCode = 0
     }
     if ([int]$exitCode -eq 0) {
-        $exitCode = Invoke-Phase3FinalUnion -WorktreeRoot $worktreeRoot
+        $exitCode = Invoke-Phase3GuardedFinalUnion -WorktreeRoot $worktreeRoot
     }
 }
 finally {

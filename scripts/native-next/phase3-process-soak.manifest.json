@@ -20,7 +20,11 @@
       "C:\\WINDOWS\\System32",
       "target-native-next\\debug"
     ],
-    "allowlist": {}
+    "allowlist": {
+      "DEVMANAGER_PROFILE": "native-next-dev",
+      "DEVMANAGER_INSTANCE_LABEL": "Next",
+      "DEVMANAGER_RUNTIME_KIND": "native-next"
+    }
   },
   "ansiCorpus": {
     "path": "tests\\fixtures\\ansi\\phase3-v1.json",
