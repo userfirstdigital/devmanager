@@ -441,13 +441,41 @@ impl KernelStore {
         crate::kernel::semantic_journal::load_fact(&self.conn, digest, sequence)
     }
 
-    pub(crate) fn semantic_journal_load_page(
+    pub(crate) fn semantic_journal_stream_page(
         &self,
         digest: &[u8; 32],
         after_sequence: i64,
-        limit: u32,
-    ) -> Result<Vec<crate::kernel::semantic_journal::SemanticJournalFactRow>, StoreError> {
-        crate::kernel::semantic_journal::load_page(&self.conn, digest, after_sequence, limit)
+        requested_high_water: Option<u64>,
+        mut visit: impl FnMut(
+            u64,
+            crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<bool, StoreError>,
+    ) -> Result<u64, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (next_sequence, _) = crate::kernel::semantic_journal::high_water(&tx, digest)?;
+        let high_water = next_sequence.checked_sub(1).ok_or(StoreError::Corruption)?;
+        if requested_high_water.is_some_and(|requested| requested != high_water) {
+            return Err(StoreError::ConstraintViolation);
+        }
+        if after_sequence < 0
+            || u64::try_from(after_sequence).map_or(true, |after| after > high_water)
+        {
+            return Err(StoreError::ConstraintViolation);
+        }
+        let high_water_i64 =
+            i64::try_from(high_water).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "semantic_journal.high_water",
+                value: high_water,
+            })?;
+        crate::kernel::semantic_journal::stream_page(
+            &tx,
+            digest,
+            after_sequence,
+            high_water_i64,
+            |row| visit(high_water, row),
+        )?;
+        tx.commit()?;
+        Ok(high_water)
     }
 
     #[cfg(test)]
@@ -791,12 +819,14 @@ fn detect_interrupted_partial_schema(
 
     // Empty migration history or a migration that predates V7 with any
     // semantic-journal object present indicates an interrupted apply. Once V7
-    // is recorded, require all of its objects to remain present before opening
-    // the store; otherwise the history would claim a schema that is not there.
-    if (applied_version < 7 && semantic_objects > 0)
-        || (applied_version >= 7 && semantic_objects != 3)
-    {
+    // is recorded, validate its complete manifest (columns, checks, foreign
+    // key, unique constraints, and explicit index) rather than counting
+    // objects, which cannot detect a weakened or partially rebuilt object.
+    if applied_version < 7 && semantic_objects > 0 {
         return Err(StoreError::MigrationInterrupted);
+    }
+    if applied_version >= 7 {
+        schema::validate_semantic_journal_schema(conn)?;
     }
     if applied.is_empty() && partial > 0 {
         return Err(StoreError::MigrationInterrupted);

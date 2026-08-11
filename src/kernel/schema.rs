@@ -1,4 +1,7 @@
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+
+use crate::kernel::StoreError;
 
 /// One immutable compiled migration entry.
 #[derive(Debug, Clone, Copy)]
@@ -397,6 +400,171 @@ pub(crate) fn latest_migration_version() -> i64 {
     migration_manifest().last().map(|m| m.version).unwrap_or(0)
 }
 
+/// Validate the complete V7 journal contract after migration history says it
+/// is installed. Object counts are insufficient: a table with a dropped
+/// column, weakened check, foreign key, or unique index can still have the
+/// expected object count while accepting unsafe state.
+pub(crate) fn validate_semantic_journal_schema(conn: &Connection) -> Result<(), StoreError> {
+    const SESSIONS: &[(&str, &str, i64, i64)] = &[
+        ("authority_digest", "BLOB", 0, 1),
+        ("provider_kind", "TEXT", 1, 0),
+        ("task_id", "BLOB", 1, 0),
+        ("agent_session_id", "BLOB", 1, 0),
+        ("resource_id", "BLOB", 1, 0),
+        ("runtime_generation", "INTEGER", 1, 0),
+        ("action_epoch", "INTEGER", 1, 0),
+        ("managed_root", "BLOB", 1, 0),
+        ("opened_at_ms", "INTEGER", 1, 0),
+    ];
+    const FACTS: &[(&str, &str, i64, i64)] = &[
+        ("authority_digest", "BLOB", 1, 1),
+        ("sequence", "INTEGER", 1, 2),
+        ("event_id", "BLOB", 1, 0),
+        ("delivery_id", "TEXT", 1, 0),
+        ("provider_event_id", "TEXT", 0, 0),
+        ("content_hash", "BLOB", 1, 0),
+        ("kind", "TEXT", 1, 0),
+        ("visibility", "TEXT", 1, 0),
+        ("privacy_class", "TEXT", 1, 0),
+        ("redaction_class", "TEXT", 1, 0),
+        ("occurred_at_ms", "INTEGER", 1, 0),
+        ("ingested_at_ms", "INTEGER", 1, 0),
+        ("schema_version", "INTEGER", 1, 0),
+        ("payload", "BLOB", 1, 0),
+    ];
+    validate_table_info(conn, "semantic_journal_sessions", SESSIONS)?;
+    validate_table_info(conn, "semantic_journal_facts", FACTS)?;
+
+    let session_sql = table_sql(conn, "semantic_journal_sessions")?;
+    require_sql_fragments(
+        &session_sql,
+        &[
+            "primarykey",
+            "check(length(authority_digest)=32)",
+            "check(length(task_id)=16)",
+            "check(length(agent_session_id)=16)",
+            "check(length(resource_id)=16)",
+            "check(runtime_generation>=0)",
+            "check(action_epoch>=0)",
+            "check(length(managed_root)=32)",
+        ],
+    )?;
+    let facts_sql = table_sql(conn, "semantic_journal_facts")?;
+    require_sql_fragments(
+        &facts_sql,
+        &[
+            "referencessemantic_journal_sessions(authority_digest)",
+            "check(sequence>0)",
+            "check(length(event_id)=16)",
+            "check(length(content_hash)=32)",
+            "primarykey(authority_digest,sequence)",
+            "unique(authority_digest,event_id)",
+            "unique(authority_digest,delivery_id)",
+            "unique(authority_digest,provider_event_id)",
+        ],
+    )?;
+
+    let foreign_key: Option<(String, String, String)> = conn
+        .query_row(
+            "PRAGMA foreign_key_list('semantic_journal_facts')",
+            [],
+            |row| Ok((row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .map_err(StoreError::from)?;
+    if foreign_key.as_ref().map(|(table, from, to)| {
+        table == "semantic_journal_sessions"
+            && from == "authority_digest"
+            && to == "authority_digest"
+    }) != Some(true)
+    {
+        return Err(StoreError::MigrationInterrupted);
+    }
+
+    let mut indexes = conn
+        .prepare("PRAGMA index_list('semantic_journal_facts')")
+        .map_err(StoreError::from)?;
+    let mut rows = indexes.query([]).map_err(StoreError::from)?;
+    let mut sequence_index_found = false;
+    while let Some(row) = rows.next().map_err(StoreError::from)? {
+        let name: String = row.get(1).map_err(StoreError::from)?;
+        if name == "idx_semantic_journal_facts_sequence" {
+            sequence_index_found = true;
+            break;
+        }
+    }
+    if !sequence_index_found {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    let mut index_columns = conn
+        .prepare("PRAGMA index_info('idx_semantic_journal_facts_sequence')")
+        .map_err(StoreError::from)?;
+    let mut index_rows = index_columns.query([]).map_err(StoreError::from)?;
+    let mut columns = Vec::new();
+    while let Some(row) = index_rows.next().map_err(StoreError::from)? {
+        columns.push(row.get::<_, String>(2).map_err(StoreError::from)?);
+    }
+    if columns != ["authority_digest", "sequence"] {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    Ok(())
+}
+
+fn validate_table_info(
+    conn: &Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+) -> Result<(), StoreError> {
+    let pragma = format!("PRAGMA table_info('{table}')");
+    let mut statement = conn.prepare(&pragma).map_err(StoreError::from)?;
+    let mut rows = statement.query([]).map_err(StoreError::from)?;
+    let mut actual = Vec::new();
+    while let Some(row) = rows.next().map_err(StoreError::from)? {
+        actual.push((
+            row.get::<_, String>(1).map_err(StoreError::from)?,
+            row.get::<_, String>(2).map_err(StoreError::from)?,
+            row.get::<_, i64>(3).map_err(StoreError::from)?,
+            row.get::<_, i64>(5).map_err(StoreError::from)?,
+        ));
+    }
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(|(actual, expected)| {
+            actual.0 != expected.0
+                || actual.1 != expected.1
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+        })
+    {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    Ok(())
+}
+
+fn table_sql(conn: &Connection, table: &str) -> Result<String, StoreError> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)?;
+    let Some(sql) = sql else {
+        return Err(StoreError::MigrationInterrupted);
+    };
+    Ok(sql
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<String>())
+}
+
+fn require_sql_fragments(sql: &str, fragments: &[&str]) -> Result<(), StoreError> {
+    if fragments.iter().any(|fragment| !sql.contains(*fragment)) {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    Ok(())
+}
+
 pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "tasks",
     "operations",
@@ -413,6 +581,22 @@ mod tests {
     use crate::kernel::StoreError;
     use rusqlite::Connection;
     use tempfile::TempDir;
+
+    #[test]
+    fn v7_manifest_rejects_missing_semantic_sequence_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("manifest.sqlite3");
+        let store = crate::kernel::KernelStore::open(&path).expect("initial open");
+        drop(store);
+        let conn = Connection::open(&path).expect("raw reopen");
+        conn.execute("DROP INDEX idx_semantic_journal_facts_sequence", [])
+            .expect("drop index");
+        drop(conn);
+        assert!(matches!(
+            crate::kernel::KernelStore::open(&path),
+            Err(StoreError::MigrationInterrupted)
+        ));
+    }
 
     #[test]
     fn schema_v1_upgrades_to_v2_without_rewriting_v1_record() {

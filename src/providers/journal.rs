@@ -6,11 +6,11 @@
 
 use crate::domain::{
     AgentSessionId, DomainEvent, EventId, PageLimits, PrivacyClass, ResourceId,
-    SemanticJournalFact, SemanticJournalPage, TaskId,
+    SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, TaskId,
 };
 use crate::kernel::semantic_journal::{SemanticJournalAuthorityRecord, SemanticJournalFactRow};
 use crate::kernel::KernelStore;
-use crate::protocol::{FrameLimits, MessagePackCodec};
+use crate::protocol::{FrameLimits, MessagePackCodec, MessagePackError};
 use crate::providers::capabilities::ProviderKind;
 use hmac::{Hmac, Mac};
 use serde::de::{self, Deserializer, Visitor};
@@ -1183,6 +1183,27 @@ fn diagnostic_ref(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn diagnostic_metadata(bytes: &[u8]) -> (u32, String) {
+    #[derive(Deserialize)]
+    struct Wire {
+        schema_version: Option<u32>,
+        source_type: Option<String>,
+    }
+    let Ok(wire) = serde_json::from_slice::<Wire>(bytes) else {
+        return (JOURNAL_SCHEMA_VERSION, "malformed".to_string());
+    };
+    let source_type = wire
+        .source_type
+        .filter(|source| reject_display_bound(source, MAX_SOURCE_TYPE_BYTES).is_ok())
+        .unwrap_or_else(|| "malformed".to_string());
+    (
+        wire.schema_version
+            .filter(|version| *version > 0)
+            .unwrap_or(JOURNAL_SCHEMA_VERSION),
+        source_type,
+    )
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct JournalEvent {
     id: EventId,
@@ -1205,6 +1226,7 @@ pub struct JournalEvent {
     text: Option<String>,
     extensions: BTreeMap<String, String>,
     unknown: Option<UnknownProviderEvent>,
+    payload: SemanticJournalPayload,
     payload_hash: [u8; 32],
 }
 
@@ -1302,10 +1324,13 @@ impl JournalEvent {
         SemanticJournalFact {
             id: self.id,
             sequence: self.sequence,
+            provider: provider_kind_sql(self.provider).to_string(),
+            schema_version: self.schema_version,
             kind: self.kind.as_str().to_string(),
             visibility: self.visibility.as_str().to_string(),
             privacy_class: self.privacy_class,
             redacted: !matches!(self.redaction_class, JournalRedactionClass::Persistable),
+            payload: self.payload.clone(),
         }
     }
 }
@@ -1313,7 +1338,10 @@ impl JournalEvent {
 pub(crate) struct JournalDraft {
     event: JournalEvent,
     authority_digest: [u8; 32],
+    managed_root: [u8; 32],
     permit_nonce: [u8; 16],
+    permit_issued_at_ms: i64,
+    permit_expires_at_ms: i64,
     store_id: [u8; 16],
     seal: [u8; 32],
 }
@@ -1335,21 +1363,30 @@ impl JournalDraft {
     fn sealed(
         event: JournalEvent,
         instance_secret: &[u8; 32],
+        authority: &JournalSessionAuthority,
         authority_digest: [u8; 32],
         permit_nonce: [u8; 16],
+        permit_issued_at_ms: i64,
+        permit_expires_at_ms: i64,
         store_id: [u8; 16],
     ) -> Self {
         let seal = compute_draft_seal(
             instance_secret,
+            authority,
             &authority_digest,
             &event,
             &permit_nonce,
+            permit_issued_at_ms,
+            permit_expires_at_ms,
             &store_id,
         );
         Self {
             event,
             authority_digest,
+            managed_root: authority.managed_root.as_bytes(),
             permit_nonce,
+            permit_issued_at_ms,
+            permit_expires_at_ms,
             store_id,
             seal,
         }
@@ -1359,35 +1396,147 @@ impl JournalDraft {
         &self,
         instance_secret: &[u8; 32],
         authority_digest: &[u8; 32],
+        authority: &JournalSessionAuthority,
         store_id: &[u8; 16],
     ) -> bool {
         if self.authority_digest != *authority_digest || self.store_id != *store_id {
             return false;
         }
+        if self.managed_root != authority.managed_root.as_bytes() {
+            return false;
+        }
+        let bytes = journal_auth_envelope_bytes(
+            authority,
+            authority_digest,
+            &self.event,
+            &self.permit_nonce,
+            self.permit_issued_at_ms,
+            self.permit_expires_at_ms,
+            store_id,
+        );
         let mut mac = Hmac::<Sha256>::new_from_slice(instance_secret).expect("hmac key length");
-        mac.update(authority_digest);
-        mac.update(&self.event.payload_hash);
-        mac.update(self.event.id.as_bytes());
-        mac.update(&self.permit_nonce);
-        mac.update(store_id);
+        mac.update(b"devmanager.semantic_journal.auth.v1\0");
+        mac.update(&bytes);
         mac.verify_slice(&self.seal).is_ok()
     }
 }
 
+#[derive(Serialize)]
+struct JournalAuthUnknown<'a> {
+    provider: ProviderKind,
+    source_type: &'a str,
+    schema_version: u32,
+    diagnostic_ref: &'a str,
+}
+
+#[derive(Serialize)]
+struct JournalAuthEnvelope<'a> {
+    envelope_version: u8,
+    authority_digest: [u8; 32],
+    store_id: [u8; 16],
+    permit_nonce: [u8; 16],
+    permit_issued_at_ms: i64,
+    permit_expires_at_ms: i64,
+    managed_root: [u8; 32],
+    provider: ProviderKind,
+    task_id: [u8; 16],
+    agent_session_id: [u8; 16],
+    resource_id: [u8; 16],
+    runtime_generation: u64,
+    action_epoch: u64,
+    event_id: [u8; 16],
+    delivery_id: &'a str,
+    provider_event_id: Option<&'a str>,
+    schema_version: u32,
+    sequence: u64,
+    kind: JournalSemanticKind,
+    occurred_at_ms: i64,
+    ingested_at_ms: i64,
+    visibility: JournalVisibility,
+    redaction_class: JournalRedactionClass,
+    privacy_class: PrivacyClass,
+    text: Option<&'a str>,
+    extensions: &'a BTreeMap<String, String>,
+    unknown: Option<JournalAuthUnknown<'a>>,
+    payload: &'a SemanticJournalPayload,
+    payload_hash: [u8; 32],
+}
+
 fn compute_draft_seal(
     secret: &[u8; 32],
+    authority: &JournalSessionAuthority,
     authority_digest: &[u8; 32],
     event: &JournalEvent,
     permit_nonce: &[u8; 16],
+    permit_issued_at_ms: i64,
+    permit_expires_at_ms: i64,
     store_id: &[u8; 16],
 ) -> [u8; 32] {
+    let bytes = journal_auth_envelope_bytes(
+        authority,
+        authority_digest,
+        event,
+        permit_nonce,
+        permit_issued_at_ms,
+        permit_expires_at_ms,
+        store_id,
+    );
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key length");
-    mac.update(authority_digest);
-    mac.update(&event.payload_hash);
-    mac.update(event.id.as_bytes());
-    mac.update(permit_nonce);
-    mac.update(store_id);
+    mac.update(b"devmanager.semantic_journal.auth.v1\0");
+    mac.update(&bytes);
     mac.finalize().into_bytes().into()
+}
+
+fn journal_auth_envelope_bytes(
+    authority: &JournalSessionAuthority,
+    authority_digest: &[u8; 32],
+    event: &JournalEvent,
+    permit_nonce: &[u8; 16],
+    permit_issued_at_ms: i64,
+    permit_expires_at_ms: i64,
+    store_id: &[u8; 16],
+) -> Vec<u8> {
+    let unknown = event.unknown.as_ref().map(|unknown| JournalAuthUnknown {
+        provider: unknown.provider,
+        source_type: &unknown.source_type,
+        schema_version: unknown.schema_version,
+        diagnostic_ref: &unknown.diagnostic_ref,
+    });
+    let envelope = JournalAuthEnvelope {
+        envelope_version: 1,
+        authority_digest: *authority_digest,
+        store_id: *store_id,
+        permit_nonce: *permit_nonce,
+        permit_issued_at_ms,
+        permit_expires_at_ms,
+        managed_root: authority.managed_root.as_bytes(),
+        provider: event.provider,
+        task_id: *event.task_id.as_bytes(),
+        agent_session_id: *event.agent_session_id.as_bytes(),
+        resource_id: *event.resource_id.as_bytes(),
+        runtime_generation: event.runtime_generation,
+        action_epoch: event.action_epoch,
+        event_id: *event.id.as_bytes(),
+        delivery_id: event.delivery_id.as_str(),
+        provider_event_id: event
+            .provider_event_id
+            .as_ref()
+            .map(ProviderEventId::as_str),
+        schema_version: event.schema_version,
+        sequence: event.sequence,
+        kind: event.kind,
+        occurred_at_ms: event.occurred_at_ms,
+        ingested_at_ms: event.ingested_at_ms,
+        visibility: event.visibility,
+        redaction_class: event.redaction_class,
+        privacy_class: event.privacy_class,
+        text: event.text.as_deref(),
+        extensions: &event.extensions,
+        unknown,
+        payload: &event.payload,
+        payload_hash: event.payload_hash,
+    };
+    rmp_serde::to_vec_named(&envelope).expect("journal auth envelope serializes")
 }
 
 fn journal_key(authority: &JournalSessionAuthority, store_id: &[u8; 16]) -> [u8; 32] {
@@ -1405,6 +1554,7 @@ pub enum JournalIngestOutcome {
     Duplicate { existing_id: EventId },
     Conflict { existing_id: EventId },
     Quarantined(JournalEvent),
+    IgnoredNeverPersist,
     IgnoredTerminal,
     Rejected(JournalRejectReason),
     Backpressure(JournalBackpressure),
@@ -1418,6 +1568,7 @@ impl fmt::Debug for JournalIngestOutcome {
             Self::Duplicate { .. } => f.write_str("Duplicate"),
             Self::Conflict { .. } => f.write_str("Conflict"),
             Self::Quarantined(event) => f.debug_tuple("Quarantined").field(&event.kind).finish(),
+            Self::IgnoredNeverPersist => f.write_str("IgnoredNeverPersist"),
             Self::IgnoredTerminal => f.write_str("IgnoredTerminal"),
             Self::Rejected(reason) => f.debug_tuple("Rejected").field(reason).finish(),
             Self::Backpressure(kind) => f.debug_tuple("Backpressure").field(kind).finish(),
@@ -1496,7 +1647,6 @@ pub struct SemanticJournal {
     store_id: [u8; 16],
     limits: JournalLimits,
     next_sequence: u64,
-    last_occurred_at_ms: Option<i64>,
     ingest_steps: u32,
 }
 
@@ -1520,7 +1670,7 @@ impl SemanticJournal {
         let store_id = store
             .semantic_journal_ensure_session(&record)
             .map_err(|_| JournalError::Store)?;
-        let (next_sequence, last_occurred_at_ms) = store
+        let (next_sequence, _) = store
             .semantic_journal_high_water(&record.digest)
             .map_err(|_| JournalError::Store)?;
         Ok(Self {
@@ -1531,7 +1681,6 @@ impl SemanticJournal {
             store_id,
             limits,
             next_sequence,
-            last_occurred_at_ms,
             ingest_steps: 0,
         })
     }
@@ -1558,7 +1707,10 @@ impl SemanticJournal {
             ) => Err(JournalIngestOutcome::Rejected(
                 JournalRejectReason::InvalidEnvelope,
             )),
-            Err(_) => Ok(self.diagnostic_draft(&permit, bytes, now_ms)?),
+            Err(_) => {
+                let (schema_version, source_type) = diagnostic_metadata(bytes);
+                Ok(self.diagnostic_draft(&permit, bytes, now_ms, schema_version, source_type)?)
+            }
         }
     }
 
@@ -1566,6 +1718,7 @@ impl SemanticJournal {
         if !draft.verify(
             &self.instance_secret,
             &self.authority_digest,
+            &self.authority,
             &self.store_id,
         ) {
             return JournalIngestOutcome::Rejected(JournalRejectReason::Foreign);
@@ -1573,12 +1726,10 @@ impl SemanticJournal {
         if let Err(outcome) = self.charge_work() {
             return outcome;
         }
-        if self.next_sequence == u64::MAX {
-            return JournalIngestOutcome::Rejected(JournalRejectReason::SequenceOverflow);
-        }
         let mut event = draft.event;
         let row = match persist_row(&event) {
-            Ok(row) => row,
+            Ok(Some(row)) => row,
+            Ok(None) => return JournalIngestOutcome::IgnoredNeverPersist,
             Err(_) => return JournalIngestOutcome::NeedsResync,
         };
         match self.store.semantic_journal_write_fact(
@@ -1596,7 +1747,6 @@ impl SemanticJournal {
             Ok(crate::kernel::semantic_journal::SemanticJournalWrite::Inserted { sequence }) => {
                 event.sequence = sequence;
                 self.next_sequence = sequence.saturating_add(1);
-                self.last_occurred_at_ms = Some(event.occurred_at_ms);
                 if event.kind == JournalSemanticKind::UnknownProviderEvent {
                     JournalIngestOutcome::Quarantined(event)
                 } else {
@@ -1619,6 +1769,9 @@ impl SemanticJournal {
             }
             Ok(crate::kernel::semantic_journal::SemanticJournalWrite::SequenceOverflow) => {
                 JournalIngestOutcome::Rejected(JournalRejectReason::SequenceOverflow)
+            }
+            Ok(crate::kernel::semantic_journal::SemanticJournalWrite::TimestampRegression) => {
+                JournalIngestOutcome::Rejected(JournalRejectReason::TimestampRegression)
             }
             Err(_) => JournalIngestOutcome::NeedsResync,
         }
@@ -1681,10 +1834,10 @@ impl SemanticJournal {
         }
     }
 
-    pub fn retained_len(&self) -> usize {
+    pub fn retained_len(&self) -> Result<usize, JournalIngestOutcome> {
         self.store
             .semantic_journal_retained_len(&self.authority_digest)
-            .unwrap_or(0)
+            .map_err(|_| JournalIngestOutcome::NeedsResync)
     }
 
     #[cfg(test)]
@@ -1729,105 +1882,114 @@ impl SemanticJournal {
         limits
             .validate()
             .map_err(|_| JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget))?;
-        let (next_seq, _) = self
-            .store
-            .semantic_journal_high_water(&self.authority_digest)
-            .map_err(|_| JournalIngestOutcome::NeedsResync)?;
-        let captured_high_water = next_seq.saturating_sub(1);
-        let high_water = match requested_high_water {
-            None => captured_high_water,
-            Some(expected) if expected == captured_high_water => expected,
-            Some(_) => return Err(JournalIngestOutcome::NeedsResync),
-        };
-        if after_sequence > high_water {
-            return Err(JournalIngestOutcome::NeedsResync);
-        }
         let after = i64::try_from(after_sequence).unwrap_or(i64::MAX);
-        let limit = limits.max_items.saturating_add(1);
-        let rows = self
-            .store
-            .semantic_journal_load_page(&self.authority_digest, after, limit)
-            .map_err(|_| JournalIngestOutcome::NeedsResync)?;
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default())
             .map_err(|_| JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget))?;
         let mut expected = after_sequence.saturating_add(1);
         let mut candidates = Vec::with_capacity(usize::try_from(limits.max_items).unwrap_or(0));
         let mut overflow_sequence = None;
-        for row in rows {
-            let sequence =
-                u64::try_from(row.sequence).map_err(|_| JournalIngestOutcome::NeedsResync)?;
-            if sequence != expected || sequence > high_water {
-                return Err(JournalIngestOutcome::NeedsResync);
-            }
-            expected = expected.saturating_add(1);
-            let event = restore_event(&self.authority, row)
-                .map_err(|_| JournalIngestOutcome::NeedsResync)?;
-            if persist_only && matches!(event.redaction_class, JournalRedactionClass::NeverPersist)
-            {
-                continue;
-            }
-            if !persist_only && event.visibility == JournalVisibility::RuntimeOnly {
-                continue;
-            }
-            if candidates.len() as u32 >= limits.max_items {
-                overflow_sequence = Some(event.sequence);
-                break;
-            }
-            candidates.push(event.to_snapshot_fact());
+        let mut scanned_through = after_sequence;
+        let mut stream_error = None;
+        let high_water = self
+            .store
+            .semantic_journal_stream_page(
+                &self.authority_digest,
+                after,
+                requested_high_water,
+                |high_water, row| {
+                    let sequence = match u64::try_from(row.sequence) {
+                        Ok(sequence) => sequence,
+                        Err(_) => {
+                            stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(false);
+                        }
+                    };
+                    if sequence != expected || sequence > high_water {
+                        stream_error = Some(JournalIngestOutcome::NeedsResync);
+                        return Ok(false);
+                    }
+                    expected = expected.saturating_add(1);
+                    scanned_through = sequence;
+                    let event = match restore_event(&self.authority, row) {
+                        Ok(event) => event,
+                        Err(_) => {
+                            stream_error = Some(JournalIngestOutcome::NeedsResync);
+                            return Ok(false);
+                        }
+                    };
+                    if !persist_only && event.visibility == JournalVisibility::RuntimeOnly {
+                        return Ok(true);
+                    }
+                    if candidates.len() as u32 >= limits.max_items {
+                        overflow_sequence = Some(event.sequence);
+                        return Ok(false);
+                    }
+                    let candidate = event.to_snapshot_fact();
+                    candidates.push(candidate);
+                    let next_sequence = (event.sequence < high_water).then_some(event.sequence + 1);
+                    let mut page = SemanticJournalPage {
+                        after_sequence,
+                        through_sequence: event.sequence,
+                        high_water,
+                        encoded_bytes: 0,
+                        next_sequence,
+                        facts: candidates.clone(),
+                    };
+                    match page_encoded_len(&codec, &mut page, limits.max_encoded_bytes) {
+                        Ok(encoded_bytes) => {
+                            page.encoded_bytes = encoded_bytes;
+                            Ok(true)
+                        }
+                        Err(PageMeasureError::TooLarge) => {
+                            let removed = candidates.pop().expect("candidate just pushed");
+                            overflow_sequence = Some(removed.sequence);
+                            Ok(false)
+                        }
+                        Err(PageMeasureError::Encode) => {
+                            stream_error = Some(JournalIngestOutcome::Backpressure(
+                                JournalBackpressure::PageBudget,
+                            ));
+                            Ok(false)
+                        }
+                    }
+                },
+            )
+            .map_err(|_| JournalIngestOutcome::NeedsResync)?;
+        if let Some(error) = stream_error {
+            return Err(error);
         }
-        loop {
-            let through_sequence = candidates
-                .last()
-                .map(|fact| fact.sequence)
-                .unwrap_or(after_sequence);
-            let next_sequence = overflow_sequence.or_else(|| {
-                candidates
-                    .last()
-                    .and_then(|fact| (fact.sequence < high_water).then_some(fact.sequence + 1))
-            });
-            let mut page = SemanticJournalPage {
-                after_sequence,
-                through_sequence,
-                high_water,
-                encoded_bytes: 0,
-                next_sequence,
-                facts: candidates.clone(),
-            };
-            let mut encoded_bytes = 0u32;
-            let mut converged = false;
-            for _ in 0..8 {
-                page.encoded_bytes = encoded_bytes;
-                let encoded = codec.encode(&page).map_err(|_| {
-                    JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget)
-                })?;
-                let measured = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
-                if measured > limits.max_encoded_bytes {
-                    break;
-                }
-                if measured == encoded_bytes {
-                    converged = true;
-                    break;
-                }
-                encoded_bytes = measured;
-            }
-            if converged {
-                let complete = codec.encode(&page).map_err(|_| {
-                    JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget)
-                })?;
-                let complete_bytes = u32::try_from(complete.len()).unwrap_or(u32::MAX);
-                if complete_bytes <= limits.max_encoded_bytes
-                    && complete_bytes == page.encoded_bytes
-                {
-                    return Ok(page);
-                }
-            }
-            let Some(removed) = candidates.pop() else {
-                return Err(JournalIngestOutcome::Backpressure(
-                    JournalBackpressure::PageBudget,
-                ));
-            };
-            overflow_sequence = Some(removed.sequence);
+        if after_sequence > high_water {
+            return Err(JournalIngestOutcome::NeedsResync);
         }
+        let through_sequence = candidates
+            .last()
+            .map(|fact| fact.sequence)
+            // An oversized first candidate was fetched and decoded only to
+            // establish that it cannot fit. It was not returned, so the page
+            // must leave the durable cursor at `after_sequence` and expose
+            // the candidate again through `next_sequence`.
+            .or_else(|| overflow_sequence.is_none().then_some(scanned_through))
+            .unwrap_or(after_sequence);
+        let next_sequence = overflow_sequence
+            .or_else(|| (scanned_through < high_water).then_some(scanned_through + 1));
+        let mut page = SemanticJournalPage {
+            after_sequence,
+            through_sequence,
+            high_water,
+            encoded_bytes: 0,
+            next_sequence,
+            facts: candidates,
+        };
+        let encoded_bytes =
+            page_encoded_len(&codec, &mut page, limits.max_encoded_bytes).map_err(|error| {
+                match error {
+                    PageMeasureError::TooLarge | PageMeasureError::Encode => {
+                        JournalIngestOutcome::Backpressure(JournalBackpressure::PageBudget)
+                    }
+                }
+            })?;
+        page.encoded_bytes = encoded_bytes;
+        Ok(page)
     }
 
     fn draft_from_content(
@@ -1842,13 +2004,6 @@ impl SemanticJournal {
                 JournalRejectReason::TimestampOverflow,
             ));
         }
-        if let Some(last) = self.last_occurred_at_ms {
-            if content.occurred_at_ms < last {
-                return Err(JournalIngestOutcome::Rejected(
-                    JournalRejectReason::TimestampRegression,
-                ));
-            }
-        }
         if matches!(content.payload, NativeJournalPayload::TerminalBytes) {
             return Err(JournalIngestOutcome::IgnoredTerminal);
         }
@@ -1861,35 +2016,44 @@ impl SemanticJournal {
         if matches!(classified, Classified::Terminal) {
             return Err(JournalIngestOutcome::IgnoredTerminal);
         }
-        let (kind, visibility, redaction_class, privacy_class, text, unknown) = match classified {
-            Classified::Unknown => (
-                JournalSemanticKind::UnknownProviderEvent,
-                JournalVisibility::Diagnostic,
-                JournalRedactionClass::MetadataOnly,
-                PrivacyClass::LocalOnly,
-                None,
-                Some(UnknownProviderEvent {
-                    provider: binding.authority.provider,
-                    source_type: content.source_type,
-                    schema_version: content.schema_version,
-                    diagnostic_ref: diagnostic_ref(raw),
-                }),
-            ),
-            Classified::Semantic {
-                kind,
-                text,
-                redaction_class,
-                privacy_class,
-            } => (
-                kind,
-                JournalVisibility::Semantic,
-                redaction_class,
-                privacy_class,
-                text,
-                None,
-            ),
-            Classified::Terminal => unreachable!("terminal handled above"),
-        };
+        let (kind, visibility, redaction_class, privacy_class, text, unknown, payload) =
+            match classified {
+                Classified::Unknown => (
+                    JournalSemanticKind::UnknownProviderEvent,
+                    JournalVisibility::Diagnostic,
+                    JournalRedactionClass::MetadataOnly,
+                    PrivacyClass::LocalOnly,
+                    None,
+                    Some(UnknownProviderEvent {
+                        provider: binding.authority.provider,
+                        source_type: content.source_type.clone(),
+                        schema_version: content.schema_version,
+                        diagnostic_ref: diagnostic_ref(raw),
+                    }),
+                    SemanticJournalPayload::Unknown {
+                        provider: provider_kind_sql(binding.authority.provider).to_string(),
+                        source_type: content.source_type.clone(),
+                        schema_version: content.schema_version,
+                        diagnostic_ref: diagnostic_ref(raw),
+                    },
+                ),
+                Classified::Semantic {
+                    kind,
+                    text,
+                    redaction_class,
+                    privacy_class,
+                    payload,
+                } => (
+                    kind,
+                    JournalVisibility::Semantic,
+                    redaction_class,
+                    privacy_class,
+                    text,
+                    None,
+                    payload,
+                ),
+                Classified::Terminal => unreachable!("terminal handled above"),
+            };
         if self.next_sequence == u64::MAX {
             return Err(JournalIngestOutcome::Rejected(
                 JournalRejectReason::SequenceOverflow,
@@ -1916,13 +2080,17 @@ impl SemanticJournal {
             text,
             extensions: content.extensions,
             unknown,
+            payload,
             payload_hash: Sha256::digest(raw).into(),
         };
         Ok(JournalDraft::sealed(
             event,
             &self.instance_secret,
+            &self.authority,
             self.authority_digest,
             binding.nonce,
+            binding.issued_at_ms,
+            binding.expires_at_ms,
             self.store_id,
         ))
     }
@@ -1932,6 +2100,8 @@ impl SemanticJournal {
         binding: &AdapterDeliveryPermit,
         raw: &[u8],
         now_ms: i64,
+        schema_version: u32,
+        source_type: String,
     ) -> Result<JournalDraft, JournalIngestOutcome> {
         if self.next_sequence == u64::MAX {
             return Err(JournalIngestOutcome::Rejected(
@@ -1941,7 +2111,7 @@ impl SemanticJournal {
         Ok(JournalDraft::sealed(
             JournalEvent {
                 id: EventId::new(),
-                schema_version: JOURNAL_SCHEMA_VERSION,
+                schema_version,
                 provider: binding.authority.provider,
                 provider_event_id: None,
                 delivery_id: binding.delivery_id.clone(),
@@ -1961,15 +2131,24 @@ impl SemanticJournal {
                 extensions: BTreeMap::new(),
                 unknown: Some(UnknownProviderEvent {
                     provider: binding.authority.provider,
-                    source_type: "malformed".to_string(),
-                    schema_version: JOURNAL_SCHEMA_VERSION,
+                    source_type: source_type.clone(),
+                    schema_version,
                     diagnostic_ref: diagnostic_ref(raw),
                 }),
+                payload: SemanticJournalPayload::Unknown {
+                    provider: provider_kind_sql(binding.authority.provider).to_string(),
+                    source_type,
+                    schema_version,
+                    diagnostic_ref: diagnostic_ref(raw),
+                },
                 payload_hash: Sha256::digest(raw).into(),
             },
             &self.instance_secret,
+            &self.authority,
             self.authority_digest,
             binding.nonce,
+            binding.issued_at_ms,
+            binding.expires_at_ms,
             self.store_id,
         ))
     }
@@ -1991,21 +2170,54 @@ fn classify_store_repeat(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageMeasureError {
+    TooLarge,
+    Encode,
+}
+
+fn page_encoded_len(
+    codec: &MessagePackCodec,
+    page: &mut SemanticJournalPage,
+    maximum: u32,
+) -> Result<u32, PageMeasureError> {
+    let mut encoded_bytes = 0_u32;
+    for _ in 0..8 {
+        page.encoded_bytes = encoded_bytes;
+        let measured = match codec.encoded_len_bounded(page, maximum) {
+            Ok(measured) => measured,
+            Err(MessagePackError::Oversized { .. }) => return Err(PageMeasureError::TooLarge),
+            Err(_) => return Err(PageMeasureError::Encode),
+        };
+        if measured == encoded_bytes {
+            return Ok(measured);
+        }
+        encoded_bytes = measured;
+    }
+    Err(PageMeasureError::Encode)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedJournalBody {
     text: Option<String>,
     extensions: BTreeMap<String, String>,
     unknown_source_type: Option<String>,
+    unknown_schema_version: Option<u32>,
     unknown_diagnostic_ref: Option<String>,
     provider_event_id: Option<String>,
+    payload: SemanticJournalPayload,
 }
 
-fn persist_row(event: &JournalEvent) -> Result<SemanticJournalFactRow, JournalError> {
+fn persist_row(event: &JournalEvent) -> Result<Option<SemanticJournalFactRow>, JournalError> {
+    if event.redaction_class == JournalRedactionClass::NeverPersist {
+        return Ok(None);
+    }
     let mut body = PersistedJournalBody {
         text: event.text.clone(),
         extensions: event.extensions.clone(),
         unknown_source_type: event.unknown.as_ref().map(|item| item.source_type.clone()),
+        unknown_schema_version: event.unknown.as_ref().map(|item| item.schema_version),
         unknown_diagnostic_ref: event
             .unknown
             .as_ref()
@@ -2014,6 +2226,7 @@ fn persist_row(event: &JournalEvent) -> Result<SemanticJournalFactRow, JournalEr
             .provider_event_id
             .as_ref()
             .map(|id| id.as_str().to_owned()),
+        payload: event.payload.clone(),
     };
     if matches!(
         event.redaction_class,
@@ -2024,7 +2237,7 @@ fn persist_row(event: &JournalEvent) -> Result<SemanticJournalFactRow, JournalEr
         body.text = None;
     }
     let payload = rmp_serde::to_vec_named(&body).map_err(|_| JournalError::Store)?;
-    Ok(SemanticJournalFactRow {
+    Ok(Some(SemanticJournalFactRow {
         sequence: 0,
         event_id: *event.id.as_bytes(),
         delivery_id: event.delivery_id.as_str().to_owned(),
@@ -2044,7 +2257,7 @@ fn persist_row(event: &JournalEvent) -> Result<SemanticJournalFactRow, JournalEr
         ingested_at_ms: event.ingested_at_ms,
         schema_version: i64::from(event.schema_version),
         payload,
-    })
+    }))
 }
 
 fn restore_event(
@@ -2058,14 +2271,15 @@ fn restore_event(
         .map_err(|_| JournalError::Store)?;
     let schema_version =
         u32::try_from(row.schema_version).map_err(|_| JournalError::InvalidEnvelope)?;
-    if schema_version != JOURNAL_SCHEMA_VERSION {
-        return Err(JournalError::UnsupportedSchemaVersion);
-    }
     let sequence = u64::try_from(row.sequence).map_err(|_| JournalError::InvalidEnvelope)?;
     if sequence == 0 || row.occurred_at_ms < 0 || row.ingested_at_ms < 0 {
         return Err(JournalError::InvalidEnvelope);
     }
     let kind = parse_kind(&row.kind)?;
+    if schema_version != JOURNAL_SCHEMA_VERSION && kind != JournalSemanticKind::UnknownProviderEvent
+    {
+        return Err(JournalError::UnsupportedSchemaVersion);
+    }
     let visibility = parse_visibility(&row.visibility)?;
     let redaction_class = parse_redaction(&row.redaction_class)?;
     let privacy_class = match row.privacy_class.as_str() {
@@ -2077,6 +2291,10 @@ fn restore_event(
     if body.provider_event_id != row_provider_event_id {
         return Err(JournalError::InvalidEnvelope);
     }
+    if redaction_class == JournalRedactionClass::NeverPersist {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    validate_semantic_payload(&kind, &body.payload)?;
     if matches!(
         redaction_class,
         JournalRedactionClass::NeverPersist
@@ -2115,7 +2333,24 @@ fn restore_event(
     }
     match kind {
         JournalSemanticKind::UnknownProviderEvent => {
-            if body.unknown_source_type.is_none() || body.unknown_diagnostic_ref.is_none() {
+            let Some(unknown_schema_version) = body.unknown_schema_version else {
+                return Err(JournalError::InvalidEnvelope);
+            };
+            let SemanticJournalPayload::Unknown {
+                provider,
+                source_type,
+                schema_version: payload_schema_version,
+                diagnostic_ref,
+            } = &body.payload
+            else {
+                return Err(JournalError::InvalidEnvelope);
+            };
+            if provider != provider_kind_sql(authority.provider)
+                || *payload_schema_version != unknown_schema_version
+                || *payload_schema_version != schema_version
+                || body.unknown_source_type.as_deref() != Some(source_type.as_str())
+                || body.unknown_diagnostic_ref.as_deref() != Some(diagnostic_ref.as_str())
+            {
                 return Err(JournalError::InvalidEnvelope);
             }
             if visibility != JournalVisibility::Diagnostic {
@@ -2123,7 +2358,10 @@ fn restore_event(
             }
         }
         _ => {
-            if body.unknown_source_type.is_some() || body.unknown_diagnostic_ref.is_some() {
+            if body.unknown_source_type.is_some()
+                || body.unknown_schema_version.is_some()
+                || body.unknown_diagnostic_ref.is_some()
+            {
                 return Err(JournalError::InvalidEnvelope);
             }
         }
@@ -2156,9 +2394,10 @@ fn restore_event(
             .map(|source_type| UnknownProviderEvent {
                 provider: authority.provider,
                 source_type,
-                schema_version: JOURNAL_SCHEMA_VERSION,
+                schema_version: body.unknown_schema_version.unwrap_or(schema_version),
                 diagnostic_ref: body.unknown_diagnostic_ref.unwrap_or_default(),
             }),
+        payload: body.payload,
         payload_hash: row.content_hash,
     })
 }
@@ -2182,6 +2421,158 @@ fn parse_kind(value: &str) -> Result<JournalSemanticKind, JournalError> {
         "unknown_provider_event" => JournalSemanticKind::UnknownProviderEvent,
         _ => return Err(JournalError::InvalidEnvelope),
     })
+}
+
+fn validate_semantic_payload(
+    kind: &JournalSemanticKind,
+    payload: &SemanticJournalPayload,
+) -> Result<(), JournalError> {
+    let matches_kind = matches!(
+        (kind, payload),
+        (
+            JournalSemanticKind::UserMessage,
+            SemanticJournalPayload::UserMessage { .. }
+        ) | (
+            JournalSemanticKind::AssistantText,
+            SemanticJournalPayload::AssistantText { .. }
+        ) | (
+            JournalSemanticKind::ReasoningSummary,
+            SemanticJournalPayload::ReasoningSummary { .. }
+        ) | (
+            JournalSemanticKind::ToolCall,
+            SemanticJournalPayload::ToolCall { .. }
+        ) | (
+            JournalSemanticKind::ToolResult,
+            SemanticJournalPayload::ToolResult { .. }
+        ) | (
+            JournalSemanticKind::ApprovalRequest,
+            SemanticJournalPayload::ApprovalRequest { .. }
+        ) | (
+            JournalSemanticKind::ApprovalResult,
+            SemanticJournalPayload::ApprovalResult { .. }
+        ) | (
+            JournalSemanticKind::Question,
+            SemanticJournalPayload::Question { .. }
+        ) | (
+            JournalSemanticKind::PlanStep,
+            SemanticJournalPayload::PlanStep { .. }
+        ) | (
+            JournalSemanticKind::UsageObservation,
+            SemanticJournalPayload::UsageObservation { .. }
+        ) | (
+            JournalSemanticKind::Error,
+            SemanticJournalPayload::Error { .. }
+        ) | (
+            JournalSemanticKind::TurnState,
+            SemanticJournalPayload::TurnState { .. }
+        ) | (
+            JournalSemanticKind::SessionState,
+            SemanticJournalPayload::SessionState { .. }
+        ) | (
+            JournalSemanticKind::ArtifactReference,
+            SemanticJournalPayload::ArtifactReference { .. }
+        ) | (
+            JournalSemanticKind::UnknownProviderEvent,
+            SemanticJournalPayload::Unknown { .. }
+        )
+    );
+    if !matches_kind {
+        return Err(JournalError::InvalidEnvelope);
+    }
+    match payload {
+        SemanticJournalPayload::UserMessage { text }
+        | SemanticJournalPayload::AssistantText { text }
+        | SemanticJournalPayload::ReasoningSummary { text } => {
+            reject_display_bound(text, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        SemanticJournalPayload::ToolCall { tool_name, call_id } => {
+            reject_display_bound(tool_name, MAX_TOOL_NAME_BYTES)?;
+            reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
+        }
+        SemanticJournalPayload::ToolResult { call_id, status } => {
+            reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
+            reject_display_bound(status, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        SemanticJournalPayload::ApprovalRequest {
+            request_id,
+            summary,
+        } => {
+            reject_display_bound(request_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(summary, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        SemanticJournalPayload::ApprovalResult {
+            request_id,
+            decision,
+        } => {
+            reject_display_bound(request_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(decision, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        SemanticJournalPayload::Question {
+            question_id,
+            prompt,
+            options,
+        } => {
+            reject_display_bound(question_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(prompt, MAX_JOURNAL_TEXT_BYTES)?;
+            if options.len() > MAX_QUESTION_OPTIONS {
+                return Err(JournalError::TooLong);
+            }
+            for option in options {
+                reject_display_bound(option, MAX_EXTENSION_VALUE_BYTES)?;
+            }
+        }
+        SemanticJournalPayload::PlanStep {
+            step_id,
+            title,
+            status,
+        } => {
+            reject_display_bound(step_id, MAX_REQUEST_ID_BYTES)?;
+            reject_display_bound(title, MAX_JOURNAL_TEXT_BYTES)?;
+            reject_display_bound(status, MAX_SOURCE_TYPE_BYTES)?;
+        }
+        SemanticJournalPayload::UsageObservation { remaining_percent } => {
+            if remaining_percent.is_some_and(|percent| percent > 100) {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        SemanticJournalPayload::Error { code, message } => {
+            reject_display_bound(code, MAX_SOURCE_TYPE_BYTES)?;
+            reject_display_bound(message, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        SemanticJournalPayload::TurnState { state } => {
+            reject_display_bound(state, MAX_SOURCE_TYPE_BYTES)?;
+            if !matches!(state.as_str(), "started" | "completed" | "failed") {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        SemanticJournalPayload::SessionState { state } => {
+            reject_display_bound(state, MAX_SOURCE_TYPE_BYTES)?;
+            if !matches!(state.as_str(), "open" | "closed") {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+        SemanticJournalPayload::ArtifactReference { label } => {
+            reject_display_bound(label, MAX_JOURNAL_TEXT_BYTES)?;
+        }
+        SemanticJournalPayload::Unknown {
+            provider,
+            source_type,
+            schema_version,
+            diagnostic_ref,
+        } => {
+            reject_display_bound(provider, MAX_SOURCE_TYPE_BYTES)?;
+            reject_display_bound(source_type, MAX_SOURCE_TYPE_BYTES)?;
+            if *schema_version == 0
+                || diagnostic_ref.len() != 64
+                || !diagnostic_ref
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(JournalError::InvalidEnvelope);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_visibility(value: &str) -> Result<JournalVisibility, JournalError> {
@@ -2212,6 +2603,7 @@ enum Classified {
         text: Option<String>,
         redaction_class: JournalRedactionClass,
         privacy_class: PrivacyClass,
+        payload: SemanticJournalPayload,
     },
 }
 
@@ -2237,6 +2629,18 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
                     text: Some(text.clone()),
                     redaction_class: JournalRedactionClass::PersistableLocalOnly,
                     privacy_class: PrivacyClass::LocalOnly,
+                    payload: match &content.payload {
+                        NativeJournalPayload::UserMessage { .. } => {
+                            SemanticJournalPayload::UserMessage { text: text.clone() }
+                        }
+                        NativeJournalPayload::AssistantText { .. } => {
+                            SemanticJournalPayload::AssistantText { text: text.clone() }
+                        }
+                        NativeJournalPayload::ReasoningSummary { .. } => {
+                            SemanticJournalPayload::ReasoningSummary { text: text.clone() }
+                        }
+                        _ => unreachable!("text payload kind already classified"),
+                    },
                 }
             }
         }
@@ -2249,6 +2653,19 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
                     text: None,
                     redaction_class: JournalRedactionClass::PersistableLocalOnly,
                     privacy_class: PrivacyClass::LocalOnly,
+                    payload: SemanticJournalPayload::Question {
+                        question_id: match &content.payload {
+                            NativeJournalPayload::Question { question_id, .. } => {
+                                question_id.clone()
+                            }
+                            _ => unreachable!("question payload kind already classified"),
+                        },
+                        prompt: prompt.clone(),
+                        options: match &content.payload {
+                            NativeJournalPayload::Question { options, .. } => options.clone(),
+                            _ => unreachable!("question payload kind already classified"),
+                        },
+                    },
                 }
             }
         }
@@ -2270,6 +2687,22 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
                     text: None,
                     redaction_class: JournalRedactionClass::PersistableLocalOnly,
                     privacy_class: PrivacyClass::LocalOnly,
+                    payload: match &content.payload {
+                        NativeJournalPayload::ApprovalRequest {
+                            request_id,
+                            summary,
+                        } => SemanticJournalPayload::ApprovalRequest {
+                            request_id: request_id.clone(),
+                            summary: summary.clone(),
+                        },
+                        NativeJournalPayload::Error { code, message } => {
+                            SemanticJournalPayload::Error {
+                                code: code.clone(),
+                                message: message.clone(),
+                            }
+                        }
+                        _ => unreachable!("summary payload kind already classified"),
+                    },
                 }
             }
         }
@@ -2278,24 +2711,64 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::LocalOnly,
+            payload: match &content.payload {
+                NativeJournalPayload::ApprovalResult {
+                    request_id,
+                    decision,
+                } => SemanticJournalPayload::ApprovalResult {
+                    request_id: request_id.clone(),
+                    decision: decision.clone(),
+                },
+                _ => unreachable!("approval result kind already classified"),
+            },
         },
         NativeJournalPayload::ToolCall { .. } => Classified::Semantic {
             kind: JournalSemanticKind::ToolCall,
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::ToolCall { tool_name, call_id } => {
+                    SemanticJournalPayload::ToolCall {
+                        tool_name: tool_name.clone(),
+                        call_id: call_id.clone(),
+                    }
+                }
+                _ => unreachable!("tool call kind already classified"),
+            },
         },
         NativeJournalPayload::ToolResult { .. } => Classified::Semantic {
             kind: JournalSemanticKind::ToolResult,
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::ToolResult { call_id, status } => {
+                    SemanticJournalPayload::ToolResult {
+                        call_id: call_id.clone(),
+                        status: status.clone(),
+                    }
+                }
+                _ => unreachable!("tool result kind already classified"),
+            },
         },
         NativeJournalPayload::PlanStep { .. } => Classified::Semantic {
             kind: JournalSemanticKind::PlanStep,
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::PlanStep {
+                    step_id,
+                    title,
+                    status,
+                } => SemanticJournalPayload::PlanStep {
+                    step_id: step_id.clone(),
+                    title: title.clone(),
+                    status: status.clone(),
+                },
+                _ => unreachable!("plan step kind already classified"),
+            },
         },
         NativeJournalPayload::UsageObservation { remaining_percent } => {
             if remaining_percent.is_some_and(|percent| percent > 100) {
@@ -2306,6 +2779,9 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
                     text: None,
                     redaction_class: JournalRedactionClass::MetadataOnly,
                     privacy_class: PrivacyClass::Shareable,
+                    payload: SemanticJournalPayload::UsageObservation {
+                        remaining_percent: *remaining_percent,
+                    },
                 }
             }
         }
@@ -2314,18 +2790,40 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::TurnState { state } => SemanticJournalPayload::TurnState {
+                    state: format!("{state:?}").to_lowercase(),
+                },
+                _ => unreachable!("turn state kind already classified"),
+            },
         },
         NativeJournalPayload::SessionState { .. } => Classified::Semantic {
             kind: JournalSemanticKind::SessionState,
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::SessionState { state } => {
+                    SemanticJournalPayload::SessionState {
+                        state: format!("{state:?}").to_lowercase(),
+                    }
+                }
+                _ => unreachable!("session state kind already classified"),
+            },
         },
         NativeJournalPayload::ArtifactReference { .. } => Classified::Semantic {
             kind: JournalSemanticKind::ArtifactReference,
             text: None,
             redaction_class: JournalRedactionClass::MetadataOnly,
             privacy_class: PrivacyClass::Shareable,
+            payload: match &content.payload {
+                NativeJournalPayload::ArtifactReference { label } => {
+                    SemanticJournalPayload::ArtifactReference {
+                        label: label.clone(),
+                    }
+                }
+                _ => unreachable!("artifact reference kind already classified"),
+            },
         },
     }
 }

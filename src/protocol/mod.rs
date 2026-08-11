@@ -28,7 +28,7 @@ pub use stream::{StreamFrame, StreamKey, StreamPayloadKind};
 
 /// Journal pages use the same bounded MessagePack codec as other protocol
 /// documents. Raw provider payloads are never a protocol page field.
-pub use crate::domain::{SemanticJournalFact, SemanticJournalPage};
+pub use crate::domain::{SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload};
 
 /// Host/protocol journal query is capability-unavailable until a later task
 /// wires `Query`/`ServerMessage` and a kernel subscription. A type re-export

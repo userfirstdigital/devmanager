@@ -47,8 +47,9 @@ pub use resource::{
 };
 pub use snapshot::{
     ArtifactContentPage, EventPage, PageLimits, PageLimitsError, SemanticJournalFact,
-    SemanticJournalPage, SnapshotItem, SnapshotItemKey, SnapshotPage, SnapshotSection,
-    TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS,
+    SemanticJournalPage, SemanticJournalPayload, SnapshotItem, SnapshotItemKey, SnapshotPage,
+    SnapshotSection, TaskSnapshot, TaskSnapshotItem, MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+    MAX_SNAPSHOT_PAGE_ITEMS,
 };
 pub use task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,

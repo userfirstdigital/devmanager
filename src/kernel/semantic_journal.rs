@@ -6,10 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::domain::EventId;
-use crate::domain::MAX_SNAPSHOT_PAGE_ITEMS;
 use crate::kernel::StoreError;
 
-const MAX_JOURNAL_PAGE_LIMIT: u32 = MAX_SNAPSHOT_PAGE_ITEMS.saturating_add(1);
+const MAX_JOURNAL_EVENTS: usize = 4_096;
+const MAX_JOURNAL_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JOURNAL_TEXT_FIELD_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticJournalAuthorityRecord {
@@ -63,6 +64,7 @@ pub(crate) enum SemanticJournalWrite {
     EventCapacity,
     DedupeCapacity,
     SequenceOverflow,
+    TimestampRegression,
 }
 
 const ALLOWED_PROVIDER_KINDS: &[&str] = &["claude_code", "codex", "cursor"];
@@ -214,41 +216,61 @@ pub(crate) fn high_water(
     conn: &Connection,
     digest: &[u8; 32],
 ) -> Result<(u64, Option<i64>), StoreError> {
-    let row: (i64, Option<i64>, Option<i64>) = conn.query_row(
-        "SELECT COUNT(*), MAX(sequence), MAX(occurred_at_ms)
-         FROM semantic_journal_facts
-         WHERE authority_digest = ?1",
-        [digest.as_slice()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    let count = u64::try_from(row.0).map_err(|_| StoreError::Corruption)?;
-    let next = match row.1 {
-        None if count == 0 => 1,
-        None => return Err(StoreError::Corruption),
-        Some(max) => {
-            let max = u64::try_from(max).map_err(|_| StoreError::Corruption)?;
-            if max == 0 || max != count {
-                return Err(StoreError::Corruption);
-            }
-            max.checked_add(1).ok_or(StoreError::IntegerOutOfRange {
-                field: "semantic_journal.sequence",
-                value: u64::MAX,
-            })?
-        }
+    let (count, last_occurred_at_ms) = validate_facts(conn, digest)?;
+    let next = if count == 0 {
+        1
+    } else {
+        count.checked_add(1).ok_or(StoreError::IntegerOutOfRange {
+            field: "semantic_journal.sequence",
+            value: u64::MAX,
+        })?
     };
-    Ok((next, row.2))
+    Ok((next, last_occurred_at_ms))
 }
 
 pub(crate) fn retained_len(conn: &Connection, digest: &[u8; 32]) -> Result<usize, StoreError> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM semantic_journal_facts WHERE authority_digest = ?1",
-        [digest.as_slice()],
-        |row| row.get(0),
-    )?;
+    let (count, _) = validate_facts(conn, digest)?;
     usize::try_from(count).map_err(|_| StoreError::IntegerOutOfRange {
         field: "semantic_journal.count",
         value: u64::MAX,
     })
+}
+
+/// Validate every durable fact's bounded envelope before exposing its count or
+/// allowing another write. This is intentionally a row scan rather than an
+/// aggregate: SQLite constraints protect shape, while this check protects the
+/// application-level identity, sequence, and payload invariants after an
+/// already-open handle observes an external mutation.
+fn validate_facts(conn: &Connection, digest: &[u8; 32]) -> Result<(u64, Option<i64>), StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
+                kind, visibility, privacy_class, redaction_class, occurred_at_ms,
+                ingested_at_ms, schema_version, payload
+         FROM semantic_journal_facts
+         WHERE authority_digest = ?1
+         ORDER BY sequence ASC",
+    )?;
+    let mut rows = stmt.query([digest.as_slice()])?;
+    let mut expected_sequence = 1_i64;
+    let mut count = 0_u64;
+    let mut last_occurred_at_ms: Option<i64> = None;
+    while let Some(row) = rows.next()? {
+        count = count.checked_add(1).ok_or(StoreError::Corruption)?;
+        if count > MAX_JOURNAL_EVENTS as u64 {
+            return Err(StoreError::Corruption);
+        }
+        let fact = finalize_fact(map_raw_fact(row)?)?;
+        if fact.sequence != expected_sequence {
+            return Err(StoreError::Corruption);
+        }
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(StoreError::Corruption)?;
+        last_occurred_at_ms = Some(
+            last_occurred_at_ms.map_or(fact.occurred_at_ms, |last| last.max(fact.occurred_at_ms)),
+        );
+    }
+    Ok((count, last_occurred_at_ms))
 }
 
 pub(crate) fn lookup_delivery(
@@ -295,17 +317,22 @@ pub(crate) fn write_fact(
     max_events: u32,
     max_dedupe_keys: u32,
 ) -> Result<SemanticJournalWrite, StoreError> {
-    // Validate the persisted sequence before any dedupe fast path. A corrupted
-    // journal must not become writable merely because the incoming delivery
-    // happens to repeat an existing key.
-    let (next_sequence, _) = high_water(tx, digest)?;
-    if let Some(hit) = lookup_delivery(tx, digest, delivery_id)? {
+    // Dedupe is deliberately the first operation in the IMMEDIATE transaction:
+    // an older retry of an already committed delivery is a duplicate, not a
+    // timestamp regression. The high-water/timestamp check below therefore
+    // observes the same pinned write view as the eventual insert.
+    let delivery_hit = lookup_delivery(tx, digest, delivery_id)?;
+    let provider_hit = if let Some(provider_event_id) = provider_event_id {
+        lookup_provider_event(tx, digest, provider_event_id)?
+    } else {
+        None
+    };
+    let (next_sequence, last_occurred_at_ms) = high_water(tx, digest)?;
+    if let Some(hit) = delivery_hit.or(provider_hit) {
         return Ok(classify_hit(hit, payload_hash));
     }
-    if let Some(provider_event_id) = provider_event_id {
-        if let Some(hit) = lookup_provider_event(tx, digest, provider_event_id)? {
-            return Ok(classify_hit(hit, payload_hash));
-        }
+    if last_occurred_at_ms.is_some_and(|last| row.occurred_at_ms < last) {
+        return Ok(SemanticJournalWrite::TimestampRegression);
     }
     let retained = retained_len(tx, digest)?;
     if retained as u32 >= max_events {
@@ -392,53 +419,38 @@ pub(crate) fn load_fact(
     .and_then(|row| row.map(finalize_fact).transpose())
 }
 
-pub(crate) fn load_page(
-    conn: &Connection,
+/// Stream facts from one pinned read transaction. The caller receives one
+/// bounded, finalized row at a time and may return `false` to stop fetching;
+/// no page-sized `Vec` is built by the kernel.
+pub(crate) fn stream_page(
+    tx: &Transaction<'_>,
     digest: &[u8; 32],
     after_sequence: i64,
-    limit: u32,
-) -> Result<Vec<SemanticJournalFactRow>, StoreError> {
-    if limit == 0 || limit > MAX_JOURNAL_PAGE_LIMIT {
-        return Err(StoreError::IntegerOutOfRange {
-            field: "semantic_journal.page_limit",
-            value: u64::from(limit),
-        });
-    }
-    let capacity = usize::try_from(limit).map_err(|_| StoreError::IntegerOutOfRange {
-        field: "semantic_journal.page_limit",
-        value: u64::from(limit),
-    })?;
-    let mut stmt = conn.prepare(
+    high_water: i64,
+    mut visit: impl FnMut(SemanticJournalFactRow) -> Result<bool, StoreError>,
+) -> Result<(), StoreError> {
+    let mut stmt = tx.prepare(
         "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
                 kind, visibility, privacy_class, redaction_class, occurred_at_ms,
                 ingested_at_ms, schema_version, payload
          FROM semantic_journal_facts
          WHERE authority_digest = ?1
            AND sequence > ?2
-           AND sequence <= (
-                SELECT COALESCE(MAX(sequence), 0)
-                FROM semantic_journal_facts
-                WHERE authority_digest = ?1
-           )
-         ORDER BY sequence ASC
-         LIMIT ?3",
+           AND sequence <= ?3
+         ORDER BY sequence ASC",
     )?;
     let mut rows = stmt.query(rusqlite::params![
         digest.as_slice(),
         after_sequence,
-        i64::from(limit),
+        high_water,
     ])?;
-    let mut facts = Vec::with_capacity(capacity);
     while let Some(row) = rows.next()? {
-        if facts.len() >= capacity {
-            return Err(StoreError::IntegerOutOfRange {
-                field: "semantic_journal.page_limit",
-                value: u64::from(limit),
-            });
+        let fact = finalize_fact(map_raw_fact(row)?)?;
+        if !visit(fact)? {
+            break;
         }
-        facts.push(finalize_fact(map_raw_fact(row)?)?);
     }
-    Ok(facts)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -525,6 +537,23 @@ fn map_raw_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawFact> {
 }
 
 fn finalize_fact(raw: RawFact) -> Result<SemanticJournalFactRow, StoreError> {
+    if raw.sequence <= 0
+        || raw.occurred_at_ms < 0
+        || raw.ingested_at_ms < 0
+        || raw.schema_version <= 0
+        || raw.payload.is_empty()
+        || raw.payload.len() > MAX_JOURNAL_PAYLOAD_BYTES
+    {
+        return Err(StoreError::Corruption);
+    }
+    validate_text_field(&raw.delivery_id)?;
+    if let Some(provider_event_id) = &raw.provider_event_id {
+        validate_text_field(provider_event_id)?;
+    }
+    validate_text_field(&raw.kind)?;
+    validate_text_field(&raw.visibility)?;
+    validate_text_field(&raw.privacy_class)?;
+    validate_text_field(&raw.redaction_class)?;
     let event_id = exact16(raw.event_id)?;
     EventId::from_bytes(event_id).map_err(|_| StoreError::Corruption)?;
     Ok(SemanticJournalFactRow {
@@ -542,6 +571,16 @@ fn finalize_fact(raw: RawFact) -> Result<SemanticJournalFactRow, StoreError> {
         schema_version: raw.schema_version,
         payload: raw.payload,
     })
+}
+
+fn validate_text_field(value: &str) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > MAX_JOURNAL_TEXT_FIELD_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 pub(crate) fn exact16(bytes: Vec<u8>) -> Result<[u8; 16], StoreError> {

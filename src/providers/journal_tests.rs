@@ -25,6 +25,22 @@ fn load_bytes(name: &str) -> Vec<u8> {
     std::fs::read(fixture_path(name)).expect("read journal fixture")
 }
 
+fn fixture_at(name: &str, occurred_at_ms: i64) -> Vec<u8> {
+    let mut body = String::from_utf8(load_bytes(name)).expect("fixture utf8");
+    let marker = "\"occurred_at_ms\":";
+    let marker_start = body.find(marker).expect("timestamp marker") + marker.len();
+    let start = marker_start
+        + body[marker_start..]
+            .find(|ch: char| !ch.is_whitespace())
+            .expect("timestamp value");
+    let end = body[start..]
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+        .map(|offset| start + offset)
+        .expect("timestamp terminator");
+    body.replace_range(start..end, &occurred_at_ms.to_string());
+    body.into_bytes()
+}
+
 fn ids() -> (TaskId, AgentSessionId, ResourceId) {
     (
         TaskId::parse("018f60b0-9c1a-7001-8000-00000000000b").expect("task"),
@@ -153,6 +169,14 @@ fn journal_normalizes_claude_codex_cursor_content_fixtures_with_trusted_permit()
         tool.accepted().expect("tool").kind(),
         JournalSemanticKind::ToolCall
     );
+    let tool_event = tool.accepted().expect("tool event");
+    assert!(matches!(
+        tool_event.to_snapshot_fact().payload,
+        SemanticJournalPayload::ToolCall {
+            tool_name,
+            call_id
+        } if tool_name == "Read" && call_id == "toolu_claude_1"
+    ));
     assert_eq!(
         assistant.accepted().expect("asst").kind(),
         JournalSemanticKind::AssistantText
@@ -223,7 +247,7 @@ fn journal_malformed_after_foreign_permit_stays_on_delivery_binding() {
         ),
         "foreign permit must fail closed, got {outcome:?}"
     );
-    assert_eq!(journal.retained_len(), 1);
+    assert_eq!(journal.retained_len().expect("retained"), 1);
     let kept = journal.event_at(1).expect("load").expect("first event");
     assert_eq!(kept.task_id(), task);
     assert_ne!(kept.delivery_id(), "relay_foreign_malformed");
@@ -258,6 +282,45 @@ fn journal_malformed_with_trusted_permit_is_delivery_scoped_diagnostic() {
 }
 
 #[test]
+fn journal_future_diagnostic_retains_schema_source_and_provider_metadata() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let body = br#"{"schema_version":99,"source_type":"future.hook.v9","payload":{"kind":"new_semantic"}}"#;
+    let event = journal
+        .ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_future_schema"),
+            body,
+            NOW_MS,
+        )
+        .quarantined()
+        .expect("future diagnostic");
+    let unknown = event.unknown_provider_event().expect("unknown metadata");
+    assert_eq!(unknown.provider(), ProviderKind::ClaudeCode);
+    assert_eq!(unknown.source_type(), "future.hook.v9");
+    assert_eq!(unknown.schema_version(), 99);
+    let restored = journal
+        .event_at(event.sequence())
+        .expect("restore")
+        .expect("event");
+    assert_eq!(
+        restored
+            .unknown_provider_event()
+            .expect("unknown")
+            .schema_version(),
+        99
+    );
+    let page = journal
+        .projected_page(0, None, PageLimits::new(8, 8 * 1024).expect("limits"))
+        .expect("page");
+    assert!(matches!(
+        page.facts[0].payload,
+        SemanticJournalPayload::Unknown {
+            schema_version: 99,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn journal_forged_identity_in_payload_fails_closed() {
     let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
     let outcome = journal.ingest(
@@ -272,7 +335,7 @@ fn journal_forged_identity_in_payload_fails_closed() {
         ),
         "payload must not stamp authority, got {outcome:?}"
     );
-    assert_eq!(journal.retained_len(), 0);
+    assert_eq!(journal.retained_len().expect("retained"), 0);
 }
 
 #[test]
@@ -404,6 +467,57 @@ fn journal_same_native_id_different_payload_is_conflict() {
 }
 
 #[test]
+fn journal_older_duplicate_retries_before_timestamp_regression() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let first_outcome = journal.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_old_duplicate"),
+        &fixture_at("claude_user_message.json", 1_725_000_001_800),
+        NOW_MS,
+    );
+    let first = first_outcome
+        .accepted()
+        .unwrap_or_else(|| panic!("first outcome: {first_outcome:?}"));
+    let newer = journal.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_newer_event"),
+        &fixture_at("claude_tool_call.json", 1_725_000_001_900),
+        NOW_MS,
+    );
+    assert!(newer.accepted().is_some(), "newer outcome: {newer:?}");
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_old_duplicate"),
+            &fixture_at("claude_user_message.json", 1_725_000_001_800),
+            NOW_MS,
+        ),
+        JournalIngestOutcome::Duplicate { existing_id } if existing_id == first.id()
+    ));
+}
+
+#[test]
+fn journal_two_handles_reject_new_older_timestamp_in_write_transaction() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("kernel.sqlite3");
+    let mut first = open_on(&path, ProviderKind::ClaudeCode);
+    let mut second = open_on(&path, ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut first,
+        ProviderKind::ClaudeCode,
+        "relay_timestamp_200",
+        "claude_user_message.json",
+    );
+    let outcome = second.ingest(
+        test_permit(ProviderKind::ClaudeCode, "relay_timestamp_100"),
+        &fixture_at("claude_tool_call.json", 1_725_000_000_900),
+        NOW_MS,
+    );
+    assert!(matches!(
+        outcome,
+        JournalIngestOutcome::Rejected(JournalRejectReason::TimestampRegression)
+    ));
+    assert_eq!(second.retained_len().expect("retained"), 1);
+}
+
+#[test]
 fn journal_crash_before_commit_then_reopen_uses_new_sqlite_connection() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kernel.sqlite3");
@@ -419,7 +533,7 @@ fn journal_crash_before_commit_then_reopen_uses_new_sqlite_connection() {
     drop(journal);
 
     let reopened = open_on(&path, ProviderKind::ClaudeCode);
-    assert_eq!(reopened.retained_len(), 0);
+    assert_eq!(reopened.retained_len().expect("retained"), 0);
     drop(reopened);
 
     let mut journal = open_on(&path, ProviderKind::ClaudeCode);
@@ -478,7 +592,25 @@ fn journal_draft_cannot_commit_into_another_journal() {
         ),
         "same-authority draft must not commit across store instances, got {outcome:?}"
     );
-    assert_eq!(journal_b.retained_len(), 0);
+    assert_eq!(journal_b.retained_len().expect("retained"), 0);
+}
+
+#[test]
+fn journal_auth_seal_covers_delivery_and_semantic_fields() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let mut draft = journal
+        .propose(
+            test_permit(ProviderKind::ClaudeCode, "relay_mac_binding"),
+            &load_bytes("claude_user_message.json"),
+            NOW_MS,
+        )
+        .expect("draft");
+    draft.event.delivery_id = RelayDeliveryId::new("relay_mac_mutated").expect("delivery");
+    assert!(matches!(
+        journal.commit(draft),
+        JournalIngestOutcome::Rejected(JournalRejectReason::Foreign)
+    ));
+    assert_eq!(journal.retained_len().expect("retained"), 0);
 }
 
 #[test]
@@ -501,7 +633,7 @@ fn journal_does_not_dedupe_by_content_or_timestamp() {
     .accepted()
     .expect("second");
     assert_ne!(first.id(), second.id());
-    assert_eq!(journal.retained_len(), 2);
+    assert_eq!(journal.retained_len().expect("retained"), 2);
 }
 
 #[test]
@@ -752,7 +884,7 @@ fn journal_rejects_16mib_cap_plus_one_nesting_duplicate_keys_and_wide_arrays() {
         ),
         JournalIngestOutcome::Rejected(JournalRejectReason::InvalidEnvelope)
     ));
-    assert_eq!(journal.retained_len(), 0);
+    assert_eq!(journal.retained_len().expect("retained"), 0);
 }
 
 #[test]
@@ -794,8 +926,8 @@ fn journal_returns_backpressure_before_100k_retained_events() {
         }
     }
     assert!(saw_backpressure);
-    assert!(journal.retained_len() <= 8);
-    assert!(journal.retained_len() < 100_000);
+    assert!(journal.retained_len().expect("retained") <= 8);
+    assert!(journal.retained_len().expect("retained") < 100_000);
 }
 
 #[test]
@@ -888,6 +1020,8 @@ fn journal_pages_replay_by_durable_sequence_and_canonical_bytes() {
         assert!(under.facts.len() < first.facts.len());
         assert!(under_bytes.len() <= usize::try_from(first.encoded_bytes - 1).unwrap());
         assert_eq!(under.encoded_bytes as usize, under_bytes.len());
+        assert_eq!(under.through_sequence, 0);
+        assert_eq!(under.next_sequence, Some(1));
     }
     let second = journal
         .projected_page(
@@ -990,7 +1124,7 @@ fn journal_same_file_reopen_commits_pre_reopen_draft() {
         matches!(outcome, JournalIngestOutcome::Accepted(_)),
         "persisted store identity must survive reopen, got {outcome:?}"
     );
-    assert_eq!(reopened.retained_len(), 1);
+    assert_eq!(reopened.retained_len().expect("retained"), 1);
 }
 
 #[test]
@@ -1009,7 +1143,7 @@ fn journal_unicode_escaped_forged_root_key_fails_closed() {
         ),
         "unicode-escaped root key must be forged identity, got {outcome:?}"
     );
-    assert_eq!(journal.retained_len(), 0);
+    assert_eq!(journal.retained_len().expect("retained"), 0);
 }
 
 #[test]
@@ -1044,6 +1178,37 @@ fn journal_corrupt_identity_blob_fails_closed() {
 }
 
 #[test]
+fn journal_post_open_corrupt_row_surfaces_retained_error_before_next_write() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_corrupt_after_open",
+        "claude_user_message.json",
+    );
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts SET event_id = zeroblob(16) WHERE sequence = 1",
+        [],
+    )
+    .expect("corrupt row");
+    drop(conn);
+
+    assert!(matches!(
+        journal.retained_len(),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_after_corrupt_row"),
+            &load_bytes("claude_tool_call.json"),
+            NOW_MS,
+        ),
+        JournalIngestOutcome::NeedsResync
+    ));
+}
+
+#[test]
 fn journal_restore_rejects_unbounded_unknown_metadata() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kernel.sqlite3");
@@ -1062,8 +1227,15 @@ fn journal_restore_rejects_unbounded_unknown_metadata() {
         text: None,
         extensions: BTreeMap::new(),
         unknown_source_type: Some("x".repeat(MAX_SOURCE_TYPE_BYTES + 1)),
+        unknown_schema_version: Some(JOURNAL_SCHEMA_VERSION),
         unknown_diagnostic_ref: Some("0".repeat(64)),
         provider_event_id: Some("claude_evt_unknown_1".into()),
+        payload: SemanticJournalPayload::Unknown {
+            provider: "claude_code".into(),
+            source_type: "x".repeat(MAX_SOURCE_TYPE_BYTES + 1),
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            diagnostic_ref: "0".repeat(64),
+        },
     };
     let payload = rmp_serde::to_vec_named(&body).expect("encode corrupt body");
     conn.execute(
@@ -1175,13 +1347,63 @@ fn journal_never_persists_never_persist_text() {
         text: Some("NEVER_PERSIST_SECRET".into()),
         extensions: BTreeMap::new(),
         unknown: None,
+        payload: SemanticJournalPayload::UserMessage {
+            text: "NEVER_PERSIST_SECRET".into(),
+        },
         payload_hash: [0x44; 32],
     };
-    let row = persist_row(&event).expect("persist");
-    let body: PersistedJournalBody =
-        rmp_serde::from_slice(&row.payload).expect("decode persisted body");
-    assert!(body.text.is_none());
+    assert!(persist_row(&event).expect("persist").is_none());
     assert!(event.projected_text().is_none());
+}
+
+#[test]
+fn journal_never_persist_is_ignored_without_receipt_or_projection() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let event = JournalEvent {
+        id: EventId::new(),
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        provider: ProviderKind::ClaudeCode,
+        provider_event_id: None,
+        delivery_id: RelayDeliveryId::new("relay_never_commit").expect("delivery"),
+        task_id: ids().0,
+        agent_session_id: ids().1,
+        resource_id: ids().2,
+        runtime_generation: 1,
+        action_epoch: 1,
+        sequence: 1,
+        kind: JournalSemanticKind::UserMessage,
+        occurred_at_ms: NOW_MS,
+        ingested_at_ms: NOW_MS,
+        visibility: JournalVisibility::Semantic,
+        redaction_class: JournalRedactionClass::NeverPersist,
+        privacy_class: PrivacyClass::LocalOnly,
+        text: Some("secret".into()),
+        extensions: BTreeMap::new(),
+        unknown: None,
+        payload: SemanticJournalPayload::UserMessage {
+            text: "secret".into(),
+        },
+        payload_hash: [0x55; 32],
+    };
+    let draft = JournalDraft::sealed(
+        event,
+        &journal.instance_secret,
+        &journal.authority,
+        journal.authority_digest,
+        [0x33; 16],
+        NOW_MS - 1_000,
+        NOW_MS + 60_000,
+        journal.store_id,
+    );
+    assert!(matches!(
+        journal.commit(draft),
+        JournalIngestOutcome::IgnoredNeverPersist
+    ));
+    assert_eq!(journal.retained_len().expect("retained"), 0);
+    let page = journal
+        .projected_page(0, None, PageLimits::new(8, 8 * 1024).expect("limits"))
+        .expect("empty projection");
+    assert!(page.facts.is_empty());
 }
 
 #[test]

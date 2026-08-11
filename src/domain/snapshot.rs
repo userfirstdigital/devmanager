@@ -57,6 +57,70 @@ pub enum SnapshotSection {
 pub const MAX_SNAPSHOT_PAGE_ITEMS: u32 = 1_000;
 pub const MAX_SNAPSHOT_PAGE_ENCODED_BYTES: u32 = 512 * 1024;
 
+/// Provider-neutral, bounded semantic payload retained by the journal. Raw
+/// provider envelopes and terminal bytes are deliberately not represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SemanticJournalPayload {
+    UserMessage {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    ReasoningSummary {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        call_id: String,
+    },
+    ToolResult {
+        call_id: String,
+        status: String,
+    },
+    ApprovalRequest {
+        request_id: String,
+        summary: String,
+    },
+    ApprovalResult {
+        request_id: String,
+        decision: String,
+    },
+    Question {
+        question_id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
+    PlanStep {
+        step_id: String,
+        title: String,
+        status: String,
+    },
+    UsageObservation {
+        remaining_percent: Option<u8>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    TurnState {
+        state: String,
+    },
+    SessionState {
+        state: String,
+    },
+    ArtifactReference {
+        label: String,
+    },
+    Unknown {
+        provider: String,
+        source_type: String,
+        schema_version: u32,
+        diagnostic_ref: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageLimitsError {
     ZeroItems,
@@ -204,10 +268,13 @@ pub struct SnapshotPage {
 pub struct SemanticJournalFact {
     pub id: EventId,
     pub sequence: u64,
+    pub provider: String,
+    pub schema_version: u32,
     pub kind: String,
     pub visibility: String,
     pub privacy_class: PrivacyClass,
     pub redacted: bool,
+    pub payload: SemanticJournalPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
