@@ -28,12 +28,14 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+$targetRoot = [IO.Path]::GetFullPath($TargetDir)
+$TargetRunDir = Join-Path $targetRoot "run-$runToken"
+New-Item -ItemType Directory -Force -Path $TargetRunDir | Out-Null
 
 $oldTargetDir = $env:CARGO_TARGET_DIR
 $oldBuildJobs = $env:CARGO_BUILD_JOBS
 try {
-    $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($TargetDir)
+    $env:CARGO_TARGET_DIR = $TargetRunDir
     $env:CARGO_BUILD_JOBS = '1'
 
     & cargo build --locked --offline --bin devmanager-next --target-dir $env:CARGO_TARGET_DIR
@@ -65,6 +67,7 @@ try {
     $densities = @('compact', 'comfortable')
     $scales = if ($AllScales) { @(100, 125, 150, 200) } else { @(100) }
     $manifest = [System.Collections.Generic.List[object]]::new()
+    $captureFailures = 0
 
     if ($AutomateWindowStates) {
         Add-Type @'
@@ -77,46 +80,120 @@ public static class DevManagerPreviewWindow {
 '@
     }
 
+    function Get-PngDimensions {
+        param([string]$Path)
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 24) {
+            throw 'PNG is shorter than its signature and IHDR.'
+        }
+        $signature = [byte[]](137, 80, 78, 71, 13, 10, 26, 10)
+        for ($index = 0; $index -lt $signature.Length; $index++) {
+            if ($bytes[$index] -ne $signature[$index]) {
+                throw 'PNG signature is invalid.'
+            }
+        }
+        $chunkType = [Text.Encoding]::ASCII.GetString($bytes, 12, 4)
+        if ($chunkType -ne 'IHDR') {
+            throw 'PNG first chunk is not IHDR.'
+        }
+        $width = ([uint32]$bytes[16] -shl 24) -bor
+            ([uint32]$bytes[17] -shl 16) -bor
+            ([uint32]$bytes[18] -shl 8) -bor [uint32]$bytes[19]
+        $height = ([uint32]$bytes[20] -shl 24) -bor
+            ([uint32]$bytes[21] -shl 16) -bor
+            ([uint32]$bytes[22] -shl 8) -bor [uint32]$bytes[23]
+        [pscustomobject]@{ Width = [uint32]$width; Height = [uint32]$height }
+    }
+
+    function Remove-CaptureOutputBestEffort {
+        param([string]$Path)
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            }
+            return $null
+        } catch {
+            return $_.Exception.Message
+        }
+    }
+
     function Invoke-WindowStateProbe {
         param(
             [string]$State,
             [string[]]$Arguments,
             [string]$OutputPath
         )
-        $probe = Start-Process -FilePath $binary -ArgumentList $Arguments -PassThru -WindowStyle Normal
+        $probe = $null
         $window = $null
-        $probeDeadline = [DateTime]::UtcNow.AddSeconds(2)
-        while ([DateTime]::UtcNow -lt $probeDeadline -and -not $probe.HasExited) {
-            Start-Sleep -Milliseconds 25
-            $probe.Refresh()
-            if ($probe.MainWindowHandle -ne 0) {
-                $window = [IntPtr]$probe.MainWindowHandle
-                break
+        $exitCode = $null
+        $failure = $null
+        $joined = $false
+        $outcome = 'probe-failed'
+        $holdEvidence = 'probe-lifecycle-failed'
+        try {
+            $probe = Start-Process -FilePath $binary -ArgumentList $Arguments -PassThru -WindowStyle Normal
+            $probeDeadline = [DateTime]::UtcNow.AddSeconds(2)
+            while ([DateTime]::UtcNow -lt $probeDeadline -and -not $probe.HasExited) {
+                Start-Sleep -Milliseconds 25
+                $probe.Refresh()
+                if ($probe.MainWindowHandle -ne 0) {
+                    $window = [IntPtr]$probe.MainWindowHandle
+                    break
+                }
+            }
+            if ($null -eq $window) {
+                throw "isolated $State window did not become discoverable"
+            }
+            if ($State -eq 'minimized') {
+                [DevManagerPreviewWindow]::ShowWindow($window, 6) | Out-Null
+            } elseif ($State -eq 'closed') {
+                [DevManagerPreviewWindow]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+            }
+            $joined = $probe.WaitForExit(4000)
+            if (-not $joined) {
+                try { $probe.Kill($true) } catch { }
+                $joined = $probe.WaitForExit(1000)
+                if (-not $joined) {
+                    $holdEvidence = 'process-join-timeout-after-kill'
+                    throw "isolated $State probe could not be joined within its bounded wait"
+                }
+                throw "isolated $State probe exceeded its bounded wait and required a bounded kill"
+            }
+            $exitCode = $probe.ExitCode
+            if ($exitCode -eq 0) {
+                throw "isolated $State probe unexpectedly published a frame"
+            }
+            if (Test-Path -LiteralPath $OutputPath) {
+                throw "isolated $State probe left an output after an unavailable window state"
+            }
+            $outcome = 'rejected'
+            $holdEvidence = 'output-absent-after-state-transition'
+        } catch {
+            $failure = $_.Exception.Message
+        } finally {
+            if ($null -ne $probe) {
+                try { $probe.Refresh() } catch { }
+                if (-not $probe.HasExited) {
+                    try { $probe.Kill($true) } catch { }
+                    try { $joined = $probe.WaitForExit(1000) } catch { }
+                }
+                $probe.Dispose()
             }
         }
-        if ($null -eq $window) {
-            try { $probe.Kill() } catch { }
-            throw "isolated $State window did not become discoverable"
-        }
-        if ($State -eq 'minimized') {
-            [DevManagerPreviewWindow]::ShowWindow($window, 6) | Out-Null
-        } elseif ($State -eq 'closed') {
-            [DevManagerPreviewWindow]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-        }
-        $probe.WaitForExit(4000) | Out-Null
-        if ($probe.ExitCode -eq 0) {
-            throw "isolated $State probe unexpectedly published a frame"
-        }
-        if (Test-Path -LiteralPath $OutputPath) {
-            throw "isolated $State probe left an output after an unavailable window state"
-        }
-        return [pscustomobject]@{
+        [pscustomobject]@{
             Fixture = 'component-gallery'
-            Page = "automated-$State-rejected"
+            Page = "automated-$State-$outcome"
             ScaleMode = 'window-state-automation'
+            Outcome = $outcome
+            HoldEvidence = $holdEvidence
+            Error = $failure
+            ExitCode = $exitCode
+            JoinState = if ($joined) { 'joined' } else { 'join-unconfirmed' }
             Bytes = 0
-            Width = 640
-            Height = 360
+            Width = 0
+            Height = 0
+            ExpectedWidth = 640
+            ExpectedHeight = 360
         }
     }
 
@@ -180,34 +257,93 @@ public static class DevManagerPreviewWindow {
                 if ($exitCode -eq 0) { break }
                 $attempt++
                 if ($attempt -lt 3) {
-                    if (Test-Path -LiteralPath $output) {
-                        Remove-Item -LiteralPath $output -Force
-                    }
+                    [void](Remove-CaptureOutputBestEffort -Path $output)
                     Start-Sleep -Milliseconds 150
                 }
             } while ($attempt -lt 3)
             if ($exitCode -ne 0) {
-                throw "isolated preview failed for fixture $baseName page $suffix (exit $exitCode)"
+                $cleanupError = Remove-CaptureOutputBestEffort -Path $output
+                $holdEvidence = if ($null -eq $cleanupError) {
+                    'output-not-published-after-capture-failure'
+                } else {
+                    'capture-failed-output-cleanup-unconfirmed'
+                }
+                $failureError = "isolated preview failed with exit $exitCode"
+                if ($null -ne $cleanupError) {
+                    $failureError = "$failureError; output cleanup failed: $cleanupError"
+                }
+                $captureFailures++
+                [void]$manifest.Add([pscustomobject]@{
+                    Fixture = $baseName
+                    Page = $suffix
+                    ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
+                    Outcome = 'capture-failed'
+                    HoldEvidence = $holdEvidence
+                    Error = $failureError
+                    Bytes = 0
+                    Width = 0
+                    Height = 0
+                    ExpectedWidth = 640
+                    ExpectedHeight = 360
+                })
+                continue
             }
-            $image = Get-Item -LiteralPath $output -ErrorAction Stop
-            if ($image.Length -le 0) {
-                throw "isolated preview produced an empty PNG for page $suffix"
+            try {
+                $image = Get-Item -LiteralPath $output -ErrorAction Stop
+                if ($image.Length -le 0) {
+                    throw "isolated preview produced an empty PNG for page $suffix"
+                }
+                $dimensions = Get-PngDimensions -Path $output
+                if ($dimensions.Width -ne 640 -or $dimensions.Height -ne 360) {
+                    throw "decoded PNG dimensions were $($dimensions.Width)x$($dimensions.Height), expected 640x360"
+                }
+                [void]$manifest.Add([pscustomobject]@{
+                    Fixture = $baseName
+                    Page = $suffix
+                    ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
+                    Outcome = 'captured'
+                    HoldEvidence = 'frame-published'
+                    Bytes = $image.Length
+                    Width = $dimensions.Width
+                    Height = $dimensions.Height
+                    ExpectedWidth = 640
+                    ExpectedHeight = 360
+                })
+            } catch {
+                try {
+                    if (Test-Path -LiteralPath $output) {
+                        Remove-Item -LiteralPath $output -Force
+                    }
+                } catch {
+                    # Keep the capture failure visible in the manifest even if
+                    # an external file lock prevents cleanup.
+                }
+                $captureFailures++
+                [void]$manifest.Add([pscustomobject]@{
+                    Fixture = $baseName
+                    Page = $suffix
+                    ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
+                    Outcome = 'capture-failed'
+                    HoldEvidence = 'output-not-published-after-png-validation-failure'
+                    Error = $_.Exception.Message
+                    Bytes = 0
+                    Width = 0
+                    Height = 0
+                    ExpectedWidth = 640
+                    ExpectedHeight = 360
+                })
             }
-            $manifest.Add([pscustomobject]@{
-                Fixture = $baseName
-                Page = $suffix
-                ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
-                Bytes = $image.Length
-                Width = 640
-                Height = 360
-            })
         }
 
         if ($AutomateWindowStates -and $isGallery) {
             foreach ($state in @('minimized', 'closed')) {
                 $probeOutput = Join-Path $OutputRoot "component-gallery-$state.png"
                 $probeArguments = @('--ui-preview', $fixtureFile.FullName, '--output', $probeOutput, '--theme', 'dark', '--density', 'compact', '--scale', '100', '--hold-ms', '800')
-                $manifest.Add((Invoke-WindowStateProbe -State $state -Arguments $probeArguments -OutputPath $probeOutput))
+                $probeResult = Invoke-WindowStateProbe -State $state -Arguments $probeArguments -OutputPath $probeOutput
+                [void]$manifest.Add($probeResult)
+                if ($probeResult.Outcome -eq 'probe-failed') {
+                    $captureFailures++
+                }
             }
         }
     }
@@ -221,9 +357,13 @@ public static class DevManagerPreviewWindow {
             Fixture = 'window-state-matrix'
             Page = 'deferred-os-dpi-100-125-150-200'
             ScaleMode = 'os-monitor-dpi-deferred'
+            Outcome = 'deferred'
+            HoldEvidence = 'disposable-vm-required-for-physical-monitor-dpi'
             Bytes = 0
-            Width = 640
-            Height = 360
+            Width = 0
+            Height = 0
+            ExpectedWidth = 640
+            ExpectedHeight = 360
         })
         # A separate VM/desktop harness is still required to put an unrelated
         # top-level window over the preview at the exact first-frame boundary.
@@ -233,14 +373,21 @@ public static class DevManagerPreviewWindow {
             Fixture = 'window-state-matrix'
             Page = 'deferred-occluded-external-desktop-race'
             ScaleMode = 'external-desktop-occlusion-deferred'
+            Outcome = 'deferred'
+            HoldEvidence = 'disposable-vm-required-for-external-occlusion-race'
             Bytes = 0
-            Width = 640
-            Height = 360
+            Width = 0
+            Height = 0
+            ExpectedWidth = 640
+            ExpectedHeight = 360
         })
     }
 
     $manifestPath = Join-Path $OutputRoot 'manifest.json'
     $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    if ($captureFailures -gt 0) {
+        throw "isolated preview capture completed with $captureFailures failure(s); see manifest HOLD evidence"
+    }
     Write-Output ("Captured {0} isolated preview page(s)." -f $manifest.Count)
     Write-Output 'Manifest and PNGs are under the process/run-unique native-next evidence root.'
 } finally {

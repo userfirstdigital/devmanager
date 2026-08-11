@@ -322,6 +322,10 @@ static CAPTURE_EXECUTOR: OnceLock<CaptureExecutor> = OnceLock::new();
 pub struct CaptureOutputAuthority {
     root_path: PathBuf,
     parent_path: PathBuf,
+    /// Lexical path from the retained root to the retained publication
+    /// parent.  The path is only an ancestry assertion; all later mutation
+    /// uses the retained/reopened directory handle below.
+    parent_relative_to_root: PathBuf,
     output_name: OsString,
     root_identity: CaptureFileIdentity,
     parent_identity: CaptureFileIdentity,
@@ -387,6 +391,7 @@ impl CaptureOutputAuthority {
             .to_os_string();
         let root_path = trusted_root.to_path_buf();
         let parent_path = parent.to_path_buf();
+        let parent_relative_to_root = verify_parent_descendant(&root_path, &parent_path)?;
         #[cfg(windows)]
         {
             let (root_handle, root_identity) = open_directory_authority(&root_path)?;
@@ -394,6 +399,7 @@ impl CaptureOutputAuthority {
             return Ok(Self {
                 root_path,
                 parent_path,
+                parent_relative_to_root,
                 output_name,
                 root_identity,
                 parent_identity,
@@ -410,6 +416,7 @@ impl CaptureOutputAuthority {
                 return Ok(Self {
                     root_path,
                     parent_path,
+                    parent_relative_to_root,
                     output_name,
                     root_identity,
                     parent_identity,
@@ -424,6 +431,7 @@ impl CaptureOutputAuthority {
                 Ok(Self {
                     root_path,
                     parent_path,
+                    parent_relative_to_root,
                     output_name,
                     root_identity,
                     parent_identity,
@@ -436,7 +444,55 @@ impl CaptureOutputAuthority {
         self.parent_path.join(&self.output_name)
     }
 
+    fn verify_parent_descendant(&self) -> Result<(), PreviewCaptureError> {
+        let relative = verify_parent_descendant(&self.root_path, &self.parent_path)?;
+        if relative != self.parent_relative_to_root {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output parent is no longer beneath its root".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_output_relative(&self) -> Result<(), PreviewCaptureError> {
+        self.remove_name_relative(&self.output_name)
+    }
+
+    fn remove_temp_relative(&self, name: &OsString) -> Result<(), PreviewCaptureError> {
+        self.remove_name_relative(name)
+    }
+
+    fn remove_name_relative(&self, name: &OsString) -> Result<(), PreviewCaptureError> {
+        self.verify_parent_descendant()?;
+        #[cfg(windows)]
+        {
+            let parent = self.reopen_parent_for_publication()?;
+            return delete_relative_windows(&parent, name).map_err(|error| {
+                PreviewCaptureError::OutputFailed(format!(
+                    "handle-relative preview cleanup failed ({error})"
+                ))
+            });
+        }
+        #[cfg(unix)]
+        {
+            let parent = self.reopen_parent_for_publication()?;
+            return unlink_relative_unix(&parent, name).map_err(|error| {
+                PreviewCaptureError::OutputFailed(format!(
+                    "handle-relative preview cleanup failed ({error})"
+                ))
+            });
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = name;
+            Err(PreviewCaptureError::OutputFailed(
+                "handle-relative preview cleanup is unsupported on this platform".into(),
+            ))
+        }
+    }
+
     fn verify_reopened(&self) -> Result<(), PreviewCaptureError> {
+        self.verify_parent_descendant()?;
         #[cfg(windows)]
         {
             let _ = self.reopen_parent_for_publication()?;
@@ -467,6 +523,7 @@ impl CaptureOutputAuthority {
     fn reopen_parent_for_publication(
         &self,
     ) -> Result<std::os::windows::io::OwnedHandle, PreviewCaptureError> {
+        self.verify_parent_descendant()?;
         let (_, root_identity) = open_directory_authority(&self.root_path).map_err(|_| {
             PreviewCaptureError::OutputFailed(
                 "trusted preview output root changed during capture".into(),
@@ -507,6 +564,7 @@ impl CaptureOutputAuthority {
 
     #[cfg(unix)]
     fn reopen_parent_for_publication(&self) -> Result<std::os::fd::OwnedFd, PreviewCaptureError> {
+        self.verify_parent_descendant()?;
         let (_, root_identity) = open_directory_authority(&self.root_path).map_err(|_| {
             PreviewCaptureError::OutputFailed(
                 "trusted preview output root changed during capture".into(),
@@ -534,6 +592,244 @@ impl CaptureOutputAuthority {
         }
         Ok(parent_handle)
     }
+}
+
+fn verify_parent_descendant(root: &Path, parent: &Path) -> Result<PathBuf, PreviewCaptureError> {
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            let value = path.to_string_lossy();
+            value
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&value)
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase()
+                .replace('/', "\\")
+        };
+        let root = normalize(root);
+        let parent = normalize(parent);
+        if parent == root {
+            return Ok(PathBuf::new());
+        }
+        let prefix = format!(r"{root}\");
+        if !parent.starts_with(&prefix) {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output parent is outside its root".into(),
+            ));
+        }
+        return Ok(PathBuf::from(&parent[prefix.len()..]));
+    }
+    #[cfg(not(windows))]
+    {
+        let root = root.components().collect::<Vec<_>>();
+        let parent = parent.components().collect::<Vec<_>>();
+        if root.len() > parent.len() {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output parent is outside its root".into(),
+            ));
+        }
+        let same_prefix = root.iter().zip(parent.iter()).all(|(root, parent)| {
+            #[cfg(windows)]
+            {
+                root.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&parent.as_os_str().to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                root == parent
+            }
+        });
+        if !same_prefix {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output parent is outside its root".into(),
+            ));
+        }
+        let relative =
+            parent
+                .iter()
+                .skip(root.len())
+                .fold(PathBuf::new(), |mut relative, component| {
+                    relative.push(component.as_os_str());
+                    relative
+                });
+        Ok(relative)
+    }
+}
+
+#[cfg(unix)]
+fn unlink_relative_unix(parent: &std::os::fd::OwnedFd, name: &OsString) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview cleanup name contains NUL",
+        )
+    })?;
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NativeIoStatusBlock {
+    status: i32,
+    information: usize,
+}
+
+#[cfg(windows)]
+fn delete_relative_windows(
+    parent: &std::os::windows::io::OwnedHandle,
+    name: &OsString,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    struct NativeUnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct NativeObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut NativeUnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct NativeFileDispositionInformation {
+        delete_file: u8,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut NativeObjectAttributes,
+            io_status_block: *mut NativeIoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut NativeIoStatusBlock,
+            file_information: *const std::ffi::c_void,
+            length: u32,
+            file_information_class: i32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const FILE_DISPOSITION_INFORMATION: i32 = 13;
+
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    let byte_length = wide
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "preview cleanup name too long",
+            )
+        })?;
+    let mut unicode = NativeUnicodeString {
+        length: byte_length,
+        maximum_length: byte_length,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = NativeObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<NativeObjectAttributes>()).unwrap_or(u32::MAX),
+        root_directory: HANDLE(parent.as_raw_handle()),
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = NativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = HANDLE::default();
+    let mut allocation_size = 0_i64;
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &mut attributes,
+            &mut io_status,
+            &mut allocation_size,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        let error = std::io::Error::from_raw_os_error(i32::try_from(error).unwrap_or(i32::MAX));
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw.0 as *mut std::ffi::c_void) };
+    let disposition = NativeFileDispositionInformation { delete_file: 1 };
+    let status = unsafe {
+        NtSetInformationFile(
+            HANDLE(handle.as_raw_handle()),
+            &mut io_status,
+            (&disposition as *const NativeFileDispositionInformation).cast(),
+            u32::try_from(std::mem::size_of::<NativeFileDispositionInformation>())
+                .unwrap_or(u32::MAX),
+            FILE_DISPOSITION_INFORMATION,
+        )
+    };
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -885,13 +1181,22 @@ pub fn cleanup_output_after_deadline(
     primary: PreviewCaptureError,
     deadline: CaptureDeadline,
 ) -> PreviewCaptureError {
-    let output = output.to_path_buf();
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let authority = match CaptureOutputAuthority::new(output, parent) {
+        Ok(authority) => Arc::new(authority),
+        Err(error) => {
+            return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
+                primary,
+                "remove output",
+                error,
+            ));
+        }
+    };
     if in_capture_executor_worker() {
-        let cleanup = match fs::remove_file(output) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(PreviewCaptureError::OutputFailed(error.to_string())),
-        };
+        let cleanup = authority.remove_output_relative();
         return match cleanup {
             Ok(()) => primary,
             Err(error) => PreviewCaptureError::CleanupFailed(
@@ -899,11 +1204,7 @@ pub fn cleanup_output_after_deadline(
             ),
         };
     }
-    let task = match spawn_cleanup_worker(move || match fs::remove_file(output) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(PreviewCaptureError::OutputFailed(error.to_string())),
-    }) {
+    let task = match spawn_cleanup_worker(move || authority.remove_output_relative()) {
         Ok(task) => task,
         Err(error) => {
             return PreviewCaptureError::CleanupFailed(CleanupFailureContext::from_settlement(
@@ -933,15 +1234,7 @@ fn cleanup_authorized_output_after_deadline(
     primary: PreviewCaptureError,
     deadline: CaptureDeadline,
 ) -> PreviewCaptureError {
-    let output = authority.output_path();
-    let cleanup = move || {
-        authority.verify_reopened()?;
-        match fs::remove_file(output) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(PreviewCaptureError::OutputFailed(error.to_string())),
-        }
-    };
+    let cleanup = move || authority.remove_output_relative();
     let cleanup_result = if in_capture_executor_worker() {
         cleanup()
     } else {
@@ -1809,11 +2102,7 @@ fn encode_bgra_png_atomic_sync(
 
     let temp_path = next_temp_path(output, parent, deadline, lease)?;
     reject_reparse_ancestors(&temp_path)?;
-    let mut temp = TempOutput::new(
-        temp_path.clone(),
-        output.to_path_buf(),
-        Arc::clone(&authority),
-    );
+    let mut temp = TempOutput::new(temp_path.clone(), Arc::clone(&authority));
     lease.check(deadline)?;
     let mut file = open_temp_output(&temp_path).map_err(|error| {
         PreviewCaptureError::OutputFailed(format!("preview temp open failed: {error}"))
@@ -1981,12 +2270,6 @@ fn atomic_publish_temp_windows(
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
 
-    #[repr(C)]
-    struct IoStatusBlock {
-        status: i32,
-        information: usize,
-    }
-
     // The Win32 wrapper rejects a non-null RootDirectory on some supported
     // Windows builds even though the native contract accepts it.  Calling the
     // native file-information boundary keeps the destination directory
@@ -1995,7 +2278,7 @@ fn atomic_publish_temp_windows(
     unsafe extern "system" {
         fn NtSetInformationFile(
             file_handle: HANDLE,
-            io_status_block: *mut IoStatusBlock,
+            io_status_block: *mut NativeIoStatusBlock,
             file_information: *const std::ffi::c_void,
             length: u32,
             file_information_class: i32,
@@ -2043,7 +2326,7 @@ fn atomic_publish_temp_windows(
             (*info).FileName.as_mut_ptr(),
             file_name.len(),
         );
-        let mut io_status = IoStatusBlock {
+        let mut io_status = NativeIoStatusBlock {
             status: 0,
             information: 0,
         };
@@ -2127,18 +2410,16 @@ fn next_temp_path(
 }
 
 struct TempOutput {
-    path: PathBuf,
-    output: PathBuf,
+    temp_name: OsString,
     authority: Arc<CaptureOutputAuthority>,
     renamed: bool,
     committed: bool,
 }
 
 impl TempOutput {
-    fn new(path: PathBuf, output: PathBuf, authority: Arc<CaptureOutputAuthority>) -> Self {
+    fn new(path: PathBuf, authority: Arc<CaptureOutputAuthority>) -> Self {
         Self {
-            path,
-            output,
+            temp_name: path.file_name().unwrap_or_default().to_os_string(),
             authority,
             renamed: false,
             committed: false,
@@ -2152,10 +2433,10 @@ impl Drop for TempOutput {
             return;
         }
         if !self.renamed {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.authority.remove_temp_relative(&self.temp_name);
         }
         if self.renamed && !self.committed {
-            let _ = fs::remove_file(&self.output);
+            let _ = self.authority.remove_output_relative();
         }
     }
 }
@@ -2187,6 +2468,33 @@ mod windows_capture_impl {
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetWindowAttribute(
+            hwnd: HWND,
+            attribute: u32,
+            value: *mut c_void,
+            value_size: u32,
+        ) -> i32;
+    }
+
+    fn extended_frame_size(hwnd: HWND) -> Option<(i32, i32)> {
+        const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+        let mut bounds = RECT::default();
+        let status = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut bounds as *mut RECT).cast(),
+                u32::try_from(std::mem::size_of::<RECT>()).ok()?,
+            )
+        };
+        (status == 0).then_some((
+            bounds.right.saturating_sub(bounds.left),
+            bounds.bottom.saturating_sub(bounds.top),
+        ))
+    }
 
     #[derive(Debug)]
     struct HandlerError(PreviewCaptureError);
@@ -2313,6 +2621,15 @@ mod windows_capture_impl {
                     return Ok(());
                 }
             };
+            if width != PREVIEW_WINDOW_WIDTH as u32 || height != PREVIEW_WINDOW_HEIGHT as u32 {
+                self.send_error(
+                    PreviewCaptureError::InvalidWindowState {
+                        reason: "capture frame dimensions do not match the 640x360 contract",
+                    },
+                    capture_control,
+                );
+                return Ok(());
+            }
             if width == 0 || height == 0 {
                 self.send_error(
                     PreviewCaptureError::CaptureFailed(
@@ -2593,12 +2910,36 @@ mod windows_capture_impl {
                 reason: "zero dimensions",
             });
         }
+        let Some((capture_width, capture_height)) = extended_frame_size(hwnd) else {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "no extended capture bounds",
+            });
+        };
+        if capture_width != PREVIEW_WINDOW_WIDTH || capture_height != PREVIEW_WINDOW_HEIGHT {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "preview capture bounds do not match the 640x360 contract",
+            });
+        }
 
         Ok(ValidatedWindow {
             hwnd: NativeHwnd(hwnd.0 as isize),
-            width: u32::try_from(width).unwrap_or(0),
-            height: u32::try_from(height).unwrap_or(0),
+            width: u32::try_from(capture_width).unwrap_or(0),
+            height: u32::try_from(capture_height).unwrap_or(0),
         })
+    }
+
+    fn wait_for_capture_bounds(
+        hwnd: HWND,
+        deadline: CaptureDeadline,
+    ) -> Result<(), PreviewCaptureError> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+        loop {
+            let remaining = deadline.remaining()?;
+            if extended_frame_size(hwnd) == Some((PREVIEW_WINDOW_WIDTH, PREVIEW_WINDOW_HEIGHT)) {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(POLL_INTERVAL));
+        }
     }
 
     fn configure_native_window(
@@ -2612,19 +2953,37 @@ mod windows_capture_impl {
         let existing_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
         let requested_style = existing_style | WS_EX_NOACTIVATE.0 as isize;
         unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, requested_style) };
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+        let mut window_rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut window_rect) }.map_err(|_| {
+            PreviewCaptureError::InvalidWindowState {
+                reason: "no window bounds",
+            }
+        })?;
+        let Some((current_capture_width, current_capture_height)) = extended_frame_size(hwnd)
+        else {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "no extended capture bounds",
+            });
+        };
+        let current_outer_width = window_rect.right.saturating_sub(window_rect.left);
+        let current_outer_height = window_rect.bottom.saturating_sub(window_rect.top);
+        let outer_width = current_outer_width
+            .saturating_add(PREVIEW_WINDOW_WIDTH.saturating_sub(current_capture_width));
+        let outer_height = current_outer_height
+            .saturating_add(PREVIEW_WINDOW_HEIGHT.saturating_sub(current_capture_height));
         unsafe {
             SetWindowPos(
                 hwnd,
                 None,
                 0,
                 0,
-                PREVIEW_WINDOW_WIDTH,
-                PREVIEW_WINDOW_HEIGHT,
+                outer_width,
+                outer_height,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
             )
         }
         .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
-        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
         unsafe {
             SetWindowPos(
                 hwnd,
@@ -2637,6 +2996,7 @@ mod windows_capture_impl {
             )
         }
         .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
+        wait_for_capture_bounds(hwnd, deadline)?;
 
         let after = foreground_hwnd();
         if after != expected_foreground {
@@ -2677,7 +3037,7 @@ mod windows_capture_impl {
         lease: CaptureLease,
         result_slot: Arc<Mutex<Option<Result<CaptureReport, PreviewCaptureError>>>>,
     ) -> Result<CaptureReport, PreviewCaptureError> {
-        let _validated = validate_native_window(hwnd)?;
+        let validated = validate_native_window(hwnd)?;
         lease.check(deadline)?;
         let contract = capture_contract();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -2712,6 +3072,13 @@ mod windows_capture_impl {
         )?;
 
         lease.check(deadline)?;
+        if frame.width != PREVIEW_WINDOW_WIDTH as u32
+            || frame.height != PREVIEW_WINDOW_HEIGHT as u32
+        {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "capture frame dimensions do not match the 640x360 contract",
+            });
+        }
         let after = foreground_hwnd();
         if after != expected_foreground {
             return Err(PreviewCaptureError::ForegroundChanged {
@@ -2721,16 +3088,16 @@ mod windows_capture_impl {
         }
         lease.check(deadline)?;
         let report = CaptureReport {
-            width: frame.width,
-            height: frame.height,
+            width: validated.width,
+            height: validated.height,
             foreground_before: expected_foreground,
             foreground_after: after,
         };
         let result_for_publication = Arc::clone(&result_slot);
         super::encode_bgra_png_atomic_with_authority_and_publication(
             authority,
-            frame.width,
-            frame.height,
+            validated.width,
+            validated.height,
             &frame.bgra,
             deadline,
             &lease,

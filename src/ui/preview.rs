@@ -34,6 +34,7 @@ const PREVIEW_SENTINEL_RGB: u32 = ((PREVIEW_SENTINEL_RGBA[0] as u32) << 16)
     | ((PREVIEW_SENTINEL_RGBA[1] as u32) << 8)
     | PREVIEW_SENTINEL_RGBA[2] as u32;
 const PREVIEW_SENTINEL_SIZE: f32 = 32.0;
+const PREVIEW_PADDING_PX: f32 = 16.0;
 const PREVIEW_USAGE: &str =
     "usage: devmanager-next --ui-preview <fixture.json> --output <preview.png>";
 static PREVIEW_RUN_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -174,6 +175,7 @@ pub const GALLERY_PAGE_COLUMNS: u16 = 1;
 pub const GALLERY_PAGE_ROWS: u16 = 3;
 const GALLERY_PAGE_GAP_PX: f32 = 8.0;
 const GALLERY_CONTENT_WIDTH_PX: f32 = 608.0;
+const GALLERY_SAMPLE_VALUE_WIDTH_PX: f32 = 400.0;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -428,7 +430,7 @@ impl PreviewRequest {
                 safe_preview_path(&fixture_path)
             )));
         }
-        let fixture_authority = open_fixture_authority(&fixture_path)?;
+        let fixture_authority = open_fixture_authority(&fixture_path, &fixture_root)?;
 
         let output_check = checked_path(&output_path)?;
         let output_root = checked_path(policy.output_root())?;
@@ -1025,24 +1027,38 @@ impl PreviewRoot {
     }
 
     pub fn element(&self) -> impl IntoElement {
-        let gallery = self.snapshot.component_gallery.as_ref().map(|gallery| {
-            render_component_gallery(gallery, self.snapshot.gallery_page.unwrap_or_default())
-        });
+        self.element_for_scale(1.0)
+    }
+
+    fn element_for_scale(&self, scale_factor: f32) -> impl IntoElement {
+        let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        let physical_px = |value: f32| px(value / scale_factor);
+        let gallery_page = self.snapshot.gallery_page.unwrap_or_default();
+        let gallery_tokens = gallery_theme_tokens(gallery_page);
+        let gallery = self
+            .snapshot
+            .component_gallery
+            .as_ref()
+            .map(|gallery| render_component_gallery(gallery, gallery_page, scale_factor));
         let mut root = div()
             .size_full()
-            .p(px(16.0))
-            .bg(gpui::rgb(crate::ui::tokens::PREVIEW_BACKGROUND.to_u32()))
-            .text_color(gpui::rgb(crate::ui::tokens::PREVIEW_FOREGROUND.to_u32()))
+            .p(physical_px(PREVIEW_PADDING_PX))
+            .bg(gpui::rgb(gallery_tokens.surfaces.canvas.to_u32()))
+            .text_color(gpui::rgb(gallery_tokens.text.primary.to_u32()))
             .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
             .child(
                 div()
                     .flex_none()
-                    .size(px(PREVIEW_SENTINEL_SIZE))
+                    .size(physical_px(PREVIEW_SENTINEL_SIZE))
                     .bg(gpui::rgb(PREVIEW_SENTINEL_RGB)),
             )
             .child(
                 div()
-                    .w_full()
+                    .w(physical_px(GALLERY_CONTENT_WIDTH_PX))
                     .line_clamp(2)
                     .child(self.snapshot.title.clone()),
             );
@@ -1056,24 +1072,15 @@ impl PreviewRoot {
 fn render_component_gallery(
     gallery: &ComponentGalleryFixture,
     page: GalleryPage,
+    scale_factor: f32,
 ) -> gpui::AnyElement {
     // This projection deliberately calls the production component elements;
     // no gallery-only hand-styled controls are allowed to hide state drift.
     gallery_layout_assertion(gallery);
-    let Some(scale) = gallery_scale(page.scale) else {
+    if gallery_scale(page.scale).is_none() {
         return div().child("Unsupported gallery scale").into_any_element();
-    };
-    let tokens = theme(
-        match page.theme {
-            GalleryTheme::Dark => ThemeMode::Dark,
-            GalleryTheme::Light => ThemeMode::Light,
-        },
-        match page.density {
-            GalleryDensity::Compact => Density::Compact,
-            GalleryDensity::Comfortable => Density::Comfortable,
-        },
-        scale,
-    );
+    }
+    let tokens = gallery_theme_tokens(page);
 
     let page_start = usize::from(page.state_page) * usize::from(GALLERY_PAGE_ROWS);
     let mut state_grid = div().flex().flex_col().gap_y_2().w_full();
@@ -1123,19 +1130,29 @@ fn render_component_gallery(
     .skip(sample_start)
     .take(4)
     {
+        let mut sample_value = div()
+            .flex_shrink_0()
+            .w(px(GALLERY_SAMPLE_VALUE_WIDTH_PX / scale_factor))
+            .text_xs();
+        if name == "long text" || name == "unicode" {
+            sample_value = sample_value
+                .max_h(px(32.0))
+                .overflow_hidden()
+                .whitespace_normal()
+                .line_clamp(2)
+                .child(wrapped_gallery_sample(&sample));
+        } else {
+            sample_value = sample_value
+                .truncate()
+                .child(bounded_gallery_sample(&sample));
+        }
         samples = samples.child(
             div()
                 .flex()
                 .w_full()
                 .gap(px(4.0))
                 .child(div().text_xs().child(format!("{name}:")))
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .text_xs()
-                        .child(bounded_gallery_sample(&sample)),
-                ),
+                .child(sample_value),
         );
     }
 
@@ -1180,7 +1197,7 @@ fn render_component_gallery(
 
     div()
         .mt(px(12.0))
-        .w_full()
+        .w(px(GALLERY_CONTENT_WIDTH_PX / scale_factor))
         .flex()
         .flex_col()
         .gap(px(8.0))
@@ -1194,6 +1211,20 @@ fn render_component_gallery(
         .into_any_element()
 }
 
+fn gallery_theme_tokens(page: GalleryPage) -> crate::ui::tokens::ThemeTokens {
+    theme(
+        match page.theme {
+            GalleryTheme::Dark => ThemeMode::Dark,
+            GalleryTheme::Light => ThemeMode::Light,
+        },
+        match page.density {
+            GalleryDensity::Compact => Density::Compact,
+            GalleryDensity::Comfortable => Density::Comfortable,
+        },
+        gallery_scale(page.scale).unwrap_or(Scale::Scale100),
+    )
+}
+
 fn bounded_gallery_sample(value: &str) -> String {
     const MAX_VISIBLE_SCALARS: usize = 36;
     let mut bounded: String = value.chars().take(MAX_VISIBLE_SCALARS).collect();
@@ -1201,6 +1232,25 @@ fn bounded_gallery_sample(value: &str) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+fn wrapped_gallery_sample(value: &str) -> String {
+    const MAX_LINE_SCALARS: usize = 20;
+    let mut wrapped = String::with_capacity(value.len());
+    let mut line_scalars = 0;
+    for word in value.split_whitespace() {
+        let word_scalars = word.chars().count();
+        if line_scalars > 0 && line_scalars + 1 + word_scalars > MAX_LINE_SCALARS {
+            wrapped.push('\n');
+            line_scalars = 0;
+        } else if line_scalars > 0 {
+            wrapped.push(' ');
+            line_scalars += 1;
+        }
+        wrapped.push_str(word);
+        line_scalars += word_scalars;
+    }
+    wrapped
 }
 
 fn gallery_layout_assertion(gallery: &ComponentGalleryFixture) {
@@ -1352,6 +1402,10 @@ opaque_preview_format!(PreviewRootFixture, "PreviewRootFixture(<opaque>)");
 opaque_preview_format!(ComponentGallerySamples, "ComponentGallerySamples(<opaque>)");
 opaque_preview_format!(ComponentGalleryFixture, "ComponentGalleryFixture(<opaque>)");
 opaque_preview_format!(FixtureFileAuthority, "FixtureFileAuthority(<opaque>)");
+opaque_preview_format!(
+    FixtureDirectoryAuthority,
+    "FixtureDirectoryAuthority(<opaque>)"
+);
 opaque_preview_format!(GalleryPage, "GalleryPage(<opaque>)");
 opaque_preview_format!(PreviewPathPolicy, "PreviewPathPolicy(<opaque>)");
 opaque_preview_format!(PreviewRequest, "PreviewRequest(<opaque>)");
@@ -1362,8 +1416,8 @@ opaque_preview_format!(PreviewApplication, "PreviewApplication(<opaque>)");
 opaque_preview_format!(PreviewRoot, "PreviewRoot(<opaque>)");
 
 impl Render for PreviewRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.element()
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.element_for_scale(window.scale_factor())
     }
 }
 
@@ -1391,10 +1445,21 @@ struct FixtureFileAuthority {
     file: Mutex<fs::File>,
     identity: FixtureFileIdentity,
     size: u64,
+    fixture_ancestor_chain: Vec<FixtureDirectoryAuthority>,
 }
 
-fn open_fixture_authority(path: &Path) -> Result<Arc<FixtureFileAuthority>, PreviewError> {
-    let file = open_fixture_handle(path).map_err(|error| {
+struct FixtureDirectoryAuthority {
+    path: PathBuf,
+    file: fs::File,
+    identity: FixtureFileIdentity,
+}
+
+fn open_fixture_authority(
+    path: &Path,
+    fixture_root: &Path,
+) -> Result<Arc<FixtureFileAuthority>, PreviewError> {
+    let fixture_ancestor_chain = open_fixture_ancestor_chain(path, fixture_root)?;
+    let file = open_fixture_relative(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             PreviewError::FixtureMissing {
                 path: path.to_path_buf(),
@@ -1426,15 +1491,49 @@ fn open_fixture_authority(path: &Path) -> Result<Arc<FixtureFileAuthority>, Prev
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    Ok(Arc::new(FixtureFileAuthority {
+    let authority = Arc::new(FixtureFileAuthority {
         path: path.to_path_buf(),
         file: Mutex::new(file),
         identity,
         size: metadata.len(),
-    }))
+        fixture_ancestor_chain,
+    });
+    authority.verify_fixture_containment()?;
+    Ok(authority)
+}
+
+impl FixtureFileAuthority {
+    fn verify_fixture_containment(&self) -> Result<(), PreviewError> {
+        for ancestor in &self.fixture_ancestor_chain {
+            let reopened = open_fixture_directory_handle(&ancestor.path).map_err(|error| {
+                PreviewError::FixtureIo {
+                    path: self.path.clone(),
+                    message: format!("fixture ancestor changed during capture: {error}"),
+                }
+            })?;
+            let reopened_identity =
+                fixture_file_identity(&reopened).map_err(|error| PreviewError::FixtureIo {
+                    path: self.path.clone(),
+                    message: error.to_string(),
+                })?;
+            let retained_identity =
+                fixture_file_identity(&ancestor.file).map_err(|error| PreviewError::FixtureIo {
+                    path: self.path.clone(),
+                    message: error.to_string(),
+                })?;
+            if reopened_identity != ancestor.identity || retained_identity != ancestor.identity {
+                return Err(PreviewError::FixtureIo {
+                    path: self.path.clone(),
+                    message: "fixture root or ancestor identity changed during capture".into(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, PreviewError> {
+    authority.verify_fixture_containment()?;
     let path = &authority.path;
     let mut fixture_handle = authority
         .file
@@ -1520,6 +1619,7 @@ fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, Previ
                     max_bytes: MAX_FIXTURE_BYTES,
                 });
             }
+            authority.verify_fixture_containment()?;
             if identity_before != authority.identity
                 || identity_before != identity_after
                 || metadata_before.len() != authority.size
@@ -1537,7 +1637,10 @@ fn read_fixture_bytes(authority: &FixtureFileAuthority) -> Result<Vec<u8>, Previ
         })
 }
 
-fn open_fixture_handle(path: &Path) -> std::io::Result<fs::File> {
+/// Open the final fixture through the already retained ancestor authority.
+/// The no-follow flags make the final boundary fail closed; the caller
+/// immediately revalidates every retained ancestor before reading this handle.
+fn open_fixture_relative(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -1551,6 +1654,121 @@ fn open_fixture_handle(path: &Path) -> std::io::Result<fs::File> {
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     options.open(path)
+}
+
+fn open_fixture_ancestor_chain(
+    path: &Path,
+    fixture_root: &Path,
+) -> Result<Vec<FixtureDirectoryAuthority>, PreviewError> {
+    let absolute_fixture = checked_path(path)?;
+    let absolute_root = checked_path(fixture_root)?;
+    if !is_within(&absolute_fixture, &absolute_root) {
+        return Err(PreviewError::OutsideApprovedRoot {
+            path: absolute_fixture,
+            root_kind: "fixture",
+        });
+    }
+    let mut paths = Vec::new();
+    let mut current = absolute_fixture
+        .parent()
+        .ok_or_else(|| PreviewError::FixtureIo {
+            path: absolute_fixture.clone(),
+            message: "fixture has no parent directory".into(),
+        })?;
+    loop {
+        paths.push(current.to_path_buf());
+        if is_same_path(current, &absolute_root) {
+            break;
+        }
+        current = current.parent().ok_or_else(|| PreviewError::UnsafePath {
+            path: absolute_fixture.clone(),
+            root_kind: "fixture",
+        })?;
+        if !is_within(current, &absolute_root) {
+            return Err(PreviewError::UnsafePath {
+                path: absolute_fixture.clone(),
+                root_kind: "fixture",
+            });
+        }
+    }
+    paths.reverse();
+    paths
+        .into_iter()
+        .map(|path| {
+            let file = open_fixture_directory_handle(&path).map_err(|error| {
+                let _ = error;
+                PreviewError::UnsafePath {
+                    path: absolute_fixture.clone(),
+                    root_kind: "fixture",
+                }
+            })?;
+            let identity =
+                fixture_file_identity(&file).map_err(|error| PreviewError::FixtureIo {
+                    path: absolute_fixture.clone(),
+                    message: error.to_string(),
+                })?;
+            Ok(FixtureDirectoryAuthority {
+                path,
+                file,
+                identity,
+            })
+        })
+        .collect()
+}
+
+fn open_fixture_directory_handle(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(
+            windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0
+                | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if !metadata.is_dir()
+            || metadata.file_attributes()
+                & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "fixture ancestor is not a regular directory",
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "fixture ancestor is not a regular directory",
+        ));
+    }
+    Ok(file)
+}
+
+fn is_same_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        return left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy());
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

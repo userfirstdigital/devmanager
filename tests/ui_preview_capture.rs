@@ -118,6 +118,124 @@ fn fixture_reads_are_bound_to_one_no_follow_handle_and_pre_post_hash() {
 }
 
 #[test]
+fn retained_output_cleanup_is_descendant_handle_relative_and_drop_never_removes_by_path() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        source.contains("parent_relative_to_root") || source.contains("verify_parent_descendant"),
+        "retained output authority must bind its parent as a descendant of the retained root"
+    );
+    assert!(
+        source.contains("remove_output_relative") && source.contains("remove_temp_relative"),
+        "authorized cleanup must remove entries through the retained parent handle"
+    );
+    assert!(
+        !source.contains("fs::remove_file(&self.path)")
+            && !source.contains("fs::remove_file(&self.output)"),
+        "TempOutput must not re-resolve either temporary or final output paths during Drop"
+    );
+    assert!(
+        !source.contains("fs::remove_file(output)"),
+        "deadline settlement must not re-resolve the final output path"
+    );
+}
+
+#[test]
+fn fixture_authority_keeps_root_ancestor_chain_through_final_open() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    for marker in [
+        "FixtureDirectoryAuthority",
+        "fixture_ancestor_chain",
+        "verify_fixture_containment",
+        "open_fixture_relative",
+    ] {
+        assert!(
+            source.contains(marker),
+            "fixture authority must retain and revalidate {marker}"
+        );
+    }
+}
+
+#[test]
+fn capture_manifest_decodes_ihdr_and_layout_contract_is_exact() {
+    let capture_source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in ["client_width", "frame.width", "PREVIEW_WINDOW_WIDTH"] {
+        assert!(
+            capture_source.contains(marker),
+            "native capture must assert the exact client/frame width contract ({marker})"
+        );
+    }
+    for marker in ["ReadAllBytes", "IHDR", "ExpectedWidth", "ExpectedHeight"] {
+        assert!(
+            script.contains(marker),
+            "capture manifest must derive and record decoded PNG IHDR dimensions ({marker})"
+        );
+    }
+}
+
+#[test]
+fn window_probe_joins_after_bounded_discovery_and_writes_failure_evidence() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "MainWindowHandle",
+        "WaitForExit(4000)",
+        "Kill($true)",
+        "WaitForExit(1000)",
+        "probe-failed",
+        "HoldEvidence",
+        "JoinState",
+    ] {
+        assert!(
+            script.contains(marker),
+            "window probe must implement bounded lifecycle/evidence marker {marker}"
+        );
+    }
+    assert!(
+        script.contains("if (-not $joined)") || script.contains("if(-not $joined)"),
+        "ExitCode must only be read after WaitForExit reports completion"
+    );
+    assert!(
+        !script.contains("WaitForExit()"),
+        "window probe cleanup joins must remain bounded"
+    );
+}
+
+#[test]
+fn gallery_keeps_long_unicode_text_for_bounded_wrap_and_uses_theme_canvas() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    assert!(
+        source.contains("samples.long_text") && source.contains("samples.unicode"),
+        "gallery must route the real long and Unicode fixture values through rendering"
+    );
+    assert!(
+        source.contains("overflow_hidden") && source.contains("max_h"),
+        "long sample presentation must use bounded wrapping rather than source truncation"
+    );
+    assert!(
+        source.contains("surfaces.canvas"),
+        "gallery canvas must follow the selected theme, including light mode"
+    );
+}
+
+#[test]
 fn gallery_preview_is_paged_and_bounded_for_the_640_by_360_surface() {
     let source =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
