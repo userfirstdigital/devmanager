@@ -1,6 +1,8 @@
 use crate::browser::BrowserAttachmentSessionBinding;
 use crate::remote::RemoteActionResult;
-use crate::services::process_manager::{ManagedShutdownReport, ProcessManagerInner};
+use crate::services::process_manager::{
+    bump_server_lifecycle_generation, ManagedShutdownReport, ProcessManagerInner,
+};
 use crate::state::{AiLaunchSpec, ServerLaunchSpec, SessionDimensions, SshLaunchSpec};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -164,6 +166,16 @@ fn op_preempts_in_flight(op: &ProcessOp) -> bool {
 }
 
 impl ProcessOp {
+    fn invalidates_server_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            ProcessOp::StartServer { .. }
+                | ProcessOp::StopServer { .. }
+                | ProcessOp::RestartServer { .. }
+                | ProcessOp::StopAll { .. }
+        )
+    }
+
     pub fn op_id(&self) -> u64 {
         match self {
             ProcessOp::StartServer { op_id, .. }
@@ -248,6 +260,7 @@ pub struct ProcessOpQueue {
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<Mutex<HashMap<String, u64>>>,
+    lifecycle_inner: Weak<ProcessManagerInner>,
     #[cfg(test)]
     successful_submissions: AtomicU64,
     #[cfg(test)]
@@ -256,6 +269,7 @@ pub struct ProcessOpQueue {
 
 impl ProcessOpQueue {
     pub fn new(inner: Weak<ProcessManagerInner>) -> Arc<Self> {
+        let lifecycle_inner = inner.clone();
         let (submit_tx, submit_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -285,6 +299,7 @@ impl ProcessOpQueue {
                 stop,
                 worker: Mutex::new(Some(worker)),
                 in_flight,
+                lifecycle_inner,
                 #[cfg(test)]
                 successful_submissions: AtomicU64::new(0),
                 #[cfg(test)]
@@ -296,6 +311,7 @@ impl ProcessOpQueue {
     pub fn submit(&self, op: ProcessOp) -> Result<u64, String> {
         let op_id = op.op_id();
         let target_id = op.target_id();
+        let invalidates_server_lifecycle = op.invalidates_server_lifecycle();
         if !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. }) {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 if op_preempts_in_flight(&op) {
@@ -309,6 +325,13 @@ impl ProcessOpQueue {
         self.submit_tx
             .send(op)
             .map_err(|_| "Process operation queue is unavailable.".to_string())?;
+        if invalidates_server_lifecycle {
+            // Queue admission is the single lifecycle hook shared by UI,
+            // remote, monitor, restore, and auto-restart server paths.
+            if let Some(inner) = self.lifecycle_inner.upgrade() {
+                bump_server_lifecycle_generation(&inner);
+            }
+        }
         #[cfg(test)]
         self.successful_submissions.fetch_add(1, Ordering::SeqCst);
         Ok(op_id)

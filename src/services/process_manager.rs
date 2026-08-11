@@ -220,6 +220,10 @@ pub(crate) struct ProcessManagerInner {
     browser_attachment_broker: BrowserAttachmentBroker,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: AtomicU64,
+    /// Monotonic admission epoch for every queued server lifecycle operation.
+    /// Port refresh fences read this value instead of trying to enumerate
+    /// operation paths or sessions.
+    server_lifecycle_generation: AtomicU64,
     observed_runtime_generations: Mutex<HashMap<String, u64>>,
     settings: RwLock<Settings>,
     terminal_backend: TerminalBackend,
@@ -512,6 +516,7 @@ impl ProcessManager {
             browser_attachment_broker: BrowserAttachmentBroker::default(),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
             runtime_revision: AtomicU64::new(1),
+            server_lifecycle_generation: AtomicU64::new(0),
             observed_runtime_generations: Mutex::new(HashMap::new()),
             settings: RwLock::new(Settings::default()),
             terminal_backend: TerminalBackend::PortablePtyFeedingAlacritty,
@@ -1174,6 +1179,12 @@ impl ProcessManager {
 
     pub fn runtime_revision(&self) -> u64 {
         self.inner.runtime_revision.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn server_lifecycle_generation(&self) -> u64 {
+        self.inner
+            .server_lifecycle_generation
+            .load(Ordering::Acquire)
     }
 
     pub fn register_runtime_session(&self, session: SessionRuntimeState) {
@@ -3176,6 +3187,23 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
+        let closes_server = self
+            .inner
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .sessions
+                    .get(session_id)
+                    .map(|session| session.session_kind)
+            })
+            .is_some_and(|kind| matches!(kind, SessionKind::Server));
+        if closes_server {
+            // This is the single direct teardown hook; it also covers
+            // shutdown/reaper paths that do not enqueue StopServer.
+            bump_server_lifecycle_generation(&self.inner);
+        }
         let result = match self.get_session(session_id) {
             Ok(session) => session.close(closed_by_user),
             Err(error) => {
@@ -5327,6 +5355,12 @@ fn mark_remote_session_dirty(inner: &Arc<ProcessManagerInner>, session_id: &str)
 
 fn bump_runtime_revision(inner: &ProcessManagerInner) {
     inner.runtime_revision.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn bump_server_lifecycle_generation(inner: &ProcessManagerInner) {
+    inner
+        .server_lifecycle_generation
+        .fetch_add(1, Ordering::AcqRel);
 }
 
 fn current_runtime_generation(inner: &ProcessManagerInner, session_id: &str) -> Option<u64> {
@@ -10497,6 +10531,24 @@ mod tests {
 
         manager.set_active_session("alpha");
         assert_eq!(manager.runtime_revision(), after_active);
+    }
+
+    #[test]
+    fn server_lifecycle_generation_advances_for_queued_server_operations() {
+        let manager = ProcessManager::new();
+        let before = manager.server_lifecycle_generation();
+
+        manager
+            .submit_process_op(ProcessOp::StopAll {
+                op_id: next_op_id(),
+                command_ids: Vec::new(),
+                wait: Duration::ZERO,
+                response: None,
+            })
+            .expect("queue StopAll");
+
+        assert!(manager.server_lifecycle_generation() > before);
+        stop_background_tasks_for_test(&manager);
     }
 
     #[test]

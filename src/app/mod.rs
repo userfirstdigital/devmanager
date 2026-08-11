@@ -552,6 +552,7 @@ struct ServerPortSnapshotState {
     refresh_in_flight: bool,
     refresh_generation: u64,
     task_action_epoch: u64,
+    server_lifecycle_generation: u64,
     active_refresh: Option<PortRefreshFence>,
     /// Stable sentinel for a port with no host-verified managed resource.
     /// This is never a managed authority; it only keeps typed projections
@@ -574,6 +575,7 @@ struct PortRefreshFence {
     runtime_generation: u64,
     resource_generation: u64,
     managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7436,6 +7438,13 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseTab { tab_id } => {
+                    let closes_server = self
+                        .state
+                        .find_tab(&tab_id)
+                        .is_some_and(|tab| matches!(tab.tab_type, TabType::Server));
+                    if closes_server {
+                        self.invalidate_server_port_snapshot(None);
+                    }
                     let workspace_key =
                         browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
                     if let Some(workspace_key) = workspace_key.as_ref() {
@@ -8063,6 +8072,9 @@ impl NativeShell {
 
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        if matches!(tab.tab_type, TabType::Server) {
+            self.invalidate_server_port_snapshot(None);
         }
         if let Some(workspace_key) = browser_workspace_key_for_ai_tab(Some(&tab)) {
             self.interrupt_browser_workspace_before_teardown(&workspace_key);
@@ -8765,6 +8777,12 @@ impl NativeShell {
 
         let result = match session.session_kind {
             SessionKind::Server => {
+                self.invalidate_server_port_snapshot(
+                    session
+                        .server_launch
+                        .as_ref()
+                        .and_then(|launch| launch.port),
+                );
                 let command_id = session
                     .command_id
                     .clone()
@@ -12008,6 +12026,11 @@ impl NativeShell {
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
+        let server_lifecycle_generation = self.process_manager.server_lifecycle_generation();
+        if self.server_port_snapshot.server_lifecycle_generation != server_lifecycle_generation {
+            self.invalidate_server_port_snapshot(None);
+            self.server_port_snapshot.server_lifecycle_generation = server_lifecycle_generation;
+        }
         let (tracked_ports, refresh_interval) = server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
             // Keep the ProcessManager-owned coordinator even while the
@@ -12096,6 +12119,7 @@ impl NativeShell {
             runtime_generation,
             resource_generation,
             managed_snapshot_generation,
+            server_lifecycle_generation,
         };
         self.server_port_snapshot.refresh_generation = refresh_fence.generation;
         self.server_port_snapshot.active_refresh = Some(refresh_fence.clone());
@@ -12152,6 +12176,8 @@ impl NativeShell {
                         }
                         let current_runtime = this.process_manager.runtime_state();
                         let current_runtime_generation = this.process_manager.runtime_revision();
+                        let current_server_lifecycle_generation =
+                            this.process_manager.server_lifecycle_generation();
                         let current_resource_generation =
                             local_stable_hash(&current_runtime.sessions);
                         let current_managed_snapshot_generation =
@@ -12164,6 +12190,7 @@ impl NativeShell {
                             current_runtime_generation,
                             current_resource_generation,
                             current_managed_snapshot_generation,
+                            current_server_lifecycle_generation,
                         ) {
                             // The callback is still for this exact refresh, but
                             // the runtime/resource generations moved while the
@@ -16736,6 +16763,7 @@ fn port_refresh_is_current_for_state(
     runtime_generation: u64,
     resource_generation: u64,
     managed_snapshot_generation: u64,
+    server_lifecycle_generation: u64,
 ) -> bool {
     port_refresh_is_current(active, expected)
         && expected.ports == tracked_ports
@@ -16743,6 +16771,7 @@ fn port_refresh_is_current_for_state(
         && expected.runtime_generation == runtime_generation
         && expected.resource_generation == resource_generation
         && expected.managed_snapshot_generation == managed_snapshot_generation
+        && expected.server_lifecycle_generation == server_lifecycle_generation
 }
 
 const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
@@ -21048,6 +21077,7 @@ mod tests {
             runtime_generation: 10,
             resource_generation: 11,
             managed_snapshot_generation: 12,
+            server_lifecycle_generation: 1,
         };
         let current = PortRefreshFence {
             generation: 8,
@@ -21056,6 +21086,7 @@ mod tests {
             runtime_generation: 13,
             resource_generation: 14,
             managed_snapshot_generation: 15,
+            server_lifecycle_generation: 2,
         };
 
         assert!(!port_refresh_is_current(Some(&current), &old));
@@ -21072,6 +21103,7 @@ mod tests {
             runtime_generation: 12,
             resource_generation: 13,
             managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
         };
         for changed in [
             PortRefreshFence {
@@ -21090,6 +21122,10 @@ mod tests {
                 managed_snapshot_generation: 17,
                 ..current.clone()
             },
+            PortRefreshFence {
+                server_lifecycle_generation: 4,
+                ..current.clone()
+            },
         ] {
             assert!(!port_refresh_is_current(Some(&current), &changed));
         }
@@ -21104,6 +21140,7 @@ mod tests {
             runtime_generation: 12,
             resource_generation: 13,
             managed_snapshot_generation: 14,
+            server_lifecycle_generation: 3,
         };
 
         assert!(port_refresh_is_current_for_state(
@@ -21114,6 +21151,7 @@ mod tests {
             12,
             13,
             14,
+            3,
         ));
         assert!(!port_refresh_is_current_for_state(
             Some(&current),
@@ -21123,6 +21161,17 @@ mod tests {
             15,
             13,
             14,
+            3,
+        ));
+        assert!(!port_refresh_is_current_for_state(
+            Some(&current),
+            &current,
+            &[5174],
+            4,
+            12,
+            13,
+            14,
+            4,
         ));
     }
 

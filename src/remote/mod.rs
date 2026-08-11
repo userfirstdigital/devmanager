@@ -318,7 +318,10 @@ impl RemotePortAuthority {
             RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
         )
         .then_some(status.resource);
-        let diagnostic = (kind == RemotePortAuthorityKind::ProbeError)
+        // A local Starting status can retain probe detail while its process is
+        // being brought up. That detail is host-only just like an explicit
+        // ProbeError; never let it become a wire error string.
+        let diagnostic = (kind == RemotePortAuthorityKind::ProbeError || status.error().is_some())
             .then_some(RemotePortDiagnostic::ProbeError);
         Self {
             port: status.port,
@@ -347,10 +350,7 @@ impl RemotePortAuthority {
                 .saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
             managed_fence_fingerprint: None,
             verified: None,
-            error: diagnostic
-                .is_none()
-                .then(|| status.error().map(str::to_string))
-                .flatten(),
+            error: None,
         }
     }
 
@@ -9444,6 +9444,28 @@ mod tests {
         let wire = serde_json::to_string(&authority).expect("serialize remote authority");
         assert!(wire.contains("probeError"));
         assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn remote_starting_probe_detail_is_typed_and_does_not_export_raw_detail() {
+        let status = crate::process::ports::PortStatus {
+            port: 43125,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 8),
+            kind: crate::process::ports::PortStatusKind::Starting,
+            listeners: Arc::from([]),
+            error: Some("C:\\private\\secret-startup-token.txt".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::Unknown);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
+        assert_eq!(authority.error, None);
+        let wire = serde_json::to_string(&authority).expect("serialize remote authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("secret-startup-token.txt"));
     }
 
     #[test]

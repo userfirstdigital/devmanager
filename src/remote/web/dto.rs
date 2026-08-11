@@ -350,13 +350,14 @@ impl WebPortAuthority {
             }
         };
         let probe_error = authority.kind == RemotePortAuthorityKind::ProbeError;
+        let has_probe_diagnostic = probe_error || authority.error.is_some();
         Self {
             port: authority.port,
             kind,
             diagnostic: authority
                 .diagnostic
                 .map(WebPortDiagnostic::from)
-                .or_else(|| probe_error.then_some(WebPortDiagnostic::ProbeError)),
+                .or_else(|| has_probe_diagnostic.then_some(WebPortDiagnostic::ProbeError)),
             resource_generation: authority
                 .resource
                 .map(|resource| resource.runtime_generation),
@@ -388,7 +389,9 @@ impl WebPortAuthority {
                     RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
                 )),
             control_reason,
-            error: (!probe_error).then(|| authority.error.clone()).flatten(),
+            // Host probe text is never a renderer diagnostic. Keep the
+            // wire-safe enum above and drop any stale/internal error string.
+            error: None,
         }
     }
 }
@@ -809,6 +812,42 @@ mod tests {
         let wire = serde_json::to_string(projected).expect("serialize web authority");
         assert!(wire.contains("probeError"));
         assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn browser_starting_authority_uses_typed_diagnostic_and_drops_raw_error() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::Starting,
+            listeners: std::sync::Arc::from([]),
+            error: Some("C:\\private\\secret-startup-token.txt".to_string()),
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        // Simulate a stale/internal status retaining its host-only detail at
+        // the Web boundary. The projection must sanitize it regardless of
+        // which caller supplied the DTO.
+        authority.error = Some("C:\\private\\secret-startup-token.txt".to_string());
+
+        let projected = WebPortAuthority::from_remote(
+            &authority,
+            &fixture.runtime,
+            crate::remote::now_epoch_ms(),
+        );
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::Unknown));
+        assert!(matches!(
+            projected.diagnostic,
+            Some(WebPortDiagnostic::ProbeError)
+        ));
+        assert_eq!(projected.error, None);
+        let wire = serde_json::to_string(&projected).expect("serialize web authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("secret-startup-token.txt"));
     }
 
     #[test]
