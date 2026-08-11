@@ -349,10 +349,14 @@ impl WebPortAuthority {
                 }
             }
         };
+        let probe_error = authority.kind == RemotePortAuthorityKind::ProbeError;
         Self {
             port: authority.port,
             kind,
-            diagnostic: authority.diagnostic.map(WebPortDiagnostic::from),
+            diagnostic: authority
+                .diagnostic
+                .map(WebPortDiagnostic::from)
+                .or_else(|| probe_error.then_some(WebPortDiagnostic::ProbeError)),
             resource_generation: authority
                 .resource
                 .map(|resource| resource.runtime_generation),
@@ -384,7 +388,7 @@ impl WebPortAuthority {
                     RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
                 )),
             control_reason,
-            error: authority.error.clone(),
+            error: (!probe_error).then(|| authority.error.clone()).flatten(),
         }
     }
 }
@@ -765,6 +769,46 @@ mod tests {
             ),
             "wire-shaped managed metadata cannot mint a Web control projection"
         );
+    }
+
+    #[test]
+    fn browser_probe_authority_uses_typed_diagnostic_and_drops_raw_error() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: std::sync::Arc::from([]),
+            error: Some("C:\\private\\listener-table.txt".to_string()),
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        authority.diagnostic = None;
+        authority.error = Some("C:\\private\\listener-table.txt".to_string());
+
+        let snapshot = WebWorkspaceSnapshot::from_host_with_authorities(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &HashMap::from([(43872, authority)]),
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        );
+        let projected = &snapshot.port_authorities[0];
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::ProbeError));
+        assert!(matches!(
+            projected.diagnostic,
+            Some(WebPortDiagnostic::ProbeError)
+        ));
+        assert_eq!(projected.error, None);
+        let wire = serde_json::to_string(projected).expect("serialize web authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("listener-table.txt"));
     }
 
     #[test]

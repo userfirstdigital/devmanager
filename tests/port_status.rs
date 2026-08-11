@@ -1201,7 +1201,16 @@ fn access_denied_identity_capture_is_probe_error_and_never_free_or_external() {
             &snapshot,
             None,
         ),
-        PortAuthority::Unknown
+        PortAuthority::ProbeError
+    );
+    assert_eq!(
+        project_port_status_from_snapshot(
+            &PortTarget::new(port, fence(17, 1), ManagedPortHealth::Ready),
+            &snapshot,
+            None,
+        )
+        .kind(),
+        PortStatusKind::ProbeError
     );
 }
 

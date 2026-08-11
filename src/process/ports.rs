@@ -1177,13 +1177,13 @@ pub fn classify_port_authority_from_snapshot_at(
     if now > deadline || !snapshot.is_fresh_at(now, DEFAULT_FREE_PROOF_MAX_AGE) {
         return PortAuthority::Unknown;
     }
-    match snapshot.issue(target.port) {
-        Some(PortObservationIssue::ProbeError(_))
-        | Some(PortObservationIssue::ReconciliationFault(_)) => return PortAuthority::Unknown,
-        None => {}
-    }
     if !snapshot.is_valid() {
         return PortAuthority::Unknown;
+    }
+    match snapshot.issue(target.port) {
+        Some(PortObservationIssue::ProbeError(_)) => return PortAuthority::ProbeError,
+        Some(PortObservationIssue::ReconciliationFault(_)) => return PortAuthority::Unknown,
+        None => {}
     }
     if matches!(observation, PortObservation::ProbeError(_)) {
         return PortAuthority::ProbeError;
@@ -1225,6 +1225,15 @@ pub fn classify_port_authority_from_snapshot_with_membership_reconciliation_at(
     now: Instant,
     deadline: Instant,
 ) -> PortAuthority {
+    if matches!(
+        snapshot.issue(target.port),
+        Some(PortObservationIssue::ProbeError(_))
+    ) || matches!(
+        snapshot.observation(target.port),
+        Some(PortObservation::ProbeError(_))
+    ) {
+        return classify_port_authority_from_snapshot_at(target, snapshot, managed, now, deadline);
+    }
     let membership_agrees = match (managed, reconciled_managed) {
         (None, None) => true,
         (Some(first), Some(second)) => first.same_authoritative_membership(second, now, deadline),
@@ -1464,15 +1473,6 @@ pub fn project_port_status_from_snapshot_at(
             error: None,
         };
     }
-    if let Some(issue) = snapshot.issue(target.port) {
-        return PortStatus {
-            port: target.port,
-            resource: target.resource,
-            kind: PortStatusKind::Unknown,
-            listeners: Arc::from(observation.listeners()),
-            error: Some(bounded_sanitized_detail(issue.detail())),
-        };
-    }
     if !snapshot.is_valid() {
         return PortStatus {
             port: target.port,
@@ -1480,6 +1480,19 @@ pub fn project_port_status_from_snapshot_at(
             kind: PortStatusKind::Unknown,
             listeners: Arc::from(observation.listeners()),
             error: snapshot.validation_error().map(bounded_sanitized_detail),
+        };
+    }
+    if let Some(issue) = snapshot.issue(target.port) {
+        let kind = match issue {
+            PortObservationIssue::ProbeError(_) => PortStatusKind::ProbeError,
+            PortObservationIssue::ReconciliationFault(_) => PortStatusKind::Unknown,
+        };
+        return PortStatus {
+            port: target.port,
+            resource: target.resource,
+            kind,
+            listeners: Arc::from(observation.listeners()),
+            error: Some(bounded_sanitized_detail(issue.detail())),
         };
     }
     let authority =
@@ -1504,6 +1517,15 @@ pub fn project_port_status_from_snapshot_with_membership_reconciliation_at(
     now: Instant,
     deadline: Instant,
 ) -> PortStatus {
+    if matches!(
+        snapshot.issue(target.port),
+        Some(PortObservationIssue::ProbeError(_))
+    ) || matches!(
+        snapshot.observation(target.port),
+        Some(PortObservation::ProbeError(_))
+    ) {
+        return project_port_status_from_snapshot_at(target, snapshot, managed, now, deadline);
+    }
     let membership_agrees = match (managed, reconciled_managed) {
         (None, None) => true,
         (Some(first), Some(second)) => first.same_authoritative_membership(second, now, deadline),

@@ -7453,6 +7453,7 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopAllServers => {
+                    self.invalidate_server_port_snapshot(None);
                     let stopped = self.process_manager.stop_all_servers();
                     if stopped > 0 {
                         did_change = true;
@@ -8033,6 +8034,7 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        self.invalidate_server_port_snapshot(None);
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::StopAllServers);
             self.terminal_notice = Some("Stopping remote server tab(s)...".to_string());
