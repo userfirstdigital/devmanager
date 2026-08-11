@@ -3,15 +3,19 @@ use crate::remote::RemoteActionResult;
 use crate::services::process_manager::{ManagedShutdownReport, ProcessManagerInner};
 use crate::state::{AiLaunchSpec, ServerLaunchSpec, SessionDimensions, SshLaunchSpec};
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, Weak,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 static NEXT_OP_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) const MAX_PROCESS_OP_BATCH_ITEMS: usize = 256;
+const MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN: usize = 256;
+const MAX_PENDING_PROCESS_OPS: usize = 256;
+const PROCESS_OP_WORKER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessOpKind {
@@ -176,6 +180,38 @@ fn op_preempts_in_flight(op: &ProcessOp) -> bool {
     )
 }
 
+fn validate_process_op_bounds(op: &ProcessOp) -> Result<(), String> {
+    if matches!(
+        op,
+        ProcessOp::StopAll { command_ids, .. }
+            if command_ids.len() > MAX_PROCESS_OP_BATCH_ITEMS
+    ) {
+        return Err(format!(
+            "Process operation batch exceeds {MAX_PROCESS_OP_BATCH_ITEMS} entries."
+        ));
+    }
+    Ok(())
+}
+
+fn drain_ready_completions(
+    rx: &Receiver<ProcessOpCompletion>,
+    in_flight: &Mutex<HashMap<String, u64>>,
+    pending_ops: &AtomicUsize,
+) -> Vec<ProcessOpCompletion> {
+    let mut completions = Vec::with_capacity(MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN);
+    while completions.len() < MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN {
+        let Ok(completion) = rx.try_recv() else {
+            break;
+        };
+        if let Ok(mut in_flight) = in_flight.lock() {
+            in_flight.remove(&completion.target_id);
+        }
+        pending_ops.fetch_sub(1, Ordering::AcqRel);
+        completions.push(completion);
+    }
+    completions
+}
+
 impl ProcessOp {
     pub fn op_id(&self) -> u64 {
         match self {
@@ -261,11 +297,17 @@ pub fn next_op_id() -> u64 {
 }
 
 pub struct ProcessOpQueue {
-    submit_tx: Sender<ProcessOp>,
+    submit_tx: SyncSender<ProcessOp>,
     completion_rx: Mutex<Receiver<ProcessOpCompletion>>,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<Mutex<HashMap<String, u64>>>,
+    admission_serial: Mutex<()>,
+    closing: AtomicBool,
+    /// Includes queued, executing, and completed-but-undrained operations.
+    /// Keeping one shared count proves both channels remain within fixed
+    /// allocation bounds without blocking the worker on completion delivery.
+    pending_ops: AtomicUsize,
     #[cfg(test)]
     successful_submissions: AtomicU64,
     #[cfg(test)]
@@ -274,8 +316,8 @@ pub struct ProcessOpQueue {
 
 impl ProcessOpQueue {
     pub fn new(inner: Weak<ProcessManagerInner>) -> Arc<Self> {
-        let (submit_tx, submit_rx) = mpsc::channel();
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::sync_channel(MAX_PENDING_PROCESS_OPS);
+        let (completion_tx, completion_rx) = mpsc::sync_channel(MAX_PENDING_PROCESS_OPS);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = stop.clone();
         let in_flight: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -303,6 +345,9 @@ impl ProcessOpQueue {
                 stop,
                 worker: Mutex::new(Some(worker)),
                 in_flight,
+                admission_serial: Mutex::new(()),
+                closing: AtomicBool::new(false),
+                pending_ops: AtomicUsize::new(0),
                 #[cfg(test)]
                 successful_submissions: AtomicU64::new(0),
                 #[cfg(test)]
@@ -312,21 +357,61 @@ impl ProcessOpQueue {
     }
 
     pub fn submit(&self, op: ProcessOp) -> Result<u64, String> {
+        let _admission = self
+            .admission_serial
+            .lock()
+            .map_err(|_| "Process operation admission is unavailable.".to_string())?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err("Process operation queue is shutting down.".to_string());
+        }
+        validate_process_op_bounds(&op)?;
+        if self.pending_ops.load(Ordering::Acquire) >= MAX_PENDING_PROCESS_OPS {
+            return Err(format!(
+                "Process operation capacity is full ({MAX_PENDING_PROCESS_OPS} pending operations)."
+            ));
+        }
+        let begins_shutdown = matches!(op, ProcessOp::Shutdown { .. });
+        if begins_shutdown {
+            // Publish the close fence while holding the same gate as every
+            // producer. No operation can be admitted behind the shutdown op.
+            self.closing.store(true, Ordering::Release);
+        }
         let op_id = op.op_id();
         let target_id = op.target_id();
-        if !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. }) {
+        let tracks_in_flight =
+            !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. });
+        if tracks_in_flight {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 if op_preempts_in_flight(&op) {
                     in_flight.remove(&target_id);
                 } else if in_flight.contains_key(&target_id) {
                     return Err(format!("Operation already in progress for `{target_id}`."));
                 }
-                in_flight.insert(target_id, op_id);
+                in_flight.insert(target_id.clone(), op_id);
             }
         }
-        self.submit_tx
-            .send(op)
-            .map_err(|_| "Process operation queue is unavailable.".to_string())?;
+        self.pending_ops.fetch_add(1, Ordering::AcqRel);
+        if let Err(send_error) = self.submit_tx.try_send(op) {
+            self.pending_ops.fetch_sub(1, Ordering::AcqRel);
+            if tracks_in_flight {
+                if let Ok(mut in_flight) = self.in_flight.lock() {
+                    if in_flight.get(&target_id) == Some(&op_id) {
+                        in_flight.remove(&target_id);
+                    }
+                }
+            }
+            if begins_shutdown {
+                self.closing.store(false, Ordering::Release);
+            }
+            return Err(match send_error {
+                TrySendError::Full(_) => format!(
+                    "Process operation capacity is full ({MAX_PENDING_PROCESS_OPS} pending operations)."
+                ),
+                TrySendError::Disconnected(_) => {
+                    "Process operation queue is unavailable.".to_string()
+                }
+            });
+        }
         #[cfg(test)]
         self.successful_submissions.fetch_add(1, Ordering::SeqCst);
         Ok(op_id)
@@ -343,30 +428,86 @@ impl ProcessOpQueue {
     }
 
     pub fn drain_completions(&self) -> Vec<ProcessOpCompletion> {
-        let mut completions = Vec::new();
         let Ok(rx) = self.completion_rx.lock() else {
-            return completions;
+            return Vec::new();
         };
-        while let Ok(completion) = rx.try_recv() {
-            if let Ok(mut in_flight) = self.in_flight.lock() {
-                in_flight.remove(&completion.target_id);
-            }
-            completions.push(completion);
-        }
-        completions
+        drain_ready_completions(&rx, &self.in_flight, &self.pending_ops)
     }
 
     pub fn shutdown(&self) {
+        let _admission = self
+            .admission_serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.closing.store(true, Ordering::Release);
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(handle) = worker.take() {
                 if handle.thread().id() == thread::current().id() {
-                    drop(handle);
+                    // Detaching the queue actor would permit effects after the
+                    // shutdown boundary. This state is an invariant failure:
+                    // queue shutdown is host-owned and never worker-owned.
+                    std::process::abort();
                 } else {
+                    let deadline = std::time::Instant::now()
+                        .checked_add(PROCESS_OP_WORKER_JOIN_BUDGET)
+                        .unwrap_or_else(std::time::Instant::now);
+                    while !handle.is_finished() && std::time::Instant::now() < deadline {
+                        thread::yield_now();
+                    }
+                    if !handle.is_finished() {
+                        // Returning would detach an operation actor that can
+                        // still mutate process state after host shutdown.
+                        std::process::abort();
+                    }
                     let _ = handle.join();
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completion(index: usize) -> ProcessOpCompletion {
+        ProcessOpCompletion {
+            op_id: index as u64,
+            kind: ProcessOpKind::CloseAi,
+            target_id: format!("session-{index}"),
+            result: Ok(()),
+            context: ProcessOpContext::default(),
+            remote_response: None,
+        }
+    }
+
+    #[test]
+    fn process_operation_batch_and_completion_drain_are_hard_bounded() {
+        let oversized = ProcessOp::StopAll {
+            op_id: next_op_id(),
+            command_ids: (0..=MAX_PROCESS_OP_BATCH_ITEMS)
+                .map(|index| format!("server-{index}"))
+                .collect(),
+            wait: Duration::ZERO,
+            response: None,
+        };
+        assert!(matches!(
+            validate_process_op_bounds(&oversized),
+            Err(detail) if detail.contains("exceeds 256 entries")
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        for index in 0..=MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN {
+            tx.send(completion(index)).expect("seed completion");
+        }
+        let in_flight = Mutex::new(HashMap::new());
+        let pending = AtomicUsize::new(MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN + 1);
+        let first = drain_ready_completions(&rx, &in_flight, &pending);
+        assert_eq!(first.len(), MAX_PROCESS_OP_COMPLETIONS_PER_DRAIN);
+        let second = drain_ready_completions(&rx, &in_flight, &pending);
+        assert_eq!(second.len(), 1, "the next poll retains overflow work");
+        assert_eq!(pending.load(Ordering::Acquire), 0);
     }
 }
 
@@ -380,7 +521,7 @@ fn run_worker_loop(
     inner: Weak<ProcessManagerInner>,
     queue: Weak<ProcessOpQueue>,
     submit_rx: Receiver<ProcessOp>,
-    completion_tx: Sender<ProcessOpCompletion>,
+    completion_tx: SyncSender<ProcessOpCompletion>,
     stop: Arc<AtomicBool>,
     in_flight: Arc<Mutex<HashMap<String, u64>>>,
 ) {

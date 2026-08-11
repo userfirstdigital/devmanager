@@ -1,6 +1,17 @@
-use crate::models::{DefaultTerminal, MacTerminalProfile};
+use crate::domain::id::{OperationId, ResourceId};
 #[cfg(windows)]
-use crate::process::teardown::ManagedTerminalTeardown;
+use crate::domain::resource::ResourceKind;
+use crate::models::{DefaultTerminal, MacTerminalProfile};
+use crate::process::identity::ProcessOwner;
+#[cfg(windows)]
+use crate::process::launcher::{prepare_suspended_pty, LaunchIntent};
+#[cfg(windows)]
+use crate::process::registry::ManagedProcessFence;
+#[cfg(windows)]
+use crate::process::teardown::{
+    ManagedTerminalActorHandles, ManagedTerminalIo, ManagedTerminalTeardown,
+};
+use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
 use crate::services::{pid_file, platform_service};
 use crate::state::{
     PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
@@ -16,17 +27,81 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 use arboard::Clipboard;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty, PtySize, SlavePty};
+#[cfg(not(windows))]
+use portable_pty::{ChildKiller, CommandBuilder};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Exact host-issued launch and teardown authority for one terminal runtime.
+/// The terminal layer cannot invent Task ownership, resource generations, or
+/// action epochs; the native host/task service must supply all of them.
+#[derive(Clone)]
+pub(crate) struct TerminalLaunchAuthority {
+    owner: ProcessOwner,
+    resource_id: ResourceId,
+    runtime_generation: u64,
+    operation_id: OperationId,
+    action_epoch: u64,
+    ports: Vec<u16>,
+    completion_store: TeardownCompletionStore,
+}
+
+impl TerminalLaunchAuthority {
+    pub(crate) fn new(
+        owner: ProcessOwner,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        operation_id: OperationId,
+        action_epoch: u64,
+        ports: Vec<u16>,
+        completion_store: TeardownCompletionStore,
+    ) -> Result<Self, String> {
+        if runtime_generation == 0 || action_epoch == 0 {
+            return Err("terminal launch generation and action epoch must be non-zero".to_string());
+        }
+        if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        let mut ports = ports;
+        ports.sort_unstable();
+        ports.dedup();
+        Ok(Self {
+            owner,
+            resource_id,
+            runtime_generation,
+            operation_id,
+            action_epoch,
+            ports,
+            completion_store,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self) -> (ProcessOwner, ResourceId, u64, u64) {
+        (
+            self.owner,
+            self.resource_id,
+            self.runtime_generation,
+            self.action_epoch,
+        )
+    }
+}
+
 type SessionStateNotifier = Arc<dyn Fn() + Send + Sync>;
 type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
 
@@ -303,11 +378,51 @@ impl EventListener for SessionEventProxy {
     }
 }
 
+#[cfg(not(windows))]
+#[derive(Default)]
+struct TerminalActorHandles {
+    reader: Option<thread::JoinHandle<()>>,
+    waiter: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+type TerminalActorHandles = ManagedTerminalActorHandles;
+
+#[derive(Default)]
+struct TerminalActorStartGate {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl TerminalActorStartGate {
+    fn wait(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+}
+
 pub struct TerminalSession {
     session_id: String,
     term: Arc<Mutex<Term<SessionEventProxy>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: Arc<Mutex<TerminalActorHandles>>,
     #[cfg(not(windows))]
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     #[cfg(windows)]
@@ -322,7 +437,7 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn spawn(
+    pub(crate) fn spawn(
         session_id: impl Into<String>,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -334,6 +449,7 @@ impl TerminalSession {
         debug_enabled: bool,
         state_notifier: Option<SessionStateNotifier>,
         output_notifier: Option<SessionOutputNotifier>,
+        authority: TerminalLaunchAuthority,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         let backend = TerminalBackend::PortablePtyFeedingAlacritty;
@@ -361,6 +477,7 @@ impl TerminalSession {
                 true,
                 state_notifier.clone(),
                 output_notifier.clone(),
+                authority.clone(),
             ) {
                 Ok(session) => return Ok(session),
                 Err(error) => last_error = Some(format!("{}: {}", candidate.program, error)),
@@ -370,7 +487,7 @@ impl TerminalSession {
         Err(last_error.unwrap_or_else(|| "No shell candidate could be spawned".to_string()))
     }
 
-    pub fn spawn_command(
+    pub(crate) fn spawn_command(
         session_id: impl Into<String>,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -383,6 +500,7 @@ impl TerminalSession {
         debug_enabled: bool,
         state_notifier: Option<SessionStateNotifier>,
         output_notifier: Option<SessionOutputNotifier>,
+        authority: TerminalLaunchAuthority,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         spawn_with_command(
@@ -400,6 +518,7 @@ impl TerminalSession {
             true,
             state_notifier,
             output_notifier,
+            authority,
         )
     }
 
@@ -466,11 +585,13 @@ impl TerminalSession {
 
     pub fn resize(&self, dimensions: SessionDimensions) -> Result<(), String> {
         {
-            let master = self
+            let mut master = self
                 .master
                 .lock()
                 .map_err(|_| "PTY master poisoned".to_string())?;
             master
+                .as_mut()
+                .ok_or_else(|| "PTY master is closed".to_string())?
                 .resize(pty_size(dimensions))
                 .map_err(|error| format!("Failed to resize PTY: {error}"))?;
         }
@@ -616,6 +737,31 @@ impl TerminalSession {
     }
 
     pub fn close(&self, closed_by_user: bool) -> Result<(), String> {
+        self.note_close_requested(closed_by_user);
+
+        self.sync_tracked_descendants();
+        #[cfg(windows)]
+        {
+            let teardown = self
+                .teardown
+                .lock()
+                .map_err(|_| "Session teardown poisoned".to_string())?
+                .clone()
+                .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
+            Self::close_managed_teardown(&teardown)
+        }
+        #[cfg(not(windows))]
+        {
+            self.killer
+                .lock()
+                .map_err(|_| "Session killer poisoned".to_string())?
+                .kill()
+                .map_err(|error| format!("Failed to terminate shell session: {error}"))?;
+            self.detach_pty_and_join_actors()
+        }
+    }
+
+    fn note_close_requested(&self, closed_by_user: bool) {
         if let Ok(mut runtime) = self.runtime_state.write() {
             if let Some(session) = runtime.sessions.get_mut(&self.session_id) {
                 session.status = SessionStatus::Stopping;
@@ -632,38 +778,63 @@ impl TerminalSession {
                 session.mark_dirty();
             }
         }
+    }
 
-        self.sync_tracked_descendants();
-        #[cfg(windows)]
-        {
-            let teardown = self
-                .teardown
-                .lock()
-                .map_err(|_| "Session teardown poisoned".to_string())?
-                .clone()
-                .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
-            let report = teardown.close()?;
-            if report.outcome() == crate::process::teardown::TeardownOutcome::Closed {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Terminal teardown did not close: {:?}; errors: {:?}",
-                    report.outcome(),
-                    report.errors()
-                ))
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            self.killer
-                .lock()
-                .map_err(|_| "Session killer poisoned".to_string())?
-                .kill()
-                .map_err(|error| format!("Failed to terminate shell session: {error}"))
+    #[cfg(windows)]
+    fn close_managed_teardown(teardown: &ManagedTerminalTeardown) -> Result<(), String> {
+        let report = teardown.close()?;
+        if report.outcome() == crate::process::teardown::TeardownOutcome::Closed {
+            Ok(())
+        } else {
+            Err(format!(
+                "Terminal teardown did not close: {:?}; errors: {:?}",
+                report.outcome(),
+                report.errors()
+            ))
         }
     }
 
-    pub fn restart_command(
+    /// Closes only the exact terminal generation selected by the caller. A
+    /// concurrent restart can replace the session slot, but can never cause a
+    /// stale diagnostic action to terminate that replacement.
+    #[cfg(windows)]
+    pub(crate) fn close_managed_process_exact(
+        &self,
+        expected: &ManagedProcessFence,
+        closed_by_user: bool,
+    ) -> Result<(), String> {
+        let teardown = self
+            .teardown
+            .lock()
+            .map_err(|_| "Session teardown poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
+        if !teardown.matches_fence(expected) {
+            return Err(
+                "Managed terminal generation changed before teardown admission".to_string(),
+            );
+        }
+        self.note_close_requested(closed_by_user);
+        self.sync_tracked_descendants();
+        Self::close_managed_teardown(&teardown)
+    }
+
+    #[cfg(not(windows))]
+    fn detach_pty_and_join_actors(&self) -> Result<(), String> {
+        detach_pty_and_join_actor_slots(&self.writer, &self.master, &self.actors)
+    }
+
+    #[cfg(test)]
+    fn live_actor_count_for_test(&self) -> usize {
+        self.actors
+            .lock()
+            .map(|actors| {
+                usize::from(actors.reader.is_some()) + usize::from(actors.waiter.is_some())
+            })
+            .unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn restart_command(
         &self,
         cwd: PathBuf,
         dimensions: SessionDimensions,
@@ -672,6 +843,7 @@ impl TerminalSession {
         env: HashMap<String, String>,
         log_file_path: Option<PathBuf>,
         track_pid: bool,
+        authority: TerminalLaunchAuthority,
     ) -> Result<(), String> {
         self.close(false)?;
 
@@ -679,34 +851,41 @@ impl TerminalSession {
         let pair = pty_system
             .openpty(pty_size(dimensions))
             .map_err(|error| error.to_string())?;
-        let mut command = CommandBuilder::new(program.clone());
-        if let Some(valid_cwd) = existing_directory(&cwd) {
-            command.cwd(valid_cwd);
-        }
-        if !args.is_empty() {
-            command.args(args.clone());
-        }
-        apply_terminal_env_defaults(&mut command, env);
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("Failed to spawn command: {error}"))?;
+        #[cfg(windows)]
+        let io = ManagedTerminalIo::new(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.master),
+            Arc::clone(&self.actors),
+        );
+        #[cfg(windows)]
+        let (child, teardown) = spawn_suspended_managed_terminal(
+            &*pair.slave,
+            &self.session_id,
+            &cwd,
+            &program,
+            &args,
+            env,
+            authority,
+            io,
+        )?;
+        #[cfg(not(windows))]
+        let child = {
+            let mut command = CommandBuilder::new(program.clone());
+            if let Some(valid_cwd) = existing_directory(&cwd) {
+                command.cwd(valid_cwd);
+            }
+            if !args.is_empty() {
+                command.args(args.clone());
+            }
+            apply_terminal_env_defaults(&mut command, env);
+            pair.slave
+                .spawn_command(command)
+                .map_err(|error| format!("Failed to spawn command: {error}"))?
+        };
 
         let pid = child.process_id();
+        #[cfg(not(windows))]
         let mut cleanup_killer = child.clone_killer();
-        #[cfg(windows)]
-        let teardown = match attach_managed_terminal_teardown(pid, &program) {
-            Ok(teardown) => teardown,
-            Err(error) => {
-                cleanup_failed_spawn(
-                    &mut cleanup_killer,
-                    #[cfg(windows)]
-                    None,
-                );
-                return Err(error);
-            }
-        };
         #[cfg(windows)]
         let teardown_handle = Arc::new(Mutex::new(Some(teardown.clone())));
         #[cfg(not(windows))]
@@ -716,9 +895,10 @@ impl TerminalSession {
             Ok(writer) => writer,
             Err(error) => {
                 cleanup_failed_spawn(
+                    #[cfg(not(windows))]
                     &mut cleanup_killer,
                     #[cfg(windows)]
-                    Some(&teardown),
+                    &teardown,
                 );
                 return Err(format!("Failed to acquire PTY writer: {error}"));
             }
@@ -727,9 +907,10 @@ impl TerminalSession {
             Ok(reader) => reader,
             Err(error) => {
                 cleanup_failed_spawn(
+                    #[cfg(not(windows))]
                     &mut cleanup_killer,
                     #[cfg(windows)]
-                    Some(&teardown),
+                    &teardown,
                 );
                 return Err(format!("Failed to clone PTY reader: {error}"));
             }
@@ -741,9 +922,10 @@ impl TerminalSession {
                 Ok(writer_slot) => writer_slot,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     return Err("PTY writer poisoned".to_string());
                 }
@@ -755,14 +937,15 @@ impl TerminalSession {
                 Ok(master_slot) => master_slot,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     return Err("PTY master poisoned".to_string());
                 }
             };
-            *master_slot = pair.master;
+            *master_slot = Some(pair.master);
         }
         {
             #[cfg(not(windows))]
@@ -770,9 +953,10 @@ impl TerminalSession {
                 Ok(killer_slot) => killer_slot,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     #[cfg(not(windows))]
                     drop(process_job.take());
@@ -789,9 +973,10 @@ impl TerminalSession {
                 Ok(current_dimensions) => current_dimensions,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     return Err("Size lock poisoned".to_string());
                 }
@@ -803,9 +988,10 @@ impl TerminalSession {
                 Ok(term) => term,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     return Err("Terminal state poisoned".to_string());
                 }
@@ -831,9 +1017,10 @@ impl TerminalSession {
                 track_managed_process(&self.runtime_state, &self.session_id, pid, &program)
             {
                 cleanup_failed_spawn(
+                    #[cfg(not(windows))]
                     &mut cleanup_killer,
                     #[cfg(windows)]
-                    Some(&teardown),
+                    &teardown,
                 );
                 return Err(error);
             }
@@ -848,9 +1035,10 @@ impl TerminalSession {
                 Ok(job_slot) => job_slot,
                 Err(_) => {
                     cleanup_failed_spawn(
+                        #[cfg(not(windows))]
                         &mut cleanup_killer,
                         #[cfg(windows)]
-                        Some(&teardown),
+                        &teardown,
                     );
                     drop(process_job.take());
                     return Err("Process job poisoned".to_string());
@@ -860,17 +1048,42 @@ impl TerminalSession {
         }
         #[cfg(windows)]
         {
-            let mut teardown_slot = self
-                .teardown
-                .lock()
-                .map_err(|_| "Session teardown poisoned".to_string())?;
+            let mut teardown_slot = self.teardown.lock().map_err(|_| {
+                cleanup_failed_spawn(&teardown);
+                "Session teardown poisoned".to_string()
+            })?;
             *teardown_slot = teardown_handle
                 .lock()
-                .map_err(|_| "Session teardown poisoned".to_string())?
+                .map_err(|_| {
+                    cleanup_failed_spawn(&teardown);
+                    "Session teardown poisoned".to_string()
+                })?
                 .clone();
         }
 
-        spawn_reader_thread(
+        let mut actor_slots = match self.actors.lock() {
+            Ok(actor_slots) => actor_slots,
+            Err(_) => {
+                cleanup_failed_spawn(
+                    #[cfg(not(windows))]
+                    &mut cleanup_killer,
+                    #[cfg(windows)]
+                    &teardown,
+                );
+                return Err("Terminal actor handles poisoned".to_string());
+            }
+        };
+        if actor_slots.reader.is_some() || actor_slots.waiter.is_some() {
+            cleanup_failed_spawn(
+                #[cfg(not(windows))]
+                &mut cleanup_killer,
+                #[cfg(windows)]
+                &teardown,
+            );
+            return Err("previous terminal actors were not joined before restart".to_string());
+        }
+        let start_gate = Arc::new(TerminalActorStartGate::default());
+        let reader_actor = match spawn_reader_thread(
             self.session_id.clone(),
             reader,
             self.term.clone(),
@@ -880,10 +1093,24 @@ impl TerminalSession {
             self.event_proxy.state_notifier.clone(),
             self.output_notifier.clone(),
             self.replay_buffer.clone(),
+            Arc::clone(&start_gate),
             #[cfg(windows)]
             teardown_handle.clone(),
-        );
-        spawn_wait_thread(
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                drop(actor_slots);
+                cleanup_failed_spawn(
+                    #[cfg(not(windows))]
+                    &mut cleanup_killer,
+                    #[cfg(windows)]
+                    &teardown,
+                );
+                return Err(error);
+            }
+        };
+        actor_slots.reader = Some(reader_actor);
+        let wait_actor = match spawn_wait_thread(
             self.session_id.clone(),
             child,
             pid,
@@ -894,7 +1121,28 @@ impl TerminalSession {
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
-        );
+            Arc::clone(&start_gate),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                drop(actor_slots);
+                start_gate.release();
+                cleanup_failed_spawn(
+                    #[cfg(not(windows))]
+                    &mut cleanup_killer,
+                    #[cfg(windows)]
+                    &teardown,
+                );
+                #[cfg(not(windows))]
+                if self.detach_pty_and_join_actors().is_err() {
+                    std::process::abort();
+                }
+                return Err(error);
+            }
+        };
+        actor_slots.waiter = Some(wait_actor);
+        drop(actor_slots);
+        start_gate.release();
 
         self.event_proxy.debug_log(format!("respawned {}", program));
         Ok(())
@@ -1151,7 +1399,14 @@ impl TerminalReplica {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = self.close(false);
+        if let Err(error) = self.close(false) {
+            eprintln!(
+                "terminal session `{}` dropped before bounded teardown completed: {error}",
+                self.session_id
+            );
+            #[cfg(windows)]
+            std::process::abort();
+        }
     }
 }
 
@@ -1413,6 +1668,7 @@ fn configured_term(scrolling_history: usize) -> TermConfig {
     }
 }
 
+#[cfg(not(windows))]
 fn apply_terminal_env_defaults(command: &mut CommandBuilder, env: HashMap<String, String>) {
     command.env_remove("NO_COLOR");
     command.env_remove("NODE_DISABLE_COLORS");
@@ -1560,6 +1816,91 @@ fn existing_directory(path: &Path) -> Option<&Path> {
     path.is_dir().then_some(path)
 }
 
+#[cfg(windows)]
+fn resolve_terminal_executable(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let supplied = PathBuf::from(program);
+    if supplied.is_absolute() || supplied.components().count() > 1 {
+        let candidate = if supplied.is_absolute() {
+            supplied
+        } else {
+            cwd.join(supplied)
+        };
+        return candidate.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve terminal executable `{}`: {error}",
+                candidate.display()
+            )
+        });
+    }
+    crate::diagnostics::resolve::resolve_all(program)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Terminal executable `{program}` was not found on PATH"))?
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize terminal executable `{program}`: {error}"))
+}
+
+#[cfg(windows)]
+fn managed_terminal_cwd(requested: &Path) -> Result<PathBuf, String> {
+    if let Some(cwd) = existing_directory(requested) {
+        return cwd
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve terminal cwd: {error}"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        if profile.is_dir() {
+            return profile
+                .canonicalize()
+                .map_err(|error| format!("Failed to resolve terminal profile cwd: {error}"));
+        }
+    }
+    std::env::current_dir().map_err(|error| format!("Failed to resolve terminal cwd: {error}"))
+}
+
+#[cfg(windows)]
+fn spawn_suspended_managed_terminal(
+    slave: &dyn SlavePty,
+    session_id: &str,
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    env: HashMap<String, String>,
+    authority: TerminalLaunchAuthority,
+    io: Arc<ManagedTerminalIo>,
+) -> Result<(Box<dyn Child + Send + Sync>, Arc<ManagedTerminalTeardown>), String> {
+    let cwd = managed_terminal_cwd(cwd)?;
+    let executable = resolve_terminal_executable(program, &cwd)?;
+    let environment: BTreeMap<OsString, OsString> = with_terminal_env_defaults(env)
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+    let pending = prepare_suspended_pty(
+        slave,
+        LaunchIntent {
+            resource_id: authority.resource_id,
+            generation: authority.runtime_generation,
+            owner: authority.owner,
+            kind: ResourceKind::Terminal,
+            executable,
+            args: args.iter().map(OsString::from).collect(),
+            cwd,
+            environment,
+            display_label: program.to_string(),
+        },
+    )
+    .map_err(|error| format!("Failed to prepare managed terminal: {error}"))?;
+    let (teardown, child) = ManagedTerminalTeardown::from_pending_launch(
+        pending,
+        authority.operation_id,
+        authority.action_epoch,
+        authority.completion_store,
+        session_id.to_string(),
+        authority.ports,
+        io,
+    )?;
+    Ok((child.into_child(), teardown))
+}
+
 fn session_kind_label(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Shell => "shell",
@@ -1612,20 +1953,87 @@ fn track_managed_process(
     })
 }
 
-fn cleanup_failed_spawn(
-    cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>,
-    #[cfg(windows)] teardown: Option<&Arc<ManagedTerminalTeardown>>,
-) {
-    #[cfg(windows)]
-    if let Some(teardown) = teardown {
-        // Once the managed Job has been registered, every setup failure still
-        // settles through the same coordinator/receiver-owned authority as a
-        // normal close. The raw ChildKiller is only a pre-authority fallback
-        // when attaching the Job itself failed.
-        let _ = teardown.close();
-        return;
+#[cfg(windows)]
+fn cleanup_failed_spawn(teardown: &Arc<ManagedTerminalTeardown>) {
+    // The suspended launcher does not return until Job registration and resume
+    // are one committed handoff. Every later setup failure therefore has exact
+    // coordinator authority; a raw PTY ChildKiller is never minted on Windows.
+    match teardown.close() {
+        Ok(report) if report.outcome() == crate::process::teardown::TeardownOutcome::Closed => {}
+        Ok(report) => {
+            eprintln!(
+                "managed terminal setup cleanup did not close exactly: {:?}",
+                report.errors()
+            );
+            std::process::abort();
+        }
+        Err(error) => {
+            eprintln!("managed terminal setup cleanup failed: {error}");
+            std::process::abort();
+        }
     }
+}
+
+#[cfg(not(windows))]
+fn cleanup_failed_spawn(cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>) {
     let _ = cleanup_killer.kill();
+}
+
+#[cfg(not(windows))]
+fn detach_pty_and_join_actor_slots(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    master: &Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: &Arc<Mutex<TerminalActorHandles>>,
+) -> Result<(), String> {
+    // Dropping the host PTY handles is the cancellation boundary for the
+    // blocking reader. The process wait actor is terminal after the child is
+    // killed or exits.
+    if let Ok(mut writer) = writer.lock() {
+        let old = std::mem::replace(&mut *writer, Box::new(std::io::sink()));
+        drop(old);
+    }
+    master
+        .lock()
+        .map_err(|_| "PTY master poisoned".to_string())?
+        .take();
+
+    let mut actors = actors
+        .lock()
+        .map_err(|_| "Terminal actor handles poisoned".to_string())?;
+    let current = thread::current().id();
+    for handle in [&actors.reader, &actors.waiter].into_iter().flatten() {
+        if handle.thread().id() == current {
+            return Err("terminal actor attempted to synchronously join itself".to_string());
+        }
+    }
+
+    let cancellation_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while [&actors.reader, &actors.waiter]
+        .into_iter()
+        .flatten()
+        .any(|handle| !handle.is_finished())
+        && std::time::Instant::now() < cancellation_deadline
+    {
+        thread::yield_now();
+    }
+    if [&actors.reader, &actors.waiter]
+        .into_iter()
+        .flatten()
+        .any(|handle| !handle.is_finished())
+    {
+        return Err("terminal actor did not acknowledge bounded PTY cancellation".to_string());
+    }
+    if let Some(reader) = actors.reader.take() {
+        reader
+            .join()
+            .map_err(|_| "terminal reader actor panicked".to_string())?;
+    }
+    if let Some(waiter) = actors.waiter.take() {
+        waiter
+            .join()
+            .map_err(|_| "terminal wait actor panicked".to_string())?;
+    }
+    Ok(())
 }
 
 fn initialize_runtime_entry(
@@ -1664,47 +2072,156 @@ fn spawn_reader_thread(
     state_notifier: Option<SessionStateNotifier>,
     output_notifier: Option<SessionOutputNotifier>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
+    start_gate: Arc<TerminalActorStartGate>,
     #[cfg(windows)] teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
-) {
-    thread::spawn(move || {
-        let mut parser = Processor::<StdSyncHandler>::new();
-        let mut shell_sequences = ShellSequenceParser::default();
-        let mut buffer = [0_u8; 4096];
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("terminal-reader-{session_id}"))
+        .spawn(move || {
+            start_gate.wait();
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let mut shell_sequences = ShellSequenceParser::default();
+            let mut buffer = [0_u8; 4096];
 
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    if debug_enabled {
-                        eprintln!("[terminal:{session_id}] PTY reader reached EOF");
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        if debug_enabled {
+                            eprintln!("[terminal:{session_id}] PTY reader reached EOF");
+                        }
+                        break;
                     }
-                    break;
+                    Ok(bytes_read) => {
+                        let mode = apply_terminal_output_chunk(
+                            &session_id,
+                            &buffer[..bytes_read],
+                            &term,
+                            &mut parser,
+                            &mut shell_sequences,
+                            &runtime_state,
+                        );
+                        append_replay_bytes(&replay_buffer, &buffer[..bytes_read]);
+
+                        if let Some(writer) = log_writer.as_mut() {
+                            writer.write_chunk(&buffer[..bytes_read]);
+                        }
+
+                        if let Some(notifier) = output_notifier.as_ref() {
+                            notifier(buffer[..bytes_read].to_vec(), mode);
+                        }
+                        if let Some(notifier) = state_notifier.as_ref() {
+                            notifier();
+                        }
+                    }
+                    Err(error) => {
+                        if debug_enabled {
+                            eprintln!("[terminal:{session_id}] PTY read error: {error}");
+                        }
+                        if let Ok(mut runtime) = runtime_state.write() {
+                            if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                                session.note_exit(
+                                    SessionExitState {
+                                        code: None,
+                                        signal: None,
+                                        closed_by_user: false,
+                                        summary: format!("PTY read failed: {error}"),
+                                    },
+                                    SessionStatus::Failed,
+                                );
+                            }
+                        }
+                        if let Some(notifier) = state_notifier.as_ref() {
+                            notifier();
+                        }
+                        #[cfg(windows)]
+                        request_managed_terminal_teardown(&teardown);
+                        break;
+                    }
                 }
-                Ok(bytes_read) => {
-                    let mode = apply_terminal_output_chunk(
-                        &session_id,
-                        &buffer[..bytes_read],
-                        &term,
-                        &mut parser,
-                        &mut shell_sequences,
-                        &runtime_state,
-                    );
-                    append_replay_bytes(&replay_buffer, &buffer[..bytes_read]);
+            }
 
-                    if let Some(writer) = log_writer.as_mut() {
-                        writer.write_chunk(&buffer[..bytes_read]);
+            if let Some(writer) = log_writer.as_mut() {
+                writer.flush_remaining();
+            }
+        })
+        .map_err(|error| format!("Failed to spawn terminal reader actor: {error}"))
+}
+
+fn spawn_wait_thread(
+    session_id: String,
+    mut child: Box<dyn Child + Send + Sync>,
+    #[cfg_attr(windows, allow(unused_variables))] pid: Option<u32>,
+    #[cfg(windows)] teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
+    #[cfg(not(windows))] process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
+    runtime_state: Arc<RwLock<RuntimeState>>,
+    debug_enabled: bool,
+    state_notifier: Option<SessionStateNotifier>,
+    start_gate: Arc<TerminalActorStartGate>,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("terminal-wait-{session_id}"))
+        .spawn(move || {
+            start_gate.wait();
+            match child.wait() {
+                Ok(status) => {
+                    if debug_enabled {
+                        eprintln!("[terminal:{session_id}] child exit -> {status}");
                     }
-
-                    if let Some(notifier) = output_notifier.as_ref() {
-                        notifier(buffer[..bytes_read].to_vec(), mode);
+                    #[cfg(windows)]
+                    request_managed_terminal_teardown(&teardown);
+                    #[cfg(not(windows))]
+                    drop_managed_process_job(&process_job);
+                    #[cfg(not(windows))]
+                    thread::sleep(Duration::from_millis(50));
+                    #[cfg(not(windows))]
+                    let surviving_descendants = pid
+                        .map(platform_service::collect_descendant_process_identities)
+                        .unwrap_or_default();
+                    if let Ok(mut runtime) = runtime_state.write() {
+                        if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                            let closed_by_user = session
+                                .exit
+                                .as_ref()
+                                .map(|exit| exit.closed_by_user)
+                                .unwrap_or(false);
+                            session.note_exit(
+                                SessionExitState {
+                                    code: Some(status.exit_code()),
+                                    signal: status.signal().map(str::to_string),
+                                    closed_by_user,
+                                    summary: if let Some(signal) = status.signal() {
+                                        format!("Shell terminated by {signal}")
+                                    } else {
+                                        format!("Shell exited with code {}", status.exit_code())
+                                    },
+                                },
+                                SessionStatus::Exited,
+                            );
+                        }
                     }
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
                     }
+                    #[cfg(not(windows))]
+                    if let Some(pid) = pid {
+                        let _ =
+                            pid_file::release_session_root(&session_id, pid, surviving_descendants);
+                    }
                 }
                 Err(error) => {
                     if debug_enabled {
-                        eprintln!("[terminal:{session_id}] PTY read error: {error}");
+                        eprintln!("[terminal:{session_id}] wait error: {error}");
                     }
+                    #[cfg(windows)]
+                    request_managed_terminal_teardown(&teardown);
+                    #[cfg(not(windows))]
+                    drop_managed_process_job(&process_job);
+                    #[cfg(not(windows))]
+                    thread::sleep(Duration::from_millis(50));
+                    #[cfg(not(windows))]
+                    let surviving_descendants = pid
+                        .map(platform_service::collect_descendant_process_identities)
+                        .unwrap_or_default();
                     if let Ok(mut runtime) = runtime_state.write() {
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
                             session.note_exit(
@@ -1712,7 +2229,9 @@ fn spawn_reader_thread(
                                     code: None,
                                     signal: None,
                                     closed_by_user: false,
-                                    summary: format!("PTY read failed: {error}"),
+                                    summary: format!(
+                                        "Failed while waiting for shell exit: {error}"
+                                    ),
                                 },
                                 SessionStatus::Failed,
                             );
@@ -1721,104 +2240,15 @@ fn spawn_reader_thread(
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
                     }
-                    #[cfg(windows)]
-                    request_managed_terminal_teardown(&teardown);
-                    break;
+                    #[cfg(not(windows))]
+                    if let Some(pid) = pid {
+                        let _ =
+                            pid_file::release_session_root(&session_id, pid, surviving_descendants);
+                    }
                 }
             }
-        }
-
-        if let Some(writer) = log_writer.as_mut() {
-            writer.flush_remaining();
-        }
-    });
-}
-
-fn spawn_wait_thread(
-    session_id: String,
-    mut child: Box<dyn Child + Send + Sync>,
-    pid: Option<u32>,
-    #[cfg(windows)] teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
-    #[cfg(not(windows))] process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
-    runtime_state: Arc<RwLock<RuntimeState>>,
-    debug_enabled: bool,
-    state_notifier: Option<SessionStateNotifier>,
-) {
-    thread::spawn(move || match child.wait() {
-        Ok(status) => {
-            if debug_enabled {
-                eprintln!("[terminal:{session_id}] child exit -> {status}");
-            }
-            #[cfg(windows)]
-            request_managed_terminal_teardown(&teardown);
-            #[cfg(not(windows))]
-            drop_managed_process_job(&process_job);
-            thread::sleep(Duration::from_millis(50));
-            let surviving_descendants = pid
-                .map(platform_service::collect_descendant_process_identities)
-                .unwrap_or_default();
-            if let Ok(mut runtime) = runtime_state.write() {
-                if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                    let closed_by_user = session
-                        .exit
-                        .as_ref()
-                        .map(|exit| exit.closed_by_user)
-                        .unwrap_or(false);
-                    session.note_exit(
-                        SessionExitState {
-                            code: Some(status.exit_code()),
-                            signal: status.signal().map(str::to_string),
-                            closed_by_user,
-                            summary: if let Some(signal) = status.signal() {
-                                format!("Shell terminated by {signal}")
-                            } else {
-                                format!("Shell exited with code {}", status.exit_code())
-                            },
-                        },
-                        SessionStatus::Exited,
-                    );
-                }
-            }
-            if let Some(notifier) = state_notifier.as_ref() {
-                notifier();
-            }
-            if let Some(pid) = pid {
-                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
-            }
-        }
-        Err(error) => {
-            if debug_enabled {
-                eprintln!("[terminal:{session_id}] wait error: {error}");
-            }
-            #[cfg(windows)]
-            request_managed_terminal_teardown(&teardown);
-            #[cfg(not(windows))]
-            drop_managed_process_job(&process_job);
-            thread::sleep(Duration::from_millis(50));
-            let surviving_descendants = pid
-                .map(platform_service::collect_descendant_process_identities)
-                .unwrap_or_default();
-            if let Ok(mut runtime) = runtime_state.write() {
-                if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                    session.note_exit(
-                        SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: format!("Failed while waiting for shell exit: {error}"),
-                        },
-                        SessionStatus::Failed,
-                    );
-                }
-            }
-            if let Some(notifier) = state_notifier.as_ref() {
-                notifier();
-            }
-            if let Some(pid) = pid {
-                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
-            }
-        }
-    });
+        })
+        .map_err(|error| format!("Failed to spawn terminal wait actor: {error}"))
 }
 
 fn spawn_with_command(
@@ -1836,6 +2266,7 @@ fn spawn_with_command(
     track_pid: bool,
     state_notifier: Option<SessionStateNotifier>,
     output_notifier: Option<SessionOutputNotifier>,
+    authority: TerminalLaunchAuthority,
 ) -> Result<TerminalSession, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1843,62 +2274,102 @@ fn spawn_with_command(
         .map_err(|error| error.to_string())?;
     let scrolling_history = scrolling_history.max(100);
 
-    let mut command = CommandBuilder::new(program.clone());
-    if let Some(valid_cwd) = existing_directory(&cwd) {
-        command.cwd(valid_cwd);
-    }
-    if !args.is_empty() {
-        command.args(args.clone());
-    }
-    apply_terminal_env_defaults(&mut command, env);
-
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("Failed to spawn command: {error}"))?;
+    #[cfg(windows)]
+    let writer = Arc::new(Mutex::new(
+        Box::new(std::io::sink()) as Box<dyn Write + Send>
+    ));
+    #[cfg(windows)]
+    let master = Arc::new(Mutex::new(None));
+    let actors = Arc::new(Mutex::new(TerminalActorHandles::default()));
+    #[cfg(windows)]
+    let io = ManagedTerminalIo::new(
+        Arc::clone(&writer),
+        Arc::clone(&master),
+        Arc::clone(&actors),
+    );
+    #[cfg(windows)]
+    let (child, teardown) = spawn_suspended_managed_terminal(
+        &*pair.slave,
+        session_id,
+        &cwd,
+        &program,
+        &args,
+        env,
+        authority,
+        io,
+    )?;
+    #[cfg(not(windows))]
+    let child = {
+        let mut command = CommandBuilder::new(program.clone());
+        if let Some(valid_cwd) = existing_directory(&cwd) {
+            command.cwd(valid_cwd);
+        }
+        if !args.is_empty() {
+            command.args(args.clone());
+        }
+        apply_terminal_env_defaults(&mut command, env);
+        pair.slave
+            .spawn_command(command)
+            .map_err(|error| format!("Failed to spawn command: {error}"))?
+    };
 
     let pid = child.process_id();
+    #[cfg(not(windows))]
     let mut cleanup_killer = child.clone_killer();
-    #[cfg(windows)]
-    let teardown = match attach_managed_terminal_teardown(pid, &program) {
-        Ok(teardown) => teardown,
-        Err(error) => {
-            cleanup_failed_spawn(
-                &mut cleanup_killer,
-                #[cfg(windows)]
-                None,
-            );
-            return Err(error);
-        }
-    };
     #[cfg(not(windows))]
     let process_job = attach_managed_process_job(pid);
-    let writer = match pair.master.take_writer() {
+    let acquired_writer = match pair.master.take_writer() {
         Ok(writer) => writer,
         Err(error) => {
             cleanup_failed_spawn(
+                #[cfg(not(windows))]
                 &mut cleanup_killer,
                 #[cfg(windows)]
-                Some(&teardown),
+                &teardown,
             );
             return Err(format!("Failed to acquire PTY writer: {error}"));
         }
     };
+    #[cfg(windows)]
+    {
+        let mut writer_slot = match writer.lock() {
+            Ok(writer_slot) => writer_slot,
+            Err(_) => {
+                cleanup_failed_spawn(&teardown);
+                return Err("terminal PTY writer poisoned".to_string());
+            }
+        };
+        *writer_slot = acquired_writer;
+    }
     let reader = match pair.master.try_clone_reader() {
         Ok(reader) => reader,
         Err(error) => {
             cleanup_failed_spawn(
+                #[cfg(not(windows))]
                 &mut cleanup_killer,
                 #[cfg(windows)]
-                Some(&teardown),
+                &teardown,
             );
             return Err(format!("Failed to clone PTY reader: {error}"));
         }
     };
     let log_writer = open_log_writer(log_file_path);
 
-    let writer = Arc::new(Mutex::new(writer));
-    let master = Arc::new(Mutex::new(pair.master));
+    #[cfg(not(windows))]
+    let writer = Arc::new(Mutex::new(acquired_writer));
+    #[cfg(windows)]
+    {
+        let mut master_slot = match master.lock() {
+            Ok(master_slot) => master_slot,
+            Err(_) => {
+                cleanup_failed_spawn(&teardown);
+                return Err("terminal PTY master poisoned".to_string());
+            }
+        };
+        *master_slot = Some(pair.master);
+    }
+    #[cfg(not(windows))]
+    let master = Arc::new(Mutex::new(Some(pair.master)));
     #[cfg(not(windows))]
     let killer = Arc::new(Mutex::new(child.clone_killer()));
     #[cfg(not(windows))]
@@ -1934,15 +2405,31 @@ fn spawn_with_command(
     if track_pid {
         if let Err(error) = track_managed_process(&runtime_state, session_id, pid, &program) {
             cleanup_failed_spawn(
+                #[cfg(not(windows))]
                 &mut cleanup_killer,
                 #[cfg(windows)]
-                Some(&teardown),
+                &teardown,
             );
             return Err(error);
         }
     }
 
-    spawn_reader_thread(
+    #[cfg(windows)]
+    let teardown_handle = Arc::new(Mutex::new(Some(teardown.clone())));
+    let mut actor_slots = match actors.lock() {
+        Ok(actor_slots) => actor_slots,
+        Err(_) => {
+            cleanup_failed_spawn(
+                #[cfg(not(windows))]
+                &mut cleanup_killer,
+                #[cfg(windows)]
+                &teardown,
+            );
+            return Err("terminal actor handles poisoned".to_string());
+        }
+    };
+    let start_gate = Arc::new(TerminalActorStartGate::default());
+    let reader_actor = match spawn_reader_thread(
         session_id.to_string(),
         reader,
         term.clone(),
@@ -1952,22 +2439,57 @@ fn spawn_with_command(
         state_notifier.clone(),
         output_notifier.clone(),
         replay_buffer.clone(),
+        Arc::clone(&start_gate),
         #[cfg(windows)]
-        Arc::new(Mutex::new(Some(teardown.clone()))),
-    );
+        teardown_handle.clone(),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
+            drop(actor_slots);
+            cleanup_failed_spawn(
+                #[cfg(not(windows))]
+                &mut cleanup_killer,
+                #[cfg(windows)]
+                &teardown,
+            );
+            return Err(error);
+        }
+    };
+    actor_slots.reader = Some(reader_actor);
 
-    spawn_wait_thread(
+    let wait_actor = match spawn_wait_thread(
         session_id.to_string(),
         child,
         pid,
         #[cfg(windows)]
-        Arc::new(Mutex::new(Some(teardown.clone()))),
+        teardown_handle,
         #[cfg(not(windows))]
         process_job.clone(),
         runtime_state.clone(),
         debug_enabled,
         state_notifier,
-    );
+        Arc::clone(&start_gate),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
+            drop(actor_slots);
+            start_gate.release();
+            cleanup_failed_spawn(
+                #[cfg(not(windows))]
+                &mut cleanup_killer,
+                #[cfg(windows)]
+                &teardown,
+            );
+            #[cfg(not(windows))]
+            if detach_pty_and_join_actor_slots(&writer, &master, &actors).is_err() {
+                std::process::abort();
+            }
+            return Err(error);
+        }
+    };
+    actor_slots.waiter = Some(wait_actor);
+    drop(actor_slots);
+    start_gate.release();
 
     event_proxy.debug_log(format!("spawned {}", program));
 
@@ -1976,6 +2498,7 @@ fn spawn_with_command(
         term,
         writer,
         master,
+        actors,
         #[cfg(not(windows))]
         killer,
         #[cfg(windows)]
@@ -2004,11 +2527,12 @@ impl TerminalSession {
     ///
     /// Does not expose the raw Job handle. Query failures degrade to `None`
     /// after emitting a concise diagnostic.
-    pub fn managed_process_ids(&self) -> Option<Vec<u32>> {
+    pub(crate) fn managed_process_ids(&self) -> Option<Vec<u32>> {
         #[cfg(windows)]
         {
-            let teardown = self.teardown.lock().ok()?.clone()?;
-            return teardown.active_process_ids().ok();
+            return self
+                .managed_process_snapshot()
+                .map(|(_, active_process_ids)| active_process_ids);
         }
         #[cfg(not(windows))]
         {
@@ -2026,24 +2550,22 @@ impl TerminalSession {
             }
         }
     }
-}
 
-#[cfg(windows)]
-fn attach_managed_terminal_teardown(
-    pid: Option<u32>,
-    program: &str,
-) -> Result<Arc<ManagedTerminalTeardown>, String> {
-    let pid = pid.ok_or_else(|| "Managed terminal process has no PID".to_string())?;
-    let job = platform_service::attach_process_to_managed_job(pid)?
-        .ok_or_else(|| "Managed Job Objects are unavailable for terminal process".to_string())?;
-    ManagedTerminalTeardown::new(pid, job, program)
+    /// Snapshots the exact managed root fence and current Job membership from
+    /// the teardown-owned registry. This deliberately exposes neither the Job
+    /// handle nor any raw termination operation.
+    #[cfg(windows)]
+    pub(crate) fn managed_process_snapshot(&self) -> Option<(ManagedProcessFence, Vec<u32>)> {
+        let teardown = self.teardown.lock().ok()?.clone()?;
+        teardown.managed_process_snapshot().ok()
+    }
 }
 
 #[cfg(windows)]
 fn request_managed_terminal_teardown(teardown: &Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>) {
     let context = teardown.lock().ok().and_then(|slot| slot.clone());
     if let Some(context) = context {
-        let _ = context.close();
+        let _ = context.request_close();
     }
 }
 
@@ -2637,6 +3159,162 @@ fn apply_shell_sequences(
 mod tests {
     use super::*;
     use std::io;
+
+    #[cfg(windows)]
+    #[test]
+    fn production_terminal_spawn_uses_suspended_managed_launch() {
+        let launches_before = crate::process::launcher::managed_launch_count_for_test();
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal teardown journal");
+        let resource_id = ResourceId::new();
+        let completion_store =
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            completion_store.clone(),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "suspended-managed-terminal-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn production terminal");
+
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 1,
+            "the production terminal path must register its suspended root before resume"
+        );
+        let (fence, active_process_ids) = session
+            .managed_process_snapshot()
+            .expect("exact managed process snapshot");
+        assert!(
+            active_process_ids.contains(&fence.root().id().pid()),
+            "the root named by the exact PID/creation/executable/generation fence must be in the authoritative Job"
+        );
+        let restart_authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            resource_id,
+            2,
+            OperationId::new(),
+            2,
+            Vec::new(),
+            completion_store,
+        )
+        .expect("terminal restart authority");
+        session
+            .restart_command(
+                std::env::current_dir().expect("restart test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                None,
+                false,
+                restart_authority,
+            )
+            .expect("restart through suspended managed launch");
+        assert_eq!(
+            crate::process::launcher::managed_launch_count_for_test(),
+            launches_before + 2,
+            "restart must use the same suspended-in-Job production path"
+        );
+        let (restart_fence, restart_process_ids) = session
+            .managed_process_snapshot()
+            .expect("restarted exact managed process snapshot");
+        assert_eq!(restart_fence.resource().runtime_generation, 2);
+        assert!(restart_process_ids.contains(&restart_fence.root().id().pid()));
+        session.close(false).expect("close managed terminal");
+        assert_eq!(
+            session.live_actor_count_for_test(),
+            0,
+            "terminal close must join its reader and wait actors before returning"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_terminal_drop_closes_job_and_joins_real_pty_actors() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal drop teardown journal");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        let session = spawn_with_command(
+            "suspended-managed-terminal-drop-test",
+            std::env::current_dir().expect("test cwd"),
+            SessionDimensions::default(),
+            "cmd.exe".to_string(),
+            vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                "ping -n 30 127.0.0.1 >nul".to_string(),
+            ],
+            HashMap::new(),
+            100,
+            None,
+            runtime,
+            false,
+            TerminalBackend::PortablePtyFeedingAlacritty,
+            false,
+            None,
+            None,
+            authority,
+        )
+        .expect("spawn production terminal for drop");
+        let pid = session
+            .managed_process_snapshot()
+            .expect("drop-test managed process snapshot")
+            .0
+            .root()
+            .id()
+            .pid();
+
+        drop(session);
+
+        assert!(
+            !platform_service::is_pid_running(pid),
+            "TerminalSession::drop must synchronously close its Job-owned root"
+        );
+    }
 
     fn test_event_proxy(dimensions: SessionDimensions) -> SessionEventProxy {
         SessionEventProxy {

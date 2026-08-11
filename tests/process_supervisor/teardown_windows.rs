@@ -326,7 +326,7 @@ impl TeardownEffects for WindowsEffects {
             let result = registry
                 .lock()
                 .expect("Windows registry")
-                .release_stopped_with_authority(&ticket, authority);
+                .release_stopped_with_authority(&ticket, &authority);
             match result {
                 Ok(UnregisterOutcome::Removed(_)) => {
                     *shared_job.lock().expect("Windows Job lock") = None;

@@ -3,10 +3,15 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
+#[cfg(test)]
 use std::io;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use portable_pty::{Child, CommandBuilder, ExitStatus, SlavePty};
+#[cfg(test)]
+use portable_pty::ExitStatus;
+use portable_pty::{Child, CommandBuilder, SlavePty};
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
@@ -18,8 +23,16 @@ use crate::process::registry::{
     UnregisterOutcome,
 };
 
+#[cfg(test)]
+static MANAGED_LAUNCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn managed_launch_count_for_test() -> usize {
+    MANAGED_LAUNCH_COUNT.load(Ordering::SeqCst)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedLaunchStage {
+pub(crate) enum ManagedLaunchStage {
     Unsupported,
     Validation,
     JobCreation,
@@ -30,9 +43,10 @@ pub enum ManagedLaunchStage {
 }
 
 #[derive(Debug)]
-pub struct ManagedLaunchError {
+pub(crate) struct ManagedLaunchError {
     stage: ManagedLaunchStage,
     detail: String,
+    #[cfg(test)]
     registry_error: Option<ProcessRegistryError>,
 }
 
@@ -41,6 +55,7 @@ impl ManagedLaunchError {
         Self {
             stage,
             detail: detail.into(),
+            #[cfg(test)]
             registry_error: None,
         }
     }
@@ -54,14 +69,12 @@ impl ManagedLaunchError {
         Self {
             stage: ManagedLaunchStage::Registration,
             detail,
+            #[cfg(test)]
             registry_error: Some(reason),
         }
     }
 
-    pub(crate) fn stage(&self) -> ManagedLaunchStage {
-        self.stage
-    }
-
+    #[cfg(test)]
     pub(crate) fn registry_error(&self) -> Option<&ProcessRegistryError> {
         self.registry_error.as_ref()
     }
@@ -80,16 +93,16 @@ impl fmt::Display for ManagedLaunchError {
 impl std::error::Error for ManagedLaunchError {}
 
 #[derive(Debug)]
-pub struct LaunchIntent {
-    pub resource_id: ResourceId,
-    pub generation: u64,
-    pub owner: ProcessOwner,
-    pub kind: ResourceKind,
-    pub executable: PathBuf,
-    pub args: Vec<OsString>,
-    pub cwd: PathBuf,
-    pub environment: BTreeMap<OsString, OsString>,
-    pub display_label: String,
+pub(crate) struct LaunchIntent {
+    pub(crate) resource_id: ResourceId,
+    pub(crate) generation: u64,
+    pub(crate) owner: ProcessOwner,
+    pub(crate) kind: ResourceKind,
+    pub(crate) executable: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) environment: BTreeMap<OsString, OsString>,
+    pub(crate) display_label: String,
 }
 
 struct ValidatedLaunchIntent {
@@ -158,6 +171,7 @@ impl LaunchIntent {
     }
 }
 
+#[cfg(all(test, not(windows)))]
 pub(crate) fn is_supported() -> Result<(), ManagedLaunchError> {
     if cfg!(windows) {
         Ok(())
@@ -172,42 +186,38 @@ pub(crate) fn is_supported() -> Result<(), ManagedLaunchError> {
 #[cfg(windows)]
 #[must_use = "a pending managed launch must be registered and resumed or dropped to abort"]
 #[derive(Debug)]
-pub struct PendingManagedLaunch {
+pub(crate) struct PendingManagedLaunch {
     // Keep pending first: ordinary field drop order aborts the child before the
     // final Job handle is closed if a caller abandons this value.
     pending: portable_pty::win::PendingChild,
     job: ManagedProcessJob,
     fence: ResourceFence,
     owner: ProcessOwner,
-    kind: ResourceKind,
     root: ManagedProcessIdentity,
     display_label: ProcessDisplayLabel,
 }
 
 #[cfg(windows)]
 impl PendingManagedLaunch {
+    #[cfg(test)]
     pub(crate) fn process_id(&self) -> u32 {
         self.root.id().pid()
     }
 
-    pub(crate) fn root_identity(&self) -> &ManagedProcessIdentity {
-        &self.root
-    }
-
+    #[cfg(test)]
     pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.job.active_process_ids()
     }
 
-    pub(crate) fn register_and_resume(
+    pub(crate) fn register_suspended(
         self,
         registry: &mut ProcessRegistry<ManagedProcessJob>,
-    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+    ) -> Result<RegisteredPendingManagedLaunch, ManagedLaunchError> {
         let Self {
             pending,
             job,
             fence,
             owner,
-            kind,
             root,
             display_label,
         } = self;
@@ -225,6 +235,46 @@ impl PendingManagedLaunch {
             }
         };
 
+        Ok(RegisteredPendingManagedLaunch {
+            pending,
+            fence: managed_fence,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_and_resume(
+        self,
+        registry: &mut ProcessRegistry<ManagedProcessJob>,
+    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+        self.register_suspended(registry)?.resume(registry)
+    }
+}
+
+/// A suspended root whose exact Job and identity fence are already present in
+/// the authoritative registry.  The host can build every fallible teardown
+/// adapter around this value before crossing the one-way resume boundary.
+#[cfg(windows)]
+#[must_use = "a registered suspended launch must be resumed or dropped to abort"]
+#[derive(Debug)]
+pub(crate) struct RegisteredPendingManagedLaunch {
+    pending: portable_pty::win::PendingChild,
+    fence: crate::process::registry::ManagedProcessFence,
+}
+
+#[cfg(windows)]
+impl RegisteredPendingManagedLaunch {
+    pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
+        &self.fence
+    }
+
+    pub(crate) fn resume(
+        self,
+        registry: &mut ProcessRegistry<ManagedProcessJob>,
+    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+        let Self {
+            pending,
+            fence: managed_fence,
+        } = self;
         let child = match pending.resume() {
             Ok(child) => child,
             Err(error) => {
@@ -248,20 +298,21 @@ impl PendingManagedLaunch {
             .commit_resumed_exact(&managed_fence)
             .expect("newly resumed launch retains its exact Starting registry fence");
 
+        #[cfg(test)]
+        MANAGED_LAUNCH_COUNT.fetch_add(1, Ordering::SeqCst);
+
         Ok(ManagedPtyChild {
             child: Box::new(child),
             fence: managed_fence,
-            kind,
         })
     }
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub struct ManagedPtyChild {
+pub(crate) struct ManagedPtyChild {
     child: Box<dyn Child + Send + Sync>,
     fence: crate::process::registry::ManagedProcessFence,
-    kind: ResourceKind,
 }
 
 #[cfg(windows)]
@@ -270,22 +321,16 @@ impl ManagedPtyChild {
         &self.fence
     }
 
+    #[cfg(test)]
     pub(crate) fn process_id(&self) -> u32 {
         self.child
             .process_id()
             .expect("managed Windows PTY child must expose its PID")
     }
 
-    pub(crate) fn kind(&self) -> ResourceKind {
-        self.kind
-    }
-
+    #[cfg(test)]
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
-    }
-
-    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
     }
 
     pub(crate) fn into_child(self) -> Box<dyn Child + Send + Sync> {
@@ -324,6 +369,8 @@ pub(crate) fn prepare_suspended_pty(
         command.env(key, value);
     }
     for key in [
+        "NO_COLOR",
+        "NODE_DISABLE_COLORS",
         "DEVMANAGER_TASK_ID",
         "DEVMANAGER_RESOURCE_ID",
         "DEVMANAGER_RESOURCE_KIND",
@@ -456,7 +503,6 @@ pub(crate) fn prepare_suspended_pty(
         job,
         fence: intent.fence,
         owner: intent.owner,
-        kind: intent.kind,
         root,
         display_label: intent.display_label,
     })

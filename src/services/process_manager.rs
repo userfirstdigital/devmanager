@@ -13,14 +13,18 @@ use crate::browser::{
     BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
+use crate::domain::id::{OperationId, ResourceId, TaskId};
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
+use crate::process::identity::ProcessOwner;
+use crate::process::teardown::{TeardownCompletionStore, MAX_MANAGED_TERMINAL_PORTS};
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
 use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
+    MAX_PROCESS_OP_BATCH_ITEMS,
 };
 use crate::services::{env_service, pid_file, platform_service};
 use crate::state::AppState;
@@ -30,10 +34,10 @@ use crate::state::{
     SshLaunchSpec,
 };
 use crate::terminal::session::{
-    bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalModeSnapshot,
-    TerminalScreenSnapshot, TerminalSession, TerminalSessionView,
+    bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalLaunchAuthority,
+    TerminalModeSnapshot, TerminalScreenSnapshot, TerminalSession, TerminalSessionView,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -75,6 +79,10 @@ pub struct ProcessManager {
     op_queue: Arc<ProcessOpQueue>,
     _claude_overlay_owner: Arc<ClaudeOverlayOwner>,
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+    /// Only user/application handles vote on the native host lifetime.
+    /// Crate-internal operation facades borrow the already-live host and must
+    /// never become the final shutdown caller on one of its own worker threads.
+    shutdown_vote: bool,
 }
 
 #[derive(Debug)]
@@ -127,21 +135,24 @@ impl ProcessManagerHandleLifecycle {
 
 impl Clone for ProcessManager {
     fn clone(&self) -> Self {
-        self.handle_lifecycle
-            .acquire()
-            .expect("a live ProcessManager handle must remain cloneable");
+        if self.shutdown_vote {
+            self.handle_lifecycle
+                .acquire()
+                .expect("a live ProcessManager handle must remain cloneable");
+        }
         Self {
             inner: self.inner.clone(),
             op_queue: self.op_queue.clone(),
             _claude_overlay_owner: self._claude_overlay_owner.clone(),
             handle_lifecycle: self.handle_lifecycle.clone(),
+            shutdown_vote: self.shutdown_vote,
         }
     }
 }
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        if self.handle_lifecycle.release() {
+        if self.shutdown_vote && self.handle_lifecycle.release() {
             shutdown_process_manager_workers(&self.inner);
         }
     }
@@ -199,14 +210,13 @@ type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
 type ProcessManagerBackgroundTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessManagerDetachedWorkerTestPhase {
-    BeforeAcquire,
-    AfterAcquire,
+enum AutoRestartWorkerTestPhase {
+    BeforeQueueAdmission,
+    AfterQueueLease,
     AfterEffect,
 }
 #[cfg(test)]
-type ProcessManagerDetachedWorkerTestHook =
-    Arc<dyn Fn(ProcessManagerDetachedWorkerTestPhase) + Send + Sync>;
+type AutoRestartWorkerTestHook = Arc<dyn Fn(AutoRestartWorkerTestPhase) + Send + Sync>;
 #[cfg(test)]
 type ProcessManagerServerSessionSpawnerTestHook = Arc<
     dyn Fn(&Arc<ProcessManagerInner>, &ServerLaunchSpec, SessionDimensions) -> Result<(), String>
@@ -245,12 +255,14 @@ pub(crate) struct ProcessManagerInner {
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    auto_restart_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    terminal_authority_issuer: TerminalAuthorityIssuer,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
     #[cfg(test)]
     background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
     #[cfg(test)]
-    auto_restart_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
+    auto_restart_worker_test_hook: RwLock<Option<AutoRestartWorkerTestHook>>,
     #[cfg(test)]
     server_session_spawner_test_hook: RwLock<Option<ProcessManagerServerSessionSpawnerTestHook>>,
 }
@@ -482,12 +494,9 @@ const DEFAULT_CLAUDE_COMMAND: &str =
 const DEFAULT_CODEX_COMMAND: &str =
     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
 const AI_COMMAND_INJECTION_DELAY_MS: u64 = 500;
-#[cfg(not(test))]
-const SESSION_REAPER_TIMEOUT: Duration = Duration::from_secs(30);
-/// Second force-kill retry window after the primary reaper timeout.
-/// Same kill strategy as the first pass; gives stubborn descendants more time to die.
-#[cfg(not(test))]
-const SESSION_REAPER_ESCALATED_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(2);
+const MAX_AUTO_RESTART_WORKERS: usize = 256;
+const MAX_TERMINAL_AUTHORITY_RESOURCES: usize = 1_024;
 
 impl Default for ProcessManager {
     fn default() -> Self {
@@ -533,6 +542,8 @@ impl ProcessManager {
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
+            auto_restart_workers: Mutex::new(Vec::new()),
+            terminal_authority_issuer: TerminalAuthorityIssuer::new(),
             op_queue: Mutex::new(Weak::new()),
             handle_lifecycle: handle_lifecycle.clone(),
             #[cfg(test)]
@@ -693,6 +704,7 @@ impl ProcessManager {
             op_queue,
             _claude_overlay_owner: claude_overlay_owner,
             handle_lifecycle,
+            shutdown_vote: true,
         }
     }
 
@@ -700,8 +712,27 @@ impl ProcessManager {
         self.op_queue.drain_completions()
     }
 
-    pub fn submit_process_op(&self, op: ProcessOp) -> Result<u64, String> {
-        self.op_queue.submit(op)
+    /// Narrow host seam for the Task-owned terminal service. It mints the
+    /// exact Task/resource/runtime-generation/action-epoch authority consumed
+    /// by the one suspended PTY launch path; no raw Job or termination handle
+    /// crosses this boundary.
+    #[allow(dead_code)]
+    pub(crate) fn issue_task_terminal_launch_authority(
+        &self,
+        task_id: TaskId,
+        session_id: &str,
+        ports: &[u16],
+    ) -> Result<TerminalLaunchAuthority, String> {
+        if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        self.inner.terminal_authority_issuer.issue(
+            session_id,
+            ProcessOwner::Task(task_id),
+            ports.to_vec(),
+        )
     }
 
     fn schedule_start_server(
@@ -804,7 +835,13 @@ impl ProcessManager {
             .values()
             .filter(|session| session.command_id.is_some() && session.status.is_live())
             .filter_map(|session| session.command_id.clone())
+            .take(MAX_PROCESS_OP_BATCH_ITEMS + 1)
             .collect();
+        if command_ids.len() > MAX_PROCESS_OP_BATCH_ITEMS {
+            return Err(format!(
+                "Stop-all server batch exceeds {MAX_PROCESS_OP_BATCH_ITEMS} managed sessions."
+            ));
+        }
         for command_id in &command_ids {
             self.update_session_state(command_id, |state| {
                 state.note_user_stop_request();
@@ -907,6 +944,7 @@ impl ProcessManager {
             args,
             env,
             auto_restart: command_auto_restart,
+            port: lookup.command.port,
             log_file_path: build_server_log_file_path(
                 lookup.project,
                 lookup.folder,
@@ -1007,6 +1045,7 @@ impl ProcessManager {
             args: args.clone(),
             env: env.clone(),
             auto_restart: command_auto_restart,
+            port: lookup.command.port,
             log_file_path: build_server_log_file_path(
                 lookup.project,
                 lookup.folder,
@@ -1070,6 +1109,7 @@ impl ProcessManager {
             args: args.clone(),
             env: env.clone(),
             auto_restart: command_auto_restart,
+            port: lookup.command.port,
             log_file_path: build_server_log_file_path(
                 lookup.project,
                 lookup.folder,
@@ -1866,11 +1906,8 @@ impl ProcessManager {
             return Ok(());
         }
 
-        let _ = force_reap_session_processes_until_clear(
-            &self.inner,
-            &session_id,
-            Duration::from_secs(2),
-        );
+        ensure_prior_session_teardown_settled(&self.inner, &session_id, Duration::from_secs(2))?;
+        let authority = issue_host_terminal_authority(&self.inner, &session_id, Vec::new())?;
 
         match TerminalSession::spawn(
             session_id.clone(),
@@ -1894,6 +1931,7 @@ impl ProcessManager {
                 self.inner.clone(),
                 session_id.clone(),
             )),
+            authority,
         ) {
             Ok(session) => {
                 self.inner
@@ -2934,7 +2972,7 @@ impl ProcessManager {
             return true;
         }
 
-        let _ = self.force_kill_session_processes(command_id);
+        let _ = self.retry_exact_session_teardown(command_id);
         if self.wait_for_session_shutdown(command_id, Duration::from_secs(2)) {
             self.update_session_state(command_id, |state| {
                 state.status = SessionStatus::Stopped;
@@ -3042,6 +3080,7 @@ impl ProcessManager {
                     )
             })
             .filter_map(|session| session.command_id.clone())
+            .take(MAX_PROCESS_OP_BATCH_ITEMS)
             .collect();
         for command_id in &command_ids {
             self.update_session_state(command_id, |state| {
@@ -3250,7 +3289,11 @@ impl ProcessManager {
                 Err(error)
             }
         };
-        self.spawn_session_reaper(session_id.to_string());
+        // `TerminalSession::close` owns and joins the exact Job/coordinator
+        // teardown.  Reconciliation stays on this caller; there is no
+        // detached PID-selected reaper that can mutate runtime or persistence
+        // after this operation returns.
+        self.reconcile_closed_session(session_id);
         result
     }
 
@@ -3279,15 +3322,7 @@ impl ProcessManager {
             .values()
             .filter(|session| session.status.is_live())
             .map(|session| session.session_id.clone())
-            .collect()
-    }
-
-    fn live_session_pids(&self) -> Vec<u32> {
-        self.runtime_state()
-            .sessions
-            .values()
-            .filter(|session| session.status.is_live())
-            .filter_map(|session| session.pid)
+            .take(MAX_PROCESS_OP_BATCH_ITEMS)
             .collect()
     }
 
@@ -3311,70 +3346,18 @@ impl ProcessManager {
         }
     }
 
-    fn force_kill_session_processes(&self, session_id: &str) -> usize {
-        force_reap_session_processes(&self.inner, session_id)
+    fn retry_exact_session_teardown(&self, session_id: &str) -> Result<(), String> {
+        retry_exact_session_teardown(&self.inner, session_id)
     }
 
-    fn spawn_session_reaper(&self, session_id: String) {
-        #[cfg(test)]
+    fn reconcile_closed_session(&self, session_id: &str) {
+        let _ = pid_file::prune_inactive_entries();
+        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
+            && !live_runtime_root_running(&self.inner, session_id)
         {
-            let _ =
-                self.reap_session_processes_until_clear(&session_id, Duration::from_millis(100));
-            if !pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                || live_runtime_root_running(&self.inner, &session_id)
-            {
-                self.note_reap_incomplete(&session_id);
-            } else {
-                mark_session_reaped(&self.inner, &session_id);
-            }
-        }
-
-        #[cfg(not(test))]
-        {
-            let inner = Arc::downgrade(&self.inner);
-            thread::spawn(move || {
-                if force_reap_session_processes_until_clear_weak(
-                    &inner,
-                    &session_id,
-                    SESSION_REAPER_TIMEOUT,
-                )
-                .is_none()
-                {
-                    return;
-                }
-                let Some(current_inner) = inner.upgrade() else {
-                    return;
-                };
-                let cleared = pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                    && !live_runtime_root_running(&current_inner, &session_id);
-                if cleared {
-                    mark_session_reaped(&current_inner, &session_id);
-                    return;
-                }
-                drop(current_inner);
-                if force_reap_session_processes_until_clear_weak(
-                    &inner,
-                    &session_id,
-                    SESSION_REAPER_ESCALATED_TIMEOUT,
-                )
-                .is_none()
-                {
-                    return;
-                }
-                let Some(current_inner) = inner.upgrade() else {
-                    return;
-                };
-                let reap_incomplete = !pid_file::active_tracked_pids_for_session(&session_id)
-                    .is_empty()
-                    || live_runtime_root_running(&current_inner, &session_id);
-                if reap_incomplete {
-                    if let Ok(manager) = process_manager_from_inner(current_inner) {
-                        manager.note_reap_incomplete(&session_id);
-                    }
-                } else {
-                    mark_session_reaped(&current_inner, &session_id);
-                }
-            });
+            mark_session_reaped(&self.inner, session_id);
+        } else {
+            self.note_reap_incomplete(session_id);
         }
     }
 
@@ -3506,14 +3489,15 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    fn reap_session_processes_until_clear(&self, session_id: &str, timeout: Duration) -> usize {
-        let reaped = force_reap_session_processes_until_clear(&self.inner, session_id, timeout);
+    fn settle_session_teardown_for_test(&self, session_id: &str, timeout: Duration) -> bool {
+        let settled =
+            ensure_prior_session_teardown_settled(&self.inner, session_id, timeout).is_ok();
         if pid_file::active_tracked_pids_for_session(session_id).is_empty()
             && !live_runtime_root_running(&self.inner, session_id)
         {
             mark_session_reaped(&self.inner, session_id);
         }
-        reaped
+        settled
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -3665,11 +3649,6 @@ fn drain_browser_provider_sessions_inner(inner: &ProcessManagerInner) {
 impl Drop for ProcessManagerInner {
     fn drop(&mut self) {
         shutdown_process_manager_workers(self);
-        if let Ok(sessions) = self.sessions.lock() {
-            for session in sessions.values() {
-                let _ = session.close(false);
-            }
-        }
         drain_claude_hook_sessions_inner(self);
         drain_browser_provider_sessions_inner(self);
         remove_owned_claude_overlay_root(&self.claude_hook_temp_root);
@@ -3684,13 +3663,81 @@ fn shutdown_process_manager_workers(inner: &ProcessManagerInner) {
     }
     if let Ok(mut handle) = inner.background_thread.lock() {
         if let Some(handle) = handle.take() {
-            if handle.thread().id() == thread::current().id() {
-                drop(handle);
-            } else {
-                let _ = handle.join();
+            handle.thread().unpark();
+            join_process_manager_helper(handle);
+        }
+    }
+    let workers = inner
+        .auto_restart_workers
+        .lock()
+        .map(|mut workers| std::mem::take(&mut *workers))
+        .unwrap_or_else(|_| std::process::abort());
+    for worker in workers {
+        join_process_manager_helper(worker);
+    }
+
+    // Worker admission is now closed and every helper has joined. Snapshot
+    // the one real terminal objects without holding the store lock, then route
+    // every remaining process tree through its exact coordinator authority.
+    loop {
+        let session = {
+            let mut sessions = inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|_| std::process::abort());
+            let Some(session_id) = sessions.keys().next().cloned() else {
+                break;
+            };
+            sessions.remove(&session_id)
+        };
+        if let Some(session) = session {
+            if let Err(error) = session.close(false) {
+                eprintln!("process-manager shutdown failed exact terminal close: {error}");
+                std::process::abort();
             }
         }
     }
+}
+
+/// The managed-shutdown operation runs on the process-operation worker, so it
+/// cannot invoke the full queue shutdown path without attempting to join
+/// itself. Its admission fence is already published by `ProcessOpQueue::submit`;
+/// stop and join the background/restart workers here before closing sessions so
+/// no auto-restart can race the exact terminal teardown.
+fn stop_background_workers_for_managed_shutdown(inner: &ProcessManagerInner) {
+    inner.background_stop.store(true, Ordering::SeqCst);
+    if let Ok(mut handle) = inner.background_thread.lock() {
+        if let Some(handle) = handle.take() {
+            handle.thread().unpark();
+            join_process_manager_helper(handle);
+        }
+    }
+    let workers = inner
+        .auto_restart_workers
+        .lock()
+        .map(|mut workers| std::mem::take(&mut *workers))
+        .unwrap_or_else(|_| std::process::abort());
+    for worker in workers {
+        join_process_manager_helper(worker);
+    }
+}
+
+fn join_process_manager_helper(handle: thread::JoinHandle<()>) {
+    if handle.thread().id() == thread::current().id() {
+        std::process::abort();
+    }
+    let deadline = Instant::now()
+        .checked_add(PROCESS_MANAGER_HELPER_JOIN_BUDGET)
+        .unwrap_or_else(Instant::now);
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    if !handle.is_finished() {
+        // A native helper that ignores its stop fence cannot be detached: it
+        // may otherwise admit or mutate process state after shutdown returns.
+        std::process::abort();
+    }
+    let _ = handle.join();
 }
 
 fn debug_enabled() -> bool {
@@ -3730,7 +3777,7 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
 
             drop(inner);
 
-            thread::sleep(Duration::from_secs(1));
+            thread::park_timeout(Duration::from_secs(1));
         }
     })
 }
@@ -4219,110 +4266,162 @@ fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) ->
     process_ids
 }
 
-fn force_reap_session_processes_until_clear(
+fn ensure_prior_session_teardown_settled(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
     timeout: Duration,
-) -> usize {
+) -> Result<(), String> {
     let started_at = Instant::now();
-    let mut reaped = 0;
+    let mut last_close_error = None;
     loop {
-        reaped += force_reap_session_processes(inner, session_id);
+        if let Err(error) = retry_exact_session_teardown(inner, session_id) {
+            last_close_error = Some(error);
+        }
         if pid_file::active_tracked_pids_for_session(session_id).is_empty()
             && !live_runtime_root_running(inner, session_id)
         {
-            break;
+            return Ok(());
         }
         if started_at.elapsed() >= timeout {
-            break;
+            let suffix = last_close_error
+                .map(|error| format!(" Last exact teardown error: {error}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Prior managed terminal `{session_id}` did not settle before replacement.{suffix}"
+            ));
         }
         thread::sleep(Duration::from_millis(100));
     }
-    reaped
 }
 
-#[cfg(not(test))]
-fn force_reap_session_processes_until_clear_weak(
-    inner: &Weak<ProcessManagerInner>,
+fn retry_exact_session_teardown(
+    inner: &Arc<ProcessManagerInner>,
     session_id: &str,
-    timeout: Duration,
-) -> Option<usize> {
-    let started_at = Instant::now();
-    let mut reaped = 0;
-    loop {
-        let current_inner = inner.upgrade()?;
-        reaped += force_reap_session_processes(&current_inner, session_id);
-        let cleared = pid_file::active_tracked_pids_for_session(session_id).is_empty()
-            && !live_runtime_root_running(&current_inner, session_id);
-        drop(current_inner);
-        if cleared || started_at.elapsed() >= timeout {
-            return Some(reaped);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &str) -> usize {
-    let mut forced_kill_pids = 0;
-    for pid in collect_session_reap_pids(inner, session_id) {
-        if !platform_service::is_pid_running(pid) {
-            continue;
-        }
-        if platform_service::kill_process_tree(pid).is_ok()
-            || !platform_service::is_pid_running(pid)
-        {
-            forced_kill_pids += 1;
-        }
+) -> Result<(), String> {
+    let session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned();
+    if let Some(session) = session {
+        session.close(false)?;
     }
     let _ = pid_file::prune_inactive_entries();
-    forced_kill_pids
+    Ok(())
 }
 
-fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Vec<u32> {
-    let mut pids = BTreeSet::new();
-    let job_pids = session_managed_process_ids(inner, session_id);
-
-    for entry in pid_file::active_tracked_processes_for_session(session_id) {
-        let root_verified = platform_service::process_matches_identity(
-            entry.pid,
-            entry.started_at_unix_secs,
-            entry.process_name.as_deref(),
-        );
-        if root_verified {
-            pids.insert(entry.pid);
-            for descendant in platform_service::collect_descendant_process_identities(entry.pid) {
-                pids.insert(descendant.pid);
-            }
-        }
-        for descendant in entry.descendant_processes {
-            if platform_service::process_matches_identity(
-                descendant.pid,
-                descendant.started_at_unix_secs,
-                descendant.process_name.as_deref(),
-            ) {
-                pids.insert(descendant.pid);
-            }
-        }
-    }
-
-    if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
-        if platform_service::is_pid_running(root_pid) {
-            pids.insert(root_pid);
-            for descendant in platform_service::collect_descendant_process_identities(root_pid) {
-                pids.insert(descendant.pid);
-            }
-        }
-    }
-
-    for pid in job_pids {
-        if platform_service::is_pid_running(pid) {
-            pids.insert(pid);
-        }
-    }
-
-    pids.into_iter().collect()
+#[derive(Debug, Clone, Copy)]
+struct IssuedTerminalResource {
+    owner: ProcessOwner,
+    resource_id: ResourceId,
+    generation: u64,
 }
 
+#[derive(Debug)]
+struct TerminalAuthorityState {
+    next_action_epoch: u64,
+    resources: HashMap<String, IssuedTerminalResource>,
+    resource_order: VecDeque<String>,
+    completion_store: Option<TeardownCompletionStore>,
+}
+
+#[derive(Debug)]
+struct TerminalAuthorityIssuer {
+    state: Mutex<TerminalAuthorityState>,
+}
+
+impl TerminalAuthorityIssuer {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(TerminalAuthorityState {
+                next_action_epoch: 1,
+                resources: HashMap::new(),
+                resource_order: VecDeque::with_capacity(MAX_TERMINAL_AUTHORITY_RESOURCES),
+                completion_store: None,
+            }),
+        }
+    }
+
+    fn issue(
+        &self,
+        session_id: &str,
+        owner: ProcessOwner,
+        ports: Vec<u16>,
+    ) -> Result<TerminalLaunchAuthority, String> {
+        if session_id.trim().is_empty() || session_id.len() > 256 {
+            return Err("terminal authority session identity is invalid".to_string());
+        }
+        if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "terminal authority issuer poisoned".to_string())?;
+        state
+            .resource_order
+            .retain(|retained| retained != session_id);
+        if !state.resources.contains_key(session_id) {
+            while state.resources.len() >= MAX_TERMINAL_AUTHORITY_RESOURCES {
+                let Some(evicted) = state.resource_order.pop_front() else {
+                    return Err("terminal authority retention index is inconsistent".to_string());
+                };
+                state.resources.remove(&evicted);
+            }
+        }
+        state.resource_order.push_back(session_id.to_string());
+        let action_epoch = state.next_action_epoch;
+        state.next_action_epoch = state
+            .next_action_epoch
+            .checked_add(1)
+            .ok_or_else(|| "terminal action epoch space is exhausted".to_string())?;
+
+        let issued = match state.resources.get(session_id).copied() {
+            Some(current) if current.owner == owner => IssuedTerminalResource {
+                generation: current
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| "terminal runtime generation is exhausted".to_string())?,
+                ..current
+            },
+            _ => IssuedTerminalResource {
+                owner,
+                resource_id: ResourceId::new(),
+                generation: 1,
+            },
+        };
+        state.resources.insert(session_id.to_string(), issued);
+        if state.completion_store.is_none() {
+            #[cfg(windows)]
+            {
+                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
+            }
+            #[cfg(not(windows))]
+            {
+                state.completion_store = Some(TeardownCompletionStore::new());
+            }
+        }
+        let completion_store = state
+            .completion_store
+            .as_ref()
+            .expect("terminal completion store initialized")
+            .clone();
+        TerminalLaunchAuthority::new(
+            issued.owner,
+            issued.resource_id,
+            issued.generation,
+            OperationId::new(),
+            action_epoch,
+            ports,
+            completion_store,
+        )
+    }
+}
+
+#[cfg(not(windows))]
 fn session_managed_process_ids(inner: &ProcessManagerInner, session_id: &str) -> Vec<u32> {
     let session = inner
         .sessions
@@ -4441,7 +4540,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 cwd,
                 dimensions,
             } => {
-                let _ = force_reap_session_processes(inner, &session_id);
+                let _ = retry_exact_session_teardown(inner, &session_id);
                 if restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions).is_err() {
                     let mut changed = false;
                     if let Ok(mut runtime) = inner.runtime_state.write() {
@@ -4460,7 +4559,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 }
             }
             ExitReconciliation::MarkStopped { session_id } => {
-                let _ = force_reap_session_processes(inner, &session_id);
+                let _ = retry_exact_session_teardown(inner, &session_id);
                 let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
@@ -4477,7 +4576,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 }
             }
             ExitReconciliation::MarkCrashed { session_id } => {
-                let _ = force_reap_session_processes(inner, &session_id);
+                let _ = retry_exact_session_teardown(inner, &session_id);
                 let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
@@ -4542,7 +4641,7 @@ fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
 }
 
 fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
-    let mut restart_candidates = Vec::new();
+    let mut restart_candidates = Vec::with_capacity(MAX_AUTO_RESTART_WORKERS);
     if let Ok(runtime) = inner.runtime_state.read() {
         for session in runtime.sessions.values() {
             if session.auto_restart
@@ -4550,6 +4649,9 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
                 && session.server_launch.is_some()
             {
                 restart_candidates.push(session.server_launch.clone().unwrap());
+                if restart_candidates.len() == MAX_AUTO_RESTART_WORKERS {
+                    break;
+                }
             }
         }
     }
@@ -4559,6 +4661,24 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
     }
 
     for launch in restart_candidates {
+        {
+            let mut workers = inner
+                .auto_restart_workers
+                .lock()
+                .unwrap_or_else(|_| std::process::abort());
+            let mut index = 0usize;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let finished = workers.swap_remove(index);
+                    join_process_manager_helper(finished);
+                } else {
+                    index += 1;
+                }
+            }
+            if workers.len() >= MAX_AUTO_RESTART_WORKERS {
+                break;
+            }
+        }
         let delay = {
             let mut backoffs = inner
                 .restart_backoffs
@@ -4602,10 +4722,24 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
         }
 
         let launch_clone = launch.clone();
-        let inner = Arc::downgrade(inner);
-        thread::spawn(move || {
-            thread::sleep(delay);
-            let Some(inner) = inner.upgrade() else {
+        let weak_inner = Arc::downgrade(inner);
+        let worker = thread::spawn(move || {
+            let delay_started = Instant::now();
+            while delay_started.elapsed() < delay {
+                let Some(inner) = weak_inner.upgrade() else {
+                    return;
+                };
+                if inner.background_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                drop(inner);
+                thread::sleep(
+                    delay
+                        .saturating_sub(delay_started.elapsed())
+                        .min(Duration::from_millis(25)),
+                );
+            }
+            let Some(inner) = weak_inner.upgrade() else {
                 return;
             };
             if inner.background_stop.load(Ordering::SeqCst) {
@@ -4618,16 +4752,23 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             #[cfg(test)]
-            let manager =
-                process_manager_from_inner_with_observer(inner, worker_test_hook.as_ref());
-            #[cfg(not(test))]
-            let manager = process_manager_from_inner(inner);
-            let Ok(manager) = manager else {
+            if let Some(hook) = worker_test_hook.as_ref() {
+                hook(AutoRestartWorkerTestPhase::BeforeQueueAdmission);
+            }
+            if inner.background_stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let op_queue = inner.op_queue.lock().ok().and_then(|queue| queue.upgrade());
+            let Some(op_queue) = op_queue else {
                 return;
             };
+            #[cfg(test)]
+            if let Some(hook) = worker_test_hook.as_ref() {
+                hook(AutoRestartWorkerTestPhase::AfterQueueLease);
+            }
+            drop(inner);
             let op_id = next_op_id();
-            if manager
-                .op_queue
+            if op_queue
                 .submit(ProcessOp::StartServer {
                     op_id,
                     launch: launch_clone,
@@ -4639,10 +4780,15 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
             {
                 #[cfg(test)]
                 if let Some(hook) = worker_test_hook.as_ref() {
-                    hook(ProcessManagerDetachedWorkerTestPhase::AfterEffect);
+                    hook(AutoRestartWorkerTestPhase::AfterEffect);
                 }
             }
         });
+        let mut workers = inner
+            .auto_restart_workers
+            .lock()
+            .unwrap_or_else(|_| std::process::abort());
+        workers.push(worker);
     }
 }
 
@@ -5224,6 +5370,25 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn issue_host_terminal_authority(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    ports: impl IntoIterator<Item = u16>,
+) -> Result<TerminalLaunchAuthority, String> {
+    let mut bounded_ports = Vec::with_capacity(MAX_MANAGED_TERMINAL_PORTS);
+    for port in ports {
+        if bounded_ports.len() == MAX_MANAGED_TERMINAL_PORTS {
+            return Err(format!(
+                "terminal launch port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+            ));
+        }
+        bounded_ports.push(port);
+    }
+    inner
+        .terminal_authority_issuer
+        .issue(session_id, ProcessOwner::Host, bounded_ports)
+}
+
 fn spawn_server_session_with_inner(
     inner: &Arc<ProcessManagerInner>,
     launch: &ServerLaunchSpec,
@@ -5251,7 +5416,7 @@ fn spawn_server_session_with_inner(
         return Ok(());
     }
 
-    let _ = force_reap_session_processes_until_clear(inner, &session_id, Duration::from_secs(2));
+    ensure_prior_session_teardown_settled(inner, &session_id, Duration::from_secs(2))?;
 
     if let Ok(existing_session) = inner
         .sessions
@@ -5259,6 +5424,8 @@ fn spawn_server_session_with_inner(
         .map(|sessions| sessions.get(&session_id).cloned())
     {
         if let Some(session) = existing_session {
+            let authority =
+                issue_host_terminal_authority(inner, &session_id, launch.port.into_iter())?;
             return session.restart_command(
                 launch.cwd.clone(),
                 dimensions,
@@ -5267,10 +5434,12 @@ fn spawn_server_session_with_inner(
                 launch.env.clone(),
                 launch.log_file_path.clone(),
                 true,
+                authority,
             );
         }
     }
 
+    let authority = issue_host_terminal_authority(inner, &session_id, launch.port.into_iter())?;
     let session = TerminalSession::spawn_command(
         session_id.clone(),
         launch.cwd.clone(),
@@ -5288,6 +5457,7 @@ fn spawn_server_session_with_inner(
         inner.debug_enabled,
         Some(session_change_notifier(inner.clone(), session_id.clone())),
         Some(session_output_notifier(inner.clone(), session_id.clone())),
+        authority,
     )?;
 
     if let Ok(mut sessions) = inner.sessions.lock() {
@@ -5323,6 +5493,7 @@ fn restore_interrupted_server_prompt(
         .cloned();
 
     if let Some(session) = existing_session {
+        let authority = issue_host_terminal_authority(inner, session_id, Vec::new())?;
         session.restart_command(
             cwd.clone(),
             dimensions,
@@ -5331,8 +5502,10 @@ fn restore_interrupted_server_prompt(
             HashMap::new(),
             None,
             false,
+            authority,
         )?;
     } else {
+        let authority = issue_host_terminal_authority(inner, session_id, Vec::new())?;
         let session = TerminalSession::spawn_command(
             session_id.to_string(),
             cwd.clone(),
@@ -5356,6 +5529,7 @@ fn restore_interrupted_server_prompt(
                 inner.clone(),
                 session_id.to_string(),
             )),
+            authority,
         )?;
         inner
             .sessions
@@ -5884,27 +6058,11 @@ fn next_ssh_session_id(connection_id: &str) -> String {
 }
 
 fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> Result<ProcessManager, String> {
-    #[cfg(test)]
-    {
-        process_manager_from_inner_with_observer(inner, None)
-    }
-    #[cfg(not(test))]
-    {
-        process_manager_from_inner_core(inner)
-    }
-}
-
-#[cfg(test)]
-fn process_manager_from_inner_with_observer(
-    inner: Arc<ProcessManagerInner>,
-    observer: Option<&ProcessManagerDetachedWorkerTestHook>,
-) -> Result<ProcessManager, String> {
-    process_manager_from_inner_core(inner, observer)
+    process_manager_from_inner_core(inner)
 }
 
 fn process_manager_from_inner_core(
     inner: Arc<ProcessManagerInner>,
-    #[cfg(test)] observer: Option<&ProcessManagerDetachedWorkerTestHook>,
 ) -> Result<ProcessManager, String> {
     let op_queue = inner
         .op_queue
@@ -5918,23 +6076,14 @@ fn process_manager_from_inner_core(
         .ok()
         .and_then(|owner| owner.upgrade())
         .ok_or_else(|| "Claude overlay owner is unavailable.".to_string())?;
-    #[cfg(test)]
-    if let Some(observer) = observer {
-        observer(ProcessManagerDetachedWorkerTestPhase::BeforeAcquire);
-    }
-    inner.handle_lifecycle.acquire()?;
     let handle_lifecycle = inner.handle_lifecycle.clone();
-    let manager = ProcessManager {
+    Ok(ProcessManager {
         inner,
         op_queue,
         _claude_overlay_owner: claude_overlay_owner,
         handle_lifecycle,
-    };
-    #[cfg(test)]
-    if let Some(observer) = observer {
-        observer(ProcessManagerDetachedWorkerTestPhase::AfterAcquire);
-    }
-    Ok(manager)
+        shutdown_vote: false,
+    })
 }
 
 pub(crate) fn execute_process_op_inner(
@@ -6055,6 +6204,8 @@ pub(crate) fn execute_process_op_inner(
                         "{}\x1b[33m{banner}\x1b[0m\r\n",
                         if clear_logs { "" } else { "\r\n" }
                     ));
+                    let authority =
+                        issue_host_terminal_authority(inner, &command_id, launch.port.into_iter())?;
                     session.restart_command(
                         launch.cwd.clone(),
                         dimensions,
@@ -6063,6 +6214,7 @@ pub(crate) fn execute_process_op_inner(
                         launch.env.clone(),
                         launch.log_file_path.clone(),
                         true,
+                        authority,
                     )?;
                     manager.update_session_state(&command_id, |state| {
                         state.configure_server(launch.clone());
@@ -6118,7 +6270,12 @@ pub(crate) fn execute_process_op_inner(
                         "Managed process `{command_id}` did not stop cleanly."
                     ));
                 }
-                crate::services::ports_service::kill_port(port)?;
+                let listener = crate::services::ports_service::check_port_in_use(port)?;
+                if listener.in_use {
+                    return Err(format!(
+                        "Port {port} is still owned by an external or unreconciled listener; DevManager will not terminate it by PID."
+                    ));
+                }
                 spawn_server_session_with_inner(inner, &launch, dimensions)?;
                 let _ = manager
                     .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
@@ -6344,6 +6501,7 @@ pub(crate) fn execute_process_op_inner(
             let outcome = kill_session_process_inner(inner, &session_id, pid, false);
             let (result, message) = match outcome {
                 Ok(KillProcessOutcome::Killed) => (Ok(()), Some(format!("Killed process {pid}."))),
+                #[cfg(not(windows))]
                 Ok(KillProcessOutcome::AlreadyGone) => {
                     (Ok(()), Some(format!("Process {pid} was already gone.")))
                 }
@@ -6372,6 +6530,7 @@ pub(crate) fn execute_process_op_inner(
                     Ok(()),
                     Some(format!("Killed process tree rooted at {pid}.")),
                 ),
+                #[cfg(not(windows))]
                 Ok(KillProcessOutcome::AlreadyGone) => (
                     Ok(()),
                     Some(format!("Process tree rooted at {pid} was already gone.")),
@@ -6404,9 +6563,11 @@ pub(crate) fn execute_process_op_inner(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KillProcessOutcome {
     Killed,
+    #[cfg(not(windows))]
     AlreadyGone,
 }
 
+#[cfg(not(windows))]
 fn verified_session_process_identity(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
@@ -6476,11 +6637,59 @@ fn verified_session_process_identity(
     None
 }
 
+#[cfg(windows)]
 fn kill_session_process_inner(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
     pid: u32,
-    kill_tree: bool,
+    _kill_tree: bool,
+) -> Result<KillProcessOutcome, String> {
+    let session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Process {pid} is not part of session `{session_id}`; exact managed authority is unavailable."
+            )
+        })?;
+    let (fence, active_process_ids) = session
+        .managed_process_snapshot()
+        .ok_or_else(|| {
+            format!(
+                "Process {pid} is not part of session `{session_id}`; exact managed authority is unavailable."
+            )
+        })?;
+    if !active_process_ids.contains(&pid) {
+        return Err(format!(
+            "Process {pid} is not part of session `{session_id}`'s exact managed Job membership."
+        ));
+    }
+
+    // A PID row is diagnostic selection, never termination authority. Close
+    // only the generation fence observed with that same authoritative Job
+    // membership snapshot; a concurrent restart cannot redirect this action
+    // to its replacement.
+    session.close_managed_process_exact(&fence, false)?;
+    let _ = pid_file::prune_inactive_entries();
+    let remaining = pid_file::active_tracked_pids_for_session(session_id);
+    if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
+        mark_session_reaped(inner, session_id);
+    } else {
+        bump_runtime_revision(inner);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
+    Ok(KillProcessOutcome::Killed)
+}
+
+#[cfg(not(windows))]
+fn kill_session_process_inner(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    pid: u32,
+    _kill_tree: bool,
 ) -> Result<KillProcessOutcome, String> {
     let Some(expected) = verified_session_process_identity(inner, session_id, pid) else {
         return Err(format!(
@@ -6501,13 +6710,18 @@ fn kill_session_process_inner(
         bump_runtime_revision(inner);
         return Ok(KillProcessOutcome::AlreadyGone);
     }
-    let result = if kill_tree {
-        platform_service::kill_process_tree(pid)
-    } else {
-        platform_service::kill_process(pid)
-    };
+    let session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| format!("Unknown session `{session_id}`"))?;
+    // A managed terminal is one Job-owned resource.  A PID row is diagnostic
+    // selection, never termination authority; both UI actions therefore
+    // close the exact session tree through its coordinator.
+    session.close(false)?;
     let _ = pid_file::prune_inactive_entries();
-    result?;
     let remaining = pid_file::active_tracked_pids_for_session(session_id);
     if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
         mark_session_reaped(inner, session_id);
@@ -6528,7 +6742,8 @@ fn spawn_ssh_session_with_inner(
     if manager.session_exists(session_id) {
         return Ok(());
     }
-    let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+    ensure_prior_session_teardown_settled(inner, session_id, Duration::from_secs(2))?;
+    let authority = issue_host_terminal_authority(inner, session_id, Vec::new())?;
     let session = TerminalSession::spawn_command(
         session_id.to_string(),
         launch.cwd.clone(),
@@ -6552,6 +6767,7 @@ fn spawn_ssh_session_with_inner(
             inner.clone(),
             session_id.to_string(),
         )),
+        authority,
     )
     .map_err(|error| {
         manager.update_session_state(session_id, |state| {
@@ -6643,13 +6859,14 @@ where
     if manager.session_exists(session_id) {
         return Ok(());
     }
-    let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+    ensure_prior_session_teardown_settled(inner, session_id, Duration::from_secs(2))?;
     let mut effective_launch = launch.clone();
     let terminal_env = manager.prepare_ai_terminal_environment(&mut effective_launch, session_id);
     manager.update_session_state(session_id, |state| {
         state.shell_program = effective_launch.shell_program.clone();
         state.configure_ai(effective_launch.clone());
     });
+    let authority = issue_host_terminal_authority(inner, session_id, Vec::new())?;
     let session = TerminalSession::spawn_command(
         session_id.to_string(),
         effective_launch.cwd.clone(),
@@ -6674,6 +6891,7 @@ where
             inner.clone(),
             session_id.to_string(),
         )),
+        authority,
     )
     .map_err(|error| {
         manager.cleanup_ai_adapters_for_session(session_id);
@@ -6709,7 +6927,7 @@ where
         }
         let _ = session.close(false);
         drop(session);
-        let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+        let _ = ensure_prior_session_teardown_settled(inner, session_id, Duration::from_secs(2));
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Failed;
             state.exit = Some(SessionExitState {
@@ -6731,13 +6949,41 @@ fn shutdown_managed_processes_inner(
 ) -> ManagedShutdownReport {
     let manager = process_manager_from_inner(inner.clone())
         .expect("managed shutdown requires an active ProcessManager handle");
-    let session_ids = manager.live_session_ids();
-    for session_id in &session_ids {
-        let _ = manager.request_session_close(session_id, false);
+    stop_background_workers_for_managed_shutdown(inner);
+    let mut requested_sessions = 0usize;
+    loop {
+        let entry = {
+            let mut sessions = inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|_| std::process::abort());
+            let Some(session_id) = sessions.keys().next().cloned() else {
+                break;
+            };
+            sessions
+                .remove(&session_id)
+                .map(|session| (session_id, session))
+        };
+        let Some((session_id, session)) = entry else {
+            continue;
+        };
+        requested_sessions = requested_sessions.saturating_add(1);
+        if session.close(false).is_err() {
+            // Keep the exact owner alive through this error observation. Its
+            // Drop guard below still fails closed rather than detaching Job
+            // authority.
+            manager.note_reap_incomplete(&session_id);
+        }
+        manager.reconcile_closed_session(&session_id);
+        drop(session);
+        // TerminalSession::Drop performs the same idempotent close guard. It
+        // may update runtime state to Stopping while its last owner leaves;
+        // reconcile that exact identity after the owner is gone.
+        manager.reconcile_closed_session(&session_id);
     }
 
     let started_at = Instant::now();
-    let mut active_tracked_processes = loop {
+    let active_tracked_processes = loop {
         let _ = pid_file::prune_inactive_entries();
         let remaining_live_sessions = manager.live_session_count();
         let active_tracked_processes = pid_file::active_tracked_processes();
@@ -6750,47 +6996,12 @@ fn shutdown_managed_processes_inner(
         thread::sleep(Duration::from_millis(100));
     };
 
-    let mut forced_kill_pids = 0;
-    if manager.live_session_count() > 0 || !active_tracked_processes.is_empty() {
-        for session_id in manager.live_session_ids() {
-            forced_kill_pids += force_reap_session_processes(inner, &session_id);
-        }
-
-        let mut pids_to_kill = manager.live_session_pids();
-        pids_to_kill.extend(pid_file::active_tracked_pids());
-        pids_to_kill.sort_unstable();
-        pids_to_kill.dedup();
-
-        for pid in pids_to_kill {
-            if !platform_service::is_pid_running(pid) {
-                continue;
-            }
-            if platform_service::kill_process_tree(pid).is_ok()
-                || !platform_service::is_pid_running(pid)
-            {
-                forced_kill_pids += 1;
-            }
-        }
-
-        let _ = pid_file::prune_inactive_entries();
-        let force_started = Instant::now();
-        while force_started.elapsed() < Duration::from_secs(1) {
-            let _ = pid_file::prune_inactive_entries();
-            let remaining_live_sessions = manager.live_session_count();
-            active_tracked_processes = pid_file::active_tracked_processes();
-            if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
     let _ = pid_file::prune_inactive_entries();
     let report = ManagedShutdownReport {
-        requested_sessions: session_ids.len(),
-        forced_kill_pids,
+        requested_sessions,
+        forced_kill_pids: 0,
         remaining_live_sessions: manager.live_session_count(),
-        remaining_tracked_pids: pid_file::active_tracked_pids().len(),
+        remaining_tracked_pids: active_tracked_processes.len(),
     };
     if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
         pid_file::clear_all();
@@ -7323,6 +7534,7 @@ mod tests {
             args: Vec::new(),
             env: HashMap::new(),
             auto_restart: true,
+            port: None,
             log_file_path: None,
         };
         let mut session = SessionRuntimeState::new(
@@ -9510,7 +9722,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_process_manager_handle_defers_final_worker_shutdown() {
+    fn internal_process_manager_handle_cannot_defer_native_worker_shutdown() {
         let manager = ProcessManager::new();
         let inner = Arc::downgrade(&manager.inner);
         let internal = process_manager_from_inner(manager.inner.clone())
@@ -9521,19 +9733,38 @@ mod tests {
         let retained = inner
             .upgrade()
             .expect("internal manager must retain the shared state");
-        assert!(!retained.background_stop.load(Ordering::SeqCst));
+        assert!(
+            retained.background_stop.load(Ordering::SeqCst),
+            "the last application handle must stop and join native workers even while an internal facade is still borrowed"
+        );
+        assert!(
+            retained
+                .background_thread
+                .lock()
+                .expect("background worker slot")
+                .is_none(),
+            "shutdown must consume the joined background worker handle"
+        );
+        assert!(
+            retained
+                .auto_restart_workers
+                .lock()
+                .expect("auto-restart worker slots")
+                .is_empty(),
+            "shutdown must consume every joined auto-restart worker handle"
+        );
         drop(retained);
 
         drop(internal);
 
         assert!(
             inner.upgrade().is_none(),
-            "the final internal manager handle must shut down and release workers"
+            "the non-owning internal facade must release shared state without initiating worker shutdown"
         );
     }
 
     #[test]
-    fn detached_auto_restart_shutdown_wins_at_lifecycle_admission() {
+    fn auto_restart_shutdown_waits_for_pre_admission_worker_and_prevents_effect() {
         let manager = ProcessManager::new();
         let launch = configure_auto_restart_race(&manager, "shutdown-auto-restart");
 
@@ -9545,7 +9776,7 @@ mod tests {
             .auto_restart_worker_test_hook
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |phase| {
-            if phase == ProcessManagerDetachedWorkerTestPhase::BeforeAcquire {
+            if phase == AutoRestartWorkerTestPhase::BeforeQueueAdmission {
                 let _ = entered_tx.try_send(());
                 let _ = release_rx
                     .lock()
@@ -9561,13 +9792,31 @@ mod tests {
         handle_auto_restart(&manager.inner);
         entered_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("auto-restart worker must pause immediately before lifecycle admission");
+            .expect("auto-restart worker must pause immediately before queue admission");
         assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
         assert_eq!(op_queue.successful_submissions_for_test(), 0);
 
-        drop(manager);
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(manager);
+            let _ = drop_done_tx.send(());
+        });
+        let shutdown_deadline = Instant::now() + Duration::from_secs(3);
+        while lifecycle_state_for_test(&lifecycle) != (0, true)
+            && Instant::now() < shutdown_deadline
+        {
+            thread::yield_now();
+        }
         assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert!(
+            matches!(drop_done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "shutdown must not return while a joined helper is paused at its cancellation checkpoint"
+        );
         release_tx.send(()).expect("release auto-restart worker");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown returns after the helper acknowledges cancellation");
+        dropper.join().expect("manager shutdown thread");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while inner.upgrade().is_some() && Instant::now() < deadline {
@@ -9591,11 +9840,9 @@ mod tests {
     }
 
     #[test]
-    fn detached_auto_restart_worker_lease_defers_final_shutdown() {
-        const FIXTURE_SPAWN_ERROR: &str = "fixture invalid auto-restart launch";
-
+    fn auto_restart_shutdown_fences_worker_that_already_holds_queue_lease() {
         let manager = ProcessManager::new();
-        let launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
+        let _launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
         let spawn_hits = Arc::new(AtomicU64::new(0));
         let observed_spawn_hits = spawn_hits.clone();
         *manager
@@ -9604,17 +9851,12 @@ mod tests {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |_, _, _| {
             observed_spawn_hits.fetch_add(1, Ordering::SeqCst);
-            Err(FIXTURE_SPAWN_ERROR.to_string())
+            Err("fixture launch must remain fenced".to_string())
         }));
 
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_acquired_tx, release_acquired_rx) = std::sync::mpsc::sync_channel(1);
-        let release_acquired_rx = Arc::new(Mutex::new(release_acquired_rx));
-        let (effect_tx, effect_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_effect_tx, release_effect_rx) = std::sync::mpsc::sync_channel(1);
-        let release_effect_rx = Arc::new(Mutex::new(release_effect_rx));
-        let acquired_hits = Arc::new(AtomicU64::new(0));
-        let observed_acquired_hits = acquired_hits.clone();
+        let (lease_tx, lease_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_lease_tx, release_lease_rx) = std::sync::mpsc::sync_channel(1);
+        let release_lease_rx = Arc::new(Mutex::new(release_lease_rx));
         let effect_hits = Arc::new(AtomicU64::new(0));
         let observed_effect_hits = effect_hits.clone();
         *manager
@@ -9623,99 +9865,159 @@ mod tests {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Arc::new(move |phase| match phase {
-                ProcessManagerDetachedWorkerTestPhase::AfterAcquire => {
-                    observed_acquired_hits.fetch_add(1, Ordering::SeqCst);
-                    let _ = acquired_tx.try_send(());
-                    let _ = release_acquired_rx
+                AutoRestartWorkerTestPhase::AfterQueueLease => {
+                    let _ = lease_tx.try_send(());
+                    let _ = release_lease_rx
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .recv();
                 }
-                ProcessManagerDetachedWorkerTestPhase::AfterEffect => {
+                AutoRestartWorkerTestPhase::AfterEffect => {
                     observed_effect_hits.fetch_add(1, Ordering::SeqCst);
-                    let _ = effect_tx.try_send(());
-                    let _ = release_effect_rx
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .recv();
                 }
-                ProcessManagerDetachedWorkerTestPhase::BeforeAcquire => {}
+                AutoRestartWorkerTestPhase::BeforeQueueAdmission => {}
             }));
 
         let lifecycle = manager.handle_lifecycle.clone();
         let op_queue = manager.op_queue.clone();
         let inner = Arc::downgrade(&manager.inner);
         handle_auto_restart(&manager.inner);
-        acquired_rx
+        lease_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("auto-restart worker must pause after lifecycle admission");
-        assert_eq!(lifecycle_state_for_test(&lifecycle), (2, false));
+            .expect("auto-restart worker must pause after taking a queue lease");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
         assert_eq!(op_queue.successful_submissions_for_test(), 0);
 
-        drop(manager);
-        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
-        release_acquired_tx
-            .send(())
-            .expect("release admitted auto-restart worker");
-        effect_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("admitted auto-restart worker must submit exactly one operation");
-
-        let (active_handles, shutting_down) = lifecycle_state_for_test(&lifecycle);
-        assert!(active_handles >= 1);
-        assert!(!shutting_down);
-        assert_eq!(acquired_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(effect_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(op_queue.successful_submissions_for_test(), 1);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while op_queue.completed_operations_for_test() != 1 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(op_queue.completed_operations_for_test(), 1);
-
-        let mut completions = Vec::new();
-        while completions.is_empty() && Instant::now() < deadline {
-            completions.extend(op_queue.drain_completions());
-            if completions.is_empty() {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-        assert_eq!(completions.len(), 1);
-        let completion = completions.pop().expect("one auto-restart completion");
-        assert_eq!(completion.kind, ProcessOpKind::StartServer);
-        assert_eq!(completion.target_id, launch.command_id);
-        assert_eq!(
-            completion.context.session_id,
-            Some(launch.command_id.clone())
-        );
-        assert!(!completion.context.focus);
-        assert!(completion.remote_response.is_none());
-        let error = completion
-            .result
-            .expect_err("the deliberately invalid auto-restart launch must fail");
-        assert_eq!(error, FIXTURE_SPAWN_ERROR);
-        assert!(!error.contains("Process manager is shutting down"));
-        assert_eq!(op_queue.successful_submissions_for_test(), 1);
-        assert_eq!(op_queue.completed_operations_for_test(), 1);
-        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
-        assert!(op_queue.drain_completions().is_empty());
-        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
-
-        release_effect_tx
-            .send(())
-            .expect("release auto-restart worker after completion observation");
-        while lifecycle_state_for_test(&lifecycle) != (0, true) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(manager);
+            let _ = drop_done_tx.send(());
+        });
+        let shutdown_deadline = Instant::now() + Duration::from_secs(3);
+        while lifecycle_state_for_test(&lifecycle) != (0, true)
+            && Instant::now() < shutdown_deadline
+        {
+            thread::yield_now();
         }
         assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert!(
+            matches!(
+                drop_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "shutdown must join a leased helper before returning"
+        );
+        release_lease_tx
+            .send(())
+            .expect("release leased auto-restart worker");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown returns after leased helper observes queue closure");
+        dropper.join().expect("manager shutdown thread");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
         while inner.upgrade().is_some() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(inner.upgrade().is_none());
+        assert_eq!(effect_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
+        assert_eq!(op_queue.completed_operations_for_test(), 0);
+        assert_eq!(spawn_hits.load(Ordering::SeqCst), 0);
+        assert!(op_queue.drain_completions().is_empty());
+    }
+
+    #[test]
+    fn process_operation_shutdown_joins_in_flight_effect_and_rejects_late_admission() {
+        let manager = ProcessManager::new();
+        let launch = configure_auto_restart_race(&manager, "joined-process-operation");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .server_session_spawner_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |_, _, _| {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+            Err("fixture joined operation".to_string())
+        }));
+
+        let op_queue = manager.op_queue.clone();
+        let lifecycle = manager.handle_lifecycle.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        op_queue
+            .submit(ProcessOp::StartServer {
+                op_id: next_op_id(),
+                launch: launch.clone(),
+                dimensions: SessionDimensions::default(),
+                activate: false,
+                response: None,
+            })
+            .expect("admit controlled process operation");
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("operation effect must reach controlled checkpoint");
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(manager);
+            let _ = drop_done_tx.send(());
+        });
+        let shutdown_deadline = Instant::now() + Duration::from_secs(3);
+        while lifecycle_state_for_test(&lifecycle) != (0, true)
+            && Instant::now() < shutdown_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert!(
+            matches!(
+                drop_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "shutdown must not return while the admitted operation effect is active"
+        );
+        let late_queue = op_queue.clone();
+        let (late_result_tx, late_result_rx) = std::sync::mpsc::sync_channel(1);
+        let late_submitter = thread::spawn(move || {
+            let result = late_queue.submit(ProcessOp::StartServer {
+                op_id: next_op_id(),
+                launch,
+                dimensions: SessionDimensions::default(),
+                activate: false,
+                response: None,
+            });
+            let _ = late_result_tx.send(result);
+        });
+        assert!(
+            matches!(
+                late_result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "late admission must serialize behind the in-progress shutdown boundary"
+        );
+
+        release_tx.send(()).expect("release process operation");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shutdown returns after the operation effect settles and joins");
+        dropper.join().expect("manager shutdown thread");
+        assert!(
+            late_result_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("late admission returns after shutdown linearizes")
+                .is_err(),
+            "the serialized shutdown fence must reject all later admission"
+        );
+        late_submitter.join().expect("late admission thread");
         assert_eq!(op_queue.successful_submissions_for_test(), 1);
         assert_eq!(op_queue.completed_operations_for_test(), 1);
-        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
+        assert!(inner.upgrade().is_none());
     }
 
     #[test]
@@ -9730,6 +10032,34 @@ mod tests {
             .expect("inner operation queue");
 
         assert!(Arc::ptr_eq(&manager.op_queue, &inner_queue));
+    }
+
+    #[test]
+    fn task_terminal_authority_preserves_owner_resource_and_monotonic_epochs() {
+        let manager = ProcessManager::new();
+        let task_id = TaskId::new();
+        let first = manager
+            .issue_task_terminal_launch_authority(task_id, "task-terminal", &[8080, 8080])
+            .expect("first Task terminal authority");
+        let second = manager
+            .issue_task_terminal_launch_authority(task_id, "task-terminal", &[8080])
+            .expect("replacement Task terminal authority");
+
+        let (first_owner, first_resource, first_generation, first_epoch) =
+            first.identity_for_test();
+        let (second_owner, second_resource, second_generation, second_epoch) =
+            second.identity_for_test();
+        assert_eq!(first_owner, ProcessOwner::Task(task_id));
+        assert_eq!(second_owner, ProcessOwner::Task(task_id));
+        assert_eq!(first_resource, second_resource);
+        assert_eq!(first_generation, 1);
+        assert_eq!(second_generation, 2);
+        assert!(second_epoch > first_epoch);
+
+        let oversized_ports = vec![0; MAX_MANAGED_TERMINAL_PORTS + 1];
+        assert!(manager
+            .issue_task_terminal_launch_authority(task_id, "task-terminal", &oversized_ports,)
+            .is_err());
     }
 
     #[test]
@@ -9947,8 +10277,8 @@ mod tests {
     }
 
     #[test]
-    fn reaper_targets_tracked_descendant_when_root_is_gone() {
-        let cwd = temp_test_dir("reaper-dead-root-descendant");
+    fn normal_reconciliation_never_promotes_pid_ledger_descendant_to_kill_authority() {
+        let cwd = temp_test_dir("authority-dead-root-descendant");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
         let current = platform_service::capture_process_identity(std::process::id())
@@ -9971,14 +10301,49 @@ mod tests {
         })
         .unwrap();
 
-        let pids = collect_session_reap_pids(&manager.inner, "server-cmd");
-
-        assert_eq!(pids, vec![std::process::id()]);
+        assert_eq!(
+            retry_exact_session_teardown(&manager.inner, "server-cmd"),
+            Ok(())
+        );
+        assert!(platform_service::is_pid_running(std::process::id()));
+        assert_eq!(
+            pid_file::active_tracked_pids_for_session("server-cmd"),
+            vec![std::process::id()],
+            "crash-recovery evidence remains retained without a live Job authority"
+        );
     }
 
     #[test]
-    fn reaper_marks_stopping_session_stopped_after_processes_clear() {
-        let cwd = temp_test_dir("reaper-stopped-session");
+    fn replacement_is_rejected_while_unowned_live_ledger_identity_remains() {
+        let cwd = temp_test_dir("replacement-live-ledger");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let current = platform_service::capture_process_identity(std::process::id())
+            .expect("current process identity");
+        pid_file::track_session_process(pid_file::ManagedProcessRecord {
+            session_id: "stale-session".to_string(),
+            pid: current.pid,
+            started_at_unix_secs: current.started_at_unix_secs,
+            process_name: current.process_name,
+            session_kind: "server".to_string(),
+            program: "cmd".to_string(),
+            project_id: Some("project-1".to_string()),
+            command_id: Some("stale-session".to_string()),
+            tab_id: None,
+            descendant_processes: Vec::new(),
+        })
+        .expect("track live ledger identity");
+
+        let error =
+            ensure_prior_session_teardown_settled(&manager.inner, "stale-session", Duration::ZERO)
+                .expect_err("replacement must fail closed without a live Job authority");
+        assert!(error.contains("did not settle before replacement"));
+        assert!(platform_service::is_pid_running(std::process::id()));
+    }
+
+    #[test]
+    fn settlement_marks_stopping_session_stopped_after_processes_clear() {
+        let cwd = temp_test_dir("settled-stopped-session");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
         manager.register_runtime_session(SessionRuntimeState::new(
@@ -9993,7 +10358,7 @@ mod tests {
             session.mark_dirty();
         });
 
-        manager.reap_session_processes_until_clear("alpha", Duration::from_millis(1));
+        manager.settle_session_teardown_for_test("alpha", Duration::from_millis(1));
 
         let runtime = manager.runtime_state();
         assert_eq!(

@@ -1385,7 +1385,7 @@ fn teardown_escalation_order_is_fixed() {
 }
 
 #[test]
-fn teardown_post_zero_failure_is_reported_with_residue_before_release() {
+fn teardown_post_zero_failure_retains_authority_and_never_releases() {
     let ticket = ticket(17, 37, TeardownScope::Host, 20, 117, 1_017);
     let admission = FakeAdmission::default();
     admission.allow(&ticket);
@@ -1441,12 +1441,16 @@ fn teardown_post_zero_failure_is_reported_with_residue_before_release() {
             "wait:CooperativeGrace",
             "settle_active_process_zero",
             "detach_after_zero",
-            "reconcile_ports",
-            "persist_settlement",
-            "release_stopped_exact",
         ]
     );
-    assert_eq!(effects.release_count(ticket.resource_id()), 1);
+    assert_eq!(
+        effects.release_count(ticket.resource_id()),
+        0,
+        "a failed terminal detach must retain exact Job/release authority"
+    );
+    assert!(!report
+        .attempted_stages()
+        .contains(&TeardownStage::ReleaseStoppedExact));
 }
 
 #[test]
@@ -1934,7 +1938,7 @@ fn teardown_shutdown_rejects_new_admission_without_lookup_or_effects() {
 }
 
 #[test]
-fn teardown_shutdown_race_rolls_back_admission_when_submission_closes() {
+fn teardown_shutdown_waits_for_in_flight_admission_and_rollback_before_return() {
     let ticket = ticket(31, 51, TeardownScope::Host, 32, 131, 1_031);
     let admission = FakeAdmission::default();
     admission.allow(&ticket);
@@ -1951,7 +1955,21 @@ fn teardown_shutdown_race_rolls_back_admission_when_submission_closes() {
     let request_thread = std::thread::spawn(move || request_coordinator.request(request_ticket));
 
     blocking_admission.wait_until_batch_entered();
-    coordinator.shutdown();
+    let (shutdown_returned_tx, shutdown_returned_rx) = std::sync::mpsc::sync_channel(1);
+    let shutdown_coordinator = Arc::clone(&coordinator);
+    let shutdown_thread = std::thread::spawn(move || {
+        shutdown_coordinator.shutdown();
+        shutdown_returned_tx
+            .send(())
+            .expect("observe shutdown return");
+    });
+
+    assert!(
+        shutdown_returned_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "shutdown returned while admission still held the serialization gate"
+    );
     blocking_admission.release_batch();
 
     assert!(matches!(
@@ -1963,6 +1981,18 @@ fn teardown_shutdown_race_rolls_back_admission_when_submission_closes() {
     assert!(
         !admission.launch_or_input_is_rejected(ticket.resource_id()),
         "a submission race must reopen the exact admission it did not schedule"
+    );
+    shutdown_returned_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown returns after exact admission rollback");
+    shutdown_thread.join().expect("join shutdown thread");
+
+    let admission_events_at_return = admission.events();
+    std::thread::sleep(Duration::from_millis(25));
+    assert_eq!(
+        admission_events_at_return,
+        admission.events(),
+        "no admission or rollback may mutate state after shutdown returns"
     );
 }
 
@@ -2172,6 +2202,61 @@ fn teardown_completion_store_retention_is_bounded() {
     assert!(
         store.inner.retained_count_for_test() <= 256,
         "completion store must retain a bounded exact-retry journal"
+    );
+}
+
+#[test]
+fn teardown_completion_journal_replays_exact_report_after_store_reopen() {
+    let temp = tempfile::tempdir().expect("durable teardown journal directory");
+    let path = temp.path().join("teardown.sqlite3");
+    let ticket = ticket(60, 61, TeardownScope::Host, 62, 160, 1_060);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let first_store = TeardownCompletionStore::durable(&path).expect("open first journal");
+    let first = TeardownCoordinator::with_configuration_and_completion_store(
+        Arc::new(admission),
+        Arc::new(effects.clone()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::default(),
+        8,
+        first_store,
+    );
+    let report = runtime().block_on(
+        first
+            .request(ticket.clone())
+            .expect("first exact admission")
+            .wait(),
+    );
+    assert_eq!(report.outcome(), TeardownOutcome::Closed);
+    drop(first);
+
+    let reopened = TeardownCompletionStore::durable(&path).expect("reopen durable journal");
+    let second = TeardownCoordinator::with_configuration_and_completion_store(
+        Arc::new(FakeAdmission::default()),
+        Arc::new(FakeEffects::default()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::default(),
+        8,
+        reopened,
+    );
+    let replay = runtime().block_on(
+        second
+            .request(ticket.clone())
+            .expect("durable completion lookup")
+            .wait(),
+    );
+    assert_eq!(replay.operation_id(), ticket.operation_id());
+    assert_eq!(replay.action_epoch(), ticket.action_epoch());
+    assert_eq!(replay.fence(), ticket.fence());
+    assert_eq!(replay.outcome(), TeardownOutcome::Closed);
+    assert_eq!(
+        effects.release_count(ticket.resource_id()),
+        1,
+        "reopening the journal must not execute teardown effects again"
     );
 }
 

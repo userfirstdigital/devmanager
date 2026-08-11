@@ -199,6 +199,8 @@ pub struct ServerLaunchSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub auto_restart: bool,
+    #[serde(default)]
+    pub port: Option<u16>,
     pub log_file_path: Option<PathBuf>,
 }
 

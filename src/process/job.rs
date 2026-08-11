@@ -123,6 +123,11 @@ const SHUTDOWN_COMPLETION_KEY: usize = 0;
 #[cfg(windows)]
 const COMPLETION_LISTENER_POLL_MILLIS: u32 = 25;
 #[cfg(windows)]
+const COMPLETION_LISTENER_RELEASE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(COMPLETION_LISTENER_POLL_MILLIS as u64 * 4);
+#[cfg(windows)]
+const COMPLETION_LISTENER_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(windows)]
 const ERROR_TIMEOUT: i32 = 258;
 #[cfg(windows)]
 static NEXT_COMPLETION_KEY: AtomicUsize = AtomicUsize::new(1);
@@ -467,6 +472,18 @@ impl ManagedProcessJob {
                 Some("managed Job completion port is unavailable while stopping listener".into())
             }
         };
+        let wait_started = std::time::Instant::now();
+        while !listener.is_finished()
+            && wait_started.elapsed() < COMPLETION_LISTENER_RELEASE_TIMEOUT
+        {
+            std::thread::yield_now();
+        }
+        if !listener.is_finished() {
+            // Keep ownership of the receiver capability.  The exact release
+            // authority remains retryable and no JoinHandle is detached.
+            self.completion_listener = Some(listener);
+            return Err("managed Job completion listener did not acknowledge cancellation before the release deadline".to_string());
+        }
         let join_error = listener
             .join()
             .err()
@@ -487,7 +504,27 @@ impl Drop for ManagedProcessJob {
         // The listener must be joined before either handle is closed. The
         // completion port is the listener's wakeup boundary, while the
         // polling stop flag is the fail-closed fallback if posting fails.
-        let _ = self.shutdown_listener();
+        if self.shutdown_listener().is_err() && self.completion_listener.is_some() {
+            // Closing the completion port is the final documented cancellation
+            // boundary for GetQueuedCompletionStatus.  Wait only for the
+            // bounded private receiver to acknowledge it, then join an
+            // already-finished thread.
+            drop(self.completion_port.take());
+            if let Some(listener) = self.completion_listener.take() {
+                let wait_started = std::time::Instant::now();
+                while !listener.is_finished()
+                    && wait_started.elapsed() < COMPLETION_LISTENER_DROP_TIMEOUT
+                {
+                    std::thread::yield_now();
+                }
+                if !listener.is_finished() {
+                    // Returning would detach the sole receiver capability and
+                    // violate the Job's no-orphan contract.
+                    std::process::abort();
+                }
+                let _ = listener.join();
+            }
+        }
         drop(self.completion_port.take());
         drop(self.handle.take());
     }

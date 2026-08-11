@@ -1,13 +1,16 @@
-//! Pure, generation-fenced process-tree teardown orchestration.
+//! Generation-fenced process-tree teardown orchestration.
 //!
-//! This module deliberately stops at the TeardownEffects seam. The host and
-//! the future terminal service provide that small runtime adapter; this core
-//! owns admission ordering, exact-fence validation, escalation, bounded
-//! concurrency, and waiter lifetime.
+//! This module owns the coordinator plus the sealed native-terminal adapter
+//! that binds exact Job authority to the production PTY lifecycle. It keeps
+//! admission ordering, exact-fence validation, escalation, bounded
+//! concurrency, and waiter lifetime behind one authority boundary.
 
 use std::collections::VecDeque;
 use std::future::Future;
+#[cfg(windows)]
+use std::io::Write;
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,22 +18,42 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
+#[cfg(windows)]
+use portable_pty::MasterPty;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::domain::id::{OperationId, ResourceId, TaskId};
+#[cfg(test)]
 use crate::domain::operation::ResourceFence;
 use crate::process::identity::ProcessOwner;
-use crate::process::registry::{
-    ManagedProcessFence, ManagedProcessState, ProcessDisplayLabel, ProcessRegistry,
-    RegisteredProcess,
-};
+use crate::process::registry::{ManagedProcessFence, ManagedProcessState, ProcessRegistry};
+#[cfg(test)]
+use crate::process::registry::{ProcessDisplayLabel, RegisteredProcess};
 
 #[cfg(windows)]
 use crate::process::job::ManagedProcessJob;
+#[cfg(windows)]
+use crate::process::launcher::{
+    ManagedPtyChild, PendingManagedLaunch, RegisteredPendingManagedLaunch,
+};
+
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CancelSynchronousIo(thread: *mut c_void) -> i32;
+}
 
 pub const DEFAULT_CONFIGURED_CAPACITY: usize = 4;
 pub const DEFAULT_COMPLETED_OPERATION_CAPACITY: usize = 256;
 pub const DEFAULT_EXECUTOR_QUEUE_CAPACITY: usize = 256;
+pub(crate) const MAX_MANAGED_TERMINAL_PORTS: usize = 64;
 /// The largest request accepted by the atomic batch API.  This is deliberately
 /// the same size as the fixed executor mailbox: a caller must never be able to
 /// turn a rejected request into an unbounded ticket/receipt allocation.
@@ -253,12 +276,6 @@ pub(crate) trait TeardownAdmission: Send + Sync + 'static {
     ) -> Result<(), TeardownAdmissionError>;
 }
 
-/// Marker implemented only by host-owned adapters whose synchronous entry
-/// points are construction-safe.  The coordinator's public host constructor
-/// accepts this marker instead of accepting an arbitrary trait object, so a
-/// blocking effect factory cannot be installed in the production boundary.
-pub(crate) trait BoundedTeardownAdmission: TeardownAdmission {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TeardownDeadline(u128);
 
@@ -317,8 +334,6 @@ impl TeardownClock for MonotonicTeardownClock {
         TeardownDeadline(now.checked_add(timeout).unwrap_or(u128::MAX))
     }
 }
-
-impl BoundedTeardownClock for MonotonicTeardownClock {}
 
 impl MonotonicTeardownClock {
     fn remaining_until(&self, deadline: TeardownDeadline) -> Duration {
@@ -412,6 +427,7 @@ impl CleanupDeadline {
         checked_remaining_until(self.absolute, operation)
     }
 
+    #[cfg(test)]
     pub(crate) fn remaining(self) -> Result<Duration, String> {
         let now = std::panic::catch_unwind(AssertUnwindSafe(Instant::now)).map_err(|payload| {
             format!(
@@ -536,11 +552,10 @@ pub enum WaitResult {
 /// exact fence and an authoritative empty membership query, all post-zero
 /// effects have completed, and `release_stopped_exact` is called.
 ///
-/// The Task 3.4 TerminalService/host implementation is intentionally not part
-/// of this pure core. Its adapter must source the zero result from the
-/// registry completion path and make `settle_active_process_zero` perform the
-/// final exact-fence plus authoritative membership check. The coordinator's
-/// `WaitResult::Zero` is deliberately not itself a proof-bearing constructor.
+/// The native terminal adapter sources zero from the registry completion path
+/// and makes `settle_active_process_zero` perform the final exact-fence plus
+/// authoritative membership check. The coordinator's `WaitResult::Zero` is
+/// deliberately not itself a proof-bearing constructor.
 ///
 /// Every method must construct its future without blocking, and polling must
 /// be cancellation-safe at the supplied deadline. Production implementations
@@ -592,16 +607,6 @@ pub(crate) trait TeardownEffects: Send + Sync + 'static {
         ticket: &'a TeardownTicket,
     ) -> BoxFuture<'a, StageResult>;
 }
-
-/// Marker for an effect adapter whose methods only capture handles and return
-/// cancellable futures.  A synchronous/non-returning effect constructor would
-/// otherwise strand one of the fixed teardown workers and make shutdown's
-/// join unbounded.
-pub(crate) trait BoundedTeardownEffects: TeardownEffects {}
-
-/// Marker for the host monotonic clock.  A clock implementation is part of the
-/// same bounded authority boundary as admission and effects.
-pub(crate) trait BoundedTeardownClock: TeardownClock {}
 
 const MAX_EVIDENCE_TEXT_BYTES: usize = 256;
 const MAX_SANITIZE_INPUT_BYTES: usize = 4096;
@@ -926,9 +931,8 @@ impl TeardownCompletionKey {
 ///
 /// The coordinator never accepts an arbitrary caller-provided blocking trait
 /// here. Both lookup and persistence are invoked only by its fixed-capacity
-/// dispatch boundary. The in-memory implementation is the current Phase 3.7
-/// store; a production durable backend can be added behind this module without
-/// widening the public seam to untracked blocking code.
+/// dispatch boundary. Production terminal authorities use the bounded SQLite
+/// journal; deterministic tests may use the in-memory implementation.
 #[derive(Debug, Clone, Default)]
 pub struct TeardownCompletionStore {
     inner: Arc<CompletionStoreInner>,
@@ -941,7 +945,7 @@ pub struct TeardownCompletionStore {
 /// adapter handle and cannot install an arbitrary blocking admission, clock,
 /// or effect implementation.
 #[derive(Clone)]
-pub struct TeardownHostAdapters {
+struct TeardownHostAdapters {
     admission: Arc<dyn TeardownAdmission>,
     effects: Arc<dyn TeardownEffects>,
     clock: Arc<dyn TeardownClock>,
@@ -956,16 +960,16 @@ impl std::fmt::Debug for TeardownHostAdapters {
 }
 
 impl TeardownHostAdapters {
-    /// Minted by the in-crate host after it has selected the production Job,
-    /// admission, and monotonic-clock implementations. The constructor is
-    /// crate-private so an external caller cannot provide an unbounded seam.
-    #[allow(dead_code)]
-    pub(crate) fn from_host<A, E, C>(admission: Arc<A>, effects: Arc<E>, clock: Arc<C>) -> Self
-    where
-        A: BoundedTeardownAdmission,
-        E: BoundedTeardownEffects,
-        C: BoundedTeardownClock,
-    {
+    /// The production adapter constructor accepts only the concrete terminal
+    /// host implementation declared in this module. This is stronger than a
+    /// marker trait: no other crate module can install a synchronously
+    /// blocking future constructor in the shutdown worker boundary.
+    #[cfg(windows)]
+    fn terminal(
+        admission: Arc<TerminalTeardownAdmission>,
+        effects: Arc<TerminalTeardownEffects>,
+        clock: Arc<MonotonicTeardownClock>,
+    ) -> Self {
         Self {
             admission: admission as Arc<dyn TeardownAdmission>,
             effects: effects as Arc<dyn TeardownEffects>,
@@ -979,12 +983,153 @@ impl TeardownHostAdapters {
 /// terminal close/restart/drop can therefore never fall back to PID- or
 /// `ChildKiller`-selected termination once a session is live.
 #[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct ManagedTerminalActorHandles {
+    pub(crate) reader: Option<JoinHandle<()>>,
+    pub(crate) waiter: Option<JoinHandle<()>>,
+}
+
+/// Concrete native-terminal resources detached only after receiver-owned
+/// ACTIVE_PROCESS_ZERO.  The slots are created before the suspended process
+/// is resumed, so every setup-failure path is covered by the same adapter.
+#[cfg(windows)]
+pub(crate) struct ManagedTerminalIo {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: Arc<Mutex<ManagedTerminalActorHandles>>,
+    detached: AtomicBool,
+}
+
+#[cfg(windows)]
+impl ManagedTerminalIo {
+    pub(crate) fn new(
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+        actors: Arc<Mutex<ManagedTerminalActorHandles>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            writer,
+            master,
+            actors,
+            detached: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    fn empty() -> Arc<Self> {
+        Self::new(
+            Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ManagedTerminalActorHandles::default())),
+        )
+    }
+
+    async fn detach_after_zero(&self) -> Result<(), String> {
+        if self.detached.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| "terminal PTY writer poisoned".to_string())?;
+            let old = std::mem::replace(&mut *writer, Box::new(std::io::sink()));
+            drop(old);
+        }
+        self.master
+            .lock()
+            .map_err(|_| "terminal PTY master poisoned".to_string())?
+            .take();
+
+        let current = thread::current().id();
+        loop {
+            let all_finished = {
+                let actors = self
+                    .actors
+                    .lock()
+                    .map_err(|_| "terminal actor handles poisoned".to_string())?;
+                for handle in [&actors.reader, &actors.waiter].into_iter().flatten() {
+                    if handle.thread().id() == current {
+                        return Err(
+                            "terminal teardown actor attempted to synchronously join itself"
+                                .to_string(),
+                        );
+                    }
+                    if !handle.is_finished() {
+                        // SAFETY: JoinHandle owns a live OS thread handle and
+                        // cancellation targets synchronous I/O issued only by
+                        // that exact actor. The subsequent loop still requires
+                        // the actor to acknowledge cancellation before join.
+                        unsafe {
+                            let _ = CancelSynchronousIo(handle.as_raw_handle());
+                        }
+                    }
+                }
+                let finished = [&actors.reader, &actors.waiter]
+                    .into_iter()
+                    .flatten()
+                    .all(JoinHandle::is_finished);
+                finished
+            };
+            if all_finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let mut actors = self
+            .actors
+            .lock()
+            .map_err(|_| "terminal actor handles poisoned".to_string())?;
+        if let Some(reader) = actors.reader.take() {
+            reader
+                .join()
+                .map_err(|_| "terminal reader actor panicked".to_string())?;
+        }
+        if let Some(waiter) = actors.waiter.take() {
+            waiter
+                .join()
+                .map_err(|_| "terminal wait actor panicked".to_string())?;
+        }
+        self.detached.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn validate_terminal_teardown_inputs(
+    session_id: &str,
+    action_epoch: u64,
+    ports: &[u16],
+) -> Result<Vec<u16>, String> {
+    if action_epoch == 0 {
+        return Err("terminal teardown action epoch must be greater than zero".to_string());
+    }
+    if session_id.trim().is_empty() || session_id.len() > 256 {
+        return Err("terminal teardown session identity is invalid".to_string());
+    }
+    if ports.len() > MAX_MANAGED_TERMINAL_PORTS {
+        return Err(format!(
+            "terminal teardown port set exceeds {MAX_MANAGED_TERMINAL_PORTS} entries"
+        ));
+    }
+    let mut normalized = ports.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+#[cfg(windows)]
 pub(crate) struct ManagedTerminalTeardown {
     coordinator: Arc<TeardownCoordinator>,
     ticket: TeardownTicket,
     waiter: Mutex<Option<TeardownWaiter>>,
     report: Mutex<Option<TeardownReport>>,
     state: Arc<Mutex<ManagedTerminalTeardownState>>,
+    /// Armed immediately before the registered suspended root is resumed.
+    /// Once armed, dropping this owner without a Closed report is a process
+    /// safety invariant violation: returning would abandon Job/actor authority.
+    armed: AtomicBool,
 }
 
 #[cfg(windows)]
@@ -992,10 +1137,129 @@ struct ManagedTerminalTeardownState {
     registry: ProcessRegistry<ManagedProcessJob>,
     fence: ManagedProcessFence,
     release_authority: Option<TeardownReleaseAuthority>,
+    session_id: String,
+    ports: Vec<u16>,
+    io: Arc<ManagedTerminalIo>,
+    settlement_persisted: bool,
 }
 
 #[cfg(windows)]
 impl ManagedTerminalTeardown {
+    /// Completes the one safe production PTY handoff: the suspended root is
+    /// registered in the exact Job-backed registry and only then resumed.
+    /// The returned child and teardown adapter share that same registry/fence;
+    /// there is no post-resume PID attachment window.
+    pub(crate) fn from_pending_launch(
+        pending: PendingManagedLaunch,
+        operation_id: OperationId,
+        action_epoch: u64,
+        completion_store: TeardownCompletionStore,
+        session_id: String,
+        ports: Vec<u16>,
+        io: Arc<ManagedTerminalIo>,
+    ) -> Result<(Arc<Self>, ManagedPtyChild), String> {
+        // All fallible host input is checked while the root is still only a
+        // PendingChild. Once it is registered, constructing the teardown
+        // authority is infallible and the next operation is the one-way
+        // resume handoff.
+        let ports = validate_terminal_teardown_inputs(&session_id, action_epoch, &ports)?;
+        let mut registry = ProcessRegistry::new();
+        let pending = pending
+            .register_suspended(&mut registry)
+            .map_err(|error| error.to_string())?;
+        let fence = pending.fence().clone();
+        let teardown = Self::from_registered(
+            registry,
+            fence,
+            operation_id,
+            action_epoch,
+            completion_store,
+            session_id,
+            ports,
+            io,
+        );
+        teardown.armed.store(true, Ordering::Release);
+        let child = match Self::resume_registered_launch(&teardown, pending) {
+            Ok(child) => child,
+            Err(error) => {
+                // `resume` rolls the exact Starting registry entry back before
+                // returning. This root never became live, so disarm the drop
+                // guard and synchronously join the unused coordinator.
+                teardown.armed.store(false, Ordering::Release);
+                teardown.coordinator.shutdown();
+                return Err(error);
+            }
+        };
+        Ok((teardown, child))
+    }
+
+    fn resume_registered_launch(
+        teardown: &Arc<Self>,
+        pending: RegisteredPendingManagedLaunch,
+    ) -> Result<ManagedPtyChild, String> {
+        let mut state = teardown
+            .state
+            .lock()
+            .map_err(|_| "terminal process registry poisoned before resume".to_string())?;
+        pending
+            .resume(&mut state.registry)
+            .map_err(|error| error.to_string())
+    }
+
+    fn from_registered(
+        registry: ProcessRegistry<ManagedProcessJob>,
+        fence: ManagedProcessFence,
+        operation_id: OperationId,
+        action_epoch: u64,
+        completion_store: TeardownCompletionStore,
+        session_id: String,
+        ports: Vec<u16>,
+        io: Arc<ManagedTerminalIo>,
+    ) -> Arc<Self> {
+        let scope = match fence.owner() {
+            ProcessOwner::Task(task_id) => TeardownScope::Task(task_id),
+            ProcessOwner::Host => TeardownScope::Host,
+        };
+        let ticket = TeardownTicket::new(operation_id, scope, action_epoch, fence.clone())
+            .expect("terminal teardown scope is derived from its exact Job owner");
+        let state = Arc::new(Mutex::new(ManagedTerminalTeardownState {
+            registry,
+            fence,
+            release_authority: None,
+            session_id,
+            ports,
+            io,
+            settlement_persisted: false,
+        }));
+        let admission = Arc::new(TerminalTeardownAdmission::new(
+            ticket.fence().clone(),
+            ticket.scope(),
+            ticket.action_epoch(),
+        ));
+        let clock = Arc::new(MonotonicTeardownClock::default());
+        let effects = Arc::new(TerminalTeardownEffects {
+            state: Arc::clone(&state),
+            clock: Arc::clone(&clock),
+        });
+        let adapters = TeardownHostAdapters::terminal(admission, effects, Arc::clone(&clock));
+        let coordinator = Arc::new(TeardownCoordinator::from_host(
+            adapters,
+            1,
+            TeardownBudgets::default(),
+            DEFAULT_COMPLETED_OPERATION_CAPACITY,
+            completion_store,
+        ));
+        Arc::new(Self {
+            coordinator,
+            ticket,
+            waiter: Mutex::new(None),
+            report: Mutex::new(None),
+            state,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         pid: u32,
         job: ManagedProcessJob,
@@ -1012,53 +1276,48 @@ impl ManagedTerminalTeardown {
         let fence = registry
             .register(process)
             .map_err(|failure| failure.to_string())?;
-        let ticket = TeardownTicket::new(OperationId::new(), TeardownScope::Host, 1, fence.clone())
-            .map_err(|_| "terminal teardown scope did not match its Job owner".to_string())?;
-        let state = Arc::new(Mutex::new(ManagedTerminalTeardownState {
+        let teardown = Self::from_registered(
             registry,
             fence,
-            release_authority: None,
-        }));
-        let admission = Arc::new(TerminalTeardownAdmission::new(ticket.fence().clone()));
-        let clock = Arc::new(MonotonicTeardownClock::default());
-        let effects = Arc::new(TerminalTeardownEffects {
-            state: Arc::clone(&state),
-            clock: Arc::clone(&clock),
-        });
-        let adapters = TeardownHostAdapters::from_host(admission, effects, Arc::clone(&clock));
-        let coordinator = Arc::new(TeardownCoordinator::from_host(
-            adapters,
+            OperationId::new(),
             1,
-            TeardownBudgets::default(),
-            DEFAULT_COMPLETED_OPERATION_CAPACITY,
             TeardownCompletionStore::default(),
-        ));
-        Ok(Arc::new(Self {
-            coordinator,
-            ticket,
-            waiter: Mutex::new(None),
-            report: Mutex::new(None),
-            state,
-        }))
+            "teardown-windows-test".to_string(),
+            Vec::new(),
+            ManagedTerminalIo::empty(),
+        );
+        teardown.armed.store(true, Ordering::Release);
+        Ok(teardown)
+    }
+
+    fn waiter(&self) -> Result<TeardownWaiter, String> {
+        let mut slot = self
+            .waiter
+            .lock()
+            .map_err(|_| "terminal teardown waiter poisoned".to_string())?;
+        if let Some(waiter) = slot.as_ref() {
+            return Ok(waiter.clone());
+        }
+        let waiter = self
+            .coordinator
+            .request(self.ticket.clone())
+            .map_err(|error| format!("terminal teardown admission failed: {error:?}"))?;
+        *slot = Some(waiter.clone());
+        Ok(waiter)
+    }
+
+    /// Starts exact teardown without blocking the terminal reader/wait actor.
+    /// The actor can then exit and be joined by the host's synchronous close.
+    pub(crate) fn request_close(&self) -> Result<(), String> {
+        self.waiter().map(|_| ())
+    }
+
+    pub(crate) fn matches_fence(&self, expected: &ManagedProcessFence) -> bool {
+        self.ticket.fence() == expected
     }
 
     pub(crate) fn close(&self) -> Result<TeardownReport, String> {
-        let waiter = {
-            let mut slot = self
-                .waiter
-                .lock()
-                .map_err(|_| "terminal teardown waiter poisoned".to_string())?;
-            if let Some(waiter) = slot.as_ref() {
-                waiter.clone()
-            } else {
-                let waiter = self
-                    .coordinator
-                    .request(self.ticket.clone())
-                    .map_err(|error| format!("terminal teardown admission failed: {error:?}"))?;
-                *slot = Some(waiter.clone());
-                waiter
-            }
-        };
+        let waiter = self.waiter()?;
         if let Some(report) = self
             .report
             .lock()
@@ -1100,22 +1359,59 @@ impl ManagedTerminalTeardown {
         Ok(report)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+        self.managed_process_snapshot()
+            .map(|(_, active_process_ids)| active_process_ids)
+    }
+
+    /// Returns the exact generation/identity fence together with a membership
+    /// snapshot from the same authoritative Job-backed registry entry.
+    /// Callers may use this to validate a diagnostic PID selection, but the
+    /// fence remains the only authority accepted by teardown.
+    pub(crate) fn managed_process_snapshot(
+        &self,
+    ) -> Result<(ManagedProcessFence, Vec<u32>), String> {
         let state = self
             .state
             .lock()
             .map_err(|_| "terminal process registry poisoned".to_string())?;
-        state
+        let active_process_ids = state
             .registry
             .current(state.fence.resource().resource_id)
             .map(|process| process.job().active_process_ids())
-            .unwrap_or_else(|| Ok(Vec::new()))
+            .unwrap_or_else(|| Ok(Vec::new()))?;
+        Ok((state.fence.clone(), active_process_ids))
     }
 }
 
 #[cfg(windows)]
 impl Drop for ManagedTerminalTeardown {
     fn drop(&mut self) {
+        if self.armed.load(Ordering::Acquire) {
+            let already_closed = self
+                .report
+                .lock()
+                .ok()
+                .and_then(|report| report.clone())
+                .is_some_and(|report| report.outcome() == TeardownOutcome::Closed);
+            if !already_closed {
+                match self.close() {
+                    Ok(report) if report.outcome() == TeardownOutcome::Closed => {}
+                    Ok(report) => {
+                        eprintln!(
+                            "managed terminal authority dropped before exact close: {:?}",
+                            report.errors()
+                        );
+                        std::process::abort();
+                    }
+                    Err(error) => {
+                        eprintln!("managed terminal authority drop failed exact close: {error}");
+                        std::process::abort();
+                    }
+                }
+            }
+        }
         self.coordinator.shutdown();
     }
 }
@@ -1123,22 +1419,26 @@ impl Drop for ManagedTerminalTeardown {
 #[cfg(windows)]
 struct TerminalTeardownAdmission {
     fence: ManagedProcessFence,
+    scope: TeardownScope,
+    action_epoch: u64,
     state: Mutex<AdmissionState>,
 }
 
 #[cfg(windows)]
 impl TerminalTeardownAdmission {
-    fn new(fence: ManagedProcessFence) -> Self {
+    fn new(fence: ManagedProcessFence, scope: TeardownScope, action_epoch: u64) -> Self {
         Self {
             fence,
+            scope,
+            action_epoch,
             state: Mutex::new(AdmissionState::Open),
         }
     }
 
     fn validate_ticket(&self, ticket: &TeardownTicket) -> Result<(), TeardownAdmissionError> {
-        if ticket.scope() != TeardownScope::Host || ticket.action_epoch() != 1 {
+        if ticket.scope() != self.scope || ticket.action_epoch() != self.action_epoch {
             return Err(TeardownAdmissionError::StaleEpoch {
-                expected: 1,
+                expected: self.action_epoch,
                 actual: ticket.action_epoch(),
             });
         }
@@ -1233,9 +1533,6 @@ impl TeardownAdmission for TerminalTeardownAdmission {
         Ok(())
     }
 }
-
-#[cfg(windows)]
-impl BoundedTeardownAdmission for TerminalTeardownAdmission {}
 
 #[cfg(windows)]
 struct TerminalTeardownEffects {
@@ -1418,16 +1715,120 @@ impl TeardownEffects for TerminalTeardownEffects {
         })
     }
 
-    fn detach_after_zero<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        Box::pin(async { StageResult::Completed })
+    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let state = Arc::clone(&self.state);
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            let io = {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return StageResult::Failed {
+                            detail: "terminal process registry poisoned".to_string(),
+                        }
+                    }
+                };
+                if let Err(detail) = Self::validate_ticket(&state, &ticket) {
+                    return StageResult::Failed { detail };
+                }
+                Arc::clone(&state.io)
+            };
+            match io.detach_after_zero().await {
+                Ok(()) => StageResult::Completed,
+                Err(detail) => StageResult::Failed { detail },
+            }
+        })
     }
 
-    fn reconcile_ports<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        Box::pin(async { StageResult::Completed })
+    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let state = Arc::clone(&self.state);
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            let state = match state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    return StageResult::Failed {
+                        detail: "terminal process registry poisoned".to_string(),
+                    }
+                }
+            };
+            if let Err(detail) = Self::validate_ticket(&state, &ticket) {
+                return StageResult::Failed { detail };
+            }
+            if state.ports.is_empty() {
+                return StageResult::Completed;
+            }
+            let listeners =
+                match crate::services::platform_service::snapshot_listener_pids(&state.ports) {
+                    Ok(listeners) => listeners,
+                    Err(detail) => return StageResult::Failed { detail },
+                };
+            let Some(process) = state.registry.current(ticket.resource_id()) else {
+                return StageResult::Failed {
+                    detail: "terminal process registry entry is missing".to_string(),
+                };
+            };
+            for (port, pid) in listeners {
+                if process.job().inspect_process(pid).is_ok() {
+                    return StageResult::Failed {
+                        detail: format!(
+                            "managed listener on port {port} remained after ACTIVE_PROCESS_ZERO"
+                        ),
+                    };
+                }
+            }
+            // A listener that is not an exact member is external. It remains
+            // untouched and the normal background port inventory will expose
+            // it as externally occupied (blue).
+            StageResult::Completed
+        })
     }
 
-    fn persist_settlement<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        Box::pin(async { StageResult::Completed })
+    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+        let state = Arc::clone(&self.state);
+        let ticket = ticket.clone();
+        Box::pin(async move {
+            let (session_id, root_pid, already_persisted) = {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return StageResult::Failed {
+                            detail: "terminal process registry poisoned".to_string(),
+                        }
+                    }
+                };
+                if let Err(detail) = Self::validate_ticket(&state, &ticket) {
+                    return StageResult::Failed { detail };
+                }
+                (
+                    state.session_id.clone(),
+                    state.fence.root().id().pid(),
+                    state.settlement_persisted,
+                )
+            };
+            if !already_persisted {
+                if let Err(detail) = crate::services::pid_file::release_session_root(
+                    &session_id,
+                    root_pid,
+                    Vec::new(),
+                ) {
+                    return StageResult::Failed { detail };
+                }
+                let mut state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return StageResult::Failed {
+                            detail: "terminal process registry poisoned".to_string(),
+                        }
+                    }
+                };
+                if let Err(detail) = Self::validate_ticket(&state, &ticket) {
+                    return StageResult::Failed { detail };
+                }
+                state.settlement_persisted = true;
+            }
+            StageResult::Completed
+        })
     }
 
     fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
@@ -1464,16 +1865,19 @@ impl TeardownEffects for TerminalTeardownEffects {
                     }
                 }
             };
-            let Some(authority) = state.release_authority.take() else {
+            let ManagedTerminalTeardownState {
+                registry,
+                release_authority,
+                ..
+            } = &mut *state;
+            let Some(authority) = release_authority.as_ref() else {
                 return StageResult::Failed {
                     detail: "terminal teardown release authority was not minted".to_string(),
                 };
             };
-            match state
-                .registry
-                .release_stopped_with_authority(&ticket, authority)
-            {
+            match registry.release_stopped_with_authority(&ticket, authority) {
                 Ok(crate::process::registry::UnregisterOutcome::Removed(_)) => {
+                    *release_authority = None;
                     StageResult::Completed
                 }
                 Ok(crate::process::registry::UnregisterOutcome::Stale) => StageResult::Failed {
@@ -1488,11 +1892,10 @@ impl TeardownEffects for TerminalTeardownEffects {
 }
 
 #[cfg(windows)]
-impl BoundedTeardownEffects for TerminalTeardownEffects {}
-
 #[derive(Debug, Default)]
 struct CompletionStoreInner {
     reports: Mutex<VecDeque<(TeardownCompletionKey, TeardownReport)>>,
+    durable_path: Option<PathBuf>,
     persist_error: Mutex<Option<String>>,
     lookup_blocked: AtomicBool,
     lookup_started: AtomicUsize,
@@ -1502,8 +1905,39 @@ struct CompletionStoreInner {
 }
 
 impl TeardownCompletionStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Opens the host-owned durable idempotency journal.  Production terminal
+    /// launch authority must carry a store created through this constructor;
+    /// pure coordinator tests use the in-memory `Default` implementation.
+    pub(crate) fn durable(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "create teardown completion journal directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let connection = Connection::open(&path).map_err(|error| {
+            format!(
+                "open teardown completion journal {}: {error}",
+                path.display()
+            )
+        })?;
+        initialize_completion_journal(&connection)?;
+        Ok(Self {
+            inner: Arc::new(CompletionStoreInner {
+                durable_path: Some(path),
+                ..CompletionStoreInner::default()
+            }),
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn for_terminal_host() -> Result<Self, String> {
+        let root = crate::persistence::app_config_dir()
+            .map_err(|error| format!("resolve teardown completion journal root: {error}"))?;
+        Self::durable(root.join("teardown-completions.sqlite3"))
     }
 
     /// Test-only fault injection at the real store boundary. This is an
@@ -1581,7 +2015,7 @@ impl TeardownCompletionStore {
             };
             thread::sleep(remaining.min(Duration::from_millis(1)));
         }
-        let report = self
+        let cached = self
             .inner
             .reports
             .lock()
@@ -1589,6 +2023,27 @@ impl TeardownCompletionStore {
             .iter()
             .find(|(stored_key, _)| stored_key == key)
             .map(|(_, report)| report.clone());
+        let report = if cached.is_some() {
+            cached
+        } else if let Some(path) = self.inner.durable_path.as_ref() {
+            let remaining = checked_remaining_until(absolute_deadline, "completion lookup")?;
+            let connection = open_completion_journal(path, remaining)?;
+            let key_json = durable_completion_key(key)?;
+            let payload = connection
+                .query_row(
+                    "SELECT report_json FROM teardown_completions WHERE completion_key = ?1",
+                    params![key_json],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("read teardown completion journal: {error}"))?;
+            match payload {
+                Some(payload) => Some(decode_durable_report(key, &payload)?),
+                None => None,
+            }
+        } else {
+            None
+        };
         checked_remaining_until(absolute_deadline, "completion lookup")?;
         Ok(report)
     }
@@ -1631,6 +2086,37 @@ impl TeardownCompletionStore {
         {
             return Err(detail);
         }
+        if let Some(path) = self.inner.durable_path.as_ref() {
+            let remaining = checked_remaining_until(absolute_deadline, "completion persistence")?;
+            let mut connection = open_completion_journal(path, remaining)?;
+            let key_json = durable_completion_key(key)?;
+            let report_json = encode_durable_report(report)?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("begin teardown completion transaction: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO teardown_completions(completion_key, report_json) VALUES (?1, ?2)
+                     ON CONFLICT(completion_key) DO UPDATE SET report_json = excluded.report_json",
+                    params![key_json, report_json],
+                )
+                .map_err(|error| format!("persist teardown completion: {error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM teardown_completions
+                     WHERE rowid NOT IN (
+                       SELECT rowid FROM teardown_completions
+                       ORDER BY rowid DESC LIMIT ?1
+                     )",
+                    params![DEFAULT_COMPLETED_OPERATION_CAPACITY as i64],
+                )
+                .map_err(|error| format!("bound teardown completion journal: {error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit teardown completion: {error}"))?;
+            checked_remaining_until(absolute_deadline, "completion persistence")?;
+        }
+
         let mut reports = self.inner.reports.lock().expect("completion store reports");
         if let Some((_, stored_report)) =
             reports.iter_mut().find(|(stored_key, _)| stored_key == key)
@@ -1646,6 +2132,233 @@ impl TeardownCompletionStore {
         checked_remaining_until(absolute_deadline, "completion persistence")?;
         Ok(())
     }
+}
+
+const COMPLETION_JOURNAL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS teardown_completions (
+    completion_key TEXT PRIMARY KEY NOT NULL,
+    report_json TEXT NOT NULL
+) STRICT;
+";
+
+fn initialize_completion_journal(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(COMPLETION_JOURNAL_SCHEMA)
+        .map_err(|error| format!("initialize teardown completion journal: {error}"))
+}
+
+fn open_completion_journal(path: &Path, remaining: Duration) -> Result<Connection, String> {
+    let connection = Connection::open(path).map_err(|error| {
+        format!(
+            "open teardown completion journal {}: {error}",
+            path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(remaining.min(Duration::from_millis(250)))
+        .map_err(|error| format!("bound teardown completion journal lock wait: {error}"))?;
+    initialize_completion_journal(&connection)?;
+    Ok(connection)
+}
+
+#[derive(Serialize)]
+struct DurableCompletionKey<'a> {
+    action_epoch: u64,
+    resource_id: String,
+    runtime_generation: u64,
+    owner_kind: &'static str,
+    owner_id: Option<String>,
+    root_pid: u32,
+    root_creation_time_100ns: u64,
+    root_executable: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _reserved: Option<&'a str>,
+}
+
+fn durable_completion_key(key: &TeardownCompletionKey) -> Result<String, String> {
+    let (owner_kind, owner_id) = match key.fence.owner() {
+        ProcessOwner::Task(task_id) => ("task", Some(task_id.to_string())),
+        ProcessOwner::Host => ("host", None),
+    };
+    let resource = key.fence.resource();
+    let root = key.fence.root();
+    serde_json::to_string(&DurableCompletionKey {
+        action_epoch: key.action_epoch,
+        resource_id: resource.resource_id.to_string(),
+        runtime_generation: resource.runtime_generation,
+        owner_kind,
+        owner_id,
+        root_pid: root.id().pid(),
+        root_creation_time_100ns: root.id().creation_time_100ns(),
+        root_executable: root.canonical_executable().display().to_string(),
+        _reserved: None,
+    })
+    .map_err(|error| format!("encode teardown completion key: {error}"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct DurableResidue {
+    job_name: String,
+    pid: u32,
+    creation_time_100ns: u64,
+    executable: String,
+    command_label: String,
+    last_lifecycle_event: String,
+    attempted_stages: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DurableReport {
+    operation_id: String,
+    outcome: String,
+    attempted_stages: Vec<String>,
+    errors: Vec<String>,
+    residue: Option<DurableResidue>,
+}
+
+fn teardown_stage_name(stage: TeardownStage) -> &'static str {
+    match stage {
+        TeardownStage::Drain => "drain",
+        TeardownStage::CooperativeClose => "cooperative_close",
+        TeardownStage::CooperativeWait => "cooperative_wait",
+        TeardownStage::InterruptOrSafeClose => "interrupt_or_safe_close",
+        TeardownStage::InterruptWait => "interrupt_wait",
+        TeardownStage::TerminateTree => "terminate_tree",
+        TeardownStage::TerminationWait => "termination_wait",
+        TeardownStage::SettleActiveProcessZero => "settle_active_process_zero",
+        TeardownStage::DetachAfterZero => "detach_after_zero",
+        TeardownStage::ReconcilePorts => "reconcile_ports",
+        TeardownStage::PersistSettlement => "persist_settlement",
+        TeardownStage::ReleaseStoppedExact => "release_stopped_exact",
+    }
+}
+
+fn parse_teardown_stage(value: &str) -> Result<TeardownStage, String> {
+    match value {
+        "drain" => Ok(TeardownStage::Drain),
+        "cooperative_close" => Ok(TeardownStage::CooperativeClose),
+        "cooperative_wait" => Ok(TeardownStage::CooperativeWait),
+        "interrupt_or_safe_close" => Ok(TeardownStage::InterruptOrSafeClose),
+        "interrupt_wait" => Ok(TeardownStage::InterruptWait),
+        "terminate_tree" => Ok(TeardownStage::TerminateTree),
+        "termination_wait" => Ok(TeardownStage::TerminationWait),
+        "settle_active_process_zero" => Ok(TeardownStage::SettleActiveProcessZero),
+        "detach_after_zero" => Ok(TeardownStage::DetachAfterZero),
+        "reconcile_ports" => Ok(TeardownStage::ReconcilePorts),
+        "persist_settlement" => Ok(TeardownStage::PersistSettlement),
+        "release_stopped_exact" => Ok(TeardownStage::ReleaseStoppedExact),
+        other => Err(format!("unknown durable teardown stage `{other}`")),
+    }
+}
+
+fn encode_durable_report(report: &TeardownReport) -> Result<String, String> {
+    let residue = report.residue.as_ref().map(|residue| DurableResidue {
+        job_name: residue.job_name.clone(),
+        pid: residue.pid,
+        creation_time_100ns: residue.creation_time_100ns,
+        executable: residue.executable.clone(),
+        command_label: residue.command_label.clone(),
+        last_lifecycle_event: residue.last_lifecycle_event.clone(),
+        attempted_stages: residue
+            .attempted_stages
+            .iter()
+            .copied()
+            .map(teardown_stage_name)
+            .map(str::to_string)
+            .collect(),
+    });
+    serde_json::to_string(&DurableReport {
+        operation_id: report.operation_id().to_string(),
+        outcome: match report.outcome {
+            TeardownOutcome::Closed => "closed",
+            TeardownOutcome::Leaked => "leaked",
+            TeardownOutcome::CleanupFailed => "cleanup_failed",
+        }
+        .to_string(),
+        attempted_stages: report
+            .attempted_stages
+            .iter()
+            .copied()
+            .map(teardown_stage_name)
+            .map(str::to_string)
+            .collect(),
+        errors: report
+            .errors
+            .iter()
+            .take(MAX_TEARDOWN_ERRORS)
+            .cloned()
+            .collect(),
+        residue,
+    })
+    .map_err(|error| format!("encode teardown completion report: {error}"))
+}
+
+fn decode_durable_report(
+    key: &TeardownCompletionKey,
+    payload: &str,
+) -> Result<TeardownReport, String> {
+    if payload.len() > 64 * 1024 {
+        return Err("durable teardown completion report exceeds 64 KiB".to_string());
+    }
+    let durable: DurableReport = serde_json::from_str(payload)
+        .map_err(|error| format!("decode teardown completion report: {error}"))?;
+    if durable.attempted_stages.len() > MAX_RESIDUE_STAGES
+        || durable.errors.len() > MAX_TEARDOWN_ERRORS
+    {
+        return Err("durable teardown completion report exceeds collection bounds".to_string());
+    }
+    let operation_id = OperationId::parse(&durable.operation_id)
+        .map_err(|error| format!("decode teardown completion operation id: {error}"))?;
+    let scope = match key.fence.owner() {
+        ProcessOwner::Task(task_id) => TeardownScope::Task(task_id),
+        ProcessOwner::Host => TeardownScope::Host,
+    };
+    let ticket = TeardownTicket::new(operation_id, scope, key.action_epoch, key.fence.clone())
+        .map_err(|_| "durable teardown completion scope mismatch".to_string())?;
+    let attempted_stages = durable
+        .attempted_stages
+        .iter()
+        .map(|stage| parse_teardown_stage(stage))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = match durable.outcome.as_str() {
+        "closed" => TeardownOutcome::Closed,
+        "leaked" => TeardownOutcome::Leaked,
+        "cleanup_failed" => TeardownOutcome::CleanupFailed,
+        other => return Err(format!("unknown durable teardown outcome `{other}`")),
+    };
+    let residue = durable
+        .residue
+        .map(|residue| {
+            if residue.attempted_stages.len() > MAX_RESIDUE_STAGES {
+                return Err("durable teardown residue exceeds stage bound".to_string());
+            }
+            let stages = residue
+                .attempted_stages
+                .iter()
+                .map(|stage| parse_teardown_stage(stage))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ResidueEvidence::new(
+                residue.job_name,
+                residue.pid,
+                residue.creation_time_100ns,
+                residue.executable,
+                residue.command_label,
+                residue.last_lifecycle_event,
+                stages,
+            ))
+        })
+        .transpose()?;
+    Ok(TeardownReport {
+        ticket,
+        outcome,
+        attempted_stages,
+        errors: durable
+            .errors
+            .into_iter()
+            .map(|error| sanitize_text(&error))
+            .collect(),
+        residue,
+    })
 }
 
 /// Bounded authority retained when admission or executor capacity cannot be
@@ -1913,7 +2626,6 @@ struct CleanupWork {
     deadline: CleanupDeadline,
     state: Arc<Mutex<CoordinatorState>>,
     completion_store: TeardownCompletionStore,
-    executor_keepalive: Arc<TeardownExecutorKeepalive>,
     completed_operation_capacity: usize,
 }
 
@@ -2162,9 +2874,23 @@ impl TeardownExecutorKeepalive {
             .expect("teardown worker handles mutex poisoned");
         let handles = std::mem::take(&mut *workers);
         drop(workers);
+        let wait_started = Instant::now();
+        while handles.iter().any(|handle| !handle.is_finished())
+            && wait_started.elapsed() < Duration::from_secs(2)
+        {
+            thread::yield_now();
+        }
         for handle in handles {
             if handle.thread().id() == current {
-                continue;
+                // Cleanup work never owns the executor keepalive; reaching
+                // this path would otherwise detach the current worker.
+                std::process::abort();
+            }
+            if !handle.is_finished() {
+                // A private production adapter has violated its cancellable
+                // construction/polling contract. Returning would orphan a
+                // mutating teardown actor, which is worse than failing closed.
+                std::process::abort();
             }
             let _ = handle.join();
         }
@@ -2348,14 +3074,14 @@ impl TeardownCoordinator {
     /// The adapter set cannot be constructed by external crates; the host
     /// controls which bounded Job/IOCP operations cross this authority
     /// boundary.
-    pub fn from_host(
+    fn from_host(
         adapters: TeardownHostAdapters,
         configured_capacity: usize,
         budgets: TeardownBudgets,
         completed_operation_capacity: usize,
         completion_store: TeardownCompletionStore,
     ) -> Self {
-        Self::with_configuration_and_completion_store(
+        Self::build(
             adapters.admission,
             adapters.effects,
             adapters.clock,
@@ -2366,6 +3092,7 @@ impl TeardownCoordinator {
         )
     }
 
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new(
         admission: Arc<dyn TeardownAdmission>,
@@ -2383,6 +3110,7 @@ impl TeardownCoordinator {
         )
     }
 
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn with_capacity(
         admission: Arc<dyn TeardownAdmission>,
@@ -2401,6 +3129,7 @@ impl TeardownCoordinator {
         )
     }
 
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn with_configuration(
         admission: Arc<dyn TeardownAdmission>,
@@ -2421,7 +3150,31 @@ impl TeardownCoordinator {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_configuration_and_completion_store(
+        admission: Arc<dyn TeardownAdmission>,
+        effects: Arc<dyn TeardownEffects>,
+        clock: Arc<dyn TeardownClock>,
+        configured_capacity: usize,
+        budgets: TeardownBudgets,
+        completed_operation_capacity: usize,
+        completion_store: TeardownCompletionStore,
+    ) -> Self {
+        Self::build(
+            admission,
+            effects,
+            clock,
+            configured_capacity,
+            budgets,
+            completed_operation_capacity,
+            completion_store,
+        )
+    }
+
+    /// The sole production constructor. Its dynamic seams have already been
+    /// sealed by the module-private `TeardownHostAdapters::terminal` factory;
+    /// arbitrary future constructors exist only in cfg(test) fixtures.
+    fn build(
         admission: Arc<dyn TeardownAdmission>,
         effects: Arc<dyn TeardownEffects>,
         clock: Arc<dyn TeardownClock>,
@@ -2453,11 +3206,17 @@ impl TeardownCoordinator {
     /// Production adapters are sealed and deadline-bounded, so no effect or
     /// persistence mutation can outlive this shutdown boundary.
     pub fn shutdown(&self) {
-        // Set the lifecycle fence before closing the executor. A request
-        // already inside the admission call will recheck this bit and roll
-        // its exact receipt back; a request that has not crossed the serial
-        // gate cannot start new work after this point.
+        // Publish the lifecycle fence first, then cross the same serialization
+        // gate as admission.  An admission already inside the gate observes
+        // the fence at its post-admission barrier and performs exact rollback;
+        // shutdown waits for that rollback before returning.  A later request
+        // observes the fence before lookup, persistence, capacity, submission,
+        // or effect work.
         self.shutdown_started.store(true, Ordering::SeqCst);
+        let _admission_serial = self
+            .admission_serial
+            .lock()
+            .expect("teardown admission serial mutex poisoned");
         self.executor.shutdown();
     }
 
@@ -2945,7 +3704,6 @@ impl TeardownCoordinator {
             deadline,
             state: Arc::clone(&self.state),
             completion_store: self.completion_store.clone(),
-            executor_keepalive: Arc::clone(&self.executor.keepalive),
             completed_operation_capacity: self.completed_operation_capacity,
             cancellation: CancellationToken::new(),
         }
@@ -3072,10 +3830,8 @@ async fn run_cleanup(work: CleanupWork) {
         deadline,
         state,
         completion_store,
-        executor_keepalive,
         completed_operation_capacity,
     } = work;
-    let _executor_keepalive = executor_keepalive;
     let fallback_ticket = ticket.clone();
     let report = match AssertUnwindSafe(execute_cleanup(
         ticket,
@@ -3656,47 +4412,80 @@ async fn settle_after_zero(
 ) -> TeardownReport {
     let mut errors = errors;
     attempted_stages.push(TeardownStage::DetachAfterZero);
-    collect_stage_result(
-        bounded_stage(
-            TeardownStage::DetachAfterZero,
-            deadline,
-            Arc::clone(&effects),
-            &ticket,
-            EffectCall::DetachAfterZero,
-            Arc::clone(&cancellation),
-        )
-        .await,
-        &mut errors,
+    let detach = bounded_stage(
         TeardownStage::DetachAfterZero,
-    );
+        deadline,
+        Arc::clone(&effects),
+        &ticket,
+        EffectCall::DetachAfterZero,
+        Arc::clone(&cancellation),
+    )
+    .await;
+    if let StageResult::Failed { detail } = detach {
+        push_bounded_error(
+            &mut errors,
+            format!("DetachAfterZero: {}", sanitize_text(&detail)),
+        );
+        return failed_post_zero_report(
+            ticket,
+            effects,
+            deadline,
+            attempted_stages,
+            errors,
+            cancellation,
+        )
+        .await;
+    }
     attempted_stages.push(TeardownStage::ReconcilePorts);
-    collect_stage_result(
-        bounded_stage(
-            TeardownStage::ReconcilePorts,
-            deadline,
-            Arc::clone(&effects),
-            &ticket,
-            EffectCall::ReconcilePorts,
-            Arc::clone(&cancellation),
-        )
-        .await,
-        &mut errors,
+    let reconcile = bounded_stage(
         TeardownStage::ReconcilePorts,
-    );
-    attempted_stages.push(TeardownStage::PersistSettlement);
-    collect_stage_result(
-        bounded_stage(
-            TeardownStage::PersistSettlement,
+        deadline,
+        Arc::clone(&effects),
+        &ticket,
+        EffectCall::ReconcilePorts,
+        Arc::clone(&cancellation),
+    )
+    .await;
+    if let StageResult::Failed { detail } = reconcile {
+        push_bounded_error(
+            &mut errors,
+            format!("ReconcilePorts: {}", sanitize_text(&detail)),
+        );
+        return failed_post_zero_report(
+            ticket,
+            effects,
             deadline,
-            Arc::clone(&effects),
-            &ticket,
-            EffectCall::PersistSettlement,
-            Arc::clone(&cancellation),
+            attempted_stages,
+            errors,
+            cancellation,
         )
-        .await,
-        &mut errors,
+        .await;
+    }
+    attempted_stages.push(TeardownStage::PersistSettlement);
+    let persist = bounded_stage(
         TeardownStage::PersistSettlement,
-    );
+        deadline,
+        Arc::clone(&effects),
+        &ticket,
+        EffectCall::PersistSettlement,
+        Arc::clone(&cancellation),
+    )
+    .await;
+    if let StageResult::Failed { detail } = persist {
+        push_bounded_error(
+            &mut errors,
+            format!("PersistSettlement: {}", sanitize_text(&detail)),
+        );
+        return failed_post_zero_report(
+            ticket,
+            effects,
+            deadline,
+            attempted_stages,
+            errors,
+            cancellation,
+        )
+        .await;
+    }
     attempted_stages.push(TeardownStage::ReleaseStoppedExact);
     let release = bounded_stage(
         TeardownStage::ReleaseStoppedExact,
@@ -3741,6 +4530,37 @@ async fn settle_after_zero(
     } else {
         None
     };
+    TeardownReport {
+        ticket,
+        outcome,
+        attempted_stages,
+        errors,
+        residue,
+    }
+}
+
+async fn failed_post_zero_report(
+    ticket: TeardownTicket,
+    effects: Arc<dyn TeardownEffects>,
+    deadline: CleanupDeadline,
+    attempted_stages: Vec<TeardownStage>,
+    mut errors: Vec<String>,
+    cancellation: Arc<CancellationToken>,
+) -> TeardownReport {
+    // Never release the exact Job authority after a failed detach, port
+    // reconciliation, or durable host settlement. The owning terminal keeps
+    // the Job and actor handles available for an exact retry; its Drop guard
+    // fails closed if the host nevertheless abandons that authority.
+    let adapter_residue =
+        bounded_residue(effects, &ticket, deadline, &mut errors, cancellation).await;
+    let outcome = TeardownOutcome::CleanupFailed;
+    let residue = required_residue(
+        &ticket,
+        &attempted_stages,
+        &errors,
+        outcome,
+        adapter_residue,
+    );
     TeardownReport {
         ticket,
         outcome,
@@ -3870,6 +4690,24 @@ mod tests {
         checked_remaining_until, sanitize_text, TeardownExecutor, TeardownReject,
         MAX_EVIDENCE_TEXT_BYTES,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_teardown_inputs_are_rejected_before_job_registration() {
+        assert!(super::validate_terminal_teardown_inputs("", 1, &[]).is_err());
+        assert!(super::validate_terminal_teardown_inputs("valid-session", 0, &[]).is_err());
+        assert!(super::validate_terminal_teardown_inputs(
+            "valid-session",
+            1,
+            &[0; super::MAX_MANAGED_TERMINAL_PORTS + 1]
+        )
+        .is_err());
+
+        let normalized =
+            super::validate_terminal_teardown_inputs("valid-session", 1, &[8080, 443, 8080])
+                .expect("valid terminal teardown inputs");
+        assert_eq!(normalized, vec![443, 8080]);
+    }
 
     #[test]
     fn absolute_deadline_boundary_rejects_expired_operations() {

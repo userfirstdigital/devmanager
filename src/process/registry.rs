@@ -698,7 +698,7 @@ impl<J> ProcessRegistry<J> {
     pub fn release_stopped_with_authority(
         &mut self,
         ticket: &TeardownTicket,
-        authority: TeardownReleaseAuthority,
+        authority: &TeardownReleaseAuthority,
     ) -> Result<UnregisterOutcome<J>, ProcessRegistryError>
     where
         J: JobMembership,
@@ -883,7 +883,7 @@ impl<J: JobMembership> ProcessRegistry<J> {
         Ok(fence)
     }
 
-    pub fn drain_job_completions(&mut self, resource_id: ResourceId) -> usize {
+    pub(crate) fn drain_job_completions(&mut self, resource_id: ResourceId) -> usize {
         let messages = self
             .current
             .get(&resource_id)
@@ -1008,7 +1008,7 @@ impl<J: JobMembership> ProcessRegistry<J> {
         Ok(TeardownReleaseAuthority::from_registry(ticket, proof.nonce))
     }
 
-    /// Applies a public-trait observation for diagnostics only. It validates
+    /// Applies a caller-supplied observation for diagnostics only. It validates
     /// the current generation but never mutates lifecycle state or creates a
     /// zero proof.
     pub fn apply_job_observation(&mut self, observation: JobCompletionObservation) -> bool {
@@ -1188,5 +1188,112 @@ impl<J: JobMembership> ProcessRegistry<J> {
             }
         }
         ProcessClassification::External
+    }
+}
+
+#[cfg(test)]
+mod release_authority_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::domain::id::{OperationId, ResourceId};
+    use crate::domain::operation::ResourceFence;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::teardown::{TeardownScope, TeardownTicket};
+
+    use super::{
+        JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership,
+        ManagedProcessFence, ProcessDisplayLabel, ProcessRegistry, ProcessRegistryError,
+        RegisteredProcess, UnregisterOutcome,
+    };
+
+    #[derive(Debug)]
+    struct RetryReleaseState {
+        root: ManagedProcessIdentity,
+        active: Vec<u32>,
+        shutdown_attempts: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RetryReleaseJob(Arc<Mutex<RetryReleaseState>>);
+
+    impl JobMembership for RetryReleaseJob {
+        fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+            Ok(self.0.lock().expect("retry Job state").active.clone())
+        }
+
+        fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+            let state = self.0.lock().expect("retry Job state");
+            if pid != state.root.id().pid() {
+                return Err(format!("PID {pid} is not the registered root"));
+            }
+            Ok(JobMemberInfo::new(state.root.clone(), None))
+        }
+
+        fn bind_completion_fence(&mut self, _fence: ManagedProcessFence) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn shutdown_for_release(&mut self) -> Result<(), String> {
+            let mut state = self.0.lock().expect("retry Job state");
+            state.shutdown_attempts += 1;
+            if state.shutdown_attempts == 1 {
+                Err("listener has not acknowledged cancellation yet".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn failed_listener_release_keeps_same_authority_retryable() {
+        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("test.exe"));
+        let root = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42_424, 7).expect("managed process id"),
+            executable,
+        )
+        .expect("managed process identity");
+        let state = Arc::new(Mutex::new(RetryReleaseState {
+            root: root.clone(),
+            active: vec![root.id().pid()],
+            shutdown_attempts: 0,
+        }));
+        let resource_id = ResourceId::new();
+        let mut registry = ProcessRegistry::new();
+        let fence = registry
+            .register(RegisteredProcess::new(
+                ResourceFence::new(resource_id, 1),
+                ProcessOwner::Host,
+                root,
+                ProcessDisplayLabel::new("retryable listener release").expect("display label"),
+                RetryReleaseJob(Arc::clone(&state)),
+            ))
+            .expect("register retry Job");
+
+        state.lock().expect("retry Job state").active.clear();
+        assert!(registry.apply_job_completion(JobCompletionMessage {
+            fence: fence.clone(),
+            event: JobCompletionEvent::ActiveProcessZero,
+        }));
+        let ticket = TeardownTicket::new(OperationId::new(), TeardownScope::Host, 9, fence.clone())
+            .expect("host teardown ticket");
+        let proof = registry
+            .active_process_zero_proof_exact(&fence)
+            .expect("receiver-owned zero proof");
+        let authority = registry
+            .mint_teardown_release_authority_exact(&ticket, proof)
+            .expect("release authority");
+
+        assert!(matches!(
+            registry.release_stopped_with_authority(&ticket, &authority),
+            Err(ProcessRegistryError::JobShutdownFailed { .. })
+        ));
+        assert!(registry.current(resource_id).is_some());
+        assert!(matches!(
+            registry.release_stopped_with_authority(&ticket, &authority),
+            Ok(UnregisterOutcome::Removed(_))
+        ));
+        assert!(registry.current(resource_id).is_none());
+        assert_eq!(state.lock().expect("retry Job state").shutdown_attempts, 2);
     }
 }

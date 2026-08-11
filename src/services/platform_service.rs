@@ -312,7 +312,7 @@ fn windows_port(raw_port: u32) -> u16 {
     u16::from_be((raw_port & 0xffff) as u16)
 }
 
-pub fn kill_process_tree(pid: u32) -> Result<(), String> {
+pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         // Terminate descendants leaf-first so a parent can't repopulate the tree
@@ -328,18 +328,6 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         kill_unix_target(pid, true)
-    }
-}
-
-pub fn kill_process(pid: u32) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        windows_terminate_pid(pid)
-    }
-
-    #[cfg(not(windows))]
-    {
-        kill_unix_target(pid, false)
     }
 }
 

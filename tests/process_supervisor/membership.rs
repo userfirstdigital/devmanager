@@ -927,7 +927,7 @@ fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
         .expect("authoritative empty membership settlement");
 
     let removed = registry
-        .release_stopped_with_authority(&ticket, authority)
+        .release_stopped_with_authority(&ticket, &authority)
         .expect("release completed Job");
     assert!(matches!(&removed, UnregisterOutcome::Removed(_)));
     drop(removed);
