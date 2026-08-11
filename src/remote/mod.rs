@@ -3068,13 +3068,13 @@ impl Drop for RemoteClientConnectionOwner {
     }
 }
 
-#[derive(Clone)]
 pub struct LocalPortForwardManager {
     inner: Arc<LocalPortForwardManagerInner>,
 }
 
 struct LocalPortForwardManagerInner {
     client: RemoteClientHandle,
+    manager_handle_count: AtomicUsize,
     operation_lock: Mutex<()>,
     entries: Mutex<HashMap<u16, LocalPortForwardEntry>>,
     worker_registry: Mutex<LocalPortForwardWorkerRegistry>,
@@ -5449,6 +5449,7 @@ impl LocalPortForwardManager {
         Self {
             inner: Arc::new(LocalPortForwardManagerInner {
                 client,
+                manager_handle_count: AtomicUsize::new(1),
                 operation_lock: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
                 worker_registry: Mutex::new(LocalPortForwardWorkerRegistry::default()),
@@ -5634,6 +5635,30 @@ impl LocalPortForwardManager {
         self.state_for(port)
             .map(|state| state.listener_active)
             .unwrap_or(false)
+    }
+}
+
+impl Clone for LocalPortForwardManager {
+    fn clone(&self) -> Self {
+        self.inner
+            .manager_handle_count
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for LocalPortForwardManager {
+    fn drop(&mut self) {
+        if self
+            .inner
+            .manager_handle_count
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.shutdown();
+        }
     }
 }
 
@@ -14555,6 +14580,68 @@ mod tests {
         assert!(
             weak_inner.upgrade().is_none(),
             "manager workers retained a strong lifecycle cycle after teardown"
+        );
+    }
+
+    #[test]
+    fn dropping_local_port_forward_manager_stops_listener_during_acceptance_callback() {
+        let port = reserve_free_tcp_port();
+        let manager = LocalPortForwardManager::new(sample_remote_client_handle("client-1"));
+        let weak_inner = Arc::downgrade(&manager.inner);
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (shutdown_started_tx, shutdown_started_rx) = mpsc::sync_channel(1);
+        *manager
+            .inner
+            .lifecycle_test_hook
+            .write()
+            .expect("local forward lifecycle hook lock") =
+            Some(Arc::new(move |event| match event {
+                LocalPortForwardLifecycleTestEvent::ConnectionAccepted => {
+                    accepted_tx
+                        .send(())
+                        .expect("acceptance observer should remain");
+                    release_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("listener acceptance callback should be released");
+                }
+                LocalPortForwardLifecycleTestEvent::AcceptanceClosed => {
+                    shutdown_started_tx
+                        .send(())
+                        .expect("shutdown observer should remain");
+                }
+            }));
+
+        assert!(manager.sync_ports(&[port]));
+        let client = TcpStream::connect(("127.0.0.1", port))
+            .expect("test client should reach local forward listener");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("listener should enter the acceptance callback");
+
+        let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+        let drop_thread = thread::spawn(move || {
+            drop(manager);
+            drop_done_tx.send(()).expect("drop observer should remain");
+        });
+        shutdown_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("manager drop should initiate listener shutdown while callback is blocked");
+        release_tx
+            .send(())
+            .expect("acceptance callback should still be waiting");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("manager drop should join the listener after callback release");
+        drop_thread.join().expect("drop worker should finish");
+        drop(client);
+
+        assert!(
+            weak_inner.upgrade().is_none(),
+            "manager drop left the listener holding the lifecycle owner"
         );
     }
 
