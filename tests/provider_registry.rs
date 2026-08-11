@@ -24,7 +24,7 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -724,6 +724,75 @@ async fn cancelled_probe_leader_stays_charged_until_worker_completion() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(registry.in_flight_len(), 0);
+}
+
+struct BlockingSelectionInspector {
+    identity: ProviderExecutable,
+    started: AtomicBool,
+    release: AtomicBool,
+}
+
+#[async_trait]
+impl ExecutableInspector for BlockingSelectionInspector {
+    async fn inspect(
+        &self,
+        _path: &Path,
+    ) -> Result<ProviderExecutable, devmanager::providers::ProviderExecutableError> {
+        self.started.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(self.identity.clone())
+    }
+}
+
+#[tokio::test]
+async fn cancelled_executable_selection_keeps_its_admission_until_the_worker_finishes() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"blocking-selection");
+    let identity = ProviderExecutable::from_path(&executable).unwrap();
+    let inspector = Arc::new(BlockingSelectionInspector {
+        identity,
+        started: AtomicBool::new(false),
+        release: AtomicBool::new(false),
+    });
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    let mut registry = ProviderRegistry::with_executable_inspector(inspector.clone());
+    registry.register(adapter.clone()).unwrap();
+    let task_registry = Arc::new(registry);
+    let observed_registry = Arc::clone(&task_registry);
+    let config = discovery(Some(executable), None);
+    let observed = tokio::spawn(async move {
+        observed_registry
+            .observe(ProviderKind::ClaudeCode, &config)
+            .await
+    });
+
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    while !inspector.started.load(Ordering::Acquire) && Instant::now() < startup_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(inspector.started.load(Ordering::Acquire));
+    observed.abort();
+    let _ = observed.await;
+
+    assert_eq!(task_registry.in_flight_len(), 1);
+    assert_eq!(adapter.capability_probes.load(Ordering::Acquire), 0);
+    inspector.release.store(true, Ordering::Release);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while task_registry.in_flight_len() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(task_registry.in_flight_len(), 0);
+    assert_eq!(adapter.capability_probes.load(Ordering::Acquire), 1);
 }
 
 struct PausedNativeAdapter {

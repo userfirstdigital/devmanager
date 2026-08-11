@@ -246,6 +246,23 @@ impl ExecutableInspector for FileSystemExecutableInspector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProbeReservationKey {
+    kind: ProviderKind,
+    executable_override: Option<PathBuf>,
+    path: Option<OsString>,
+}
+
+impl ProbeReservationKey {
+    fn new(kind: ProviderKind, config: &ProviderDiscoveryConfig) -> Self {
+        Self {
+            kind,
+            executable_override: config.executable_override.clone(),
+            path: config.path.clone().or_else(|| std::env::var_os("PATH")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProbeIdentityKey {
     kind: ProviderKind,
     executable: ProviderExecutable,
@@ -254,19 +271,16 @@ struct ProbeIdentityKey {
     semantic_schema_version: SemanticSchemaVersion,
 }
 
+#[derive(Clone)]
+struct ProbeWorkResult {
+    capabilities: ProviderCapabilities,
+    executable: ProviderExecutable,
+    executable_handle: ProviderExecutableHandle,
+    had_matching_cached: bool,
+}
+
 struct ProbeFlight {
-    result: Mutex<
-        Option<
-            Result<
-                (
-                    ProviderCapabilities,
-                    ProviderExecutable,
-                    ProviderExecutableHandle,
-                ),
-                ProviderError,
-            >,
-        >,
-    >,
+    result: Mutex<Option<Result<ProbeWorkResult, ProviderError>>>,
     completed: Notify,
     started_at: Instant,
     deadline: Instant,
@@ -319,6 +333,7 @@ struct ProbeRun {
     capabilities: ProviderCapabilities,
     executable: ProviderExecutable,
     executable_handle: ProviderExecutableHandle,
+    had_matching_cached: bool,
     leader: bool,
 }
 
@@ -441,7 +456,7 @@ impl CapabilityCache {
 pub struct ProviderRegistry {
     adapters: BTreeMap<ProviderKind, Arc<dyn ProviderAdapter>>,
     cache: Arc<Mutex<CapabilityCache>>,
-    in_flight: Arc<Mutex<HashMap<ProbeIdentityKey, Arc<ProbeFlight>>>>,
+    in_flight: Arc<Mutex<HashMap<ProbeReservationKey, Arc<ProbeFlight>>>>,
     executable_inspector: Arc<dyn ExecutableInspector>,
     auth_evidence: Mutex<ProviderAuthEvidenceRegistry>,
 }
@@ -625,34 +640,19 @@ impl ProviderRegistry {
             .get(&kind)
             .cloned()
             .ok_or(ProviderError::ProviderNotRegistered(kind))?;
-        let (requested_path, before, before_handle) = self.select_executable(kind, config).await?;
-        let identity_key = ProbeIdentityKey {
-            kind,
-            executable: before.clone(),
-            launch_handle: before_handle.clone(),
-            adapter_revision: TASK_4_1_ADAPTER_REVISION,
-            semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
-        };
-        let cached_before = self.cached_identity_entries(&identity_key, &before_handle);
-        let probe = self
-            .probe_once(
-                Arc::clone(&adapter),
-                requested_path.clone(),
-                before.clone(),
-                before_handle,
-                identity_key,
-            )
-            .await?;
-
-        // `probe_once` performs this recheck before inserting the stable
-        // projection. The caller also uses the returned identity, so a
-        // follower cannot accidentally report the pre-probe executable.
-        if before != probe.executable {
-            return Err(ProviderError::ExecutableChanged {
-                before,
-                after: probe.executable,
-            });
+        // Admission is keyed by the complete discovery request because the
+        // executable identity is not available until selection finishes. The
+        // retained flight owns selection as well as probing, so cancellation
+        // cannot drop a potentially blocking inspector task before a bounded
+        // slot has been charged.
+        let reservation_key = ProbeReservationKey::new(kind, config);
+        let mut worker_config = config.clone();
+        if worker_config.path.is_none() {
+            worker_config.path = reservation_key.path.clone();
         }
+        let probe = self
+            .probe_once(Arc::clone(&adapter), kind, worker_config, reservation_key)
+            .await?;
 
         let version = probe.capabilities.version.clone();
         let key = CapabilityCacheKey::new(
@@ -662,12 +662,15 @@ impl ProviderRegistry {
             TASK_4_1_ADAPTER_REVISION,
             TASK_4_1_SEMANTIC_SCHEMA_VERSION,
         );
-        let matching_cached = cached_before
-            .iter()
-            .find(|(cached_key, _)| cached_key == &key)
-            .map(|(_, capabilities)| capabilities.clone());
-        let had_matching_cached = matching_cached.is_some();
-        let stable = matching_cached.or_else(|| {
+        let stable = if probe.had_matching_cached {
+            self.cache
+                .lock()
+                .unwrap()
+                .get(&key, &probe.executable_handle)
+        } else {
+            None
+        }
+        .or_else(|| {
             if !probe.leader {
                 self.cache
                     .lock()
@@ -695,7 +698,7 @@ impl ProviderRegistry {
             }
             None => stable,
         };
-        let cache_status = if had_matching_cached || !probe.leader {
+        let cache_status = if probe.had_matching_cached || !probe.leader {
             CacheStatus::Hit
         } else {
             CacheStatus::Miss
@@ -717,10 +720,9 @@ impl ProviderRegistry {
     async fn probe_once(
         &self,
         adapter: Arc<dyn ProviderAdapter>,
-        requested_path: PathBuf,
-        before: ProviderExecutable,
-        before_handle: ProviderExecutableHandle,
-        key: ProbeIdentityKey,
+        kind: ProviderKind,
+        config: ProviderDiscoveryConfig,
+        key: ProbeReservationKey,
     ) -> Result<ProbeRun, ProviderError> {
         let (flight, leader) = {
             let mut in_flight = self.in_flight.lock().unwrap();
@@ -734,21 +736,6 @@ impl ProviderRegistry {
                 .collect();
             for (_expired_key, expired_flight) in expired {
                 expired_flight.cancel();
-            }
-            let replaced: Vec<_> = in_flight
-                .iter()
-                .filter(|(existing_key, _)| {
-                    existing_key.kind == key.kind
-                        && existing_key.adapter_revision == key.adapter_revision
-                        && existing_key.semantic_schema_version == key.semantic_schema_version
-                        && existing_key.executable.canonical_path()
-                            == key.executable.canonical_path()
-                        && existing_key.launch_handle != key.launch_handle
-                })
-                .map(|(existing_key, flight)| (existing_key.clone(), Arc::clone(flight)))
-                .collect();
-            for (_replaced_key, replaced_flight) in replaced {
-                replaced_flight.cancel();
             }
             if let Some(flight) = in_flight.get(&key) {
                 (Arc::clone(flight), false)
@@ -782,50 +769,45 @@ impl ProviderRegistry {
         };
 
         if leader {
-            self.spawn_probe_worker(
-                Arc::clone(&flight),
-                key,
-                adapter,
-                requested_path,
-                before,
-                before_handle,
-            );
+            self.spawn_probe_worker(Arc::clone(&flight), key, adapter, kind, config);
             let mut leader_cleanup = ProbeLeaderCleanup::new(Arc::clone(&flight));
             let published = Self::await_probe_flight(Arc::clone(&flight)).await;
             leader_cleanup.disarm();
-            published.map(|(capabilities, executable, executable_handle)| ProbeRun {
-                capabilities,
-                executable,
-                executable_handle,
+            published.map(|probe| ProbeRun {
+                capabilities: probe.capabilities,
+                executable: probe.executable,
+                executable_handle: probe.executable_handle,
+                had_matching_cached: probe.had_matching_cached,
                 leader: true,
             })
         } else {
-            Self::await_probe_flight(Arc::clone(&flight)).await.map(
-                |(capabilities, executable, executable_handle)| ProbeRun {
-                    capabilities,
-                    executable,
-                    executable_handle,
+            Self::await_probe_flight(Arc::clone(&flight))
+                .await
+                .map(|probe| ProbeRun {
+                    capabilities: probe.capabilities,
+                    executable: probe.executable,
+                    executable_handle: probe.executable_handle,
+                    had_matching_cached: probe.had_matching_cached,
                     leader: false,
-                },
-            )
+                })
         }
     }
 
     fn spawn_probe_worker(
         &self,
         flight: Arc<ProbeFlight>,
-        key: ProbeIdentityKey,
+        key: ProbeReservationKey,
         adapter: Arc<dyn ProviderAdapter>,
-        requested_path: PathBuf,
-        before: ProviderExecutable,
-        before_handle: ProviderExecutableHandle,
+        kind: ProviderKind,
+        config: ProviderDiscoveryConfig,
     ) {
         let cache = Arc::clone(&self.cache);
         let in_flight = Arc::clone(&self.in_flight);
         let executable_inspector = Arc::clone(&self.executable_inspector);
         tokio::spawn(async move {
             // The timer only publishes cancellation. It never owns the
-            // adapter future, so cancellation cannot drop native work.
+            // inspector/adapter future, so cancellation cannot drop blocking
+            // selection or native work.
             let timer_flight: Weak<ProbeFlight> = Arc::downgrade(&flight);
             let timer = tokio::spawn(async move {
                 let Some(flight) = timer_flight.upgrade() else {
@@ -836,18 +818,32 @@ impl ProviderRegistry {
                 flight.cancel();
             });
 
-            // Keep this future owned by the detached worker until the
-            // adapter returns. ProviderProbeRunner's blocking task is joined
-            // by that future, including after callers cancel or time out.
-            let result = Self::perform_probe(
-                &cache,
-                &executable_inspector,
-                &adapter,
-                &requested_path,
-                &before,
-                &before_handle,
-                &key,
-            )
+            // Selection is part of the retained worker. A caller timeout
+            // during executable inspection therefore leaves the same bounded
+            // admission charged until selection and the exact native leader
+            // have completed.
+            let result = async {
+                let (requested_path, before, before_handle) =
+                    Self::select_executable_with_inspector(&executable_inspector, kind, &config)
+                        .await?;
+                let identity_key = ProbeIdentityKey {
+                    kind,
+                    executable: before.clone(),
+                    launch_handle: before_handle.clone(),
+                    adapter_revision: TASK_4_1_ADAPTER_REVISION,
+                    semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
+                };
+                Self::perform_probe(
+                    &cache,
+                    &executable_inspector,
+                    &adapter,
+                    &requested_path,
+                    &before,
+                    &before_handle,
+                    &identity_key,
+                )
+                .await
+            }
             .await;
             timer.abort();
 
@@ -871,14 +867,7 @@ impl ProviderRegistry {
 
     async fn await_probe_flight(
         flight: Arc<ProbeFlight>,
-    ) -> Result<
-        (
-            ProviderCapabilities,
-            ProviderExecutable,
-            ProviderExecutableHandle,
-        ),
-        ProviderError,
-    > {
+    ) -> Result<ProbeWorkResult, ProviderError> {
         loop {
             if let Some(result) = flight.result.lock().unwrap().clone() {
                 return result;
@@ -906,14 +895,7 @@ impl ProviderRegistry {
         before: &ProviderExecutable,
         before_handle: &ProviderExecutableHandle,
         identity_key: &ProbeIdentityKey,
-    ) -> Result<
-        (
-            ProviderCapabilities,
-            ProviderExecutable,
-            ProviderExecutableHandle,
-        ),
-        ProviderError,
-    > {
+    ) -> Result<ProbeWorkResult, ProviderError> {
         let capabilities = adapter.probe(before_handle).await?;
         if capabilities.kind != identity_key.kind {
             return Err(ProviderError::CapabilityKindMismatch {
@@ -975,16 +957,35 @@ impl ProviderRegistry {
             identity_key.adapter_revision,
             identity_key.semantic_schema_version,
         );
+        let had_matching_cached = cache
+            .lock()
+            .unwrap()
+            .matching_entries(identity_key, before_handle)
+            .iter()
+            .any(|(existing_key, _)| existing_key == &cache_key);
         cache.lock().unwrap().insert(
             cache_key,
             capabilities.stable_projection(),
             before_handle.clone(),
         );
-        Ok((capabilities, after, before_handle.clone()))
+        Ok(ProbeWorkResult {
+            capabilities,
+            executable: after,
+            executable_handle: before_handle.clone(),
+            had_matching_cached,
+        })
     }
 
     async fn select_executable(
         &self,
+        kind: ProviderKind,
+        config: &ProviderDiscoveryConfig,
+    ) -> Result<(PathBuf, ProviderExecutable, ProviderExecutableHandle), ProviderError> {
+        Self::select_executable_with_inspector(&self.executable_inspector, kind, config).await
+    }
+
+    async fn select_executable_with_inspector(
+        executable_inspector: &Arc<dyn ExecutableInspector>,
         kind: ProviderKind,
         config: &ProviderDiscoveryConfig,
     ) -> Result<(PathBuf, ProviderExecutable, ProviderExecutableHandle), ProviderError> {
@@ -996,18 +997,18 @@ impl ProviderRegistry {
                     override_path.clone(),
                 ))
                 .map_err(|error| map_discovery_error(kind, Some(override_path), error))?;
-            let identity =
-                self.executable_inspector
-                    .inspect(override_path)
-                    .await
-                    .map_err(|error| match error {
-                        ProviderExecutableError::Missing(_)
-                        | ProviderExecutableError::NotAFile(_) => ProviderError::MissingCli {
+            let identity = executable_inspector
+                .inspect(override_path)
+                .await
+                .map_err(|error| match error {
+                    ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_) => {
+                        ProviderError::MissingCli {
                             kind,
                             requested: Some(override_path.clone()),
-                        },
-                        other => ProviderError::Executable(other),
-                    })?;
+                        }
+                    }
+                    other => ProviderError::Executable(other),
+                })?;
             if candidate.executable() != &identity {
                 return Err(ProviderError::ExecutableChanged {
                     before: candidate.executable().clone(),
@@ -1041,17 +1042,6 @@ impl ProviderRegistry {
             candidate.executable().clone(),
             handle,
         ))
-    }
-
-    fn cached_identity_entries(
-        &self,
-        identity: &ProbeIdentityKey,
-        launch_handle: &ProviderExecutableHandle,
-    ) -> Vec<(CapabilityCacheKey, ProviderCapabilities)> {
-        self.cache
-            .lock()
-            .unwrap()
-            .matching_entries(identity, launch_handle)
     }
 
     pub fn cache_len(&self) -> usize {

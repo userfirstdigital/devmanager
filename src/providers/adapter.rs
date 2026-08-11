@@ -929,32 +929,50 @@ impl WindowsProviderProbeRunner {
         request: ProviderProbeRequest,
     ) -> Result<ProviderProbeResult, ProviderProbeError> {
         let deadline = std::time::Instant::now() + request.timeout();
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        let (executable, fixed_arguments, launch_files) =
+            prepare_unix_launch(&self.policy, request.executable())?;
+        #[cfg(all(unix, not(target_os = "macos")))]
         let (executable, fixed_arguments, _launch_files) =
             prepare_unix_launch(&self.policy, request.executable())?;
         #[cfg(windows)]
         let executable = validate_probe_executable(&self.policy, request.executable())?;
+        #[cfg(not(target_os = "macos"))]
         let mut command = std::process::Command::new(&executable);
-        #[cfg(windows)]
-        command.args(request.executable().launch_fixed_arguments());
-        #[cfg(unix)]
-        command.args(fixed_arguments);
-        command
-            .args(request.arguments())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        scrub_provider_secret_environment(&mut command);
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(windows)]
+            command.args(request.executable().launch_fixed_arguments());
+            #[cfg(unix)]
+            command.args(fixed_arguments);
+            command
+                .args(request.arguments())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            scrub_provider_secret_environment(&mut command);
 
-        #[cfg(windows)]
-        command.creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
-        #[cfg(unix)]
-        command.process_group(0);
-
+            #[cfg(windows)]
+            command
+                .creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
+            #[cfg(unix)]
+            command.process_group(0);
+        }
+        #[cfg(not(target_os = "macos"))]
         let mut process = ProbeProcess::spawn(
             command,
             deadline,
             Some(request.executable().launch_program().canonical_path()),
+            request.executable(),
+        )?;
+        #[cfg(target_os = "macos")]
+        let mut process = ProbeProcess::spawn_macos(
+            &executable,
+            &fixed_arguments,
+            request.arguments(),
+            launch_files,
+            deadline,
+            request.executable().launch_program().canonical_path(),
             request.executable(),
         )?;
         // Windows keeps the no-delete handles open through CreateProcess;
@@ -966,15 +984,28 @@ impl WindowsProviderProbeRunner {
                 ProviderProbeIoError::ExecutableNotAllowed,
             ));
         }
+        if let Err(error) = process.release_attestation_barrier() {
+            let _ = process.terminate_tree(deadline);
+            return Err(error);
+        }
+        #[cfg(target_os = "macos")]
+        if request.executable().revalidate().is_err()
+            || attest_launched_image(
+                process.pid(),
+                request.executable().launch_program().canonical_path(),
+            )
+            .is_err()
+        {
+            let _ = process.terminate_tree(deadline);
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
         let stdout = process
-            .child_mut()
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
         let stderr = process
-            .child_mut()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
         let capture = Arc::new(BoundedProbeCapture::new(request.max_output_bytes()));
         let stdout_reader = spawn_probe_reader(stdout, Arc::clone(&capture), true);
@@ -983,21 +1014,21 @@ impl WindowsProviderProbeRunner {
         let mut timed_out = false;
         let mut primary_error = None;
         let exit_code = loop {
-            match process.child_mut().try_wait() {
+            match process.try_wait() {
                 Err(_) => {
                     primary_error = Some(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed));
                     let _ = process.terminate_tree(deadline);
                     break None;
                 }
-                Ok(Some(status)) => break status.code(),
-                Ok(None)
+                Ok(ProbeWait::Exited(code)) => break code,
+                Ok(ProbeWait::Running)
                     if std::time::Instant::now()
                         .checked_add(PROVIDER_PROBE_CLEANUP_RESERVE)
                         .is_some_and(|cleanup_start| cleanup_start < deadline) =>
                 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Ok(None) => {
+                Ok(ProbeWait::Running) => {
                     timed_out = true;
                     if let Err(error) = process.terminate_tree(deadline) {
                         primary_error = Some(error);
@@ -1143,13 +1174,9 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn attest_launched_image(
-    child: &Child,
-    expected: &std::path::Path,
-) -> Result<(), ProviderProbeError> {
+fn attest_launched_image(pid: u32, expected: &std::path::Path) -> Result<(), ProviderProbeError> {
     let mut buffer = vec![0_u8; 4096];
-    let length =
-        unsafe { proc_pidpath(child.id() as i32, buffer.as_mut_ptr(), buffer.len() as u32) };
+    let length = unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr(), buffer.len() as u32) };
     if length <= 0 {
         return Err(ProviderProbeError::Io(
             ProviderProbeIoError::ExecutableNotAllowed,
@@ -1286,15 +1313,39 @@ fn is_provider_secret_environment_key(key: &str) -> bool {
         || key.contains("CREDENTIAL")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeWait {
+    Running,
+    Exited(Option<i32>),
+}
+
 struct ProbeProcess {
+    #[cfg(not(target_os = "macos"))]
     child: Child,
+    #[cfg(target_os = "macos")]
+    pid: u32,
+    #[cfg(target_os = "macos")]
+    macos_stdout: Option<std::fs::File>,
+    #[cfg(target_os = "macos")]
+    macos_stderr: Option<std::fs::File>,
+    #[cfg(target_os = "macos")]
+    macos_launch_files: Vec<std::fs::File>,
+    #[cfg(target_os = "macos")]
+    macos_waited: bool,
+    #[cfg(target_os = "macos")]
+    macos_exit_code: Option<i32>,
     managed_job: Option<crate::process::job::ManagedProcessJob>,
     deadline: std::time::Instant,
     #[cfg(unix)]
     process_group: bool,
+    #[cfg(target_os = "linux")]
+    linux_ptrace_stopped: bool,
+    #[cfg(target_os = "macos")]
+    macos_suspended: bool,
 }
 
 impl ProbeProcess {
+    #[cfg(not(target_os = "macos"))]
     fn spawn(
         mut command: std::process::Command,
         deadline: std::time::Instant,
@@ -1306,6 +1357,15 @@ impl ProbeProcess {
             let _ = (&command, deadline, expected, _requested);
             return Err(ProviderProbeError::UnsupportedAttestation);
         }
+        #[cfg(target_os = "linux")]
+        if expected.is_none() {
+            let _ = (&command, deadline, _requested);
+            return Err(ProviderProbeError::UnsupportedAttestation);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(linux_ptrace_traceme);
+        }
         let mut child = command.spawn().map_err(|error| {
             ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
                 ProviderProbeIoError::ExecutableMissing
@@ -1315,16 +1375,11 @@ impl ProbeProcess {
                 ProviderProbeIoError::SpawnFailed
             })
         })?;
-        #[cfg(target_os = "macos")]
-        // `std::process::Command::spawn` waits for the child exec-error pipe;
-        // a SIGSTOP in `pre_exec` would therefore deadlock this parent before
-        // it could inspect the retained graph. Stop the just-created child
-        // immediately instead, then perform the exact image and descriptor
-        // checks while suspended and before SIGCONT.
-        if suspend_macos_process(child.id()).is_err() {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = wait_for_linux_exec_stop(&child, deadline) {
             let _ = child.kill();
             reap_child_until(&mut child, deadline);
-            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+            return Err(error);
         }
         #[cfg(windows)]
         if let Some(expected) = expected {
@@ -1337,14 +1392,17 @@ impl ProbeProcess {
             }
         }
         #[cfg(target_os = "linux")]
-        if let Some(expected) = expected {
-            if attest_launched_image(&child, expected).is_err() {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::Io(
-                    ProviderProbeIoError::ExecutableNotAllowed,
-                ));
-            }
+        if attest_launched_image(
+            &child,
+            expected.expect("Linux expected image checked above"),
+        )
+        .is_err()
+        {
+            let _ = child.kill();
+            reap_child_until(&mut child, deadline);
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
         }
         let managed_job =
             match crate::services::platform_service::claim_suspended_process(child.id()) {
@@ -1355,40 +1413,6 @@ impl ProbeProcess {
                     return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
                 }
             };
-        #[cfg(target_os = "macos")]
-        {
-            let Some(expected) = expected else {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::UnsupportedAttestation);
-            };
-            if _requested.revalidate().is_err() {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::Io(
-                    ProviderProbeIoError::ExecutableNotAllowed,
-                ));
-            }
-            if attest_launched_image(&child, expected).is_err() {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::Io(
-                    ProviderProbeIoError::ExecutableNotAllowed,
-                ));
-            }
-            if resume_macos_suspended_process(child.id()).is_err() {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
-            }
-            if attest_launched_image(&child, expected).is_err() {
-                let _ = child.kill();
-                reap_child_until(&mut child, deadline);
-                return Err(ProviderProbeError::Io(
-                    ProviderProbeIoError::ExecutableNotAllowed,
-                ));
-            }
-        }
         #[cfg(windows)]
         if managed_job.is_none() {
             let _ = child.kill();
@@ -1401,16 +1425,342 @@ impl ProbeProcess {
             deadline,
             #[cfg(unix)]
             process_group: cfg!(unix),
+            #[cfg(target_os = "linux")]
+            linux_ptrace_stopped: true,
+            #[cfg(target_os = "macos")]
+            macos_suspended: true,
         })
     }
 
-    fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+    #[cfg(target_os = "macos")]
+    fn spawn_macos(
+        executable: &Path,
+        fixed_arguments: &[std::ffi::OsString],
+        request_arguments: &[&str],
+        launch_files: Vec<std::fs::File>,
+        deadline: std::time::Instant,
+        expected: &Path,
+        requested: &ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeError> {
+        use std::ffi::{CString, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{FromRawFd, RawFd};
+
+        fn cstring(value: &OsStr) -> Result<CString, ProviderProbeError> {
+            CString::new(value.as_bytes())
+                .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))
+        }
+
+        requested
+            .revalidate()
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+        let executable_c = cstring(executable.as_os_str())?;
+        let mut arguments = Vec::with_capacity(1 + fixed_arguments.len() + request_arguments.len());
+        arguments.push(executable_c.clone());
+        for argument in fixed_arguments {
+            arguments.push(cstring(argument.as_os_str())?);
+        }
+        for argument in request_arguments {
+            arguments.push(cstring(OsStr::new(argument))?);
+        }
+        let mut argv: Vec<*mut libc::c_char> = arguments
+            .iter_mut()
+            .map(|argument| argument.as_ptr() as *mut libc::c_char)
+            .collect();
+        argv.push(std::ptr::null_mut());
+
+        let mut environment = Vec::new();
+        for (key, value) in std::env::vars_os() {
+            let normalized = key.to_string_lossy().to_ascii_uppercase();
+            if is_provider_secret_environment_key(&normalized) {
+                continue;
+            }
+            let mut entry = key.as_os_str().as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            environment.push(
+                CString::new(entry)
+                    .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?,
+            );
+        }
+        let mut envp: Vec<*mut libc::c_char> = environment
+            .iter_mut()
+            .map(|entry| entry.as_ptr() as *mut libc::c_char)
+            .collect();
+        envp.push(std::ptr::null_mut());
+
+        let mut stdout_pipe = [-1 as RawFd; 2];
+        let mut stderr_pipe = [-1 as RawFd; 2];
+        if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) } != 0
+        {
+            if stdout_pipe[0] >= 0 {
+                unsafe {
+                    libc::close(stdout_pipe[0]);
+                    if stdout_pipe[1] >= 0 {
+                        libc::close(stdout_pipe[1]);
+                    }
+                }
+            }
+            if stderr_pipe[0] >= 0 {
+                unsafe {
+                    libc::close(stderr_pipe[0]);
+                    if stderr_pipe[1] >= 0 {
+                        libc::close(stderr_pipe[1]);
+                    }
+                }
+            }
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+        }
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        let mut attributes: libc::posix_spawnattr_t = std::ptr::null_mut();
+        let mut initialized_actions = false;
+        let mut initialized_attributes = false;
+        let setup_result = unsafe {
+            let mut result = libc::posix_spawn_file_actions_init(&mut actions);
+            if result == 0 {
+                initialized_actions = true;
+                result = libc::posix_spawn_file_actions_addopen(
+                    &mut actions,
+                    libc::STDIN_FILENO,
+                    b"/dev/null\0".as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY,
+                    0,
+                );
+            }
+            if result == 0 {
+                result = libc::posix_spawn_file_actions_adddup2(
+                    &mut actions,
+                    stdout_pipe[1],
+                    libc::STDOUT_FILENO,
+                );
+            }
+            if result == 0 {
+                result = libc::posix_spawn_file_actions_adddup2(
+                    &mut actions,
+                    stderr_pipe[1],
+                    libc::STDERR_FILENO,
+                );
+            }
+            for fd in [
+                stdout_pipe[0],
+                stdout_pipe[1],
+                stderr_pipe[0],
+                stderr_pipe[1],
+            ] {
+                if result != 0 {
+                    break;
+                }
+                if (libc::STDIN_FILENO..=libc::STDERR_FILENO).contains(&fd) {
+                    continue;
+                }
+                result = libc::posix_spawn_file_actions_addclose(&mut actions, fd);
+            }
+            if result == 0 {
+                result = libc::posix_spawnattr_init(&mut attributes);
+                initialized_attributes = result == 0;
+            }
+            if result == 0 {
+                result = libc::posix_spawnattr_setflags(
+                    &mut attributes,
+                    (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETPGROUP)
+                        as libc::c_short,
+                );
+            }
+            if result == 0 {
+                result = libc::posix_spawnattr_setpgroup(&mut attributes, 0);
+            }
+            result
+        };
+        if setup_result != 0 {
+            unsafe {
+                if initialized_attributes {
+                    libc::posix_spawnattr_destroy(&mut attributes);
+                }
+                if initialized_actions {
+                    libc::posix_spawn_file_actions_destroy(&mut actions);
+                }
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[0]);
+                libc::close(stderr_pipe[1]);
+            }
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+        }
+
+        let mut pid = 0 as libc::pid_t;
+        let spawn_result = unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                executable_c.as_ptr(),
+                &actions,
+                &attributes,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
+        unsafe {
+            libc::posix_spawnattr_destroy(&mut attributes);
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+        }
+        if spawn_result != 0 {
+            unsafe {
+                libc::close(stdout_pipe[0]);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[0]);
+                libc::close(stderr_pipe[1]);
+            }
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+        }
+        unsafe {
+            libc::close(stdout_pipe[1]);
+            libc::close(stderr_pipe[1]);
+        }
+        let stdout = unsafe { std::fs::File::from_raw_fd(stdout_pipe[0]) };
+        let stderr = unsafe { std::fs::File::from_raw_fd(stderr_pipe[0]) };
+        let pid = pid as u32;
+        if attest_launched_image(pid, expected).is_err() || requested.revalidate().is_err() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = macos_reap_pid(pid, deadline);
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
+        let managed_job = match crate::services::platform_service::claim_suspended_process(pid) {
+            Ok(job) => job,
+            Err(_) => {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = macos_reap_pid(pid, deadline);
+                return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+            }
+        };
+        Ok(Self {
+            pid,
+            macos_stdout: Some(stdout),
+            macos_stderr: Some(stderr),
+            macos_launch_files: launch_files,
+            macos_waited: false,
+            macos_exit_code: None,
+            managed_job,
+            deadline,
+            process_group: true,
+            macos_suspended: true,
+            #[cfg(target_os = "linux")]
+            linux_ptrace_stopped: false,
+        })
+    }
+
+    #[cfg(unix)]
+    fn pid(&self) -> u32 {
+        #[cfg(target_os = "macos")]
+        {
+            self.pid
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child.id()
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .macos_stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>)
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .macos_stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>)
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<ProbeWait> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.macos_try_wait();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child.try_wait().map(|status| {
+                status
+                    .map(|status| ProbeWait::Exited(status.code()))
+                    .unwrap_or(ProbeWait::Running)
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_try_wait(&mut self) -> std::io::Result<ProbeWait> {
+        if self.macos_waited {
+            return Ok(ProbeWait::Exited(self.macos_exit_code));
+        }
+        let mut status = 0_i32;
+        let waited = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if waited == 0 {
+            return Ok(ProbeWait::Running);
+        }
+        if waited < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.macos_waited = true;
+        self.macos_exit_code = if (status & 0x7f) == 0 {
+            Some((status >> 8) & 0xff)
+        } else {
+            None
+        };
+        Ok(ProbeWait::Exited(self.macos_exit_code))
+    }
+
+    fn release_attestation_barrier(&mut self) -> Result<(), ProviderProbeError> {
+        #[cfg(target_os = "linux")]
+        if self.linux_ptrace_stopped {
+            if unsafe { linux_ptrace_detach(self.pid()) } != 0 {
+                return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+            }
+            self.linux_ptrace_stopped = false;
+        }
+        #[cfg(target_os = "macos")]
+        if self.macos_suspended {
+            resume_macos_suspended_process(self.pid())
+                .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
+            self.macos_suspended = false;
+        }
+        Ok(())
     }
 
     fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
         let mut job_empty = true;
         let mut cleanup_failed = false;
+        if self.release_attestation_barrier().is_err() {
+            cleanup_failed = true;
+        }
         #[cfg(unix)]
         let now = std::time::Instant::now();
         #[cfg(unix)]
@@ -1442,11 +1792,11 @@ impl ProbeProcess {
             let remaining = group_cleanup_deadline.saturating_duration_since(now);
             let term_grace = remaining / 3;
             let result = crate::services::platform_service::terminate_owned_process_group(
-                self.child.id(),
+                self.pid(),
                 term_grace,
             );
             if result.is_err() {
-                force_kill_unix_process_group(self.child.id());
+                force_kill_unix_process_group(self.pid());
                 false
             } else {
                 true
@@ -1461,13 +1811,13 @@ impl ProbeProcess {
         // spend the absolute deadline waiting for a second observation of the
         // same process exit.
         if !(self.managed_job.is_some() && job_empty) {
-            if self.child.try_wait().ok().flatten().is_none() {
-                let _ = self.child.kill();
+            if matches!(self.try_wait(), Ok(ProbeWait::Running)) {
+                let _ = self.kill_process();
             }
         }
         #[cfg(unix)]
-        let group_exited = group_signal_ok
-            && wait_for_unix_process_group_exit(self.child.id(), group_cleanup_deadline);
+        let group_exited =
+            group_signal_ok && wait_for_unix_process_group_exit(self.pid(), group_cleanup_deadline);
         #[cfg(not(unix))]
         let group_exited = true;
         let child_exited = if self.managed_job.is_some() && job_empty {
@@ -1476,7 +1826,7 @@ impl ProbeProcess {
             // non-waitable after the Job has consumed the process.
             true
         } else {
-            reap_child_until(&mut self.child, deadline)
+            self.reap_owned_until(deadline)
         };
         if cleanup_failed || !job_empty || !child_exited || !group_exited {
             return Err(ProviderProbeError::Io(
@@ -1486,10 +1836,122 @@ impl ProbeProcess {
         drop(self.managed_job.take());
         Ok(())
     }
+
+    fn kill_process(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if unsafe { libc::kill(self.pid() as libc::pid_t, libc::SIGKILL) } == 0 {
+                return Ok(());
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child.kill()
+        }
+    }
+
+    fn reap_owned_until(&mut self, deadline: std::time::Instant) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            loop {
+                match self.try_wait() {
+                    Ok(ProbeWait::Exited(_)) => return true,
+                    Ok(ProbeWait::Running) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(ProbeWait::Running) | Err(_) => return false,
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            reap_child_until(&mut self.child, deadline)
+        }
+    }
 }
 
-#[cfg(target_os = "macos")]
-const MACOS_SIGSTOP: i32 = 17;
+#[cfg(target_os = "linux")]
+const LINUX_PTRACE_TRACEME: i64 = 0;
+#[cfg(target_os = "linux")]
+const LINUX_PTRACE_DETACH: i64 = 17;
+#[cfg(target_os = "linux")]
+const LINUX_WAIT_NOHANG: i32 = 1;
+#[cfg(target_os = "linux")]
+const LINUX_WAIT_WALL: i32 = 0x4000_0000;
+#[cfg(target_os = "linux")]
+const LINUX_SIGTRAP: i32 = 5;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn linux_ptrace(
+        request: i64,
+        pid: i32,
+        address: *mut std::ffi::c_void,
+        data: *mut std::ffi::c_void,
+    ) -> i64;
+    fn linux_waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ptrace_traceme() -> std::io::Result<()> {
+    if unsafe {
+        linux_ptrace(
+            LINUX_PTRACE_TRACEME,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == -1
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_linux_exec_stop(
+    child: &Child,
+    deadline: std::time::Instant,
+) -> Result<(), ProviderProbeError> {
+    let mut status = 0_i32;
+    loop {
+        let waited = unsafe {
+            linux_waitpid(
+                child.id() as i32,
+                &mut status,
+                LINUX_WAIT_NOHANG | LINUX_WAIT_WALL,
+            )
+        };
+        if waited == child.id() as i32 {
+            let stopped = (status & 0x7f) == 0x7f;
+            let signal = (status >> 8) & 0xff;
+            if stopped && signal == LINUX_SIGTRAP {
+                return Ok(());
+            }
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
+        }
+        if waited < 0 {
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ProviderProbeError::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn linux_ptrace_detach(pid: u32) -> i64 {
+    linux_ptrace(
+        LINUX_PTRACE_DETACH,
+        pid as i32,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )
+}
+
 #[cfg(target_os = "macos")]
 const MACOS_SIGCONT: i32 = 19;
 
@@ -1499,8 +1961,8 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn suspend_macos_process(pid: u32) -> std::io::Result<()> {
-    if unsafe { macos_kill(pid as i32, MACOS_SIGSTOP) } == 0 {
+fn resume_macos_suspended_process(pid: u32) -> std::io::Result<()> {
+    if unsafe { macos_kill(pid as i32, MACOS_SIGCONT) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
@@ -1508,11 +1970,17 @@ fn suspend_macos_process(pid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn resume_macos_suspended_process(pid: u32) -> std::io::Result<()> {
-    if unsafe { macos_kill(pid as i32, MACOS_SIGCONT) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+fn macos_reap_pid(pid: u32, deadline: std::time::Instant) -> bool {
+    let mut status = 0_i32;
+    loop {
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if waited == pid as libc::pid_t {
+            return true;
+        }
+        if waited < 0 || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1830,12 +2298,20 @@ pub trait ProviderAdapter: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::ProbeProcess;
     use super::{
         classify_auth_output, ProviderAuthEvidenceError, ProviderAuthProbeResult,
         ProviderExecutable, ProviderKind, ProviderProbeKind, ProviderProbeOutput,
         ProviderProbeRequest, ProviderProbeResult,
     };
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    use super::{ProviderExecutablePolicy, ProviderProbeError};
     use crate::providers::capabilities::ProviderAuthEvidenceRegistry;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
     use std::time::Duration;
 
     #[test]
@@ -2039,5 +2515,62 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_probe_process_has_no_user_code_side_effect_before_attestation_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("provider-started");
+        let requested = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let requested_handle = requested.open_for_launch().unwrap();
+        let expected = ProviderExecutable::from_path(Path::new("/bin/sh")).unwrap();
+
+        #[cfg(not(target_os = "macos"))]
+        use std::process::{Command, Stdio};
+        #[cfg(not(target_os = "macos"))]
+        let mut command = Command::new(expected.canonical_path());
+        #[cfg(not(target_os = "macos"))]
+        command
+            .arg("-c")
+            .arg("printf started > \"$DEV_MANAGER_PROVIDER_IDENTITY_MARKER\"; sleep 2")
+            .env("DEV_MANAGER_PROVIDER_IDENTITY_MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(not(target_os = "macos"))]
+        command.process_group(0);
+
+        #[cfg(not(target_os = "macos"))]
+        let mut process = ProbeProcess::spawn(
+            command,
+            std::time::Instant::now() + Duration::from_secs(3),
+            Some(expected.canonical_path()),
+            &requested_handle,
+        )
+        .unwrap();
+        #[cfg(target_os = "macos")]
+        let mut process = ProbeProcess::spawn_macos(
+            expected.canonical_path(),
+            &[
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("printf started > \"$1\"; sleep 2"),
+                std::ffi::OsString::from("--"),
+                marker.as_os_str().to_os_string(),
+            ],
+            &[],
+            Vec::new(),
+            std::time::Instant::now() + Duration::from_secs(3),
+            expected.canonical_path(),
+            &requested_handle,
+        )
+        .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "provider user code ran before the image/graph attestation barrier released it"
+        );
+
+        let _ = process.terminate_tree(std::time::Instant::now() + Duration::from_secs(3));
     }
 }
