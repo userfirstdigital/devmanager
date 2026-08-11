@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::Sender,
-    Arc, Mutex, RwLock, Weak,
+    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -101,6 +101,8 @@ impl ManagedJobObservationSnapshot {
 #[derive(Debug, Default)]
 struct ResourceSamplingSource {
     sessions: HashMap<String, ResourceSamplingSession>,
+    #[cfg(test)]
+    before_direct_publication_delay: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -3829,6 +3831,69 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     refresh_resource_snapshots_with_source(inner, system, None);
 }
 
+fn sampling_mutex_until<'a, T>(
+    mutex: &'a Mutex<T>,
+    absolute_deadline: Instant,
+) -> Result<MutexGuard<'a, T>, ()> {
+    loop {
+        if Instant::now() >= absolute_deadline {
+            return Err(());
+        }
+        match mutex.try_lock() {
+            Ok(guard) => {
+                if Instant::now() >= absolute_deadline {
+                    return Err(());
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
+        }
+    }
+}
+
+fn sampling_read_until<'a, T>(
+    lock: &'a RwLock<T>,
+    absolute_deadline: Instant,
+) -> Result<RwLockReadGuard<'a, T>, ()> {
+    loop {
+        if Instant::now() >= absolute_deadline {
+            return Err(());
+        }
+        match lock.try_read() {
+            Ok(guard) => {
+                if Instant::now() >= absolute_deadline {
+                    return Err(());
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
+        }
+    }
+}
+
+fn sampling_write_until<'a, T>(
+    lock: &'a RwLock<T>,
+    absolute_deadline: Instant,
+) -> Result<RwLockWriteGuard<'a, T>, ()> {
+    loop {
+        if Instant::now() >= absolute_deadline {
+            return Err(());
+        }
+        match lock.try_write() {
+            Ok(guard) => {
+                if Instant::now() >= absolute_deadline {
+                    return Err(());
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
+        }
+    }
+}
+
 fn refresh_resource_snapshots_with_source(
     inner: &ProcessManagerInner,
     system: &mut sysinfo::System,
@@ -3842,53 +3907,52 @@ fn refresh_resource_snapshots_with_source(
         sampled_at + RESOURCE_SAMPLE_TICK_BUDGET,
         RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK,
     );
-    let sessions: Vec<(
+    let runtime = match sampling_read_until(&inner.runtime_state, tick_budget.deadline()) {
+        Ok(runtime) => runtime,
+        Err(()) => return,
+    };
+    let mut sessions: Vec<(
         String,
         u32,
         bool,
         SessionKind,
         SessionStatus,
         ResourceSnapshot,
-    )> = inner
-        .runtime_state
-        .read()
-        .map(|runtime| {
-            let mut selected = Vec::new();
-            for (id, session) in &runtime.sessions {
-                if tick_budget.work_counters().runtime_sessions
-                    >= RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK
-                    || tick_budget.checkpoint().is_err()
-                {
-                    break;
-                }
-                tick_budget.note_runtime_session();
-                let (pid, status) = if session.status.is_live() {
-                    (session.pid, session.status)
-                } else if session.reap_incomplete {
-                    (
-                        session.resources.process_ids.first().copied(),
-                        SessionStatus::Failed,
-                    )
-                } else {
-                    continue;
-                };
-                if let Some(pid) = pid {
-                    selected.push((
-                        id.clone(),
-                        pid,
-                        session.session_kind.is_ai(),
-                        session.session_kind,
-                        status,
-                        bounded_previous_snapshot(&session.resources, &mut tick_budget),
-                    ));
-                }
-            }
-            selected
-        })
-        .unwrap_or_default();
+    )> = Vec::new();
+    for (id, session) in &runtime.sessions {
+        if tick_budget.work_counters().runtime_sessions >= RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK
+            || tick_budget.checkpoint().is_err()
+        {
+            break;
+        }
+        tick_budget.note_runtime_session();
+        let (pid, status) = if session.status.is_live() {
+            (session.pid, session.status)
+        } else if session.reap_incomplete {
+            (
+                session.resources.process_ids.first().copied(),
+                SessionStatus::Failed,
+            )
+        } else {
+            continue;
+        };
+        if let Some(pid) = pid {
+            sessions.push((
+                id.clone(),
+                pid,
+                session.session_kind.is_ai(),
+                session.session_kind,
+                status,
+                bounded_previous_snapshot(&session.resources, &mut tick_budget),
+            ));
+        }
+    }
+    drop(runtime);
 
     if sessions.is_empty() {
-        if let Ok(mut samplers) = inner.resource_samplers.lock() {
+        if let Ok(mut samplers) =
+            sampling_mutex_until(&inner.resource_samplers, tick_budget.deadline())
+        {
             samplers.clear();
         }
         return;
@@ -3896,16 +3960,19 @@ fn refresh_resource_snapshots_with_source(
 
     // Snapshot TerminalSession Arcs without holding the sessions lock across OS queries.
     let mut terminal_sessions = HashMap::with_capacity(sessions.len());
-    if let Ok(guard) = inner.sessions.lock() {
-        for (session_id, _, _, _, _, _) in &sessions {
-            if tick_budget.checkpoint().is_err() {
-                break;
-            }
-            if let Some(session) = guard.get(session_id) {
-                terminal_sessions.insert(session_id.clone(), session.clone());
-            }
+    let guard = match sampling_mutex_until(&inner.sessions, tick_budget.deadline()) {
+        Ok(guard) => guard,
+        Err(()) => return,
+    };
+    for (session_id, _, _, _, _, _) in &sessions {
+        if tick_budget.checkpoint().is_err() {
+            break;
+        }
+        if let Some(session) = guard.get(session_id) {
+            terminal_sessions.insert(session_id.clone(), session.clone());
         }
     }
+    drop(guard);
 
     let mut job_member_observations: HashMap<String, ManagedJobObservationSnapshot> =
         HashMap::new();
@@ -4053,10 +4120,11 @@ fn refresh_resource_snapshots_with_source(
         .iter()
         .map(|(session_id, _, _, _, _, _)| session_id.clone())
         .collect();
-    let mut resource_samplers = inner
-        .resource_samplers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut resource_samplers =
+        match sampling_mutex_until(&inner.resource_samplers, tick_budget.deadline()) {
+            Ok(samplers) => samplers,
+            Err(()) => return,
+        };
     resource_samplers.retain(|session_id, _| active_sampler_ids.contains(session_id));
 
     for (
@@ -4188,7 +4256,9 @@ fn refresh_resource_snapshots_with_source(
                     }
                 }
                 Ok(ManagedResourceSamplePublication::StaleGeneration { dirty_changed }) => {
-                    if let Ok(mut samplers) = inner.resource_samplers.lock() {
+                    if let Ok(mut samplers) =
+                        sampling_mutex_until(&inner.resource_samplers, tick_budget.deadline())
+                    {
                         samplers.remove(&session_id);
                     }
                     if dirty_changed {
@@ -4196,7 +4266,9 @@ fn refresh_resource_snapshots_with_source(
                     }
                 }
                 Err(_) => {
-                    if let Ok(mut samplers) = inner.resource_samplers.lock() {
+                    if let Ok(mut samplers) =
+                        sampling_mutex_until(&inner.resource_samplers, tick_budget.deadline())
+                    {
                         samplers.remove(&session_id);
                     }
                 }
@@ -4207,9 +4279,24 @@ fn refresh_resource_snapshots_with_source(
         direct_snapshots.push((session_id, snapshot, awaiting_external_editor));
     }
 
-    if let Ok(mut runtime) = inner.runtime_state.write() {
-        for (session_id, snapshot, awaiting_external_editor) in direct_snapshots {
-            if let Some(session) = runtime.sessions.get_mut(&session_id) {
+    #[cfg(test)]
+    if let Some(delay) = source.and_then(|source| source.before_direct_publication_delay) {
+        thread::sleep(delay);
+    }
+
+    if !direct_snapshots.is_empty() && tick_budget.checkpoint().is_ok() {
+        if let Ok(mut runtime) = sampling_write_until(&inner.runtime_state, tick_budget.deadline())
+        {
+            for (session_id, snapshot, awaiting_external_editor) in direct_snapshots {
+                if tick_budget.checkpoint().is_err() {
+                    break;
+                }
+                let Some(session) = runtime.sessions.get_mut(&session_id) else {
+                    continue;
+                };
+                if tick_budget.checkpoint().is_err() {
+                    break;
+                }
                 let dirty_before = session.dirty_generation;
                 let cleared_unreaped = session.reap_incomplete && snapshot.process_ids.is_empty();
                 session.note_resource_sample(snapshot);
@@ -4512,6 +4599,7 @@ fn clone_injected_job_members_with_budget(
             })?;
     let root_pid = fence.root().id().pid();
     let mut members = Vec::with_capacity(source.job_members.len().min(query_member_limit));
+    let mut exact_root_observed = false;
     for member in &source.job_members {
         budget.checkpoint()?;
         budget.note_job_candidate();
@@ -4521,6 +4609,7 @@ fn clone_injected_job_members_with_budget(
                 if identity.id().pid() == root_pid && identity != fence.root() {
                     return Err(SamplerError::ConflictingProcessIdentity { pid: root_pid });
                 }
+                exact_root_observed |= identity == fence.root();
                 budget.admit_identity(identity)?;
                 JobMemberObservation::Accessible {
                     identity: identity.clone(),
@@ -4544,6 +4633,12 @@ fn clone_injected_job_members_with_budget(
         };
         members.push(safe_member);
         budget.checkpoint()?;
+    }
+    if !exact_root_observed {
+        return Err(SamplerError::ObservationFailed {
+            pid: root_pid,
+            reason: "injected_source_missing_exact_root".to_string(),
+        });
     }
     Ok(members)
 }
@@ -5395,26 +5490,9 @@ fn retry_exact_session_teardown(
     if session_projection_is_already_settled(inner, session_id) {
         return Ok(());
     }
-    // Crash-recovery reconciliation may encounter ledger evidence for a
-    // session that has no runtime projection and no exact Job capability.
-    // There is nothing authoritative to terminate or publish in that case;
-    // retain the ledger evidence for recovery and report the reconciliation
-    // pass itself as complete.  A retained Failed/reap-incomplete runtime row
-    // still fails closed through the branch below.
-    if session_runtime_projection_is_absent(inner, session_id) {
-        return Ok(());
-    }
     Err(format!(
         "Exact managed teardown authority for session `{session_id}` is unavailable"
     ))
-}
-
-fn session_runtime_projection_is_absent(inner: &ProcessManagerInner, session_id: &str) -> bool {
-    inner
-        .runtime_state
-        .read()
-        .map(|runtime| !runtime.sessions.contains_key(session_id))
-        .unwrap_or(false)
 }
 
 fn session_has_no_process_authority_or_evidence(
@@ -5459,12 +5537,13 @@ fn close_exact_session_owner(
     session_id: &str,
     closed_by_user: bool,
 ) -> Result<bool, String> {
-    let session = inner
-        .sessions
-        .lock()
-        .map_err(|_| "Session store poisoned".to_string())?
-        .get(session_id)
-        .cloned();
+    let session = match inner.sessions.lock() {
+        Ok(sessions) => sessions.get(session_id).cloned(),
+        Err(_) => {
+            clear_unowned_managed_process_projection(inner, session_id);
+            return Err("Session store poisoned".to_string());
+        }
+    };
     let Some(session) = session else {
         return Ok(false);
     };
@@ -7725,10 +7804,13 @@ fn close_managed_process_exact(
         .lock()
         .map_err(|_| "Session store poisoned".to_string())?
         .get(session_id)
-        .cloned()
-        .ok_or_else(|| {
-            format!("Exact managed teardown authority for session `{session_id}` is unavailable")
-        })?;
+        .cloned();
+    let Some(session) = session else {
+        clear_unowned_managed_process_projection(inner, session_id);
+        return Err(format!(
+            "Exact managed teardown authority for session `{session_id}` is unavailable"
+        ));
+    };
 
     #[cfg(windows)]
     session.close_managed_process_exact(fence, true)?;
@@ -7755,6 +7837,39 @@ fn close_managed_process_exact(
     let _ = pid_file::prune_inactive_entries();
     mark_session_reaped(inner, session_id);
     Ok(())
+}
+
+fn clear_unowned_managed_process_projection(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+    let mut changed = false;
+    let mut runtime = match inner.runtime_state.write() {
+        Ok(runtime) => runtime,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(session) = runtime.sessions.get_mut(session_id) {
+        let dirty_before = session.dirty_generation;
+        session.status = SessionStatus::Failed;
+        session.reap_incomplete = true;
+        session.pid = None;
+        session.resources = ResourceSnapshot {
+            metrics_unavailable: true,
+            metrics_status: ProcessMetricStatus::Failed,
+            metric_values: ResourceMetricValueState::Unavailable,
+            cpu_value_state: ResourceMetricValueState::Unavailable,
+            memory_value_state: ResourceMetricValueState::Unavailable,
+            process_count_value_state: ResourceMetricValueState::Unavailable,
+            metrics_error: Some("exact_owner_unavailable".to_string()),
+            last_sample_at: Some(Instant::now()),
+            ..ResourceSnapshot::default()
+        };
+        session.mark_dirty();
+        changed = session.dirty_generation != dirty_before;
+    }
+    drop(runtime);
+    if changed {
+        bump_runtime_revision(inner);
+        mark_remote_session_dirty(inner, session_id);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
 }
 
 fn validate_process_op_host_string(value: &str, field: &str) -> Result<(), String> {
@@ -11375,7 +11490,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_reconciliation_never_promotes_pid_ledger_descendant_to_kill_authority() {
+    fn absent_runtime_projection_with_live_ledger_evidence_remains_retryable() {
         let cwd = temp_test_dir("authority-dead-root-descendant");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -11399,10 +11514,9 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
-            retry_exact_session_teardown(&manager.inner, "server-cmd"),
-            Ok(())
-        );
+        let error = retry_exact_session_teardown(&manager.inner, "server-cmd")
+            .expect_err("live exact ledger evidence must prevent a forged stopped result");
+        assert!(error.contains("authority"), "{error}");
         assert!(platform_service::is_pid_running(std::process::id()));
         assert_eq!(
             pid_file::active_tracked_pids_for_session("server-cmd"),
@@ -11989,6 +12103,7 @@ mod tests {
         let manager = ProcessManager::new();
         let session_id = "stale-kill-session";
         let running_pid = std::process::id();
+        let stale_fence = synthetic_process_fence(running_pid);
 
         {
             let mut runtime = manager.inner.runtime_state.write().expect("runtime write");
@@ -12000,9 +12115,10 @@ mod tests {
             );
             session.status = SessionStatus::Failed;
             session.reap_incomplete = true;
-            session.pid = None;
+            session.pid = Some(running_pid);
             session.resources = ResourceSnapshot {
                 process_count: 1,
+                process_count_value_state: ResourceMetricValueState::LastKnown,
                 process_ids: vec![running_pid],
                 processes: vec![crate::state::ProcessResourceNode {
                     pid: running_pid,
@@ -12027,6 +12143,7 @@ mod tests {
                     memory_value_state: ResourceMetricValueState::Unavailable,
                     sampling_generation: 0,
                 }],
+                managed_process_fence: Some(stale_fence.clone()),
                 ..Default::default()
             };
             runtime.sessions.insert(session_id.to_string(), session);
@@ -12038,12 +12155,21 @@ mod tests {
                 op_id: next_op_id(),
                 session_id: session_id.to_string(),
                 pid: running_pid,
-                fence: synthetic_process_fence(running_pid),
+                fence: stale_fence,
                 response: None,
             },
         );
         assert!(completion.result.is_err());
         assert!(completion.result.unwrap_err().contains("authority"));
+        let runtime = manager.runtime_state();
+        let session = runtime
+            .sessions
+            .get(session_id)
+            .expect("failed runtime residue remains visible");
+        assert!(session.pid.is_none());
+        assert!(session.resources.process_ids.is_empty());
+        assert!(session.resources.processes.is_empty());
+        assert!(session.resources.managed_process_fence.is_none());
     }
 
     #[test]
@@ -12238,9 +12364,174 @@ mod tests {
             .is_some_and(|exit| exit.summary.contains("retry")));
     }
 
+    fn injected_sampling_fixture(
+        manager: &ProcessManager,
+        session_id: &str,
+        fence: ManagedProcessFence,
+    ) -> ResourceSamplingSource {
+        let pid = fence.root().id().pid();
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        runtime.status = SessionStatus::Running;
+        runtime.pid = Some(pid);
+        manager.register_runtime_session(runtime);
+
+        ResourceSamplingSource {
+            sessions: HashMap::from([(
+                session_id.to_string(),
+                ResourceSamplingSession {
+                    managed_process_fence: Some(fence.clone()),
+                    job_members: vec![JobMemberObservation::Accessible {
+                        identity: fence.root().clone(),
+                    }],
+                    member_observations: vec![ProcessMemberObservation::Accessible(
+                        AccessibleProcess::new(fence.root().clone(), 0, 4_096),
+                    )],
+                    metadata: HashMap::from([(
+                        pid,
+                        ProcessProjectionMetadata {
+                            display_name: "Shell".to_string(),
+                            command_label: "Shell".to_string(),
+                            ..ProcessProjectionMetadata::default()
+                        },
+                    )]),
+                },
+            )]),
+            ..ResourceSamplingSource::default()
+        }
+    }
+
+    fn spawn_sampling_refresh(
+        manager: ProcessManager,
+        source: Option<ResourceSamplingSource>,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let mut system = sysinfo::System::new();
+            started_tx.send(()).expect("sampling worker started");
+            refresh_resource_snapshots_with_source(&manager.inner, &mut system, source.as_ref());
+            finished_tx.send(()).expect("sampling worker finished");
+        });
+        (started_rx, finished_rx, handle)
+    }
+
+    #[test]
+    fn sampling_tick_does_not_wait_past_one_deadline_for_runtime_session_or_sampler_locks() {
+        const COMPLETION_BOUND: Duration = Duration::from_millis(250);
+
+        let runtime_manager = ProcessManager::new();
+        let runtime_guard = runtime_manager
+            .inner
+            .runtime_state
+            .write()
+            .expect("hold runtime projection");
+        let (started, finished, handle) = spawn_sampling_refresh(runtime_manager.clone(), None);
+        started.recv().expect("runtime-lock worker started");
+        let runtime_bounded = finished.recv_timeout(COMPLETION_BOUND).is_ok();
+        drop(runtime_guard);
+        handle.join().expect("runtime-lock worker joined");
+
+        let sessions_manager = ProcessManager::new();
+        let _ = injected_sampling_fixture(
+            &sessions_manager,
+            "session-lock-budget",
+            sealed_fence_issuer::issue(20, 1, ProcessOwner::Host, 720, 31),
+        );
+        let sessions_guard = sessions_manager
+            .inner
+            .sessions
+            .lock()
+            .expect("hold terminal session store");
+        let (started, finished, handle) = spawn_sampling_refresh(sessions_manager.clone(), None);
+        started.recv().expect("session-lock worker started");
+        let sessions_bounded = finished.recv_timeout(COMPLETION_BOUND).is_ok();
+        drop(sessions_guard);
+        handle.join().expect("session-lock worker joined");
+
+        let sampler_manager = ProcessManager::new();
+        let source = injected_sampling_fixture(
+            &sampler_manager,
+            "sampler-lock-budget",
+            sealed_fence_issuer::issue(21, 1, ProcessOwner::Host, 721, 32),
+        );
+        let sampler_guard = sampler_manager
+            .inner
+            .resource_samplers
+            .lock()
+            .expect("hold sampler store");
+        let (started, finished, handle) =
+            spawn_sampling_refresh(sampler_manager.clone(), Some(source));
+        started.recv().expect("sampler-lock worker started");
+        let sampler_bounded = finished.recv_timeout(COMPLETION_BOUND).is_ok();
+        drop(sampler_guard);
+        handle.join().expect("sampler-lock worker joined");
+
+        assert!(
+            runtime_bounded,
+            "runtime read exceeded the one tick deadline"
+        );
+        assert!(
+            sessions_bounded,
+            "session store exceeded the one tick deadline"
+        );
+        assert!(
+            sampler_bounded,
+            "sampler store exceeded the one tick deadline"
+        );
+    }
+
+    #[test]
+    fn expired_tick_never_commits_an_injected_snapshot_after_sampling() {
+        let manager = ProcessManager::new();
+        let session_id = "expired-direct-publication";
+        let fence = sealed_fence_issuer::issue(22, 1, ProcessOwner::Host, 722, 33);
+        let mut source = injected_sampling_fixture(&manager, session_id, fence);
+        source.before_direct_publication_delay = Some(Duration::from_millis(75));
+
+        let mut system = sysinfo::System::new();
+        refresh_resource_snapshots_with_source(&manager.inner, &mut system, Some(&source));
+
+        let runtime = manager.runtime_state();
+        let session = runtime.sessions.get(session_id).expect("runtime session");
+        assert!(session.resources.last_sample_at.is_none());
+        assert!(session.resources.managed_process_fence.is_none());
+    }
+
     #[test]
     fn injected_sampling_rejects_fence_job_and_metric_identity_mismatch() {
         let fence = sealed_fence_issuer::issue(7, 3, ProcessOwner::Host, 700, 11);
+        let foreign_member = sealed_fence_issuer::issue(11, 7, ProcessOwner::Host, 701, 22)
+            .root()
+            .clone();
+        let missing_root = ResourceSamplingSession {
+            managed_process_fence: Some(fence.clone()),
+            job_members: vec![JobMemberObservation::Accessible {
+                identity: foreign_member.clone(),
+            }],
+            member_observations: vec![ProcessMemberObservation::Accessible(
+                AccessibleProcess::new(foreign_member, 0, 1),
+            )],
+            metadata: HashMap::new(),
+        };
+        let mut budget = SamplingBudget::from_now(2, Duration::from_secs(1));
+        assert_eq!(
+            clone_injected_job_members_with_budget(&missing_root, 2, &mut budget)
+                .expect_err("the injected Job tuple must contain the exact fenced root"),
+            SamplerError::ObservationFailed {
+                pid: 700,
+                reason: "injected_source_missing_exact_root".to_string(),
+            }
+        );
+
         let conflicting = sealed_fence_issuer::issue(8, 4, ProcessOwner::Host, 700, 12)
             .root()
             .clone();
@@ -12337,6 +12628,7 @@ mod tests {
         )]);
         let source = ResourceSamplingSource {
             sessions: HashMap::from([("bounded".to_string(), source_session)]),
+            ..ResourceSamplingSource::default()
         };
         let authoritative = BTreeSet::from([710]);
         let metadata =
@@ -12445,6 +12737,7 @@ mod tests {
                     metadata,
                 },
             )]),
+            ..ResourceSamplingSource::default()
         };
 
         let mut system = sysinfo::System::new();

@@ -444,6 +444,8 @@ pub struct TerminalSession {
     lifecycle: Mutex<()>,
     #[cfg(windows)]
     retired: AtomicBool,
+    #[cfg(all(test, windows))]
+    managed_resource_publication_barrier: Mutex<Option<ManagedResourcePublicationTestBarrier>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
     event_proxy: SessionEventProxy,
@@ -451,6 +453,12 @@ pub struct TerminalSession {
     scrolling_history: Arc<RwLock<usize>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     output_notifier: Option<SessionOutputNotifier>,
+}
+
+#[cfg(all(test, windows))]
+struct ManagedResourcePublicationTestBarrier {
+    validated: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 /// Opaque read-only result of one exact Job query. The retained teardown Arc
@@ -2783,6 +2791,8 @@ fn spawn_with_command(
         lifecycle: Mutex::new(()),
         #[cfg(windows)]
         retired: AtomicBool::new(false),
+        #[cfg(all(test, windows))]
+        managed_resource_publication_barrier: Mutex::new(None),
         #[cfg(not(windows))]
         process_job,
         runtime_state,
@@ -2860,8 +2870,10 @@ impl TerminalSession {
 
     /// Publishes one accounting snapshot only if the exact teardown Arc,
     /// registry fence, runtime generation, and root PID captured by the Job
-    /// query are still current. Lock order intentionally matches restart:
-    /// lifecycle first, then runtime projection.
+    /// query are still current. Lock order intentionally matches restart and
+    /// asynchronous teardown: lifecycle, publication guard, teardown state,
+    /// then runtime projection. Release takes only the publication write guard
+    /// and teardown state, so it cannot invalidate authority during commit.
     #[cfg(windows)]
     pub(crate) fn publish_managed_resource_sample_if_current(
         &self,
@@ -2878,10 +2890,21 @@ impl TerminalSession {
                 && current.matches_fence(&capture.fence)
                 && capture.teardown.matches_fence(&capture.fence)
         });
+        let _publication_guard = exact_teardown_is_current
+            .then(|| {
+                capture
+                    .teardown
+                    .lock_resource_publication_until(absolute_deadline)
+            })
+            .transpose()?;
         let exact_registry_is_current = exact_teardown_is_current
             && capture
                 .teardown
                 .exact_registry_entry_is_current_until(absolute_deadline)?;
+        #[cfg(all(test, windows))]
+        if exact_registry_is_current {
+            self.pause_managed_resource_publication_after_validation_for_test()?;
+        }
 
         let mut runtime =
             lock_terminal_runtime_write_until(&self.runtime_state, absolute_deadline)?;
@@ -2890,6 +2913,9 @@ impl TerminalSession {
                 dirty_changed: false,
             });
         };
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal resource publication exceeded deadline".to_string());
+        }
         let dirty_before = session.dirty_generation;
         let exact_runtime_is_current =
             session.status.is_live() && session.pid == Some(capture.fence.root().id().pid());
@@ -2919,6 +2945,9 @@ impl TerminalSession {
             });
         }
 
+        if std::time::Instant::now() >= absolute_deadline {
+            return Err("terminal resource publication exceeded deadline".to_string());
+        }
         let cleared_unreaped = session.reap_incomplete && snapshot.process_ids.is_empty();
         session.note_resource_sample(snapshot);
         session.note_external_editor_wait(awaiting_external_editor);
@@ -2926,6 +2955,39 @@ impl TerminalSession {
             dirty_changed: session.dirty_generation != dirty_before,
             cleared_unreaped,
         })
+    }
+
+    #[cfg(all(test, windows))]
+    fn install_managed_resource_publication_barrier_for_test(
+        &self,
+        validated: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .managed_resource_publication_barrier
+            .lock()
+            .expect("managed resource publication test barrier") =
+            Some(ManagedResourcePublicationTestBarrier { validated, resume });
+    }
+
+    #[cfg(all(test, windows))]
+    fn pause_managed_resource_publication_after_validation_for_test(&self) -> Result<(), String> {
+        let barrier = self
+            .managed_resource_publication_barrier
+            .lock()
+            .map_err(|_| "managed resource publication test barrier poisoned".to_string())?
+            .take();
+        let Some(barrier) = barrier else {
+            return Ok(());
+        };
+        barrier
+            .validated
+            .send(())
+            .map_err(|_| "managed resource publication test signal was dropped".to_string())?;
+        barrier
+            .resume
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "managed resource publication test release timed out".to_string())
     }
 }
 
@@ -3946,6 +4008,148 @@ mod tests {
             "the replacement generation must remain alive"
         );
         session.close(false).expect("close replacement generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn asynchronous_registry_release_cannot_cross_a_validated_sample_commit() {
+        let runtime = Arc::new(RwLock::new(RuntimeState::default()));
+        let journal = tempfile::tempdir().expect("terminal release/publication journal");
+        let authority = TerminalLaunchAuthority::new(
+            ProcessOwner::Host,
+            ResourceId::new(),
+            1,
+            OperationId::new(),
+            1,
+            Vec::new(),
+            TeardownCompletionStore::durable(journal.path().join("teardown.sqlite3"))
+                .expect("durable terminal teardown store"),
+        )
+        .expect("terminal launch authority");
+        let session = Arc::new(
+            spawn_with_command(
+                "sampling-release-barrier-test",
+                std::env::current_dir().expect("test cwd"),
+                SessionDimensions::default(),
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "ping -n 30 127.0.0.1 >nul".to_string(),
+                ],
+                HashMap::new(),
+                100,
+                None,
+                Arc::clone(&runtime),
+                false,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+                false,
+                None,
+                None,
+                authority,
+            )
+            .expect("spawn managed generation"),
+        );
+        let teardown = lock_terminal_teardown_slot(&session.teardown)
+            .expect("teardown slot")
+            .clone()
+            .expect("managed teardown");
+
+        let (release_attempted_tx, release_attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_resume_tx, release_resume_rx) = std::sync::mpsc::sync_channel(0);
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        teardown.install_release_barrier_for_test(
+            release_attempted_tx,
+            release_resume_rx,
+            released_tx,
+        );
+
+        let query = session
+            .managed_process_observations_until(
+                std::time::Instant::now() + Duration::from_secs(2),
+                32,
+            )
+            .expect("exact Job query")
+            .expect("managed observation authority");
+        let (capture, members) = query.into_parts();
+        members.expect("exact Job members");
+        let fence = capture.fence().clone();
+        let (validated_tx, validated_rx) = std::sync::mpsc::sync_channel(1);
+        let (publication_resume_tx, publication_resume_rx) = std::sync::mpsc::sync_channel(0);
+        session.install_managed_resource_publication_barrier_for_test(
+            validated_tx,
+            publication_resume_rx,
+        );
+
+        let sampling_session = Arc::clone(&session);
+        let sample_fence = fence.clone();
+        let sampler = thread::spawn(move || {
+            sampling_session.publish_managed_resource_sample_if_current(
+                &capture,
+                ResourceSnapshot {
+                    process_count: 1,
+                    process_count_value_state: crate::state::ResourceMetricValueState::Observed,
+                    process_ids: vec![sample_fence.root().id().pid()],
+                    managed_process_fence: Some(sample_fence),
+                    metrics_status: crate::domain::snapshot::ProcessMetricStatus::Complete,
+                    metric_values: crate::state::ResourceMetricValueState::Observed,
+                    cpu_value_state: crate::state::ResourceMetricValueState::Observed,
+                    memory_value_state: crate::state::ResourceMetricValueState::Observed,
+                    ..ResourceSnapshot::default()
+                },
+                false,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+        });
+
+        validated_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sample reached post-validation barrier");
+        teardown
+            .request_close()
+            .expect("request asynchronous coordinator close");
+        release_attempted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("coordinator reached exact registry release");
+        release_resume_tx
+            .send(())
+            .expect("allow exact registry release attempt");
+
+        let released_while_publication_paused =
+            released_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        let registry_current_while_publication_paused = teardown
+            .exact_registry_entry_is_current_until(
+                std::time::Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_or(false);
+        publication_resume_tx
+            .send(())
+            .expect("release sample publication");
+        let publication = sampler.join().expect("join sample publication");
+        if !released_while_publication_paused {
+            released_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("registry releases after sample commit");
+        }
+        session.close(false).expect("settle managed teardown");
+
+        assert!(
+            !released_while_publication_paused,
+            "registry release crossed the validated-but-uncommitted sample"
+        );
+        assert!(
+            registry_current_while_publication_paused,
+            "validated sample lost exact registry authority before commit"
+        );
+        assert!(
+            matches!(
+                &publication,
+                Ok(ManagedResourceSamplePublication::Published { .. })
+                    | Ok(ManagedResourceSamplePublication::StaleGeneration { .. })
+            ),
+            "validated sample did not resolve safely: {publication:?}"
+        );
     }
 
     #[cfg(windows)]

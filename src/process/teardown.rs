@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+#[cfg(windows)]
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -552,6 +554,52 @@ fn lock_mutex_until<'a, T>(
             }
             Err(TryLockError::Poisoned(_)) => {
                 return Err(format!("{operation} mutex poisoned"));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_rw_read_until<'a, T>(
+    lock: &'a RwLock<T>,
+    absolute_deadline: Instant,
+    operation: &str,
+) -> Result<RwLockReadGuard<'a, T>, String> {
+    loop {
+        let remaining = checked_remaining_until(absolute_deadline, operation)?;
+        match lock.try_read() {
+            Ok(guard) => {
+                checked_remaining_until(absolute_deadline, operation)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(format!("{operation} read lock poisoned"));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_rw_write_until<'a, T>(
+    lock: &'a RwLock<T>,
+    absolute_deadline: Instant,
+    operation: &str,
+) -> Result<RwLockWriteGuard<'a, T>, String> {
+    loop {
+        let remaining = checked_remaining_until(absolute_deadline, operation)?;
+        match lock.try_write() {
+            Ok(guard) => {
+                checked_remaining_until(absolute_deadline, operation)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(format!("{operation} write lock poisoned"));
             }
         }
     }
@@ -1349,10 +1397,20 @@ pub(crate) struct ManagedTerminalTeardown {
     ticket: TeardownTicket,
     report: Mutex<Option<TeardownReport>>,
     state: Arc<Mutex<ManagedTerminalTeardownState>>,
+    publication_release_guard: Arc<RwLock<()>>,
+    #[cfg(test)]
+    release_test_barrier: Arc<Mutex<Option<Arc<TerminalReleaseTestBarrier>>>>,
     /// Armed immediately before the registered suspended root is resumed.
     /// Once armed, dropping this owner without a Closed report is a process
     /// safety invariant violation: returning would abandon Job/actor authority.
     armed: AtomicBool,
+}
+
+#[cfg(all(test, windows))]
+struct TerminalReleaseTestBarrier {
+    attempted: std::sync::mpsc::SyncSender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    released: std::sync::mpsc::SyncSender<()>,
 }
 
 #[cfg(windows)]
@@ -1476,8 +1534,14 @@ impl ManagedTerminalTeardown {
             ticket.action_epoch(),
         ));
         let clock = Arc::new(MonotonicTeardownClock::default());
+        let publication_release_guard = Arc::new(RwLock::new(()));
+        #[cfg(test)]
+        let release_test_barrier = Arc::new(Mutex::new(None));
         let effects = Arc::new(TerminalTeardownEffects {
             state: Arc::clone(&state),
+            publication_release_guard: Arc::clone(&publication_release_guard),
+            #[cfg(test)]
+            release_test_barrier: Arc::clone(&release_test_barrier),
         });
         let adapters = TeardownHostAdapters::terminal(admission, effects, Arc::clone(&clock));
         let coordinator = Arc::new(TeardownCoordinator::from_host(
@@ -1492,6 +1556,9 @@ impl ManagedTerminalTeardown {
             ticket,
             report: Mutex::new(None),
             state,
+            publication_release_guard,
+            #[cfg(test)]
+            release_test_barrier,
             armed: AtomicBool::new(false),
         })
     }
@@ -1681,6 +1748,37 @@ impl ManagedTerminalTeardown {
         }
         Ok(state.registry.exact_fence_matches(&state.fence))
     }
+
+    /// Prevents the exact registry entry from being released between resource
+    /// validation and runtime publication. The caller must acquire this after
+    /// the TerminalSession lifecycle lock and retain it through the commit.
+    pub(crate) fn lock_resource_publication_until(
+        &self,
+        absolute_deadline: Instant,
+    ) -> Result<RwLockReadGuard<'_, ()>, String> {
+        lock_rw_read_until(
+            &self.publication_release_guard,
+            absolute_deadline,
+            "terminal resource publication guard",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_release_barrier_for_test(
+        &self,
+        attempted: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+        released: std::sync::mpsc::SyncSender<()>,
+    ) {
+        *self
+            .release_test_barrier
+            .lock()
+            .expect("terminal release test barrier") = Some(Arc::new(TerminalReleaseTestBarrier {
+            attempted,
+            resume: Mutex::new(resume),
+            released,
+        }));
+    }
 }
 
 #[cfg(windows)]
@@ -1843,6 +1941,9 @@ impl TeardownAdmission for TerminalTeardownAdmission {
 #[cfg(windows)]
 struct TerminalTeardownEffects {
     state: Arc<Mutex<ManagedTerminalTeardownState>>,
+    publication_release_guard: Arc<RwLock<()>>,
+    #[cfg(test)]
+    release_test_barrier: Arc<Mutex<Option<Arc<TerminalReleaseTestBarrier>>>>,
 }
 
 #[cfg(all(windows, not(test)))]
@@ -2341,8 +2442,41 @@ impl TeardownEffects for TerminalTeardownEffects {
         deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let state = Arc::clone(&self.state);
+        let publication_release_guard = Arc::clone(&self.publication_release_guard);
+        #[cfg(test)]
+        let release_test_barrier = Arc::clone(&self.release_test_barrier);
         let ticket = ticket.clone();
         Box::pin(async move {
+            #[cfg(test)]
+            let release_test_barrier = release_test_barrier
+                .lock()
+                .ok()
+                .and_then(|barrier| barrier.clone());
+            #[cfg(test)]
+            if let Some(barrier) = release_test_barrier.as_ref() {
+                if barrier.attempted.send(()).is_err()
+                    || barrier
+                        .resume
+                        .lock()
+                        .map_err(|_| ())
+                        .and_then(|resume| {
+                            resume.recv_timeout(Duration::from_secs(5)).map_err(|_| ())
+                        })
+                        .is_err()
+                {
+                    return StageResult::Failed {
+                        detail: "terminal release test barrier failed".to_string(),
+                    };
+                }
+            }
+            let _publication_release = match lock_rw_write_until(
+                &publication_release_guard,
+                deadline.absolute,
+                "terminal exact Job release publication guard",
+            ) {
+                Ok(guard) => guard,
+                Err(detail) => return StageResult::Failed { detail },
+            };
             let mut state =
                 match lock_mutex_until(&state, deadline.absolute, "terminal exact Job release") {
                     Ok(state) => state,
@@ -2374,6 +2508,10 @@ impl TeardownEffects for TerminalTeardownEffects {
                 Ok(crate::process::registry::UnregisterOutcome::Removed(_)) => {
                     *release_authority = None;
                     *released_exact = true;
+                    #[cfg(test)]
+                    if let Some(barrier) = release_test_barrier.as_ref() {
+                        let _ = barrier.released.send(());
+                    }
                     match deadline.check("terminal exact Job release") {
                         Ok(_) => StageResult::Completed,
                         Err(detail) => StageResult::Failed { detail },
