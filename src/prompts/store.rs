@@ -4062,7 +4062,13 @@ fn load_chain_receipt(
         ));
     }
     validate_chain_receipt_command(tx, &stored_command.command, &receipt)?;
-    validate_chain_receipt_effect(tx, command_id, &stored_command.command, &receipt)?;
+    validate_chain_receipt_effect(
+        tx,
+        command_id,
+        &stored_command.command,
+        stored_command.resolved_prompt_version_id,
+        &receipt,
+    )?;
     Ok(Some(receipt))
 }
 
@@ -4971,23 +4977,58 @@ fn validate_prompt_noop_state(
         PromptStoreError::Corruption("semantic no-op prompt receipt target is missing".into())
     })?;
     validate_saved_prompt_record(tx, &prompt)?;
-    if receipt.prompt_id != prompt.id
-        || receipt.prompt_version_id != prompt.current_version_id
-        || receipt.revision != prompt.revision
+    let expected_revision = match command {
+        PromptCommand::RenamePrompt(command) => command.expected_revision,
+        PromptCommand::SetPromptTags(command) => command.expected_revision,
+        PromptCommand::ArchivePrompt(command) => command.expected_revision,
+        PromptCommand::RestorePrompt(command) => command.expected_revision,
+        PromptCommand::CreatePrompt(_) | PromptCommand::CreatePromptVersion(_) => {
+            return Err(PromptStoreError::Corruption(
+                "prompt creation cannot be a semantic no-op".into(),
+            ))
+        }
+    };
+    if receipt.prompt_id != prompt.id || receipt.revision != expected_revision {
+        return Err(PromptStoreError::Corruption(
+            "semantic no-op prompt receipt does not match its immutable precondition".into(),
+        ));
+    }
+    let durable_prompt =
+        load_prompt_at_revision(tx, prompt.id, prompt.revision)?.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "prompt projection is missing from its durable event history".into(),
+            )
+        })?;
+    if durable_prompt != prompt {
+        return Err(PromptStoreError::Corruption(
+            "prompt projection does not match its durable event history".into(),
+        ));
+    }
+    let original_prompt =
+        load_prompt_at_revision(tx, prompt.id, expected_revision)?.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "semantic no-op prompt precondition is missing from its event history".into(),
+            )
+        })?;
+    if original_prompt.revision != expected_revision
+        || receipt.prompt_version_id != original_prompt.current_version_id
     {
         return Err(PromptStoreError::Corruption(
-            "semantic no-op prompt receipt does not match exact current state".into(),
+            "semantic no-op prompt receipt does not match its immutable precondition".into(),
         ));
     }
     let unchanged = match command {
-        PromptCommand::RenamePrompt(command) => prompt.title == command.title,
+        PromptCommand::RenamePrompt(command) => {
+            original_prompt.archived_at_ms.is_none()
+                && original_prompt.title == trim_prompt_whitespace(&command.title)
+        }
         PromptCommand::SetPromptTags(command) => {
             let tags = command.validate()?;
             validate_sql_tags(&tags)?;
-            prompt.tags == tags
+            original_prompt.archived_at_ms.is_none() && original_prompt.tags == tags
         }
-        PromptCommand::ArchivePrompt(_) => prompt.archived_at_ms.is_some(),
-        PromptCommand::RestorePrompt(_) => prompt.archived_at_ms.is_none(),
+        PromptCommand::ArchivePrompt(_) => original_prompt.archived_at_ms.is_some(),
+        PromptCommand::RestorePrompt(_) => original_prompt.archived_at_ms.is_none(),
         PromptCommand::CreatePrompt(_) | PromptCommand::CreatePromptVersion(_) => false,
     };
     if unchanged {
@@ -4999,10 +5040,151 @@ fn validate_prompt_noop_state(
     }
 }
 
+fn load_prompt_at_revision(
+    tx: &Transaction<'_>,
+    prompt_id: PromptId,
+    revision: u64,
+) -> Result<Option<SavedPrompt>, PromptStoreError> {
+    let mut statement = tx.prepare(
+        "SELECT payload FROM prompt_events
+         WHERE prompt_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows = statement.query_map([prompt_id.as_bytes().as_slice()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut durable_prompt = None;
+    for row in rows {
+        let payload = row?;
+        validate_wire_size("prompt event", &payload)?;
+        let event = PromptEvent::decode(&payload)
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+        let event_revision = match &event {
+            PromptEvent::PromptCreated { prompt, .. } => prompt.revision,
+            PromptEvent::PromptVersionCreated { revision, .. }
+            | PromptEvent::PromptRenamed { revision, .. }
+            | PromptEvent::PromptTagsSet { revision, .. }
+            | PromptEvent::PromptArchived { revision, .. }
+            | PromptEvent::PromptRestored { revision, .. } => *revision,
+        };
+        if event_revision > revision {
+            break;
+        }
+        match event {
+            PromptEvent::PromptCreated { prompt, version } => {
+                if prompt.id != prompt_id
+                    || version.prompt_id != prompt_id
+                    || durable_prompt.is_some()
+                {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt event history has an invalid creation state".into(),
+                    ));
+                }
+                durable_prompt = Some(prompt);
+            }
+            PromptEvent::PromptVersionCreated {
+                prompt_id: event_prompt_id,
+                version,
+                revision,
+            } => {
+                let prompt = durable_prompt.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt version event has no creation state".into(),
+                    )
+                })?;
+                if event_prompt_id != prompt_id
+                    || version.prompt_id != prompt_id
+                    || revision != next_revision(prompt.revision)?
+                {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt version event history is not contiguous".into(),
+                    ));
+                }
+                prompt.current_version_id = version.id;
+                prompt.revision = revision;
+            }
+            PromptEvent::PromptRenamed {
+                prompt_id: event_prompt_id,
+                title,
+                revision,
+            } => {
+                let prompt = durable_prompt.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption("prompt rename event has no creation state".into())
+                })?;
+                if event_prompt_id != prompt_id || revision != next_revision(prompt.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt rename event history is not contiguous".into(),
+                    ));
+                }
+                prompt.title = title;
+                prompt.revision = revision;
+            }
+            PromptEvent::PromptTagsSet {
+                prompt_id: event_prompt_id,
+                tags,
+                revision,
+            } => {
+                let prompt = durable_prompt.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption("prompt tags event has no creation state".into())
+                })?;
+                if event_prompt_id != prompt_id || revision != next_revision(prompt.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt tags event history is not contiguous".into(),
+                    ));
+                }
+                prompt.tags = tags;
+                prompt.revision = revision;
+            }
+            PromptEvent::PromptArchived {
+                prompt_id: event_prompt_id,
+                archived_at_ms,
+                revision,
+            } => {
+                let prompt = durable_prompt.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt archive event has no creation state".into(),
+                    )
+                })?;
+                if event_prompt_id != prompt_id || revision != next_revision(prompt.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt archive event history is not contiguous".into(),
+                    ));
+                }
+                prompt.archived_at_ms = Some(archived_at_ms);
+                prompt.revision = revision;
+            }
+            PromptEvent::PromptRestored {
+                prompt_id: event_prompt_id,
+                revision,
+            } => {
+                let prompt = durable_prompt.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt restore event has no creation state".into(),
+                    )
+                })?;
+                if event_prompt_id != prompt_id || revision != next_revision(prompt.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt restore event history is not contiguous".into(),
+                    ));
+                }
+                prompt.archived_at_ms = None;
+                prompt.revision = revision;
+            }
+        }
+    }
+    if durable_prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.revision != revision)
+    {
+        return Ok(None);
+    }
+    Ok(durable_prompt)
+}
+
 fn validate_chain_receipt_effect(
     tx: &Transaction<'_>,
     command_id: CommandId,
     command: &PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
     receipt: &PromptChainMutationReceipt,
 ) -> Result<(), PromptStoreError> {
     let effect_count = count_command_effects(tx, "prompt_chain_events", command_id)?;
@@ -5028,7 +5210,7 @@ fn validate_chain_receipt_effect(
                 "semantic no-op prompt chain receipt has a durable effect".into(),
             ));
         }
-        validate_chain_noop_state(tx, command, receipt)
+        validate_chain_noop_state(tx, command, resolved_prompt_version_id, receipt)
     } else if receipt.revision
         == if matches!(command, PromptChainCommand::CreatePromptChain(_)) {
             1
@@ -5081,6 +5263,7 @@ fn validate_chain_receipt_effect(
 fn validate_chain_noop_state(
     tx: &Transaction<'_>,
     command: &PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
     receipt: &PromptChainMutationReceipt,
 ) -> Result<(), PromptStoreError> {
     let chain_id = match command {
@@ -5100,74 +5283,119 @@ fn validate_chain_noop_state(
     let chain = load_chain(tx, chain_id)?.ok_or_else(|| {
         PromptStoreError::Corruption("semantic no-op prompt chain target is missing".into())
     })?;
-    if receipt.chain_id != chain.id || receipt.revision != chain.revision {
+    if receipt.chain_id != chain.id || receipt.revision != expected_chain_revision(command)? {
         return Err(PromptStoreError::Corruption(
-            "semantic no-op prompt chain receipt does not match exact current state".into(),
+            "semantic no-op prompt chain receipt does not match its immutable precondition".into(),
+        ));
+    }
+
+    let current_links = load_chain_links(tx, chain.id)?;
+    validate_chain_links(tx, chain.id, &current_links)?;
+    let durable_chain =
+        load_chain_metadata_at_revision(tx, chain.id, chain.revision)?.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "semantic no-op prompt chain current state is missing from its event history"
+                    .into(),
+            )
+        })?;
+    if durable_chain != chain {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain projection does not match its durable event history".into(),
+        ));
+    }
+    let durable_links =
+        load_chain_links_at_revision(tx, chain.id, chain.revision)?.ok_or_else(|| {
+            PromptStoreError::Corruption(
+                "prompt chain link projection is missing from its event history".into(),
+            )
+        })?;
+    if durable_links != current_links {
+        return Err(PromptStoreError::Corruption(
+            "prompt chain link projection does not match its durable event history".into(),
+        ));
+    }
+
+    let original_chain =
+        load_chain_metadata_at_revision(tx, chain.id, expected_chain_revision(command)?)?
+            .ok_or_else(|| {
+                PromptStoreError::Corruption(
+                    "semantic no-op prompt chain precondition is missing from its event history"
+                        .into(),
+                )
+            })?;
+    let original_links =
+        load_chain_links_at_revision(tx, chain.id, expected_chain_revision(command)?)?.ok_or_else(
+            || {
+                PromptStoreError::Corruption(
+            "semantic no-op prompt chain link precondition is missing from its event history"
+                .into(),
+        )
+            },
+        )?;
+    validate_chain_links(tx, chain.id, &original_links)?;
+    if original_chain.revision != expected_chain_revision(command)? {
+        return Err(PromptStoreError::Corruption(
+            "semantic no-op prompt chain precondition revision is invalid".into(),
         ));
     }
     let unchanged = match command {
-        PromptChainCommand::RenamePromptChain(command) => chain.title == command.title,
+        PromptChainCommand::RenamePromptChain(command) => {
+            original_chain.archived_at_ms.is_none()
+                && original_chain.title == trim_prompt_whitespace(&command.title)
+        }
         PromptChainCommand::MovePromptChainLink(command) => {
-            let links = load_chain_links(tx, chain.id)?;
-            validate_chain_links(tx, chain.id, &links)?;
-            let durable_links =
-                load_chain_links_at_revision(tx, chain.id, command.expected_revision)?;
-            if durable_links.as_ref() != Some(&links) {
-                return Err(PromptStoreError::Corruption(
-                    "semantic no-op move does not match its prior durable chain state".into(),
-                ));
-            }
-            let mut moved = links.clone();
-            let position = moved
-                .iter()
-                .position(|link| link.id() == command.link_id)
-                .ok_or_else(|| {
-                    PromptStoreError::Corruption("semantic no-op move link is missing".into())
-                })?;
-            if command.before_link_id == Some(command.link_id) {
-                true
+            if original_chain.archived_at_ms.is_some() {
+                false
             } else {
-                if let Some(before) = command.before_link_id {
-                    if !moved.iter().any(|link| link.id() == before) {
-                        return Err(PromptStoreError::Corruption(
-                            "semantic no-op move before-link is missing".into(),
-                        ));
+                let mut moved = original_links.clone();
+                let position = moved
+                    .iter()
+                    .position(|link| link.id() == command.link_id)
+                    .ok_or_else(|| {
+                        PromptStoreError::Corruption(
+                            "semantic no-op move link is missing from its precondition".into(),
+                        )
+                    })?;
+                if command.before_link_id == Some(command.link_id) {
+                    true
+                } else {
+                    if let Some(before) = command.before_link_id {
+                        if !moved.iter().any(|link| link.id() == before) {
+                            return Err(PromptStoreError::Corruption(
+                                "semantic no-op move before-link is missing from its precondition"
+                                    .into(),
+                            ));
+                        }
                     }
+                    let moving = moved.remove(position);
+                    let target = command
+                        .before_link_id
+                        .and_then(|before| moved.iter().position(|link| link.id() == before))
+                        .unwrap_or(moved.len());
+                    moved.insert(target, moving);
+                    renumber_links(&mut moved)?;
+                    moved == original_links
                 }
-                let moving = moved.remove(position);
-                let target = command
-                    .before_link_id
-                    .and_then(|before| moved.iter().position(|link| link.id() == before))
-                    .unwrap_or(moved.len());
-                moved.insert(target, moving);
-                renumber_links(&mut moved)?;
-                moved == links
             }
         }
         PromptChainCommand::UpdatePromptChainLinkVersion(command) => {
-            let links = load_chain_links(tx, chain.id)?;
-            validate_chain_links(tx, chain.id, &links)?;
-            let durable_links =
-                load_chain_links_at_revision(tx, chain.id, command.expected_revision)?;
-            if durable_links.as_ref() != Some(&links) {
-                return Err(PromptStoreError::Corruption(
-                    "semantic no-op update does not match its prior durable chain state".into(),
-                ));
+            if original_chain.archived_at_ms.is_some() {
+                false
+            } else {
+                let link = original_links
+                    .iter()
+                    .find(|link| link.id() == command.link_id)
+                    .ok_or_else(|| {
+                        PromptStoreError::Corruption(
+                            "semantic no-op update link is missing from its precondition".into(),
+                        )
+                    })?;
+                resolved_prompt_version_id
+                    .is_some_and(|version_id| version_id == link.prompt_version_id())
             }
-            let link = links
-                .iter()
-                .find(|link| link.id() == command.link_id)
-                .ok_or_else(|| {
-                    PromptStoreError::Corruption("semantic no-op update link is missing".into())
-                })?;
-            let prompt = load_prompt(tx, link.prompt_id())?.ok_or_else(|| {
-                PromptStoreError::Corruption("semantic no-op update prompt is missing".into())
-            })?;
-            validate_saved_prompt_record(tx, &prompt)?;
-            link.prompt_version_id() == prompt.current_version_id
         }
-        PromptChainCommand::ArchivePromptChain(_) => chain.archived_at_ms.is_some(),
-        PromptChainCommand::RestorePromptChain(_) => chain.archived_at_ms.is_none(),
+        PromptChainCommand::ArchivePromptChain(_) => original_chain.archived_at_ms.is_some(),
+        PromptChainCommand::RestorePromptChain(_) => original_chain.archived_at_ms.is_none(),
         PromptChainCommand::CreatePromptChain(_)
         | PromptChainCommand::InsertPromptChainLink(_)
         | PromptChainCommand::RemovePromptChainLink(_) => false,
@@ -5178,6 +5406,19 @@ fn validate_chain_noop_state(
         Err(PromptStoreError::Corruption(
             "semantic no-op prompt chain receipt does not match exact current state".into(),
         ))
+    }
+}
+
+fn expected_chain_revision(command: &PromptChainCommand) -> Result<u64, PromptStoreError> {
+    match command {
+        PromptChainCommand::CreatePromptChain(_) => Ok(1),
+        PromptChainCommand::RenamePromptChain(command) => Ok(command.expected_revision),
+        PromptChainCommand::InsertPromptChainLink(command) => Ok(command.expected_revision),
+        PromptChainCommand::MovePromptChainLink(command) => Ok(command.expected_revision),
+        PromptChainCommand::RemovePromptChainLink(command) => Ok(command.expected_revision),
+        PromptChainCommand::UpdatePromptChainLinkVersion(command) => Ok(command.expected_revision),
+        PromptChainCommand::ArchivePromptChain(command) => Ok(command.expected_revision),
+        PromptChainCommand::RestorePromptChain(command) => Ok(command.expected_revision),
     }
 }
 
@@ -5217,6 +5458,123 @@ fn load_chain_links_at_revision(
         }
     }
     Ok(durable_links)
+}
+
+fn load_chain_metadata_at_revision(
+    tx: &Transaction<'_>,
+    chain_id: PromptChainId,
+    revision: u64,
+) -> Result<Option<PromptChain>, PromptStoreError> {
+    let mut statement = tx.prepare(
+        "SELECT payload FROM prompt_chain_events
+         WHERE chain_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows = statement.query_map([chain_id.as_bytes().as_slice()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut durable_chain = None;
+    for row in rows {
+        let payload = row?;
+        validate_wire_size("prompt chain event", &payload)?;
+        let event = decode_prompt_chain_event(&payload)?;
+        let event_revision = match &event {
+            PromptChainEvent::PromptChainCreated { chain } => chain.revision,
+            PromptChainEvent::PromptChainLinksReplaced { revision, .. }
+            | PromptChainEvent::PromptChainRenamed { revision, .. }
+            | PromptChainEvent::PromptChainArchived { revision, .. }
+            | PromptChainEvent::PromptChainRestored { revision, .. } => *revision,
+        };
+        if event_revision > revision {
+            break;
+        }
+        match event {
+            PromptChainEvent::PromptChainCreated { chain } => {
+                if chain.id != chain_id || durable_chain.is_some() {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt chain event history has an invalid creation state".into(),
+                    ));
+                }
+                durable_chain = Some(chain);
+            }
+            PromptChainEvent::PromptChainRenamed {
+                chain_id: event_chain_id,
+                title,
+                revision,
+            } => {
+                let chain = durable_chain.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt chain rename event has no creation state".into(),
+                    )
+                })?;
+                if event_chain_id != chain_id || revision != next_revision(chain.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt chain rename event history is not contiguous".into(),
+                    ));
+                }
+                chain.title = title;
+                chain.revision = revision;
+            }
+            PromptChainEvent::PromptChainLinksReplaced {
+                chain_id: event_chain_id,
+                revision,
+                ..
+            } => {
+                let chain = durable_chain.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt chain link event has no creation state".into(),
+                    )
+                })?;
+                if event_chain_id != chain_id || revision != next_revision(chain.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt chain link event history is not contiguous".into(),
+                    ));
+                }
+                chain.revision = revision;
+            }
+            PromptChainEvent::PromptChainArchived {
+                chain_id: event_chain_id,
+                archived_at_ms,
+                revision,
+            } => {
+                let chain = durable_chain.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt chain archive event has no creation state".into(),
+                    )
+                })?;
+                if event_chain_id != chain_id || revision != next_revision(chain.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt chain archive event history is not contiguous".into(),
+                    ));
+                }
+                chain.archived_at_ms = Some(archived_at_ms);
+                chain.revision = revision;
+            }
+            PromptChainEvent::PromptChainRestored {
+                chain_id: event_chain_id,
+                revision,
+            } => {
+                let chain = durable_chain.as_mut().ok_or_else(|| {
+                    PromptStoreError::Corruption(
+                        "prompt chain restore event has no creation state".into(),
+                    )
+                })?;
+                if event_chain_id != chain_id || revision != next_revision(chain.revision)? {
+                    return Err(PromptStoreError::Corruption(
+                        "prompt chain restore event history is not contiguous".into(),
+                    ));
+                }
+                chain.archived_at_ms = None;
+                chain.revision = revision;
+            }
+        }
+    }
+    if durable_chain
+        .as_ref()
+        .is_some_and(|chain| chain.revision != revision)
+    {
+        return Ok(None);
+    }
+    Ok(durable_chain)
 }
 
 fn validate_all_prompt_receipts(tx: &Transaction<'_>) -> Result<(), PromptStoreError> {

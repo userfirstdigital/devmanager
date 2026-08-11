@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use devmanager::domain::{CommandId, PromptChainId, PromptChainLinkId, PromptId, PromptVersionId};
 use devmanager::prompts::{
@@ -112,20 +114,16 @@ fn chain_accepts_any_positive_link_count() {
     // ceiling. Building the ceiling through one-link commands would itself
     // serialize a full replacement event per append and turn this bounded
     // storage test into an O(n^2) harness.
-    append_link(
-        &mut store,
-        chain_id,
-        PromptChainLinkId::new(),
-        prompt_id,
-        None,
-        1,
-    );
+    let first_link = PromptChainLinkId::new();
+    append_link(&mut store, chain_id, first_link, prompt_id, None, 1);
     let connection = Connection::open(&path).expect("open chain fixture database");
     let transaction = connection
         .unchecked_transaction()
         .expect("start chain fixture transaction");
+    let mut last_link = first_link;
     for position in 1..2_000_i64 {
         let link_id = PromptChainLinkId::new();
+        last_link = link_id;
         transaction
             .execute(
                 "INSERT INTO prompt_chain_links(
@@ -150,6 +148,99 @@ fn chain_accepts_any_positive_link_count() {
     assert_eq!(links.len(), 2_000);
     assert_eq!(links.first().expect("first link").position(), 0);
     assert_eq!(links.last().expect("last link").position(), 1_999);
+
+    PromptChainService::new(&mut store)
+        .apply(
+            CommandId::new(),
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id,
+                link_id: last_link,
+                before_link_id: Some(first_link),
+                expected_revision: 2,
+            }),
+        )
+        .expect("move must use the bounded temporary-position offset");
+    let moved = PromptChainService::new(&mut store)
+        .links(chain_id)
+        .expect("list moved maximum chain");
+    assert_eq!(moved.len(), 2_000);
+    assert_eq!(moved.first().expect("moved first link").id(), last_link);
+    assert_eq!(moved.get(1).expect("moved second link").id(), first_link);
+    assert!(
+        moved
+            .iter()
+            .enumerate()
+            .all(|(position, link)| link.position() == position as u32),
+        "maximum chain remains dense after one SQL interval shift"
+    );
+}
+
+#[test]
+fn chain_position_u32_boundary_fails_closed_without_mutation() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let prompt_id = PromptId::new();
+    let version_id = PromptVersionId::new();
+    let chain_id = PromptChainId::new();
+    let link_id = PromptChainLinkId::new();
+    create_prompt(&mut store, prompt_id, version_id);
+    create_chain(&mut store, chain_id);
+    append_link(&mut store, chain_id, link_id, prompt_id, None, 1);
+    let connection = Connection::open(&path).expect("open position boundary database");
+    connection
+        .execute(
+            "UPDATE prompt_chain_links SET position = ?1 WHERE link_id = ?2",
+            rusqlite::params![i64::from(u32::MAX) + 1, link_id.as_bytes().as_slice()],
+        )
+        .expect("write out-of-range position fixture");
+    drop(connection);
+
+    let error = PromptChainService::new(&mut store)
+        .links(chain_id)
+        .expect_err("positions beyond u32 must fail closed");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn chain_revision_i64_boundary_rejects_next_revision_without_mutation() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let prompt_id = PromptId::new();
+    let version_id = PromptVersionId::new();
+    let chain_id = PromptChainId::new();
+    create_prompt(&mut store, prompt_id, version_id);
+    create_chain(&mut store, chain_id);
+    let connection = Connection::open(&path).expect("open revision boundary database");
+    connection
+        .execute(
+            "UPDATE prompt_chains SET revision = ?1 WHERE chain_id = ?2",
+            rusqlite::params![i64::MAX, chain_id.as_bytes().as_slice()],
+        )
+        .expect("write maximum revision fixture");
+    drop(connection);
+
+    let error = PromptChainService::new(&mut store)
+        .apply(
+            CommandId::new(),
+            PromptChainCommand::RenamePromptChain(devmanager::prompts::RenamePromptChain {
+                chain_id,
+                title: "Revision boundary".into(),
+                expected_revision: i64::MAX as u64,
+            }),
+        )
+        .expect_err("next revision must reject SQLite integer overflow");
+    assert!(matches!(error, PromptStoreError::Corruption(_)));
+    let revision: i64 = Connection::open(&path)
+        .expect("reopen revision boundary database")
+        .query_row(
+            "SELECT revision FROM prompt_chains WHERE chain_id = ?1",
+            [chain_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("load unchanged maximum revision");
+    assert_eq!(revision, i64::MAX);
 }
 
 #[test]
@@ -526,24 +617,43 @@ fn revision_conflict_changes_nothing() {
 }
 
 #[test]
-fn concurrent_insert_conflict_leaves_one_ordered_result() {
+fn overlapping_independent_connections_insert_conflict_leaves_one_ordered_result() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
-    let mut first_store = open_store(&path);
     let prompt_id = PromptId::new();
     let version_id = PromptVersionId::new();
     let chain_id = PromptChainId::new();
-    create_prompt(&mut first_store, prompt_id, version_id);
-    create_chain(&mut first_store, chain_id);
-    drop(first_store);
+    let mut seed_store = open_store(&path);
+    create_prompt(&mut seed_store, prompt_id, version_id);
+    create_chain(&mut seed_store, chain_id);
+    drop(seed_store);
 
-    let mut first_store = open_store(&path);
-    let mut second_store = open_store(&path);
     let first_link = PromptChainLinkId::new();
     let second_link = PromptChainLinkId::new();
-    append_link(&mut first_store, chain_id, first_link, prompt_id, None, 1);
-    let error = PromptChainService::new(&mut second_store)
-        .apply(
+    let barrier = Arc::new(Barrier::new(2));
+    let first_path = path.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_thread = thread::spawn(move || {
+        let mut store = open_store(&first_path);
+        first_barrier.wait();
+        PromptChainService::new(&mut store).apply(
+            CommandId::new(),
+            PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
+                chain_id,
+                link_id: first_link,
+                prompt_id,
+                prompt_version_id: None,
+                before_link_id: None,
+                expected_revision: 1,
+            }),
+        )
+    });
+    let second_path = path.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_thread = thread::spawn(move || {
+        let mut store = open_store(&second_path);
+        second_barrier.wait();
+        PromptChainService::new(&mut store).apply(
             CommandId::new(),
             PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
                 chain_id,
@@ -554,22 +664,111 @@ fn concurrent_insert_conflict_leaves_one_ordered_result() {
                 expected_revision: 1,
             }),
         )
-        .expect_err("stale concurrent insert must conflict");
-    assert!(matches!(
-        error,
-        PromptStoreError::RevisionConflict {
-            expected: 1,
-            actual: 2
-        }
-    ));
+    });
+    let first_result = first_thread.join().expect("first insert thread");
+    let second_result = second_thread.join().expect("second insert thread");
+    let results = [first_result, second_result];
     assert_eq!(
-        PromptChainService::new(&mut first_store)
-            .links(chain_id)
-            .expect("list winning links")
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "one overlapping insert must commit"
+    );
+    assert_eq!(
+        results
             .iter()
-            .map(|link| link.id())
-            .collect::<Vec<_>>(),
-        vec![first_link]
+            .filter(|result| matches!(result, Err(PromptStoreError::RevisionConflict { .. })))
+            .count(),
+        1,
+        "the other overlapping insert must report a revision conflict"
+    );
+    let mut verify_store = open_store(&path);
+    let winning_link = PromptChainService::new(&mut verify_store)
+        .links(chain_id)
+        .expect("list winning links");
+    assert_eq!(
+        winning_link.len(),
+        1,
+        "overlapping inserts must leave one link"
+    );
+    assert!(winning_link[0].id() == first_link || winning_link[0].id() == second_link);
+}
+
+#[test]
+fn overlapping_independent_connections_move_conflict_leaves_one_ordered_result() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt_id = PromptId::new();
+    let version_id = PromptVersionId::new();
+    let chain_id = PromptChainId::new();
+    let mut seed_store = open_store(&path);
+    create_prompt(&mut seed_store, prompt_id, version_id);
+    create_chain(&mut seed_store, chain_id);
+    let first_link = PromptChainLinkId::new();
+    let second_link = PromptChainLinkId::new();
+    let third_link = PromptChainLinkId::new();
+    append_link(&mut seed_store, chain_id, first_link, prompt_id, None, 1);
+    append_link(&mut seed_store, chain_id, second_link, prompt_id, None, 2);
+    append_link(&mut seed_store, chain_id, third_link, prompt_id, None, 3);
+    drop(seed_store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first_path = path.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_thread = thread::spawn(move || {
+        let mut store = open_store(&first_path);
+        first_barrier.wait();
+        PromptChainService::new(&mut store).apply(
+            CommandId::new(),
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id,
+                link_id: first_link,
+                before_link_id: Some(third_link),
+                expected_revision: 4,
+            }),
+        )
+    });
+    let second_path = path.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_thread = thread::spawn(move || {
+        let mut store = open_store(&second_path);
+        second_barrier.wait();
+        PromptChainService::new(&mut store).apply(
+            CommandId::new(),
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id,
+                link_id: third_link,
+                before_link_id: Some(first_link),
+                expected_revision: 4,
+            }),
+        )
+    });
+    let first_result = first_thread.join().expect("first move thread");
+    let second_result = second_thread.join().expect("second move thread");
+    let results = [first_result, second_result];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "one overlapping move must commit"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(PromptStoreError::RevisionConflict { .. })))
+            .count(),
+        1,
+        "the other overlapping move must report a revision conflict"
+    );
+    let mut verify_store = open_store(&path);
+    let order = PromptChainService::new(&mut verify_store)
+        .links(chain_id)
+        .expect("list moved links")
+        .iter()
+        .map(|link| link.id())
+        .collect::<Vec<_>>();
+    assert!(
+        order == vec![second_link, first_link, third_link]
+            || order == vec![third_link, first_link, second_link],
+        "winning move must determine the complete dense order: {order:?}"
     );
 }
 

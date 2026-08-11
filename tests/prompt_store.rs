@@ -730,6 +730,69 @@ fn idempotent_semantic_noop_rejects_a_forged_event() {
 }
 
 #[test]
+fn historical_prompt_noop_survives_later_revision_reopen_rebuild_and_retry() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(236);
+    let first = version_id(237);
+    let second = version_id(238);
+    let noop_id = command_id(239);
+    let noop = PromptCommand::RenamePrompt(RenamePrompt {
+        prompt_id: prompt,
+        title: "Review code".into(),
+        expected_revision: 1,
+    });
+    let mut store = open_store(&path);
+
+    store
+        .execute(command_id(240), create_prompt(prompt, first))
+        .expect("create prompt");
+    let expected_receipt = store
+        .execute(noop_id, noop.clone())
+        .expect("rename to current title is a semantic no-op");
+    store
+        .execute(
+            command_id(241),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second,
+                variables: Vec::new(),
+                body: "new body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create newer prompt version");
+
+    assert_eq!(
+        store
+            .execute(noop_id, noop.clone())
+            .expect("historical prompt no-op retry"),
+        expected_receipt
+    );
+
+    drop(store);
+    let mut reopened = open_store(&path);
+    reopened
+        .rebuild_projection()
+        .expect("rebuild accepts historical prompt no-op receipt");
+    assert_eq!(
+        reopened
+            .execute(noop_id, noop)
+            .expect("historical prompt no-op retry after reopen"),
+        expected_receipt
+    );
+    assert_eq!(
+        reopened
+            .get_prompt(prompt)
+            .expect("load prompt")
+            .expect("prompt")
+            .current_version_id,
+        second
+    );
+}
+
+#[test]
 fn idempotent_chain_receipt_requires_correlated_chain_target() {
     let dir = TempDir::new().expect("unique temp dir");
     let path = db_path(&dir);
@@ -2146,6 +2209,172 @@ fn idempotent_chain_noop_replay_proves_immediate_successor_and_end_state() {
         .execute_chain(command_id(214), end_move)
         .expect_err("end no-op must prove unchanged state");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn historical_chain_noop_survives_later_revision_reopen_rebuild_and_retry() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(215);
+    let version = version_id(216);
+    let chain = chain_id(217);
+    let first_link = link_id(218);
+    let second_link = link_id(219);
+    let noop_id = command_id(220);
+    let mut store = open_store(&path);
+
+    store
+        .execute(command_id(221), create_prompt(prompt, version))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(222), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(223),
+            insert_link(chain, first_link, prompt, Some(version), None, 1),
+        )
+        .expect("insert first link");
+    store
+        .execute_chain(
+            command_id(224),
+            insert_link(chain, second_link, prompt, Some(version), None, 2),
+        )
+        .expect("insert second link");
+
+    let noop = PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+        chain_id: chain,
+        link_id: first_link,
+        before_link_id: Some(second_link),
+        expected_revision: 3,
+    });
+    let expected_receipt = store
+        .execute_chain(noop_id, noop.clone())
+        .expect("immediate-successor move is a semantic no-op");
+
+    store
+        .execute_chain(
+            command_id(225),
+            PromptChainCommand::MovePromptChainLink(MovePromptChainLink {
+                chain_id: chain,
+                link_id: second_link,
+                before_link_id: Some(first_link),
+                expected_revision: 3,
+            }),
+        )
+        .expect("later move creates a new chain revision");
+
+    assert_eq!(
+        store
+            .execute_chain(noop_id, noop.clone())
+            .expect("historical no-op retry"),
+        expected_receipt
+    );
+
+    drop(store);
+    let mut reopened = open_store(&path);
+    let mut second_connection = open_store(&path);
+    reopened
+        .rebuild_projection()
+        .expect("rebuild accepts historical no-op receipt");
+    assert_eq!(
+        second_connection
+            .execute_chain(noop_id, noop.clone())
+            .expect("historical no-op retry from a second connection"),
+        expected_receipt
+    );
+    assert_eq!(
+        reopened
+            .execute_chain(noop_id, noop)
+            .expect("historical no-op retry after reopen"),
+        expected_receipt
+    );
+    assert_eq!(
+        reopened
+            .list_chain_links(chain)
+            .expect("list final chain")
+            .iter()
+            .map(|link| link.id())
+            .collect::<Vec<_>>(),
+        vec![second_link, first_link]
+    );
+}
+
+#[test]
+fn historical_chain_update_noop_survives_new_prompt_version_reopen_rebuild_and_retry() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(226);
+    let first = version_id(227);
+    let second = version_id(228);
+    let chain = chain_id(229);
+    let link = link_id(230);
+    let noop_id = command_id(231);
+    let mut store = open_store(&path);
+
+    store
+        .execute(command_id(232), create_prompt(prompt, first))
+        .expect("create prompt");
+    store
+        .execute_chain(command_id(233), create_chain(chain))
+        .expect("create chain");
+    store
+        .execute_chain(
+            command_id(234),
+            insert_link(chain, link, prompt, Some(first), None, 1),
+        )
+        .expect("insert pinned link");
+
+    let noop = PromptChainCommand::UpdatePromptChainLinkVersion(UpdatePromptChainLinkVersion {
+        chain_id: chain,
+        link_id: link,
+        expected_revision: 2,
+    });
+    let expected_receipt = store
+        .execute_chain(noop_id, noop.clone())
+        .expect("update to current version is a semantic no-op");
+
+    store
+        .execute(
+            command_id(235),
+            PromptCommand::CreatePromptVersion(CreatePromptVersion {
+                prompt_id: prompt,
+                prompt_version_id: second,
+                variables: Vec::new(),
+                body: "new body".into(),
+                created_at_ms: 2,
+                expected_revision: 1,
+            }),
+        )
+        .expect("create newer prompt version");
+
+    assert_eq!(
+        store
+            .execute_chain(noop_id, noop.clone())
+            .expect("historical update no-op retry"),
+        expected_receipt
+    );
+
+    drop(store);
+    let mut reopened = open_store(&path);
+    reopened
+        .rebuild_projection()
+        .expect("rebuild accepts historical update no-op receipt");
+    assert_eq!(
+        reopened
+            .execute_chain(noop_id, noop)
+            .expect("historical update no-op retry after reopen"),
+        expected_receipt
+    );
+    assert_eq!(
+        reopened
+            .list_chain_links(chain)
+            .expect("list pinned chain")
+            .first()
+            .expect("pinned link")
+            .prompt_version_id(),
+        first
+    );
 }
 
 #[test]
