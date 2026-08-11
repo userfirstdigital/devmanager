@@ -1,4 +1,5 @@
 pub use crate::domain::snapshot::ProcessMetricStatus;
+use crate::process::registry::ManagedProcessFence;
 use crate::terminal::session::TerminalBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -380,6 +381,11 @@ pub struct ResourceSnapshot {
     /// snapshots produced before this field existed.
     #[serde(default = "default_logical_cpu_count")]
     pub logical_cpu_count: u32,
+    /// Exact local control authority captured atomically with the current Job
+    /// observations. It is intentionally omitted from every persisted/remote
+    /// projection and is never reconstructed from a PID.
+    #[serde(skip, default)]
+    pub managed_process_fence: Option<ManagedProcessFence>,
     #[serde(skip, default)]
     pub last_sample_at: Option<Instant>,
 }
@@ -405,6 +411,7 @@ impl Default for ResourceSnapshot {
             io_write_bytes: None,
             processes: Vec::new(),
             logical_cpu_count: 1,
+            managed_process_fence: None,
             last_sample_at: None,
         }
     }
@@ -431,6 +438,8 @@ pub struct ServerLaunchSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub auto_restart: bool,
+    #[serde(default)]
+    pub port: Option<u16>,
     pub log_file_path: Option<PathBuf>,
 }
 
@@ -1115,7 +1124,53 @@ pub use SessionStatus as ProcessStatus;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::registry::ManagedProcessFence;
     use std::path::PathBuf;
+
+    fn test_managed_process_fence() -> ManagedProcessFence {
+        let resource_id = ResourceId::from_bytes([
+            0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x51,
+        ])
+        .expect("resource id");
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42, 7).expect("managed process id"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("canonical test executable");
+        ManagedProcessFence::new(
+            ResourceFence::new(resource_id, 3),
+            ProcessOwner::Host,
+            identity,
+        )
+    }
+
+    #[test]
+    fn resource_snapshot_control_fence_is_local_only_and_never_deserialized() {
+        let fence = test_managed_process_fence();
+        let executable_name = fence
+            .root()
+            .canonical_executable()
+            .file_name()
+            .expect("test executable name")
+            .to_string_lossy()
+            .into_owned();
+        let snapshot = ResourceSnapshot {
+            managed_process_fence: Some(fence.clone()),
+            ..ResourceSnapshot::default()
+        };
+
+        let encoded = serde_json::to_string(&snapshot).expect("resource snapshot JSON");
+        assert!(!encoded.contains("managed_process_fence"));
+        assert!(!encoded.contains(&executable_name));
+
+        let decoded: ResourceSnapshot = serde_json::from_str(&encoded).expect("resource snapshot");
+        assert_eq!(snapshot.managed_process_fence.as_ref(), Some(&fence));
+        assert!(decoded.managed_process_fence.is_none());
+    }
 
     #[test]
     fn memory_totals_never_mix_stale_or_unavailable_values_into_current_bytes() {

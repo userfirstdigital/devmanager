@@ -8,9 +8,10 @@ use devmanager::domain::operation::ResourceFence;
 use devmanager::kernel::RuntimeRegistryError;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
-    JobMembership, OwnershipFault, ProcessClassification, ProcessDisplayLabel,
-    ProcessDisplayLabelError, ProcessRegistry, ProcessRegistryError, RegisteredProcess,
-    UnregisterOutcome, MAX_PROCESS_DISPLAY_LABEL_BYTES,
+    JobCompletionEvent, JobCompletionObservation, JobMembership, ManagedProcessState,
+    OwnershipFault, ProcessClassification, ProcessDisplayLabel, ProcessDisplayLabelError,
+    ProcessRegistry, ProcessRegistryError, RegisteredProcess, UnregisterOutcome,
+    MAX_PROCESS_DISPLAY_LABEL_BYTES,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -45,6 +46,7 @@ struct DropSpy {
     id: u8,
     dropped: Arc<Mutex<Vec<u8>>>,
     membership: Arc<Mutex<Result<Vec<u32>, String>>>,
+    identity: Option<ManagedProcessIdentity>,
 }
 
 impl DropSpy {
@@ -69,13 +71,31 @@ impl DropSpy {
             id,
             dropped: Arc::clone(dropped),
             membership,
+            identity: None,
         }
+    }
+
+    fn set_identity(&mut self, identity: ManagedProcessIdentity) {
+        self.identity = Some(identity);
     }
 }
 
 impl JobMembership for DropSpy {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.membership.lock().expect("membership state").clone()
+    }
+
+    fn inspect_process(
+        &self,
+        pid: u32,
+    ) -> Result<devmanager::process::registry::JobMemberInfo, String> {
+        if !self.active_process_ids()?.contains(&pid) {
+            return Err(format!("PID {pid} is not a Job member"));
+        }
+        self.identity
+            .clone()
+            .map(|identity| devmanager::process::registry::JobMemberInfo::new(identity, None))
+            .ok_or_else(|| format!("PID {pid} identity is unavailable"))
     }
 }
 
@@ -85,13 +105,146 @@ impl Drop for DropSpy {
     }
 }
 
+#[test]
+fn empty_membership_requires_receiver_completion_proof() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let membership = Arc::new(Mutex::new(Ok(vec![1_717])));
+    let executable = current_executable();
+    let job = DropSpy::with_membership(1, &dropped, Arc::clone(&membership));
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource_id(16),
+            1,
+            ProcessOwner::Task(TaskId::new()),
+            identity(1_717, 17_000, &executable),
+            job,
+        ))
+        .expect("registration");
+
+    *membership.lock().expect("membership state") = Ok(Vec::new());
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert_eq!(
+        registry
+            .current(resource_id(16))
+            .expect("current process")
+            .state(),
+        ManagedProcessState::Starting
+    );
+
+    assert!(
+        registry.apply_job_observation(JobCompletionObservation::new(
+            fence.clone(),
+            JobCompletionEvent::ActiveProcessZero,
+        ))
+    );
+    assert_eq!(
+        registry
+            .current(resource_id(16))
+            .expect("untrusted completion must retain the managed entry")
+            .state(),
+        ManagedProcessState::Starting,
+        "a caller-constructed completion is diagnostics-only"
+    );
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert!(registry.release_stopped_exact(&fence).is_err());
+}
+
+#[test]
+fn externally_constructed_zero_cannot_authorize_stop_or_release() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let membership = Arc::new(Mutex::new(Ok(vec![1_818])));
+    let executable = current_executable();
+    let job = DropSpy::with_membership(1, &dropped, Arc::clone(&membership));
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource_id(17),
+            1,
+            ProcessOwner::Host,
+            identity(1_818, 18_000, &executable),
+            job,
+        ))
+        .expect("registration");
+
+    *membership.lock().expect("membership state") = Ok(Vec::new());
+    assert!(
+        registry.apply_job_observation(JobCompletionObservation::new(
+            fence.clone(),
+            JobCompletionEvent::ActiveProcessZero,
+        ))
+    );
+    assert_eq!(
+        registry
+            .current(resource_id(17))
+            .expect("untrusted completion must retain the managed entry")
+            .state(),
+        ManagedProcessState::Starting,
+        "a caller-constructed completion is diagnostics-only"
+    );
+    assert!(matches!(
+        registry.active_process_zero_proof_exact(&fence),
+        Err(ProcessRegistryError::ActiveProcessZeroUnproved { .. })
+    ));
+    assert!(registry.release_stopped_exact(&fence).is_err());
+}
+
+#[test]
+fn externally_constructed_completion_cannot_mutate_any_lifecycle_state() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executable = current_executable();
+    let job = DropSpy::member(1, 1_919, &dropped);
+    let mut registry = ProcessRegistry::new();
+    let fence = registry
+        .register(registration(
+            resource_id(18),
+            1,
+            ProcessOwner::Host,
+            identity(1_919, 19_000, &executable),
+            job,
+        ))
+        .expect("registration");
+
+    for event in [
+        JobCompletionEvent::NewProcess { pid: 1_919 },
+        JobCompletionEvent::AbnormalExitProcess { pid: 1_919 },
+        JobCompletionEvent::Limit {
+            message_id: 99,
+            pid: Some(1_919),
+        },
+        JobCompletionEvent::MonitorFailed {
+            detail: "caller supplied".to_string(),
+        },
+        JobCompletionEvent::ActiveProcessZero,
+    ] {
+        assert!(
+            registry.apply_job_observation(JobCompletionObservation::new(fence.clone(), event,))
+        );
+        assert_eq!(
+            registry
+                .current(resource_id(18))
+                .expect("managed entry")
+                .state(),
+            ManagedProcessState::Starting,
+            "untrusted completion must never mutate lifecycle state"
+        );
+    }
+}
+
 fn registration(
     resource_id: ResourceId,
     generation: u64,
     owner: ProcessOwner,
     root: ManagedProcessIdentity,
-    job: DropSpy,
+    mut job: DropSpy,
 ) -> RegisteredProcess<DropSpy> {
+    job.set_identity(root.clone());
     RegisteredProcess::new(
         ResourceFence::new(resource_id, generation),
         owner,

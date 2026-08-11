@@ -548,6 +548,7 @@ mod tests {
             args: Vec::new(),
             env: HashMap::new(),
             auto_restart: false,
+            port: None,
             log_file_path: None,
         });
         server.resources = ResourceSnapshot {

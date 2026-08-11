@@ -38,10 +38,6 @@ pub enum ProcessMonitorAction {
 pub struct ProcessMonitorActions<'a> {
     pub on_action:
         &'a dyn Fn(ProcessMonitorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-    /// Resolves the fence published with the current exact Job-member
-    /// snapshot. No fence means the row is diagnostic-only and cannot expose
-    /// a close action.
-    pub fence_for_session: &'a dyn Fn(&str) -> Option<ManagedProcessFence>,
 }
 
 pub fn render_process_monitor(
@@ -213,7 +209,7 @@ fn render_session_card(
     let unreaped = entry.unreaped;
     let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
-    let process_fence = (actions.fence_for_session)(&session_id);
+    let process_fence = entry.managed_process_fence;
 
     div()
         .rounded_sm()
@@ -620,6 +616,7 @@ fn process_monitor_entries(
                 metrics_stale: session.resources.metrics_stale,
                 unreaped: session.reap_incomplete,
                 logical_cpu_count: session.resources.logical_cpu_count.max(1),
+                managed_process_fence: session.resources.managed_process_fence.clone(),
                 processes: ordered_process_nodes(&session),
             }
         })
@@ -952,6 +949,27 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn process_monitor_entry_uses_only_the_fence_bound_to_its_resource_snapshot() {
+        let fence = test_process_fence();
+        let app_state = AppState::default();
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "snapshot-fenced",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        session.resources.managed_process_fence = Some(fence.clone());
+        runtime.sessions.insert(session.session_id.clone(), session);
+
+        let entries = process_monitor_entries(&app_state, &runtime);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].managed_process_fence.as_ref(), Some(&fence));
     }
 
     #[test]
@@ -1307,6 +1325,7 @@ struct ProcessMonitorEntry {
     metrics_stale: bool,
     unreaped: bool,
     logical_cpu_count: u32,
+    managed_process_fence: Option<ManagedProcessFence>,
     processes: Vec<ProcessResourceNode>,
 }
 

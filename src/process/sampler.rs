@@ -122,6 +122,10 @@ impl SamplingBudget {
         self.max_members
     }
 
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     pub fn claimed_members(&self) -> usize {
         self.members.len()
     }

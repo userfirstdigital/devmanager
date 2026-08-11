@@ -2,20 +2,29 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
 use crate::kernel::{RuntimeRegistry, RuntimeRegistryError};
 use crate::process::identity::{ManagedProcessIdentity, ProcessOwner};
+use crate::process::teardown::{TeardownReleaseAuthority, TeardownTicket};
 
 pub const MAX_PROCESS_DISPLAY_LABEL_BYTES: usize = 256;
+
+mod sealed {
+    pub(crate) trait JobMembership {}
+
+    #[cfg(test)]
+    impl<T> JobMembership for T {}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessDisplayLabel(String);
 
 impl ProcessDisplayLabel {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProcessDisplayLabelError> {
-        let value = value.into();
+    pub fn new(value: impl AsRef<str>) -> Result<Self, ProcessDisplayLabelError> {
+        let value = value.as_ref();
         if value.trim().is_empty() {
             return Err(ProcessDisplayLabelError::Empty);
         }
@@ -25,7 +34,7 @@ impl ProcessDisplayLabel {
                 max: MAX_PROCESS_DISPLAY_LABEL_BYTES,
             });
         }
-        Ok(Self(value))
+        Ok(Self(value.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -57,37 +66,143 @@ impl std::error::Error for ProcessDisplayLabelError {}
 ///
 /// This query proves current membership only. It is deliberately not evidence
 /// that a caller successfully assigned a process to the Job.
-pub trait JobMembership {
+///
+/// The seam is crate-private: exposing it would let arbitrary callers block
+/// registry release or fabricate the membership observations that protect the
+/// receiver-owned ACTIVE_PROCESS_ZERO proof. Production entries use the
+/// concrete managed Windows Job adapter below.
+///
+/// The concrete adapter's membership queries and listener release are bounded
+/// by the Job/IOCP polling contract. An external blocking implementation is
+/// not an allowed registry authority.
+///
+/// ```compile_fail
+/// use devmanager::process::registry::{JobMemberInfo, JobMembership};
+///
+/// struct ExternalMembership;
+///
+/// impl JobMembership for ExternalMembership {
+///     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+///         Ok(Vec::new())
+///     }
+///     fn inspect_process(&self, _pid: u32) -> Result<JobMemberInfo, String> {
+///         panic!("external implementation must be rejected")
+///     }
+/// }
+/// ```
+#[allow(dead_code)]
+pub(crate) trait JobMembership: sealed::JobMembership {
     fn active_process_ids(&self) -> Result<Vec<u32>, String>;
+
+    fn active_process_ids_until(&self, absolute_deadline: Instant) -> Result<Vec<u32>, String> {
+        if Instant::now() >= absolute_deadline {
+            return Err("Job membership query exceeded teardown absolute deadline".to_string());
+        }
+        let process_ids = self.active_process_ids()?;
+        if Instant::now() >= absolute_deadline {
+            return Err("Job membership query exceeded teardown absolute deadline".to_string());
+        }
+        Ok(process_ids)
+    }
+
+    /// Terminate the owned Job tree, never a PID-selected process.
+    fn terminate_tree(&self) -> Result<(), String> {
+        Err("Job tree termination is unavailable for this membership".to_string())
+    }
 
     fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         Err(format!("process identity for PID {pid} is inaccessible"))
+    }
+
+    fn inspect_process_until(
+        &self,
+        pid: u32,
+        absolute_deadline: Instant,
+    ) -> Result<JobMemberInfo, String> {
+        if Instant::now() >= absolute_deadline {
+            return Err("Job member inspection exceeded teardown absolute deadline".to_string());
+        }
+        let member = self.inspect_process(pid)?;
+        if Instant::now() >= absolute_deadline {
+            return Err("Job member inspection exceeded teardown absolute deadline".to_string());
+        }
+        Ok(member)
     }
 
     fn bind_completion_fence(&mut self, _fence: ManagedProcessFence) -> Result<(), String> {
         Ok(())
     }
 
-    fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
-        Vec::new()
+    /// Stops receiver-owned listeners before a stopped registry entry is
+    /// removed. Implementations that do not own a listener may accept the
+    /// default no-op.
+    fn shutdown_for_release(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn shutdown_for_release_until(&mut self, _absolute_deadline: Instant) -> Result<(), String> {
+        self.shutdown_for_release()
+    }
+
+    fn drain_completion_messages_until(
+        &self,
+        absolute_deadline: Instant,
+    ) -> Result<Vec<JobCompletionMessage>, String> {
+        if Instant::now() >= absolute_deadline {
+            return Err("Job completion drain exceeded teardown absolute deadline".to_string());
+        }
+        Ok(Vec::new())
     }
 }
+
+#[cfg(not(test))]
+impl sealed::JobMembership for crate::process::job::ManagedProcessJob {}
 
 impl JobMembership for crate::process::job::ManagedProcessJob {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         crate::process::job::ManagedProcessJob::active_process_ids(self)
     }
 
+    fn active_process_ids_until(&self, absolute_deadline: Instant) -> Result<Vec<u32>, String> {
+        crate::process::job::ManagedProcessJob::active_process_ids_until(self, absolute_deadline)
+    }
+
+    fn terminate_tree(&self) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::terminate_tree(self)
+    }
+
     fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
         crate::process::job::ManagedProcessJob::inspect_process(self, pid)
+    }
+
+    fn inspect_process_until(
+        &self,
+        pid: u32,
+        absolute_deadline: Instant,
+    ) -> Result<JobMemberInfo, String> {
+        crate::process::job::ManagedProcessJob::inspect_process_until(self, pid, absolute_deadline)
     }
 
     fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
         crate::process::job::ManagedProcessJob::bind_completion_fence(self, fence)
     }
 
-    fn drain_completion_messages(&self) -> Vec<JobCompletionMessage> {
-        crate::process::job::ManagedProcessJob::drain_completion_messages(self)
+    fn shutdown_for_release(&mut self) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::shutdown_for_release(self)
+    }
+
+    fn shutdown_for_release_until(&mut self, absolute_deadline: Instant) -> Result<(), String> {
+        crate::process::job::ManagedProcessJob::shutdown_for_release_until(self, absolute_deadline)
+    }
+
+    fn drain_completion_messages_until(
+        &self,
+        absolute_deadline: Instant,
+    ) -> Result<Vec<JobCompletionMessage>, String> {
+        crate::process::job::ManagedProcessJob::drain_completion_messages_until(
+            self,
+            absolute_deadline,
+        )
     }
 }
 
@@ -96,7 +211,11 @@ pub enum ManagedProcessState {
     Starting,
     Running,
     Stopping,
-    Stopped,
+    /// The owning Job has authoritatively reported zero active processes, but
+    /// its completion receiver and registry entry are still retained.  This
+    /// is deliberately not named `Stopped`: externally visible stopped state
+    /// may be published only after exact Job release removes the live entry.
+    ZeroSettled,
     Failed,
     Leaked,
 }
@@ -141,6 +260,33 @@ pub struct JobCompletionMessage {
 }
 
 impl JobCompletionMessage {
+    pub(crate) fn from_completion_receiver(
+        _receiver: &crate::process::job::CompletionReceiverToken,
+        fence: ManagedProcessFence,
+        event: JobCompletionEvent,
+    ) -> Self {
+        Self { fence, event }
+    }
+
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+
+    pub fn event(&self) -> &JobCompletionEvent {
+        &self.event
+    }
+}
+
+/// A caller-visible completion observation. It is intentionally distinct from
+/// `JobCompletionMessage`, which is produced only by the concrete managed Job
+/// completion receiver and is the sole input that can create zero authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCompletionObservation {
+    fence: ManagedProcessFence,
+    event: JobCompletionEvent,
+}
+
+impl JobCompletionObservation {
     pub fn new(fence: ManagedProcessFence, event: JobCompletionEvent) -> Self {
         Self { fence, event }
     }
@@ -151,6 +297,27 @@ impl JobCompletionMessage {
 
     pub fn event(&self) -> &JobCompletionEvent {
         &self.event
+    }
+}
+
+/// A registry-issued receipt for one exact ACTIVE_PROCESS_ZERO completion.
+///
+/// The fence and nonce are private so teardown adapters cannot invent a zero
+/// observation. The registry keeps the matching receipt pending until an
+/// authoritative membership query consumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveProcessZeroProof {
+    fence: ManagedProcessFence,
+    nonce: u64,
+}
+
+impl ActiveProcessZeroProof {
+    fn from_completion(fence: ManagedProcessFence, nonce: u64) -> Self {
+        Self { fence, nonce }
+    }
+
+    pub fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
     }
 }
 
@@ -166,10 +333,14 @@ pub struct RegisteredProcess<J> {
     unknown_member_pids: Vec<u32>,
     last_limit: Option<(u32, Option<u32>)>,
     pending_zero_prior_state: Option<ManagedProcessState>,
+    pending_zero_proof: Option<ActiveProcessZeroProof>,
+    authoritative_zero_settled: bool,
+    settled_zero_nonce: Option<u64>,
+    next_zero_proof_nonce: u64,
 }
 
 impl<J> RegisteredProcess<J> {
-    pub fn new(
+    pub(crate) fn new(
         fence: ResourceFence,
         owner: ProcessOwner,
         root: ManagedProcessIdentity,
@@ -187,6 +358,10 @@ impl<J> RegisteredProcess<J> {
             unknown_member_pids: Vec::new(),
             last_limit: None,
             pending_zero_prior_state: None,
+            pending_zero_proof: None,
+            authoritative_zero_settled: false,
+            settled_zero_nonce: None,
+            next_zero_proof_nonce: 1,
         }
     }
 
@@ -206,7 +381,7 @@ impl<J> RegisteredProcess<J> {
         self.display_label.as_str()
     }
 
-    pub fn job(&self) -> &J {
+    pub(crate) fn job(&self) -> &J {
         &self.job
     }
 
@@ -318,6 +493,24 @@ pub enum ProcessRegistryError {
         resource_id: ResourceId,
         detail: String,
     },
+    IdentityMismatch {
+        resource_id: ResourceId,
+        expected: ManagedProcessIdentity,
+        observed: ManagedProcessIdentity,
+    },
+    ActiveProcessZeroUnproved {
+        resource_id: ResourceId,
+    },
+    ReleaseAuthorityRequired {
+        resource_id: ResourceId,
+    },
+    TeardownReleaseAuthorityMismatch {
+        resource_id: ResourceId,
+    },
+    JobShutdownFailed {
+        resource_id: ResourceId,
+        detail: String,
+    },
     InvalidLifecycleState {
         resource_id: ResourceId,
         operation: ProcessLifecycleOperation,
@@ -364,6 +557,33 @@ impl fmt::Display for ProcessRegistryError {
                 f,
                 "could not start resource {resource_id}'s Job notifications: {detail}"
             ),
+            Self::IdentityMismatch {
+                resource_id,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "resource {resource_id} expected managed process identity {expected:?}, observed {observed:?}"
+            ),
+            Self::ActiveProcessZeroUnproved { resource_id } => write!(
+                f,
+                "resource {resource_id} has no matching ACTIVE_PROCESS_ZERO completion proof"
+            ),
+            Self::ReleaseAuthorityRequired { resource_id } => write!(
+                f,
+                "resource {resource_id} requires an opaque teardown release authority"
+            ),
+            Self::TeardownReleaseAuthorityMismatch { resource_id } => write!(
+                f,
+                "resource {resource_id} received a stale or mismatched teardown release authority"
+            ),
+            Self::JobShutdownFailed {
+                resource_id,
+                detail,
+            } => write!(
+                f,
+                "resource {resource_id} could not stop its managed Job listener before release: {detail}"
+            ),
             Self::InvalidLifecycleState {
                 resource_id,
                 operation,
@@ -393,6 +613,11 @@ impl std::error::Error for ProcessRegistryError {
             | Self::NotJobMember { .. }
             | Self::MembershipQueryFailed { .. }
             | Self::CompletionNotificationsFailed { .. }
+            | Self::IdentityMismatch { .. }
+            | Self::ActiveProcessZeroUnproved { .. }
+            | Self::ReleaseAuthorityRequired { .. }
+            | Self::TeardownReleaseAuthorityMismatch { .. }
+            | Self::JobShutdownFailed { .. }
             | Self::InvalidLifecycleState { .. }
             | Self::StaleLifecycleFence { .. } => None,
         }
@@ -469,6 +694,14 @@ impl<J> ProcessRegistry<J> {
         self.current.len()
     }
 
+    /// Compare a full generation/owner/root fence against the current entry.
+    /// PID or resource ID alone is never sufficient for teardown authority.
+    pub fn exact_fence_matches(&self, fence: &ManagedProcessFence) -> bool {
+        self.current
+            .get(&fence.resource.resource_id)
+            .is_some_and(|current| ManagedProcessFence::from_process(current) == *fence)
+    }
+
     fn take_exact_in_state(
         &mut self,
         fence: &ManagedProcessFence,
@@ -513,9 +746,94 @@ impl<J> ProcessRegistry<J> {
         &mut self,
         fence: &ManagedProcessFence,
     ) -> Result<UnregisterOutcome<J>, ProcessRegistryError> {
+        if let Some(current) = self.current.get(&fence.resource.resource_id) {
+            if ManagedProcessFence::from_process(current) == *fence {
+                return Err(ProcessRegistryError::ReleaseAuthorityRequired {
+                    resource_id: fence.resource.resource_id,
+                });
+            }
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id: fence.resource.resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        Err(ProcessRegistryError::StaleLifecycleFence {
+            resource_id: fence.resource.resource_id,
+            operation: ProcessLifecycleOperation::ReleaseStopped,
+        })
+    }
+
+    /// Releases one stopped process only with the registry-minted authority
+    /// bound to the exact teardown ticket, epoch, fence, and zero receipt.
+    #[allow(private_bounds)]
+    pub fn release_stopped_with_authority(
+        &mut self,
+        ticket: &TeardownTicket,
+        authority: &TeardownReleaseAuthority,
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError>
+    where
+        J: JobMembership,
+    {
+        let absolute_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or_else(|| ProcessRegistryError::JobShutdownFailed {
+                resource_id: ticket.resource_id(),
+                detail: "managed Job release deadline overflow".to_string(),
+            })?;
+        self.release_stopped_with_authority_until(ticket, authority, absolute_deadline)
+    }
+
+    #[allow(private_bounds)]
+    pub(crate) fn release_stopped_with_authority_until(
+        &mut self,
+        ticket: &TeardownTicket,
+        authority: &TeardownReleaseAuthority,
+        absolute_deadline: Instant,
+    ) -> Result<UnregisterOutcome<J>, ProcessRegistryError>
+    where
+        J: JobMembership,
+    {
+        let resource_id = ticket.resource_id();
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        let current_fence = ManagedProcessFence::from_process(current);
+        if current_fence != *ticket.fence() {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        let Some(nonce) = current.settled_zero_nonce else {
+            return Err(ProcessRegistryError::ReleaseAuthorityRequired { resource_id });
+        };
+        if !current.authoritative_zero_settled || !authority.matches(ticket, nonce) {
+            return Err(ProcessRegistryError::TeardownReleaseAuthorityMismatch { resource_id });
+        }
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::JobShutdownFailed {
+                resource_id,
+                detail: "managed Job release exceeded teardown absolute deadline".to_string(),
+            });
+        }
+        if let Err(detail) = current.job.shutdown_for_release_until(absolute_deadline) {
+            return Err(ProcessRegistryError::JobShutdownFailed {
+                resource_id,
+                detail,
+            });
+        }
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::JobShutdownFailed {
+                resource_id,
+                detail: "managed Job release exceeded teardown absolute deadline".to_string(),
+            });
+        }
         self.take_exact_in_state(
-            fence,
-            ManagedProcessState::Stopped,
+            ticket.fence(),
+            ManagedProcessState::ZeroSettled,
             ProcessLifecycleOperation::ReleaseStopped,
         )
     }
@@ -563,11 +881,12 @@ impl<J> ProcessRegistry<J> {
                 true
             }
             ManagedProcessState::Stopping => true,
-            ManagedProcessState::Stopped | ManagedProcessState::Leaked => false,
+            ManagedProcessState::ZeroSettled | ManagedProcessState::Leaked => false,
         }
     }
 }
 
+#[allow(private_bounds)]
 impl<J: JobMembership> ProcessRegistry<J> {
     pub fn register(
         &mut self,
@@ -622,6 +941,29 @@ impl<J: JobMembership> ProcessRegistry<J> {
             ));
         }
 
+        let observed_root = match process.job.inspect_process(proposed_pid) {
+            Ok(member) => member.identity().clone(),
+            Err(detail) => {
+                return Err(ProcessRegistrationFailure::new(
+                    ProcessRegistryError::MembershipQueryFailed {
+                        resource_id: proposed.resource_id,
+                        detail,
+                    },
+                    process,
+                ));
+            }
+        };
+        if observed_root != *process.root() {
+            return Err(ProcessRegistrationFailure::new(
+                ProcessRegistryError::IdentityMismatch {
+                    resource_id: proposed.resource_id,
+                    expected: process.root().clone(),
+                    observed: observed_root,
+                },
+                process,
+            ));
+        }
+
         let fence = ManagedProcessFence::from_process(&process);
         if let Err(detail) = process.job.bind_completion_fence(fence.clone()) {
             return Err(ProcessRegistrationFailure::new(
@@ -643,19 +985,237 @@ impl<J: JobMembership> ProcessRegistry<J> {
         Ok(fence)
     }
 
-    pub fn drain_job_completions(&mut self, resource_id: ResourceId) -> usize {
+    pub(crate) fn drain_job_completions_until(
+        &mut self,
+        resource_id: ResourceId,
+        absolute_deadline: Instant,
+    ) -> Result<usize, ProcessRegistryError> {
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::CompletionNotificationsFailed {
+                resource_id,
+                detail: "Job completion drain exceeded teardown absolute deadline".to_string(),
+            });
+        }
         let messages = self
             .current
             .get(&resource_id)
-            .map(|process| process.job.drain_completion_messages())
+            .map(|process| {
+                process
+                    .job
+                    .drain_completion_messages_until(absolute_deadline)
+            })
+            .transpose()
+            .map_err(
+                |detail| ProcessRegistryError::CompletionNotificationsFailed {
+                    resource_id,
+                    detail,
+                },
+            )?
             .unwrap_or_default();
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::CompletionNotificationsFailed {
+                resource_id,
+                detail: "Job completion drain exceeded teardown absolute deadline".to_string(),
+            });
+        }
         let count = messages.len();
         for message in messages {
+            if Instant::now() >= absolute_deadline {
+                return Err(ProcessRegistryError::CompletionNotificationsFailed {
+                    resource_id,
+                    detail: "Job completion application exceeded teardown absolute deadline"
+                        .to_string(),
+                });
+            }
             self.apply_job_completion(message);
         }
-        count
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::CompletionNotificationsFailed {
+                resource_id,
+                detail: "Job completion application exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
+        Ok(count)
     }
 
+    /// Returns the pending receipt for a previously observed exact
+    /// ACTIVE_PROCESS_ZERO completion.
+    ///
+    /// The receipt is retained by the registry until
+    /// `settle_active_process_zero_exact` consumes it, so an adapter can carry
+    /// it across its wait boundary without turning a caller boolean into proof.
+    pub fn active_process_zero_proof_exact(
+        &self,
+        fence: &ManagedProcessFence,
+    ) -> Result<ActiveProcessZeroProof, ProcessRegistryError> {
+        let resource_id = fence.resource.resource_id;
+        let Some(current) = self.current.get(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        if ManagedProcessFence::from_process(current) != *fence {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        current
+            .pending_zero_proof
+            .clone()
+            .ok_or(ProcessRegistryError::ActiveProcessZeroUnproved { resource_id })
+    }
+
+    /// Settle a registry-issued ACTIVE_PROCESS_ZERO receipt only after
+    /// rechecking the exact fence and querying the Job for authoritative empty
+    /// membership.
+    ///
+    /// Ok(false) means the completion was not enough because the Job still has
+    /// members. The caller must keep the Job/completion handles alive and must
+    /// not call release_stopped_exact in that case.
+    pub fn settle_active_process_zero_exact(
+        &mut self,
+        proof: ActiveProcessZeroProof,
+    ) -> Result<bool, ProcessRegistryError> {
+        let absolute_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or_else(|| ProcessRegistryError::MembershipQueryFailed {
+                resource_id: proof.fence.resource.resource_id,
+                detail: "ACTIVE_PROCESS_ZERO settlement deadline overflow".to_string(),
+            })?;
+        self.settle_active_process_zero_exact_until(proof, absolute_deadline)
+    }
+
+    pub(crate) fn settle_active_process_zero_exact_until(
+        &mut self,
+        proof: ActiveProcessZeroProof,
+        absolute_deadline: Instant,
+    ) -> Result<bool, ProcessRegistryError> {
+        let resource_id = proof.fence.resource.resource_id;
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "ACTIVE_PROCESS_ZERO settlement exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
+        let Some(current) = self.current.get_mut(&resource_id) else {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        };
+        if ManagedProcessFence::from_process(current) != proof.fence {
+            return Err(ProcessRegistryError::StaleLifecycleFence {
+                resource_id,
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+            });
+        }
+        if current.pending_zero_proof.as_ref() != Some(&proof) {
+            return Err(ProcessRegistryError::ActiveProcessZeroUnproved { resource_id });
+        }
+
+        let mut active_process_ids = current
+            .job
+            .active_process_ids_until(absolute_deadline)
+            .map_err(|detail| ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail,
+            })?;
+        active_process_ids.sort_unstable();
+        active_process_ids.dedup();
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "ACTIVE_PROCESS_ZERO settlement exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
+        if !active_process_ids.is_empty() {
+            current.pending_zero_proof = None;
+            current.authoritative_zero_settled = false;
+            current.settled_zero_nonce = None;
+            current.state = current
+                .pending_zero_prior_state
+                .take()
+                .unwrap_or(ManagedProcessState::Leaked);
+            return Ok(false);
+        }
+
+        current.pending_zero_proof = None;
+        current.pending_zero_prior_state = None;
+        current.known_members.clear();
+        current.unknown_member_pids.clear();
+        current.state = ManagedProcessState::ZeroSettled;
+        current.authoritative_zero_settled = true;
+        current.settled_zero_nonce = Some(proof.nonce);
+        Ok(true)
+    }
+
+    /// Performs the final receiver-proof plus authoritative empty-membership
+    /// settlement while binding the result to the exact teardown action epoch.
+    /// The returned authority is the only input accepted by final release.
+    pub fn mint_teardown_release_authority_exact(
+        &mut self,
+        ticket: &TeardownTicket,
+        proof: ActiveProcessZeroProof,
+    ) -> Result<TeardownReleaseAuthority, ProcessRegistryError> {
+        let absolute_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or_else(|| ProcessRegistryError::MembershipQueryFailed {
+                resource_id: ticket.resource_id(),
+                detail: "teardown release authority deadline overflow".to_string(),
+            })?;
+        self.mint_teardown_release_authority_exact_until(ticket, proof, absolute_deadline)
+    }
+
+    pub(crate) fn mint_teardown_release_authority_exact_until(
+        &mut self,
+        ticket: &TeardownTicket,
+        proof: ActiveProcessZeroProof,
+        absolute_deadline: Instant,
+    ) -> Result<TeardownReleaseAuthority, ProcessRegistryError> {
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id: ticket.resource_id(),
+                detail: "teardown release authority exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
+        if proof.fence() != ticket.fence() {
+            return Err(ProcessRegistryError::TeardownReleaseAuthorityMismatch {
+                resource_id: ticket.resource_id(),
+            });
+        }
+        if !self.settle_active_process_zero_exact_until(proof.clone(), absolute_deadline)? {
+            return Err(ProcessRegistryError::InvalidLifecycleState {
+                resource_id: ticket.resource_id(),
+                operation: ProcessLifecycleOperation::ReleaseStopped,
+                state: self
+                    .current(ticket.resource_id())
+                    .map(|current| current.state)
+                    .unwrap_or(ManagedProcessState::Leaked),
+            });
+        }
+        Ok(TeardownReleaseAuthority::from_registry(ticket, proof.nonce))
+    }
+
+    /// Applies a caller-supplied observation for diagnostics only. It validates
+    /// the current generation but never mutates lifecycle state or creates a
+    /// zero proof.
+    pub fn apply_job_observation(&mut self, observation: JobCompletionObservation) -> bool {
+        let resource_id = observation.fence.resource.resource_id;
+        self.current
+            .get(&resource_id)
+            .map(|current| ManagedProcessFence::from_process(current) == observation.fence)
+            .unwrap_or(false)
+    }
+
+    /// Applies one message emitted by the concrete managed Job receiver.
+    /// `JobCompletionMessage` has no public constructor; this boundary is
+    /// therefore unforgeable by caller-owned membership adapters.
     pub fn apply_job_completion(&mut self, message: JobCompletionMessage) -> bool {
         let resource_id = message.fence.resource.resource_id;
         let Some(current) = self.current.get_mut(&resource_id) else {
@@ -676,41 +1236,37 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 // identity. The next authoritative Job query updates members.
             }
             JobCompletionEvent::AbnormalExitProcess { .. } => {
-                if current.state != ManagedProcessState::Stopped {
+                if current.state != ManagedProcessState::ZeroSettled {
                     current.state = ManagedProcessState::Failed;
                 }
             }
             JobCompletionEvent::ActiveProcessZero => {
-                if current.state != ManagedProcessState::Stopped {
-                    match current.job.active_process_ids() {
-                        Ok(process_ids) if process_ids.is_empty() => {
-                            current.pending_zero_prior_state = None;
-                            current.known_members.clear();
-                            current.unknown_member_pids.clear();
-                            current.state = ManagedProcessState::Stopped;
-                        }
-                        Ok(_) => {
-                            if let Some(prior_state) = current.pending_zero_prior_state.take() {
-                                current.state = prior_state;
-                            }
-                        }
-                        Err(_) => {
-                            if current.pending_zero_prior_state.is_none() {
-                                current.pending_zero_prior_state = Some(current.state);
-                            }
-                            current.state = ManagedProcessState::Leaked;
-                        }
+                if current.state != ManagedProcessState::ZeroSettled {
+                    if current.pending_zero_prior_state.is_none() {
+                        current.pending_zero_prior_state = Some(current.state);
                     }
+                    current.authoritative_zero_settled = false;
+                    current.settled_zero_nonce = None;
+                    let fence = ManagedProcessFence::from_process(current);
+                    let nonce = current.next_zero_proof_nonce;
+                    current.next_zero_proof_nonce =
+                        current.next_zero_proof_nonce.wrapping_add(1).max(1);
+                    current.pending_zero_proof =
+                        Some(ActiveProcessZeroProof::from_completion(fence, nonce));
+                    // The completion packet is receiver-authenticated but is
+                    // still only a scheduling hint.  Membership is queried at
+                    // the explicit, deadline-bound reconciliation/settlement
+                    // boundary; never perform an unbounded query here.
                 }
             }
             JobCompletionEvent::Limit { message_id, pid } => {
                 current.last_limit = Some((message_id, pid));
-                if current.state != ManagedProcessState::Stopped {
+                if current.state != ManagedProcessState::ZeroSettled {
                     current.state = ManagedProcessState::Failed;
                 }
             }
             JobCompletionEvent::MonitorFailed { .. } => {
-                if current.state != ManagedProcessState::Stopped {
+                if current.state != ManagedProcessState::ZeroSettled {
                     current.state = ManagedProcessState::Leaked;
                 }
             }
@@ -722,25 +1278,61 @@ impl<J: JobMembership> ProcessRegistry<J> {
         &mut self,
         resource_id: ResourceId,
     ) -> Result<(), ProcessRegistryError> {
+        let absolute_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or_else(|| ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "Job membership reconciliation deadline overflow".to_string(),
+            })?;
+        self.reconcile_membership_until(resource_id, absolute_deadline)
+    }
+
+    pub(crate) fn reconcile_membership_until(
+        &mut self,
+        resource_id: ResourceId,
+        absolute_deadline: Instant,
+    ) -> Result<(), ProcessRegistryError> {
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
         let Some(current) = self.current.get_mut(&resource_id) else {
             return Ok(());
         };
-        let mut active_pids = current.job.active_process_ids().map_err(|detail| {
-            ProcessRegistryError::MembershipQueryFailed {
+        let mut active_pids = current
+            .job
+            .active_process_ids_until(absolute_deadline)
+            .map_err(|detail| ProcessRegistryError::MembershipQueryFailed {
                 resource_id,
                 detail,
-            }
-        })?;
+            })?;
         active_pids.sort_unstable();
         active_pids.dedup();
-        if let Some(prior_state) = current.pending_zero_prior_state.take() {
+        if current.pending_zero_proof.is_some() {
             if active_pids.is_empty() {
+                current.pending_zero_prior_state = None;
                 current.known_members.clear();
                 current.unknown_member_pids.clear();
-                current.state = ManagedProcessState::Stopped;
+                // Empty membership is not final release.  Keep the live Job
+                // entry visibly nonterminal until exact authority consumes it.
+                current.state = ManagedProcessState::ZeroSettled;
+                if Instant::now() >= absolute_deadline {
+                    return Err(ProcessRegistryError::MembershipQueryFailed {
+                        resource_id,
+                        detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                            .to_string(),
+                    });
+                }
                 return Ok(());
             }
-            current.state = prior_state;
+            current.pending_zero_proof = None;
+            current.state = current
+                .pending_zero_prior_state
+                .take()
+                .unwrap_or(ManagedProcessState::Leaked);
         }
         if !active_pids.is_empty() && current.state == ManagedProcessState::Starting {
             current.state = ManagedProcessState::Running;
@@ -749,7 +1341,22 @@ impl<J: JobMembership> ProcessRegistry<J> {
         let mut known_members = Vec::with_capacity(active_pids.len());
         let mut unknown_member_pids = Vec::new();
         for pid in active_pids {
-            match current.job.inspect_process(pid) {
+            if Instant::now() >= absolute_deadline {
+                return Err(ProcessRegistryError::MembershipQueryFailed {
+                    resource_id,
+                    detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                        .to_string(),
+                });
+            }
+            let observation = current.job.inspect_process_until(pid, absolute_deadline);
+            if Instant::now() >= absolute_deadline {
+                return Err(ProcessRegistryError::MembershipQueryFailed {
+                    resource_id,
+                    detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                        .to_string(),
+                });
+            }
+            match observation {
                 Ok(member) if member.identity.id().pid() == pid => known_members.push(member),
                 Ok(_) | Err(_) => unknown_member_pids.push(pid),
             }
@@ -760,8 +1367,22 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 member.identity.id().creation_time_100ns(),
             )
         });
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
         current.known_members = known_members;
         current.unknown_member_pids = unknown_member_pids;
+        if Instant::now() >= absolute_deadline {
+            return Err(ProcessRegistryError::MembershipQueryFailed {
+                resource_id,
+                detail: "Job membership reconciliation exceeded teardown absolute deadline"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -771,7 +1392,21 @@ impl<J: JobMembership> ProcessRegistry<J> {
                 let expected = ManagedProcessFence::from_process(current);
                 return match current.job.active_process_ids() {
                     Ok(process_ids) if process_ids.contains(&observed.id().pid()) => {
-                        ProcessClassification::Managed(expected)
+                        match current.job.inspect_process(observed.id().pid()) {
+                            Ok(member) if member.identity() == observed => {
+                                ProcessClassification::Managed(expected)
+                            }
+                            Ok(_) => ProcessClassification::ReconciliationFault {
+                                expected,
+                                observed: observed.clone(),
+                                reason: OwnershipFault::IdentityMismatch,
+                            },
+                            Err(detail) => ProcessClassification::ReconciliationFault {
+                                expected,
+                                observed: observed.clone(),
+                                reason: OwnershipFault::MembershipQueryFailed { detail },
+                            },
+                        }
                     }
                     Ok(_) => ProcessClassification::ReconciliationFault {
                         expected,
@@ -794,5 +1429,120 @@ impl<J: JobMembership> ProcessRegistry<J> {
             }
         }
         ProcessClassification::External
+    }
+}
+
+#[cfg(test)]
+mod release_authority_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use crate::domain::id::{OperationId, ResourceId};
+    use crate::domain::operation::ResourceFence;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::teardown::{TeardownScope, TeardownTicket};
+
+    use super::{
+        JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership,
+        ManagedProcessFence, ProcessDisplayLabel, ProcessRegistry, ProcessRegistryError,
+        RegisteredProcess, UnregisterOutcome,
+    };
+
+    #[derive(Debug)]
+    struct RetryReleaseState {
+        root: ManagedProcessIdentity,
+        active: Vec<u32>,
+        shutdown_attempts: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RetryReleaseJob(Arc<Mutex<RetryReleaseState>>);
+
+    impl JobMembership for RetryReleaseJob {
+        fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+            Ok(self.0.lock().expect("retry Job state").active.clone())
+        }
+
+        fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+            let state = self.0.lock().expect("retry Job state");
+            if pid != state.root.id().pid() {
+                return Err(format!("PID {pid} is not the registered root"));
+            }
+            Ok(JobMemberInfo::new(state.root.clone(), None))
+        }
+
+        fn bind_completion_fence(&mut self, _fence: ManagedProcessFence) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn shutdown_for_release(&mut self) -> Result<(), String> {
+            let mut state = self.0.lock().expect("retry Job state");
+            state.shutdown_attempts += 1;
+            if state.shutdown_attempts == 1 {
+                Err("listener has not acknowledged cancellation yet".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn failed_listener_release_keeps_same_authority_retryable() {
+        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("test.exe"));
+        let root = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42_424, 7).expect("managed process id"),
+            executable,
+        )
+        .expect("managed process identity");
+        let state = Arc::new(Mutex::new(RetryReleaseState {
+            root: root.clone(),
+            active: vec![root.id().pid()],
+            shutdown_attempts: 0,
+        }));
+        let resource_id = ResourceId::new();
+        let mut registry = ProcessRegistry::new();
+        let fence = registry
+            .register(RegisteredProcess::new(
+                ResourceFence::new(resource_id, 1),
+                ProcessOwner::Host,
+                root,
+                ProcessDisplayLabel::new("retryable listener release").expect("display label"),
+                RetryReleaseJob(Arc::clone(&state)),
+            ))
+            .expect("register retry Job");
+
+        state.lock().expect("retry Job state").active.clear();
+        assert!(registry.apply_job_completion(JobCompletionMessage {
+            fence: fence.clone(),
+            event: JobCompletionEvent::ActiveProcessZero,
+        }));
+        let ticket = TeardownTicket::new(OperationId::new(), TeardownScope::Host, 9, fence.clone())
+            .expect("host teardown ticket");
+        let proof = registry
+            .active_process_zero_proof_exact(&fence)
+            .expect("receiver-owned zero proof");
+        let authority = registry
+            .mint_teardown_release_authority_exact(&ticket, proof)
+            .expect("release authority");
+
+        assert!(matches!(
+            registry.release_stopped_with_authority_until(&ticket, &authority, Instant::now()),
+            Err(ProcessRegistryError::JobShutdownFailed { .. })
+        ));
+        assert!(registry.current(resource_id).is_some());
+        assert_eq!(state.lock().expect("retry Job state").shutdown_attempts, 0);
+
+        assert!(matches!(
+            registry.release_stopped_with_authority(&ticket, &authority),
+            Err(ProcessRegistryError::JobShutdownFailed { .. })
+        ));
+        assert!(registry.current(resource_id).is_some());
+        assert!(matches!(
+            registry.release_stopped_with_authority(&ticket, &authority),
+            Ok(UnregisterOutcome::Removed(_))
+        ));
+        assert!(registry.current(resource_id).is_none());
+        assert_eq!(state.lock().expect("retry Job state").shutdown_attempts, 2);
     }
 }

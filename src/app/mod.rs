@@ -1109,7 +1109,28 @@ impl NativeShell {
                 None => diagnostic,
             });
         }
-        pid_file::cleanup_orphaned_processes();
+        match pid_file::reconcile_orphaned_process_ledger() {
+            Ok(pid_file::OrphanedProcessReconciliation::Clear) => {}
+            Ok(pid_file::OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions,
+                retained_processes,
+            }) => {
+                let diagnostic = format!(
+                    "Found {retained_processes} verified process(es) from {retained_sessions} prior session(s). They remain observable, but were not terminated because the prior instance's exact managed-process authority is unavailable."
+                );
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+            Err(error) => {
+                let diagnostic = format!("Could not reconcile the prior process ledger: {error}");
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+        }
 
         let process_manager = ProcessManager::new();
         process_manager.set_settings(state.config.settings.clone());
@@ -15361,9 +15382,6 @@ impl Render for NativeShell {
                     this.handle_process_monitor_action(action.clone(), cx);
                 }))
             };
-        let process_monitor_fence_manager = self.process_manager.clone();
-        let process_monitor_fence_for_session =
-            move |session_id: &str| process_monitor_fence_manager.process_monitor_fence(session_id);
         let editor_entity = cx.weak_entity();
         let make_editor_action_handler = {
             let editor_entity = editor_entity.clone();
@@ -15895,7 +15913,6 @@ impl Render for NativeShell {
                     &runtime_snapshot,
                     process_monitor::ProcessMonitorActions {
                         on_action: &make_process_monitor_action_handler,
-                        fence_for_session: &process_monitor_fence_for_session,
                     },
                 )
             }))

@@ -1,12 +1,19 @@
 //! Fail-closed managed PTY process creation.
 
-use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(test)]
 use std::io;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use portable_pty::{Child, CommandBuilder, ExitStatus, SlavePty};
+#[cfg(test)]
+use portable_pty::ExitStatus;
+use portable_pty::{Child, CommandBuilder, SlavePty};
 
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
@@ -15,11 +22,27 @@ use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, Process
 use crate::process::job::ManagedProcessJob;
 use crate::process::registry::{
     ProcessDisplayLabel, ProcessRegistry, ProcessRegistryError, RegisteredProcess,
-    UnregisterOutcome,
+    UnregisterOutcome, MAX_PROCESS_DISPLAY_LABEL_BYTES,
 };
 
+#[cfg(test)]
+static MANAGED_LAUNCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+const MAX_LAUNCH_ARGUMENTS: usize = 256;
+const MAX_LAUNCH_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_LAUNCH_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_ENVIRONMENT_KEY_BYTES: usize = 256;
+const MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_PATH_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_TOTAL_BYTES: usize = 256 * 1024;
+
+#[cfg(test)]
+pub(crate) fn managed_launch_count_for_test() -> usize {
+    MANAGED_LAUNCH_COUNT.load(Ordering::SeqCst)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedLaunchStage {
+pub(crate) enum ManagedLaunchStage {
     Unsupported,
     Validation,
     JobCreation,
@@ -30,9 +53,10 @@ pub enum ManagedLaunchStage {
 }
 
 #[derive(Debug)]
-pub struct ManagedLaunchError {
+pub(crate) struct ManagedLaunchError {
     stage: ManagedLaunchStage,
     detail: String,
+    #[cfg(test)]
     registry_error: Option<ProcessRegistryError>,
 }
 
@@ -41,6 +65,7 @@ impl ManagedLaunchError {
         Self {
             stage,
             detail: detail.into(),
+            #[cfg(test)]
             registry_error: None,
         }
     }
@@ -54,15 +79,13 @@ impl ManagedLaunchError {
         Self {
             stage: ManagedLaunchStage::Registration,
             detail,
+            #[cfg(test)]
             registry_error: Some(reason),
         }
     }
 
-    pub fn stage(&self) -> ManagedLaunchStage {
-        self.stage
-    }
-
-    pub fn registry_error(&self) -> Option<&ProcessRegistryError> {
+    #[cfg(test)]
+    pub(crate) fn registry_error(&self) -> Option<&ProcessRegistryError> {
         self.registry_error.as_ref()
     }
 }
@@ -80,16 +103,16 @@ impl fmt::Display for ManagedLaunchError {
 impl std::error::Error for ManagedLaunchError {}
 
 #[derive(Debug)]
-pub struct LaunchIntent {
-    pub resource_id: ResourceId,
-    pub generation: u64,
-    pub owner: ProcessOwner,
-    pub kind: ResourceKind,
-    pub executable: PathBuf,
-    pub args: Vec<OsString>,
-    pub cwd: PathBuf,
-    pub environment: BTreeMap<OsString, OsString>,
-    pub display_label: String,
+pub(crate) struct LaunchIntent {
+    pub(crate) resource_id: ResourceId,
+    pub(crate) generation: u64,
+    pub(crate) owner: ProcessOwner,
+    pub(crate) kind: ResourceKind,
+    pub(crate) executable: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) environment: BTreeMap<OsString, OsString>,
+    pub(crate) display_label: String,
 }
 
 struct ValidatedLaunchIntent {
@@ -111,6 +134,7 @@ impl LaunchIntent {
                 "runtime generation must be greater than zero",
             ));
         }
+        validate_launch_input_bounds(&self)?;
         let executable = std::fs::canonicalize(&self.executable).map_err(|error| {
             ManagedLaunchError::new(
                 ManagedLaunchStage::Validation,
@@ -126,6 +150,11 @@ impl LaunchIntent {
                 format!("executable `{}` is not a file", executable.display()),
             ));
         }
+        validate_host_os_bound(
+            executable.as_os_str(),
+            MAX_LAUNCH_PATH_BYTES,
+            "canonical executable path",
+        )?;
         let cwd = std::fs::canonicalize(&self.cwd).map_err(|error| {
             ManagedLaunchError::new(
                 ManagedLaunchStage::Validation,
@@ -141,6 +170,11 @@ impl LaunchIntent {
                 format!("working directory `{}` is not a directory", cwd.display()),
             ));
         }
+        validate_host_os_bound(
+            cwd.as_os_str(),
+            MAX_LAUNCH_PATH_BYTES,
+            "canonical working directory path",
+        )?;
         let display_label = ProcessDisplayLabel::new(self.display_label).map_err(|error| {
             ManagedLaunchError::new(ManagedLaunchStage::Validation, error.to_string())
         })?;
@@ -158,7 +192,205 @@ impl LaunchIntent {
     }
 }
 
-pub fn is_supported() -> Result<(), ManagedLaunchError> {
+fn validate_launch_input_bounds(intent: &LaunchIntent) -> Result<(), ManagedLaunchError> {
+    if intent.display_label.trim().is_empty() {
+        return Err(validation_error("display label must be non-empty"));
+    }
+    if intent.display_label.len() > MAX_PROCESS_DISPLAY_LABEL_BYTES {
+        return Err(validation_error(format!(
+            "display label exceeds {MAX_PROCESS_DISPLAY_LABEL_BYTES} bytes"
+        )));
+    }
+    if intent.args.len() > MAX_LAUNCH_ARGUMENTS {
+        return Err(validation_error(format!(
+            "argument count exceeds {MAX_LAUNCH_ARGUMENTS}"
+        )));
+    }
+    if intent.environment.len() > MAX_LAUNCH_ENVIRONMENT_ENTRIES {
+        return Err(validation_error(format!(
+            "environment entry count exceeds {MAX_LAUNCH_ENVIRONMENT_ENTRIES}"
+        )));
+    }
+
+    let mut total = 0usize;
+    accumulate_host_os_bound(
+        &mut total,
+        intent.executable.as_os_str(),
+        MAX_LAUNCH_PATH_BYTES,
+        "executable path",
+    )?;
+    accumulate_host_os_bound(
+        &mut total,
+        intent.cwd.as_os_str(),
+        MAX_LAUNCH_PATH_BYTES,
+        "working directory path",
+    )?;
+    accumulate_bytes(&mut total, intent.display_label.len(), "display label")?;
+    for (index, argument) in intent.args.iter().enumerate() {
+        let bytes = host_os_bytes(argument)?;
+        if bytes > MAX_LAUNCH_ARGUMENT_BYTES {
+            return Err(validation_error(format!(
+                "argument {index} exceeds {MAX_LAUNCH_ARGUMENT_BYTES} host bytes"
+            )));
+        }
+        accumulate_bytes(&mut total, bytes, "argument")?;
+    }
+    for (key, value) in &intent.environment {
+        accumulate_host_os_bound(
+            &mut total,
+            key,
+            MAX_LAUNCH_ENVIRONMENT_KEY_BYTES,
+            "environment key",
+        )?;
+        accumulate_host_os_bound(
+            &mut total,
+            value,
+            MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate borrowed terminal inputs before duplicating them into native
+/// launch collections or resolving caller-controlled paths. The reserved
+/// environment count covers the fixed defaults added by the terminal bridge.
+pub(crate) fn validate_terminal_launch_source_bounds(
+    executable: &OsStr,
+    cwd: &OsStr,
+    display_label: &str,
+    args: &[String],
+    environment: &HashMap<String, String>,
+    reserved_environment_entries: usize,
+) -> Result<(), ManagedLaunchError> {
+    if display_label.trim().is_empty() {
+        return Err(validation_error("display label must be non-empty"));
+    }
+    if display_label.len() > MAX_PROCESS_DISPLAY_LABEL_BYTES {
+        return Err(validation_error(format!(
+            "display label exceeds {MAX_PROCESS_DISPLAY_LABEL_BYTES} bytes"
+        )));
+    }
+    if args.len() > MAX_LAUNCH_ARGUMENTS {
+        return Err(validation_error(format!(
+            "argument count exceeds {MAX_LAUNCH_ARGUMENTS}"
+        )));
+    }
+    let environment_count = environment
+        .len()
+        .checked_add(reserved_environment_entries)
+        .ok_or_else(|| validation_error("environment entry count overflow"))?;
+    if environment_count > MAX_LAUNCH_ENVIRONMENT_ENTRIES {
+        return Err(validation_error(format!(
+            "environment entry count exceeds {MAX_LAUNCH_ENVIRONMENT_ENTRIES}"
+        )));
+    }
+
+    let mut total = 0usize;
+    accumulate_host_os_bound(
+        &mut total,
+        executable,
+        MAX_LAUNCH_PATH_BYTES,
+        "executable path",
+    )?;
+    accumulate_host_os_bound(
+        &mut total,
+        cwd,
+        MAX_LAUNCH_PATH_BYTES,
+        "working directory path",
+    )?;
+    accumulate_bytes(&mut total, display_label.len(), "display label")?;
+    for (index, argument) in args.iter().enumerate() {
+        let bytes = host_os_bytes(OsStr::new(argument))?;
+        if bytes > MAX_LAUNCH_ARGUMENT_BYTES {
+            return Err(validation_error(format!(
+                "argument {index} exceeds {MAX_LAUNCH_ARGUMENT_BYTES} host bytes"
+            )));
+        }
+        accumulate_bytes(&mut total, bytes, "argument")?;
+    }
+    for (key, value) in environment {
+        accumulate_host_os_bound(
+            &mut total,
+            OsStr::new(key),
+            MAX_LAUNCH_ENVIRONMENT_KEY_BYTES,
+            "environment key",
+        )?;
+        accumulate_host_os_bound(
+            &mut total,
+            OsStr::new(value),
+            MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_host_os_bound(
+    value: &OsStr,
+    maximum: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    let bytes = host_os_bytes(value)?;
+    if bytes > maximum {
+        return Err(validation_error(format!(
+            "{field} exceeds {maximum} host bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn accumulate_host_os_bound(
+    total: &mut usize,
+    value: &OsStr,
+    maximum: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    let bytes = host_os_bytes(value)?;
+    if bytes > maximum {
+        return Err(validation_error(format!(
+            "{field} exceeds {maximum} host bytes"
+        )));
+    }
+    accumulate_bytes(total, bytes, field)
+}
+
+fn accumulate_bytes(
+    total: &mut usize,
+    bytes: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| validation_error(format!("{field} overflows the launch byte budget")))?;
+    if *total > MAX_LAUNCH_TOTAL_BYTES {
+        return Err(validation_error(format!(
+            "launch total byte count exceeds {MAX_LAUNCH_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn host_os_bytes(value: &OsStr) -> Result<usize, ManagedLaunchError> {
+    value
+        .encode_wide()
+        .count()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| validation_error("host string byte count overflow"))
+}
+
+#[cfg(not(windows))]
+fn host_os_bytes(value: &OsStr) -> Result<usize, ManagedLaunchError> {
+    Ok(value.as_encoded_bytes().len())
+}
+
+fn validation_error(detail: impl Into<String>) -> ManagedLaunchError {
+    ManagedLaunchError::new(ManagedLaunchStage::Validation, detail)
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn is_supported() -> Result<(), ManagedLaunchError> {
     if cfg!(windows) {
         Ok(())
     } else {
@@ -172,42 +404,43 @@ pub fn is_supported() -> Result<(), ManagedLaunchError> {
 #[cfg(windows)]
 #[must_use = "a pending managed launch must be registered and resumed or dropped to abort"]
 #[derive(Debug)]
-pub struct PendingManagedLaunch {
+pub(crate) struct PendingManagedLaunch {
     // Keep pending first: ordinary field drop order aborts the child before the
     // final Job handle is closed if a caller abandons this value.
     pending: portable_pty::win::PendingChild,
     job: ManagedProcessJob,
     fence: ResourceFence,
     owner: ProcessOwner,
-    kind: ResourceKind,
     root: ManagedProcessIdentity,
     display_label: ProcessDisplayLabel,
 }
 
 #[cfg(windows)]
 impl PendingManagedLaunch {
-    pub fn process_id(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn process_id(&self) -> u32 {
         self.root.id().pid()
     }
 
-    pub fn root_identity(&self) -> &ManagedProcessIdentity {
-        &self.root
-    }
-
-    pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+    #[cfg(test)]
+    pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.job.active_process_ids()
     }
 
-    pub fn register_and_resume(
+    #[cfg(test)]
+    pub(crate) fn internal_job_name(&self) -> &str {
+        self.job.internal_name()
+    }
+
+    pub(crate) fn register_suspended(
         self,
         registry: &mut ProcessRegistry<ManagedProcessJob>,
-    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+    ) -> Result<RegisteredPendingManagedLaunch, ManagedLaunchError> {
         let Self {
             pending,
             job,
             fence,
             owner,
-            kind,
             root,
             display_label,
         } = self;
@@ -225,6 +458,46 @@ impl PendingManagedLaunch {
             }
         };
 
+        Ok(RegisteredPendingManagedLaunch {
+            pending,
+            fence: managed_fence,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_and_resume(
+        self,
+        registry: &mut ProcessRegistry<ManagedProcessJob>,
+    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+        self.register_suspended(registry)?.resume(registry)
+    }
+}
+
+/// A suspended root whose exact Job and identity fence are already present in
+/// the authoritative registry.  The host can build every fallible teardown
+/// adapter around this value before crossing the one-way resume boundary.
+#[cfg(windows)]
+#[must_use = "a registered suspended launch must be resumed or dropped to abort"]
+#[derive(Debug)]
+pub(crate) struct RegisteredPendingManagedLaunch {
+    pending: portable_pty::win::PendingChild,
+    fence: crate::process::registry::ManagedProcessFence,
+}
+
+#[cfg(windows)]
+impl RegisteredPendingManagedLaunch {
+    pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
+        &self.fence
+    }
+
+    pub(crate) fn resume(
+        self,
+        registry: &mut ProcessRegistry<ManagedProcessJob>,
+    ) -> Result<ManagedPtyChild, ManagedLaunchError> {
+        let Self {
+            pending,
+            fence: managed_fence,
+        } = self;
         let child = match pending.resume() {
             Ok(child) => child,
             Err(error) => {
@@ -248,53 +521,63 @@ impl PendingManagedLaunch {
             .commit_resumed_exact(&managed_fence)
             .expect("newly resumed launch retains its exact Starting registry fence");
 
+        #[cfg(test)]
+        MANAGED_LAUNCH_COUNT.fetch_add(1, Ordering::SeqCst);
+
         Ok(ManagedPtyChild {
             child: Box::new(child),
             fence: managed_fence,
-            kind,
         })
     }
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub struct ManagedPtyChild {
+pub(crate) struct ManagedPtyChild {
     child: Box<dyn Child + Send + Sync>,
     fence: crate::process::registry::ManagedProcessFence,
-    kind: ResourceKind,
 }
 
 #[cfg(windows)]
 impl ManagedPtyChild {
-    pub fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
+    pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
         &self.fence
     }
 
-    pub fn process_id(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn process_id(&self) -> u32 {
         self.child
             .process_id()
             .expect("managed Windows PTY child must expose its PID")
     }
 
-    pub fn kind(&self) -> ResourceKind {
-        self.kind
-    }
-
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    #[cfg(test)]
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
-    }
-
-    pub fn into_child(self) -> Box<dyn Child + Send + Sync> {
+    pub(crate) fn into_child(self) -> Box<dyn Child + Send + Sync> {
         self.child
     }
 }
 
 #[cfg(windows)]
-pub fn prepare_suspended_pty(
+pub(crate) fn validate_process_image_length(
+    reported_length: u32,
+    buffer_capacity: usize,
+) -> Result<usize, String> {
+    let reported_length = usize::try_from(reported_length)
+        .map_err(|_| "process image length does not fit usize".to_string())?;
+    if reported_length > buffer_capacity {
+        return Err(format!(
+            "process image length {reported_length} exceeds buffer capacity {buffer_capacity}"
+        ));
+    }
+    Ok(reported_length)
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_suspended_pty(
     slave: &dyn SlavePty,
     intent: LaunchIntent,
 ) -> Result<PendingManagedLaunch, ManagedLaunchError> {
@@ -308,14 +591,8 @@ pub fn prepare_suspended_pty(
     };
 
     let intent = intent.validate()?;
-    let job = ManagedProcessJob::create()
-        .map_err(|error| ManagedLaunchError::new(ManagedLaunchStage::JobCreation, error))?
-        .ok_or_else(|| {
-            ManagedLaunchError::new(
-                ManagedLaunchStage::Unsupported,
-                "Windows Job Objects are unavailable",
-            )
-        })?;
+    let job = ManagedProcessJob::create_for_resource(intent.owner, intent.fence)
+        .map_err(|error| ManagedLaunchError::new(ManagedLaunchStage::JobCreation, error))?;
 
     let mut command = CommandBuilder::new(&intent.executable);
     command.args(&intent.args);
@@ -324,6 +601,8 @@ pub fn prepare_suspended_pty(
         command.env(key, value);
     }
     for key in [
+        "NO_COLOR",
+        "NODE_DISABLE_COLORS",
         "DEVMANAGER_TASK_ID",
         "DEVMANAGER_RESOURCE_ID",
         "DEVMANAGER_RESOURCE_KIND",
@@ -402,7 +681,17 @@ pub fn prepare_suspended_pty(
             pending,
         ));
     }
-    let observed_executable = PathBuf::from(OsString::from_wide(&path_buffer[..path_len as usize]));
+    let path_len = match validate_process_image_length(path_len, path_buffer.len()) {
+        Ok(path_len) => path_len,
+        Err(error) => {
+            return Err(abort_pending(
+                ManagedLaunchStage::IdentityCapture,
+                error,
+                pending,
+            ));
+        }
+    };
+    let observed_executable = PathBuf::from(OsString::from_wide(&path_buffer[..path_len]));
     let process_id = match ManagedProcessId::new(pid, creation_time_100ns) {
         Ok(process_id) => process_id,
         Err(error) => {
@@ -456,7 +745,6 @@ pub fn prepare_suspended_pty(
         job,
         fence: intent.fence,
         owner: intent.owner,
-        kind: intent.kind,
         root,
         display_label: intent.display_label,
     })
