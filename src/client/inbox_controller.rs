@@ -1,22 +1,53 @@
-//! Native-next Inbox host controller.
+//! Transport-free Inbox lane.
 //!
-//! This is the execution boundary for the real desktop client: one explicit
-//! [`HostClient`], one [`ClientSubscription`], and caller-driven synchronization
-//! and receive.  It deliberately has no GPUI, timer, thread, environment, or
-//! legacy session dependency.  A native-next shell can run these methods from
-//! its background executor and hand the bounded updates to its projection.
+//! The canonical native host runtime owns the authenticated transport. This
+//! module owns only one subscription/release state, preferences, and a
+//! bounded nonblocking handoff into the projection. Transport IO is supplied by a
+//! borrowed [`InboxTransport`] or by already-applied subscription events.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::client::host_client::{HostClient, HostClientConfig};
 use crate::client::preferences::{ClientPreferenceError, InboxPreferenceStore};
 use crate::client::subscription::{
     ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,
 };
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::host::IpcError;
+use crate::ui::task_cockpit::{InboxRuntime, SearchProgress};
 
 pub type SharedInboxSubscription = Arc<Mutex<ClientSubscription>>;
+
+pub type InboxTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Borrowed transport seam implemented by the canonical native host runtime.
+/// The Inbox lane never stores or constructs an authenticated transport.
+pub trait InboxTransport {
+    fn is_connected(&self) -> bool;
+
+    fn synchronize<'a>(
+        &'a mut self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>>;
+
+    fn receive_one<'a>(
+        &'a self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<SubscriptionUpdate, SubscriptionError>>;
+
+    fn release<'a>(
+        &'a mut self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>>;
+
+    fn reconnect<'a>(&'a mut self) -> InboxTransportFuture<'a, Result<(), IpcError>>;
+
+    fn execute_command<'a>(
+        &'a mut self,
+        envelope: CommandEnvelope,
+    ) -> InboxTransportFuture<'a, Result<CommandReceipt, IpcError>>;
+}
 
 #[derive(Debug)]
 pub enum InboxControllerError {
@@ -24,17 +55,19 @@ pub enum InboxControllerError {
     Subscription(SubscriptionError),
     Preference(ClientPreferenceError),
     PoisonedSubscription,
-    NotConnected,
+    Unattached,
+    AlreadyAttached,
 }
 
 impl std::fmt::Display for InboxControllerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Host(error) => write!(f, "Inbox host client failed: {error}"),
+            Self::Host(error) => write!(f, "Inbox transport failed: {error}"),
             Self::Subscription(error) => write!(f, "Inbox subscription failed: {error}"),
             Self::Preference(error) => write!(f, "Inbox preference failed: {error}"),
             Self::PoisonedSubscription => write!(f, "Inbox subscription lock is poisoned"),
-            Self::NotConnected => write!(f, "Inbox host client is not connected"),
+            Self::Unattached => write!(f, "Inbox lane is unattached to the canonical runtime"),
+            Self::AlreadyAttached => write!(f, "Inbox lane already has a subscription"),
         }
     }
 }
@@ -59,41 +92,70 @@ impl From<ClientPreferenceError> for InboxControllerError {
     }
 }
 
-/// One native-next client owner for the Inbox stream.
-///
-/// `HostClientConfig` is supplied by the caller and therefore always carries
-/// an explicit isolated profile. There is no default profile and no lookup of
-/// `DEVMANAGER_PROFILE` here. Callers keep the owner on one background
-/// executor and never borrow it from paint/input work.
-pub struct InboxHostController {
-    config: HostClientConfig,
-    client: Option<HostClient>,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InboxLaneTick {
+    pub update_applied: bool,
+    pub search_progress: SearchProgress,
+}
+
+/// One reusable Inbox lane. It is deliberately not a host/client owner.
+pub struct InboxLane {
     subscription: SharedInboxSubscription,
+    attached: bool,
     preferences: InboxPreferenceStore,
 }
 
-impl std::fmt::Debug for InboxHostController {
+/// Source compatibility for callers that still use the old controller name.
+/// The alias has no host client/configuration and delegates to the lane seam.
+pub type InboxHostController = InboxLane;
+
+impl std::fmt::Debug for InboxLane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InboxHostController")
-            .field("named_profile", &self.config.named_profile)
-            .field(
-                "connected",
-                &self.client.as_ref().is_some_and(HostClient::is_connected),
-            )
+        f.debug_struct("InboxLane")
+            .field("attached", &self.attached)
             .field("subscription_state", &self.subscription_state())
             .field("preference_path", &self.preferences.path())
             .finish()
     }
 }
 
-impl InboxHostController {
-    pub fn new(config: HostClientConfig, preferences: InboxPreferenceStore) -> Self {
+impl InboxLane {
+    pub fn new(preferences: InboxPreferenceStore) -> Self {
         Self {
-            config,
-            client: None,
             subscription: Arc::new(Mutex::new(ClientSubscription::new())),
+            attached: false,
             preferences,
         }
+    }
+
+    pub fn with_subscription(
+        subscription: SharedInboxSubscription,
+        preferences: InboxPreferenceStore,
+    ) -> Self {
+        Self {
+            subscription,
+            attached: true,
+            preferences,
+        }
+    }
+
+    pub fn attach_subscription(
+        &mut self,
+        subscription: SharedInboxSubscription,
+    ) -> Result<(), InboxControllerError> {
+        if self.attached {
+            return Err(InboxControllerError::AlreadyAttached);
+        }
+        self.subscription = subscription;
+        self.attached = true;
+        Ok(())
+    }
+
+    /// Mark the lane as attached to the caller-owned canonical runtime. This
+    /// does not create or store that runtime; it only closes the typed seam
+    /// after composition has supplied the pending subscription.
+    pub fn attach_runtime(&mut self) {
+        self.attached = true;
     }
 
     pub fn subscription(&self) -> SharedInboxSubscription {
@@ -107,17 +169,14 @@ impl InboxHostController {
             .unwrap_or(ClientSubscriptionState::NeedsResync)
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.client.as_ref().is_some_and(HostClient::is_connected)
+    pub fn is_attached(&self) -> bool {
+        self.attached
     }
 
     pub fn preferences(&self) -> &InboxPreferenceStore {
         &self.preferences
     }
 
-    /// Restore the bounded cursor bytes before the first projection attach.
-    /// The caller decodes them through `UnreadCursor::decode_durable` and
-    /// rejects invalid/foreign versions instead of manufacturing unread state.
     pub fn restore_unread_cursor(&self) -> Result<Option<Vec<u8>>, InboxControllerError> {
         self.preferences.load_unread_cursor().map_err(Into::into)
     }
@@ -128,135 +187,130 @@ impl InboxHostController {
             .map_err(Into::into)
     }
 
-    /// Attach to the configured host and perform snapshot + race-closing
-    /// replay.  Replay events remain available through the shared subscription
-    /// until the projection drains them.
-    pub async fn synchronize(&mut self) -> Result<(), InboxControllerError> {
+    /// Synchronize one subscription through the canonical runtime's borrowed
+    /// transport. The lane never connects, reconnects, or stores that runtime.
+    pub async fn synchronize<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), InboxControllerError> {
+        if !self.attached || !transport.is_connected() {
+            return Err(InboxControllerError::Unattached);
+        }
         if self.subscription_state() != ClientSubscriptionState::Pending {
-            // Explicit synchronization always settles the old generation
-            // before replacing its Arc. This releases the host replay owner
-            // on a live connection and fences late tails on a lost one.
-            self.retire_subscription().await?;
+            self.retire_subscription(transport).await?;
         }
-        if self.client.is_none() {
-            self.client = Some(HostClient::connect(self.config.clone()).await?);
-        }
-        let client = self
-            .client
-            .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
         let result = {
             let mut subscription = self
                 .subscription
                 .lock()
                 .map_err(|_| InboxControllerError::PoisonedSubscription)?;
-            subscription.synchronize(client).await
+            transport.synchronize(&mut subscription).await
         };
-        if let Err(error) = result {
-            if matches!(error, SubscriptionError::Transport(_)) {
-                self.client = None;
-            }
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    /// Reconnect the authenticated client and always rebuild snapshot + replay
-    /// before allowing live receive.  This makes a disconnect a bounded
-    /// resync boundary rather than an attempt to apply stale events.
-    pub async fn reconnect_and_synchronize(&mut self) -> Result<(), InboxControllerError> {
-        let old_subscription = Arc::clone(&self.subscription);
-        if let Some(client) = self.client.as_mut() {
-            if let Err(error) = client.reconnect().await {
-                old_subscription
-                    .lock()
-                    .map_err(|_| InboxControllerError::PoisonedSubscription)?
-                    .retire_without_transport();
-                self.client = None;
-                return Err(error.into());
-            }
-            old_subscription
-                .lock()
-                .map_err(|_| InboxControllerError::PoisonedSubscription)?
-                .retire_without_transport();
-        } else {
-            old_subscription
-                .lock()
-                .map_err(|_| InboxControllerError::PoisonedSubscription)?
-                .retire_without_transport();
-            self.client = Some(HostClient::connect(self.config.clone()).await?);
-        }
-        // A reconnect is a new subscription generation. Do not let a stale
-        // Ready/NeedsResync object reject the authoritative synchronize call
-        // or leak its old replay handoff into the new model.
-        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
-        self.synchronize().await
-    }
-
-    async fn retire_subscription(&mut self) -> Result<(), InboxControllerError> {
-        let old_subscription = Arc::clone(&self.subscription);
-        let release_result = if let Some(client) = self.client.as_mut() {
-            let mut subscription = old_subscription
-                .lock()
-                .map_err(|_| InboxControllerError::PoisonedSubscription)?;
-            Some(subscription.release(client).await)
-        } else {
-            old_subscription
-                .lock()
-                .map_err(|_| InboxControllerError::PoisonedSubscription)?
-                .retire_without_transport();
-            None
-        };
-        if let Some(Err(error)) = release_result {
-            if matches!(error, SubscriptionError::Transport(_)) {
-                old_subscription
-                    .lock()
-                    .map_err(|_| InboxControllerError::PoisonedSubscription)?
-                    .retire_without_transport();
-                self.client = None;
-            }
-            return Err(error.into());
-        }
-        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
-        Ok(())
-    }
-
-    /// Drain one live update.  This is the only method that waits on host I/O;
-    /// native-next calls it from its controller/task lane, never from paint or
-    /// input dispatch.  Transport loss leaves the subscription fenced and the
-    /// next caller must invoke `reconnect_and_synchronize`.
-    pub async fn receive_one(&mut self) -> Result<SubscriptionUpdate, InboxControllerError> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or(InboxControllerError::NotConnected)?;
-        let result = {
-            let mut subscription = self
-                .subscription
-                .lock()
-                .map_err(|_| InboxControllerError::PoisonedSubscription)?;
-            subscription.recv_and_apply(client).await
-        };
-        if let Err(error) = &result {
-            if matches!(error, SubscriptionError::Transport(_)) {
-                self.client = None;
-            }
-        }
         result.map_err(Into::into)
     }
 
-    /// Consume the real command lane on the same authenticated HostClient.
-    /// Callers pass a previously captured, revision-fenced envelope from the
-    /// shell dispatcher; this method does not synthesize task identity.
-    pub async fn execute_command(
+    /// Reconnect and rebuild one subscription generation through the borrowed
+    /// canonical runtime. Replacement is fenced before the new synchronize.
+    pub async fn reconnect_and_synchronize<T: InboxTransport + ?Sized>(
         &mut self,
+        transport: &mut T,
+    ) -> Result<(), InboxControllerError> {
+        if !self.attached {
+            return Err(InboxControllerError::Unattached);
+        }
+        if let Err(error) = transport.reconnect().await {
+            self.subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
+            self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+            return Err(InboxControllerError::Host(error));
+        }
+        self.subscription
+            .lock()
+            .map_err(|_| InboxControllerError::PoisonedSubscription)?
+            .retire_without_transport();
+        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        self.synchronize(transport).await
+    }
+
+    async fn retire_subscription<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), InboxControllerError> {
+        let old = Arc::clone(&self.subscription);
+        let result = if transport.is_connected() {
+            let mut subscription = old
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?;
+            transport.release(&mut subscription).await
+        } else {
+            old.lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
+            Ok(())
+        };
+        if let Err(error) = result {
+            old.lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?
+                .retire_without_transport();
+            return Err(error.into());
+        }
+        self.subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        Ok(())
+    }
+
+    pub async fn receive_one<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &T,
+    ) -> Result<SubscriptionUpdate, InboxControllerError> {
+        if !self.attached || !transport.is_connected() {
+            return Err(InboxControllerError::Unattached);
+        }
+        let result = {
+            let mut subscription = self
+                .subscription
+                .lock()
+                .map_err(|_| InboxControllerError::PoisonedSubscription)?;
+            transport.receive_one(&mut subscription).await
+        };
+        result.map_err(Into::into)
+    }
+
+    pub async fn execute_command<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
         envelope: CommandEnvelope,
     ) -> Result<CommandReceipt, InboxControllerError> {
-        let client = self
-            .client
-            .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
-        client.execute_command(envelope).await.map_err(Into::into)
+        if !self.attached || !transport.is_connected() {
+            return Err(InboxControllerError::Unattached);
+        }
+        transport
+            .execute_command(envelope)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Bounded, nonblocking projection/controller handoff. Transport IO is done by
+    /// the canonical runtime before supplying one applied event here; this
+    /// tick only applies that event and advances at most one search page.
+    pub fn tick(
+        &mut self,
+        runtime: &mut InboxRuntime,
+        update: Option<SubscriptionUpdate>,
+    ) -> Result<InboxLaneTick, InboxControllerError> {
+        if !self.attached {
+            return Err(InboxControllerError::Unattached);
+        }
+        let update_applied = update
+            .map(|update| runtime.apply_subscription_update(update))
+            .transpose()?
+            .unwrap_or(false);
+        let search_progress = runtime.tick_background_search();
+        Ok(InboxLaneTick {
+            update_applied,
+            search_progress,
+        })
     }
 
     pub fn take_replay_events(
@@ -272,58 +326,101 @@ impl InboxHostController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::HostClientConfig;
-    use crate::domain::ClientId;
-    use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+    use crate::ui::task_cockpit::InboxRuntime;
 
-    fn test_config(profile: &str) -> HostClientConfig {
-        HostClientConfig {
-            named_profile: profile.to_string(),
-            client_build: "inbox-controller-test".to_string(),
-            client_id: ClientId::new(),
-            requested: CapabilitySet::from_capabilities([
-                Capability::PagedSnapshots,
-                Capability::EventReplay,
-            ]),
-            limits: FrameLimits::v1_default(),
+    struct FakeTransport;
+
+    impl InboxTransport for FakeTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn synchronize<'a>(
+            &'a mut self,
+            _subscription: &'a mut ClientSubscription,
+        ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>> {
+            Box::pin(async { Err(SubscriptionError::MissingCapabilities) })
+        }
+
+        fn receive_one<'a>(
+            &'a self,
+            _subscription: &'a mut ClientSubscription,
+        ) -> InboxTransportFuture<'a, Result<SubscriptionUpdate, SubscriptionError>> {
+            Box::pin(async { Err(SubscriptionError::NotReady) })
+        }
+
+        fn release<'a>(
+            &'a mut self,
+            _subscription: &'a mut ClientSubscription,
+        ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reconnect<'a>(&'a mut self) -> InboxTransportFuture<'a, Result<(), IpcError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn execute_command<'a>(
+            &'a mut self,
+            _envelope: CommandEnvelope,
+        ) -> InboxTransportFuture<'a, Result<CommandReceipt, IpcError>> {
+            Box::pin(async { Err(IpcError::Unavailable) })
         }
     }
 
     #[test]
-    fn controller_requires_explicit_profile_and_uses_isolated_preferences() {
+    fn lane_starts_pending_and_does_not_claim_a_runtime() {
         let directory = tempfile::tempdir().expect("temp directory");
         let preferences = InboxPreferenceStore::at_profile_root(directory.path());
-        let controller =
-            InboxHostController::new(test_config("inbox-controller-test"), preferences);
-        assert_eq!(
-            controller.subscription_state(),
-            ClientSubscriptionState::Pending
-        );
-        assert!(!controller.is_connected());
-        assert_eq!(
-            controller.restore_unread_cursor().expect("default cursor"),
-            None
-        );
-        assert_eq!(
-            controller.preferences().path().parent(),
-            Some(directory.path())
-        );
+        let lane = InboxLane::new(preferences);
+        assert_eq!(lane.subscription_state(), ClientSubscriptionState::Pending);
+        assert!(!lane.is_attached());
     }
 
     #[test]
-    fn controller_cursor_persistence_never_uses_session_file() {
+    fn lane_tick_without_canonical_runtime_is_typed_unattached() {
         let directory = tempfile::tempdir().expect("temp directory");
         let preferences = InboxPreferenceStore::at_profile_root(directory.path());
-        let controller =
-            InboxHostController::new(test_config("inbox-controller-test"), preferences);
-        controller
-            .persist_unread_cursor(Some(&[0x01, 0x02]))
+        let mut lane = InboxLane::new(preferences);
+        let mut runtime = InboxRuntime::new();
+
+        let error = lane
+            .tick(&mut runtime, None)
+            .expect_err("a lane without the canonical runtime must not self-connect");
+        assert!(matches!(error, InboxControllerError::Unattached));
+    }
+
+    #[tokio::test]
+    async fn lane_uses_borrowed_transport_without_constructing_a_host_client() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let preferences = InboxPreferenceStore::at_profile_root(directory.path());
+        let mut lane = InboxLane::new(preferences);
+        lane.attach_runtime();
+        let mut transport = FakeTransport;
+
+        let error = lane
+            .synchronize(&mut transport)
+            .await
+            .expect_err("fake transport admission should remain typed");
+        assert!(matches!(
+            error,
+            InboxControllerError::Subscription(SubscriptionError::MissingCapabilities)
+        ));
+        assert_eq!(lane.subscription_state(), ClientSubscriptionState::Pending);
+    }
+
+    #[test]
+    fn lane_cursor_persistence_stays_in_its_explicit_preference_store() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let preferences = InboxPreferenceStore::at_profile_root(directory.path());
+        let lane = InboxLane::new(preferences);
+        lane.persist_unread_cursor(Some(&[0x01, 0x02]))
             .expect("persist cursor");
         assert_eq!(
-            controller.restore_unread_cursor().expect("restore cursor"),
+            lane.restore_unread_cursor().expect("restore cursor"),
             Some(vec![0x01, 0x02])
         );
-        assert!(!controller
+        assert!(!lane
             .preferences()
             .path()
             .file_name()

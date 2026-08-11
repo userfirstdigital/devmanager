@@ -498,23 +498,24 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
         .expect("fixture task command");
     command_client.disconnect();
 
-    let controller = InboxHostController::new(
-        HostClientConfig {
-            named_profile: profile,
-            client_build: "native-next-inbox-fixture".to_string(),
-            client_id: ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
-            requested: CapabilitySet::from_capabilities([
-                Capability::PagedSnapshots,
-                Capability::EventReplay,
-            ]),
-            limits: FrameLimits::v1_default(),
-        },
-        InboxPreferenceStore::at_profile_root(config_base.path().join("client-preferences")),
-    );
+    let subscription_config = HostClientConfig {
+        named_profile: profile,
+        client_build: "native-next-inbox-fixture".to_string(),
+        client_id: ClientId::from_bytes(fixed_uuid_v7(0x7b)).expect("subscription client id"),
+        requested: CapabilitySet::from_capabilities([
+            Capability::PagedSnapshots,
+            Capability::EventReplay,
+        ]),
+        limits: FrameLimits::v1_default(),
+    };
+    let mut subscription_client = connect_bounded(&subscription_config, &mut host).await;
+    let controller = InboxHostController::new(InboxPreferenceStore::at_profile_root(
+        config_base.path().join("client-preferences"),
+    ));
     let mut cockpit = NativeNextTaskCockpit::from_controller(controller)
         .expect("native-next bootstrap must load isolated preferences");
     cockpit
-        .synchronize()
+        .synchronize(&mut subscription_client)
         .await
         .expect("native-next controller must synchronize fixture host");
 
@@ -532,7 +533,7 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
         .expect("controller owner")
         .subscription();
     cockpit
-        .reconnect_and_synchronize()
+        .reconnect_and_synchronize(&mut subscription_client)
         .await
         .expect("reconnect must resynchronize from an authoritative snapshot");
     let second_subscription = cockpit
@@ -575,7 +576,7 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
         .expect("archive action is a real host command");
     assert!(matches!(
         cockpit
-            .execute_command(archive)
+            .execute_command(&mut subscription_client, archive)
             .await
             .expect("archive command"),
         CommandReceipt::Accepted { .. }
@@ -603,13 +604,15 @@ async fn repeated_native_next_synchronize_retires_old_tails_without_busy_leaks()
         ]),
         limits: FrameLimits::v1_default(),
     };
-    let mut readiness_client = connect_bounded(&controller_config, &mut host).await;
-    readiness_client.disconnect();
-    let mut controller = InboxHostController::new(
-        controller_config,
-        InboxPreferenceStore::at_profile_root(config_base.path().join("client-preferences")),
-    );
-    controller.synchronize().await.expect("initial synchronize");
+    let mut controller_client = connect_bounded(&controller_config, &mut host).await;
+    let mut controller = InboxHostController::new(InboxPreferenceStore::at_profile_root(
+        config_base.path().join("client-preferences"),
+    ));
+    controller.attach_runtime();
+    controller
+        .synchronize(&mut controller_client)
+        .await
+        .expect("initial synchronize");
     let old_subscription = controller.subscription();
     let old_subscription_id = old_subscription
         .lock()
@@ -619,7 +622,7 @@ async fn repeated_native_next_synchronize_retires_old_tails_without_busy_leaks()
 
     for _ in 0..40 {
         controller
-            .synchronize()
+            .synchronize(&mut controller_client)
             .await
             .expect("repeated synchronize must not leak replay sessions");
         assert_eq!(

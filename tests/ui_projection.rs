@@ -1,11 +1,11 @@
 use devmanager::client::model::MAX_CLIENT_SEARCH_POSTING_BYTES;
 use devmanager::client::{
-    ClientModel, ClientModelBuilder, HostClientConfig, InboxHostController, InboxPreferenceStore,
+    ClientModel, ClientModelBuilder, InboxHostController, InboxPreferenceStore,
 };
 use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
-    AgentSessionId, ClientId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
+    AgentSessionId, EnvironmentId, EventId, ProjectId, ResourceId, SnapshotId, TaskId,
 };
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
@@ -15,7 +15,6 @@ use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskLifecycle, WorkspaceRef,
 };
-use devmanager::protocol::{Capability, CapabilitySet, FrameLimits};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::preview::{
     parse_preview_args, PreviewApplication, PreviewDismiss, PreviewError, PreviewOutputCapability,
@@ -1346,19 +1345,7 @@ fn native_next_cursor_store_restores_into_runtime_without_legacy_session_state()
 
     let profile = tempdir().expect("isolated native-next profile");
     let store = InboxPreferenceStore::at_profile_root(profile.path());
-    let controller = InboxHostController::new(
-        HostClientConfig {
-            named_profile: "native-next-inbox-test".to_string(),
-            client_build: "ui-projection-test".to_string(),
-            client_id: ClientId::new(),
-            requested: CapabilitySet::from_capabilities([
-                Capability::PagedSnapshots,
-                Capability::EventReplay,
-            ]),
-            limits: FrameLimits::v1_default(),
-        },
-        store,
-    );
+    let controller = InboxHostController::new(store);
     let mut runtime = InboxRuntime::new();
     runtime.restore_unread_cursor(cursor.clone());
     runtime

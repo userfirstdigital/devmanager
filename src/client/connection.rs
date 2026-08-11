@@ -61,7 +61,25 @@ pub enum UnsolicitedServerMessage {
     Stream(StreamFrame),
 }
 
-/// Durable-priority unsolicited inbox with a separate coalescing stream lane.
+#[derive(Clone, Copy)]
+enum UnsolicitedLane {
+    Durable,
+    Retained,
+    Stream,
+}
+
+impl UnsolicitedLane {
+    fn next(self) -> Self {
+        match self {
+            Self::Durable => Self::Retained,
+            Self::Retained => Self::Stream,
+            Self::Stream => Self::Durable,
+        }
+    }
+}
+
+/// Bounded fair unsolicited inbox with separate retained, durable, and
+/// coalescing current-stream lanes.
 struct DurableInboxState {
     durable_tx: mpsc::Sender<UnsolicitedServerMessage>,
     durable_rx: mpsc::Receiver<UnsolicitedServerMessage>,
@@ -80,6 +98,7 @@ struct UnsolicitedInbox {
     /// retirement mark plus queue drain: an old frame is either linearized
     /// before retirement and drained, or observes the retired id.
     durable: Mutex<DurableInboxState>,
+    next_lane: Mutex<UnsolicitedLane>,
     stream_capacity: usize,
     streams: Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
     notify: tokio::sync::Notify,
@@ -105,6 +124,9 @@ impl UnsolicitedInbox {
                 retained_durable: VecDeque::new(),
                 retired_subscription_ids: HashSet::new(),
             }),
+            // Preserve the durable-first admission behavior, then rotate
+            // retained and current-stream work before another durable turn.
+            next_lane: Mutex::new(UnsolicitedLane::Durable),
             stream_capacity: stream_capacity.max(1),
             streams: Mutex::new(std::collections::HashMap::new()),
             notify: tokio::sync::Notify::new(),
@@ -262,17 +284,31 @@ impl UnsolicitedInbox {
     fn try_dequeue_from_state(
         durable: &mut DurableInboxState,
         streams: &Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+        next_lane: &mut UnsolicitedLane,
     ) -> Option<UnsolicitedServerMessage> {
-        if let Some(message) = durable.retained_durable.pop_front() {
-            return Some(message);
+        let first_lane = *next_lane;
+        for offset in 0..3 {
+            let lane = match offset {
+                0 => first_lane,
+                1 => first_lane.next(),
+                _ => first_lane.next().next(),
+            };
+            let message = match lane {
+                UnsolicitedLane::Retained => durable.retained_durable.pop_front(),
+                UnsolicitedLane::Durable => durable.durable_rx.try_recv().ok(),
+                UnsolicitedLane::Stream => {
+                    let mut streams = streams.lock().expect("stream inbox");
+                    let key = streams.keys().next().copied();
+                    key.and_then(|key| streams.remove(&key))
+                        .map(UnsolicitedServerMessage::Stream)
+                }
+            };
+            if message.is_some() {
+                *next_lane = lane.next();
+                return message;
+            }
         }
-        if let Ok(message) = durable.durable_rx.try_recv() {
-            return Some(message);
-        }
-        let mut streams = streams.lock().expect("stream inbox");
-        let key = streams.keys().next().copied();
-        key.and_then(|key| streams.remove(&key))
-            .map(UnsolicitedServerMessage::Stream)
+        None
     }
 
     async fn recv(&self) -> Result<UnsolicitedServerMessage, IpcError> {
@@ -307,8 +343,9 @@ impl UnsolicitedInbox {
     }
 
     fn try_dequeue(&self) -> Option<UnsolicitedServerMessage> {
+        let mut next_lane = self.next_lane.lock().expect("unsolicited lane");
         let mut durable = self.durable.lock().expect("durable inbox");
-        Self::try_dequeue_from_state(&mut durable, &self.streams)
+        Self::try_dequeue_from_state(&mut durable, &self.streams, &mut next_lane)
     }
 }
 
@@ -1665,6 +1702,86 @@ mod tests {
         assert_eq!(got[1], second);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_durable_producer_cannot_starve_current_stream_lane() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, ResourceId, SubscriptionId};
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+        use std::sync::{Arc, Barrier};
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(128, 1));
+        let subscription = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xa1,
+        ])
+        .expect("subscription");
+        let stream = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xa2,
+            ])
+            .expect("stream resource"),
+        );
+        let step = Arc::new(Barrier::new(2));
+        let producer = {
+            let inbox = Arc::clone(&inbox);
+            let step = Arc::clone(&step);
+            std::thread::spawn(move || {
+                for marker in 0..64u8 {
+                    inbox
+                        .push_durable(UnsolicitedServerMessage::DurableEvent {
+                            subscription_id: subscription,
+                            event: DomainEvent {
+                                id: EventId::from_bytes([
+                                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, marker,
+                                ])
+                                .expect("event"),
+                                task_id: None,
+                                sequence: u64::from(marker),
+                                task_revision: None,
+                                occurred_at_ms: i64::from(marker),
+                                payload: Event::TaskReopened,
+                            },
+                        })
+                        .expect("durable admission");
+                    inbox
+                        .push_stream(StreamFrame {
+                            subscription_id: subscription,
+                            stream,
+                            generation: 1,
+                            sequence: u64::from(marker),
+                            payload_kind: StreamPayloadKind::new(1).expect("payload kind"),
+                            schema_version: 1,
+                            payload: vec![marker],
+                        })
+                        .expect("stream admission");
+                    step.wait();
+                    step.wait();
+                }
+            })
+        };
+
+        let mut stream_count = 0usize;
+        for _ in 0..64 {
+            step.wait();
+            let message = tokio::time::timeout(Duration::from_millis(250), inbox.recv())
+                .await
+                .expect("continuous producer must not leave recv waiting")
+                .expect("recv");
+            if matches!(message, UnsolicitedServerMessage::Stream(_)) {
+                stream_count += 1;
+            }
+            step.wait();
+        }
+        producer.join().expect("producer join");
+        assert!(
+            stream_count >= 32,
+            "current stream lane must receive a fair share while durables stay continuous; got {stream_count}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn stream_close_during_recv_wait_returns_unavailable_without_hang() {
         // Catches: close between empty-queue check and waiter registration must not
@@ -1833,16 +1950,19 @@ mod tests {
                 payload: vec![0xe3],
             })
             .expect("current stream must remain admissible after durable flood");
-        for _ in 0..MAX_RETIRED_DRAIN_WORK {
-            flood.recv().await.expect("retained current durable frame");
+        let mut stream_survived = false;
+        for _ in 0..=MAX_RETIRED_DRAIN_WORK + 1 {
+            if matches!(
+                flood.recv().await.expect("flooded frame"),
+                UnsolicitedServerMessage::Stream(frame) if frame.stream == stream_key
+            ) {
+                stream_survived = true;
+                break;
+            }
         }
-        flood
-            .recv()
-            .await
-            .expect("queued frame after drain quantum");
-        assert!(matches!(
-            flood.recv().await.expect("current stream frame"),
-            UnsolicitedServerMessage::Stream(frame) if frame.stream == stream_key
-        ));
+        assert!(
+            stream_survived,
+            "fair dispatch must preserve a current stream during a retired durable flood"
+        );
     }
 }

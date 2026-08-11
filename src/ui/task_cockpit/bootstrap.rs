@@ -1,13 +1,12 @@
 //! Native-next Task Cockpit/client bootstrap.
 //!
-//! This boundary is intentionally separate from `app::NativeShell`.  It owns
-//! one explicit Inbox host controller and hands only bounded projection state
-//! to the shell.  Callers invoke the async methods from their controller/task
-//! lane; rendering and input dispatch only read the already-built model.
+//! The canonical host runtime owns the authenticated transport. This boundary
+//! composes that borrowed transport with one transport-free Inbox lane and one
+//! projection runtime; rendering and input only read already-published state.
 
 use crate::client::{
-    ClientPreferenceError, InboxControllerError, InboxHostController, SharedInboxSubscription,
-    SubscriptionUpdate,
+    ClientPreferenceError, InboxControllerError, InboxHostController, InboxLaneTick,
+    InboxTransport, SharedInboxSubscription, SubscriptionUpdate,
 };
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 
@@ -21,10 +20,13 @@ pub struct NativeNextTaskCockpit {
 }
 
 impl NativeNextTaskCockpit {
-    /// Build the real native-next client boundary without connecting. The
-    /// caller supplies an explicit profile/configuration and preference store;
-    /// no environment/default profile or legacy session path is consulted.
-    pub fn from_controller(controller: InboxHostController) -> Result<Self, InboxControllerError> {
+    /// Compose a transport-free lane with the canonical runtime without
+    /// connecting. The caller owns the transport and supplies it to each
+    /// pump operation.
+    pub fn from_controller(
+        mut controller: InboxHostController,
+    ) -> Result<Self, InboxControllerError> {
+        controller.attach_runtime();
         let mut runtime = InboxRuntime::new();
         match controller.restore_unread_cursor()? {
             Some(bytes) => runtime
@@ -34,16 +36,16 @@ impl NativeNextTaskCockpit {
                 })?,
             None => runtime.restore_unread_cursor(crate::ui::task_cockpit::UnreadCursor::default()),
         }
-        runtime.attach_host_controller(&controller);
+        runtime.attach_live_subscription(controller.subscription());
         Ok(Self {
             controller: Some(controller),
             runtime,
         })
     }
 
-    /// Host-free injection seam for deterministic shell tests and later entry
-    /// cutover wiring. The injected subscription remains caller-owned and its
-    /// transport is never touched by paint/input work.
+    /// Host-free injection seam for deterministic shell tests. The injected
+    /// subscription remains caller-owned and no transport is touched by
+    /// paint/input work.
     pub fn from_subscription(subscription: SharedInboxSubscription) -> Self {
         let mut runtime = InboxRuntime::new();
         runtime.attach_live_subscription(subscription);
@@ -53,80 +55,88 @@ impl NativeNextTaskCockpit {
         }
     }
 
-    /// Connect/synchronize from the caller's controller/task lane, then hand
-    /// the shared subscription to the projection. No GPUI callback awaits this
-    /// method.
-    pub async fn synchronize(&mut self) -> Result<(), InboxControllerError> {
+    /// Synchronize the lane using the canonical runtime's borrowed transport.
+    pub async fn synchronize<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), InboxControllerError> {
         self.runtime.invalidate_for_resync();
         let controller = self
             .controller
             .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
-        controller.synchronize().await?;
-        self.runtime.attach_host_controller(controller);
-        self.runtime.refresh_from_subscription();
+            .ok_or(InboxControllerError::Unattached)?;
+        controller.synchronize(transport).await?;
+        self.runtime
+            .attach_live_subscription(controller.subscription());
         Ok(())
     }
 
     /// Receive and apply one unsolicited update on the caller-driven pump
-    /// lane. The returned update is retained for action/revision diagnostics;
-    /// the runtime consumes it incrementally after the subscription applies it
-    /// to the client model.
-    pub async fn receive_one(&mut self) -> Result<SubscriptionUpdate, InboxControllerError> {
+    /// lane. A single bounded search tick follows the update.
+    pub async fn receive_one<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &T,
+    ) -> Result<SubscriptionUpdate, InboxControllerError> {
         let controller = self
             .controller
             .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
-        let update = match controller.receive_one().await {
+            .ok_or(InboxControllerError::Unattached)?;
+        let update = match controller.receive_one(transport).await {
             Ok(update) => update,
             Err(error) => {
                 self.runtime.invalidate_for_resync();
                 return Err(error);
             }
         };
-        self.runtime
-            .apply_subscription_update(update.clone())
-            .map_err(InboxControllerError::Subscription)?;
-        // Advance one bounded Inbox continuation on the caller-driven pump
-        // lane. GPUI paint/input only reads the projection published here.
-        self.runtime.poll_background_search();
+        controller.tick(&mut self.runtime, Some(update.clone()))?;
         Ok(update)
     }
 
     /// Advance one bounded search continuation from the controller/task lane.
-    /// This is intentionally separate from `render_model` so no paint path can
-    /// perform model search or transport work.
+    /// Paint and input never perform this work.
     pub fn pump_background_search(&mut self) -> bool {
-        self.runtime.poll_background_search()
+        self.runtime.tick_background_search().published
     }
 
-    pub async fn reconnect_and_synchronize(&mut self) -> Result<(), InboxControllerError> {
+    /// Canonical nonblocking tick: apply at most one supplied event and request
+    /// at most one continuation page.
+    pub fn tick(
+        &mut self,
+        update: Option<SubscriptionUpdate>,
+    ) -> Result<InboxLaneTick, InboxControllerError> {
+        let controller = self
+            .controller
+            .as_mut()
+            .ok_or(InboxControllerError::Unattached)?;
+        controller.tick(&mut self.runtime, update)
+    }
+
+    pub async fn reconnect_and_synchronize<T: InboxTransport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), InboxControllerError> {
         self.runtime.invalidate_for_resync();
         let controller = self
             .controller
             .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
-        controller.reconnect_and_synchronize().await?;
-        self.runtime.attach_host_controller(controller);
-        self.runtime.refresh_from_subscription();
+            .ok_or(InboxControllerError::Unattached)?;
+        controller.reconnect_and_synchronize(transport).await?;
+        self.runtime
+            .attach_live_subscription(controller.subscription());
         Ok(())
     }
 
-    /// Execute a captured shell command on the authenticated host client.
-    ///
-    /// Command envelopes are created by the input/dispatcher lane with the
-    /// task, revision, focus, and generation fences already captured. The
-    /// native-next shell calls this method from its action/task lane; paint
-    /// never waits on the transport.
-    pub async fn execute_command(
+    /// Execute a captured shell command on the authenticated host runtime.
+    pub async fn execute_command<T: InboxTransport + ?Sized>(
         &mut self,
+        transport: &mut T,
         envelope: CommandEnvelope,
     ) -> Result<CommandReceipt, InboxControllerError> {
         let controller = self
             .controller
             .as_mut()
-            .ok_or(InboxControllerError::NotConnected)?;
-        controller.execute_command(envelope).await
+            .ok_or(InboxControllerError::Unattached)?;
+        controller.execute_command(transport, envelope).await
     }
 
     pub fn render_model(&self, width: InboxPresentationWidth) -> InboxRenderModel {
@@ -155,7 +165,7 @@ impl NativeNextTaskCockpit {
 
     pub fn persist_preferences(&self) -> Result<(), InboxControllerError> {
         let Some(controller) = self.controller.as_ref() else {
-            return Err(InboxControllerError::NotConnected);
+            return Err(InboxControllerError::Unattached);
         };
         self.runtime
             .persist_unread_cursor_to_controller(controller)

@@ -303,6 +303,18 @@ pub struct SearchPage {
 }
 
 impl SearchPage {
+    pub(crate) fn pending() -> Self {
+        Self {
+            ids: Vec::new(),
+            known_total: 0,
+            exact_total: None,
+            work: 0,
+            status: SearchPageStatus::Partial,
+            query_truncated: false,
+            continuation: None,
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         self.status == SearchPageStatus::Complete
     }
@@ -810,30 +822,38 @@ fn next_posting_capacity(capacity: usize) -> usize {
     }
 }
 
-/// Lowercase one scalar at a time and stop after the shared scalar bound.
-/// Unicode lowercase can expand a scalar (for example, `İ`), so this avoids
-/// both pre-bound mismatch and whole-input allocation for hostile strings.
+/// Lowercase one bounded source scalar at a time and stop at the shared output
+/// bound. Unicode lowercase can expand a scalar (for example, `İ`), so the
+/// source bound prevents hostile input work while the output bound keeps the
+/// title/query representation compact and consistent.
 pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, bool) {
     if max_chars == 0 {
         return (String::new(), value.chars().next().is_some());
     }
     let mut output = String::new();
     let mut source = value.chars();
-    let mut retained = 0usize;
+    let mut source_seen = 0usize;
+    let mut output_chars = 0usize;
     let mut truncated = false;
-    'source: while let Some(ch) = source.next() {
+    while source_seen < max_chars {
+        let Some(ch) = source.next() else {
+            return (output, false);
+        };
+        source_seen = source_seen.saturating_add(1);
         for lowered in ch.to_lowercase() {
-            if retained >= max_chars {
+            if output_chars >= max_chars {
                 truncated = true;
-                break 'source;
+                break;
             }
             output.push(lowered);
-            retained = retained.saturating_add(1);
+            output_chars = output_chars.saturating_add(1);
         }
-        if retained >= max_chars {
-            truncated = source.next().is_some();
+        if truncated {
             break;
         }
+    }
+    if !truncated && source.next().is_some() {
+        truncated = true;
     }
     (output, truncated)
 }

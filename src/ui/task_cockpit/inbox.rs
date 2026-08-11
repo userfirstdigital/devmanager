@@ -3,13 +3,12 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
     Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
 
 use gpui::{
     div, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -570,73 +569,52 @@ pub type LiveClientSubscription = Arc<Mutex<ClientSubscription>>;
 struct BackgroundSearchResult {
     generation: u64,
     model_revision: u64,
-    active: SearchPage,
-    archived: Option<SearchPage>,
+    archived: bool,
+    page: SearchPage,
 }
 
-fn run_background_search(
+#[derive(Debug)]
+struct BackgroundSearchRequest {
+    generation: u64,
+    archived: bool,
+    continuation: Option<SearchContinuation>,
+}
+
+fn run_background_search_page(
     model: Arc<ClientModel>,
     filter: InboxFilter,
-    generation: u64,
+    request: BackgroundSearchRequest,
     cancelled_generation: Arc<AtomicU64>,
     results: mpsc::SyncSender<BackgroundSearchResult>,
 ) {
-    let model_revision = model.task_projection_index().revision();
-    let mut active: Option<SearchPage> = None;
-    let mut archived: Option<SearchPage> = None;
-    loop {
-        if cancelled_generation.load(AtomicOrdering::Acquire) != generation {
-            return;
-        }
-        if active
-            .as_ref()
-            .is_none_or(|page| page.continuation().is_some())
-        {
-            let continuation = active.as_ref().and_then(|page| page.continuation());
-            active = Some(model.search_task_ids_page(filter.query(), false, continuation));
-        }
-        if filter.includes_archived()
-            && archived
-                .as_ref()
-                .is_none_or(|page| page.continuation().is_some())
-        {
-            let continuation = archived.as_ref().and_then(|page| page.continuation());
-            archived = Some(model.search_task_ids_page(filter.query(), true, continuation));
-        }
-        let active_page = active.clone().expect("active search page");
-        let archived_page = archived.clone();
-        let done = active_page.continuation().is_none()
-            && (!filter.includes_archived()
-                || archived_page
-                    .as_ref()
-                    .is_some_and(|page| page.continuation().is_none()));
-        let mut result = BackgroundSearchResult {
-            generation,
-            model_revision,
-            active: active_page,
-            archived: archived_page,
-        };
-        loop {
-            match results.try_send(result) {
-                Ok(()) => break,
-                Err(TrySendError::Disconnected(_)) => return,
-                Err(TrySendError::Full(next)) => {
-                    result = next;
-                    if cancelled_generation.load(AtomicOrdering::Acquire) != generation {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }
-        if done {
-            return;
-        }
+    if cancelled_generation.load(AtomicOrdering::Acquire) != request.generation {
+        return;
     }
+    let page = model.search_task_ids_page(
+        filter.query(),
+        request.archived,
+        request.continuation.as_ref(),
+    );
+    if cancelled_generation.load(AtomicOrdering::Acquire) != request.generation {
+        return;
+    }
+    let _ = results.try_send(BackgroundSearchResult {
+        generation: request.generation,
+        model_revision: model.task_projection_index().revision(),
+        archived: request.archived,
+        page,
+    });
 }
 
-/// The production native-shell bridge. A shell owns one subscription and one
-/// projection; no legacy task-list cache is permitted beside it. Host IO is
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SearchProgress {
+    pub published: bool,
+    pub requested: bool,
+    pub complete: bool,
+}
+
+/// The production Inbox projection bridge. The canonical lane owns one
+/// projection; no legacy task-list cache is permitted beside it. Transport IO is
 /// caller-driven, while this object keeps the durable cursor and performs the
 /// small projection update synchronously after each applied event.
 #[derive(Debug, Default)]
@@ -652,6 +630,8 @@ pub struct InboxRuntime {
     background_cancel: Option<Arc<AtomicU64>>,
     background_results: Option<Receiver<BackgroundSearchResult>>,
     background_model: Option<Arc<ClientModel>>,
+    background_active_page: Option<SearchPage>,
+    background_archived_page: Option<SearchPage>,
 }
 
 impl InboxRuntime {
@@ -670,7 +650,7 @@ impl InboxRuntime {
 
     /// Attach the caller-driven production subscription without cloning its
     /// potentially large ClientModel. The pump owns the mutex while it awaits
-    /// HostClient IO; the UI only takes a short `try_lock` during update/render
+    /// Transport IO; the UI only takes a short `try_lock` during update/render
     /// handoff and therefore never waits on transport from paint/input.
     pub fn attach_live_subscription(&mut self, subscription: LiveClientSubscription) {
         self.cancel_background_search();
@@ -681,7 +661,7 @@ impl InboxRuntime {
         self.refresh_from_subscription();
     }
 
-    /// Native-next attaches the one controller-owned subscription here. The
+    /// Native-next attaches the one canonical-lane subscription here. The
     /// controller remains responsible for host I/O; this method only hands
     /// the shared model projection to the caller's Inbox runtime.
     pub fn attach_host_controller(&mut self, controller: &InboxHostController) {
@@ -779,9 +759,19 @@ impl InboxRuntime {
                 }
                 let filter = self.filter.clone();
                 let unread = self.unread.clone();
-                self.projection = subscription
-                    .model()
-                    .map(|model| Inbox::from_model_with_filter(model, &filter, &unread));
+                self.projection = subscription.model().map(|model| {
+                    if filter.query().trim().is_empty() {
+                        Inbox::from_model_with_filter(model, &filter, &unread)
+                    } else {
+                        Inbox::from_model_with_search_pages(
+                            model,
+                            &filter,
+                            &unread,
+                            empty_background_search_page(),
+                            None,
+                        )
+                    }
+                });
                 self.projection_stale = false;
                 self.projection_updates = self.projection_updates.saturating_add(1);
             }
@@ -809,18 +799,23 @@ impl InboxRuntime {
     /// or model-revision mismatch is discarded and can never replace rows for
     /// a newer filter or subscription generation.
     pub fn poll_background_search(&mut self) -> bool {
-        let result = match self.background_results.as_ref() {
-            Some(results) => match results.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    self.background_results = None;
-                    self.background_cancel = None;
-                    return false;
-                }
-            },
-            None => return false,
+        let Some(results) = self.background_results.take() else {
+            return false;
         };
+        let result = match results.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                self.background_results = Some(results);
+                return false;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.background_cancel = None;
+                return false;
+            }
+        };
+        // A page worker always returns after one result. Clearing the in-flight
+        // slot here makes the next request an explicit canonical-lane demand.
+        self.background_cancel = None;
         if result.generation != self.search_generation || self.projection_stale {
             return false;
         }
@@ -836,9 +831,9 @@ impl InboxRuntime {
             };
             if model.task_projection_index().revision() != result.model_revision {
                 drop(subscription);
-                self.cancel_background_search();
                 self.rebuild_projection();
-                self.start_background_search();
+                self.background_active_page = None;
+                self.background_archived_page = None;
                 return false;
             }
             return self.publish_background_result(result, model);
@@ -847,12 +842,120 @@ impl InboxRuntime {
             return false;
         };
         if model.task_projection_index().revision() != result.model_revision {
-            self.cancel_background_search();
             self.rebuild_projection();
-            self.start_background_search();
+            self.background_active_page = None;
+            self.background_archived_page = None;
             return false;
         }
         self.publish_background_result(result, &model)
+    }
+
+    /// Advance one bounded continuation on the canonical controller lane.
+    /// Polling and scheduling are nonblocking; at most one page worker exists
+    /// and at most one next page is requested per tick.
+    pub fn tick_background_search(&mut self) -> SearchProgress {
+        let published = self.poll_background_search();
+        let requested = self.request_background_search_page();
+        SearchProgress {
+            published,
+            requested,
+            complete: self.background_search_complete(),
+        }
+    }
+
+    fn background_search_complete(&self) -> bool {
+        if self.filter.query().trim().is_empty() {
+            return true;
+        }
+        let active_complete = self
+            .background_active_page
+            .as_ref()
+            .is_some_and(|page| page.continuation().is_none());
+        let archived_complete = !self.filter.includes_archived()
+            || self
+                .background_archived_page
+                .as_ref()
+                .is_some_and(|page| page.continuation().is_none());
+        active_complete && archived_complete
+    }
+
+    /// Request exactly one page. The caller must invoke this again after the
+    /// returned page is published if the continuation still has demand.
+    pub fn request_background_search_page(&mut self) -> bool {
+        if self.projection_stale
+            || self.filter.query().trim().is_empty()
+            || self.background_results.is_some()
+        {
+            return false;
+        }
+        let (archived, continuation) = if self.background_active_page.is_none() {
+            (false, None)
+        } else if self
+            .background_active_page
+            .as_ref()
+            .is_some_and(|page| page.continuation().is_some())
+        {
+            (
+                false,
+                self.background_active_page
+                    .as_ref()
+                    .and_then(|page| page.continuation().cloned()),
+            )
+        } else if !self.filter.includes_archived() {
+            return false;
+        } else if self.background_archived_page.is_none() {
+            (true, None)
+        } else if self
+            .background_archived_page
+            .as_ref()
+            .is_some_and(|page| page.continuation().is_some())
+        {
+            (
+                true,
+                self.background_archived_page
+                    .as_ref()
+                    .and_then(|page| page.continuation().cloned()),
+            )
+        } else {
+            return false;
+        };
+
+        let subscription = self.live_subscription.clone();
+        let model = self.background_model.clone();
+        if subscription.is_none() && model.is_none() {
+            return false;
+        }
+        let generation = self.search_generation;
+        let cancellation = Arc::new(AtomicU64::new(generation));
+        let (results_tx, results_rx) = mpsc::sync_channel(1);
+        self.background_cancel = Some(Arc::clone(&cancellation));
+        self.background_results = Some(results_rx);
+        let filter = self.filter.clone();
+        thread::spawn(move || {
+            let model = model.or_else(|| {
+                subscription.and_then(|subscription| {
+                    subscription
+                        .lock()
+                        .ok()
+                        .and_then(|subscription| subscription.model().cloned())
+                        .map(Arc::new)
+                })
+            });
+            if let Some(model) = model {
+                run_background_search_page(
+                    model,
+                    filter,
+                    BackgroundSearchRequest {
+                        generation,
+                        archived,
+                        continuation,
+                    },
+                    cancellation,
+                    results_tx,
+                );
+            }
+        });
+        true
     }
 
     fn publish_background_result(
@@ -860,24 +963,24 @@ impl InboxRuntime {
         result: BackgroundSearchResult,
         model: &ClientModel,
     ) -> bool {
-        let done = result.active.continuation().is_none()
-            && result
-                .archived
-                .as_ref()
-                .is_none_or(|page| page.continuation().is_none());
+        if result.archived {
+            self.background_archived_page = Some(result.page);
+        } else {
+            self.background_active_page = Some(result.page);
+        }
+        let Some(active_page) = self.background_active_page.clone() else {
+            return false;
+        };
+        let archived_page = self.background_archived_page.clone();
         self.projection = Some(Inbox::from_model_with_search_pages(
             model,
             &self.filter,
             &self.unread,
-            result.active,
-            result.archived,
+            active_page,
+            archived_page,
         ));
         self.projection_stale = false;
         self.projection_updates = self.projection_updates.saturating_add(1);
-        if done {
-            self.background_results = None;
-            self.background_cancel = None;
-        }
         true
     }
 
@@ -1013,9 +1116,31 @@ impl InboxRuntime {
                 let _ = self.unread.observe_durable_event(&event);
             }
             let unread = self.unread.clone();
-            self.projection = subscription
-                .model()
-                .map(|model| Inbox::from_model_with_filter(model, &filter, &unread));
+            self.projection = subscription.model().map(|model| {
+                if filter.query().trim().is_empty() {
+                    Inbox::from_model_with_filter(model, &filter, &unread)
+                } else {
+                    Inbox::from_model_with_search_pages(
+                        model,
+                        &filter,
+                        &unread,
+                        empty_background_search_page(),
+                        None,
+                    )
+                }
+            });
+        } else if let Some(model) = self.background_model.as_deref() {
+            self.projection = Some(if filter.query().trim().is_empty() {
+                Inbox::from_model_with_filter(model, &filter, &self.unread)
+            } else {
+                Inbox::from_model_with_search_pages(
+                    model,
+                    &filter,
+                    &self.unread,
+                    empty_background_search_page(),
+                    None,
+                )
+            });
         } else {
             self.projection = self.live_subscription.clone().and_then(|subscription| {
                 let mut subscription = subscription.try_lock().ok()?;
@@ -1023,9 +1148,19 @@ impl InboxRuntime {
                     let _ = self.unread.observe_durable_event(&event);
                 }
                 let unread = self.unread.clone();
-                subscription
-                    .model()
-                    .map(|model| Inbox::from_model_with_filter(model, &filter, &unread))
+                subscription.model().map(|model| {
+                    if filter.query().trim().is_empty() {
+                        Inbox::from_model_with_filter(model, &filter, &unread)
+                    } else {
+                        Inbox::from_model_with_search_pages(
+                            model,
+                            &filter,
+                            &unread,
+                            empty_background_search_page(),
+                            None,
+                        )
+                    }
+                })
             });
         }
         self.projection_stale = self.projection.is_none();
@@ -1040,37 +1175,12 @@ impl InboxRuntime {
             );
         }
         self.background_results = None;
+        self.background_active_page = None;
+        self.background_archived_page = None;
     }
 
     fn start_background_search(&mut self) {
-        if self.projection_stale || self.filter.query().trim().is_empty() {
-            return;
-        }
-        let subscription = self.live_subscription.clone();
-        let model = self.background_model.clone();
-        if subscription.is_none() && model.is_none() {
-            return;
-        }
-        let generation = self.search_generation;
-        let cancellation = Arc::new(AtomicU64::new(generation));
-        let (results_tx, results_rx) = mpsc::sync_channel(2);
-        self.background_cancel = Some(Arc::clone(&cancellation));
-        self.background_results = Some(results_rx);
-        let filter = self.filter.clone();
-        thread::spawn(move || {
-            let model = model.or_else(|| {
-                subscription.and_then(|subscription| {
-                    subscription
-                        .lock()
-                        .ok()
-                        .and_then(|subscription| subscription.model().cloned())
-                        .map(Arc::new)
-                })
-            });
-            if let Some(model) = model {
-                run_background_search(model, filter, generation, cancellation, results_tx);
-            }
-        });
+        let _ = self.request_background_search_page();
     }
 }
 
@@ -1223,6 +1333,10 @@ fn search_projection_page(
         archived,
         continuation,
     ))
+}
+
+fn empty_background_search_page() -> SearchPage {
+    SearchPage::pending()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2045,4 +2159,285 @@ fn compare_rows(left: &TaskRowModel, right: &TaskRowModel) -> Ordering {
         .then_with(|| left_title.cmp(&right_title))
         .then_with(|| left.title.cmp(&right.title))
         .then_with(|| left.task_id.cmp(&right.task_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ClientModelBuilder;
+    use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId};
+    use crate::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+        TaskLifecycle, WorkspaceRef,
+    };
+    use std::time::Duration;
+
+    fn search_model(task_count: u64) -> ClientModel {
+        search_model_with_title_prefix(task_count, "Task")
+    }
+
+    fn search_model_with_title_prefix(task_count: u64, title_prefix: &str) -> ClientModel {
+        let snapshot_id = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ])
+        .expect("snapshot");
+        let tasks = (0..task_count)
+            .map(|index| {
+                let id = crate::domain::id::TaskId::from_bytes({
+                    let mut bytes = [0u8; 16];
+                    bytes[..8].copy_from_slice(&[0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01]);
+                    bytes[8] = 0x80;
+                    bytes[9..].copy_from_slice(&index.to_be_bytes()[1..]);
+                    bytes
+                })
+                .expect("task");
+                SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id,
+                        environment_id: EnvironmentId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x11,
+                        ])
+                        .expect("environment"),
+                        title: format!("{title_prefix} {index}"),
+                        description: None,
+                        project_id: ProjectId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x12,
+                        ])
+                        .expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: index,
+                        created_at_ms: index as i64,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut builder = ClientModelBuilder::new();
+        for (section, items) in [
+            (SnapshotSection::Tasks, tasks),
+            (SnapshotSection::AgentSessions, Vec::new()),
+            (SnapshotSection::Artifacts, Vec::new()),
+            (SnapshotSection::Resources, Vec::new()),
+            (SnapshotSection::Operations, Vec::new()),
+        ] {
+            builder
+                .ingest_page(SnapshotPage {
+                    snapshot_id,
+                    through_sequence: 1,
+                    section,
+                    after_item: None,
+                    items,
+                    encoded_bytes: 1,
+                    next_cursor: None,
+                })
+                .expect("snapshot page");
+        }
+        builder.finish().expect("client model")
+    }
+
+    #[test]
+    fn background_search_worker_publishes_one_requested_page_then_returns() {
+        let model = Arc::new(search_model(10_001));
+        let first = model.search_task_ids_page("task", false, None);
+        let continuation = first
+            .continuation()
+            .cloned()
+            .expect("fixture must require a continuation");
+        let request = BackgroundSearchRequest {
+            generation: 7,
+            archived: false,
+            continuation: Some(continuation),
+        };
+        let cancellation = Arc::new(AtomicU64::new(7));
+        let (results_tx, results_rx) = mpsc::sync_channel(1);
+
+        run_background_search_page(
+            model,
+            InboxFilter::new("task"),
+            request,
+            cancellation,
+            results_tx,
+        );
+
+        let result = results_rx.try_recv().expect("one page result");
+        assert_eq!(result.page.ids.len(), MAX_TASK_LIST_ITEMS);
+        assert!(
+            results_rx.try_recv().is_err(),
+            "one worker invocation must not prequeue a second continuation"
+        );
+    }
+
+    #[test]
+    fn background_search_worker_discards_cancelled_generation_before_publish() {
+        let model = Arc::new(search_model(10_001));
+        let cancellation = Arc::new(AtomicU64::new(8));
+        let (results_tx, results_rx) = mpsc::sync_channel(1);
+
+        run_background_search_page(
+            model,
+            InboxFilter::new("task"),
+            BackgroundSearchRequest {
+                generation: 7,
+                archived: false,
+                continuation: None,
+            },
+            cancellation,
+            results_tx,
+        );
+
+        assert!(results_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_requests_one_page_only_after_the_previous_page_is_published() {
+        let model = Arc::new(search_model(10_001));
+        let mut runtime = InboxRuntime::new();
+        runtime.background_model = Some(Arc::clone(&model));
+        runtime.filter = InboxFilter::new("task");
+        runtime.projection_stale = false;
+        runtime.projection = Some(Inbox::from_model_with_search_pages(
+            &model,
+            &runtime.filter,
+            &runtime.unread,
+            SearchPage::pending(),
+            None,
+        ));
+
+        assert!(runtime.request_background_search_page());
+        assert!(runtime.background_search_pending());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !runtime.poll_background_search() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one bounded page must become available"
+            );
+            thread::yield_now();
+        }
+        assert!(!runtime.background_search_pending());
+        assert_eq!(
+            runtime
+                .projection()
+                .expect("published first page")
+                .active_rows()
+                .len(),
+            MAX_TASK_LIST_ITEMS
+        );
+
+        let progress = runtime.tick_background_search();
+        assert!(progress.requested, "the next page is explicit tick demand");
+        assert!(runtime.background_search_pending());
+        assert!(
+            !runtime.tick_background_search().requested,
+            "a paused page cannot prequeue another worker"
+        );
+    }
+
+    #[test]
+    fn runtime_filter_change_cancels_and_cannot_publish_an_old_generation() {
+        let model = Arc::new(search_model(10_001));
+        let mut runtime = InboxRuntime::new();
+        runtime.background_model = Some(Arc::clone(&model));
+        runtime.filter = InboxFilter::new("task");
+        runtime.projection_stale = false;
+        runtime.projection = Some(Inbox::from_model_with_search_pages(
+            &model,
+            &runtime.filter,
+            &runtime.unread,
+            SearchPage::pending(),
+            None,
+        ));
+        let (results_tx, results_rx) = mpsc::sync_channel(1);
+        runtime.background_results = Some(results_rx);
+        let cancellation = Arc::new(AtomicU64::new(runtime.search_generation));
+        runtime.background_cancel = Some(Arc::clone(&cancellation));
+        results_tx
+            .send(BackgroundSearchResult {
+                generation: runtime.search_generation,
+                model_revision: model.task_projection_index().revision(),
+                archived: false,
+                page: model.search_task_ids_page("task", false, None),
+            })
+            .expect("old result is queued before the filter changes");
+
+        runtime.set_filter(InboxFilter::new("different"));
+
+        assert!(
+            runtime.background_search_pending(),
+            "the new generation may have one page in flight, but the old result is gone"
+        );
+        assert!(cancellation.load(AtomicOrdering::Acquire) != 0);
+        assert_eq!(runtime.filter().query(), "different");
+        assert_eq!(
+            runtime
+                .projection()
+                .expect("new filter placeholder")
+                .active_rows()
+                .len(),
+            0
+        );
+        runtime.cancel_background_search();
+    }
+
+    #[test]
+    fn runtime_keeps_partial_overflow_truth_until_exact_total_arrives() {
+        let model = Arc::new(search_model_with_title_prefix(100_000, "aaaaaaaaa"));
+        let mut runtime = InboxRuntime::new();
+        runtime.background_model = Some(Arc::clone(&model));
+        runtime.filter = InboxFilter::new("aaaaaaaaa");
+        runtime.projection_stale = false;
+        runtime.projection = Some(Inbox::from_model_with_search_pages(
+            &model,
+            &runtime.filter,
+            &runtime.unread,
+            SearchPage::pending(),
+            None,
+        ));
+
+        assert!(runtime.request_background_search_page());
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !runtime.poll_background_search() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first bounded page must become available"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            runtime
+                .projection()
+                .expect("first page projection")
+                .active_overflow()
+                .expect("partial search must expose overflow")
+                .total_count,
+            MAX_TASK_LIST_ITEMS + 1
+        );
+
+        while !runtime.tick_background_search().complete {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded continuation must eventually reach its exact total"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            runtime
+                .projection()
+                .expect("complete search projection")
+                .active_overflow()
+                .expect("100000 results still exceed the retained window")
+                .total_count,
+            100_000
+        );
+    }
 }

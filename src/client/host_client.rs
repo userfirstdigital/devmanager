@@ -27,6 +27,8 @@ use crate::protocol::{
 
 use super::action::task_show_query;
 use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
+use super::inbox_controller::{InboxTransport, InboxTransportFuture};
+use super::subscription::{ClientSubscription, SubscriptionError, SubscriptionUpdate};
 
 /// Caller-owned connection configuration. `client_id` is never rotated here.
 #[derive(Debug, Clone)]
@@ -878,6 +880,44 @@ impl HostClient {
     #[cfg(test)]
     fn attached_connection(&self) -> Option<&ClientConnection> {
         self.connection.as_ref()
+    }
+}
+
+impl InboxTransport for HostClient {
+    fn is_connected(&self) -> bool {
+        HostClient::is_connected(self)
+    }
+
+    fn synchronize<'a>(
+        &'a mut self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>> {
+        Box::pin(async move { subscription.synchronize(self).await })
+    }
+
+    fn receive_one<'a>(
+        &'a self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<SubscriptionUpdate, SubscriptionError>> {
+        Box::pin(async move { subscription.recv_and_apply(self).await })
+    }
+
+    fn release<'a>(
+        &'a mut self,
+        subscription: &'a mut ClientSubscription,
+    ) -> InboxTransportFuture<'a, Result<(), SubscriptionError>> {
+        Box::pin(async move { subscription.release(self).await })
+    }
+
+    fn reconnect<'a>(&'a mut self) -> InboxTransportFuture<'a, Result<(), IpcError>> {
+        Box::pin(async move { HostClient::reconnect(self).await })
+    }
+
+    fn execute_command<'a>(
+        &'a mut self,
+        envelope: CommandEnvelope,
+    ) -> InboxTransportFuture<'a, Result<CommandReceipt, IpcError>> {
+        Box::pin(async move { HostClient::execute_command(self, envelope).await })
     }
 }
 
