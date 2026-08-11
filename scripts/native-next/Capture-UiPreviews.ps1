@@ -4,6 +4,7 @@ param(
     [switch]$AllThemes,
     [switch]$AllScales,
     [switch]$AutomateWindowStates,
+    [switch]$ValidateOnly,
     [string]$TargetDir = 'C:\Temp\devmanager-phase5-ui-capture-correction3',
     [string]$BinaryPath,
     [string]$OutputRoot
@@ -15,7 +16,362 @@ $repoRoot = (Resolve-Path (Join-Path $scriptRoot '..\..')).Path
 $fixtureRoot = Join-Path $repoRoot 'tests\fixtures\ui'
 $approvedEvidenceRoot = Join-Path $repoRoot '.devmanager-next\evidence\phase-05\screenshots'
 $approvedEvidencePrefix = ([IO.Path]::GetFullPath($approvedEvidenceRoot)).TrimEnd('\') + '\'
+$artifactReceiptPath = Join-Path $repoRoot '.devmanager-next\preview-artifact.json'
+$canonicalWorktree = ([IO.Path]::GetFullPath($repoRoot)).TrimEnd('\')
+$artifactSchema = 'devmanager.native-next.preview-artifact/v1'
+$artifactName = 'devmanager-next'
+$artifactBinaryName = 'devmanager-next.exe'
 $runToken = '{0}-{1}' -f $PID, ([Guid]::NewGuid().ToString('N'))
+
+if ($env:OS -eq 'Windows_NT' -and $null -eq ('DevManagerPreviewArtifactNative' -as [type])) {
+    Add-Type @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class DevManagerPreviewArtifactNative
+{
+    private const uint GenericRead = 0x80000000;
+    private const uint ShareRead = 0x00000001;
+    private const uint OpenExisting = 3;
+    private const uint OpenReparsePoint = 0x00200000;
+    private const uint FileAttributeNormal = 0x00000080;
+    private const uint FileAttributeReparsePoint = 0x00000400;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle file,
+        out ByHandleFileInformation information);
+
+    public static SafeFileHandle OpenReadNoFollow(string path)
+    {
+        var handle = CreateFileW(
+            path,
+            GenericRead,
+            ShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileAttributeNormal | OpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "preview artifact identity could not open the file without following a reparse point");
+        }
+        return handle;
+    }
+
+    private static ByHandleFileInformation Read(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var information))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "preview artifact identity could not read the retained file identity");
+        }
+        return information;
+    }
+
+    public static bool IsReparsePoint(SafeFileHandle handle)
+    {
+        return (Read(handle).FileAttributes & FileAttributeReparsePoint) != 0;
+    }
+
+    public static long Length(SafeFileHandle handle)
+    {
+        var information = Read(handle);
+        return ((long)information.FileSizeHigh << 32) | information.FileSizeLow;
+    }
+
+    public static string Identity(SafeFileHandle handle)
+    {
+        var information = Read(handle);
+        return $"{information.VolumeSerialNumber:x8}:{information.FileIndexHigh:x8}{information.FileIndexLow:x8}";
+    }
+}
+'@
+}
+
+function Get-PreviewSourceRevision {
+    $revisionLines = @(& git -C $canonicalWorktree rev-parse --verify HEAD 2>$null)
+    $gitExitCode = $LASTEXITCODE
+    $revision = $revisionLines | Select-Object -First 1
+    if ($gitExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($revision)) {
+        throw 'preview artifact identity could not resolve the canonical worktree revision.'
+    }
+    $revision.ToString().Trim()
+}
+
+function Get-PreviewHostTarget {
+    $versionLines = @(& rustc -vV 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'preview artifact identity could not resolve the Rust host target.'
+    }
+    $hostLine = $versionLines | Where-Object { $_ -match '^host:\s*(.+)$' } | Select-Object -First 1
+    if ($null -eq $hostLine -or $hostLine -notmatch '^host:\s*(.+)$') {
+        throw 'preview artifact identity could not parse the Rust host target.'
+    }
+    $Matches[1].Trim()
+}
+
+function Assert-PreviewPathHasNoReparseAncestors {
+    param([string]$Path)
+
+    $cursor = [IO.Path]::GetFullPath($Path)
+    while ($true) {
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "preview artifact identity refuses a reparse ancestor: $cursor"
+        }
+        $parent = $item.Parent
+        if ($null -eq $parent -or $parent.FullName.Equals($cursor, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $cursor = $parent.FullName
+    }
+}
+
+function Open-PreviewArtifactNoFollow {
+    param([string]$Path)
+
+    $canonicalPath = [IO.Path]::GetFullPath($Path)
+    Assert-PreviewPathHasNoReparseAncestors -Path $canonicalPath
+    $handle = $null
+    $stream = $null
+    try {
+        $handle = [DevManagerPreviewArtifactNative]::OpenReadNoFollow($canonicalPath)
+        if ([DevManagerPreviewArtifactNative]::IsReparsePoint($handle)) {
+            throw 'preview artifact identity refuses a reparse-point executable.'
+        }
+        $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::Read)
+        $handle = $null
+        [pscustomobject]@{
+            Path = $canonicalPath
+            Stream = $stream
+            FileIdentity = [DevManagerPreviewArtifactNative]::Identity($stream.SafeFileHandle)
+            Length = [DevManagerPreviewArtifactNative]::Length($stream.SafeFileHandle)
+        }
+    } catch {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        } elseif ($null -ne $handle) {
+            $handle.Dispose()
+        }
+        throw
+    }
+}
+
+function Get-PreviewArtifactSha256 {
+    param([IO.Stream]$Stream)
+
+    $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        $digest = $hashAlgorithm.ComputeHash($Stream)
+        ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hashAlgorithm.Dispose()
+    }
+}
+
+function Get-PreviewArtifactSnapshot {
+    param([string]$Path)
+
+    $opened = Open-PreviewArtifactNoFollow -Path $Path
+    try {
+        $identityBefore = [DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle)
+        $hash = Get-PreviewArtifactSha256 -Stream $opened.Stream
+        $identityAfter = [DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle)
+        if ($identityBefore -ne $identityAfter) {
+            throw 'preview artifact identity changed while its retained handle was read.'
+        }
+        [pscustomobject]@{
+            Path = $opened.Path
+            FileIdentity = $identityAfter
+            Length = [int64]$opened.Length
+            Sha256 = $hash
+        }
+    } finally {
+        $opened.Stream.Dispose()
+    }
+}
+
+function New-PreviewArtifactReceipt {
+    param(
+        [string]$Path,
+        [string]$SourceRevision,
+        [string]$HostTarget
+    )
+
+    $snapshot = Get-PreviewArtifactSnapshot -Path $Path
+    $receipt = [pscustomobject][ordered]@{
+        schema = $artifactSchema
+        artifact = $artifactName
+        canonicalWorktree = $canonicalWorktree
+        sourceRevision = $SourceRevision
+        buildContract = [pscustomobject][ordered]@{
+            package = 'devmanager'
+            binary = $artifactName
+            profile = 'debug'
+            target = $HostTarget
+            locked = $true
+            offline = $true
+            targetDir = 'isolated-per-capture-run'
+        }
+        binaryPath = $snapshot.Path
+        binaryName = $artifactBinaryName
+        binaryFileIdentity = $snapshot.FileIdentity
+        binaryLength = $snapshot.Length
+        binarySha256 = $snapshot.Sha256
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $artifactReceiptPath) | Out-Null
+    $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $artifactReceiptPath -Encoding utf8NoBOM
+    $receipt
+}
+
+function Read-PreviewArtifactReceipt {
+    $opened = Open-PreviewArtifactNoFollow -Path $artifactReceiptPath
+    try {
+        $reader = [IO.StreamReader]::new($opened.Stream, [Text.Encoding]::UTF8, $true, 1024, $true)
+        try {
+            $receiptJson = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+        if ([DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle) -ne $opened.FileIdentity) {
+            throw 'preview artifact identity receipt changed while it was being read.'
+        }
+        $receipt = $receiptJson | ConvertFrom-Json
+    } finally {
+        $opened.Stream.Dispose()
+    }
+    if ($null -eq $receipt -or $receipt.schema -ne $artifactSchema -or $receipt.artifact -ne $artifactName) {
+        throw 'preview artifact identity receipt has the wrong schema or artifact.'
+    }
+    $receipt
+}
+
+function Assert-PreviewArtifactIdentity {
+    param(
+        [string]$RequestedPath,
+        [object]$Receipt,
+        [string]$SourceRevision,
+        [string]$HostTarget
+    )
+
+    $requested = [IO.Path]::GetFullPath($RequestedPath)
+    $expectedPath = [IO.Path]::GetFullPath([string]$Receipt.binaryPath)
+    if (-not $requested.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'preview artifact identity rejected a caller-supplied path that is not the recorded canonical artifact.'
+    }
+    if (-not ([IO.Path]::GetFileName($expectedPath)).Equals($artifactBinaryName, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'preview artifact identity rejected an artifact with the wrong executable name.'
+    }
+    if (-not ([IO.Path]::GetFullPath([string]$Receipt.canonicalWorktree)).TrimEnd('\').Equals($canonicalWorktree, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'preview artifact identity receipt is bound to another canonical worktree.'
+    }
+    if (-not ([string]$Receipt.sourceRevision).Equals($SourceRevision, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'preview artifact identity receipt is stale for the current source revision.'
+    }
+    $contract = $Receipt.buildContract
+    if ($null -eq $contract -or
+        $contract.package -ne 'devmanager' -or
+        $contract.binary -ne $artifactName -or
+        $contract.profile -ne 'debug' -or
+        $contract.target -ne $HostTarget -or
+        -not [bool]$contract.locked -or
+        -not [bool]$contract.offline -or
+        $contract.targetDir -ne 'isolated-per-capture-run') {
+        throw 'preview artifact identity receipt has the wrong build contract.'
+    }
+
+    $opened = Open-PreviewArtifactNoFollow -Path $expectedPath
+    try {
+        $identityBefore = [DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle)
+        $hash = Get-PreviewArtifactSha256 -Stream $opened.Stream
+        $identityAfter = [DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle)
+        if ($identityBefore -ne $identityAfter) {
+            throw 'preview artifact identity changed during immediate pre-launch revalidation.'
+        }
+        if ($identityAfter -ne [string]$Receipt.binaryFileIdentity) {
+            throw 'preview artifact identity file identity does not match the build receipt.'
+        }
+        if ([int64]$opened.Length -ne [int64]$Receipt.binaryLength -or $hash -ne [string]$Receipt.binarySha256) {
+            throw 'preview artifact identity content hash or length does not match the build receipt.'
+        }
+        $opened
+    } catch {
+        $opened.Stream.Dispose()
+        throw
+    }
+}
+
+function Invoke-TrustedPreview {
+    param(
+        [string]$Path,
+        [object]$Receipt,
+        [string]$SourceRevision,
+        [string]$HostTarget,
+        [string[]]$Arguments
+    )
+
+    $opened = Assert-PreviewArtifactIdentity -RequestedPath $Path -Receipt $Receipt -SourceRevision $SourceRevision -HostTarget $HostTarget
+    try {
+        & $opened.Path @Arguments
+        $script:PreviewLastExitCode = $LASTEXITCODE
+    } finally {
+        $opened.Stream.Dispose()
+    }
+}
+
+function Start-TrustedPreview {
+    param(
+        [string]$Path,
+        [object]$Receipt,
+        [string]$SourceRevision,
+        [string]$HostTarget,
+        [string[]]$Arguments
+    )
+
+    $opened = Assert-PreviewArtifactIdentity -RequestedPath $Path -Receipt $Receipt -SourceRevision $SourceRevision -HostTarget $HostTarget
+    try {
+        $process = Start-Process -FilePath $opened.Path -ArgumentList $Arguments -PassThru -WindowStyle Normal
+        [pscustomobject]@{ Process = $process; Stream = $opened.Stream }
+        $opened = $null
+    } finally {
+        if ($null -ne $opened) {
+            $opened.Stream.Dispose()
+        }
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $approvedEvidenceRoot "ui-capture-$runToken"
@@ -28,14 +384,20 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $OutputRoot "run-$runToken"
 }
 
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $targetRoot = [IO.Path]::GetFullPath($TargetDir)
 $TargetRunDir = Join-Path $targetRoot "run-$runToken"
-New-Item -ItemType Directory -Force -Path $TargetRunDir | Out-Null
+if (-not $ValidateOnly) {
+    New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+}
+if (-not $ValidateOnly -and [string]::IsNullOrWhiteSpace($BinaryPath)) {
+    New-Item -ItemType Directory -Force -Path $TargetRunDir | Out-Null
+}
 
 $oldTargetDir = $env:CARGO_TARGET_DIR
 $oldBuildJobs = $env:CARGO_BUILD_JOBS
 try {
+    $sourceRevision = Get-PreviewSourceRevision
+    $hostTarget = Get-PreviewHostTarget
     if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
         $env:CARGO_TARGET_DIR = $TargetRunDir
         $env:CARGO_BUILD_JOBS = '1'
@@ -48,26 +410,31 @@ try {
         if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw 'isolated devmanager-next binary was not produced.'
         }
+        if ((Get-PreviewSourceRevision) -ne $sourceRevision) {
+            throw 'preview artifact identity source revision changed during the isolated build.'
+        }
+        $artifactReceipt = New-PreviewArtifactReceipt -Path $binary -SourceRevision $sourceRevision -HostTarget $hostTarget
     } else {
-        # A warm isolated binary is allowed only from this worktree; never launch an installed app.
+        # Warm mode is authorized only by the fixed receipt emitted by this script's isolated build.
         $warmBinaryPath = if ([IO.Path]::IsPathRooted($BinaryPath)) {
             $BinaryPath
         } else {
             Join-Path (Get-Location).Path $BinaryPath
         }
         $binary = [IO.Path]::GetFullPath($warmBinaryPath)
-        $repoPrefix = ([IO.Path]::GetFullPath($repoRoot)).TrimEnd('\') + '\'
-        if (-not ($binary.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or
-                $binary.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase))) {
-            throw 'warm isolated binary must remain beneath this worktree.'
-        }
-        $binaryItem = Get-Item -LiteralPath $binary -ErrorAction Stop
-        if (-not $binaryItem.PSIsContainer -and
-            (($binaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
-            Write-Verbose ("using warm isolated binary {0}" -f $binary)
-        } else {
-            throw 'warm isolated binary must be a non-reparse file.'
-        }
+        $artifactReceipt = Read-PreviewArtifactReceipt
+    }
+
+    $startupValidation = Assert-PreviewArtifactIdentity -RequestedPath $binary -Receipt $artifactReceipt -SourceRevision $sourceRevision -HostTarget $hostTarget
+    try {
+        Write-Verbose ("using validated warm isolated binary {0} ({1})" -f $binary, $startupValidation.FileIdentity)
+    } finally {
+        $startupValidation.Stream.Dispose()
+    }
+
+    if ($ValidateOnly) {
+        Write-Output ("Validated preview artifact identity for {0}." -f $binary)
+        return
     }
 
     $fixtureFiles = @(Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.json' -File |
@@ -135,6 +502,7 @@ public static class DevManagerPreviewWindow {
             [string]$OutputPath
         )
         $probe = $null
+        $launch = $null
         $window = $null
         $exitCode = $null
         $failure = $null
@@ -142,7 +510,8 @@ public static class DevManagerPreviewWindow {
         $outcome = 'probe-failed'
         $holdEvidence = 'probe-lifecycle-failed'
         try {
-            $probe = Start-Process -FilePath $binary -ArgumentList $Arguments -PassThru -WindowStyle Normal
+            $launch = Start-TrustedPreview -Path $binary -Receipt $artifactReceipt -SourceRevision $sourceRevision -HostTarget $hostTarget -Arguments $Arguments
+            $probe = $launch.Process
             $probeDeadline = [DateTime]::UtcNow.AddSeconds(2)
             while ([DateTime]::UtcNow -lt $probeDeadline -and -not $probe.HasExited) {
                 Start-Sleep -Milliseconds 25
@@ -198,6 +567,9 @@ public static class DevManagerPreviewWindow {
                     try { $joined = $probe.WaitForExit(1000) } catch { }
                 }
                 $probe.Dispose()
+            }
+            if ($null -ne $launch) {
+                $launch.Stream.Dispose()
             }
         }
         [pscustomobject]@{
@@ -279,8 +651,8 @@ public static class DevManagerPreviewWindow {
                         $arguments += @('--sample-page', [string]$page.SamplePage)
                     }
                 }
-                & $binary @arguments
-                $exitCode = $LASTEXITCODE
+                Invoke-TrustedPreview -Path $binary -Receipt $artifactReceipt -SourceRevision $sourceRevision -HostTarget $hostTarget -Arguments $arguments
+                $exitCode = $script:PreviewLastExitCode
                 if ($exitCode -eq 0) { break }
                 if ($attempt -lt 3) {
                     Start-Sleep -Milliseconds 150

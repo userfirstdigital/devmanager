@@ -320,6 +320,130 @@ fn capture_script_never_path_deletes_outputs_and_uses_unique_retry_names() {
     }
 }
 
+#[cfg(windows)]
+fn run_preview_artifact_validation(binary: &std::path::Path) -> std::process::Output {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/native-next/Capture-UiPreviews.ps1");
+    let output_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".devmanager-next/evidence/phase-05/screenshots");
+    let target_dir = binary
+        .parent()
+        .expect("temporary binary parent")
+        .join("isolated-target");
+    Command::new("pwsh")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .args(["-ValidateOnly", "-BinaryPath"])
+        .arg(binary)
+        .args(["-TargetDir"])
+        .arg(target_dir)
+        .args(["-OutputRoot"])
+        .arg(output_root)
+        .output()
+        .expect("PowerShell must run the preview artifact validator")
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_rejects_an_arbitrary_rust_harness_before_launch() {
+    let root = tempdir().expect("arbitrary harness root");
+    let renamed_harness = root.path().join("devmanager-next.exe");
+    fs::copy(
+        std::env::current_exe().expect("current Rust harness"),
+        &renamed_harness,
+    )
+    .expect("copy Rust harness under the canonical-looking name");
+
+    let result = run_preview_artifact_validation(&renamed_harness);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.status.success(),
+        "arbitrary harness was accepted: {combined}"
+    );
+    assert!(
+        combined.contains("preview artifact identity"),
+        "rejection must identify the provenance failure: {combined}"
+    );
+    assert!(
+        !combined.contains("Unrecognized option"),
+        "the Rust harness must not be launched before provenance rejection: {combined}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_rejects_a_renamed_unrelated_exe_before_launch() {
+    let root = tempdir().expect("unrelated executable root");
+    let unrelated = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .expect("SystemRoot")
+        .join("System32/where.exe");
+    assert!(
+        unrelated.is_file(),
+        "Windows where.exe must exist for this probe"
+    );
+    let renamed_unrelated = root.path().join("devmanager-next.exe");
+    fs::copy(&unrelated, &renamed_unrelated).expect("copy unrelated executable");
+
+    let result = run_preview_artifact_validation(&renamed_unrelated);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.status.success(),
+        "renamed unrelated EXE was accepted: {combined}"
+    );
+    assert!(
+        combined.contains("preview artifact identity"),
+        "rejection must identify the provenance failure: {combined}"
+    );
+}
+
+#[test]
+fn preview_script_binds_every_warm_launch_to_the_fixed_artifact_receipt() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "preview-artifact.json",
+        "Get-PreviewSourceRevision",
+        "buildContract",
+        "binaryFileIdentity",
+        "binarySha256",
+        "OpenReparsePoint",
+        "Open-PreviewArtifactNoFollow",
+        "Assert-PreviewArtifactIdentity",
+        "Invoke-TrustedPreview",
+        "Start-TrustedPreview",
+        "ValidateOnly",
+        "ShareRead",
+    ] {
+        assert!(
+            script.contains(marker),
+            "warm preview launches must enforce {marker}"
+        );
+    }
+    assert!(
+        !script.contains("StartsWith($repoPrefix"),
+        "a lexical worktree prefix must not be the warm-binary authority"
+    );
+}
+
 #[test]
 fn preview_cli_raii_shutdown_joins_capture_executor_on_every_exit() {
     let source =
