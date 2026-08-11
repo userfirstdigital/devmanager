@@ -10,7 +10,10 @@ use devmanager::domain::task::{TaskActivity, VisibleTaskStatus};
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::AccessibleRole;
 use devmanager::ui::shell::{HostEpochSnapshot, PointerButton, Shell, ShellAttachmentError};
-use devmanager::ui::task_cockpit::header::{AgentRoleProjection, CpuInputUnit, TitleLayout};
+use devmanager::ui::task_cockpit::header::{
+    AgentRoleProjection, CpuInputUnit, RemoteHealth, RemoteObservation, RemoteObservationIdentity,
+    TitleLayout,
+};
 use devmanager::ui::task_cockpit::{
     native_next_host_channel, HeaderField, HostSnapshot, NativeNextDispatchStatus,
     NativeNextHostCommand, NativeNextHostEvent, NativeNextTaskCockpit,
@@ -18,6 +21,7 @@ use devmanager::ui::task_cockpit::{
     TopBarProjectionController, TopBarProjectionInput, WorkspaceProjection, MAX_HEADER_SPECIALISTS,
     PROVIDER_QUOTA_MAX_AGE_MS,
 };
+use devmanager::ui::tokens::Scale;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +264,8 @@ fn cpu_input(
             cpu_observed_at_ms: Some(1_000),
             memory_observed_at_ms: Some(1_000),
             generation: Some(7),
+            cpu_revision: 1,
+            memory_revision: 1,
         }),
     }
 }
@@ -1056,6 +1062,7 @@ fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
     );
 
     assert!(cockpit.activate_open_task_details());
+    cockpit.tick();
     let NativeNextHostCommand::Dispatch(action) = worker
         .try_recv()
         .expect("activation must dispatch the projected action");
@@ -1075,6 +1082,7 @@ fn native_next_gpui_surface_renders_header_and_dispatches_open_details() {
     );
     assert!(wide_cockpit.render_surface(720).overflow_menu.is_none());
     assert!(wide_cockpit.activate_open_task_details());
+    wide_cockpit.tick();
     let NativeNextHostCommand::Dispatch(action) = wide_worker
         .try_recv()
         .expect("Ctrl+M must dispatch at wide width too");
@@ -1145,6 +1153,7 @@ fn native_next_dispatch_rechecks_shell_epochs_after_projection() {
         .action
         .clone();
     assert!(cockpit.activate_open_task_details());
+    cockpit.tick();
     assert!(matches!(
         worker.try_recv(),
         Ok(NativeNextHostCommand::Dispatch(_))
@@ -1156,8 +1165,13 @@ fn native_next_dispatch_rechecks_shell_epochs_after_projection() {
             .expect("stale shell snapshot");
     assert!(cockpit.apply_host_snapshot(stale_snapshot).is_ok());
     assert_eq!(
-        cockpit.dispatch_action(&captured_action),
-        NativeNextDispatchStatus::Rejected
+        cockpit.queue_action(&captured_action),
+        NativeNextDispatchStatus::Queued
+    );
+    cockpit.tick();
+    assert_eq!(
+        cockpit.host_state(),
+        devmanager::ui::task_cockpit::NativeNextHostState::Rejected
     );
     assert!(matches!(
         worker.try_recv(),
@@ -1273,6 +1287,129 @@ fn quota_controller_rejects_late_observations_by_provider_generation_and_authori
 }
 
 #[test]
+fn top_bar_controller_keeps_each_field_at_its_source_high_water_revision() {
+    let fixture = fixture();
+    let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+
+    let mut newer = fixture.top_bar.clone();
+    newer.now_ms += 1;
+    newer.host.as_mut().unwrap().identity.revision += 1;
+    newer.host.as_mut().unwrap().health = devmanager::ui::task_cockpit::HostHealth::Degraded;
+    newer.connect.as_mut().unwrap().identity.connection_epoch += 1;
+    newer.connect.as_mut().unwrap().state = devmanager::ui::task_cockpit::ConnectState::Connecting;
+    newer.update.as_mut().unwrap().identity.revision = 2;
+    newer.update.as_mut().unwrap().state = devmanager::ui::task_cockpit::UpdateState::Checking;
+    newer.resources.as_mut().unwrap().cpu_revision = 2;
+    newer.resources.as_mut().unwrap().cpu_percent = Some(25.0);
+    newer.resources.as_mut().unwrap().memory_revision = 2;
+    newer.resources.as_mut().unwrap().memory_bytes = Some(22_000_000);
+    assert!(controller.apply(newer).expect("newer source fields"));
+
+    let mut mixed = fixture.top_bar;
+    mixed.now_ms += 2;
+    mixed.host.as_mut().unwrap().identity.revision = 17;
+    mixed.host.as_mut().unwrap().health = devmanager::ui::task_cockpit::HostHealth::Unavailable;
+    mixed.connect.as_mut().unwrap().identity.connection_epoch = 5;
+    mixed.connect.as_mut().unwrap().state =
+        devmanager::ui::task_cockpit::ConnectState::Disconnected;
+    mixed.update.as_mut().unwrap().identity.revision = 1;
+    mixed.update.as_mut().unwrap().state = devmanager::ui::task_cockpit::UpdateState::Error;
+    mixed.resources.as_mut().unwrap().cpu_revision = 1;
+    mixed.resources.as_mut().unwrap().cpu_percent = Some(99.0);
+    mixed.resources.as_mut().unwrap().memory_revision = 3;
+    mixed.resources.as_mut().unwrap().memory_bytes = Some(33_000_000);
+    assert!(controller.apply(mixed).expect("mixed source fields"));
+
+    let model = controller.model();
+    assert_eq!(
+        model.host.as_ref().map(|link| link.status),
+        Some(devmanager::ui::task_cockpit::TopBarStatus::Host(
+            devmanager::ui::task_cockpit::HostHealth::Degraded
+        ))
+    );
+    assert_eq!(
+        model.connect.as_ref().map(|link| link.status),
+        Some(devmanager::ui::task_cockpit::TopBarStatus::Connect(
+            devmanager::ui::task_cockpit::ConnectState::Disconnected
+        ))
+    );
+    assert_eq!(
+        model.update.as_ref().map(|link| link.status),
+        Some(devmanager::ui::task_cockpit::TopBarStatus::Update(
+            devmanager::ui::task_cockpit::UpdateState::Checking
+        ))
+    );
+    let resources = model.resources.expect("resource projection");
+    assert_eq!(resources.cpu.unwrap().whole_machine_percent, 25.0 / 64.0);
+    assert_eq!(resources.memory_bytes, Some(33_000_000));
+}
+
+#[test]
+fn top_bar_controller_does_not_revive_resource_after_missing_bundle() {
+    let fixture = fixture();
+    let mut controller = TopBarProjectionController::new(fixture.top_bar.clone())
+        .expect("fixture top bar must pass controller preflight");
+
+    let mut missing = fixture.top_bar.clone();
+    missing.now_ms += 1;
+    missing.resources = None;
+    assert!(controller.apply(missing).expect("missing resource bundle"));
+    assert!(controller.model().resources.is_none());
+
+    let mut delayed = fixture.top_bar;
+    delayed.now_ms += 2;
+    delayed.resources.as_mut().expect("resources").cpu_revision = 0;
+    delayed
+        .resources
+        .as_mut()
+        .expect("resources")
+        .memory_revision = 0;
+    controller
+        .apply(delayed)
+        .expect("delayed resource bundle must be ignored");
+    assert!(controller.model().resources.is_none());
+}
+
+#[test]
+fn top_bar_controller_keeps_remote_source_at_its_high_water_revision() {
+    let fixture = fixture();
+    let initial_remote = RemoteObservation {
+        identity: RemoteObservationIdentity {
+            source_id: "remote-host".to_string(),
+            revision: 10,
+        },
+        health: RemoteHealth::Healthy,
+        label: "Remote host healthy".to_string(),
+        observed_at_ms: Some(fixture.top_bar.now_ms),
+        generation: Some(fixture.top_bar.generation),
+    };
+    let mut controller =
+        TopBarProjectionController::new_with_remote(fixture.top_bar.clone(), Some(initial_remote))
+            .expect("fixture top bar must pass controller preflight");
+
+    let mut mixed = fixture.top_bar;
+    mixed.now_ms += 1;
+    let stale_remote = RemoteObservation {
+        identity: RemoteObservationIdentity {
+            source_id: "remote-host".to_string(),
+            revision: 9,
+        },
+        health: RemoteHealth::Unavailable,
+        label: "Remote host unavailable".to_string(),
+        observed_at_ms: Some(mixed.now_ms),
+        generation: Some(mixed.generation),
+    };
+    assert!(controller
+        .apply_with_remote(mixed, Some(stale_remote))
+        .expect("mixed remote bundle"));
+    assert_eq!(
+        controller.remote().map(|remote| remote.health),
+        Some(RemoteHealth::Healthy)
+    );
+}
+
+#[test]
 fn top_bar_input_is_preflight_bounded_before_projection_copy_or_truncation() {
     let fixture = fixture();
     let mut oversized = fixture.top_bar;
@@ -1385,6 +1522,7 @@ fn native_next_host_attachment_updates_bounded_controller_and_dispatches_typed_a
     );
 
     assert!(cockpit.activate_open_task_details());
+    cockpit.tick();
     let NativeNextHostCommand::Dispatch(action) = worker.try_recv().expect("dispatch");
     assert_eq!(action.id(), action::ACTION_TASK_SHOW);
 }
@@ -1588,6 +1726,83 @@ fn native_next_render_tree_wraps_title_and_virtualizes_specialists_at_all_widths
 }
 
 #[test]
+fn native_next_render_waits_for_bounded_background_tick_and_input_only_queues() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let (mut cockpit, worker) =
+        native_cockpit(model.clone(), shell.clone(), fixture.top_bar.clone());
+
+    let mut newer_top_bar = fixture.top_bar.clone();
+    newer_top_bar.quotas[0].identity.observation_id += 1;
+    newer_top_bar.quotas[0].detail = Some("61% remaining".into());
+    let newer =
+        HostSnapshot::try_from_host(2, 2, model, shell, newer_top_bar).expect("newer snapshot");
+    worker
+        .send_event(NativeNextHostEvent::Snapshot(newer))
+        .expect("snapshot event");
+
+    let before_paint = cockpit.projection().clone();
+    let _tree = cockpit.render_tree_with_scale(320, Scale::Scale200);
+    assert_eq!(cockpit.projection(), &before_paint);
+
+    let tick = cockpit.tick();
+    assert_eq!(tick.events_drained, 1);
+    assert_eq!(
+        cockpit.projection().top_bar.quotas[0].detail,
+        "61% remaining"
+    );
+
+    assert!(cockpit.activate_open_task_details());
+    assert!(matches!(
+        worker.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(cockpit.tick().actions_drained, 1);
+    assert!(matches!(
+        worker.try_recv(),
+        Ok(NativeNextHostCommand::Dispatch(_))
+    ));
+}
+
+#[test]
+fn native_next_top_bar_layout_is_bounded_and_accessible_at_each_windows_scale() {
+    let fixture = fixture();
+    let model = model_from_pages(&fixture.snapshot_pages);
+    let shell = attached_shell(
+        Some(fixture.selected_task_id),
+        model.last_applied_sequence(),
+    );
+    let (cockpit, _worker) = native_cockpit(model, shell, fixture.top_bar);
+
+    for scale in [
+        Scale::Scale100,
+        Scale::Scale125,
+        Scale::Scale150,
+        Scale::Scale200,
+    ] {
+        let layout = cockpit.top_bar_layout(320, scale);
+        assert!(layout.rows >= 1, "top bar must occupy a row at {:?}", scale);
+        assert!(layout.logical_width_px <= 320);
+        assert_eq!(layout.visible_item_count, layout.item_count);
+        assert!(layout.hidden_item_count <= layout.item_count);
+        assert!(layout.virtualized_quota_count <= layout.item_count);
+
+        let tree = cockpit.render_tree_with_scale(320, scale);
+        assert_eq!(tree.top_bar.role, AccessibleRole::Region);
+        assert!(!tree.top_bar.accessible_description.is_empty());
+        for node in tree.top_bar.children.iter().filter(|node| node.focusable) {
+            assert_eq!(node.role, AccessibleRole::Button);
+            assert!(!node.label.is_empty());
+            assert!(!node.keyboard_shortcut.is_empty());
+        }
+    }
+}
+
+#[test]
 fn native_next_host_channel_is_bounded_nonblocking_and_receipts_project_back() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
@@ -1608,9 +1823,10 @@ fn native_next_host_channel_is_bounded_nonblocking_and_receipts_project_back() {
     let mut cockpit = NativeNextTaskCockpit::from_host_snapshot(snapshot, client);
 
     assert_eq!(
-        cockpit.dispatch_action(&action),
+        cockpit.queue_action(&action),
         NativeNextDispatchStatus::Queued
     );
+    assert_eq!(cockpit.tick().actions_drained, 1);
     assert!(matches!(
         worker.try_recv(),
         Ok(NativeNextHostCommand::Dispatch(_))
@@ -1620,7 +1836,7 @@ fn native_next_host_channel_is_bounded_nonblocking_and_receipts_project_back() {
             action_id: action.id(),
         })
         .expect("receipt event");
-    assert_eq!(cockpit.poll_host_events(), 1);
+    assert_eq!(cockpit.tick().events_drained, 1);
     assert!(cockpit.last_receipt().is_some());
 }
 
@@ -1645,13 +1861,15 @@ fn native_next_host_channel_reports_backpressure_and_typed_unavailable_without_l
         .action
         .clone();
     assert_eq!(
-        cockpit.dispatch_action(&action),
+        cockpit.queue_action(&action),
         NativeNextDispatchStatus::Queued
     );
+    assert_eq!(cockpit.tick().actions_drained, 1);
     assert_eq!(
-        cockpit.dispatch_action(&action),
-        NativeNextDispatchStatus::Backpressured
+        cockpit.queue_action(&action),
+        NativeNextDispatchStatus::Queued
     );
+    assert_eq!(cockpit.tick().actions_drained, 1);
     assert_eq!(
         cockpit.host_state(),
         devmanager::ui::task_cockpit::NativeNextHostState::Backpressured
@@ -1665,7 +1883,7 @@ fn native_next_host_channel_reports_backpressure_and_typed_unavailable_without_l
 }
 
 #[test]
-fn native_next_host_event_poll_collapses_contiguous_snapshots_and_reports_disconnect() {
+fn native_next_host_event_tick_collapses_contiguous_snapshots_and_reports_disconnect() {
     let fixture = fixture();
     let model = model_from_pages(&fixture.snapshot_pages);
     let shell = attached_shell(
@@ -1695,14 +1913,14 @@ fn native_next_host_event_poll_collapses_contiguous_snapshots_and_reports_discon
     worker
         .send_event(NativeNextHostEvent::Snapshot(third))
         .expect("third event");
-    assert_eq!(cockpit.poll_host_events(), 1);
+    assert_eq!(cockpit.tick().events_drained, 1);
     assert_eq!(
         cockpit.projection().top_bar.quotas[0].detail,
         "50% remaining"
     );
 
     drop(worker);
-    assert_eq!(cockpit.poll_host_events(), 0);
+    assert_eq!(cockpit.tick().events_drained, 0);
     assert_eq!(
         cockpit.host_state(),
         devmanager::ui::task_cockpit::NativeNextHostState::Unavailable

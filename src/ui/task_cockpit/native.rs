@@ -10,8 +10,8 @@ use std::num::NonZeroU64;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
 use gpui::{
-    div, px, uniform_list, App, Context, InteractiveElement, IntoElement, KeyBinding,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, uniform_list, App, Context, InteractiveElement, IntoElement, KeyBinding, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::button::Button;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -29,13 +29,18 @@ use super::{
     TopBarProjectionController, TopBarProjectionError, TopBarProjectionInput, TopBarStatusLink,
     WorkspaceProjection, NARROW_HEADER_WIDTH_PX,
 };
+use crate::ui::tokens::Scale;
 
 gpui::actions!(native_next_task_cockpit, [OpenTaskDetailsAction]);
 
 /// Maximum number of command/event messages drained by one UI turn.
 pub const NATIVE_NEXT_HOST_CHANNEL_CAPACITY: usize = 32;
 pub const NATIVE_NEXT_HOST_EVENT_DRAIN_LIMIT: usize = 32;
-const NATIVE_NEXT_SPECIALIST_RENDER_LIMIT: usize = 32;
+pub const NATIVE_NEXT_ACTION_QUEUE_CAPACITY: usize = 32;
+pub const NATIVE_NEXT_ACTION_DRAIN_LIMIT: usize = 32;
+/// Semantic accessibility snapshots stay bounded while the concrete GPUI
+/// uniform list virtualizes the complete specialist collection.
+const NATIVE_NEXT_SPECIALIST_SEMANTIC_WINDOW: usize = 32;
 
 /// One atomic snapshot issued by the host/client subscription boundary.
 ///
@@ -387,6 +392,7 @@ pub struct NativeNextRenderNode {
     pub focusable: bool,
     pub accessible_description: String,
     pub tooltip: String,
+    pub keyboard_shortcut: String,
     pub virtualized: bool,
     pub children: Vec<NativeNextRenderNode>,
 }
@@ -397,6 +403,63 @@ pub struct NativeNextRenderTree {
     pub header: Option<NativeNextRenderNode>,
     pub overflow_menu: Option<NativeNextRenderNode>,
     pub title_lines: Vec<String>,
+}
+
+/// Width/DPI facts used by the semantic top-bar layout and by the GPUI
+/// surface. Width is physical pixels; `logical_width_px` is the bounded
+/// width after Windows scaling has been applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeNextTopBarLayout {
+    pub width_px: u16,
+    pub logical_width_px: u16,
+    pub scale: Scale,
+    pub rows: u16,
+    pub item_count: usize,
+    pub visible_item_count: usize,
+    pub hidden_item_count: usize,
+    pub virtualized_quota_count: usize,
+}
+
+impl NativeNextTopBarLayout {
+    fn for_model(top_bar: &TopBarModel, width_px: u16, scale: Scale) -> Self {
+        let logical_width_px = ((u32::from(width_px) * 100) / u32::from(scale.percent()))
+            .clamp(1, u32::from(u16::MAX)) as u16;
+        let item_count = top_bar_item_count(top_bar);
+        let min_item_width = 96u32;
+        let row_capacity = (u32::from(logical_width_px) / min_item_width).max(1) as usize;
+        // Flex wrapping keeps every rendered control reachable. Only quota
+        // observations omitted by the bounded projection are hidden behind
+        // the explicit quota overflow control.
+        let visible_item_count = item_count;
+        let hidden_item_count = top_bar.quota_hidden_count;
+        let rows = if item_count == 0 {
+            1
+        } else {
+            ((item_count + row_capacity - 1) / row_capacity).min(u16::MAX as usize) as u16
+        };
+        Self {
+            width_px,
+            logical_width_px,
+            scale,
+            rows,
+            item_count,
+            visible_item_count,
+            hidden_item_count,
+            virtualized_quota_count: top_bar.quotas.len(),
+        }
+    }
+}
+
+/// Immutable result produced by the bounded background/tick adapter. GPUI
+/// consumes a clone of this projection; it never owns a receiver or drains a
+/// host channel during paint or input dispatch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeNextHostTick {
+    pub projection: NativeNextTaskCockpitProjection,
+    pub state: NativeNextHostState,
+    pub last_receipt: Option<NativeNextHostReceipt>,
+    pub actions_drained: usize,
+    pub events_drained: usize,
 }
 
 /// Bounded host-attachment state consumed by the renderer.
@@ -524,6 +587,9 @@ impl NativeNextHostAttachment {
     }
 
     fn dispatch_projected_action(&mut self, action: &ProjectedAction) -> NativeNextDispatchStatus {
+        if self.state == NativeNextHostState::Unavailable {
+            return NativeNextDispatchStatus::Unavailable;
+        }
         let valid = match action.target() {
             ActionTarget::Task(_) | ActionTarget::Agent(_) => self
                 .snapshot
@@ -549,7 +615,7 @@ impl NativeNextHostAttachment {
         status
     }
 
-    fn poll_host_events(&mut self) -> usize {
+    fn drain_host_events(&mut self) -> usize {
         let mut count = 0;
         let (events, disconnected) = self.host_client.drain_events();
         for event in events {
@@ -586,34 +652,118 @@ impl NativeNextHostAttachment {
     }
 }
 
+/// Bounded background/tick adapter for the host attachment.
+///
+/// The adapter is the only owner that drains host events or dispatches a
+/// projected action to the canonical shell. A GPUI click/keyboard callback
+/// only places an action in `action_rx`'s bounded queue; the caller invokes
+/// [`Self::tick`] from a background/tick boundary and then publishes the
+/// returned immutable snapshot to the view.
+pub struct NativeNextHostTickAdapter {
+    attachment: NativeNextHostAttachment,
+    action_rx: Receiver<ProjectedAction>,
+}
+
+impl NativeNextHostTickAdapter {
+    fn new(attachment: NativeNextHostAttachment, action_rx: Receiver<ProjectedAction>) -> Self {
+        Self {
+            attachment,
+            action_rx,
+        }
+    }
+
+    fn initial_tick(&self) -> NativeNextHostTick {
+        NativeNextHostTick {
+            projection: self.attachment.projection(),
+            state: self.attachment.state(),
+            last_receipt: self.attachment.last_receipt().cloned(),
+            actions_drained: 0,
+            events_drained: 0,
+        }
+    }
+
+    /// Drain at most the bounded action/event budgets and return one
+    /// immutable projection. No caller may observe a partially applied
+    /// snapshot because `NativeNextHostAttachment` is updated before this
+    /// value is published.
+    pub fn tick(&mut self) -> NativeNextHostTick {
+        // Apply the newest host snapshot before consuming queued input so an
+        // action is always fenced against the latest immutable projection.
+        let events_drained = self.attachment.drain_host_events();
+        let mut actions_drained = 0;
+        while actions_drained < NATIVE_NEXT_ACTION_DRAIN_LIMIT {
+            match self.action_rx.try_recv() {
+                Ok(action) => {
+                    actions_drained += 1;
+                    self.attachment.dispatch_projected_action(&action);
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        NativeNextHostTick {
+            projection: self.attachment.projection(),
+            state: self.attachment.state(),
+            last_receipt: self.attachment.last_receipt().cloned(),
+            actions_drained,
+            events_drained,
+        }
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        snapshot: HostSnapshot,
+    ) -> Result<NativeNextHostTick, HostSnapshotError> {
+        self.attachment.apply_snapshot(snapshot)?;
+        Ok(self.initial_tick())
+    }
+
+    fn reject(&mut self) {
+        self.attachment.state = NativeNextHostState::Rejected;
+    }
+}
+
 /// GPUI renderer/controller for the native-next task cockpit.
 pub struct NativeNextTaskCockpit {
     projection: NativeNextTaskCockpitProjection,
-    attachment: Option<NativeNextHostAttachment>,
+    action_tx: Option<SyncSender<ProjectedAction>>,
+    host_tick: Option<NativeNextHostTickAdapter>,
+    host_state: NativeNextHostState,
+    last_receipt: Option<NativeNextHostReceipt>,
 }
 
 impl NativeNextTaskCockpit {
     pub fn new(projection: NativeNextTaskCockpitProjection) -> Self {
         Self {
             projection,
-            attachment: None,
+            action_tx: None,
+            host_tick: None,
+            host_state: NativeNextHostState::Unavailable,
+            last_receipt: None,
         }
     }
 
     pub fn from_host_snapshot(snapshot: HostSnapshot, host_client: NativeNextHostClient) -> Self {
         let attachment = NativeNextHostAttachment::new(snapshot, host_client);
         let projection = attachment.projection();
+        let (action_tx, action_rx) = mpsc::sync_channel(NATIVE_NEXT_ACTION_QUEUE_CAPACITY);
         Self {
             projection,
-            attachment: Some(attachment),
+            action_tx: Some(action_tx),
+            host_tick: Some(NativeNextHostTickAdapter::new(attachment, action_rx)),
+            host_state: NativeNextHostState::Attached,
+            last_receipt: None,
         }
     }
 
     pub fn from_attachment(attachment: NativeNextHostAttachment) -> Self {
         let projection = attachment.projection();
+        let (action_tx, action_rx) = mpsc::sync_channel(NATIVE_NEXT_ACTION_QUEUE_CAPACITY);
         Self {
             projection,
-            attachment: Some(attachment),
+            action_tx: Some(action_tx),
+            host_tick: Some(NativeNextHostTickAdapter::new(attachment, action_rx)),
+            host_state: NativeNextHostState::Attached,
+            last_receipt: None,
         }
     }
 
@@ -629,52 +779,72 @@ impl NativeNextTaskCockpit {
     }
 
     pub fn host_state(&self) -> NativeNextHostState {
-        self.attachment.as_ref().map_or(
-            NativeNextHostState::Unavailable,
-            NativeNextHostAttachment::state,
-        )
+        self.host_state
     }
 
     pub fn last_receipt(&self) -> Option<&NativeNextHostReceipt> {
-        self.attachment
-            .as_ref()
-            .and_then(NativeNextHostAttachment::last_receipt)
+        self.last_receipt.as_ref()
+    }
+
+    /// Run one bounded background/tick adapter turn and publish its immutable
+    /// projection. This method is intentionally separate from `element()`;
+    /// callers must invoke it from the shell's subscription/tick boundary.
+    pub fn tick(&mut self) -> NativeNextHostTick {
+        let Some(adapter) = self.host_tick.as_mut() else {
+            return NativeNextHostTick {
+                projection: self.projection.clone(),
+                state: self.host_state,
+                last_receipt: self.last_receipt.clone(),
+                actions_drained: 0,
+                events_drained: 0,
+            };
+        };
+        let tick = adapter.tick();
+        self.apply_tick(&tick);
+        tick
+    }
+
+    fn apply_tick(&mut self, tick: &NativeNextHostTick) {
+        self.projection = tick.projection.clone();
+        self.host_state = tick.state;
+        self.last_receipt = tick.last_receipt.clone();
     }
 
     pub fn apply_host_snapshot(
         &mut self,
         snapshot: HostSnapshot,
     ) -> Result<bool, HostSnapshotError> {
-        let Some(attachment) = self.attachment.as_mut() else {
+        let Some(adapter) = self.host_tick.as_mut() else {
             return Err(HostSnapshotError::NoAttachment);
         };
-        let changed = match attachment.apply_snapshot(snapshot) {
-            Ok(changed) => changed,
+        let previous = self.projection.clone();
+        let tick = match adapter.apply_snapshot(snapshot) {
+            Ok(tick) => tick,
             Err(error) => {
-                attachment.state = NativeNextHostState::Rejected;
+                adapter.reject();
+                self.host_state = NativeNextHostState::Rejected;
                 return Err(error);
             }
         };
-        if changed {
-            self.projection = attachment.projection();
+        self.apply_tick(&tick);
+        Ok(previous != self.projection)
+    }
+
+    /// Queue an action for the background adapter. This operation is bounded,
+    /// nonblocking, and does not dispatch to the host from a GPUI input
+    /// callback.
+    pub fn queue_action(&self, action: &ProjectedAction) -> NativeNextDispatchStatus {
+        if self.host_state == NativeNextHostState::Unavailable {
+            return NativeNextDispatchStatus::Unavailable;
         }
-        Ok(changed)
-    }
-
-    pub fn poll_host_events(&mut self) -> usize {
-        let Some(attachment) = self.attachment.as_mut() else {
-            return 0;
-        };
-        let count = attachment.poll_host_events();
-        self.projection = attachment.projection();
-        count
-    }
-
-    pub fn dispatch_action(&mut self, action: &ProjectedAction) -> NativeNextDispatchStatus {
-        let Some(attachment) = self.attachment.as_mut() else {
+        let Some(action_tx) = self.action_tx.as_ref() else {
             return NativeNextDispatchStatus::Unavailable;
         };
-        attachment.dispatch_projected_action(action)
+        match action_tx.try_send(action.clone()) {
+            Ok(()) => NativeNextDispatchStatus::Queued,
+            Err(TrySendError::Full(_)) => NativeNextDispatchStatus::Backpressured,
+            Err(TrySendError::Disconnected(_)) => NativeNextDispatchStatus::Unavailable,
+        }
     }
 
     pub fn activate_open_task_details(&mut self) -> bool {
@@ -686,16 +856,29 @@ impl NativeNextTaskCockpit {
             .overflow_control
             .map(|control| control.action)
             .unwrap_or_else(|| header.status.action.clone());
-        self.dispatch_action(&action) == NativeNextDispatchStatus::Queued
+        self.queue_action(&action) == NativeNextDispatchStatus::Queued
+    }
+
+    pub fn top_bar_layout(&self, width_px: u16, scale: Scale) -> NativeNextTopBarLayout {
+        NativeNextTopBarLayout::for_model(&self.projection.top_bar, width_px, scale)
     }
 
     pub fn render_surface(&self, width_px: u16) -> NativeNextTaskCockpitSurface {
+        self.render_surface_with_scale(width_px, Scale::Scale100)
+    }
+
+    pub fn render_surface_with_scale(
+        &self,
+        width_px: u16,
+        scale: Scale,
+    ) -> NativeNextTaskCockpitSurface {
+        let logical_width_px = self.top_bar_layout(width_px, scale).logical_width_px;
         let (header_layout, overflow_control, overflow_menu) = self
             .projection
             .header
             .as_ref()
             .map(|header| {
-                let layout = header.responsive_layout(width_px);
+                let layout = header.responsive_layout(logical_width_px);
                 let overflow_control = layout.overflow_control.clone();
                 let overflow_menu = build_header_menu(header, &layout);
                 (Some(layout), overflow_control, overflow_menu)
@@ -713,8 +896,18 @@ impl NativeNextTaskCockpit {
     /// Build the semantic tree consumed by `element()`. Tests inspect this
     /// tree to assert the real renderer's children, roles, labels, and bounds.
     pub fn render_tree(&self, width_px: u16) -> NativeNextRenderTree {
-        let surface = self.render_surface(width_px);
+        self.render_tree_with_scale(width_px, Scale::Scale100)
+    }
+
+    pub fn render_tree_with_scale(&self, width_px: u16, scale: Scale) -> NativeNextRenderTree {
+        let layout = self.top_bar_layout(width_px, scale);
+        let logical_width_px = layout.logical_width_px;
+        let surface = self.render_surface_with_scale(width_px, scale);
         let mut top_bar = build_top_bar_tree(&surface.top_bar);
+        top_bar.label = format!(
+            "Host and resource status ({} rows, {} of {} visible)",
+            layout.rows, layout.visible_item_count, layout.item_count
+        );
         if self.host_state() != NativeNextHostState::Attached {
             let (label, description) = host_state_copy(self.host_state());
             top_bar.children.push(semantic_node(
@@ -732,9 +925,9 @@ impl NativeNextTaskCockpit {
         let (header, overflow_menu, title_lines) = match (&surface.header, &surface.header_layout) {
             (Some(header), Some(layout)) => {
                 let title_lines = title_lines(&layout.title);
-                let header_node = build_header_tree(header, layout, width_px);
+                let header_node = build_header_tree(header, layout, logical_width_px);
                 let overflow = surface.overflow_menu.as_ref().map(|menu| {
-                    semantic_node(
+                    let mut node = semantic_node(
                         "native-next-task-overflow",
                         menu.label.clone(),
                         menu.role,
@@ -755,7 +948,9 @@ impl NativeNextTaskCockpit {
                                 )
                             })
                             .collect(),
-                    )
+                    );
+                    node.keyboard_shortcut = "Ctrl+M".to_string();
+                    node
                 });
                 (Some(header_node), overflow, title_lines)
             }
@@ -790,7 +985,7 @@ impl NativeNextTaskCockpit {
     ) -> gpui::AnyElement {
         let id = id.into();
         let handler = cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _window, cx| {
-            if this.dispatch_action(&action) == NativeNextDispatchStatus::Queued {
+            if this.queue_action(&action) == NativeNextDispatchStatus::Queued {
                 cx.notify();
             }
         });
@@ -904,7 +1099,7 @@ impl NativeNextTaskCockpit {
                     let label = format!("{} — {}", item.label, item.description);
                     popup.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
                         entity.update(cx, |this, cx| {
-                            if this.dispatch_action(&action) == NativeNextDispatchStatus::Queued {
+                            if this.queue_action(&action) == NativeNextDispatchStatus::Queued {
                                 cx.notify();
                             }
                         });
@@ -915,17 +1110,19 @@ impl NativeNextTaskCockpit {
     }
 
     fn element(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.poll_host_events();
         let width_px = window_width_px(window);
-        let surface = self.render_surface(width_px);
-        let tree = self.render_tree(width_px);
+        let scale = scale_from_factor(window.scale_factor());
+        let logical_width_px = self.top_bar_layout(width_px, scale).logical_width_px;
+        let surface = self.render_surface_with_scale(width_px, scale);
+        let tree = self.render_tree_with_scale(width_px, scale);
 
         let top_bar_description: SharedString = tree.top_bar.accessible_description.clone().into();
         let mut top_bar = div()
             .id(SharedString::from(tree.top_bar.id.clone()))
             .tooltip(move |window, cx| Tooltip::new(top_bar_description.clone()).build(window, cx))
             .flex()
-            .items_center()
+            .flex_wrap()
+            .items_start()
             .gap_2();
         if let Some(host) = &surface.top_bar.host {
             top_bar = top_bar.child(Self::render_status_link(cx, "host", host));
@@ -1040,12 +1237,17 @@ impl NativeNextTaskCockpit {
             )))
             .tooltip(move |window, cx| Tooltip::new(header_description.clone()).build(window, cx))
             .flex()
-            .items_center()
+            .flex_wrap()
+            .items_start()
             .gap_2();
         if let (Some(header), Some(layout)) = (&surface.header, &surface.header_layout) {
             for field in &layout.inline {
                 header_element = header_element.child(Self::render_header_field(
-                    cx, header, layout, *field, width_px,
+                    cx,
+                    header,
+                    layout,
+                    *field,
+                    logical_width_px,
                 ));
             }
             if let Some(menu) = &surface.overflow_menu {
@@ -1098,9 +1300,26 @@ fn semantic_node(
         focusable,
         accessible_description: accessible_description.into(),
         tooltip: tooltip.into(),
+        keyboard_shortcut: if focusable {
+            "Enter/Space".to_string()
+        } else {
+            String::new()
+        },
         virtualized: false,
         children,
     }
+}
+
+fn top_bar_item_count(top_bar: &TopBarModel) -> usize {
+    usize::from(top_bar.host.is_some())
+        + usize::from(top_bar.connect.is_some())
+        + usize::from(top_bar.update.is_some())
+        + top_bar.resources.as_ref().map_or(0, |resources| {
+            usize::from(resources.cpu.is_some()) + usize::from(resources.memory_bytes.is_some())
+        })
+        + top_bar.quotas.len()
+        + usize::from(top_bar.quota_overflow_action.is_some())
+        + usize::from(!top_bar.unavailable.is_empty())
 }
 
 fn build_top_bar_tree(top_bar: &TopBarModel) -> NativeNextRenderNode {
@@ -1300,7 +1519,7 @@ fn build_header_tree(
                     header
                         .specialists
                         .len()
-                        .min(NATIVE_NEXT_SPECIALIST_RENDER_LIMIT)
+                        .min(NATIVE_NEXT_SPECIALIST_SEMANTIC_WINDOW)
                 };
                 let specialist_children: Vec<NativeNextRenderNode> = header
                     .specialists
@@ -1334,6 +1553,7 @@ fn build_header_tree(
                         header.specialist_total.saturating_sub(visible)
                     ),
                     tooltip: "Specialist agents attached to this task.".to_string(),
+                    keyboard_shortcut: String::new(),
                     virtualized: true,
                     children: specialist_children,
                 });
@@ -1360,6 +1580,7 @@ fn build_header_tree(
                 header.specialist_total
             ),
             tooltip: "Specialist agents attached to this task.".to_string(),
+            keyboard_shortcut: String::new(),
             virtualized: true,
             children: Vec::new(),
         });
@@ -1504,12 +1725,7 @@ fn render_specialists_element(
             false,
         );
     }
-    let agents = header
-        .specialists
-        .iter()
-        .take(NATIVE_NEXT_SPECIALIST_RENDER_LIMIT)
-        .cloned()
-        .collect::<Vec<_>>();
+    let agents = header.specialists.iter().cloned().collect::<Vec<_>>();
     let entity = cx.entity();
     let list = uniform_list(
         "native-next-task-specialists-list",
@@ -1530,7 +1746,7 @@ fn render_specialists_element(
                     .tab_stop(true)
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |this, cx| {
-                            if this.dispatch_action(&action) == NativeNextDispatchStatus::Queued {
+                            if this.queue_action(&action) == NativeNextDispatchStatus::Queued {
                                 cx.notify();
                             }
                         });
@@ -1541,8 +1757,7 @@ fn render_specialists_element(
     );
     div()
         .id("native-next-task-specialists")
-        .max_h(px(48.0))
-        .overflow_hidden()
+        .overflow_y_scroll()
         .child(list)
         .into_any_element()
 }
@@ -1625,14 +1840,16 @@ fn window_width_px(window: &Window) -> u16 {
         .clamp(0.0, f64::from(u16::MAX)) as u16
 }
 
+fn scale_from_factor(factor: f32) -> Scale {
+    match factor {
+        value if value >= 1.75 => Scale::Scale200,
+        value if value >= 1.375 => Scale::Scale150,
+        value if value >= 1.125 => Scale::Scale125,
+        _ => Scale::Scale100,
+    }
+}
+
 pub fn is_task_details_action(action: &ProjectedAction) -> bool {
     action.id() == crate::client::action::ACTION_TASK_SHOW
         && matches!(action.target(), ActionTarget::Task(_))
 }
-
-/// Compatibility symbol for the pre-canonical `devmanager-next` entrypoint.
-///
-/// Startup is owned by the canonical native shell; keeping this inert shim
-/// lets an older binary target compile while the entrypoint union is applied.
-#[deprecated(note = "the canonical native shell owns devmanager-next startup")]
-pub fn run_native_next() {}

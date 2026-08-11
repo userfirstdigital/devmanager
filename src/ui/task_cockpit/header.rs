@@ -716,6 +716,10 @@ pub struct ConnectObservation {
 pub struct UpdateObservationIdentity {
     pub current_version: String,
     pub target_version: Option<String>,
+    /// Host-issued updater source revision. Older bundles must not revive a
+    /// previous update state after a newer check has been admitted.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -757,6 +761,44 @@ pub struct HostResourceObservation {
     pub cpu_observed_at_ms: Option<i64>,
     pub memory_observed_at_ms: Option<i64>,
     pub generation: Option<u64>,
+    /// Independent source revisions: CPU and memory can arrive in separate
+    /// observations and must not roll each other back.
+    #[serde(default)]
+    pub cpu_revision: u64,
+    #[serde(default)]
+    pub memory_revision: u64,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteObservationIdentity {
+    pub source_id: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteObservation {
+    pub identity: RemoteObservationIdentity,
+    pub health: RemoteHealth,
+    pub label: String,
+    pub observed_at_ms: Option<i64>,
+    pub generation: Option<u64>,
+}
+
+impl RemoteObservation {
+    pub fn preflight(&self) -> Result<(), TopBarProjectionError> {
+        check_input_text("remote.source_id", &self.identity.source_id)?;
+        check_input_text("remote.label", &self.label)
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -918,6 +960,7 @@ impl fmt::Debug for UpdateObservationIdentity {
                 "target_version",
                 &self.target_version.as_ref().map(|_| "[redacted]"),
             )
+            .field("revision", &self.revision)
             .finish()
     }
 }
@@ -943,6 +986,41 @@ impl fmt::Debug for UpdateObservation {
 impl fmt::Display for UpdateObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("update-observation[redacted]")
+    }
+}
+
+impl fmt::Debug for RemoteObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteObservationIdentity")
+            .field("source_id", &"[redacted]")
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+impl fmt::Display for RemoteObservationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("remote-identity[redacted]")
+    }
+}
+
+impl fmt::Debug for RemoteObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteObservation")
+            .field("identity", &self.identity)
+            .field("health", &self.health)
+            .field("label", &"[redacted]")
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl fmt::Display for RemoteObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("remote-observation[redacted]")
     }
 }
 
@@ -1334,7 +1412,68 @@ pub struct TopBarProjectionController {
     quota_high_water: BTreeMap<QuotaCacheKey, (u64, i64)>,
     active_quota_sessions: BTreeMap<(String, u64), String>,
     retired_quota_sessions: BTreeSet<(String, u64, String)>,
+    field_high_water: TopBarFieldHighWater,
+    remote: Option<RemoteObservation>,
+    remote_high_water: SourceRevisionHighWater,
     generation: u64,
+}
+
+/// Source-local high-water fences. A top-bar bundle is allowed to advance one
+/// field while another field is replayed late; the late field remains at its
+/// last admitted value instead of reviving an older observation.
+#[derive(Clone, Debug, Default)]
+struct TopBarFieldHighWater {
+    host: SourceRevisionHighWater,
+    connect: SourceRevisionHighWater,
+    update: SourceRevisionHighWater,
+    cpu_revision: Option<u64>,
+    memory_revision: Option<u64>,
+}
+
+impl TopBarFieldHighWater {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceRevisionHighWater {
+    active_source: Option<String>,
+    revisions: BTreeMap<String, u64>,
+    retired_sources: BTreeSet<String>,
+}
+
+impl SourceRevisionHighWater {
+    fn admit(&mut self, source: String, revision: u64) -> bool {
+        if self.retired_sources.contains(&source) {
+            return false;
+        }
+        if self
+            .revisions
+            .get(&source)
+            .is_some_and(|high_water| revision <= *high_water)
+        {
+            return false;
+        }
+        if let Some(previous) = self.active_source.replace(source.clone()) {
+            if previous != source {
+                self.retired_sources.insert(previous);
+            }
+        }
+        self.revisions.insert(source, revision);
+        true
+    }
+
+    fn seed(&mut self, source: String, revision: u64) {
+        if self.active_source.is_none() {
+            self.active_source = Some(source.clone());
+            self.revisions.insert(source, revision);
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1372,12 +1511,28 @@ impl TopBarProjectionController {
             quota_high_water: BTreeMap::new(),
             active_quota_sessions: BTreeMap::new(),
             retired_quota_sessions: BTreeSet::new(),
+            field_high_water: TopBarFieldHighWater::default(),
+            remote: None,
+            remote_high_water: SourceRevisionHighWater::default(),
             generation,
         };
+        let initial_input = controller.input.clone();
+        controller.seed_field_high_water(&initial_input);
         let observations = controller.input.quotas.clone();
         let input = controller.input.clone();
         controller.admit_quota_observations(&observations, &input, generation);
         controller.sync_cached_quotas();
+        Ok(controller)
+    }
+
+    pub fn new_with_remote(
+        input: TopBarProjectionInput,
+        remote: Option<RemoteObservation>,
+    ) -> Result<Self, TopBarProjectionError> {
+        let mut controller = Self::new(input)?;
+        if let Some(remote) = remote {
+            controller.admit_remote(remote)?;
+        }
         Ok(controller)
     }
 
@@ -1387,6 +1542,10 @@ impl TopBarProjectionController {
 
     pub fn cached_quota_count(&self) -> usize {
         self.quota_cache.len()
+    }
+
+    pub fn remote(&self) -> Option<&RemoteObservation> {
+        self.remote.as_ref()
     }
 
     pub fn model(&self) -> TopBarModel {
@@ -1399,6 +1558,14 @@ impl TopBarProjectionController {
     /// this is intentionally not an error because replay can deliver those
     /// events after a newer observation.
     pub fn apply(&mut self, input: TopBarProjectionInput) -> Result<bool, TopBarProjectionError> {
+        self.apply_with_remote(input, None)
+    }
+
+    pub fn apply_with_remote(
+        &mut self,
+        input: TopBarProjectionInput,
+        remote: Option<RemoteObservation>,
+    ) -> Result<bool, TopBarProjectionError> {
         input.preflight()?;
         if input.generation < self.generation {
             return Ok(false);
@@ -1414,6 +1581,9 @@ impl TopBarProjectionController {
             self.quota_high_water.clear();
             self.active_quota_sessions.clear();
             self.retired_quota_sessions.clear();
+            self.field_high_water.clear();
+            self.remote_high_water.clear();
+            self.remote = None;
         }
 
         // The cache is a projection boundary too: observations that are no
@@ -1424,22 +1594,198 @@ impl TopBarProjectionController {
             fresh_stamp(observation.observed_at_ms, observation.generation, &input).is_some()
         });
 
-        let mut changed = generation_changed
-            || self.input.now_ms != input.now_ms
-            || self.input.host != input.host
-            || self.input.connect != input.connect
-            || self.input.update != input.update
-            || self.input.resources != input.resources;
-        changed |= self.admit_quota_observations(&input.quotas, &input, input.generation);
+        let previous_quotas = self.input.quotas.clone();
+        let host = self.admit_host(input.host.clone());
+        let connect = self.admit_connect(input.connect.clone());
+        let update = self.admit_update(input.update.clone());
+        let resources = self.admit_resources(input.resources.clone(), generation_changed);
 
+        let changed = generation_changed
+            || self.input.now_ms != input.now_ms
+            || self.input.host != host
+            || self.input.connect != connect
+            || self.input.update != update
+            || self.input.resources != resources
+            || previous_quotas != self.quota_cache.values().cloned().collect::<Vec<_>>();
+        let quotas_changed = self.admit_quota_observations(&input.quotas, &input, input.generation);
+        let changed = changed || quotas_changed;
         self.input.now_ms = input.now_ms;
         self.input.generation = self.generation;
-        self.input.host = input.host;
-        self.input.connect = input.connect;
-        self.input.update = input.update;
-        self.input.resources = input.resources;
+        self.input.host = host;
+        self.input.connect = connect;
+        self.input.update = update;
+        self.input.resources = resources;
         self.sync_cached_quotas();
-        Ok(changed)
+        let remote_changed = if let Some(remote) = remote {
+            self.admit_remote(remote)?
+        } else {
+            false
+        };
+        Ok(changed || remote_changed)
+    }
+
+    fn admit_remote(&mut self, remote: RemoteObservation) -> Result<bool, TopBarProjectionError> {
+        remote.preflight()?;
+        if remote.generation != Some(self.generation)
+            || fresh_stamp(remote.observed_at_ms, remote.generation, &self.input).is_none()
+        {
+            return Ok(false);
+        }
+        if self
+            .remote_high_water
+            .admit(remote.identity.source_id.clone(), remote.identity.revision)
+        {
+            self.remote = Some(remote);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn seed_field_high_water(&mut self, input: &TopBarProjectionInput) {
+        if let Some(host) = &input.host {
+            self.field_high_water
+                .host
+                .seed(host.identity.host_id.clone(), host.identity.revision);
+        }
+        if let Some(connect) = &input.connect {
+            self.field_high_water.connect.seed(
+                connect.identity.host_id.clone(),
+                connect.identity.connection_epoch,
+            );
+        }
+        if let Some(update) = &input.update {
+            self.field_high_water.update.seed(
+                update_source_key(&update.identity),
+                update.identity.revision,
+            );
+        }
+        if let Some(resources) = &input.resources {
+            self.field_high_water.cpu_revision = Some(resources.cpu_revision);
+            self.field_high_water.memory_revision = Some(resources.memory_revision);
+        }
+    }
+
+    fn admit_host(&mut self, incoming: Option<HostObservation>) -> Option<HostObservation> {
+        let Some(observation) = incoming else {
+            return None;
+        };
+        if self.field_high_water.host.admit(
+            observation.identity.host_id.clone(),
+            observation.identity.revision,
+        ) {
+            Some(observation)
+        } else {
+            self.input.host.clone()
+        }
+    }
+
+    fn admit_connect(
+        &mut self,
+        incoming: Option<ConnectObservation>,
+    ) -> Option<ConnectObservation> {
+        let Some(observation) = incoming else {
+            return None;
+        };
+        if self.field_high_water.connect.admit(
+            observation.identity.host_id.clone(),
+            observation.identity.connection_epoch,
+        ) {
+            Some(observation)
+        } else {
+            self.input.connect.clone()
+        }
+    }
+
+    fn admit_update(&mut self, incoming: Option<UpdateObservation>) -> Option<UpdateObservation> {
+        let Some(observation) = incoming else {
+            return None;
+        };
+        if self.field_high_water.update.admit(
+            update_source_key(&observation.identity),
+            observation.identity.revision,
+        ) {
+            Some(observation)
+        } else {
+            self.input.update.clone()
+        }
+    }
+
+    fn admit_resources(
+        &mut self,
+        incoming: Option<HostResourceObservation>,
+        generation_changed: bool,
+    ) -> Option<HostResourceObservation> {
+        let Some(incoming) = incoming else {
+            return None;
+        };
+        if generation_changed || self.input.resources.is_none() {
+            if generation_changed {
+                self.field_high_water.cpu_revision = Some(incoming.cpu_revision);
+                self.field_high_water.memory_revision = Some(incoming.memory_revision);
+                return Some(incoming);
+            }
+
+            // A missing resource bundle is an explicit unavailable state, not
+            // permission to reset the field fences. Re-admit each field
+            // independently so a delayed CPU sample cannot revive the bundle
+            // while a newer memory sample is accepted.
+            let cpu_admitted = Self::admit_resource_revision(
+                &mut self.field_high_water.cpu_revision,
+                incoming.cpu_revision,
+            );
+            let memory_admitted = Self::admit_resource_revision(
+                &mut self.field_high_water.memory_revision,
+                incoming.memory_revision,
+            );
+            if !cpu_admitted && !memory_admitted {
+                return None;
+            }
+            let mut admitted = incoming;
+            if !cpu_admitted {
+                admitted.cpu_percent = None;
+                admitted.cpu_observed_at_ms = None;
+            }
+            if !memory_admitted {
+                admitted.memory_bytes = None;
+                admitted.memory_observed_at_ms = None;
+            }
+            return Some(admitted);
+        }
+
+        let mut merged = self.input.resources.clone().expect("resource is present");
+        let cpu_admitted = Self::admit_resource_revision(
+            &mut self.field_high_water.cpu_revision,
+            incoming.cpu_revision,
+        );
+        if cpu_admitted {
+            merged.cpu_percent = incoming.cpu_percent;
+            merged.cpu_input_unit = incoming.cpu_input_unit;
+            merged.logical_cpu_count = incoming.logical_cpu_count;
+            merged.cpu_observed_at_ms = incoming.cpu_observed_at_ms;
+            merged.cpu_revision = incoming.cpu_revision;
+        }
+        let memory_admitted = Self::admit_resource_revision(
+            &mut self.field_high_water.memory_revision,
+            incoming.memory_revision,
+        );
+        if memory_admitted {
+            merged.memory_bytes = incoming.memory_bytes;
+            merged.memory_observed_at_ms = incoming.memory_observed_at_ms;
+            merged.memory_revision = incoming.memory_revision;
+        }
+        if cpu_admitted || memory_admitted {
+            merged.generation = incoming.generation;
+        }
+        Some(merged)
+    }
+
+    fn admit_resource_revision(high_water: &mut Option<u64>, revision: u64) -> bool {
+        let admitted = high_water.is_none_or(|current| revision > current);
+        if admitted {
+            *high_water = Some(revision);
+        }
+        admitted
     }
 
     fn admit_quota_observations(
@@ -2093,6 +2439,14 @@ fn provider_key(provider: &str) -> String {
         "codex" => "codex".to_string(),
         other => other.to_string(),
     }
+}
+
+fn update_source_key(identity: &UpdateObservationIdentity) -> String {
+    format!(
+        "{}\u{0}{}",
+        identity.current_version,
+        identity.target_version.as_deref().unwrap_or_default()
+    )
 }
 
 fn safe_quota_detail(detail: &str) -> Option<String> {
