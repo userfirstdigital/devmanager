@@ -2,6 +2,8 @@
 //! unique delivery / provider-native IDs. This table is not a DomainEvent
 //! projection and never feeds `apply()`.
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
@@ -11,6 +13,32 @@ use crate::kernel::StoreError;
 const MAX_JOURNAL_EVENTS: usize = 4_096;
 const MAX_JOURNAL_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOURNAL_TEXT_FIELD_BYTES: usize = 256;
+const ALLOWED_JOURNAL_KINDS: &[&str] = &[
+    "user_message",
+    "assistant_text",
+    "reasoning_summary",
+    "tool_call",
+    "tool_result",
+    "approval_request",
+    "approval_result",
+    "question",
+    "plan_step",
+    "usage_observation",
+    "error",
+    "turn_state",
+    "session_state",
+    "artifact_reference",
+    "unknown_provider_event",
+];
+const ALLOWED_JOURNAL_VISIBILITIES: &[&str] = &["semantic", "diagnostic", "runtime_only"];
+const ALLOWED_JOURNAL_PRIVACY_CLASSES: &[&str] = &["local_only", "shareable"];
+const ALLOWED_JOURNAL_REDACTION_CLASSES: &[&str] = &[
+    "persistable",
+    "persistable_local_only",
+    "redact_on_persist",
+    "metadata_only",
+    "never_persist",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticJournalAuthorityRecord {
@@ -60,6 +88,10 @@ pub(crate) enum SemanticJournalWrite {
     Conflict {
         event_id: [u8; 16],
         content_hash: [u8; 32],
+    },
+    KeyConflict {
+        delivery_event_id: [u8; 16],
+        provider_event_id: [u8; 16],
     },
     EventCapacity,
     DedupeCapacity,
@@ -216,7 +248,7 @@ pub(crate) fn high_water(
     conn: &Connection,
     digest: &[u8; 32],
 ) -> Result<(u64, Option<i64>), StoreError> {
-    let (count, last_occurred_at_ms) = validate_facts(conn, digest)?;
+    let (count, last_occurred_at_ms) = validate_facts(conn, digest, |_| Ok(()))?;
     let next = if count == 0 {
         1
     } else {
@@ -229,7 +261,7 @@ pub(crate) fn high_water(
 }
 
 pub(crate) fn retained_len(conn: &Connection, digest: &[u8; 32]) -> Result<usize, StoreError> {
-    let (count, _) = validate_facts(conn, digest)?;
+    let (count, _) = validate_facts(conn, digest, |_| Ok(()))?;
     usize::try_from(count).map_err(|_| StoreError::IntegerOutOfRange {
         field: "semantic_journal.count",
         value: u64::MAX,
@@ -241,7 +273,11 @@ pub(crate) fn retained_len(conn: &Connection, digest: &[u8; 32]) -> Result<usize
 /// aggregate: SQLite constraints protect shape, while this check protects the
 /// application-level identity, sequence, and payload invariants after an
 /// already-open handle observes an external mutation.
-fn validate_facts(conn: &Connection, digest: &[u8; 32]) -> Result<(u64, Option<i64>), StoreError> {
+pub(crate) fn validate_facts(
+    conn: &Connection,
+    digest: &[u8; 32],
+    mut validate_row: impl FnMut(&SemanticJournalFactRow) -> Result<(), StoreError>,
+) -> Result<(u64, Option<i64>), StoreError> {
     let mut stmt = conn.prepare(
         "SELECT sequence, event_id, delivery_id, provider_event_id, content_hash,
                 kind, visibility, privacy_class, redaction_class, occurred_at_ms,
@@ -254,6 +290,10 @@ fn validate_facts(conn: &Connection, digest: &[u8; 32]) -> Result<(u64, Option<i
     let mut expected_sequence = 1_i64;
     let mut count = 0_u64;
     let mut last_occurred_at_ms: Option<i64> = None;
+    let mut last_ingested_at_ms: Option<i64> = None;
+    let mut event_ids = HashSet::new();
+    let mut delivery_ids = HashSet::new();
+    let mut provider_event_ids = HashSet::new();
     while let Some(row) = rows.next()? {
         count = count.checked_add(1).ok_or(StoreError::Corruption)?;
         if count > MAX_JOURNAL_EVENTS as u64 {
@@ -263,12 +303,29 @@ fn validate_facts(conn: &Connection, digest: &[u8; 32]) -> Result<(u64, Option<i
         if fact.sequence != expected_sequence {
             return Err(StoreError::Corruption);
         }
+        if !event_ids.insert(fact.event_id)
+            || !delivery_ids.insert(fact.delivery_id.clone())
+            || fact
+                .provider_event_id
+                .as_ref()
+                .is_some_and(|provider_event_id| {
+                    !provider_event_ids.insert(provider_event_id.clone())
+                })
+        {
+            return Err(StoreError::Corruption);
+        }
+        if last_occurred_at_ms.is_some_and(|last| fact.occurred_at_ms < last) {
+            return Err(StoreError::Corruption);
+        }
+        if last_ingested_at_ms.is_some_and(|last| fact.ingested_at_ms < last) {
+            return Err(StoreError::Corruption);
+        }
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or(StoreError::Corruption)?;
-        last_occurred_at_ms = Some(
-            last_occurred_at_ms.map_or(fact.occurred_at_ms, |last| last.max(fact.occurred_at_ms)),
-        );
+        last_occurred_at_ms = Some(fact.occurred_at_ms);
+        last_ingested_at_ms = Some(fact.ingested_at_ms);
+        validate_row(&fact)?;
     }
     Ok((count, last_occurred_at_ms))
 }
@@ -316,29 +373,43 @@ pub(crate) fn write_fact(
     mut row: SemanticJournalFactRow,
     max_events: u32,
     max_dedupe_keys: u32,
+    mut validate_row: impl FnMut(&SemanticJournalFactRow) -> Result<(), StoreError>,
 ) -> Result<SemanticJournalWrite, StoreError> {
-    // Dedupe is deliberately the first operation in the IMMEDIATE transaction:
-    // an older retry of an already committed delivery is a duplicate, not a
-    // timestamp regression. The high-water/timestamp check below therefore
-    // observes the same pinned write view as the eventual insert.
+    // Validate the complete pinned journal before any write decision. Dedupe
+    // lookups then precede the candidate timestamp check, so an older retry
+    // remains a duplicate rather than becoming a timestamp regression.
+    let (count, last_occurred_at_ms) = validate_facts(tx, digest, &mut validate_row)?;
+    let next_sequence = if count == 0 {
+        1
+    } else {
+        count.checked_add(1).ok_or(StoreError::Corruption)?
+    };
     let delivery_hit = lookup_delivery(tx, digest, delivery_id)?;
     let provider_hit = if let Some(provider_event_id) = provider_event_id {
         lookup_provider_event(tx, digest, provider_event_id)?
     } else {
         None
     };
-    let (next_sequence, last_occurred_at_ms) = high_water(tx, digest)?;
+    if let (Some(delivery_hit), Some(provider_hit)) = (&delivery_hit, &provider_hit) {
+        if delivery_hit.event_id != provider_hit.event_id
+            || delivery_hit.content_hash != provider_hit.content_hash
+        {
+            return Ok(SemanticJournalWrite::KeyConflict {
+                delivery_event_id: delivery_hit.event_id,
+                provider_event_id: provider_hit.event_id,
+            });
+        }
+    }
     if let Some(hit) = delivery_hit.or(provider_hit) {
         return Ok(classify_hit(hit, payload_hash));
     }
     if last_occurred_at_ms.is_some_and(|last| row.occurred_at_ms < last) {
         return Ok(SemanticJournalWrite::TimestampRegression);
     }
-    let retained = retained_len(tx, digest)?;
-    if retained as u32 >= max_events {
+    if count as u32 >= max_events {
         return Ok(SemanticJournalWrite::EventCapacity);
     }
-    if retained.saturating_mul(2) as u32 >= max_dedupe_keys {
+    if count.saturating_mul(2) as u32 >= max_dedupe_keys {
         return Ok(SemanticJournalWrite::DedupeCapacity);
     }
     if next_sequence == u64::MAX {
@@ -349,6 +420,8 @@ pub(crate) fn write_fact(
         value: next_sequence,
     })?;
     row.sequence = sequence;
+    validate_fact_fields(&row)?;
+    validate_row(&row)?;
     insert_fact(tx, digest, &row)?;
     Ok(SemanticJournalWrite::Inserted {
         sequence: next_sequence,
@@ -546,17 +619,9 @@ fn finalize_fact(raw: RawFact) -> Result<SemanticJournalFactRow, StoreError> {
     {
         return Err(StoreError::Corruption);
     }
-    validate_text_field(&raw.delivery_id)?;
-    if let Some(provider_event_id) = &raw.provider_event_id {
-        validate_text_field(provider_event_id)?;
-    }
-    validate_text_field(&raw.kind)?;
-    validate_text_field(&raw.visibility)?;
-    validate_text_field(&raw.privacy_class)?;
-    validate_text_field(&raw.redaction_class)?;
     let event_id = exact16(raw.event_id)?;
     EventId::from_bytes(event_id).map_err(|_| StoreError::Corruption)?;
-    Ok(SemanticJournalFactRow {
+    let fact = SemanticJournalFactRow {
         sequence: raw.sequence,
         event_id,
         delivery_id: raw.delivery_id,
@@ -570,7 +635,38 @@ fn finalize_fact(raw: RawFact) -> Result<SemanticJournalFactRow, StoreError> {
         ingested_at_ms: raw.ingested_at_ms,
         schema_version: raw.schema_version,
         payload: raw.payload,
-    })
+    };
+    validate_fact_fields(&fact)?;
+    Ok(fact)
+}
+
+fn validate_fact_fields(fact: &SemanticJournalFactRow) -> Result<(), StoreError> {
+    if fact.sequence <= 0
+        || fact.occurred_at_ms < 0
+        || fact.ingested_at_ms < 0
+        || fact.schema_version <= 0
+        || fact.payload.is_empty()
+        || fact.payload.len() > MAX_JOURNAL_PAYLOAD_BYTES
+        || !ALLOWED_JOURNAL_KINDS.contains(&fact.kind.as_str())
+        || !ALLOWED_JOURNAL_VISIBILITIES.contains(&fact.visibility.as_str())
+        || !ALLOWED_JOURNAL_PRIVACY_CLASSES.contains(&fact.privacy_class.as_str())
+        || !ALLOWED_JOURNAL_REDACTION_CLASSES.contains(&fact.redaction_class.as_str())
+    {
+        return Err(StoreError::Corruption);
+    }
+    validate_text_field(&fact.delivery_id)?;
+    if let Some(provider_event_id) = &fact.provider_event_id {
+        validate_text_field(provider_event_id)?;
+    }
+    validate_text_field(&fact.kind)?;
+    validate_text_field(&fact.visibility)?;
+    validate_text_field(&fact.privacy_class)?;
+    validate_text_field(&fact.redaction_class)?;
+    EventId::from_bytes(fact.event_id).map_err(|_| StoreError::Corruption)?;
+    if fact.content_hash == [0u8; 32] {
+        return Err(StoreError::Corruption);
+    }
+    Ok(())
 }
 
 fn validate_text_field(value: &str) -> Result<(), StoreError> {

@@ -9,7 +9,7 @@ use crate::domain::{
     SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, TaskId,
 };
 use crate::kernel::semantic_journal::{SemanticJournalAuthorityRecord, SemanticJournalFactRow};
-use crate::kernel::KernelStore;
+use crate::kernel::{KernelStore, StoreError};
 use crate::protocol::{FrameLimits, MessagePackCodec, MessagePackError};
 use crate::providers::capabilities::ProviderKind;
 use hmac::{Hmac, Mac};
@@ -1183,24 +1183,30 @@ fn diagnostic_ref(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn diagnostic_metadata(bytes: &[u8]) -> (u32, String) {
+fn diagnostic_metadata(bytes: &[u8]) -> (u32, String, Option<String>) {
     #[derive(Deserialize)]
     struct Wire {
         schema_version: Option<u32>,
         source_type: Option<String>,
+        provider_event_id: Option<String>,
     }
     let Ok(wire) = serde_json::from_slice::<Wire>(bytes) else {
-        return (JOURNAL_SCHEMA_VERSION, "malformed".to_string());
+        return (JOURNAL_SCHEMA_VERSION, "malformed".to_string(), None);
     };
     let source_type = wire
         .source_type
         .filter(|source| reject_display_bound(source, MAX_SOURCE_TYPE_BYTES).is_ok())
         .unwrap_or_else(|| "malformed".to_string());
+    let provider_event_id = wire
+        .provider_event_id
+        .and_then(|value| ProviderEventId::new(value).ok())
+        .map(|value| value.as_str().to_owned());
     (
         wire.schema_version
             .filter(|version| *version > 0)
             .unwrap_or(JOURNAL_SCHEMA_VERSION),
         source_type,
+        provider_event_id,
     )
 }
 
@@ -1708,8 +1714,15 @@ impl SemanticJournal {
                 JournalRejectReason::InvalidEnvelope,
             )),
             Err(_) => {
-                let (schema_version, source_type) = diagnostic_metadata(bytes);
-                Ok(self.diagnostic_draft(&permit, bytes, now_ms, schema_version, source_type)?)
+                let (schema_version, source_type, provider_event_id) = diagnostic_metadata(bytes);
+                Ok(self.diagnostic_draft(
+                    &permit,
+                    bytes,
+                    now_ms,
+                    schema_version,
+                    source_type,
+                    provider_event_id,
+                )?)
             }
         }
     }
@@ -1732,6 +1745,7 @@ impl SemanticJournal {
             Ok(None) => return JournalIngestOutcome::IgnoredNeverPersist,
             Err(_) => return JournalIngestOutcome::NeedsResync,
         };
+        let authority = self.authority;
         match self.store.semantic_journal_write_fact(
             &self.authority_digest,
             event.delivery_id.as_str(),
@@ -1743,6 +1757,7 @@ impl SemanticJournal {
             row,
             self.limits.max_events,
             self.limits.max_dedupe_keys,
+            |row| validate_restored_row(authority, row),
         ) {
             Ok(crate::kernel::semantic_journal::SemanticJournalWrite::Inserted { sequence }) => {
                 event.sequence = sequence;
@@ -1761,6 +1776,9 @@ impl SemanticJournal {
                 event_id,
                 content_hash,
             }) => classify_store_repeat(event_id, content_hash, event.payload_hash),
+            Ok(crate::kernel::semantic_journal::SemanticJournalWrite::KeyConflict { .. }) => {
+                JournalIngestOutcome::NeedsResync
+            }
             Ok(crate::kernel::semantic_journal::SemanticJournalWrite::EventCapacity) => {
                 JournalIngestOutcome::Backpressure(JournalBackpressure::EventCapacity)
             }
@@ -1824,8 +1842,9 @@ impl SemanticJournal {
         let sequence = i64::try_from(sequence).map_err(|_| JournalIngestOutcome::NeedsResync)?;
         match self
             .store
-            .semantic_journal_load_fact(&self.authority_digest, sequence)
-        {
+            .semantic_journal_load_fact(&self.authority_digest, sequence, |row| {
+                validate_restored_row(self.authority, row)
+            }) {
             Ok(Some(row)) => restore_event(&self.authority, row)
                 .map(Some)
                 .map_err(|_| JournalIngestOutcome::NeedsResync),
@@ -1836,7 +1855,10 @@ impl SemanticJournal {
 
     pub fn retained_len(&self) -> Result<usize, JournalIngestOutcome> {
         self.store
-            .semantic_journal_retained_len(&self.authority_digest)
+            .semantic_journal_validate(&self.authority_digest, |row| {
+                validate_restored_row(self.authority, row)
+            })
+            .and_then(|(count, _)| usize::try_from(count).map_err(|_| StoreError::Corruption))
             .map_err(|_| JournalIngestOutcome::NeedsResync)
     }
 
@@ -1896,6 +1918,7 @@ impl SemanticJournal {
                 &self.authority_digest,
                 after,
                 requested_high_water,
+                |row| validate_restored_row(self.authority, row),
                 |high_water, row| {
                     let sequence = match u64::try_from(row.sequence) {
                         Ok(sequence) => sequence,
@@ -1910,6 +1933,23 @@ impl SemanticJournal {
                     }
                     expected = expected.saturating_add(1);
                     scanned_through = sequence;
+                    if candidates.len() as u32 >= limits.max_items {
+                        overflow_sequence = Some(sequence);
+                        return Ok(false);
+                    }
+                    // The persisted body contains the typed payload plus its
+                    // envelope. A first body already at the complete page
+                    // budget cannot fit after page/fact metadata is added.
+                    // Reject it before restoring/materializing a candidate;
+                    // the bounded serializer below remains authoritative for
+                    // all rows that pass this cheap preflight.
+                    if candidates.is_empty()
+                        && row.payload.len()
+                            >= usize::try_from(limits.max_encoded_bytes).unwrap_or(usize::MAX)
+                    {
+                        overflow_sequence = Some(sequence);
+                        return Ok(false);
+                    }
                     let event = match restore_event(&self.authority, row) {
                         Ok(event) => event,
                         Err(_) => {
@@ -1920,10 +1960,6 @@ impl SemanticJournal {
                     if !persist_only && event.visibility == JournalVisibility::RuntimeOnly {
                         return Ok(true);
                     }
-                    if candidates.len() as u32 >= limits.max_items {
-                        overflow_sequence = Some(event.sequence);
-                        return Ok(false);
-                    }
                     let candidate = event.to_snapshot_fact();
                     candidates.push(candidate);
                     let next_sequence = (event.sequence < high_water).then_some(event.sequence + 1);
@@ -1933,19 +1969,22 @@ impl SemanticJournal {
                         high_water,
                         encoded_bytes: 0,
                         next_sequence,
-                        facts: candidates.clone(),
+                        facts: std::mem::take(&mut candidates),
                     };
                     match page_encoded_len(&codec, &mut page, limits.max_encoded_bytes) {
                         Ok(encoded_bytes) => {
                             page.encoded_bytes = encoded_bytes;
+                            candidates = page.facts;
                             Ok(true)
                         }
                         Err(PageMeasureError::TooLarge) => {
-                            let removed = candidates.pop().expect("candidate just pushed");
+                            let removed = page.facts.pop().expect("candidate just pushed");
+                            candidates = page.facts;
                             overflow_sequence = Some(removed.sequence);
                             Ok(false)
                         }
                         Err(PageMeasureError::Encode) => {
+                            candidates = page.facts;
                             stream_error = Some(JournalIngestOutcome::Backpressure(
                                 JournalBackpressure::PageBudget,
                             ));
@@ -2102,6 +2141,7 @@ impl SemanticJournal {
         now_ms: i64,
         schema_version: u32,
         source_type: String,
+        provider_event_id: Option<String>,
     ) -> Result<JournalDraft, JournalIngestOutcome> {
         if self.next_sequence == u64::MAX {
             return Err(JournalIngestOutcome::Rejected(
@@ -2113,7 +2153,12 @@ impl SemanticJournal {
                 id: EventId::new(),
                 schema_version,
                 provider: binding.authority.provider,
-                provider_event_id: None,
+                provider_event_id: provider_event_id
+                    .map(ProviderEventId::new)
+                    .transpose()
+                    .map_err(|_| {
+                        JournalIngestOutcome::Rejected(JournalRejectReason::InvalidEnvelope)
+                    })?,
                 delivery_id: binding.delivery_id.clone(),
                 task_id: binding.authority.task_id,
                 agent_session_id: binding.authority.agent_session_id,
@@ -2400,6 +2445,15 @@ fn restore_event(
         payload: body.payload,
         payload_hash: row.content_hash,
     })
+}
+
+fn validate_restored_row(
+    authority: JournalSessionAuthority,
+    row: &SemanticJournalFactRow,
+) -> Result<(), StoreError> {
+    restore_event(&authority, row.clone())
+        .map(|_| ())
+        .map_err(|_| StoreError::Corruption)
 }
 
 fn parse_kind(value: &str) -> Result<JournalSemanticKind, JournalError> {

@@ -409,6 +409,19 @@ impl KernelStore {
         crate::kernel::semantic_journal::retained_len(&self.conn, digest)
     }
 
+    pub(crate) fn semantic_journal_validate(
+        &self,
+        digest: &[u8; 32],
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
+    ) -> Result<(u64, Option<i64>), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let result = crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn semantic_journal_write_fact(
         &mut self,
         digest: &[u8; 32],
@@ -418,6 +431,9 @@ impl KernelStore {
         row: crate::kernel::semantic_journal::SemanticJournalFactRow,
         max_events: u32,
         max_dedupe_keys: u32,
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
     ) -> Result<crate::kernel::semantic_journal::SemanticJournalWrite, StoreError> {
         self.with_immediate_transaction(|tx| {
             crate::kernel::semantic_journal::write_fact(
@@ -429,6 +445,7 @@ impl KernelStore {
                 row,
                 max_events,
                 max_dedupe_keys,
+                validate_row,
             )
         })
     }
@@ -437,8 +454,15 @@ impl KernelStore {
         &self,
         digest: &[u8; 32],
         sequence: i64,
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
     ) -> Result<Option<crate::kernel::semantic_journal::SemanticJournalFactRow>, StoreError> {
-        crate::kernel::semantic_journal::load_fact(&self.conn, digest, sequence)
+        let tx = self.conn.unchecked_transaction()?;
+        crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        let fact = crate::kernel::semantic_journal::load_fact(&tx, digest, sequence)?;
+        tx.commit()?;
+        Ok(fact)
     }
 
     pub(crate) fn semantic_journal_stream_page(
@@ -446,13 +470,18 @@ impl KernelStore {
         digest: &[u8; 32],
         after_sequence: i64,
         requested_high_water: Option<u64>,
+        validate_row: impl FnMut(
+            &crate::kernel::semantic_journal::SemanticJournalFactRow,
+        ) -> Result<(), StoreError>,
         mut visit: impl FnMut(
             u64,
             crate::kernel::semantic_journal::SemanticJournalFactRow,
         ) -> Result<bool, StoreError>,
     ) -> Result<u64, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let (next_sequence, _) = crate::kernel::semantic_journal::high_water(&tx, digest)?;
+        let (count, _) =
+            crate::kernel::semantic_journal::validate_facts(&tx, digest, validate_row)?;
+        let next_sequence = count.checked_add(1).ok_or(StoreError::Corruption)?;
         let high_water = next_sequence.checked_sub(1).ok_or(StoreError::Corruption)?;
         if requested_high_water.is_some_and(|requested| requested != high_water) {
             return Err(StoreError::ConstraintViolation);

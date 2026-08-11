@@ -321,6 +321,29 @@ fn journal_future_diagnostic_retains_schema_source_and_provider_metadata() {
 }
 
 #[test]
+fn journal_future_diagnostic_preserves_bounded_provider_id_for_dedupe() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    let body = br#"{"schema_version":99,"source_type":"future.hook.v9","provider_event_id":"future_evt_1","payload":{"kind":"new_semantic"}}"#;
+    let first = journal
+        .ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_future_provider_id_1"),
+            body,
+            NOW_MS,
+        )
+        .quarantined()
+        .expect("future diagnostic");
+    assert_eq!(first.provider_event_id(), Some("future_evt_1"));
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_future_provider_id_2"),
+            body,
+            NOW_MS,
+        ),
+        JournalIngestOutcome::Duplicate { existing_id } if existing_id == first.id()
+    ));
+}
+
+#[test]
 fn journal_forged_identity_in_payload_fails_closed() {
     let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
     let outcome = journal.ingest(
@@ -464,6 +487,31 @@ fn journal_same_native_id_different_payload_is_conflict() {
         JournalIngestOutcome::Conflict { existing_id } => assert_eq!(existing_id, first.id()),
         other => panic!("expected conflict, got {other:?}"),
     }
+}
+
+#[test]
+fn journal_delivery_and_provider_key_hits_must_agree() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_key_a",
+        "claude_user_message.json",
+    );
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_key_b",
+        "claude_tool_call.json",
+    );
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_key_a"),
+            &load_bytes("claude_tool_call.json"),
+            NOW_MS,
+        ),
+        JournalIngestOutcome::NeedsResync
+    ));
 }
 
 #[test]
@@ -1209,6 +1257,51 @@ fn journal_post_open_corrupt_row_surfaces_retained_error_before_next_write() {
 }
 
 #[test]
+fn journal_corruption_in_later_row_is_sticky_across_all_reads_and_writes() {
+    let (_dir, path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_sticky_first",
+        "claude_user_message.json",
+    );
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_sticky_second",
+        "claude_tool_call.json",
+    );
+    let conn = Connection::open(&path).expect("reopen raw");
+    conn.execute(
+        "UPDATE semantic_journal_facts SET kind = 'not_a_semantic_kind' WHERE sequence = 2",
+        [],
+    )
+    .expect("corrupt later row");
+    drop(conn);
+
+    assert!(matches!(
+        journal.retained_len(),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+    assert!(matches!(
+        journal.event_at(1),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(8, 8 * 1024).expect("limits")),
+        Err(JournalIngestOutcome::NeedsResync)
+    ));
+    assert!(matches!(
+        journal.ingest(
+            test_permit(ProviderKind::ClaudeCode, "relay_sticky_after_corruption"),
+            &load_bytes("cursor_usage.json"),
+            NOW_MS,
+        ),
+        JournalIngestOutcome::NeedsResync
+    ));
+}
+
+#[test]
 fn journal_restore_rejects_unbounded_unknown_metadata() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("kernel.sqlite3");
@@ -1249,6 +1342,23 @@ fn journal_restore_rejects_unbounded_unknown_metadata() {
     assert!(matches!(
         reopened.event_at(1),
         Err(JournalIngestOutcome::NeedsResync)
+    ));
+}
+
+#[test]
+fn journal_oversized_first_page_fails_before_returning_materialized_facts() {
+    let (_dir, _path, mut journal) = temp_journal(ProviderKind::ClaudeCode);
+    ingest_named(
+        &mut journal,
+        ProviderKind::ClaudeCode,
+        "relay_oversized_first",
+        "claude_user_message.json",
+    );
+    assert!(matches!(
+        journal.projected_page(0, None, PageLimits::new(1, 1).expect("minimum cap")),
+        Err(JournalIngestOutcome::Backpressure(
+            JournalBackpressure::PageBudget
+        ))
     ));
 }
 
