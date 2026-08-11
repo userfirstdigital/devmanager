@@ -530,6 +530,23 @@ struct ScanExecution {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+fn typed_failure_snapshot(
+    ports: &[u16],
+    detail: impl Into<String>,
+    cancellation: &ScanCancellation,
+    publication_sequence: u64,
+) -> Arc<PortInventorySnapshot> {
+    Arc::new(
+        PortInventorySnapshot::probe_failure_at(
+            ports.iter().copied(),
+            detail,
+            cancellation.observed_at(),
+            cancellation.deadline(),
+        )
+        .with_publication_sequence(publication_sequence),
+    )
+}
+
 fn execute_scan(
     weak_inner: &Weak<PortInventoryInner>,
     scanner: Arc<dyn PortScanner>,
@@ -551,12 +568,23 @@ fn execute_scan(
         }) {
         Ok(worker) => worker,
         Err(error) => {
-            return ScanExecution {
-                result: Err(PortScanError::Scan(format!(
-                    "could not start scan: {error}"
-                ))),
-                worker: None,
+            let failure = typed_failure_snapshot(
+                &failure_ports,
+                format!("could not start scan: {error}"),
+                &cancellation,
+                sequence,
+            );
+            if let Some(inner) = weak_inner.upgrade() {
+                let _ = inner_publish_snapshot(&inner, failure);
             }
+            return ScanExecution {
+                result: Err(PortScanError::Scan(
+                    crate::process::ports::sanitize_port_detail(&format!(
+                        "could not start scan: {error}"
+                    )),
+                )),
+                worker: None,
+            };
         }
     };
 
@@ -567,12 +595,11 @@ fn execute_scan(
         Ok(Ok(snapshot)) => {
             if cancellation.is_cancelled() {
                 if Instant::now() >= cancellation.deadline() {
-                    let failure = Arc::new(
-                        PortInventorySnapshot::probe_failure(
-                            failure_ports,
-                            "listener inventory scan timed out",
-                        )
-                        .with_publication_sequence(sequence),
+                    let failure = typed_failure_snapshot(
+                        &failure_ports,
+                        "listener inventory scan timed out",
+                        &cancellation,
+                        sequence,
                     );
                     if let Some(inner) = weak_inner.upgrade() {
                         let _ = inner_publish_snapshot(&inner, failure);
@@ -587,7 +614,15 @@ fn execute_scan(
                     worker: Some(worker),
                 };
             }
-            let snapshot = Arc::new(snapshot.with_publication_sequence(sequence));
+            // The worker admission deadline is an upper bound even for a
+            // custom scanner that returns a snapshot without carrying its own
+            // native deadline. Never widen the source evidence window here.
+            let source_deadline = snapshot.freshness_deadline().min(cancellation.deadline());
+            let snapshot = Arc::new(
+                snapshot
+                    .with_freshness_deadline(source_deadline)
+                    .with_publication_sequence(sequence),
+            );
             if let Some(inner) = weak_inner.upgrade() {
                 let _ = inner_publish_snapshot(&inner, snapshot.clone());
             }
@@ -600,12 +635,11 @@ fn execute_scan(
             if cancellation.is_cancelled() {
                 let timeout = Instant::now() >= cancellation.deadline();
                 if timeout {
-                    let failure = Arc::new(
-                        PortInventorySnapshot::probe_failure(
-                            failure_ports,
-                            "listener inventory scan timed out",
-                        )
-                        .with_publication_sequence(sequence),
+                    let failure = typed_failure_snapshot(
+                        &failure_ports,
+                        "listener inventory scan timed out",
+                        &cancellation,
+                        sequence,
                     );
                     if let Some(inner) = weak_inner.upgrade() {
                         let _ = inner_publish_snapshot(&inner, failure);
@@ -621,10 +655,8 @@ fn execute_scan(
                 };
             }
             let error = bounded_scan_error(&error);
-            let failure = Arc::new(
-                PortInventorySnapshot::probe_failure(failure_ports, error.clone())
-                    .with_publication_sequence(sequence),
-            );
+            let failure =
+                typed_failure_snapshot(&failure_ports, error.clone(), &cancellation, sequence);
             if let Some(inner) = weak_inner.upgrade() {
                 let _ = inner_publish_snapshot(&inner, failure);
             }
@@ -635,12 +667,11 @@ fn execute_scan(
         }
         Err(RecvTimeoutError::Timeout) => {
             cancellation.cancel();
-            let failure = Arc::new(
-                PortInventorySnapshot::probe_failure(
-                    failure_ports,
-                    "listener inventory scan timed out",
-                )
-                .with_publication_sequence(sequence),
+            let failure = typed_failure_snapshot(
+                &failure_ports,
+                "listener inventory scan timed out",
+                &cancellation,
+                sequence,
             );
             if let Some(inner) = weak_inner.upgrade() {
                 let _ = inner_publish_snapshot(&inner, failure);
@@ -652,10 +683,7 @@ fn execute_scan(
         }
         Err(RecvTimeoutError::Disconnected) => {
             let error = "port scanner terminated without a result";
-            let failure = Arc::new(
-                PortInventorySnapshot::probe_failure(failure_ports, error)
-                    .with_publication_sequence(sequence),
-            );
+            let failure = typed_failure_snapshot(&failure_ports, error, &cancellation, sequence);
             if let Some(inner) = weak_inner.upgrade() {
                 let _ = inner_publish_snapshot(&inner, failure);
             }
@@ -671,6 +699,12 @@ fn inner_publish_snapshot(
     inner: &PortInventoryInner,
     snapshot: Arc<PortInventorySnapshot>,
 ) -> bool {
+    let Ok(coordinator) = inner.coordinator.lock() else {
+        return false;
+    };
+    if coordinator.shutdown {
+        return false;
+    }
     let mut current = inner.snapshot.write().expect("port inventory cache lock");
     if snapshot.publication_sequence() <= current.publication_sequence() {
         return false;
@@ -912,11 +946,12 @@ where
         ));
     }
     ensure_before_deadline()?;
-    Ok(PortInventorySnapshot::from_parts(
+    Ok(PortInventorySnapshot::from_parts_with_deadline(
         observations,
         endpoints,
         issues,
         observation_time,
+        deadline,
     ))
 }
 
@@ -958,17 +993,14 @@ fn normalize_listener_table(
 }
 
 fn bounded_scan_error(error: &str) -> String {
-    let mut characters = error.chars();
+    let sanitized = crate::process::ports::sanitize_port_detail(error);
     let mut detail = String::new();
+    let mut characters = sanitized.chars();
     while detail.chars().count() < 255 {
         let Some(character) = characters.next() else {
             return detail;
         };
-        detail.push(if character.is_control() {
-            ' '
-        } else {
-            character
-        });
+        detail.push(character);
     }
     if characters.next().is_some() {
         detail.push('…');

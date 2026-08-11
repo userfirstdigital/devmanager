@@ -372,6 +372,82 @@ fn public_snapshot_bounds_and_sanitizes_diagnostic_strings() {
 }
 
 #[test]
+fn whole_scan_failure_publishes_typed_probe_errors_without_path_or_secret_detail() {
+    let ports = [43_103, 43_104];
+    let secret_path = r"file:///C:/Users/alice/private/port-token.txt";
+    let secret_value = "super-secret-value";
+    let scanner = move |_ports: &[u16], _cancellation: &ScanCancellation| {
+        Err(format!(
+            "listener probe failed at {secret_path}: token={secret_value} Authorization: Bearer {secret_value}"
+        ))
+    };
+    let inventory = PortInventory::with_scanner_and_timeout(scanner, Duration::from_secs(1));
+    let request = inventory.request_scan(&ports).expect("scan request");
+    assert!(matches!(
+        request.wait(Duration::from_secs(1)),
+        Err(PortScanError::Scan(_))
+    ));
+
+    let snapshot = inventory.cached_snapshot();
+    assert_eq!(snapshot.requested_ports(), ports);
+    for (index, port) in ports.iter().copied().enumerate() {
+        let detail = match snapshot.observation(port) {
+            Some(PortObservation::ProbeError(detail)) => detail,
+            other => panic!("expected typed probe failure for port {port}, got {other:?}"),
+        };
+        assert!(!detail.contains(secret_path));
+        assert!(!detail.contains(secret_value));
+        let status = project_port_status_from_snapshot(
+            &PortTarget::new(port, fence(103 + index as u8, 1), ManagedPortHealth::Ready),
+            &snapshot,
+            None,
+        );
+        assert_eq!(status.kind(), PortStatusKind::ProbeError);
+    }
+    inventory.shutdown();
+}
+
+#[test]
+fn listener_scan_snapshot_preserves_source_observation_deadline() {
+    let observed_at = Instant::now();
+    let deadline = observed_at + Duration::from_millis(250);
+    let snapshot = scan_listener_inventory_with_deadline(
+        &[43_105],
+        |_ports| Ok(BTreeMap::new()),
+        |_pid| unreachable!("free listener scan does not capture identities"),
+        observed_at,
+        deadline,
+    )
+    .expect("listener inventory");
+
+    assert_eq!(snapshot.observed_at(), observed_at);
+    assert_eq!(snapshot.freshness_deadline(), deadline);
+}
+
+#[test]
+fn projected_status_rejects_an_expired_source_deadline_without_restamping() {
+    let port = 43_106;
+    let observed_at = Instant::now() - Duration::from_secs(1);
+    let deadline = Instant::now() - Duration::from_millis(1);
+    let snapshot = PortInventorySnapshot::from_parts_with_deadline(
+        BTreeMap::from([(port, PortObservation::Free)]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        observed_at,
+        deadline,
+    )
+    .with_publication_sequence(1);
+
+    let status = project_port_status_from_snapshot(
+        &PortTarget::new(port, fence(106, 1), ManagedPortHealth::Ready),
+        &snapshot,
+        None,
+    );
+
+    assert_eq!(status.kind(), PortStatusKind::Unknown);
+}
+
+#[test]
 fn probe_failure_remains_visible_while_managed_resource_is_starting() {
     let resource = fence(10, 1);
     let (registry, _) = registry_with_root(resource, 11_013, 1_013);

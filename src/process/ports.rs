@@ -29,6 +29,7 @@ pub const DEFAULT_MEMBERSHIP_MAX_AGE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct ScanCancellation {
     cancelled: Arc<AtomicBool>,
+    observed_at: Instant,
     deadline: Instant,
 }
 
@@ -36,6 +37,7 @@ impl ScanCancellation {
     pub(crate) fn new(deadline: Instant) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            observed_at: Instant::now(),
             deadline,
         }
     }
@@ -50,6 +52,13 @@ impl ScanCancellation {
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    /// The immutable admission instant for the scan. Callers that publish a
+    /// failure snapshot must retain this source clock rather than stamping
+    /// the failure at callback/publication time.
+    pub fn observed_at(&self) -> Instant {
+        self.observed_at
     }
 }
 
@@ -94,8 +103,9 @@ const MAX_PORT_DETAIL_CHARS: usize = 256;
 const MAX_LISTENER_IDENTITY_DISPLAY_CHARS: usize = 2048;
 
 fn bounded_sanitized_detail(detail: &str) -> String {
-    let mut sanitized = String::with_capacity(detail.len().min(MAX_PORT_DETAIL_CHARS));
-    let mut characters = detail.chars();
+    let redacted = sanitize_port_detail(detail);
+    let mut sanitized = String::with_capacity(redacted.len().min(MAX_PORT_DETAIL_CHARS));
+    let mut characters = redacted.chars();
     while sanitized.chars().count() < MAX_PORT_DETAIL_CHARS.saturating_sub(1) {
         let Some(character) = characters.next() else {
             return sanitized;
@@ -110,6 +120,166 @@ fn bounded_sanitized_detail(detail: &str) -> String {
         sanitized.push('…');
     }
     sanitized
+}
+
+/// Produce deterministic, host-safe diagnostics for port probes. Absolute
+/// paths and values assigned to secret-like keys are replaced before any
+/// projection can retain or display the detail. The result intentionally
+/// normalizes whitespace so the same native error has one stable rendering.
+pub(crate) fn sanitize_port_detail(detail: &str) -> String {
+    let mut redacted = Vec::new();
+    let mut pending_secret_values = 0usize;
+    for token in detail.split_whitespace() {
+        if pending_secret_values > 0 {
+            // Keep an explicit separator readable while still carrying the
+            // pending value redaction across `token = value` diagnostics.
+            if token.trim_matches(['"', '\'', '(', '[', '{', ')', ']', '}']) == "=" {
+                redacted.push(token.to_string());
+                continue;
+            }
+            redacted.push("[redacted]".to_string());
+            pending_secret_values = pending_secret_values.saturating_sub(1);
+            continue;
+        }
+
+        pending_secret_values = secret_value_tokens_to_redact(token);
+        redacted.push(redact_port_detail_token(token));
+    }
+    redacted.join(" ")
+}
+
+fn secret_value_tokens_to_redact(token: &str) -> usize {
+    let (core_start, core_end) = token_core_bounds(token);
+    let core = &token[core_start..core_end];
+    let Some(separator) = core.find(['=', ':']) else {
+        return secret_key_value_count(core);
+    };
+    let key = normalize_secret_key(&core[..separator]);
+    if !is_secret_key(&key) || !core[separator + 1..].is_empty() {
+        return 0;
+    }
+    if key == "authorization" {
+        2
+    } else {
+        1
+    }
+}
+
+fn secret_key_value_count(core: &str) -> usize {
+    let key = normalize_secret_key(core);
+    if !is_secret_key(&key) {
+        return 0;
+    }
+    if key == "authorization" {
+        2
+    } else {
+        1
+    }
+}
+
+fn normalize_secret_key(key: &str) -> String {
+    key.trim_start_matches(|character: char| matches!(character, '-' | '?' | '&'))
+        .to_ascii_lowercase()
+}
+
+fn is_secret_key(key: &str) -> bool {
+    matches!(
+        key,
+        "token"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "bearer"
+            | "authorization"
+            | "api_key"
+            | "apikey"
+            | "private_key"
+    )
+}
+
+fn token_core_bounds(token: &str) -> (usize, usize) {
+    let mut core_start = 0;
+    let mut core_end = token.len();
+    while core_start < core_end
+        && token.as_bytes()[core_start].is_ascii_punctuation()
+        && matches!(
+            token.as_bytes()[core_start],
+            b'"' | b'\'' | b'(' | b'[' | b'{'
+        )
+    {
+        core_start += 1;
+    }
+    while core_end > core_start
+        && token.as_bytes()[core_end - 1].is_ascii_punctuation()
+        && matches!(
+            token.as_bytes()[core_end - 1],
+            b'"' | b'\'' | b')' | b']' | b'}'
+        )
+    {
+        core_end -= 1;
+    }
+    (core_start, core_end)
+}
+
+fn redact_port_detail_token(token: &str) -> String {
+    let (core_start, core_end) = token_core_bounds(token);
+    let core = &token[core_start..core_end];
+    let lower = core.to_ascii_lowercase();
+    if let Some(scheme_end) = lower.find("://") {
+        let scheme = &lower[..scheme_end];
+        if scheme == "file" {
+            return format!(
+                "{}[redacted path]{}",
+                &token[..core_start],
+                &token[core_end..]
+            );
+        }
+        if matches!(scheme, "http" | "https" | "ws" | "wss") {
+            let authority_start = scheme_end + 3;
+            if let Some(path_offset) = core[authority_start..].find(['/', '?', '#']) {
+                let path_start = authority_start + path_offset;
+                return format!(
+                    "{}{}[redacted path]{}",
+                    &token[..core_start],
+                    &core[..path_start],
+                    &token[core_end..]
+                );
+            }
+        }
+    }
+    let path_like = (core.contains(['\\', '/']) && !lower.contains("://"))
+        || (core.len() >= 3
+            && core.as_bytes()[1] == b':'
+            && matches!(core.as_bytes()[2], b'\\' | b'/'));
+    if path_like {
+        return format!(
+            "{}[redacted path]{}",
+            &token[..core_start],
+            &token[core_end..]
+        );
+    }
+
+    if let Some(separator) = core.find(['=', ':']) {
+        let key = normalize_secret_key(&core[..separator]);
+        if is_secret_key(&key) {
+            return format!(
+                "{}{}[redacted]{}",
+                &token[..core_start],
+                &core[..separator + 1],
+                &token[core_end..]
+            );
+        }
+    }
+    token
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn normalized_ports(ports: impl IntoIterator<Item = u16>) -> Vec<u16> {
@@ -426,6 +596,7 @@ pub struct PortInventorySnapshot {
     issues: Arc<BTreeMap<u16, PortObservationIssue>>,
     requested_ports: Arc<[u16]>,
     observed_at: Instant,
+    freshness_deadline: Instant,
     publication_sequence: u64,
     endpoint_count: usize,
     error_count: usize,
@@ -462,6 +633,25 @@ impl PortInventorySnapshot {
         endpoints: BTreeMap<u16, Arc<[TcpEndpoint]>>,
         issues: BTreeMap<u16, PortObservationIssue>,
         observed_at: Instant,
+    ) -> Self {
+        let freshness_deadline = observed_at
+            .checked_add(DEFAULT_FREE_PROOF_MAX_AGE)
+            .unwrap_or(observed_at);
+        Self::from_parts_with_deadline(
+            observations,
+            endpoints,
+            issues,
+            observed_at,
+            freshness_deadline,
+        )
+    }
+
+    pub fn from_parts_with_deadline(
+        observations: BTreeMap<u16, PortObservation>,
+        endpoints: BTreeMap<u16, Arc<[TcpEndpoint]>>,
+        issues: BTreeMap<u16, PortObservationIssue>,
+        observed_at: Instant,
+        freshness_deadline: Instant,
     ) -> Self {
         let observations = observations
             .into_iter()
@@ -556,6 +746,7 @@ impl PortInventorySnapshot {
             issues: Arc::new(issues),
             requested_ports: Arc::from(requested_ports.into_boxed_slice()),
             observed_at,
+            freshness_deadline,
             publication_sequence: 0,
             endpoint_count,
             error_count,
@@ -564,12 +755,31 @@ impl PortInventorySnapshot {
     }
 
     pub fn probe_failure(ports: impl IntoIterator<Item = u16>, detail: impl Into<String>) -> Self {
+        let observed_at = Instant::now();
+        let freshness_deadline = observed_at
+            .checked_add(DEFAULT_FREE_PROOF_MAX_AGE)
+            .unwrap_or(observed_at);
+        Self::probe_failure_at(ports, detail, observed_at, freshness_deadline)
+    }
+
+    pub fn probe_failure_at(
+        ports: impl IntoIterator<Item = u16>,
+        detail: impl Into<String>,
+        observed_at: Instant,
+        freshness_deadline: Instant,
+    ) -> Self {
         let detail = bounded_sanitized_detail(&detail.into());
         let observations = normalized_ports(ports)
             .into_iter()
             .map(|port| (port, PortObservation::ProbeError(detail.clone())))
             .collect();
-        Self::new(observations)
+        Self::from_parts_with_deadline(
+            observations,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            observed_at,
+            freshness_deadline,
+        )
     }
 
     pub fn observation(&self, port: u16) -> Option<&PortObservation> {
@@ -600,6 +810,10 @@ impl PortInventorySnapshot {
         self.observed_at
     }
 
+    pub fn freshness_deadline(&self) -> Instant {
+        self.freshness_deadline
+    }
+
     pub fn publication_sequence(&self) -> u64 {
         self.publication_sequence
     }
@@ -625,12 +839,22 @@ impl PortInventorySnapshot {
     }
 
     pub fn is_fresh_at(&self, now: Instant, max_age: Duration) -> bool {
-        now.checked_duration_since(self.observed_at)
-            .is_some_and(|age| age <= max_age)
+        now <= self.freshness_deadline
+            && now
+                .checked_duration_since(self.observed_at)
+                .is_some_and(|age| age <= max_age)
     }
 
     pub fn with_observed_at(mut self, observed_at: Instant) -> Self {
         self.observed_at = observed_at;
+        self.freshness_deadline = observed_at
+            .checked_add(DEFAULT_FREE_PROOF_MAX_AGE)
+            .unwrap_or(observed_at);
+        self
+    }
+
+    pub fn with_freshness_deadline(mut self, freshness_deadline: Instant) -> Self {
+        self.freshness_deadline = freshness_deadline;
         self
     }
 
@@ -651,6 +875,8 @@ impl PortInventorySnapshot {
         deadline: Instant,
     ) -> bool {
         observation_time <= deadline
+            && observation_time <= self.freshness_deadline
+            && observation_time <= other.freshness_deadline
             && self.is_valid()
             && other.is_valid()
             && self.is_exactly_for(other.requested_ports())
