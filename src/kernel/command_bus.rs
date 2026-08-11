@@ -2065,6 +2065,7 @@ fn execute_in_tx(
                     command_id: envelope.command_id,
                     code: RejectionCode::IdempotencyConflict,
                     current_revision: snapshot.as_ref().map(|snap| snap.task.revision),
+                    resolution: None,
                 });
             }
         }
@@ -2102,13 +2103,14 @@ fn execute_in_tx(
     let current_revision = snapshot.as_ref().map(|snap| snap.task.revision);
 
     match decide(snapshot.as_ref(), &envelope) {
-        Err(code) => persist_rejection(
+        Err(code) => persist_rejection_with_resolution(
             tx,
             &envelope,
             effective_task_id,
             code,
             current_revision,
             accepted_at_ms,
+            provider_resolution_for_rejection(snapshot.as_ref(), &envelope, code),
         ),
         Ok(decision) => {
             // Empty authoritative decisions for already Closing/Releasing stay unsupported
@@ -2629,7 +2631,16 @@ fn validate_accepted_receipt_correlation(
     }
     // Missing outbox must not fall through into the pure validator for accepted ops.
     if operation.state == "accepted" {
-        return Err(StoreError::Corruption);
+        return validate_provider_input_accepted_receipt(
+            tx,
+            command_id,
+            expected_operation_id,
+            event_ids,
+            receipt_final_revision,
+            scope,
+            committed_sequence,
+            &operation,
+        );
     }
     validate_pure_accepted_receipt(
         tx,
@@ -2640,6 +2651,71 @@ fn validate_accepted_receipt_correlation(
         scope,
         committed_sequence,
         &operation,
+    )
+}
+
+fn validate_provider_input_accepted_receipt(
+    tx: &Connection,
+    command_id: CommandId,
+    expected_operation_id: OperationId,
+    event_ids: &[EventId],
+    receipt_final_revision: u64,
+    scope: TaskId,
+    committed_sequence: u64,
+    operation: &OperationProjectionRow,
+) -> Result<(), StoreError> {
+    if operation.state != "accepted"
+        || operation.action_epoch.is_some()
+        || operation.resource_id.is_some()
+        || operation.runtime_generation.is_some()
+        || operation.result.is_some()
+        || operation.outcome_code.is_some()
+        || operation.outcome_at_ms.is_some()
+    {
+        return Err(StoreError::Corruption);
+    }
+    if event_ids.len() != 1 {
+        return Err(StoreError::Corruption);
+    }
+    let decision_count = u64::try_from(event_ids.len()).map_err(|_| StoreError::Corruption)?;
+    let first_decision_sequence = committed_sequence
+        .checked_sub(decision_count)
+        .ok_or(StoreError::Corruption)?;
+    validate_decision_event_batch(
+        tx,
+        event_ids,
+        scope,
+        receipt_final_revision,
+        first_decision_sequence,
+        operation.accepted_at_ms,
+        is_provider_input_decision_fact,
+    )?;
+    let accepted_row = load_event_row_at_sequence(tx, committed_sequence)?;
+    validate_accepted_fact_row(
+        &accepted_row,
+        command_id,
+        expected_operation_id,
+        Some(scope),
+        operation.accepted_at_ms,
+        OperationFence {
+            action_epoch: None,
+            resource_id: None,
+            runtime_generation: None,
+        },
+    )?;
+    ensure_unique_operation_accepted_fact(
+        tx,
+        command_id,
+        expected_operation_id,
+        Some(scope),
+        operation.accepted_at_ms,
+        committed_sequence,
+        &accepted_row,
+        OperationFence {
+            action_epoch: None,
+            resource_id: None,
+            runtime_generation: None,
+        },
     )
 }
 
@@ -5497,6 +5573,10 @@ fn is_pure_slice_decision_fact(event: &Event) -> bool {
     )
 }
 
+fn is_provider_input_decision_fact(event: &Event) -> bool {
+    matches!(event, Event::ProviderInputAccepted { .. })
+}
+
 fn is_side_effect_decision_fact(event: &Event) -> bool {
     matches!(
         event,
@@ -5555,10 +5635,31 @@ fn persist_rejection(
     current_revision: Option<u64>,
     created_at_ms: i64,
 ) -> Result<CommandReceipt, StoreError> {
+    persist_rejection_with_resolution(
+        tx,
+        envelope,
+        effective_task_id,
+        code,
+        current_revision,
+        created_at_ms,
+        None,
+    )
+}
+
+fn persist_rejection_with_resolution(
+    tx: &Transaction<'_>,
+    envelope: &CommandEnvelope,
+    effective_task_id: Option<TaskId>,
+    code: RejectionCode,
+    current_revision: Option<u64>,
+    created_at_ms: i64,
+    resolution: Option<crate::domain::ProviderResolutionWinner>,
+) -> Result<CommandReceipt, StoreError> {
     let receipt = CommandReceipt::Rejected {
         command_id: envelope.command_id,
         code,
         current_revision,
+        resolution,
     };
     insert_receipt_row(
         tx,
@@ -5571,10 +5672,33 @@ fn persist_rejection(
     Ok(receipt)
 }
 
-/// Commits decision facts plus OperationAccepted/OperationSettled in one
-/// transaction. For `SubmitProviderInput`, OperationSettled is *intent*
-/// acceptance only. Delivery stays `ProviderDeliveryVisibility::Hold` on
-/// the decision event until a destination/outbox adapter exists.
+fn provider_resolution_for_rejection(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    code: RejectionCode,
+) -> Option<crate::domain::ProviderResolutionWinner> {
+    if code != RejectionCode::AlreadyResolved {
+        return None;
+    }
+    let snapshot = snapshot?;
+    let Command::SubmitProviderInput(intent) = &envelope.command else {
+        return None;
+    };
+    let session = snapshot.provider_sessions.get(&intent.agent_session_id())?;
+    match intent.action() {
+        crate::domain::ProviderInputAction::AnswerQuestion { question_id, .. } => {
+            session.question_winners.get(question_id).copied()
+        }
+        crate::domain::ProviderInputAction::ResolveApproval { approval_id, .. } => {
+            session.approval_winners.get(approval_id).copied()
+        }
+        _ => None,
+    }
+}
+
+/// Commits pure decision facts plus OperationAccepted in one transaction.
+/// Provider input deliberately stops at Accepted/HOLD: without a destination
+/// adapter there is no durable delivery proof and therefore no settlement.
 fn persist_pure_acceptance(
     tx: &Transaction<'_>,
     envelope: &CommandEnvelope,
@@ -5583,6 +5707,8 @@ fn persist_pure_acceptance(
     decision: Vec<Event>,
     accepted_at_ms: i64,
 ) -> Result<CommandReceipt, StoreError> {
+    let is_provider_input = decision.len() == 1
+        && matches!(decision.first(), Some(Event::ProviderInputAccepted { .. }));
     let operation_id = OperationId::new();
     let decision_event_ids: Vec<EventId> = (0..decision.len()).map(|_| EventId::new()).collect();
     let accepted_event_id = EventId::new();
@@ -5648,7 +5774,7 @@ fn persist_pure_acceptance(
         None,
     )
     .map_err(|err| StoreError::Projection(err.to_string()))?;
-    append_and_project(
+    let committed_sequence = append_and_project(
         tx,
         accepted_event_id,
         effective_task_id,
@@ -5656,6 +5782,11 @@ fn persist_pure_acceptance(
         accepted_at_ms,
         Event::OperationAccepted(accepted),
     )?;
+
+    if is_provider_input {
+        set_committed_sequence(tx, envelope.command_id, committed_sequence)?;
+        return Ok(receipt);
+    }
 
     let settled = OperationSettledFact::new(
         envelope.command_id,
@@ -6074,13 +6205,12 @@ fn load_provider_sessions(
         }
         let agent_session_id =
             id16::<AgentSessionId>("provider_input_state.agent_session_id", &agent_bytes)?;
-        if !sessions
-            .insert(
-                agent_session_id,
-                unpack_projection_blob("provider_input_state.state", &state)?,
-            )
-            .is_none()
-        {
+        let projection: crate::domain::provider_input::ProviderSessionProjection =
+            unpack_projection_blob("provider_input_state.state", &state)?;
+        projection
+            .validate_bounds()
+            .map_err(|err| StoreError::Projection(err.to_string()))?;
+        if !sessions.insert(agent_session_id, projection).is_none() {
             return Err(StoreError::Projection(
                 "duplicate provider_input_state agent_session_id".into(),
             ));

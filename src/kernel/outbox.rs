@@ -411,6 +411,8 @@ enum ReceiptBodyWire {
         command_id: CommandId,
         code: RejectionCode,
         current_revision: Option<u64>,
+        #[serde(default)]
+        resolution: Option<crate::domain::ProviderResolutionWinner>,
     },
 }
 
@@ -438,10 +440,12 @@ pub(crate) fn encode_receipt_document(receipt: &CommandReceipt) -> Result<Vec<u8
             command_id,
             code,
             current_revision,
+            resolution,
         } => ReceiptBodyWire::Rejected {
             command_id: *command_id,
             code: *code,
             current_revision: *current_revision,
+            resolution: resolution.clone(),
         },
     };
     let wire = ReceiptDocumentWire {
@@ -482,10 +486,12 @@ pub(crate) fn decode_receipt_document(payload: &[u8]) -> Result<CommandReceipt, 
             command_id,
             code,
             current_revision,
+            resolution,
         } => CommandReceipt::Rejected {
             command_id,
             code,
             current_revision,
+            resolution,
         },
     })
 }

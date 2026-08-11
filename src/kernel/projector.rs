@@ -356,6 +356,31 @@ pub(crate) fn apply_event(
                 ));
             }
             upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                    Some(*command_id),
+                    Some(task_id),
+                    *agent_session_id,
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    *question_id,
+                    *approval_id,
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    Some(action),
+                    Some(*wait),
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
                 session.current_turn = Some(*turn_id);
                 session.last_settlement =
                     Some(crate::domain::provider_input::ProviderInputSettlement {
@@ -412,12 +437,38 @@ pub(crate) fn apply_event(
         }
         Event::ProviderQuestionPresented {
             agent_session_id,
+            runtime_generation,
             turn_id,
             question_id,
-            ..
+            action_epoch,
         } => {
             let task_id = require_task_id(event)?;
             upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                    None,
+                    Some(task_id),
+                    *agent_session_id,
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    Some(*question_id),
+                    None,
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    None,
+                    None,
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
                 session.current_turn = Some(*turn_id);
                 session.open_question = Some(*question_id);
                 Ok(())
@@ -426,12 +477,38 @@ pub(crate) fn apply_event(
         }
         Event::ProviderApprovalPresented {
             agent_session_id,
+            runtime_generation,
             turn_id,
             approval_id,
-            ..
+            action_epoch,
         } => {
             let task_id = require_task_id(event)?;
             upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context = read_provider_fence_context(
+                    tx,
+                    shadow,
+                    task_id,
+                    *agent_session_id,
+                    session.current_turn,
+                    false,
+                )?;
+                let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                    None,
+                    Some(task_id),
+                    *agent_session_id,
+                    *runtime_generation,
+                    *action_epoch,
+                    *turn_id,
+                    None,
+                    Some(*approval_id),
+                );
+                crate::domain::provider_input::validate_provider_fence(
+                    &fence,
+                    None,
+                    None,
+                    Some(&context),
+                )
+                .map_err(|err| StoreError::Projection(err.to_string()))?;
                 session.current_turn = Some(*turn_id);
                 session.open_approval = Some(*approval_id);
                 Ok(())
@@ -446,6 +523,21 @@ pub(crate) fn apply_event(
                 task_id,
                 fence.agent_session_id(),
                 |session| {
+                    let context = read_provider_fence_context(
+                        tx,
+                        shadow,
+                        task_id,
+                        fence.agent_session_id(),
+                        session.current_turn,
+                        true,
+                    )?;
+                    crate::domain::provider_input::validate_provider_fence(
+                        &fence.identity(),
+                        None,
+                        None,
+                        Some(&context),
+                    )
+                    .map_err(|err| StoreError::Projection(err.to_string()))?;
                     let record = session.waits.get_mut(&fence.command_id()).ok_or_else(|| {
                         StoreError::Projection("provider wait settlement missing wait".into())
                     })?;
@@ -933,6 +1025,66 @@ fn require_one_change(tx: &Transaction<'_>, context: &str) -> Result<(), StoreEr
         )));
     }
     Ok(())
+}
+
+fn read_provider_fence_context(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    current_turn: Option<crate::domain::id::TurnId>,
+    allow_closing: bool,
+) -> Result<crate::domain::provider_input::ProviderFenceContext, StoreError> {
+    let table = table_name("agent_sessions", shadow);
+    let row: Result<(Vec<u8>, String, i64), rusqlite::Error> = tx.query_row(
+        &format!(
+            "SELECT task_id, lifecycle, runtime_generation FROM {table}
+             WHERE agent_session_id = ?1"
+        ),
+        [agent_session_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let (agent_task_bytes, lifecycle, runtime_generation) = match row {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(StoreError::Projection(
+                "provider fence agent session not found".into(),
+            ))
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let agent_task_bytes: [u8; 16] = agent_task_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        StoreError::Projection(format!(
+            "provider fence agent task id must be 16 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    let agent_task_id = TaskId::from_bytes(agent_task_bytes)
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    let lifecycle = match lifecycle.as_str() {
+        "open" => crate::domain::agent::AgentSessionLifecycle::Open,
+        "closing" => crate::domain::agent::AgentSessionLifecycle::Closing,
+        "closed" => crate::domain::agent::AgentSessionLifecycle::Closed,
+        other => {
+            return Err(StoreError::Projection(format!(
+                "provider fence agent lifecycle is invalid: {other}"
+            )))
+        }
+    };
+    let (_, action_epoch) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    Ok(crate::domain::provider_input::ProviderFenceContext {
+        task_id,
+        agent_session_id,
+        agent_task_id,
+        runtime_generation: u64_from_nonnegative_i64(
+            "agent_sessions.runtime_generation",
+            runtime_generation,
+        )?,
+        action_epoch: u64_from_nonnegative_i64("tasks.action_epoch", action_epoch)?,
+        lifecycle,
+        current_turn,
+        allow_closing,
+    })
 }
 
 fn read_task_lifecycle_epoch(
@@ -1724,13 +1876,20 @@ fn upsert_provider_session_state(
                     "provider_input_state.state exceeds its byte bound".into(),
                 ));
             }
-            rmp_serde::from_slice(&bytes).map_err(|err| {
+            let decoded = rmp_serde::from_slice(&bytes).map_err(|err| {
                 StoreError::Projection(format!("provider_input_state.state decode: {err}"))
-            })?
+            })?;
+            decoded
         }
         None => crate::domain::provider_input::ProviderSessionProjection::default(),
     };
+    session
+        .validate_bounds()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
     mutate(&mut session)?;
+    session
+        .validate_bounds()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
     let packed = pack(&session)?;
     if packed.len() > crate::domain::MAX_PROVIDER_SESSION_STATE_BYTES {
         return Err(StoreError::Projection(

@@ -8,8 +8,8 @@ use devmanager::client::action::{
 };
 use devmanager::domain::{
     decide, AgentSessionId, ClientId, Command, CommandEnvelope, CommandId,
-    PresentProviderQuestionIntent, ProviderInputAction, QuestionId, RejectionCode,
-    SubmitProviderInputIntent, TaskId, TurnId,
+    PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderInputAction, QuestionId,
+    RejectionCode, SubmitProviderInputIntent, TaskId, TurnId,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -184,6 +184,11 @@ fn submit_provider_input_receipt_survives_close_reopen_only_after_durable_commit
         panic!("receipt may say persisted only after durable commit, got {first:?}");
     };
     assert_eq!(accepted_id, command_id);
+    assert!(matches!(
+        bus.operation_status(operation_id)
+            .expect("operation status"),
+        Some(devmanager::domain::OperationState::Accepted)
+    ));
     drop(bus);
 
     let mut reopened = CommandBus::open(&path).expect("reopen");
@@ -365,9 +370,14 @@ fn first_answer_wins_uses_host_order_and_survives_reopen_and_second_connection()
         .expect("loser answer");
     match loser {
         CommandReceipt::Rejected {
-            code: RejectionCode::AlreadyExists,
+            code: RejectionCode::AlreadyResolved,
+            resolution: Some(winner),
             ..
-        } => {}
+        } => {
+            assert_eq!(winner.command_id, winner_cmd);
+            assert_eq!(winner.client_id, client_id);
+            assert!(winner.accepted_at_ms > 0);
+        }
         other => panic!("second device must not change the winner, got {other:?}"),
     }
     drop(bus);
@@ -382,13 +392,14 @@ fn first_answer_wins_uses_host_order_and_survives_reopen_and_second_connection()
         .provider_sessions
         .get(&agent_session_id)
         .expect("provider session");
+    assert_eq!(session.open_question, None);
     let stored = session
         .question_winners
         .get(&question_id)
         .expect("persisted winner");
     assert_eq!(stored.command_id, winner_cmd);
     assert_eq!(stored.client_id, client_id);
-    assert_ne!(stored.accepted_at_ms, 9_999_999_999_999);
+    assert!(stored.accepted_at_ms > 0);
     let settlement = session.last_settlement.expect("intent settlement");
     assert_eq!(settlement.command_id, winner_cmd);
     assert_eq!(
@@ -500,6 +511,203 @@ fn wait_settlement_requires_exact_fence_and_rejects_replacement_generation() {
         matches!(settled, CommandReceipt::Accepted { .. }),
         "exact fence must settle, got {settled:?}"
     );
+}
+
+#[test]
+fn settled_waits_reclaim_capacity_across_sixty_five_cycles() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::domain::{ProviderWaitFence, SettleProviderWaitIntent};
+    use devmanager::kernel::CommandBus;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-wait-capacity.sqlite3");
+    let mut bus = CommandBus::open(&path).expect("open");
+    let (task_id, agent_session_id, action_epoch, mut revision, client_id) =
+        seed_open_task_with_agent(&mut bus, 0xE0);
+    let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xEA)).expect("turn");
+
+    for index in 0..65_u8 {
+        let wait_command_id =
+            CommandId::from_bytes(fixed_uuid_v7(index.wrapping_add(1))).expect("wait command");
+        let accepted = bus
+            .execute(CommandEnvelope {
+                command_id: wait_command_id,
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_001_000_000 + i64::from(index) * 2,
+                expected_task_revision: Some(revision),
+                command: Command::SubmitProviderInput(send_now_intent(
+                    agent_session_id,
+                    turn_id,
+                    action_epoch,
+                    "cycle",
+                    true,
+                )),
+            })
+            .expect("wait input");
+        let CommandReceipt::Accepted {
+            task_revision: Some(after_wait),
+            ..
+        } = accepted
+        else {
+            panic!("wait input must be accepted");
+        };
+
+        let fence = ProviderWaitFence::new(
+            wait_command_id,
+            task_id,
+            action_epoch,
+            agent_session_id,
+            3,
+            turn_id,
+            None,
+            None,
+        );
+        let settled = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::from_bytes(fixed_uuid_v7(index.wrapping_add(100)))
+                    .expect("settle command"),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_001_000_001 + i64::from(index) * 2,
+                expected_task_revision: Some(after_wait),
+                command: Command::SettleProviderWait(
+                    SettleProviderWaitIntent::try_new(fence).expect("settle intent"),
+                ),
+            })
+            .expect("settle wait");
+        let CommandReceipt::Accepted {
+            task_revision: Some(after_settle),
+            ..
+        } = settled
+        else {
+            panic!("wait settlement must be accepted");
+        };
+        revision = after_settle;
+    }
+
+    let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+    let session = snapshot
+        .provider_sessions
+        .get(&agent_session_id)
+        .expect("provider session");
+    assert!(session.waits.len() <= devmanager::domain::MAX_PROVIDER_WAITS);
+    assert!(session.waits.values().all(|record| !record.pending));
+}
+
+#[test]
+fn first_approval_wins_reports_typed_resolution_and_clears_open_approval() {
+    use devmanager::domain::command::CommandReceipt;
+    use devmanager::kernel::CommandBus;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("provider-input-approval.sqlite3");
+    let mut bus = CommandBus::open(&path).expect("open");
+    let (task_id, agent_session_id, action_epoch, mut revision, client_id) =
+        seed_open_task_with_agent(&mut bus, 0xF0);
+    let turn_id = TurnId::from_bytes(fixed_uuid_v7(0xFA)).expect("turn");
+    let approval_id =
+        devmanager::domain::ApprovalId::from_bytes(fixed_uuid_v7(0xFB)).expect("approval");
+
+    let presented = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xFC)).expect("present command"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_002_000_000,
+            expected_task_revision: Some(revision),
+            command: Command::PresentProviderApproval(
+                PresentProviderApprovalIntent::try_new(
+                    agent_session_id,
+                    3,
+                    turn_id,
+                    action_epoch,
+                    approval_id,
+                )
+                .expect("present approval"),
+            ),
+        })
+        .expect("present approval");
+    let CommandReceipt::Accepted {
+        task_revision: Some(after_present),
+        ..
+    } = presented
+    else {
+        panic!("approval presentation must be accepted");
+    };
+    revision = after_present;
+
+    let winner_command_id = CommandId::from_bytes(fixed_uuid_v7(0xFD)).expect("winner");
+    let winner_at = 1_725_002_000_010;
+    let winner = bus
+        .execute(CommandEnvelope {
+            command_id: winner_command_id,
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: winner_at,
+            expected_task_revision: Some(revision),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    agent_session_id,
+                    3,
+                    turn_id,
+                    action_epoch,
+                    None,
+                    Some(approval_id),
+                    ProviderInputAction::ResolveApproval {
+                        approval_id,
+                        allow: true,
+                    },
+                )
+                .expect("resolve approval"),
+            ),
+        })
+        .expect("resolve approval");
+    let CommandReceipt::Accepted { .. } = winner else {
+        panic!("approval winner must be accepted: {winner:?}");
+    };
+
+    let loser = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xFE)).expect("loser"),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: winner_at + 1,
+            expected_task_revision: Some(revision + 1),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    agent_session_id,
+                    3,
+                    turn_id,
+                    action_epoch,
+                    None,
+                    Some(approval_id),
+                    ProviderInputAction::ResolveApproval {
+                        approval_id,
+                        allow: false,
+                    },
+                )
+                .expect("resolve approval loser"),
+            ),
+        })
+        .expect("loser approval");
+    assert!(matches!(
+        loser,
+        CommandReceipt::Rejected {
+            code: RejectionCode::AlreadyResolved,
+            resolution: Some(_),
+            ..
+        }
+    ));
+
+    let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+    let session = snapshot
+        .provider_sessions
+        .get(&agent_session_id)
+        .expect("provider session");
+    assert_eq!(session.open_approval, None);
 }
 
 #[test]
@@ -868,6 +1076,52 @@ fn oversized_provider_session_projection_is_rejected_before_decode() {
         matches!(&error, devmanager::kernel::StoreError::Projection(message) if message.contains("exceeds")),
         "unexpected error: {error:?}"
     );
+}
+
+#[test]
+fn provider_session_projection_map_bounds_apply_on_write_and_decode() {
+    use std::collections::BTreeMap;
+
+    use serde::Serialize;
+
+    let mut projection = devmanager::domain::ProviderSessionProjection::default();
+    for _ in 0..=devmanager::domain::MAX_PROVIDER_QUESTION_WINS {
+        projection.question_winners.insert(
+            QuestionId::new(),
+            devmanager::domain::ProviderResolutionWinner {
+                command_id: CommandId::new(),
+                client_id: ClientId::new(),
+                accepted_at_ms: 1,
+            },
+        );
+    }
+    assert!(projection.validate_bounds().is_err());
+    assert!(rmp_serde::to_vec_named(&projection).is_err());
+
+    #[derive(Serialize)]
+    struct OversizedProjectionWire {
+        current_turn: Option<TurnId>,
+        open_question: Option<QuestionId>,
+        open_approval: Option<devmanager::domain::ApprovalId>,
+        question_winners: BTreeMap<QuestionId, devmanager::domain::ProviderResolutionWinner>,
+        approval_winners:
+            BTreeMap<devmanager::domain::ApprovalId, devmanager::domain::ProviderResolutionWinner>,
+        waits: BTreeMap<CommandId, devmanager::domain::ProviderWaitRecord>,
+        last_settlement: Option<devmanager::domain::ProviderInputSettlement>,
+    }
+    let encoded = rmp_serde::to_vec_named(&OversizedProjectionWire {
+        current_turn: None,
+        open_question: None,
+        open_approval: None,
+        question_winners: projection.question_winners,
+        approval_winners: BTreeMap::new(),
+        waits: BTreeMap::new(),
+        last_settlement: None,
+    })
+    .expect("encode malformed projection fixture");
+    let error = rmp_serde::from_slice::<devmanager::domain::ProviderSessionProjection>(&encoded)
+        .expect_err("oversized map must fail before projection use");
+    assert!(error.to_string().contains("winner map") || error.to_string().contains("entries"));
 }
 
 #[test]

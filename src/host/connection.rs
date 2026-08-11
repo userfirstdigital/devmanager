@@ -1321,11 +1321,10 @@ impl HostRequestExecutor {
                 if envelope.client_id != negotiated.client_id {
                     return Err(IpcError::Unauthorized);
                 }
-                if matches!(envelope.command, Command::ConfirmHostQuit(_))
-                    && !negotiated.capabilities.contains(Capability::HostShutdown)
-                {
-                    return Err(IpcError::UnsupportedCapability);
-                }
+                validate_authenticated_command_capability(
+                    negotiated.capabilities,
+                    &envelope.command,
+                )?;
                 let receipt = self.bus.execute(envelope).map_err(map_store_error)?;
                 self.fan_out_live_durable_events();
                 Ok(ServerMessage::CommandReceipt(receipt))
@@ -2137,11 +2136,7 @@ pub(crate) fn dispatch_authenticated_request(
             if envelope.client_id != authenticated_client_id {
                 return Err(IpcError::Unauthorized);
             }
-            if matches!(envelope.command, Command::ConfirmHostQuit(_))
-                && !capabilities.contains(Capability::HostShutdown)
-            {
-                return Err(IpcError::UnsupportedCapability);
-            }
+            validate_authenticated_command_capability(capabilities, &envelope.command)?;
             let receipt = bus.execute(envelope).map_err(map_store_error)?;
             Ok(ServerMessage::CommandReceipt(receipt))
         }
@@ -2183,6 +2178,27 @@ pub(crate) fn dispatch_authenticated_request(
             Ok(ServerMessage::QueryReply(reply))
         }
         ClientRequest::Detach(_) => Err(IpcError::Unavailable),
+    }
+}
+
+/// Capability/source gate shared by both host command dispatch paths.
+/// Journal-only provider facts are never accepted from an authenticated client;
+/// provider input itself requires the negotiated capability bit.
+fn validate_authenticated_command_capability(
+    capabilities: CapabilitySet,
+    command: &Command,
+) -> Result<(), IpcError> {
+    match command {
+        Command::ConfirmHostQuit(_) if !capabilities.contains(Capability::HostShutdown) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        Command::PresentProviderQuestion(_)
+        | Command::PresentProviderApproval(_)
+        | Command::SettleProviderWait(_) => Err(IpcError::UnsupportedCapability),
+        Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
+            Err(IpcError::UnsupportedCapability)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -5290,12 +5306,14 @@ mod output_tests {
             .expect("collision duplex");
         match collision {
             DuplexExecuteCompletion::CallerMustWrite(ServerMessage::CommandReceipt(
-                CommandReceipt::Accepted {
-                    task_revision: Some(_),
+                CommandReceipt::Rejected {
+                    code: RejectionCode::IdempotencyConflict,
                     ..
                 },
             )) => {}
-            other => panic!("collision must stay caller-owned non-quit Accepted, got {other:?}"),
+            other => panic!(
+                "collision must stay caller-owned non-quit IdempotencyConflict, got {other:?}"
+            ),
         }
         assert!(ports.try_recv_prioritized().is_none());
         assert!(requests
@@ -5971,5 +5989,85 @@ mod output_tests {
         drop(healthy_reg);
         drop(slow_reg);
         drop(requests);
+    }
+
+    #[test]
+    fn authenticated_command_gate_rejects_journal_source_and_requires_provider_capability() {
+        use crate::domain::command::{Command, SubmitProviderInputIntent};
+        use crate::domain::provider_input::SettleProviderWaitIntent;
+        use crate::domain::{
+            AgentSessionId, ApprovalId, CommandId, PresentProviderApprovalIntent,
+            PresentProviderQuestionIntent, ProviderInputAction, ProviderWaitFence, QuestionId,
+            TaskId, TurnId,
+        };
+        use crate::protocol::{Capability, CapabilitySet};
+
+        let question = Command::PresentProviderQuestion(
+            PresentProviderQuestionIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                QuestionId::new(),
+            )
+            .expect("question intent"),
+        );
+        let approval = Command::PresentProviderApproval(
+            PresentProviderApprovalIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                ApprovalId::new(),
+            )
+            .expect("approval intent"),
+        );
+        let wait = Command::SettleProviderWait(
+            SettleProviderWaitIntent::try_new(ProviderWaitFence::new(
+                CommandId::new(),
+                TaskId::new(),
+                1,
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                None,
+                None,
+            ))
+            .expect("wait intent"),
+        );
+        for command in [&question, &approval, &wait] {
+            assert!(matches!(
+                super::validate_authenticated_command_capability(
+                    CapabilitySet::from_capabilities([Capability::ProviderInput]),
+                    command,
+                ),
+                Err(crate::host::IpcError::UnsupportedCapability)
+            ));
+        }
+
+        let provider = Command::SubmitProviderInput(
+            SubmitProviderInputIntent::try_new(
+                AgentSessionId::new(),
+                1,
+                TurnId::new(),
+                1,
+                None,
+                None,
+                ProviderInputAction::SendNow {
+                    text: "input".into(),
+                    wait: false,
+                },
+            )
+            .expect("provider intent"),
+        );
+        assert!(matches!(
+            super::validate_authenticated_command_capability(CapabilitySet::empty(), &provider),
+            Err(crate::host::IpcError::UnsupportedCapability)
+        ));
+        assert!(super::validate_authenticated_command_capability(
+            CapabilitySet::from_capabilities([Capability::ProviderInput]),
+            &provider,
+        )
+        .is_ok());
     }
 }

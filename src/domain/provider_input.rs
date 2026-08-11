@@ -6,9 +6,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::ser;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::agent::AgentSessionLifecycle;
 use crate::domain::id::{
     AgentSessionId, ApprovalId, ClientId, CommandId, QuestionId, TaskId, TurnId,
 };
@@ -24,6 +26,9 @@ pub enum ProviderInputIntentError {
     EmptyText,
     TextTooLarge,
     InconsistentNestedIds,
+    QuestionWinnerLimit,
+    ApprovalWinnerLimit,
+    WaitLimit,
 }
 
 impl fmt::Display for ProviderInputIntentError {
@@ -37,6 +42,15 @@ impl fmt::Display for ProviderInputIntentError {
             Self::InconsistentNestedIds => {
                 write!(f, "provider input nested identities are inconsistent")
             }
+            Self::QuestionWinnerLimit => write!(
+                f,
+                "provider question winner map exceeds {MAX_PROVIDER_QUESTION_WINS} entries"
+            ),
+            Self::ApprovalWinnerLimit => write!(
+                f,
+                "provider approval winner map exceeds {MAX_PROVIDER_APPROVAL_WINS} entries"
+            ),
+            Self::WaitLimit => write!(f, "provider wait map exceeds {MAX_PROVIDER_WAITS} entries"),
         }
     }
 }
@@ -305,10 +319,153 @@ impl ProviderWaitFence {
     pub fn matches(&self, other: &Self) -> bool {
         self == other
     }
+
+    pub fn identity(&self) -> ProviderFenceIdentity {
+        ProviderFenceIdentity::new(
+            Some(self.command_id),
+            Some(self.task_id),
+            self.agent_session_id,
+            self.runtime_generation,
+            self.action_epoch,
+            self.turn_id,
+            self.question_id,
+            self.approval_id,
+        )
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+/// Exact provider identity carried by every provider event/fence.
+///
+/// The command identity is optional only for provider-originated question and
+/// approval presentation events; accepted input and wait settlement always
+/// carry it. No identity is inferred from cwd, timestamps, or PTY state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderFenceIdentity {
+    pub command_id: Option<CommandId>,
+    pub task_id: Option<TaskId>,
+    pub agent_session_id: AgentSessionId,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub turn_id: TurnId,
+    pub question_id: Option<QuestionId>,
+    pub approval_id: Option<ApprovalId>,
+}
+
+impl ProviderFenceIdentity {
+    pub const fn new(
+        command_id: Option<CommandId>,
+        task_id: Option<TaskId>,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        turn_id: TurnId,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+    ) -> Self {
+        Self {
+            command_id,
+            task_id,
+            agent_session_id,
+            runtime_generation,
+            action_epoch,
+            turn_id,
+            question_id,
+            approval_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderFenceContext {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub agent_task_id: TaskId,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub lifecycle: AgentSessionLifecycle,
+    pub current_turn: Option<TurnId>,
+    pub allow_closing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFenceError {
+    TaskMismatch,
+    AgentSessionMismatch,
+    AgentOwnershipMismatch,
+    RuntimeGenerationMismatch,
+    ActionEpochMismatch,
+    TurnMismatch,
+    AgentNotLive,
+    InvalidNestedIds,
+    WaitFlagMismatch,
+}
+
+impl fmt::Display for ProviderFenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::TaskMismatch => "provider fence task identity mismatch",
+            Self::AgentSessionMismatch => "provider fence agent session identity mismatch",
+            Self::AgentOwnershipMismatch => "provider fence agent belongs to another task",
+            Self::RuntimeGenerationMismatch => "provider fence runtime generation mismatch",
+            Self::ActionEpochMismatch => "provider fence action epoch mismatch",
+            Self::TurnMismatch => "provider fence turn identity mismatch",
+            Self::AgentNotLive => "provider fence agent lifecycle is not live",
+            Self::InvalidNestedIds => "provider fence nested identities are inconsistent",
+            Self::WaitFlagMismatch => "provider input wait flag disagrees with action",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for ProviderFenceError {}
+
+pub fn validate_provider_fence(
+    fence: &ProviderFenceIdentity,
+    action: Option<&ProviderInputAction>,
+    wait: Option<bool>,
+    context: Option<&ProviderFenceContext>,
+) -> Result<(), ProviderFenceError> {
+    if let Some(action) = action {
+        validate_action_nested_ids(action, fence.question_id, fence.approval_id)
+            .map_err(|_| ProviderFenceError::InvalidNestedIds)?;
+        if wait != Some(action.waits_for_turn()) {
+            return Err(ProviderFenceError::WaitFlagMismatch);
+        }
+    } else if wait.is_some() {
+        return Err(ProviderFenceError::WaitFlagMismatch);
+    }
+    if let Some(context) = context {
+        if fence.task_id != Some(context.task_id) {
+            return Err(ProviderFenceError::TaskMismatch);
+        }
+        if fence.agent_session_id != context.agent_session_id {
+            return Err(ProviderFenceError::AgentSessionMismatch);
+        }
+        if context.agent_task_id != context.task_id {
+            return Err(ProviderFenceError::AgentOwnershipMismatch);
+        }
+        if fence.runtime_generation != context.runtime_generation {
+            return Err(ProviderFenceError::RuntimeGenerationMismatch);
+        }
+        if fence.action_epoch != context.action_epoch {
+            return Err(ProviderFenceError::ActionEpochMismatch);
+        }
+        let live = matches!(context.lifecycle, AgentSessionLifecycle::Open)
+            || (context.allow_closing
+                && matches!(context.lifecycle, AgentSessionLifecycle::Closing));
+        if !live {
+            return Err(ProviderFenceError::AgentNotLive);
+        }
+        if let Some(current_turn) = context.current_turn {
+            if fence.turn_id != current_turn {
+                return Err(ProviderFenceError::TurnMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProviderSessionProjection {
     pub current_turn: Option<TurnId>,
     pub open_question: Option<QuestionId>,
@@ -316,11 +473,139 @@ pub struct ProviderSessionProjection {
     pub question_winners: BTreeMap<QuestionId, ProviderResolutionWinner>,
     pub approval_winners: BTreeMap<ApprovalId, ProviderResolutionWinner>,
     pub waits: BTreeMap<CommandId, ProviderWaitRecord>,
-    #[serde(default)]
     pub last_settlement: Option<ProviderInputSettlement>,
 }
 
+struct BoundedProjectionMap<K, V, const LIMIT: usize>(BTreeMap<K, V>);
+
+impl<'de, K, V, const LIMIT: usize> Deserialize<'de> for BoundedProjectionMap<K, V, LIMIT>
+where
+    K: Ord + Deserialize<'de>,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoundedMapVisitor<K, V, const LIMIT: usize>(std::marker::PhantomData<(K, V)>);
+
+        impl<'de, K, V, const LIMIT: usize> Visitor<'de> for BoundedMapVisitor<K, V, LIMIT>
+        where
+            K: Ord + Deserialize<'de>,
+            V: Deserialize<'de>,
+        {
+            type Value = BoundedProjectionMap<K, V, LIMIT>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "a provider projection map with at most {LIMIT} entries"
+                )
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                if map.size_hint().is_some_and(|hint| hint > LIMIT) {
+                    return Err(de::Error::custom(format!(
+                        "provider projection map exceeds {LIMIT} entries"
+                    )));
+                }
+                let mut values = BTreeMap::new();
+                let mut entries_seen = 0usize;
+                while let Some(key) = map.next_key::<K>()? {
+                    if entries_seen >= LIMIT {
+                        return Err(de::Error::custom(format!(
+                            "provider projection map exceeds {LIMIT} entries"
+                        )));
+                    }
+                    entries_seen += 1;
+                    let value = map.next_value::<V>()?;
+                    values.insert(key, value);
+                }
+                Ok(BoundedProjectionMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(BoundedMapVisitor::<K, V, LIMIT>(std::marker::PhantomData))
+    }
+}
+
+impl Serialize for ProviderSessionProjection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate_bounds().map_err(ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            current_turn: &'a Option<TurnId>,
+            open_question: &'a Option<QuestionId>,
+            open_approval: &'a Option<ApprovalId>,
+            question_winners: &'a BTreeMap<QuestionId, ProviderResolutionWinner>,
+            approval_winners: &'a BTreeMap<ApprovalId, ProviderResolutionWinner>,
+            waits: &'a BTreeMap<CommandId, ProviderWaitRecord>,
+            last_settlement: &'a Option<ProviderInputSettlement>,
+        }
+        Wire {
+            current_turn: &self.current_turn,
+            open_question: &self.open_question,
+            open_approval: &self.open_approval,
+            question_winners: &self.question_winners,
+            approval_winners: &self.approval_winners,
+            waits: &self.waits,
+            last_settlement: &self.last_settlement,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderSessionProjection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            current_turn: Option<TurnId>,
+            open_question: Option<QuestionId>,
+            open_approval: Option<ApprovalId>,
+            question_winners: BoundedProjectionMap<
+                QuestionId,
+                ProviderResolutionWinner,
+                MAX_PROVIDER_QUESTION_WINS,
+            >,
+            approval_winners: BoundedProjectionMap<
+                ApprovalId,
+                ProviderResolutionWinner,
+                MAX_PROVIDER_APPROVAL_WINS,
+            >,
+            waits: BoundedProjectionMap<CommandId, ProviderWaitRecord, MAX_PROVIDER_WAITS>,
+            #[serde(default)]
+            last_settlement: Option<ProviderInputSettlement>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let projection = Self {
+            current_turn: wire.current_turn,
+            open_question: wire.open_question,
+            open_approval: wire.open_approval,
+            question_winners: wire.question_winners.0,
+            approval_winners: wire.approval_winners.0,
+            waits: wire.waits.0,
+            last_settlement: wire.last_settlement,
+        };
+        projection.validate_bounds().map_err(de::Error::custom)?;
+        Ok(projection)
+    }
+}
+
 impl ProviderSessionProjection {
+    pub fn validate_bounds(&self) -> Result<(), ProviderInputIntentError> {
+        if self.question_winners.len() > MAX_PROVIDER_QUESTION_WINS {
+            return Err(ProviderInputIntentError::QuestionWinnerLimit);
+        }
+        if self.approval_winners.len() > MAX_PROVIDER_APPROVAL_WINS {
+            return Err(ProviderInputIntentError::ApprovalWinnerLimit);
+        }
+        if self.waits.len() > MAX_PROVIDER_WAITS {
+            return Err(ProviderInputIntentError::WaitLimit);
+        }
+        Ok(())
+    }
+
     pub(crate) fn bounded_insert_question_winner(
         &mut self,
         question_id: QuestionId,
@@ -329,7 +614,7 @@ impl ProviderSessionProjection {
         if !self.question_winners.contains_key(&question_id)
             && self.question_winners.len() >= MAX_PROVIDER_QUESTION_WINS
         {
-            return Err(ProviderInputIntentError::InconsistentNestedIds);
+            return Err(ProviderInputIntentError::QuestionWinnerLimit);
         }
         self.question_winners.insert(question_id, winner);
         self.open_question = None;
@@ -344,7 +629,7 @@ impl ProviderSessionProjection {
         if !self.approval_winners.contains_key(&approval_id)
             && self.approval_winners.len() >= MAX_PROVIDER_APPROVAL_WINS
         {
-            return Err(ProviderInputIntentError::InconsistentNestedIds);
+            return Err(ProviderInputIntentError::ApprovalWinnerLimit);
         }
         self.approval_winners.insert(approval_id, winner);
         self.open_approval = None;
@@ -356,8 +641,23 @@ impl ProviderSessionProjection {
         command_id: CommandId,
         record: ProviderWaitRecord,
     ) -> Result<(), ProviderInputIntentError> {
-        if !self.waits.contains_key(&command_id) && self.waits.len() >= MAX_PROVIDER_WAITS {
-            return Err(ProviderInputIntentError::InconsistentNestedIds);
+        if !self.waits.contains_key(&command_id) && record.pending {
+            let pending = self.waits.values().filter(|record| record.pending).count();
+            if pending >= MAX_PROVIDER_WAITS {
+                return Err(ProviderInputIntentError::WaitLimit);
+            }
+            if self.waits.len() >= MAX_PROVIDER_WAITS {
+                let reclaim = self
+                    .waits
+                    .iter()
+                    .find(|(_, record)| !record.pending)
+                    .map(|(id, _)| *id);
+                if let Some(reclaim) = reclaim {
+                    self.waits.remove(&reclaim);
+                } else {
+                    return Err(ProviderInputIntentError::WaitLimit);
+                }
+            }
         }
         self.waits.insert(command_id, record);
         Ok(())

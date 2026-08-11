@@ -43,8 +43,9 @@ pub use operation::{
     MAX_EXTERNAL_IDENTITY_BYTES,
 };
 pub use provider_input::{
-    PresentProviderApprovalIntent, PresentProviderQuestionIntent, ProviderDeliveryHoldReason,
-    ProviderDeliveryVisibility, ProviderInputAction, ProviderInputIntentError,
+    validate_provider_fence, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
+    ProviderDeliveryHoldReason, ProviderDeliveryVisibility, ProviderFenceContext,
+    ProviderFenceError, ProviderFenceIdentity, ProviderInputAction, ProviderInputIntentError,
     ProviderInputSettlement, ProviderIntentPhase, ProviderResolutionWinner,
     ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord, SettleProviderWaitIntent,
     MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES, MAX_PROVIDER_QUESTION_WINS,

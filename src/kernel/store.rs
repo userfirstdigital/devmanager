@@ -1482,6 +1482,96 @@ pub(crate) fn decode_stored_event(
             ),
         });
     }
+    match &event {
+        Event::ProviderInputAccepted {
+            command_id,
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            ..
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                Some(*command_id),
+                None,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            crate::domain::provider_input::validate_provider_fence(
+                &fence,
+                Some(action),
+                Some(*wait),
+                None,
+            )
+            .map_err(|err| StoreError::CodecMismatch {
+                detail: err.to_string(),
+            })?;
+        }
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                None,
+                None,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
+        }
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => {
+            let fence = crate::domain::provider_input::ProviderFenceIdentity::new(
+                None,
+                None,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            );
+            crate::domain::provider_input::validate_provider_fence(&fence, None, None, None)
+                .map_err(|err| StoreError::CodecMismatch {
+                    detail: err.to_string(),
+                })?;
+        }
+        Event::ProviderWaitSettled { fence } => {
+            crate::domain::provider_input::validate_provider_fence(
+                &fence.identity(),
+                None,
+                None,
+                None,
+            )
+            .map_err(|err| StoreError::CodecMismatch {
+                detail: err.to_string(),
+            })?;
+        }
+        _ => {}
+    }
     Ok(event)
 }
 
@@ -1496,20 +1586,117 @@ pub(crate) fn decode_stored_domain_event(
     occurred_at_ms: i64,
     payload: &[u8],
 ) -> Result<DomainEvent, StoreError> {
+    let task_id = match task_id_bytes {
+        Some(bytes) => Some(task_id_from_bytes(bytes)?),
+        None => None,
+    };
+    let payload = decode_stored_event(event_type, schema_version, payload)?;
+    validate_provider_event_task_identity(&payload, task_id)?;
     Ok(DomainEvent {
         id: event_id_from_bytes(event_id_bytes)?,
-        task_id: match task_id_bytes {
-            Some(bytes) => Some(task_id_from_bytes(bytes)?),
-            None => None,
-        },
+        task_id,
         sequence: u64_from_nonnegative_i64("events.sequence", sequence)?,
         task_revision: match task_revision {
             Some(value) => Some(u64_from_nonnegative_i64("events.task_revision", value)?),
             None => None,
         },
         occurred_at_ms,
-        payload: decode_stored_event(event_type, schema_version, payload)?,
+        payload,
     })
+}
+
+fn validate_provider_event_task_identity(
+    event: &Event,
+    task_id: Option<TaskId>,
+) -> Result<(), StoreError> {
+    let Some((identity, action, wait)) = (match event {
+        Event::ProviderInputAccepted {
+            command_id,
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+            approval_id,
+            action,
+            wait,
+            ..
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new(
+                Some(*command_id),
+                task_id,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            ),
+            Some(action),
+            Some(*wait),
+        )),
+        Event::ProviderQuestionPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            question_id,
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new(
+                None,
+                task_id,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            ),
+            None,
+            None,
+        )),
+        Event::ProviderApprovalPresented {
+            agent_session_id,
+            runtime_generation,
+            turn_id,
+            action_epoch,
+            approval_id,
+        } => Some((
+            crate::domain::provider_input::ProviderFenceIdentity::new(
+                None,
+                task_id,
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            ),
+            None,
+            None,
+        )),
+        Event::ProviderWaitSettled { fence } => {
+            if task_id != Some(fence.task_id()) {
+                return Err(StoreError::CodecMismatch {
+                    detail: "provider wait fence task identity disagrees with event scope".into(),
+                });
+            }
+            Some((fence.identity(), None, None))
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    if identity.task_id.is_none() {
+        return Err(StoreError::CodecMismatch {
+            detail: "provider event requires a task scope".into(),
+        });
+    }
+    crate::domain::provider_input::validate_provider_fence(&identity, action, wait, None).map_err(
+        |err| StoreError::CodecMismatch {
+            detail: err.to_string(),
+        },
+    )
 }
 
 fn unpack<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, StoreError> {

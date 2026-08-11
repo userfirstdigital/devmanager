@@ -17,8 +17,9 @@ use crate::domain::operation::{
     OperationUncertaintyCode, OutcomeFenceError, OutcomeSource,
 };
 use crate::domain::provider_input::{
-    validate_action_nested_ids, ProviderDeliveryVisibility, ProviderInputAction,
-    ProviderInputSettlement, ProviderResolutionWinner, ProviderWaitFence, ProviderWaitRecord,
+    validate_provider_fence, ProviderDeliveryVisibility, ProviderFenceIdentity,
+    ProviderInputAction, ProviderInputSettlement, ProviderResolutionWinner, ProviderWaitFence,
+    ProviderWaitRecord,
 };
 use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
@@ -1096,13 +1097,20 @@ impl TryFrom<EventDocument> for Event {
             EventBody::OperationCancelled(fact) => Event::OperationCancelled(fact),
             EventBody::OperationUncertain(fact) => Event::OperationUncertain(fact),
             EventBody::ProviderInputAccepted(p) => {
-                validate_action_nested_ids(&p.action, p.question_id, p.approval_id)
+                let fence = ProviderFenceIdentity::new(
+                    Some(p.command_id),
+                    // Event envelopes carry the task identity; the provider payload
+                    // deliberately carries all remaining fence identities.
+                    None,
+                    p.agent_session_id,
+                    p.runtime_generation,
+                    p.action_epoch,
+                    p.turn_id,
+                    p.question_id,
+                    p.approval_id,
+                );
+                validate_provider_fence(&fence, Some(&p.action), Some(p.wait), None)
                     .map_err(|err| EventSerdeError::Payload(err.to_string()))?;
-                if p.wait != p.action.waits_for_turn() {
-                    return Err(EventSerdeError::Payload(
-                        "provider input wait flag disagrees with action".into(),
-                    ));
-                }
                 Event::ProviderInputAccepted {
                     command_id: p.command_id,
                     client_id: p.client_id,
@@ -1288,6 +1296,33 @@ fn require_next_revision(snap: &TaskSnapshot, event: &DomainEvent) -> Result<u64
     Ok(expected)
 }
 
+fn validate_snapshot_provider_fence(
+    snap: &TaskSnapshot,
+    agent_session_id: AgentSessionId,
+    fence: &ProviderFenceIdentity,
+    action: Option<&ProviderInputAction>,
+    wait: Option<bool>,
+    current_turn: Option<TurnId>,
+    allow_closing: bool,
+) -> Result<(), ApplyError> {
+    let agent = snap
+        .agents
+        .get(&agent_session_id)
+        .ok_or(ApplyError::NotFound)?;
+    let context = crate::domain::provider_input::ProviderFenceContext {
+        task_id: snap.task.id,
+        agent_session_id,
+        agent_task_id: agent.task_id,
+        runtime_generation: agent.runtime_generation,
+        action_epoch: snap.task.action_epoch,
+        lifecycle: agent.lifecycle,
+        current_turn,
+        allow_closing,
+    };
+    validate_provider_fence(fence, action, wait, Some(&context))
+        .map_err(|_| ApplyError::InvalidTransition)
+}
+
 fn apply_into(
     snap: &mut TaskSnapshot,
     payload: &Event,
@@ -1446,18 +1481,32 @@ fn apply_into(
             wait,
             delivery,
         } => {
-            let agent = snap
-                .agents
-                .get(agent_session_id)
-                .ok_or(ApplyError::NotFound)?;
-            if agent.runtime_generation != *runtime_generation
-                || snap.task.action_epoch != *action_epoch
-            {
-                return Err(ApplyError::InvalidTransition);
-            }
             if delivery.is_delivered() {
                 return Err(ApplyError::InvalidTransition);
             }
+            let current_turn = snap
+                .provider_sessions
+                .get(agent_session_id)
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new(
+                Some(*command_id),
+                Some(snap.task.id),
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                *question_id,
+                *approval_id,
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                Some(action),
+                Some(*wait),
+                current_turn,
+                false,
+            )?;
             let session = snap.provider_sessions.entry(*agent_session_id).or_default();
             session.current_turn = Some(*turn_id);
             session.last_settlement = Some(ProviderInputSettlement {
@@ -1515,15 +1564,29 @@ fn apply_into(
             action_epoch,
             question_id,
         } => {
-            let agent = snap
-                .agents
+            let current_turn = snap
+                .provider_sessions
                 .get(agent_session_id)
-                .ok_or(ApplyError::NotFound)?;
-            if agent.runtime_generation != *runtime_generation
-                || snap.task.action_epoch != *action_epoch
-            {
-                return Err(ApplyError::InvalidTransition);
-            }
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new(
+                None,
+                Some(snap.task.id),
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                Some(*question_id),
+                None,
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                None,
+                None,
+                current_turn,
+                false,
+            )?;
             let session = snap.provider_sessions.entry(*agent_session_id).or_default();
             session.current_turn = Some(*turn_id);
             session.open_question = Some(*question_id);
@@ -1535,20 +1598,47 @@ fn apply_into(
             action_epoch,
             approval_id,
         } => {
-            let agent = snap
-                .agents
+            let current_turn = snap
+                .provider_sessions
                 .get(agent_session_id)
-                .ok_or(ApplyError::NotFound)?;
-            if agent.runtime_generation != *runtime_generation
-                || snap.task.action_epoch != *action_epoch
-            {
-                return Err(ApplyError::InvalidTransition);
-            }
+                .and_then(|session| session.current_turn);
+            let fence = ProviderFenceIdentity::new(
+                None,
+                Some(snap.task.id),
+                *agent_session_id,
+                *runtime_generation,
+                *action_epoch,
+                *turn_id,
+                None,
+                Some(*approval_id),
+            );
+            validate_snapshot_provider_fence(
+                snap,
+                *agent_session_id,
+                &fence,
+                None,
+                None,
+                current_turn,
+                false,
+            )?;
             let session = snap.provider_sessions.entry(*agent_session_id).or_default();
             session.current_turn = Some(*turn_id);
             session.open_approval = Some(*approval_id);
         }
         Event::ProviderWaitSettled { fence } => {
+            let current_turn = snap
+                .provider_sessions
+                .get(&fence.agent_session_id())
+                .and_then(|session| session.current_turn);
+            validate_snapshot_provider_fence(
+                snap,
+                fence.agent_session_id(),
+                &fence.identity(),
+                None,
+                None,
+                current_turn,
+                true,
+            )?;
             let session = snap
                 .provider_sessions
                 .get_mut(&fence.agent_session_id())

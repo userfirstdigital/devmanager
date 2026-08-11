@@ -11,7 +11,8 @@ use crate::domain::id::{
 };
 use crate::domain::provider_input::{
     validate_action_nested_ids, PresentProviderApprovalIntent, PresentProviderQuestionIntent,
-    ProviderInputAction, ProviderInputIntentError, SettleProviderWaitIntent,
+    ProviderInputAction, ProviderInputIntentError, ProviderResolutionWinner,
+    SettleProviderWaitIntent,
 };
 use crate::domain::resource::ResourceFacts;
 use crate::domain::snapshot::TaskSnapshot;
@@ -31,6 +32,7 @@ pub enum RejectionCode {
     UnsupportedCapability,
     Closing,
     IdempotencyConflict,
+    AlreadyResolved,
 }
 
 impl<'de> Deserialize<'de> for RejectionCode {
@@ -60,6 +62,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                     "unsupported_capability" => Ok(RejectionCode::UnsupportedCapability),
                     "closing" => Ok(RejectionCode::Closing),
                     "idempotency_conflict" => Ok(RejectionCode::IdempotencyConflict),
+                    "already_resolved" => Ok(RejectionCode::AlreadyResolved),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -71,6 +74,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                             "unsupported_capability",
                             "closing",
                             "idempotency_conflict",
+                            "already_resolved",
                         ],
                     )),
                 }
@@ -254,6 +258,7 @@ pub enum CommandReceipt {
         command_id: CommandId,
         code: RejectionCode,
         current_revision: Option<u64>,
+        resolution: Option<ProviderResolutionWinner>,
     },
 }
 
@@ -297,6 +302,7 @@ struct RejectedReceiptRef<'a> {
     command_id: &'a CommandId,
     code: &'a RejectionCode,
     current_revision: &'a Option<u64>,
+    resolution: &'a Option<ProviderResolutionWinner>,
 }
 
 impl Serialize for RejectedReceiptRef<'_> {
@@ -304,10 +310,14 @@ impl Serialize for RejectedReceiptRef<'_> {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map =
+            serializer.serialize_map(Some(if self.resolution.is_some() { 4 } else { 3 }))?;
         map.serialize_entry("command_id", self.command_id)?;
         map.serialize_entry("code", self.code)?;
         map.serialize_entry("current_revision", self.current_revision)?;
+        if let Some(resolution) = self.resolution {
+            map.serialize_entry("resolution", resolution)?;
+        }
         map.end()
     }
 }
@@ -337,12 +347,14 @@ impl Serialize for CommandReceipt {
                 command_id,
                 code,
                 current_revision,
+                resolution,
             } => map.serialize_entry(
                 "rejected",
                 &RejectedReceiptRef {
                     command_id,
                     code,
                     current_revision,
+                    resolution,
                 },
             )?,
         }
@@ -510,12 +522,13 @@ impl<'de> DeserializeSeed<'de> for RejectedReceiptSeed {
     }
 }
 
-const REJECTED_RECEIPT_FIELDS: &[&str] = &["command_id", "code", "current_revision"];
+const REJECTED_RECEIPT_FIELDS: &[&str] = &["command_id", "code", "current_revision", "resolution"];
 
 enum RejectedReceiptField {
     CommandId,
     Code,
     CurrentRevision,
+    Resolution,
 }
 
 impl<'de> Deserialize<'de> for RejectedReceiptField {
@@ -540,6 +553,7 @@ impl<'de> Deserialize<'de> for RejectedReceiptField {
                     "command_id" => Ok(RejectedReceiptField::CommandId),
                     "code" => Ok(RejectedReceiptField::Code),
                     "current_revision" => Ok(RejectedReceiptField::CurrentRevision),
+                    "resolution" => Ok(RejectedReceiptField::Resolution),
                     _ => Err(de::Error::unknown_field(value, REJECTED_RECEIPT_FIELDS)),
                 }
             }
@@ -565,6 +579,7 @@ impl<'de> Visitor<'de> for RejectedReceiptVisitor {
         let mut command_id = None;
         let mut code = None;
         let mut current_revision: Option<Option<u64>> = None;
+        let mut resolution: Option<Option<ProviderResolutionWinner>> = None;
 
         while let Some(field) = map.next_key()? {
             match field {
@@ -586,6 +601,12 @@ impl<'de> Visitor<'de> for RejectedReceiptVisitor {
                     }
                     current_revision = Some(map.next_value()?);
                 }
+                RejectedReceiptField::Resolution => {
+                    if resolution.is_some() {
+                        return Err(de::Error::duplicate_field("resolution"));
+                    }
+                    resolution = Some(map.next_value()?);
+                }
             }
         }
 
@@ -594,6 +615,7 @@ impl<'de> Visitor<'de> for RejectedReceiptVisitor {
             code: code.ok_or_else(|| de::Error::missing_field("code"))?,
             current_revision: current_revision
                 .ok_or_else(|| de::Error::missing_field("current_revision"))?,
+            resolution: resolution.unwrap_or(None),
         })
     }
 }
@@ -1168,7 +1190,7 @@ fn decide_submit_provider_input(
         }
         ProviderInputAction::AnswerQuestion { question_id, .. } => {
             if session.question_winners.contains_key(question_id) {
-                return Err(RejectionCode::AlreadyExists);
+                return Err(RejectionCode::AlreadyResolved);
             }
             if session.open_question != Some(*question_id) {
                 return Err(RejectionCode::InvalidTransition);
@@ -1179,7 +1201,7 @@ fn decide_submit_provider_input(
         }
         ProviderInputAction::ResolveApproval { approval_id, .. } => {
             if session.approval_winners.contains_key(approval_id) {
-                return Err(RejectionCode::AlreadyExists);
+                return Err(RejectionCode::AlreadyResolved);
             }
             if session.open_approval != Some(*approval_id) {
                 return Err(RejectionCode::InvalidTransition);
@@ -1191,7 +1213,12 @@ fn decide_submit_provider_input(
     }
     if intent.action().waits_for_turn()
         && !session.waits.contains_key(&envelope.command_id)
-        && session.waits.len() >= crate::domain::provider_input::MAX_PROVIDER_WAITS
+        && session
+            .waits
+            .values()
+            .filter(|record| record.pending)
+            .count()
+            >= crate::domain::provider_input::MAX_PROVIDER_WAITS
     {
         return Err(RejectionCode::InvalidTransition);
     }
@@ -1238,7 +1265,7 @@ fn decide_present_provider_question(
         }
     }
     if session.question_winners.contains_key(&intent.question_id()) {
-        return Err(RejectionCode::AlreadyExists);
+        return Err(RejectionCode::AlreadyResolved);
     }
     if let Some(open) = session.open_question {
         if open != intent.question_id() {
@@ -1283,7 +1310,7 @@ fn decide_present_provider_approval(
         }
     }
     if session.approval_winners.contains_key(&intent.approval_id()) {
-        return Err(RejectionCode::AlreadyExists);
+        return Err(RejectionCode::AlreadyResolved);
     }
     if let Some(open) = session.open_approval {
         if open != intent.approval_id() {

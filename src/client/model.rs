@@ -693,6 +693,7 @@ impl ClientModelBuilder {
                     primary_agent_id: item.primary_agent_id,
                     artifacts: BTreeMap::new(),
                     resources: BTreeMap::new(),
+                    provider_sessions: BTreeMap::new(),
                 },
             );
         }

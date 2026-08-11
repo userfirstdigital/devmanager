@@ -997,6 +997,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
         command_id: protocol_command_id(0x65),
         code: RejectionCode::RevisionConflict,
         current_revision: None,
+        resolution: None,
     };
     assert_eq!(rejected.command_id(), protocol_command_id(0x65));
     assert_eq!(rejected.accepted_operation_id(), None);
@@ -1029,6 +1030,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
         ),
         (RejectionCode::Closing, "closing"),
         (RejectionCode::IdempotencyConflict, "idempotency_conflict"),
+        (RejectionCode::AlreadyResolved, "already_resolved"),
     ]
     .into_iter()
     .enumerate()
@@ -1037,6 +1039,7 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             command_id: protocol_command_id(0xA0 + u8::try_from(index).unwrap()),
             code,
             current_revision: Some(3),
+            resolution: None,
         };
         assert_eq!(
             codec
@@ -2805,6 +2808,7 @@ fn protocol_server_message_unsolicited_variants_are_strict_named_maps() {
                     command_id: protocol_command_id(0xd8),
                     code: RejectionCode::NotFound,
                     current_revision: None,
+                    resolution: None,
                 },
             )?;
             map.serialize_entry(
