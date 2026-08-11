@@ -1,6 +1,13 @@
 //! Pure Task Cockpit projection contracts.
 
+pub mod header;
 pub mod inbox;
+
+pub use header::{
+    HeaderField, HeaderHighWaterLedger, HighWaterDecision, PendingHeaderActionOutcome,
+    PendingHeaderActionQueue, ProjectedAction, SpecialistProjection, TaskHeaderModel, TaskIdentity,
+    TopBarModel, TopBarProjectionController, TopBarProjectionInput,
+};
 
 pub use inbox::{
     Inbox, TaskList, TaskListOverflow, ViewportError, VirtualListViewport, VirtualWindow,
