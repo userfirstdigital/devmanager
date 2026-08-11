@@ -1570,10 +1570,50 @@ enum RecoveryClaimResidueKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryReleaseReceipt {
+    receipt_id: Uuid,
+    state: ProviderSessionState,
+    claim: RecoveryClaim,
+    handoff_receipt: Option<Uuid>,
+    cleanup_owner_id: Option<Uuid>,
+    cleanup_claim_generation: u64,
+    cleanup_deadline_ms: u64,
+}
+
+impl RecoveryReleaseReceipt {
+    fn new(state: &ProviderSessionState, claim: &RecoveryClaim) -> Self {
+        Self {
+            receipt_id: Uuid::now_v7(),
+            state: state.clone(),
+            claim: claim.clone(),
+            handoff_receipt: None,
+            cleanup_owner_id: None,
+            cleanup_claim_generation: 0,
+            cleanup_deadline_ms: 0,
+        }
+    }
+
+    fn with_handoff_receipt(&self, handoff_receipt: Uuid) -> Self {
+        let mut next = self.clone();
+        next.handoff_receipt = Some(handoff_receipt);
+        next
+    }
+
+    fn with_cleanup_claim(&self, owner_id: Uuid, claim_generation: u64, deadline_ms: u64) -> Self {
+        let mut next = self.clone();
+        next.cleanup_owner_id = Some(owner_id);
+        next.cleanup_claim_generation = claim_generation;
+        next.cleanup_deadline_ms = deadline_ms;
+        next
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryClaimResidue {
     state: ProviderSessionState,
     claim: RecoveryClaim,
     kind: RecoveryClaimResidueKind,
+    release_receipt: Option<RecoveryReleaseReceipt>,
 }
 
 impl ProviderSessionState {
@@ -2024,6 +2064,46 @@ pub trait ProviderSessionStateStore: sealed::ProviderSessionStateStore {
     ) -> Result<(), String> {
         Err("provider session store does not implement durable recovery claims".to_string())
     }
+
+    /// Persist an exact recovery-release receipt before a manager can lose its
+    /// local lease. The receipt carries the complete state identity, original
+    /// recovery claim, and eventual process-registry handoff receipt.
+    fn record_recovery_release(&mut self, _receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        Err(
+            "provider session store does not implement durable recovery release receipts"
+                .to_string(),
+        )
+    }
+
+    fn list_recovery_releases(&self) -> Result<Vec<RecoveryReleaseReceipt>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Claim one exact pending release for immediate cleanup by this manager.
+    /// The claim is independent of the original process-recovery claim and is
+    /// itself CAS-protected by the full durable receipt.
+    fn claim_recovery_release(
+        &mut self,
+        _receipt: &RecoveryReleaseReceipt,
+        _owner_id: Uuid,
+        _now_ms: u64,
+    ) -> Result<Option<RecoveryReleaseReceipt>, String> {
+        Err(
+            "provider session store does not implement durable recovery release receipts"
+                .to_string(),
+        )
+    }
+
+    fn release_pending_recovery(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        self.release_recovery(&receipt.state, &receipt.claim)
+    }
+
+    fn clear_recovery_release(&mut self, _receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        Err(
+            "provider session store does not implement durable recovery release receipts"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2033,6 +2113,7 @@ pub struct InMemoryProviderSessionStateStore {
     consumed_tokens: HashSet<Uuid>,
     recovery_claims: HashMap<RecoveryKey, RecoveryClaim>,
     settled_recoveries: HashSet<RecoveryKey>,
+    recovery_releases: HashMap<Uuid, RecoveryReleaseReceipt>,
 }
 
 #[cfg(test)]
@@ -2086,8 +2167,6 @@ impl ProviderSessionStateStore for InMemoryProviderSessionStateStore {
             return Err("provider session state initial revision must be one".to_string());
         }
         self.states.insert(state.agent_session_id, state.clone());
-        self.settled_recoveries
-            .remove(&RecoveryKey::from_state(&state));
         Ok(())
     }
 
@@ -2242,6 +2321,84 @@ impl ProviderSessionStateStore for InMemoryProviderSessionStateStore {
         {
             self.recovery_claims.remove(&key);
         }
+        Ok(())
+    }
+
+    fn record_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        if let Some(existing) = self.recovery_releases.get(&receipt.receipt_id) {
+            if !same_recovery_release_key(existing, receipt) {
+                return Err("provider recovery release receipt is stale".to_string());
+            }
+        }
+        let next = self
+            .recovery_releases
+            .get(&receipt.receipt_id)
+            .map(|existing| {
+                let mut next = existing.clone();
+                if next.handoff_receipt.is_none() {
+                    next.handoff_receipt = receipt.handoff_receipt;
+                }
+                next
+            })
+            .unwrap_or_else(|| receipt.clone());
+        self.recovery_releases.insert(receipt.receipt_id, next);
+        Ok(())
+    }
+
+    fn list_recovery_releases(&self) -> Result<Vec<RecoveryReleaseReceipt>, String> {
+        Ok(self.recovery_releases.values().cloned().collect())
+    }
+
+    fn claim_recovery_release(
+        &mut self,
+        receipt: &RecoveryReleaseReceipt,
+        owner_id: Uuid,
+        now_ms: u64,
+    ) -> Result<Option<RecoveryReleaseReceipt>, String> {
+        let Some(existing) = self.recovery_releases.get(&receipt.receipt_id).cloned() else {
+            return Ok(None);
+        };
+        if existing != *receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        if existing.cleanup_owner_id.is_some_and(|owner| {
+            existing.handoff_receipt.is_none()
+                && owner != owner_id
+                && existing.cleanup_deadline_ms > now_ms
+        }) {
+            return Ok(None);
+        }
+        let claim_generation = existing
+            .cleanup_claim_generation
+            .checked_add(1)
+            .ok_or_else(|| "provider recovery release claim generation exhausted".to_string())?;
+        let deadline_ms = now_ms
+            .checked_add(RECOVERY_CLAIM_LEASE_MS)
+            .ok_or_else(|| "provider recovery release claim deadline exhausted".to_string())?;
+        let claimed = existing.with_cleanup_claim(owner_id, claim_generation, deadline_ms);
+        self.recovery_releases
+            .insert(receipt.receipt_id, claimed.clone());
+        Ok(Some(claimed))
+    }
+
+    fn release_pending_recovery(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        let Some(existing) = self.recovery_releases.get(&receipt.receipt_id) else {
+            return Err("provider recovery release receipt is missing".to_string());
+        };
+        if existing != receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        self.release_recovery(&receipt.state, &receipt.claim)
+    }
+
+    fn clear_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        let Some(existing) = self.recovery_releases.get(&receipt.receipt_id) else {
+            return Ok(());
+        };
+        if existing != receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        self.recovery_releases.remove(&receipt.receipt_id);
         Ok(())
     }
 }
@@ -2593,19 +2750,39 @@ impl SqliteProviderSessionStateStore {
                    lifecycle TEXT NOT NULL,
                    state_json BLOB NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS provider_session_recovery_ownership (
-                   agent_session_id TEXT NOT NULL,
-                   generation INTEGER NOT NULL,
-                   action_epoch INTEGER NOT NULL,
-                   launch_nonce TEXT NOT NULL,
+                  CREATE TABLE IF NOT EXISTS provider_session_recovery_ownership (
+                    agent_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    action_epoch INTEGER NOT NULL,
+                    launch_nonce TEXT NOT NULL,
                    ownership_state TEXT NOT NULL,
                    revision INTEGER NOT NULL,
                    claim_owner_id TEXT,
                    claim_generation INTEGER NOT NULL DEFAULT 0,
-                   claim_deadline_ms INTEGER NOT NULL DEFAULT 0,
-                   PRIMARY KEY (agent_session_id, generation, action_epoch, launch_nonce)
-                 );
-                 CREATE TABLE IF NOT EXISTS provider_session_start_tokens (
+                    claim_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (agent_session_id, generation, action_epoch, launch_nonce)
+                  );
+                  CREATE TABLE IF NOT EXISTS provider_session_recovery_release_pending (
+                    receipt_id TEXT PRIMARY KEY,
+                    agent_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    action_epoch INTEGER NOT NULL,
+                    launch_nonce TEXT NOT NULL,
+                    state_json BLOB NOT NULL,
+                    claim_owner_id TEXT NOT NULL,
+                    claim_generation INTEGER NOT NULL,
+                    claim_deadline_ms INTEGER NOT NULL,
+                    claim_settled INTEGER NOT NULL,
+                    handoff_receipt_id TEXT,
+                    cleanup_owner_id TEXT,
+                    cleanup_claim_generation INTEGER NOT NULL DEFAULT 0,
+                    cleanup_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (
+                      agent_session_id, generation, action_epoch, launch_nonce,
+                      claim_owner_id, claim_generation
+                    )
+                  );
+                  CREATE TABLE IF NOT EXISTS provider_session_start_tokens (
                    token_id TEXT PRIMARY KEY,
                    task_id TEXT NOT NULL,
                    agent_session_id TEXT NOT NULL,
@@ -2834,8 +3011,10 @@ impl SqliteProviderSessionStateStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(agent_session_id, generation, action_epoch, launch_nonce)
                  DO UPDATE SET
-                   ownership_state = excluded.ownership_state,
-                   revision = excluded.revision",
+                    ownership_state = CASE
+                      WHEN provider_session_recovery_ownership.ownership_state = ?7
+                      THEN ?7 ELSE excluded.ownership_state END,
+                    revision = excluded.revision",
                 params![
                     state.agent_session_id.to_string(),
                     generation,
@@ -2843,6 +3022,7 @@ impl SqliteProviderSessionStateStore {
                     state.launch_nonce.raw().to_string(),
                     persisted_lifecycle_name(state.lifecycle),
                     revision,
+                    RECOVERY_OWNERSHIP_SETTLED,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -3372,7 +3552,10 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        transaction
+        // The original recovery owner/generation is part of the CAS. A zero
+        // row update is safe: that exact claim was already released or
+        // superseded, and this receipt must never clear a newer claim.
+        let released = transaction
             .execute(
                 "UPDATE provider_session_recovery_ownership
                  SET claim_owner_id = NULL, claim_deadline_ms = 0
@@ -3389,8 +3572,391 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if released > 1 {
+            return Err("provider recovery release CAS matched multiple claims".to_string());
+        }
         transaction.commit().map_err(|error| error.to_string())
     }
+
+    fn record_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        let state_json = receipt.state.encode()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                        launch_nonce, state_json, claim_owner_id, claim_generation,
+                        claim_deadline_ms, claim_settled, handoff_receipt_id, cleanup_owner_id,
+                        cleanup_claim_generation, cleanup_deadline_ms
+                 FROM provider_session_recovery_release_pending
+                 WHERE receipt_id = ?1",
+                params![receipt.receipt_id.to_string()],
+                pending_release_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(decode_recovery_release_row)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if !same_recovery_release_key(&existing, receipt) {
+                return Err("provider recovery release receipt is stale".to_string());
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO provider_session_recovery_release_pending
+                   (receipt_id, agent_session_id, generation, action_epoch, launch_nonce,
+                    state_json, claim_owner_id, claim_generation, claim_deadline_ms, claim_settled,
+                    handoff_receipt_id, cleanup_owner_id, cleanup_claim_generation,
+                    cleanup_deadline_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(receipt_id) DO UPDATE SET
+                   handoff_receipt_id = COALESCE(
+                     provider_session_recovery_release_pending.handoff_receipt_id,
+                     excluded.handoff_receipt_id
+                   )",
+                params![
+                    receipt.receipt_id.to_string(),
+                    receipt.state.agent_session_id.to_string(),
+                    checked_sql_i64(receipt.state.generation, "provider release generation")?,
+                    checked_sql_i64(receipt.state.action_epoch, "provider release action epoch")?,
+                    receipt.state.launch_nonce.raw().to_string(),
+                    state_json,
+                    receipt.claim.owner_id.to_string(),
+                    checked_sql_i64(receipt.claim.claim_generation, "provider claim generation")?,
+                    checked_sql_i64(receipt.claim.deadline_ms, "provider claim deadline")?,
+                    i64::from(receipt.claim.settled),
+                    receipt.handoff_receipt.map(|id| id.to_string()),
+                    receipt.cleanup_owner_id.map(|id| id.to_string()),
+                    checked_sql_i64(
+                        receipt.cleanup_claim_generation,
+                        "provider cleanup claim generation",
+                    )?,
+                    checked_sql_i64(receipt.cleanup_deadline_ms, "provider cleanup deadline")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn list_recovery_releases(&self) -> Result<Vec<RecoveryReleaseReceipt>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                        launch_nonce, state_json, claim_owner_id, claim_generation,
+                        claim_deadline_ms, claim_settled, handoff_receipt_id, cleanup_owner_id,
+                        cleanup_claim_generation, cleanup_deadline_ms
+                 FROM provider_session_recovery_release_pending",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], pending_release_row)
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            row.map_err(|error| error.to_string())
+                .and_then(decode_recovery_release_row)
+        })
+        .collect()
+    }
+
+    fn claim_recovery_release(
+        &mut self,
+        receipt: &RecoveryReleaseReceipt,
+        owner_id: Uuid,
+        now_ms: u64,
+    ) -> Result<Option<RecoveryReleaseReceipt>, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let Some(existing) = transaction
+            .query_row(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                        launch_nonce, state_json, claim_owner_id, claim_generation,
+                        claim_deadline_ms, claim_settled, handoff_receipt_id, cleanup_owner_id,
+                        cleanup_claim_generation, cleanup_deadline_ms
+                 FROM provider_session_recovery_release_pending
+                 WHERE receipt_id = ?1",
+                params![receipt.receipt_id.to_string()],
+                pending_release_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(decode_recovery_release_row)
+            .transpose()?
+        else {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        if existing != *receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        if existing.cleanup_owner_id.is_some_and(|owner| {
+            existing.handoff_receipt.is_none()
+                && owner != owner_id
+                && existing.cleanup_deadline_ms > now_ms
+        }) {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        let claim_generation = existing
+            .cleanup_claim_generation
+            .checked_add(1)
+            .ok_or_else(|| "provider recovery release claim generation exhausted".to_string())?;
+        let deadline_ms = now_ms
+            .checked_add(RECOVERY_CLAIM_LEASE_MS)
+            .ok_or_else(|| "provider recovery release claim deadline exhausted".to_string())?;
+        transaction
+            .execute(
+                "UPDATE provider_session_recovery_release_pending
+                 SET cleanup_owner_id = ?1, cleanup_claim_generation = ?2,
+                     cleanup_deadline_ms = ?3
+                 WHERE receipt_id = ?4 AND cleanup_claim_generation = ?5",
+                params![
+                    owner_id.to_string(),
+                    checked_sql_i64(claim_generation, "provider cleanup claim generation")?,
+                    checked_sql_i64(deadline_ms, "provider cleanup deadline")?,
+                    receipt.receipt_id.to_string(),
+                    checked_sql_i64(
+                        existing.cleanup_claim_generation,
+                        "provider cleanup claim generation",
+                    )?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(Some(existing.with_cleanup_claim(
+            owner_id,
+            claim_generation,
+            deadline_ms,
+        )))
+    }
+
+    fn release_pending_recovery(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        if receipt.cleanup_owner_id.is_none() {
+            return Err("provider recovery release receipt is not claimed".to_string());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let Some(existing) = transaction
+            .query_row(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                        launch_nonce, state_json, claim_owner_id, claim_generation,
+                        claim_deadline_ms, claim_settled, handoff_receipt_id, cleanup_owner_id,
+                        cleanup_claim_generation, cleanup_deadline_ms
+                 FROM provider_session_recovery_release_pending
+                 WHERE receipt_id = ?1",
+                params![receipt.receipt_id.to_string()],
+                pending_release_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(decode_recovery_release_row)
+            .transpose()?
+        else {
+            return Err("provider recovery release receipt is missing".to_string());
+        };
+        if existing != *receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        // The original recovery owner/generation is part of the CAS. A zero
+        // row update is safe: that exact claim was already released or
+        // superseded, and this receipt must never clear a newer claim.
+        let released = transaction
+            .execute(
+                "UPDATE provider_session_recovery_ownership
+                 SET claim_owner_id = NULL, claim_deadline_ms = 0
+                 WHERE agent_session_id = ?1 AND generation = ?2
+                   AND action_epoch = ?3 AND launch_nonce = ?4
+                   AND claim_owner_id = ?5 AND claim_generation = ?6",
+                params![
+                    receipt.state.agent_session_id.to_string(),
+                    checked_sql_i64(receipt.state.generation, "provider session generation")?,
+                    checked_sql_i64(receipt.state.action_epoch, "provider session action epoch")?,
+                    receipt.state.launch_nonce.raw().to_string(),
+                    receipt.claim.owner_id.to_string(),
+                    checked_sql_i64(receipt.claim.claim_generation, "provider claim generation")?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if released > 1 {
+            return Err("provider recovery release CAS matched multiple claims".to_string());
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn clear_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
+        let state_json = receipt.state.encode()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                        launch_nonce, state_json, claim_owner_id, claim_generation,
+                        claim_deadline_ms, claim_settled, handoff_receipt_id, cleanup_owner_id,
+                        cleanup_claim_generation, cleanup_deadline_ms
+                 FROM provider_session_recovery_release_pending
+                 WHERE receipt_id = ?1",
+                params![receipt.receipt_id.to_string()],
+                pending_release_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(decode_recovery_release_row)
+            .transpose()?;
+        let Some(existing) = existing else {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        };
+        if existing != *receipt {
+            return Err("provider recovery release receipt is stale".to_string());
+        }
+        transaction
+            .execute(
+                "DELETE FROM provider_session_recovery_release_pending
+                 WHERE receipt_id = ?1 AND agent_session_id = ?2
+                   AND generation = ?3 AND action_epoch = ?4 AND launch_nonce = ?5
+                   AND claim_owner_id = ?6 AND claim_generation = ?7
+                   AND state_json = ?8",
+                params![
+                    receipt.receipt_id.to_string(),
+                    receipt.state.agent_session_id.to_string(),
+                    checked_sql_i64(receipt.state.generation, "provider release generation")?,
+                    checked_sql_i64(receipt.state.action_epoch, "provider release action epoch")?,
+                    receipt.state.launch_nonce.raw().to_string(),
+                    receipt.claim.owner_id.to_string(),
+                    checked_sql_i64(receipt.claim.claim_generation, "provider claim generation")?,
+                    state_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+type PendingRecoveryReleaseRow = (
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    Vec<u8>,
+    String,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+);
+
+fn pending_release_row(row: &Row<'_>) -> rusqlite::Result<PendingRecoveryReleaseRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        bounded_state_blob(row, 5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    ))
+}
+
+fn decode_recovery_release_row(
+    (
+        receipt_id,
+        agent_session_id,
+        generation,
+        action_epoch,
+        launch_nonce,
+        state_json,
+        claim_owner_id,
+        claim_generation,
+        claim_deadline_ms,
+        claim_settled,
+        handoff_receipt_id,
+        cleanup_owner_id,
+        cleanup_claim_generation,
+        cleanup_deadline_ms,
+    ): PendingRecoveryReleaseRow,
+) -> Result<RecoveryReleaseReceipt, String> {
+    let receipt_id = Uuid::parse_str(&receipt_id)
+        .map_err(|error| format!("provider recovery release receipt ID is invalid: {error}"))?;
+    let row_agent_id = agent_session_id
+        .parse::<AgentSessionId>()
+        .map_err(|error| format!("provider recovery release agent identity is invalid: {error}"))?;
+    let state = ProviderSessionState::decode(&state_json)?;
+    let generation = checked_sql_u64(generation, "provider release generation")?;
+    let action_epoch = checked_sql_u64(action_epoch, "provider release action epoch")?;
+    let launch_nonce = Uuid::parse_str(&launch_nonce)
+        .map_err(|error| format!("provider release launch nonce is invalid: {error}"))?;
+    if state.agent_session_id != row_agent_id
+        || state.generation != generation
+        || state.action_epoch != action_epoch
+        || state.launch_nonce.raw() != launch_nonce
+    {
+        return Err("provider recovery release state identity does not match its row".to_string());
+    }
+    let claim_owner_id = Uuid::parse_str(&claim_owner_id)
+        .map_err(|error| format!("provider recovery claim owner is invalid: {error}"))?;
+    let claim_settled = match claim_settled {
+        0 => false,
+        1 => true,
+        _ => return Err("provider recovery claim settled flag is invalid".to_string()),
+    };
+    let claim = RecoveryClaim {
+        owner_id: claim_owner_id,
+        claim_generation: checked_sql_u64(claim_generation, "provider claim generation")?,
+        deadline_ms: checked_sql_u64(claim_deadline_ms, "provider claim deadline")?,
+        settled: claim_settled,
+    };
+    let handoff_receipt = handoff_receipt_id
+        .map(|id| {
+            Uuid::parse_str(&id)
+                .map_err(|error| format!("provider handoff receipt is invalid: {error}"))
+        })
+        .transpose()?;
+    let cleanup_owner_id = cleanup_owner_id
+        .map(|id| {
+            Uuid::parse_str(&id)
+                .map_err(|error| format!("provider cleanup owner is invalid: {error}"))
+        })
+        .transpose()?;
+    let cleanup_claim_generation = checked_sql_u64(
+        cleanup_claim_generation,
+        "provider cleanup claim generation",
+    )?;
+    let cleanup_deadline_ms = checked_sql_u64(cleanup_deadline_ms, "provider cleanup deadline")?;
+    if cleanup_owner_id.is_none() && (cleanup_claim_generation != 0 || cleanup_deadline_ms != 0) {
+        return Err("provider cleanup claim metadata is inconsistent".to_string());
+    }
+    if cleanup_owner_id.is_some() && cleanup_claim_generation == 0 {
+        return Err("provider cleanup claim generation is zero".to_string());
+    }
+    Ok(RecoveryReleaseReceipt {
+        receipt_id,
+        state,
+        claim,
+        handoff_receipt,
+        cleanup_owner_id,
+        cleanup_claim_generation,
+        cleanup_deadline_ms,
+    })
 }
 
 /// One-shot authenticated current-generation SessionStart token. The token is
@@ -4053,6 +4619,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         request: StartProviderSessionRequest,
     ) -> Result<ProviderRuntime, ProviderSessionError> {
+        self.retry_recovery_releases()?;
         self.ensure_request_admissible(&request)?;
         let agent_id = request.agent.id;
         let persisted = self.load_state(agent_id)?;
@@ -4294,6 +4861,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         request: StartProviderSessionRequest,
     ) -> Result<ProviderRuntime, ProviderSessionError> {
+        self.retry_recovery_releases()?;
         self.ensure_request_admissible(&request)?;
         let agent_id = request.agent.id;
         let persisted = self.load_state(agent_id)?;
@@ -4454,6 +5022,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         agent_session_id: AgentSessionId,
     ) -> Result<(), ProviderSessionError> {
+        self.retry_recovery_releases()?;
         let Some(runtime) = self.current.get(&agent_session_id).cloned() else {
             return match self.load_state(agent_session_id)? {
                 Some(state) if state.lifecycle == PersistedRuntimeLifecycle::Closed => {
@@ -4894,8 +5463,48 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state: state.clone(),
                 claim,
                 kind,
+                release_receipt: None,
             },
         );
+    }
+
+    fn remember_release_residue(&mut self, receipt: RecoveryReleaseReceipt) {
+        self.pending_recovery_claims.insert(
+            receipt.state.agent_session_id,
+            RecoveryClaimResidue {
+                state: receipt.state.clone(),
+                claim: receipt.claim.clone(),
+                kind: RecoveryClaimResidueKind::Release,
+                release_receipt: Some(receipt),
+            },
+        );
+    }
+
+    fn release_receipt_for(
+        &self,
+        state: &ProviderSessionState,
+        claim: &RecoveryClaim,
+    ) -> Option<RecoveryReleaseReceipt> {
+        self.pending_recovery_claims
+            .get(&state.agent_session_id)
+            .filter(|residue| {
+                residue.kind == RecoveryClaimResidueKind::Release
+                    && same_recovery_identity(&residue.state, state)
+                    && residue.claim == *claim
+            })
+            .and_then(|residue| residue.release_receipt.clone())
+    }
+
+    fn forget_release_receipt(&mut self, receipt: &RecoveryReleaseReceipt) {
+        if self
+            .pending_recovery_claims
+            .get(&receipt.state.agent_session_id)
+            .and_then(|residue| residue.release_receipt.as_ref())
+            .is_some_and(|existing| existing.receipt_id == receipt.receipt_id)
+        {
+            self.pending_recovery_claims
+                .remove(&receipt.state.agent_session_id);
+        }
     }
 
     fn release_recovery_claim(
@@ -4903,23 +5512,53 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         state: &ProviderSessionState,
         claim: &RecoveryClaim,
     ) -> Result<(), ProviderSessionError> {
+        let durable_state = self
+            .state_store
+            .load(state.agent_session_id)
+            .map_err(ProviderSessionError::StateStore)?
+            .ok_or(ProviderSessionError::AgentSessionNotFound(
+                state.agent_session_id,
+            ))?;
+        if !same_recovery_identity(state, &durable_state) {
+            return Err(ProviderSessionError::RecoveryAuthorityMismatch {
+                expected_generation: state.generation,
+                actual_generation: durable_state.generation,
+            });
+        }
+        let existing_receipt = self.release_receipt_for(state, claim);
         match self.state_store.release_recovery(state, claim) {
             Ok(()) => {
-                if self
+                if let Some(receipt) = existing_receipt {
+                    if let Err(error) = self.state_store.clear_recovery_release(&receipt) {
+                        self.remember_release_residue(receipt.clone());
+                        return Err(ProviderSessionError::RecoveryReleaseFailed {
+                            agent_session_id: state.agent_session_id,
+                            generation: state.generation,
+                            error,
+                        });
+                    }
+                    self.forget_release_receipt(&receipt);
+                } else if self
                     .pending_recovery_claims
                     .get(&state.agent_session_id)
-                    .is_some_and(|residue| residue.state == *state && residue.claim == *claim)
+                    .is_some_and(|residue| {
+                        same_recovery_identity(&residue.state, state) && residue.claim == *claim
+                    })
                 {
                     self.pending_recovery_claims.remove(&state.agent_session_id);
                 }
                 Ok(())
             }
             Err(error) => {
-                self.remember_recovery_claim(
-                    state,
-                    claim.clone(),
-                    RecoveryClaimResidueKind::Release,
-                );
+                let receipt =
+                    existing_receipt.unwrap_or_else(|| RecoveryReleaseReceipt::new(state, claim));
+                let error = match self.state_store.record_recovery_release(&receipt) {
+                    Ok(()) => error,
+                    Err(receipt_error) => {
+                        format!("{error}; durable recovery release receipt failed: {receipt_error}")
+                    }
+                };
+                self.remember_release_residue(receipt);
                 Err(ProviderSessionError::RecoveryReleaseFailed {
                     agent_session_id: state.agent_session_id,
                     generation: state.generation,
@@ -4927,6 +5566,110 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 })
             }
         }
+    }
+
+    fn retry_durable_recovery_releases(&mut self) -> Result<(), ProviderSessionError> {
+        let pending = self
+            .state_store
+            .list_recovery_releases()
+            .map_err(ProviderSessionError::StateStore)?;
+        let mut first_error = None;
+        for receipt in pending {
+            let claimed = match self.state_store.claim_recovery_release(
+                &receipt,
+                self.recovery_owner_id,
+                recovery_now_ms(),
+            ) {
+                Ok(Some(claimed)) => claimed,
+                Ok(None) => {
+                    if first_error.is_none() {
+                        first_error = Some(ProviderSessionError::RecoveryClaimed {
+                            agent_session_id: receipt.state.agent_session_id,
+                            generation: receipt.state.generation,
+                        });
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(ProviderSessionError::StateStore(error));
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = self.state_store.release_pending_recovery(&claimed) {
+                self.remember_release_residue(claimed.clone());
+                if first_error.is_none() {
+                    first_error = Some(ProviderSessionError::RecoveryReleaseFailed {
+                        agent_session_id: claimed.state.agent_session_id,
+                        generation: claimed.state.generation,
+                        error,
+                    });
+                }
+                continue;
+            }
+            if let Err(error) = self.state_store.clear_recovery_release(&claimed) {
+                self.remember_release_residue(claimed.clone());
+                if first_error.is_none() {
+                    first_error = Some(ProviderSessionError::RecoveryReleaseFailed {
+                        agent_session_id: claimed.state.agent_session_id,
+                        generation: claimed.state.generation,
+                        error,
+                    });
+                }
+                continue;
+            }
+            self.forget_release_receipt(&claimed);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn retry_local_recovery_releases(&mut self) -> Result<(), ProviderSessionError> {
+        let residues: Vec<_> = self
+            .pending_recovery_claims
+            .values()
+            .filter(|residue| residue.kind == RecoveryClaimResidueKind::Release)
+            .map(|residue| (residue.state.clone(), residue.claim.clone()))
+            .collect();
+        let mut first_error = None;
+        for (state, claim) in residues {
+            if let Err(error) = self.release_recovery_claim(&state, &claim) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn retry_recovery_releases(&mut self) -> Result<(), ProviderSessionError> {
+        let durable_error = self.retry_durable_recovery_releases().err();
+        let local_error = self.retry_local_recovery_releases().err();
+        durable_error.or(local_error).map_or(Ok(()), Err)
+    }
+
+    fn record_recovery_handoff(
+        &mut self,
+        state: &ProviderSessionState,
+        claim: &RecoveryClaim,
+    ) -> Result<(), ProviderSessionError> {
+        let Some(receipt) = self.release_receipt_for(state, claim) else {
+            return Err(ProviderSessionError::RecoveryReleaseFailed {
+                agent_session_id: state.agent_session_id,
+                generation: state.generation,
+                error: "settled recovery release receipt is missing before handoff".to_string(),
+            });
+        };
+        let updated = receipt.with_handoff_receipt(Uuid::now_v7());
+        self.state_store
+            .record_recovery_release(&updated)
+            .map_err(|error| ProviderSessionError::RecoveryReleaseFailed {
+                agent_session_id: state.agent_session_id,
+                generation: state.generation,
+                error,
+            })?;
+        self.remember_release_residue(updated);
+        Ok(())
     }
 
     /// Make joined-zero settlement durable before any later lifecycle write or
@@ -5258,20 +6001,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
     /// destroyed. A failed bridge transfer returns the opaque lease to this
     /// manager and remains visible to the caller for retry.
     pub fn prepare_for_shutdown(&mut self) -> Result<(), ProviderSessionError> {
-        let mut first_error = None;
-        let pending_releases: Vec<_> = self
-            .pending_recovery_claims
-            .values()
-            .filter(|residue| residue.kind == RecoveryClaimResidueKind::Release)
-            .cloned()
-            .collect();
-        for residue in pending_releases {
-            if let Err(error) = self.release_recovery_claim(&residue.state, &residue.claim) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
+        let mut first_error = self.retry_recovery_releases().err();
         let slots = std::mem::take(&mut self.leases);
         for (agent_id, slot) in slots {
             self.pending_launches.remove(&agent_id);
@@ -5350,6 +6080,47 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             }
             if settled {
                 if let Err(error) = self.ensure_durable_settlement(&slot_state) {
+                    if first_error.is_none() {
+                        first_error = Some(error.clone());
+                    }
+                    let recovery_claim = self
+                        .pending_recovery_claims
+                        .get(&agent_id)
+                        .filter(|residue| {
+                            residue.kind == RecoveryClaimResidueKind::Release
+                                && same_recovery_identity(&residue.state, &slot_state)
+                        })
+                        .map(|residue| residue.claim.clone());
+                    if let Some(recovery_claim) = recovery_claim {
+                        match self.launcher.retain_for_recovery(&state, lease) {
+                            Ok(()) => {
+                                if let Err(handoff_error) =
+                                    self.record_recovery_handoff(&state, &recovery_claim)
+                                {
+                                    if first_error.is_none() {
+                                        first_error = Some(handoff_error);
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(failure) => {
+                                let retain_error = failure.error();
+                                self.leases.insert(
+                                    agent_id,
+                                    LeaseSlot {
+                                        lease: failure.into_lease(),
+                                        state: slot_state,
+                                        settled,
+                                    },
+                                );
+                                if first_error.is_none() {
+                                    first_error =
+                                        Some(ProviderSessionError::StopFailed(retain_error));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     self.leases.insert(
                         agent_id,
                         LeaseSlot {
@@ -5534,6 +6305,15 @@ fn same_recovery_identity(expected: &ProviderSessionState, actual: &ProviderSess
         && expected.launch_spec == actual.launch_spec
         && expected.provider_session_id == actual.provider_session_id
         && expected.process_root == actual.process_root
+}
+
+fn same_recovery_release_key(
+    expected: &RecoveryReleaseReceipt,
+    actual: &RecoveryReleaseReceipt,
+) -> bool {
+    expected.receipt_id == actual.receipt_id
+        && same_recovery_identity(&expected.state, &actual.state)
+        && expected.claim == actual.claim
 }
 
 #[cfg(test)]
@@ -5885,6 +6665,7 @@ mod tests {
         fail_after_successful_persists: Option<usize>,
         fail_next_mark_recovery_settled: bool,
         fail_next_release_recovery: bool,
+        fail_release_recovery_permanently: bool,
     }
 
     impl FailingPersistProviderSessionStateStore {
@@ -5895,6 +6676,7 @@ mod tests {
                 fail_after_successful_persists: None,
                 fail_next_mark_recovery_settled: false,
                 fail_next_release_recovery: false,
+                fail_release_recovery_permanently: false,
             }
         }
 
@@ -5912,6 +6694,10 @@ mod tests {
 
         fn fail_next_release_recovery(&mut self) {
             self.fail_next_release_recovery = true;
+        }
+
+        fn fail_release_recovery_permanently(&mut self) {
+            self.fail_release_recovery_permanently = true;
         }
     }
 
@@ -5967,11 +6753,45 @@ mod tests {
             state: &ProviderSessionState,
             claim: &RecoveryClaim,
         ) -> Result<(), String> {
-            if self.fail_next_release_recovery {
+            if self.fail_release_recovery_permanently || self.fail_next_release_recovery {
                 self.fail_next_release_recovery = false;
                 return Err("injected provider recovery release failure".to_string());
             }
             self.inner.release_recovery(state, claim)
+        }
+
+        fn record_recovery_release(
+            &mut self,
+            receipt: &RecoveryReleaseReceipt,
+        ) -> Result<(), String> {
+            self.inner.record_recovery_release(receipt)
+        }
+
+        fn list_recovery_releases(&self) -> Result<Vec<RecoveryReleaseReceipt>, String> {
+            self.inner.list_recovery_releases()
+        }
+
+        fn claim_recovery_release(
+            &mut self,
+            receipt: &RecoveryReleaseReceipt,
+            owner_id: Uuid,
+            now_ms: u64,
+        ) -> Result<Option<RecoveryReleaseReceipt>, String> {
+            self.inner.claim_recovery_release(receipt, owner_id, now_ms)
+        }
+
+        fn release_pending_recovery(
+            &mut self,
+            receipt: &RecoveryReleaseReceipt,
+        ) -> Result<(), String> {
+            self.release_recovery(&receipt.state, &receipt.claim)
+        }
+
+        fn clear_recovery_release(
+            &mut self,
+            receipt: &RecoveryReleaseReceipt,
+        ) -> Result<(), String> {
+            self.inner.clear_recovery_release(receipt)
         }
     }
 
@@ -6594,6 +7414,77 @@ mod tests {
         assert_eq!(launcher.snapshot().stop_attempts(), 1);
         assert_eq!(launcher.snapshot().lease_drops(), 1);
         drop(failed);
+    }
+
+    #[test]
+    fn permanent_release_failure_survives_drop_for_immediate_reopen() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.process_exited(runtime.correlation()).unwrap();
+        let state = manager.state_store.load(agent.id).unwrap().unwrap();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        launcher
+            .clone()
+            .retain_for_recovery(&state, slot.lease)
+            .unwrap();
+        drop(runtime);
+        drop(manager);
+
+        let mut failed = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        failed.state_store.fail_release_recovery_permanently();
+        assert!(matches!(
+            failed.close_agent_session(agent.id),
+            Err(ProviderSessionError::RecoveryReleaseFailed { .. })
+        ));
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        drop(failed);
+
+        // Drop must transfer the already-settled permit to the external
+        // recovery owner even though the durable claim release is still down.
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+
+        let pending_store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        let pending = pending_store.list_recovery_releases().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].handoff_receipt.is_some());
+        assert!(pending[0].cleanup_owner_id.is_some());
+        assert!(pending[0].cleanup_claim_generation > 0);
+        assert!(same_recovery_identity(&pending[0].state, &state));
+
+        // A receipt from another generation is not allowed to claim or
+        // release this handoff, even though it names the same agent session.
+        let mut foreign_receipt = pending[0].clone();
+        foreign_receipt.state.generation = foreign_receipt.state.generation.checked_add(1).unwrap();
+        let mut foreign_store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        assert!(matches!(
+            foreign_store.claim_recovery_release(&foreign_receipt, Uuid::now_v7(), recovery_now_ms()),
+            Err(error) if error.contains("stale")
+        ));
+
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        reopened.close_agent_session(agent.id).unwrap();
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 1);
+        drop(reopened);
     }
 
     #[test]
