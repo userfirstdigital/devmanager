@@ -593,7 +593,7 @@ fn preview_capture_new_external_reader_tasks_are_joined_on_every_exit() {
         "preview.command.reader-join-failed",
         "$stdoutTask = $null",
         "$stderrTask = $null",
-        "$owned.Dispose()",
+        "$Launch.Job.Dispose()",
     ] {
         assert!(
             script.contains(marker),
@@ -666,12 +666,193 @@ fn preview_capture_new_unix_unlink_and_drop_cleanup_errors_remain_visible() {
             && !source.contains("let _ = cleanup_authorized_output_after_deadline"),
         "publication and TempOutput cleanup failures must not be discarded"
     );
-    for marker in ["record_cleanup_failure", "retry"] {
+    for marker in ["record_cleanup_failure", "O_TMPFILE", "AT_EMPTY_PATH"] {
         assert!(
             source.contains(marker),
             "cleanup failure handling must provide {marker}"
         );
     }
+}
+
+#[test]
+fn preview_capture_new_external_readers_cancel_and_retain_unresolved_ownership() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "CancellationToken",
+        "Cancel()",
+        "::WhenAll",
+        "Join-PreviewProcessWaitTaskBounded",
+        "PreviewExternalCleanupLedger",
+        "activePreviewProcesses.Add($launch)",
+        "ProcessWaitTask = $Launch.ProcessWaitTask",
+        "preview.cleanup.ownership-retained",
+    ] {
+        assert!(
+            script.contains(marker),
+            "external reader ownership must provide {marker}"
+        );
+    }
+    assert!(
+        script.contains("Do not clear unresolved external preview ownership"),
+        "failed joins must remain in the visible cleanup ledger"
+    );
+}
+
+#[test]
+fn preview_capture_new_inherited_pipe_descendant_regression_is_job_owned() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "CreatePipe",
+        "SetHandleInformation",
+        "ProcThreadAttributeHandleList",
+        "CreateInheritableOutputPipe",
+        "AssignProcessToJobObject",
+        "ReadBoundedUtf8Async",
+    ] {
+        assert!(
+            script.contains(marker),
+            "inherited-pipe descendant regression must provide {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_capture_new_linux_temp_publication_never_unlinks_a_replaced_name() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    for marker in [
+        "O_TMPFILE",
+        "AT_EMPTY_PATH",
+        "atomic_publish_temp_linux_rejects_named_temp_replacement",
+        "preview temporary inode identity changed",
+    ] {
+        assert!(
+            source.contains(marker),
+            "Linux temp publication must provide {marker}"
+        );
+    }
+    assert!(
+        !source.contains("unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0)"),
+        "Linux publication must never unlink a trusted temp name after it can be replaced"
+    );
+}
+
+#[test]
+fn preview_capture_new_json_inputs_are_bounded_before_materialization() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Read-PreviewJsonBounded",
+        "preview.json.lexical-limit",
+        "preview.json.depth-limit",
+        "preview.json.node-limit",
+    ] {
+        assert!(script.contains(marker), "JSON input must provide {marker}");
+    }
+    let helper = script
+        .find("function Read-PreviewJsonBounded")
+        .expect("bounded JSON input helper");
+    for conversion in ["ConvertFrom-Json"] {
+        let mut offset = 0;
+        while let Some(relative) = script[offset..].find(conversion) {
+            let absolute = offset + relative;
+            assert!(
+                helper < absolute,
+                "bounded JSON input helper must precede {conversion}"
+            );
+            offset = absolute + conversion.len();
+        }
+    }
+    assert!(
+        script.contains("Read-PreviewJsonBounded -Text $line")
+            && script.contains("Read-PreviewJsonBounded -Text $json")
+            && script.contains("Read-PreviewJsonBounded -Text $receiptJson"),
+        "fixture, cargo, and receipt JSON must all use the bounded parser"
+    );
+    assert!(
+        script.contains("Get-PreviewJsonLinesBounded -Text $buildResult.Output")
+            && !script.contains("$buildResult.Output -split"),
+        "cargo JSON lines must stream through bounded preflight without split materialization"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_rejects_deep_high_node_and_oversize_json_fixtures_before_parse() {
+    use base64::Engine as _;
+
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/native-next/Capture-UiPreviews.ps1");
+    let script_literal = script_path.to_string_lossy().replace('\'', "''");
+    let command = r#"
+$scriptPath = '__SCRIPT_PATH__'
+$source = [IO.File]::ReadAllText($scriptPath)
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+$wanted = @('Assert-PreviewJsonLexicalBounded', 'Read-PreviewJsonBounded')
+$definitions = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $wanted -contains $node.Name
+}, $true))
+if ($definitions.Count -ne $wanted.Count) { throw 'preview-json-test-functions-missing' }
+foreach ($definition in $definitions) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$MAX_PREVIEW_JSON_NODES = 16
+$deep = ((('[' * 12) -join '') + '0' + ((']' * 12) -join ''))
+$high = '[' + ((('0,' * 32) -join '') + '0') + ']'
+$oversize = '{"value":"' + ('x' * 256) + '"}'
+$cases = @(
+    [pscustomobject]@{ Text = $deep; MaxBytes = 1024; MaxNodes = 100; MaxDepth = 8; Code = 'preview.json.depth-limit' }
+    [pscustomobject]@{ Text = $high; MaxBytes = 1024; MaxNodes = 8; MaxDepth = 32; Code = 'preview.json.node-limit' }
+    [pscustomobject]@{ Text = $oversize; MaxBytes = 32; MaxNodes = 100; MaxDepth = 8; Code = 'preview.json.lexical-limit' }
+)
+foreach ($case in $cases) {
+    try {
+        Read-PreviewJsonBounded -Text $case.Text -MaxBytes $case.MaxBytes -MaxNodes $case.MaxNodes -MaxDepth $case.MaxDepth | Out-Null
+        throw "accepted:$($case.Code)"
+    } catch {
+        if ($_.Exception.Message -ne $case.Code) { throw }
+    }
+}
+Write-Output 'preview-json-adversarial-fixtures-rejected'
+"#.replace("__SCRIPT_PATH__", &script_literal);
+    let mut utf16 = Vec::with_capacity(command.len() * 2);
+    for unit in command.encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let output = Command::new("pwsh")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive"])
+        .arg("-EncodedCommand")
+        .arg(encoded)
+        .output()
+        .expect("PowerShell must run JSON adversarial fixtures");
+    assert!(
+        output.status.success(),
+        "bounded JSON fixtures must fail closed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("preview-json-adversarial-fixtures-rejected"),
+        "PowerShell fixture probe must report all rejection cases"
+    );
 }
 
 #[test]

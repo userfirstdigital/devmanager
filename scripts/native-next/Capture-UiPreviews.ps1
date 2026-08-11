@@ -346,16 +346,22 @@ public static class DevManagerPreviewArtifactNative
         return handle;
     }
 
-    public static Task<string> ReadBoundedUtf8Async(Stream stream, long maxBytes)
+    public static Task<string> ReadBoundedUtf8Async(
+        Stream stream,
+        long maxBytes,
+        CancellationToken cancellationToken)
     {
         if (stream == null || maxBytes < 0 || maxBytes > int.MaxValue)
         {
             throw new ArgumentException("preview bounded stream arguments are invalid");
         }
-        return ReadBoundedUtf8CoreAsync(stream, maxBytes);
+        return ReadBoundedUtf8CoreAsync(stream, maxBytes, cancellationToken);
     }
 
-    private static async Task<string> ReadBoundedUtf8CoreAsync(Stream stream, long maxBytes)
+    private static async Task<string> ReadBoundedUtf8CoreAsync(
+        Stream stream,
+        long maxBytes,
+        CancellationToken cancellationToken)
     {
         var buffer = new byte[16 * 1024];
         using (var output = new MemoryStream())
@@ -363,7 +369,11 @@ public static class DevManagerPreviewArtifactNative
             long total = 0;
             while (true)
             {
-                var read = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+                var read = await stream.ReadAsync(
+                    buffer,
+                    0,
+                    buffer.Length,
+                    cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
                     return Encoding.UTF8.GetString(output.ToArray());
@@ -1292,38 +1302,149 @@ function Join-PreviewReaderTasksBounded {
         [datetime]$Deadline
     )
 
-    $joinFailure = $false
-    foreach ($task in @($StdoutTask, $StderrTask)) {
-        if ($null -eq $task) { continue }
-        while (-not $task.IsCompleted) {
+    $tasks = @($StdoutTask, $StderrTask) | Where-Object { $null -ne $_ }
+    if ($tasks.Count -eq 0) {
+        return $true
+    }
+    $whenAll = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]$tasks)
+    $settled = $whenAll.IsCompleted
+    if (-not $settled) {
+        try {
             $remaining = Get-PreviewRemainingMilliseconds -Deadline $Deadline
-            if ($remaining -le 0) {
-                $joinFailure = $true
-                break
-            }
-            try {
-                if (-not $task.Wait($remaining)) {
-                    $joinFailure = $true
-                    break
-                }
-            } catch {
-                $joinFailure = $true
-                break
-            }
-        }
-        if ($task.IsCompleted) {
-            try {
-                [void]$task.GetAwaiter().GetResult()
-            } catch {
-                # A bounded reader fault is already represented by the
-                # command's primary output/read error.  It is still observed
-                # here so no faulted task escapes the command scope.
-            }
+            $settled = $whenAll.Wait($remaining)
+        } catch {
+            $settled = $whenAll.IsCompleted
         }
     }
-    if ($joinFailure) {
+    if (-not $settled) {
         throw 'preview.command.reader-join-failed'
     }
+    try {
+        [void]$whenAll.GetAwaiter().GetResult()
+    } catch {
+        # A bounded reader fault is represented by the command's primary
+        # output/read error. It is still observed so no faulted task escapes.
+    }
+    return $true
+}
+
+function Join-PreviewProcessWaitTaskBounded {
+    param(
+        [Threading.Tasks.Task]$Task,
+        [datetime]$Deadline
+    )
+
+    if ($null -eq $Task) {
+        return $true
+    }
+    $settled = $Task.IsCompleted
+    if (-not $settled) {
+        try {
+            $remaining = Get-PreviewRemainingMilliseconds -Deadline $Deadline
+            $settled = $Task.Wait($remaining)
+        } catch {
+            $settled = $Task.IsCompleted
+        }
+    }
+    if (-not $settled) {
+        throw 'preview.command.process-join-failed'
+    }
+    try {
+        [void]$Task.GetAwaiter().GetResult()
+    } catch {
+        # Process termination is represented by the owned process/job result;
+        # observe a wait-task fault so no task escapes unobserved.
+    }
+    return $true
+}
+
+function Add-PreviewExternalCleanupLedger {
+    param(
+        [object]$Launch,
+        [string]$Reason = 'preview.cleanup.ownership-retained'
+    )
+
+    if ($null -eq $Launch.LedgerEntry) {
+        $entry = [pscustomobject]@{
+            Launch = $Launch
+            Reason = $Reason
+            ReaderTasks = @($Launch.StdoutTask, $Launch.StderrTask)
+            ProcessWaitTask = $Launch.ProcessWaitTask
+            Process = $Launch.Process
+            Job = $Launch.Job
+        }
+        [void]$externalCleanupLedger.Add($entry)
+        $Launch.LedgerEntry = $entry
+    } else {
+        $Launch.LedgerEntry.Reason = $Reason
+    }
+    $Launch.ReaderJoinState = 'unresolved'
+}
+
+function Remove-PreviewExternalCleanupLedger {
+    param([object]$Launch)
+
+    if ($null -ne $Launch.LedgerEntry) {
+        [void]$externalCleanupLedger.Remove($Launch.LedgerEntry)
+        $Launch.LedgerEntry = $null
+    }
+    [void]$activePreviewProcesses.Remove($Launch)
+}
+
+function Join-PreviewExternalLaunchBounded {
+    param(
+        [object]$Launch,
+        [datetime]$Deadline
+    )
+
+    if ($null -eq $Launch -or $null -eq $Launch.Job) {
+        throw 'preview.cleanup.ownership-retained'
+    }
+    $cancelFailure = $false
+    try {
+        if ($null -ne $Launch.ReaderCancellation) {
+            $Launch.ReaderCancellation.Cancel()
+        }
+    } catch {
+        $cancelFailure = $true
+    }
+
+    $processJoined = $false
+    try {
+        [void](Join-PreviewProcessBounded -Launch $Launch -Deadline $Deadline -Label 'external command' -KeepOwnedResources)
+        $processJoined = $Launch.JoinState -in @('joined', 'killed-and-joined')
+    } catch {
+        $processJoined = $false
+    }
+    $processWaitJoined = $false
+    try {
+        $processWaitJoined = [bool](Join-PreviewProcessWaitTaskBounded -Task $Launch.ProcessWaitTask -Deadline $Deadline)
+    } catch {
+        $processWaitJoined = $false
+    }
+    $readerJoined = $false
+    try {
+        $readerJoined = [bool](Join-PreviewReaderTasksBounded -StdoutTask $Launch.StdoutTask -StderrTask $Launch.StderrTask -Deadline $Deadline)
+    } catch {
+        $readerJoined = $false
+    }
+    if ($cancelFailure -or -not $processJoined -or -not $processWaitJoined -or -not $readerJoined) {
+        Add-PreviewExternalCleanupLedger -Launch $Launch
+        throw 'preview.cleanup.ownership-retained'
+    }
+    try {
+        $Launch.Job.Dispose()
+        if ($null -ne $Launch.ReaderCancellation) {
+            $Launch.ReaderCancellation.Dispose()
+        }
+        $Launch.ResourcesDisposed = $true
+        $Launch.ReaderJoinState = 'joined'
+    } catch {
+        Add-PreviewExternalCleanupLedger -Launch $Launch
+        throw 'preview.cleanup.ownership-retained'
+    }
+    Remove-PreviewExternalCleanupLedger -Launch $Launch
+    $true
 }
 
 function Invoke-PreviewExternalCommand {
@@ -1350,13 +1471,31 @@ function Invoke-PreviewExternalCommand {
             Job = $owned
             JoinState = 'started'
             ExitCode = $null
+            Kind = 'external'
+            ReaderCancellation = [Threading.CancellationTokenSource]::new()
+            StdoutTask = $null
+            StderrTask = $null
+            ProcessWaitTask = $null
+            ReaderJoinState = 'pending'
+            ResourcesDisposed = $false
+            LedgerEntry = $null
         }
+        [void]$activePreviewProcesses.Add($launch)
         if ($null -eq $owned.StandardOutput -or $null -eq $owned.StandardError) {
             throw 'preview.command.output-stream-missing'
         }
-        $stdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardOutput, $MaxOutputBytes)
-        $stderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardError, $MaxOutputBytes)
+        $stdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async(
+            $owned.StandardOutput,
+            $MaxOutputBytes,
+            $launch.ReaderCancellation.Token)
+        $stderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async(
+            $owned.StandardError,
+            $MaxOutputBytes,
+            $launch.ReaderCancellation.Token)
+        $launch.StdoutTask = $stdoutTask
+        $launch.StderrTask = $stderrTask
         $processWaitTask = $owned.Process.WaitForExitAsync()
+        $launch.ProcessWaitTask = $processWaitTask
         while (-not ($stdoutTask.IsCompleted -and $stderrTask.IsCompleted -and $processWaitTask.IsCompleted)) {
             if ($stdoutTask.IsFaulted -or $stderrTask.IsFaulted) {
                 throw 'preview.command.output-limit'
@@ -1398,29 +1537,10 @@ function Invoke-PreviewExternalCommand {
         $cleanupFailure = $false
         if ($null -ne $launch) {
             try {
-                [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'external command')
+                [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
             } catch {
                 $cleanupFailure = $true
-                try {
-                    if ($null -ne $launch.Job) {
-                        $launch.Job.Dispose()
-                    }
-                } catch {
-                    $cleanupFailure = $true
-                }
             }
-        }
-        try {
-            Join-PreviewReaderTasksBounded -StdoutTask $stdoutTask -StderrTask $stderrTask -Deadline $Deadline
-        } catch {
-            $cleanupFailure = $true
-        }
-        try {
-            if ($null -ne $owned) {
-                $owned.Dispose()
-            }
-        } catch {
-            $cleanupFailure = $true
         }
         if ($cleanupFailure) {
             throw 'preview.cleanup.failed'
@@ -1512,6 +1632,160 @@ function Read-PreviewUtf8Text {
     }
 }
 
+function Assert-PreviewJsonLexicalBounded {
+    param(
+        [string]$Text,
+        [long]$MaxBytes,
+        [int]$MaxNodes = $MAX_PREVIEW_JSON_NODES,
+        [int]$MaxDepth = 32
+    )
+
+    if ($null -eq $Text -or $MaxBytes -lt 0 -or $MaxNodes -lt 1 -or $MaxDepth -lt 1) {
+        throw 'preview.json.lexical-limit'
+    }
+    try {
+        $utf8Bytes = [Text.Encoding]::UTF8.GetByteCount($Text)
+    } catch {
+        throw 'preview.json.lexical-limit'
+    }
+    if ($utf8Bytes -gt $MaxBytes) {
+        throw 'preview.json.lexical-limit'
+    }
+
+    $state = [pscustomobject]@{
+        Index = 0
+        Depth = 0
+        Nodes = [int64]0
+    }
+    $addNode = {
+        $state.Nodes++
+        if ($state.Nodes -gt $MaxNodes) {
+            throw 'preview.json.node-limit'
+        }
+    }
+    $length = $Text.Length
+    while ($state.Index -lt $length) {
+        $character = $Text[$state.Index]
+        if ([char]::IsWhiteSpace($character) -or $character -eq ',' -or $character -eq ':') {
+            $state.Index++
+            continue
+        }
+        if ($character -eq '"') {
+            & $addNode
+            $state.Index++
+            $closed = $false
+            $escaped = $false
+            while ($state.Index -lt $length) {
+                $character = $Text[$state.Index]
+                if ($escaped) {
+                    $escaped = $false
+                } elseif ($character -eq [char]0x5c) {
+                    $escaped = $true
+                } elseif ($character -eq '"') {
+                    $closed = $true
+                    $state.Index++
+                    break
+                }
+                $state.Index++
+            }
+            if (-not $closed) {
+                throw 'preview.json.lexical-limit'
+            }
+            continue
+        }
+        if ($character -eq '{' -or $character -eq '[') {
+            & $addNode
+            $state.Depth++
+            if ($state.Depth -gt $MaxDepth) {
+                throw 'preview.json.depth-limit'
+            }
+            $state.Index++
+            continue
+        }
+        if ($character -eq '}' -or $character -eq ']') {
+            if ($state.Depth -le 0) {
+                throw 'preview.json.lexical-limit'
+            }
+            $state.Depth--
+            $state.Index++
+            continue
+        }
+        & $addNode
+        $tokenStart = $state.Index
+        while ($state.Index -lt $length) {
+            $character = $Text[$state.Index]
+            if ([char]::IsWhiteSpace($character) -or
+                $character -eq ',' -or $character -eq ':' -or
+                $character -eq '{' -or $character -eq '}' -or
+                $character -eq '[' -or $character -eq ']') {
+                break
+            }
+            $state.Index++
+        }
+        if ($state.Index -eq $tokenStart) {
+            throw 'preview.json.lexical-limit'
+        }
+    }
+    if ($state.Depth -ne 0) {
+        throw 'preview.json.depth-limit'
+    }
+}
+
+function Get-PreviewJsonLinesBounded {
+    param(
+        [string]$Text,
+        [long]$MaxLineBytes,
+        [int]$MaxLines = $MAX_PREVIEW_JSON_NODES
+    )
+
+    if ($null -eq $Text -or $MaxLineBytes -lt 1 -or $MaxLines -lt 1) {
+        throw 'preview.json.lexical-limit'
+    }
+    $length = $Text.Length
+    $index = 0
+    $lineCount = 0
+    while ($index -lt $length) {
+        $lineEnd = $Text.IndexOf([char]0x0a, $index)
+        if ($lineEnd -lt 0) {
+            $lineEnd = $length
+        }
+        $lineLength = $lineEnd - $index
+        if ($lineLength -gt 0 -and $Text[$index + $lineLength - 1] -eq [char]0x0d) {
+            $lineLength--
+        }
+        $lineText = $Text.Substring($index, $lineLength)
+        try {
+            $lineBytes = [Text.Encoding]::UTF8.GetByteCount($lineText)
+        } catch {
+            throw 'preview.json.lexical-limit'
+        }
+        if ($lineBytes -gt $MaxLineBytes) {
+            throw 'preview.json.lexical-limit'
+        }
+        $lineCount++
+        if ($lineCount -gt $MaxLines) {
+            throw 'preview.json.node-limit'
+        }
+        Write-Output $lineText
+        if ($lineEnd -eq $length) {
+            break
+        }
+        $index = $lineEnd + 1
+    }
+}
+
+function Read-PreviewJsonBounded {
+    param(
+        [string]$Text,
+        [long]$MaxBytes,
+        [int]$MaxNodes = $MAX_PREVIEW_JSON_NODES,
+        [int]$MaxDepth = 32
+    )
+
+    Assert-PreviewJsonLexicalBounded -Text $Text -MaxBytes $MaxBytes -MaxNodes $MaxNodes -MaxDepth $MaxDepth
+    ConvertFrom-Json -InputObject $Text
+}
+
 function Read-PreviewFixture {
     param(
         [string]$Path,
@@ -1524,7 +1798,7 @@ function Read-PreviewFixture {
     $opened = Open-PreviewArtifactNoFollow -Path $Path
     try {
         $json = Read-PreviewUtf8Text -Stream $opened.Stream -Deadline $Deadline -MaxBytes $MAX_PREVIEW_FIXTURE_BYTES
-        $json | ConvertFrom-Json
+        Read-PreviewJsonBounded -Text $json -MaxBytes $MAX_PREVIEW_FIXTURE_BYTES -MaxDepth 32
     } finally {
         $opened.Stream.Dispose()
     }
@@ -2663,7 +2937,7 @@ function Read-PreviewArtifactReceipt {
     $opened = Open-PreviewArtifactRelative -ParentAuthority $ParentAuthority -Name ([IO.Path]::GetFileName($artifactReceiptPath))
     try {
         $receiptJson = Read-PreviewUtf8Text -Stream $opened.Stream -Deadline $Deadline -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES
-        $receipt = $receiptJson | ConvertFrom-Json
+        $receipt = Read-PreviewJsonBounded -Text $receiptJson -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxDepth 32
         Assert-PreviewReceiptSchema -Receipt $receipt
         $hash = Get-PreviewArtifactSha256 -Stream $opened.Stream -Deadline $Deadline -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES
         if ([DevManagerPreviewArtifactNative]::Identity($opened.Stream.SafeFileHandle) -ne $opened.FileIdentity -or
@@ -2799,7 +3073,8 @@ function Join-PreviewProcessBounded {
     param(
         [object]$Launch,
         [datetime]$Deadline,
-        [string]$Label
+        [string]$Label,
+        [switch]$KeepOwnedResources
     )
 
     $process = $Launch.Process
@@ -2841,22 +3116,50 @@ function Join-PreviewProcessBounded {
         $Launch.JoinState = 'joined'
         $Launch.ExitCode = $process.ExitCode
     }
-    $job.Dispose()
+    if (-not $KeepOwnedResources) {
+        try {
+            $job.Dispose()
+            $Launch.ResourcesDisposed = $true
+        } catch {
+            $Launch.JoinState = 'join-failed-resource-disposal'
+            throw 'preview.process.resource-disposal-failed'
+        }
+    }
     $Launch.ExitCode
+}
+
+function Test-PreviewLaunchSettled {
+    param([object]$Launch)
+
+    if ($null -eq $Launch -or $Launch.JoinState -notin @('joined', 'killed-and-joined')) {
+        return $false
+    }
+    if ($Launch.Kind -eq 'external') {
+        return $Launch.ReaderJoinState -eq 'joined' -and [bool]$Launch.ResourcesDisposed
+    }
+    if ($null -ne $Launch.PSObject.Properties['ResourcesDisposed']) {
+        return [bool]$Launch.ResourcesDisposed
+    }
+    $true
 }
 
 function Assert-NoLivePreviewProcesses {
     param([datetime]$Deadline)
 
     foreach ($launch in @($activePreviewProcesses)) {
-        if ($null -eq $launch -or $launch.JoinState -in @('joined', 'killed-and-joined')) {
+        if (Test-PreviewLaunchSettled -Launch $launch) {
             continue
         }
-        if ($null -ne $launch -and $null -ne $launch.Process -and -not $launch.Process.HasExited) {
+        if ($launch.Kind -eq 'external') {
+            [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
+        } elseif ($null -ne $launch -and $null -ne $launch.Process -and -not $launch.Process.HasExited) {
             [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'before manifest publication')
         }
         if ($null -ne $launch -and $null -ne $launch.Job -and $launch.Job.ActiveProcessCount() -gt 0) {
             throw 'preview process remained live before manifest publication.'
+        }
+        if (-not (Test-PreviewLaunchSettled -Launch $launch)) {
+            throw 'preview.cleanup.ownership-retained'
         }
     }
 }
@@ -2869,28 +3172,49 @@ function Close-PreviewTrackedProcesses {
     }
     $cleanupFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($launch in @($activePreviewProcesses)) {
-        if ($null -eq $launch -or $launch.JoinState -in @('joined', 'killed-and-joined')) { continue }
+        if (Test-PreviewLaunchSettled -Launch $launch) {
+            if ($null -ne $launch.Authority) {
+                try {
+                    Close-PreviewLaunchAuthority -Authority $launch.Authority
+                    $launch.Authority = $null
+                } catch {
+                    [void]$cleanupFailures.Add('preview.cleanup.failed')
+                }
+            }
+            Remove-PreviewExternalCleanupLedger -Launch $launch
+            continue
+        }
         try {
-            [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'tracked process cleanup')
+            if ($launch.Kind -eq 'external') {
+                [void](Join-PreviewExternalLaunchBounded -Launch $launch -Deadline $Deadline)
+            } else {
+                [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'tracked process cleanup')
+            }
+            if (Test-PreviewLaunchSettled -Launch $launch) {
+                Remove-PreviewExternalCleanupLedger -Launch $launch
+            } else {
+                [void]$cleanupFailures.Add('preview.cleanup.ownership-retained')
+            }
         } catch {
             [void]$cleanupFailures.Add('preview.cleanup.failed')
-            try {
-                if ($null -ne $launch.Job) {
-                    $launch.Job.Dispose()
-                }
-            } catch {
-                [void]$cleanupFailures.Add('preview.cleanup.failed')
+            if ($launch.Kind -eq 'external') {
+                Add-PreviewExternalCleanupLedger -Launch $launch
             }
         }
-        if ($null -ne $launch.Authority) {
+        if (Test-PreviewLaunchSettled -Launch $launch -and $null -ne $launch.Authority) {
             try {
                 Close-PreviewLaunchAuthority -Authority $launch.Authority
+                $launch.Authority = $null
             } catch {
                 [void]$cleanupFailures.Add('preview.cleanup.failed')
             }
         }
     }
-    $activePreviewProcesses.Clear()
+    # Do not clear unresolved external preview ownership: the ledger and the
+    # active list must retain every task/process/job that still needs retry.
+    if ($externalCleanupLedger.Count -gt 0) {
+        [void]$cleanupFailures.Add('preview.cleanup.ownership-retained')
+    }
     if ($cleanupFailures.Count -gt 0) {
         throw 'preview.cleanup.failed'
     }
@@ -3059,6 +3383,7 @@ function Start-TrustedPreview {
             Authority = $authority
             JoinState = 'started'
             ReadinessHandshake = 'pending'
+            ResourcesDisposed = $false
         }
         Assert-PreviewLaunchAuthorityStable -Authority $authority -ReceiptState $ReceiptState -BuildIdentity $BuildIdentity -Deadline $Deadline
         $launch
@@ -3161,6 +3486,7 @@ $outputRootAuthority = $null
 $manifestAuthority = $null
 $retainedOutputAuthorities = [System.Collections.Generic.List[object]]::new()
 $activePreviewProcesses = [System.Collections.Generic.List[object]]::new()
+$externalCleanupLedger = [System.Collections.Generic.List[object]]::new()
 $previewDeadline = [datetime]::MinValue
 try {
     $buildWorktreeAuthority = Open-PreviewDirectoryNoFollow -Path $canonicalWorktree
@@ -3182,18 +3508,25 @@ try {
         '--no-default-features', '--bin', 'devmanager-next', '--target-dir', $TargetRunDir,
         '--message-format=json-render-diagnostics'
     ) -Deadline $buildDeadline -Environment $buildEnvironment -MaxOutputBytes $MAX_PREVIEW_ARTIFACT_BYTES
-    $artifactPaths = @(
-        $buildResult.Output -split "`r?`n" |
-            ForEach-Object {
-                $line = $_.ToString()
-                if ([string]::IsNullOrWhiteSpace($line)) { return }
-                try { $message = $line | ConvertFrom-Json } catch { return }
-                if ($message.reason -eq 'compiler-artifact' -and
-                    $message.target.name -eq 'devmanager-next' -and
-                    -not [string]::IsNullOrWhiteSpace($message.executable)) {
-                    $message.executable.ToString()
+    $artifactPaths = [System.Collections.Generic.List[string]]::new()
+    Get-PreviewJsonLinesBounded -Text $buildResult.Output -MaxLineBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxLines $MAX_PREVIEW_JSON_NODES |
+        ForEach-Object {
+            $line = $_.ToString()
+            if ([string]::IsNullOrWhiteSpace($line)) { return }
+            try {
+                $message = Read-PreviewJsonBounded -Text $line -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxDepth 32
+            } catch {
+                return
+            }
+            if ($message.reason -eq 'compiler-artifact' -and
+                $message.target.name -eq 'devmanager-next' -and
+                -not [string]::IsNullOrWhiteSpace($message.executable)) {
+                if ($artifactPaths.Count -ge $MAX_PREVIEW_JSON_NODES) {
+                    throw 'preview.json.node-limit'
                 }
-            })
+                [void]$artifactPaths.Add($message.executable.ToString())
+            }
+        }
     $uniqueArtifactPaths = @($artifactPaths | Sort-Object -Unique)
     if ($uniqueArtifactPaths.Count -ne 1) {
         throw 'isolated devmanager-next build did not produce exactly one parsed executable artifact.'

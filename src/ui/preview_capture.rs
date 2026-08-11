@@ -1423,7 +1423,7 @@ mod publication_tests {
         fs::rename(&temp, &moved_temp).expect("move trusted temp path");
         fs::write(&temp, b"attacker replacement").expect("attacker temp replacement");
         atomic_publish_temp(
-            temp.file_name().expect("temporary file name"),
+            Some(temp.file_name().expect("temporary file name")),
             &authority,
             &file,
         )
@@ -1437,6 +1437,66 @@ mod publication_tests {
         assert_eq!(
             fs::read(&temp).expect("attacker temp replacement remains isolated"),
             b"attacker replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_publish_temp_linux_rejects_named_temp_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().expect("publication test temp root");
+        let output = root.path().join("published.png");
+        let named = root.path().join(".published.tmp");
+        let moved = root.path().join(".published-moved.tmp");
+        let authority = CaptureOutputAuthority::new(&output, root.path())
+            .expect("publication test authority should open");
+        fs::write(&named, b"trusted named source").expect("named source");
+        fs::rename(&named, &moved).expect("rename trusted named source");
+        fs::write(&named, b"attacker replacement").expect("attacker replacement");
+
+        let generation = CaptureGeneration::new();
+        let lease = generation.begin();
+        let (temp_name, mut file) = match open_temp_output_relative(
+            &authority,
+            &output,
+            CaptureDeadline::from_now(Duration::from_secs(1)),
+            &lease,
+        ) {
+            Ok(value) => value,
+            Err(PreviewCaptureError::OutputFailed(message)) if message.contains("HOLD") => return,
+            Err(error) => panic!("anonymous temporary publication failed: {error}"),
+        };
+        assert!(
+            temp_name.is_none(),
+            "Linux publication must never create a named temporary entry"
+        );
+        let trusted_inode = file.metadata().expect("anonymous source metadata").ino();
+        std::io::Write::write_all(&mut file, b"trusted anonymous source")
+            .expect("anonymous source");
+        file.sync_all().expect("anonymous source sync");
+        atomic_publish_temp(temp_name.as_deref(), &authority, &file)
+            .expect("anonymous handle-relative publication");
+        drop(file);
+
+        assert_eq!(
+            fs::read(&output).expect("published output"),
+            b"trusted anonymous source"
+        );
+        assert_eq!(
+            fs::read(&named).expect("attacker replacement remains isolated"),
+            b"attacker replacement"
+        );
+        assert_eq!(
+            fs::read(&moved).expect("renamed named source remains isolated"),
+            b"trusted named source"
+        );
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("published output metadata")
+                .ino(),
+            trusted_inode,
+            "preview temporary inode identity changed during named-path replacement",
         );
     }
 }
@@ -2408,15 +2468,11 @@ fn encode_bgra_png_atomic_sync(
             .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
         lease.check(deadline)?;
         lease.publish_with(deadline, || {
-            let publication_result = atomic_publish_temp(&temp_name, &authority, &file)
-                .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+            let publication_result =
+                atomic_publish_temp(temp_name.as_deref(), &authority, &file)
+                    .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
             temp.renamed = true;
             temp.temp_removed = matches!(&publication_result, AtomicPublishOutcome::Published);
-            if let AtomicPublishOutcome::PublishedWithTempCleanupError = publication_result {
-                return Err(PreviewCaptureError::OutputFailed(
-                    "temporary preview entry cleanup did not settle".into(),
-                ));
-            }
             drop(file);
             if let Some(callback) = publication.take() {
                 callback();
@@ -2456,11 +2512,54 @@ fn open_temp_output_relative(
     output: &Path,
     deadline: CaptureDeadline,
     lease: &CaptureLease,
-) -> Result<(OsString, std::fs::File), PreviewCaptureError> {
+) -> Result<(Option<OsString>, std::fs::File), PreviewCaptureError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let _ = output;
+        lease.check(deadline)?;
+        let parent = authority.reopen_parent_for_publication()?;
+        let directory = CString::new(".").expect("static anonymous temp directory");
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                directory.as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let message = match error.raw_os_error() {
+                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {
+                    "anonymous Linux preview temporary inodes are unavailable; visual capture HOLD"
+                }
+                _ => "anonymous Linux preview temporary inode could not be created",
+            };
+            return Err(PreviewCaptureError::OutputFailed(message.into()));
+        }
+        return Ok((
+            None,
+            std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (authority, output, deadline, lease);
+        return Err(PreviewCaptureError::OutputFailed(
+            "anonymous handle-relative preview temporary inodes are unsupported; visual capture HOLD".into(),
+        ));
+    }
+
+    #[cfg(not(unix))]
     let stem = output
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("preview");
+    #[cfg(not(unix))]
     for _ in 0..32 {
         lease.check(deadline)?;
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2469,7 +2568,7 @@ fn open_temp_output_relative(
         {
             let parent = authority.reopen_parent_for_publication()?;
             match open_relative_windows(&parent, &name) {
-                Ok(file) => return Ok((name, file)),
+                Ok(file) => return Ok((Some(name), file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(PreviewCaptureError::OutputFailed(format!(
@@ -2510,7 +2609,7 @@ fn open_temp_output_relative(
                 )));
             }
             return Ok((
-                name,
+                Some(name),
                 std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
             ));
         }
@@ -2540,11 +2639,10 @@ fn next_temp_name(stem: &str, counter: usize) -> OsString {
 #[allow(dead_code)]
 enum AtomicPublishOutcome {
     Published,
-    PublishedWithTempCleanupError,
 }
 
 fn atomic_publish_temp(
-    temp: &std::ffi::OsStr,
+    temp: Option<&std::ffi::OsStr>,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<AtomicPublishOutcome> {
@@ -2571,7 +2669,7 @@ fn atomic_publish_temp(
 
 #[cfg(unix)]
 fn atomic_publish_temp_unix(
-    temp: &std::ffi::OsStr,
+    _temp: Option<&std::ffi::OsStr>,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<AtomicPublishOutcome> {
@@ -2581,12 +2679,6 @@ fn atomic_publish_temp_unix(
 
     let parent = authority.reopen_parent_for_publication().map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
-    })?;
-    let temp_name = CString::new(temp.as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "temporary preview name is invalid",
-        )
     })?;
     let output_name = CString::new(authority.output_name.as_bytes()).map_err(|_| {
         std::io::Error::new(
@@ -2611,35 +2703,23 @@ fn atomic_publish_temp_unix(
             )
         };
         if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut cleanup_failed = false;
-        // A bounded retry keeps transient directory-entry contention
-        // retryable while preserving the published-state cleanup signal.
-        for attempt in 0..3 {
-            let unlink_result =
-                unsafe { libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0) };
-            if unlink_result == 0 {
-                return Ok(AtomicPublishOutcome::Published);
-            }
             let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(AtomicPublishOutcome::Published);
+            if matches!(error.raw_os_error(), Some(code) if
+                code == libc::EPERM || code == libc::EOPNOTSUPP || code == libc::EINVAL)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "anonymous Linux preview publication is unavailable; visual capture HOLD",
+                ));
             }
-            cleanup_failed = true;
-            if attempt < 2 {
-                std::thread::yield_now();
-            }
-        }
-        if cleanup_failed {
-            return Ok(AtomicPublishOutcome::PublishedWithTempCleanupError);
+            return Err(error);
         }
         return Ok(AtomicPublishOutcome::Published);
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (temp_name, file);
+        let _ = file;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "handle-relative preview publication is unsupported on this Unix platform",
@@ -2649,7 +2729,7 @@ fn atomic_publish_temp_unix(
 
 #[cfg(windows)]
 fn atomic_publish_temp_windows(
-    _temp: &std::ffi::OsStr,
+    _temp: Option<&std::ffi::OsStr>,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<AtomicPublishOutcome> {
@@ -2823,7 +2903,7 @@ fn settle_temp_cleanup_result(
 }
 
 struct TempOutput {
-    temp_name: OsString,
+    temp_name: Option<OsString>,
     authority: Arc<CaptureOutputAuthority>,
     cleanup: TempCleanupState,
     renamed: bool,
@@ -2833,16 +2913,17 @@ struct TempOutput {
 
 impl TempOutput {
     fn new(
-        temp_name: OsString,
+        temp_name: Option<OsString>,
         authority: Arc<CaptureOutputAuthority>,
         cleanup: TempCleanupState,
     ) -> Self {
+        let temp_removed = temp_name.is_none();
         Self {
             temp_name,
             authority,
             cleanup,
             renamed: false,
-            temp_removed: false,
+            temp_removed,
             committed: false,
         }
     }
@@ -2859,9 +2940,13 @@ impl Drop for TempOutput {
             return;
         }
         if !self.temp_removed {
-            if let Err(error) = self.authority.remove_temp_relative(&self.temp_name) {
-                self.cleanup
-                    .record_cleanup_failure("remove temporary output", error);
+            if let Some(temp_name) = &self.temp_name {
+                if let Err(error) = self.authority.remove_temp_relative(temp_name) {
+                    self.cleanup
+                        .record_cleanup_failure("remove temporary output", error);
+                } else {
+                    self.temp_removed = true;
+                }
             } else {
                 self.temp_removed = true;
             }
