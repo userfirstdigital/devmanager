@@ -4,12 +4,13 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 
 use crate::connect::{
-    bind_device_credential, ActionId, BrowserDeviceDto, BrowserPrivateStorage, ConnectRole,
-    CredentialLocation, CredentialVault, DeviceId, DeviceKeyProof, DeviceKind, HostKeyProof,
-    IdentityCommand, IdentityError, IdentityLimitField, IdentityOp, IdentityPersistence,
-    InMemoryIdentityPersistence, IsolatedRemoteStore, LoadedRemoteDocument, MachineBinding,
-    PairingPurpose, PermissionDecision, PermissionEvaluator, PermissionRequest, RegisterDevice,
-    MAX_IDENTITY_ARRAY_ITEMS, MAX_IDENTITY_DEVICES, MAX_IDENTITY_MAP_ENTRIES, MAX_IDENTITY_NESTING,
+    bind_device_credential, validate_device_credential, ActionId, BrowserDeviceDto,
+    BrowserPrivateStorage, ConnectRole, CredentialLocation, CredentialVault, DeviceId,
+    DeviceKeyProof, DeviceKind, HostKeyProof, IdentityCommand, IdentityError, IdentityLimitField,
+    IdentityOp, IdentityPersistence, InMemoryIdentityPersistence, IsolatedRemoteStore,
+    LoadedRemoteDocument, MachineBinding, PairingPurpose, PermissionDecision, PermissionEvaluator,
+    PermissionRequest, RegisterDevice, RepairDevice, MAX_IDENTITY_ARRAY_ITEMS,
+    MAX_IDENTITY_DEVICES, MAX_IDENTITY_MAP_ENTRIES, MAX_IDENTITY_NESTING,
     MAX_IDENTITY_PHYSICAL_BYTES, MAX_LABEL_BYTES,
 };
 use crate::domain::id::CommandId;
@@ -83,6 +84,7 @@ struct FakeVault {
     host: Option<HostSlot>,
     pending_host: Option<HostSlot>,
     devices: BTreeMap<DeviceId, DeviceSlot>,
+    pending_device_repairs: BTreeMap<DeviceId, DeviceSlot>,
     fail_next_commit: bool,
     constant_device_fingerprint: bool,
     invalid_host_proof: bool,
@@ -100,6 +102,7 @@ impl FakeVault {
             host: None,
             pending_host: None,
             devices: BTreeMap::new(),
+            pending_device_repairs: BTreeMap::new(),
             fail_next_commit: false,
             constant_device_fingerprint: false,
             invalid_host_proof: false,
@@ -119,6 +122,7 @@ impl FakeVault {
             host: self.host.clone(),
             pending_host: None,
             devices: self.devices.clone(),
+            pending_device_repairs: BTreeMap::new(),
             fail_next_commit: self.fail_next_commit,
             constant_device_fingerprint: self.constant_device_fingerprint,
             invalid_host_proof: self.invalid_host_proof,
@@ -172,7 +176,7 @@ impl CredentialVault for FakeVault {
                 generation: 1,
                 fingerprint: String::new(),
             });
-            return Ok(HostKeyProof::from_parts_for_test(1, String::new()));
+            return Ok(HostKeyProof::from_parts_for_test(host_id, 1, String::new()));
         }
         let fingerprint = self.fingerprint(host_id.as_bytes(), 1);
         self.host = Some(HostSlot {
@@ -180,7 +184,7 @@ impl CredentialVault for FakeVault {
             generation: 1,
             fingerprint: fingerprint.clone(),
         });
-        Ok(HostKeyProof::from_parts_for_test(1, fingerprint))
+        Ok(HostKeyProof::from_parts_for_test(host_id, 1, fingerprint))
     }
 
     fn rollback_host_establishment(
@@ -224,7 +228,11 @@ impl CredentialVault for FakeVault {
             fingerprint: fingerprint.clone(),
         };
         self.pending_host = Some(slot);
-        Ok(HostKeyProof::from_parts_for_test(generation, fingerprint))
+        Ok(HostKeyProof::from_parts_for_test(
+            host_id,
+            generation,
+            fingerprint,
+        ))
     }
 
     fn commit_host_rotation(&mut self) -> Result<(), IdentityError> {
@@ -286,6 +294,9 @@ impl CredentialVault for FakeVault {
         if slot.host_id != host_id {
             return Err(IdentityError::MissingCredentialProof);
         }
+        if proof.host_public_id() != host_id {
+            return Err(IdentityError::MissingCredentialProof);
+        }
         if slot.generation != proof.generation() {
             return Err(IdentityError::WrongCredentialGeneration);
         }
@@ -312,7 +323,11 @@ impl CredentialVault for FakeVault {
                 kind,
             },
         );
-        Ok(DeviceKeyProof::from_parts_for_test(kind, fingerprint))
+        Ok(DeviceKeyProof::from_parts_for_test(
+            device_id,
+            kind,
+            fingerprint,
+        ))
     }
 
     fn rollback_device_establishment(
@@ -343,6 +358,77 @@ impl CredentialVault for FakeVault {
             .ok_or(IdentityError::MissingCredentialProof)?;
         if slot.kind != proof.kind() || slot.fingerprint != proof.fingerprint() {
             return Err(IdentityError::MissingCredentialProof);
+        }
+        if proof.device_id() != device_id {
+            return Err(IdentityError::MissingCredentialProof);
+        }
+        Ok(())
+    }
+
+    fn prepare_device_repair(
+        &mut self,
+        device_id: DeviceId,
+        kind: DeviceKind,
+    ) -> Result<DeviceKeyProof, IdentityError> {
+        let previous = self
+            .devices
+            .get(&device_id)
+            .cloned()
+            .ok_or(IdentityError::MissingCredentialProof)?;
+        self.pending_device_repairs.insert(device_id, previous);
+        let fingerprint = self.fingerprint(device_id.as_bytes(), 2);
+        self.devices.insert(
+            device_id,
+            DeviceSlot {
+                fingerprint: fingerprint.clone(),
+                kind,
+            },
+        );
+        Ok(DeviceKeyProof::from_parts_for_test(
+            device_id,
+            kind,
+            fingerprint,
+        ))
+    }
+
+    fn commit_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
+        if self.fail_next_commit {
+            self.fail_next_commit = false;
+            return Err(IdentityError::PersistFailed);
+        }
+        self.pending_device_repairs.remove(&device_id);
+        Ok(())
+    }
+
+    fn device_repair_committed(
+        &self,
+        device_id: DeviceId,
+        proof: &DeviceKeyProof,
+    ) -> Result<bool, IdentityError> {
+        if self.pending_device_repairs.contains_key(&device_id) {
+            return Ok(false);
+        }
+        self.verify_device(device_id, proof).map(|_| true)
+    }
+
+    fn rollback_device_repair(
+        &mut self,
+        device_id: DeviceId,
+        _proof: &DeviceKeyProof,
+    ) -> Result<(), IdentityError> {
+        if self.fail_device_rollback {
+            self.fail_device_rollback = false;
+            return Err(IdentityError::PersistFailed);
+        }
+        if let Some(previous) = self.pending_device_repairs.remove(&device_id) {
+            self.devices.insert(device_id, previous);
+        }
+        Ok(())
+    }
+
+    fn abort_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
+        if let Some(previous) = self.pending_device_repairs.remove(&device_id) {
+            self.devices.insert(device_id, previous);
         }
         Ok(())
     }
@@ -402,6 +488,17 @@ impl ScriptedPersistence {
     fn panic_after_marker(&self) {
         let mut inner = self.inner.lock().expect("scripted lock");
         inner.panic_on_write = Some(inner.successful_writes + 2);
+    }
+
+    fn fail_after_cas(&self) {
+        let mut inner = self.inner.lock().expect("scripted lock");
+        inner.fail_on_write = Some(inner.successful_writes + 3);
+    }
+
+    fn clear_faults(&self) {
+        let mut inner = self.inner.lock().expect("scripted lock");
+        inner.fail_on_write = None;
+        inner.panic_on_write = None;
     }
 
     fn claim_len(&self, len: usize) {
@@ -1304,6 +1401,87 @@ fn paired_owner_allows_dangerous_only_with_bound_device_credential_proof() {
 }
 
 #[test]
+fn stale_credentials_are_rejected_by_authoritative_identity_validation() {
+    let mut harness = enabled_with_two_devices();
+    let identity = harness.load().identity().unwrap().clone();
+    let device_id = identity.devices()[0].device_id;
+    let proof = bind_device_credential(&identity, &harness.binding, &harness.vault, device_id, 7)
+        .expect("current registered host-bound device");
+
+    let mut foreign = enabled_with_two_devices();
+    let foreign_identity = foreign.load().identity().unwrap().clone();
+    assert_eq!(
+        validate_device_credential(
+            &foreign_identity,
+            &foreign.binding,
+            &foreign.vault,
+            &proof,
+            7,
+        ),
+        Err(IdentityError::WrongCredentialGeneration)
+    );
+
+    harness.execute(
+        3,
+        IdentityOp::RevokeDevice {
+            device_id,
+            now_epoch_ms: 8,
+        },
+    );
+    let revoked = harness.load().identity().unwrap().clone();
+    assert_eq!(
+        validate_device_credential(&revoked, &harness.binding, &harness.vault, &proof, 7,),
+        Err(IdentityError::UnknownDevice)
+    );
+    assert_eq!(
+        harness
+            .store
+            .validate_device_credential(&harness.binding, &harness.vault, &proof, 7,),
+        Err(IdentityError::UnknownDevice)
+    );
+    assert_eq!(
+        PermissionEvaluator::owner_only().evaluate_with_authority(
+            PermissionRequest {
+                role: ConnectRole::PairedOwner,
+                task_id: None,
+                action: ActionId::APPROVE_DANGEROUS,
+                credential: Some(proof),
+            },
+            &revoked,
+            &harness.binding,
+            &harness.vault,
+            7,
+        ),
+        PermissionDecision::Denied(crate::connect::PermissionDenyReason::DeviceCredentialRequired)
+    );
+
+    let mut rotated_harness = enabled_with_two_devices();
+    let rotated_identity = rotated_harness.load().identity().unwrap().clone();
+    let rotated_device_id = rotated_identity.devices()[0].device_id;
+    let rotated_proof = bind_device_credential(
+        &rotated_identity,
+        &rotated_harness.binding,
+        &rotated_harness.vault,
+        rotated_device_id,
+        7,
+    )
+    .expect("rotated proof starts current");
+    rotated_harness.execute(3, IdentityOp::RotateHostIdentity { now_epoch_ms: 9 });
+    let rotated = rotated_harness.load().identity().unwrap().clone();
+    assert!(
+        validate_device_credential(
+            &rotated,
+            &rotated_harness.binding,
+            &rotated_harness.vault,
+            &rotated_proof,
+            7,
+        )
+        .is_err(),
+        "host rotation must invalidate the old proof"
+    );
+}
+
+#[test]
 fn host_rotation_requires_devices_to_re_pair_before_new_credentials() {
     let mut harness = enabled_with_two_devices();
     let device_id = harness.load().identity().unwrap().devices()[0].device_id;
@@ -1340,6 +1518,50 @@ fn persisted_browser_registration_rejects_cleared_storage_repair_false() {
         .load(&harness.binding, &harness.vault)
         .expect_err("persisted browser must require visible repair");
     assert_eq!(error, IdentityError::InvalidDevice);
+}
+
+#[test]
+fn unavailable_browser_credential_degrades_only_that_device() {
+    let mut harness = enabled_with_two_devices();
+    let browser_id = harness
+        .load()
+        .identity()
+        .unwrap()
+        .devices()
+        .iter()
+        .find(|device| device.kind == DeviceKind::Browser)
+        .unwrap()
+        .device_id;
+    harness.vault.devices.remove(&browser_id);
+
+    let loaded = harness
+        .store
+        .load(&harness.binding, &harness.vault)
+        .expect("host load must survive unavailable browser credential");
+    let identity = loaded.identity().expect("host identity remains available");
+    assert!(identity.device(browser_id).unwrap().requires_re_pair);
+    assert!(identity
+        .devices()
+        .iter()
+        .filter(|device| device.device_id != browser_id)
+        .all(|device| !device.requires_re_pair));
+}
+
+#[test]
+fn existing_empty_or_truncated_identity_file_requires_explicit_recovery() {
+    for bytes in [b"".as_slice(), br#"{"#.as_slice()] {
+        let persistence = InMemoryIdentityPersistence::from_bytes(bytes).expect("bounded file");
+        let mut store = IsolatedRemoteStore::new(persistence).expect("store");
+        assert_eq!(
+            store
+                .load(
+                    &MachineBinding::new("fixture-machine-a"),
+                    &FakeVault::empty(),
+                )
+                .expect_err("existing malformed file must not look like first run"),
+            IdentityError::Corrupt
+        );
+    }
 }
 
 #[test]
@@ -1414,6 +1636,445 @@ fn abort_host_rotation_failure_is_typed_and_retryable() {
         .abandon_pending_transition(&binding, &mut vault)
         .expect("retryable abort");
     assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn abandoning_register_preserves_committed_host_identity() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .unwrap();
+    let host_id = store
+        .load(&binding, &vault)
+        .unwrap()
+        .identity()
+        .unwrap()
+        .host_public_id();
+    persistence.panic_after_marker();
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RegisterDevice(RegisterDevice {
+                    kind: DeviceKind::Native,
+                    label: "pending desktop".to_string(),
+                    legacy_client_id: Some("pending-desktop".to_string()),
+                    browser: None,
+                }),
+            },
+        )
+    }));
+    assert!(crashed.is_err());
+
+    let persisted = persistence
+        .read_bounded(MAX_IDENTITY_PHYSICAL_BYTES)
+        .unwrap()
+        .unwrap();
+    let reopened_persistence = InMemoryIdentityPersistence::from_bytes(&persisted).unwrap();
+    let mut reopened = IsolatedRemoteStore::new(reopened_persistence).unwrap();
+    let abandoned = reopened
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("abandon pending register");
+    assert_eq!(abandoned.identity().unwrap().host_public_id(), host_id);
+    assert!(abandoned.identity().unwrap().devices().is_empty());
+    assert!(!abandoned.requires_explicit_reestablish());
+}
+
+#[test]
+fn abandoning_rotate_restores_exact_previous_identity_snapshot() {
+    let mut harness = enabled_with_two_devices();
+    let previous = harness.load().identity().unwrap().clone();
+    harness.vault.fail_next_commit();
+    let error = harness
+        .store
+        .execute(
+            &harness.binding,
+            &mut harness.vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 3,
+                op: IdentityOp::RotateHostIdentity { now_epoch_ms: 9 },
+            },
+        )
+        .expect_err("commit failure leaves pending rotate");
+    assert_eq!(error, IdentityError::PersistFailed);
+
+    let abandoned = harness
+        .store
+        .abandon_pending_transition(&harness.binding, &mut harness.vault)
+        .expect("abandon pending rotate");
+    let restored = abandoned.identity().expect("previous identity remains");
+    assert_eq!(restored.host_public_id(), previous.host_public_id());
+    assert_eq!(
+        restored.host_key().fingerprint(),
+        previous.host_key().fingerprint()
+    );
+    assert_eq!(restored.devices(), previous.devices());
+    assert!(!restored
+        .devices()
+        .iter()
+        .any(|device| device.requires_re_pair));
+}
+
+#[test]
+fn abandoning_pre_cas_rotate_aborts_uncommitted_new_host_slot() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .unwrap();
+    let previous = store
+        .load(&binding, &vault)
+        .unwrap()
+        .identity()
+        .unwrap()
+        .clone();
+    persistence.panic_after_marker();
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RotateHostIdentity { now_epoch_ms: 2 },
+            },
+        )
+    }));
+    assert!(crashed.is_err());
+    assert!(vault.pending_host.is_some());
+    persistence.clear_faults();
+
+    let abandoned = store
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("abandon pre-CAS rotate");
+    assert_eq!(abandoned.identity(), Some(&previous));
+    assert!(vault.pending_host.is_none());
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn abandoning_already_committed_rotate_preserves_new_identity_snapshot() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .unwrap();
+    let old_host = store
+        .load(&binding, &vault)
+        .unwrap()
+        .identity()
+        .unwrap()
+        .host_key()
+        .fingerprint()
+        .to_string();
+    persistence.fail_after_cas();
+    let error = store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RotateHostIdentity { now_epoch_ms: 2 },
+            },
+        )
+        .expect_err("clear failure leaves the committed rotate marker");
+    assert_eq!(error, IdentityError::PersistFailed);
+    let new_host = vault.host.as_ref().unwrap().fingerprint.clone();
+    assert_ne!(new_host, old_host);
+
+    let abandoned = store
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("abandon must recognize the already committed vault slot");
+    assert_eq!(
+        abandoned.identity().unwrap().host_key().fingerprint(),
+        new_host
+    );
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn abandoning_already_committed_repair_preserves_new_device_snapshot() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 0,
+                op: IdentityOp::Enable {
+                    host_build: 100,
+                    now_epoch_ms: 1,
+                },
+            },
+        )
+        .unwrap();
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::RegisterDevice(RegisterDevice {
+                    kind: DeviceKind::Native,
+                    label: "desktop".to_string(),
+                    legacy_client_id: Some("desktop".to_string()),
+                    browser: None,
+                }),
+            },
+        )
+        .unwrap();
+    store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 2,
+                op: IdentityOp::RotateHostIdentity { now_epoch_ms: 2 },
+            },
+        )
+        .unwrap();
+    let before_repair = store
+        .load(&binding, &vault)
+        .unwrap()
+        .identity()
+        .unwrap()
+        .clone();
+    let device = before_repair.devices()[0].clone();
+    persistence.fail_after_cas();
+    let error = store
+        .execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 3,
+                op: IdentityOp::RepairDevice(RepairDevice {
+                    device_id: device.device_id,
+                    kind: device.kind,
+                    label: device.label().to_string(),
+                    legacy_client_id: device.legacy_client_id.clone(),
+                    browser: device.browser.clone(),
+                }),
+            },
+        )
+        .expect_err("clear failure leaves the committed repair marker");
+    assert_eq!(error, IdentityError::PersistFailed);
+    let abandoned = store
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("abandon must recognize the already committed device slot");
+    let repaired = abandoned
+        .identity()
+        .unwrap()
+        .device(device.device_id)
+        .unwrap();
+    assert_ne!(
+        repaired.public_key.fingerprint(),
+        device.public_key.fingerprint()
+    );
+    assert!(!repaired.requires_re_pair);
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn authenticated_repair_replaces_key_without_changing_device_id() {
+    let mut harness = enabled_with_two_devices();
+    let device = harness.load().identity().unwrap().devices()[0].clone();
+    harness.execute(3, IdentityOp::RotateHostIdentity { now_epoch_ms: 9 });
+    let repaired = harness.execute(
+        4,
+        IdentityOp::RepairDevice(RepairDevice {
+            device_id: device.device_id,
+            kind: device.kind,
+            label: device.label().to_string(),
+            legacy_client_id: device.legacy_client_id.clone(),
+            browser: device.browser.clone(),
+        }),
+    );
+    let repaired = repaired.registered_device().expect("repaired device");
+    assert_eq!(repaired.device_id, device.device_id);
+    assert_ne!(
+        repaired.public_key.fingerprint(),
+        device.public_key.fingerprint()
+    );
+    assert!(!repaired.requires_re_pair);
+}
+
+#[test]
+fn abandoning_repair_restores_exact_previous_device_snapshot() {
+    let mut harness = enabled_with_two_devices();
+    harness.execute(3, IdentityOp::RotateHostIdentity { now_epoch_ms: 9 });
+    let before_repair = harness.load().identity().unwrap().clone();
+    let device = before_repair.devices()[0].clone();
+    let repair = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 4,
+        op: IdentityOp::RepairDevice(RepairDevice {
+            device_id: device.device_id,
+            kind: device.kind,
+            label: device.label().to_string(),
+            legacy_client_id: device.legacy_client_id.clone(),
+            browser: device.browser.clone(),
+        }),
+    };
+    harness.vault.fail_next_commit();
+    assert_eq!(
+        harness
+            .store
+            .execute(&harness.binding, &mut harness.vault, repair)
+            .expect_err("repair commit failure leaves a durable marker"),
+        IdentityError::PersistFailed
+    );
+
+    let abandoned = harness
+        .store
+        .abandon_pending_transition(&harness.binding, &mut harness.vault)
+        .expect("abandon repair");
+    let restored = abandoned.identity().unwrap();
+    assert_eq!(restored.devices(), before_repair.devices());
+    assert_eq!(
+        harness
+            .vault
+            .devices
+            .get(&device.device_id)
+            .unwrap()
+            .fingerprint,
+        device.public_key.fingerprint()
+    );
+    assert!(!abandoned.has_pending_transition());
+}
+
+#[test]
+fn pending_transition_nonce_changes_and_is_persisted() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    persistence.panic_after_marker();
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    let command = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 0,
+        op: IdentityOp::Enable {
+            host_build: 100,
+            now_epoch_ms: 1,
+        },
+    };
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(&binding, &mut vault, command)
+    }));
+    assert!(crashed.is_err());
+    let first = String::from_utf8(persistence.snapshot_bytes().unwrap()).unwrap();
+    assert!(first.contains("transitionNonce"));
+}
+
+#[test]
+fn stale_transition_nonce_cannot_claim_a_newer_marker() {
+    let persistence = ScriptedPersistence::new(LEGACY_REMOTE_JSON.as_bytes());
+    let mut store = IsolatedRemoteStore::new(persistence.clone()).unwrap();
+    let binding = MachineBinding::new("fixture-machine-a");
+    let mut vault = FakeVault::bind(&binding);
+    persistence.panic_after_marker();
+    let enable = IdentityCommand {
+        command_id: CommandId::new(),
+        expected_revision: 0,
+        op: IdentityOp::Enable {
+            host_build: 100,
+            now_epoch_ms: 1,
+        },
+    };
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(&binding, &mut vault, enable)
+    }));
+    assert!(crashed.is_err());
+    let pending_a = store
+        .pending_transition_for_test()
+        .unwrap()
+        .expect("first marker");
+    persistence.clear_faults();
+    store
+        .abandon_pending_transition(&binding, &mut vault)
+        .expect("first marker abandoned");
+
+    persistence.panic_after_marker();
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.execute(
+            &binding,
+            &mut vault,
+            IdentityCommand {
+                command_id: CommandId::new(),
+                expected_revision: 1,
+                op: IdentityOp::Enable {
+                    host_build: 101,
+                    now_epoch_ms: 2,
+                },
+            },
+        )
+    }));
+    assert!(crashed.is_err());
+    let pending_b = store
+        .pending_transition_for_test()
+        .unwrap()
+        .expect("second marker");
+    assert_ne!(
+        pending_a.transition_nonce, pending_b.transition_nonce,
+        "each transition must use a fresh opaque nonce"
+    );
+    assert_eq!(
+        store
+            .claim_pending_transition_for_test(&pending_a)
+            .expect_err("stale marker must not claim newer marker"),
+        IdentityError::RevisionConflict
+    );
 }
 
 #[test]

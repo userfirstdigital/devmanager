@@ -193,10 +193,13 @@ struct WirePendingTransition {
     command_id: String,
     command_digest: String,
     kind: String,
+    transition_nonce: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_public_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_identity: Option<WireIdentity>,
 }
 
 const CONNECT_IDENTITY_KEYS: &[&str] = &[
@@ -219,7 +222,7 @@ pub(crate) fn decode_identity_bytes(bytes: &[u8]) -> Result<IdentityDocument, Id
         });
     }
     if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Ok(IdentityDocument::default());
+        return Err(IdentityError::Corrupt);
     }
     scan_bounded_json(bytes)?;
     let value: Value = serde_json::from_slice(bytes).map_err(|_| IdentityError::Corrupt)?;
@@ -755,6 +758,7 @@ fn pending_transition_from_wire(
     let kind = match wire.kind.as_str() {
         "enable" => PendingIdentityTransitionKind::Enable,
         "registerDevice" => PendingIdentityTransitionKind::RegisterDevice,
+        "repairDevice" => PendingIdentityTransitionKind::RepairDevice,
         "rotateHostIdentity" => PendingIdentityTransitionKind::RotateHostIdentity,
         _ => return Err(IdentityError::Corrupt),
     };
@@ -762,12 +766,18 @@ fn pending_transition_from_wire(
         command_id: CommandId::parse(&wire.command_id).map_err(|_| IdentityError::Corrupt)?,
         command_digest: parse_digest(&wire.command_digest)?,
         kind,
+        transition_nonce: parse_nonce(&wire.transition_nonce)?,
         host_public_id: wire
             .host_public_id
             .as_deref()
             .map(HostPublicId::parse)
             .transpose()?,
         device_id: wire.device_id.as_deref().map(DeviceId::parse).transpose()?,
+        previous_identity: wire
+            .previous_identity
+            .map(connect_identity_from_wire)
+            .transpose()?
+            .map(Box::new),
     })
 }
 
@@ -778,11 +788,17 @@ fn pending_transition_to_wire(pending: &PendingIdentityTransition) -> WirePendin
         kind: match pending.kind {
             PendingIdentityTransitionKind::Enable => "enable",
             PendingIdentityTransitionKind::RegisterDevice => "registerDevice",
+            PendingIdentityTransitionKind::RepairDevice => "repairDevice",
             PendingIdentityTransitionKind::RotateHostIdentity => "rotateHostIdentity",
         }
         .to_string(),
+        transition_nonce: hex_encode(&pending.transition_nonce),
         host_public_id: pending.host_public_id.map(|id| uuid_string(id.as_bytes())),
         device_id: pending.device_id.map(|id| uuid_string(id.as_bytes())),
+        previous_identity: pending
+            .previous_identity
+            .as_deref()
+            .map(connect_identity_to_wire),
     }
 }
 
@@ -790,13 +806,43 @@ fn validate_pending_transition(pending: &PendingIdentityTransition) -> Result<()
     if pending.command_digest == [0; 32] {
         return Err(IdentityError::Corrupt);
     }
+    if pending.transition_nonce == [0; 16] {
+        return Err(IdentityError::Corrupt);
+    }
     match pending.kind {
         PendingIdentityTransitionKind::Enable
-            if pending.host_public_id.is_some() && pending.device_id.is_none() => {}
+            if pending.host_public_id.is_some()
+                && pending.device_id.is_none()
+                && pending.previous_identity.is_none() => {}
         PendingIdentityTransitionKind::RegisterDevice
-            if pending.host_public_id.is_none() && pending.device_id.is_some() => {}
+            if pending.host_public_id.is_none()
+                && pending.device_id.is_some()
+                && pending.previous_identity.is_none() => {}
+        PendingIdentityTransitionKind::RepairDevice
+            if pending.host_public_id.is_none()
+                && pending.device_id.is_some()
+                && pending.previous_identity.is_some() =>
+        {
+            let Some(previous) = pending.previous_identity.as_deref() else {
+                return Err(IdentityError::Corrupt);
+            };
+            previous.validate_structure()?;
+            let device_id = pending.device_id.ok_or(IdentityError::Corrupt)?;
+            let device = previous.device(device_id).ok_or(IdentityError::Corrupt)?;
+            if device.revoked || !device.requires_re_pair {
+                return Err(IdentityError::Corrupt);
+            }
+        }
         PendingIdentityTransitionKind::RotateHostIdentity
-            if pending.host_public_id.is_none() && pending.device_id.is_none() => {}
+            if pending.host_public_id.is_none()
+                && pending.device_id.is_none()
+                && pending.previous_identity.is_some() =>
+        {
+            let Some(previous) = pending.previous_identity.as_deref() else {
+                return Err(IdentityError::Corrupt);
+            };
+            previous.validate_structure()?;
+        }
         _ => return Err(IdentityError::Corrupt),
     }
     Ok(())
@@ -835,6 +881,25 @@ fn parse_digest(raw: &str) -> Result<[u8; 32], IdentityError> {
         *slot = (hex_value(high)? << 4) | hex_value(low)?;
     }
     Ok(digest)
+}
+
+fn parse_nonce(raw: &str) -> Result<[u8; 16], IdentityError> {
+    if raw.len() != 32
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(IdentityError::Corrupt);
+    }
+    let mut nonce = [0_u8; 16];
+    for (index, slot) in nonce.iter_mut().enumerate() {
+        *slot = (hex_value(raw.as_bytes()[index * 2])? << 4)
+            | hex_value(raw.as_bytes()[index * 2 + 1])?;
+    }
+    if nonce == [0; 16] {
+        return Err(IdentityError::Corrupt);
+    }
+    Ok(nonce)
 }
 
 fn hex_value(byte: u8) -> Result<u8, IdentityError> {

@@ -3,8 +3,12 @@
 use std::fmt;
 use std::num::NonZeroU16;
 
-use crate::connect::DeviceCredentialProof;
 use crate::domain::id::TaskId;
+
+use super::identity::{
+    validate_device_credential, ConnectIdentity, CredentialVault, DeviceCredentialProof,
+    MachineBinding,
+};
 
 /// Stable action discriminant. Unknown nonzero values are denied, never
 /// converted into a new command or interactive action.
@@ -94,7 +98,7 @@ pub enum ConnectRole {
     Collaborator { task_id: TaskId },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub role: ConnectRole,
     pub task_id: Option<TaskId>,
@@ -208,6 +212,29 @@ impl PermissionEvaluator {
                 PermissionDecision::Allow
             }
         }
+    }
+
+    /// Evaluate a request only after revalidating a PairedOwner proof against
+    /// the authoritative identity, vault, and active session epoch.
+    pub fn evaluate_with_authority<V: CredentialVault>(
+        &self,
+        request: PermissionRequest,
+        identity: &ConnectIdentity,
+        binding: &MachineBinding,
+        vault: &V,
+        active_session_epoch: u64,
+    ) -> PermissionDecision {
+        if matches!(request.role, ConnectRole::PairedOwner) {
+            let Some(proof) = request.credential.as_ref() else {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            };
+            if validate_device_credential(identity, binding, vault, proof, active_session_epoch)
+                .is_err()
+            {
+                return PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired);
+            }
+        }
+        self.evaluate(request)
     }
 
     pub fn authorize(&self, request: PermissionRequest) -> bool {

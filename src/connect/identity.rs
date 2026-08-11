@@ -348,7 +348,7 @@ impl DeviceRecord {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectIdentity {
     pub(crate) schema_version: u16,
     pub(crate) host_public_id: HostPublicId,
@@ -472,6 +472,15 @@ pub struct RegisterDevice {
 }
 
 #[derive(Clone)]
+pub struct RepairDevice {
+    pub device_id: DeviceId,
+    pub kind: DeviceKind,
+    pub label: String,
+    pub legacy_client_id: Option<String>,
+    pub browser: Option<BrowserDeviceDto>,
+}
+
+#[derive(Clone)]
 pub struct IdentityCommand {
     pub command_id: CommandId,
     pub expected_revision: u64,
@@ -519,6 +528,28 @@ impl IdentityCommand {
                     }
                 }
             }
+            IdentityOp::RepairDevice(request) => {
+                digest.update([7]);
+                digest.update(request.device_id.as_bytes());
+                digest.update([match request.kind {
+                    DeviceKind::Native => 0,
+                    DeviceKind::Browser => 1,
+                }]);
+                digest_string(&mut digest, &request.label);
+                digest_option_string(&mut digest, request.legacy_client_id.as_deref());
+                match &request.browser {
+                    None => digest.update([0]),
+                    Some(browser) => {
+                        digest.update([1]);
+                        digest_string(&mut digest, &browser.browser_install_id);
+                        digest_option_string(&mut digest, browser.nickname.as_deref());
+                        digest.update([match browser.private_identity_storage {
+                            BrowserPrivateStorage::WebCryptoNonExportableIndexedDb => 0,
+                        }]);
+                        digest.update([u8::from(browser.cleared_storage_requires_visible_repair)]);
+                    }
+                }
+            }
             IdentityOp::RotatePairingCode { now_epoch_ms } => {
                 digest.update([3]);
                 digest.update(now_epoch_ms.to_be_bytes());
@@ -554,6 +585,7 @@ pub enum IdentityOp {
         now_epoch_ms: u64,
     },
     RegisterDevice(RegisterDevice),
+    RepairDevice(RepairDevice),
     RotatePairingCode {
         now_epoch_ms: u64,
     },
@@ -572,13 +604,15 @@ pub enum IdentityOp {
 /// Durable marker written before a vault mutation. Public ids name vault
 /// slots that abandon/retry must reconcile; a restart must not pretend an
 /// interrupted vault operation committed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PendingIdentityTransition {
     pub(crate) command_id: CommandId,
     pub(crate) command_digest: [u8; 32],
     pub(crate) kind: PendingIdentityTransitionKind,
+    pub(crate) transition_nonce: [u8; 16],
     pub(crate) host_public_id: Option<HostPublicId>,
     pub(crate) device_id: Option<DeviceId>,
+    pub(crate) previous_identity: Option<Box<ConnectIdentity>>,
 }
 
 impl fmt::Debug for PendingIdentityTransition {
@@ -594,6 +628,7 @@ impl fmt::Debug for PendingIdentityTransition {
 pub(crate) enum PendingIdentityTransitionKind {
     Enable,
     RegisterDevice,
+    RepairDevice,
     RotateHostIdentity,
 }
 
@@ -602,6 +637,7 @@ impl PendingIdentityTransitionKind {
         match operation {
             IdentityOp::Enable { .. } => Some(Self::Enable),
             IdentityOp::RegisterDevice(_) => Some(Self::RegisterDevice),
+            IdentityOp::RepairDevice(_) => Some(Self::RepairDevice),
             IdentityOp::RotateHostIdentity { .. } => Some(Self::RotateHostIdentity),
             IdentityOp::NoteHostBuild { .. }
             | IdentityOp::RotatePairingCode { .. }
@@ -659,6 +695,7 @@ impl fmt::Debug for IdentityReceipt {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct HostKeyProof {
+    host_public_id: HostPublicId,
     generation: u64,
     fingerprint: String,
     _seal: HostProofSeal,
@@ -668,8 +705,13 @@ pub struct HostKeyProof {
 struct HostProofSeal;
 
 impl HostKeyProof {
-    pub(crate) fn from_parts(generation: u64, fingerprint: impl Into<String>) -> Self {
+    pub(crate) fn from_parts(
+        host_public_id: HostPublicId,
+        generation: u64,
+        fingerprint: impl Into<String>,
+    ) -> Self {
         Self {
+            host_public_id,
             generation,
             fingerprint: fingerprint.into(),
             _seal: HostProofSeal,
@@ -678,8 +720,16 @@ impl HostKeyProof {
 
     /// Construct a proof for an in-crate test harness.
     #[cfg(test)]
-    pub(crate) fn from_parts_for_test(generation: u64, fingerprint: impl Into<String>) -> Self {
-        Self::from_parts(generation, fingerprint)
+    pub(crate) fn from_parts_for_test(
+        host_public_id: HostPublicId,
+        generation: u64,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::from_parts(host_public_id, generation, fingerprint)
+    }
+
+    pub fn host_public_id(&self) -> HostPublicId {
+        self.host_public_id
     }
 
     pub fn generation(&self) -> u64 {
@@ -703,6 +753,7 @@ impl fmt::Debug for HostKeyProof {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceKeyProof {
+    device_id: DeviceId,
     kind: DeviceKind,
     fingerprint: String,
     _seal: DeviceProofSeal,
@@ -712,8 +763,13 @@ pub struct DeviceKeyProof {
 struct DeviceProofSeal;
 
 impl DeviceKeyProof {
-    pub(crate) fn from_parts(kind: DeviceKind, fingerprint: impl Into<String>) -> Self {
+    pub(crate) fn from_parts(
+        device_id: DeviceId,
+        kind: DeviceKind,
+        fingerprint: impl Into<String>,
+    ) -> Self {
         Self {
+            device_id,
             kind,
             fingerprint: fingerprint.into(),
             _seal: DeviceProofSeal,
@@ -722,8 +778,16 @@ impl DeviceKeyProof {
 
     /// Construct a proof for an in-crate test harness.
     #[cfg(test)]
-    pub(crate) fn from_parts_for_test(kind: DeviceKind, fingerprint: impl Into<String>) -> Self {
-        Self::from_parts(kind, fingerprint)
+    pub(crate) fn from_parts_for_test(
+        device_id: DeviceId,
+        kind: DeviceKind,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::from_parts(device_id, kind, fingerprint)
+    }
+
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
     }
 
     pub fn kind(&self) -> DeviceKind {
@@ -751,9 +815,13 @@ impl fmt::Debug for DeviceKeyProof {
 /// HOLD: real connection/session wiring and OS vault verification stay
 /// outside this slice. Callers must mint this only via
 /// `bind_device_credential`; a raw `DeviceId` is never enough.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceCredentialProof {
+    host_public_id: HostPublicId,
     device_id: DeviceId,
+    host_key_fingerprint: String,
+    device_key_fingerprint: String,
+    revocation_epoch: u64,
     session_epoch: u64,
     host_generation: u64,
     _seal: DeviceCredentialSeal,
@@ -763,16 +831,24 @@ pub struct DeviceCredentialProof {
 struct DeviceCredentialSeal;
 
 impl DeviceCredentialProof {
-    pub fn device_id(self) -> DeviceId {
+    pub fn device_id(&self) -> DeviceId {
         self.device_id
     }
 
-    pub fn session_epoch(self) -> u64 {
+    pub fn session_epoch(&self) -> u64 {
         self.session_epoch
     }
 
-    pub fn host_generation(self) -> u64 {
+    pub fn host_generation(&self) -> u64 {
         self.host_generation
+    }
+
+    pub fn host_public_id(&self) -> HostPublicId {
+        self.host_public_id
+    }
+
+    pub fn revocation_epoch(&self) -> u64 {
+        self.revocation_epoch
     }
 }
 
@@ -806,24 +882,79 @@ pub fn bind_device_credential<V: CredentialVault>(
     if host_generation == 0 {
         return Err(IdentityError::Corrupt);
     }
-    let host_proof =
-        HostKeyProof::from_parts(host_generation, identity.host_key.fingerprint.clone());
-    vault.verify_host(identity.host_public_id, &host_proof)?;
     let device = identity
         .device(device_id)
         .ok_or(IdentityError::UnknownDevice)?;
     if device.revoked || device.requires_re_pair {
         return Err(IdentityError::UnknownDevice);
     }
-    let device_proof =
-        DeviceKeyProof::from_parts(device.kind, device.public_key.fingerprint().to_string());
-    vault.verify_device(device.device_id, &device_proof)?;
-    Ok(DeviceCredentialProof {
+    let proof = DeviceCredentialProof {
+        host_public_id: identity.host_public_id,
         device_id,
+        host_key_fingerprint: identity.host_key.fingerprint().to_string(),
+        device_key_fingerprint: device.public_key.fingerprint().to_string(),
+        revocation_epoch: device.revoked_at_epoch_ms.unwrap_or(0),
         session_epoch,
         host_generation,
         _seal: DeviceCredentialSeal,
-    })
+    };
+    validate_device_credential(identity, binding, vault, &proof, session_epoch)?;
+    Ok(proof)
+}
+
+/// Revalidate an opaque device proof against the current identity document,
+/// machine binding, vault custody, and active session epoch. A proof is not a
+/// durable authorization: revocation, host rotation, key replacement, or a
+/// foreign profile invalidates it.
+pub fn validate_device_credential<V: CredentialVault>(
+    identity: &ConnectIdentity,
+    binding: &MachineBinding,
+    vault: &V,
+    proof: &DeviceCredentialProof,
+    active_session_epoch: u64,
+) -> Result<(), IdentityError> {
+    if active_session_epoch == 0 || proof.session_epoch != active_session_epoch {
+        return Err(IdentityError::MissingCredentialProof);
+    }
+    identity.validate_structure()?;
+    if identity.profile_binding_hash != binding.binding_hash() {
+        return Err(IdentityError::CopiedProfile);
+    }
+    if proof.host_public_id != identity.host_public_id {
+        return Err(IdentityError::WrongCredentialGeneration);
+    }
+    let host_generation = identity.host_key.generation.unwrap_or(0);
+    if host_generation == 0 || proof.host_generation != host_generation {
+        return Err(IdentityError::WrongCredentialGeneration);
+    }
+    if proof.host_key_fingerprint != identity.host_key.fingerprint {
+        return Err(IdentityError::WrongCredentialGeneration);
+    }
+    let host_proof = HostKeyProof::from_parts(
+        identity.host_public_id,
+        host_generation,
+        identity.host_key.fingerprint.clone(),
+    );
+    vault.verify_host(identity.host_public_id, &host_proof)?;
+    let device = identity
+        .device(proof.device_id)
+        .ok_or(IdentityError::UnknownDevice)?;
+    if device.revoked || device.requires_re_pair {
+        return Err(IdentityError::UnknownDevice);
+    }
+    if proof.revocation_epoch != device.revoked_at_epoch_ms.unwrap_or(0) {
+        return Err(IdentityError::UnknownDevice);
+    }
+    if proof.device_key_fingerprint != device.public_key.fingerprint() {
+        return Err(IdentityError::MissingCredentialProof);
+    }
+    let device_proof = DeviceKeyProof::from_parts(
+        device.device_id,
+        device.kind,
+        device.public_key.fingerprint().to_string(),
+    );
+    vault.verify_device(device.device_id, &device_proof)?;
+    Ok(())
 }
 
 /// Vault authority seam.
@@ -867,6 +998,38 @@ pub trait CredentialVault {
         device_id: DeviceId,
         kind: DeviceKind,
     ) -> Result<DeviceKeyProof, IdentityError>;
+    /// Replace the credential for an existing stable DeviceId. The old
+    /// credential remains restorable until the identity CAS commits.
+    fn prepare_device_repair(
+        &mut self,
+        device_id: DeviceId,
+        kind: DeviceKind,
+    ) -> Result<DeviceKeyProof, IdentityError> {
+        self.establish_device(device_id, kind)
+    }
+    fn commit_device_repair(&mut self, _device_id: DeviceId) -> Result<(), IdentityError> {
+        Ok(())
+    }
+    /// Report whether a prepared replacement is durably active. Adapters that
+    /// expose a prepared key through `verify_device` before commit must
+    /// override this to distinguish prepared from committed custody.
+    fn device_repair_committed(
+        &self,
+        device_id: DeviceId,
+        proof: &DeviceKeyProof,
+    ) -> Result<bool, IdentityError> {
+        self.verify_device(device_id, proof).map(|_| true)
+    }
+    fn rollback_device_repair(
+        &mut self,
+        device_id: DeviceId,
+        proof: &DeviceKeyProof,
+    ) -> Result<(), IdentityError> {
+        self.rollback_device_establishment(device_id, proof)
+    }
+    fn abort_device_repair(&mut self, device_id: DeviceId) -> Result<(), IdentityError> {
+        self.discard_uncommitted_device(device_id)
+    }
     fn rollback_device_establishment(
         &mut self,
         device_id: DeviceId,
@@ -877,6 +1040,15 @@ pub trait CredentialVault {
         device_id: DeviceId,
         proof: &DeviceKeyProof,
     ) -> Result<(), IdentityError>;
+}
+
+pub(crate) fn generate_transition_nonce() -> Result<[u8; 16], IdentityError> {
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| IdentityError::Corrupt)?;
+    if nonce == [0; 16] {
+        return Err(IdentityError::Corrupt);
+    }
+    Ok(nonce)
 }
 
 fn digest_string(digest: &mut Sha256, value: &str) {

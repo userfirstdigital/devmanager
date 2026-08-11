@@ -7,13 +7,13 @@
 use std::fmt;
 
 use super::identity::{
-    rotate_pairing_until_changed, seed_pairing_code, validate_device_record, BrowserPrivateStorage,
-    ConnectIdentity, CredentialVault, DeviceKeyProof, DeviceKind, DeviceRecord,
-    HostIdentityRotation, HostKeyProof, HostPublicId, IdentityCommand, IdentityError,
-    IdentityLimitField, IdentityOp, IdentityReceipt, IdentitySetup, KeyReference, MachineBinding,
-    PairingPurpose, PendingIdentityTransition, PendingIdentityTransitionKind, RegisterDevice,
-    CONNECT_IDENTITY_SCHEMA_VERSION, MAX_IDENTITY_DEVICES, MAX_IDENTITY_PHYSICAL_BYTES,
-    MAX_IDENTITY_RECEIPTS, MAX_LABEL_BYTES,
+    generate_transition_nonce, rotate_pairing_until_changed, seed_pairing_code,
+    validate_device_record, BrowserPrivateStorage, ConnectIdentity, CredentialVault,
+    DeviceKeyProof, DeviceKind, DeviceRecord, HostIdentityRotation, HostKeyProof, HostPublicId,
+    IdentityCommand, IdentityError, IdentityLimitField, IdentityOp, IdentityReceipt, IdentitySetup,
+    KeyReference, MachineBinding, PairingPurpose, PendingIdentityTransition,
+    PendingIdentityTransitionKind, RegisterDevice, RepairDevice, CONNECT_IDENTITY_SCHEMA_VERSION,
+    MAX_IDENTITY_DEVICES, MAX_IDENTITY_PHYSICAL_BYTES, MAX_IDENTITY_RECEIPTS, MAX_LABEL_BYTES,
 };
 use super::identity_codec::{
     decode_identity_bytes, device_receipt, empty_receipt, enable_receipt, encode_identity_document,
@@ -204,6 +204,10 @@ enum VaultTransition {
         device_id: super::identity::DeviceId,
         proof: DeviceKeyProof,
     },
+    DeviceRepair {
+        device_id: super::identity::DeviceId,
+        proof: DeviceKeyProof,
+    },
     HostRotation,
 }
 
@@ -233,13 +237,30 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         &mut self.persistence
     }
 
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn pending_transition_for_test(
+        &self,
+    ) -> Result<Option<PendingIdentityTransition>, IdentityError> {
+        Ok(self.read_document()?.pending_transition)
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn claim_pending_transition_for_test(
+        &mut self,
+        expected: &PendingIdentityTransition,
+    ) -> Result<(), IdentityError> {
+        self.claim_pending_transition(expected).map(|_| ())
+    }
+
     pub fn load<V: CredentialVault>(
         &mut self,
         binding: &MachineBinding,
         vault: &V,
     ) -> Result<LoadedRemoteDocument, IdentityError> {
-        let document = self.read_document()?;
-        if let Some(pending) = document.pending_transition {
+        let mut document = self.read_document()?;
+        if let Some(pending) = document.pending_transition.clone() {
             // Enable/Register keep any already-committed identity visible.
             // RotateHost may have written a next key that is not vault-committed;
             // do not treat that key as live authority until retry settles.
@@ -261,14 +282,68 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 });
             }
             if let Some(identity) = &document.identity {
-                verify_bound_identity(identity, binding, vault)?;
+                let degraded = verify_bound_identity(identity, binding, vault)?;
+                self.persist_browser_degradation(&mut document, &degraded)?;
             }
             return Ok(LoadedRemoteDocument { document });
         }
         if let Some(identity) = &document.identity {
-            verify_bound_identity(identity, binding, vault)?;
+            let degraded = verify_bound_identity(identity, binding, vault)?;
+            self.persist_browser_degradation(&mut document, &degraded)?;
         }
         Ok(LoadedRemoteDocument { document })
+    }
+
+    /// Validate a credential against the document currently persisted by this
+    /// store. Callers must not authorize from a previously loaded identity
+    /// snapshot because revocation, host rotation, and repair can invalidate
+    /// an otherwise well-formed proof.
+    pub fn validate_device_credential<V: CredentialVault>(
+        &mut self,
+        binding: &MachineBinding,
+        vault: &V,
+        proof: &super::identity::DeviceCredentialProof,
+        active_session_epoch: u64,
+    ) -> Result<(), IdentityError> {
+        let loaded = self.load(binding, vault)?;
+        if loaded.has_pending_transition() {
+            return Err(IdentityError::TransitionPending);
+        }
+        let identity = loaded.identity().ok_or(IdentityError::NotEnabled)?;
+        super::identity::validate_device_credential(
+            identity,
+            binding,
+            vault,
+            proof,
+            active_session_epoch,
+        )
+    }
+
+    fn persist_browser_degradation(
+        &mut self,
+        document: &mut IdentityDocument,
+        degraded_devices: &[super::identity::DeviceId],
+    ) -> Result<(), IdentityError> {
+        if degraded_devices.is_empty() {
+            return Ok(());
+        }
+        let observed = self.persistence.current_revision();
+        let mut updated = document.clone();
+        let identity = updated.identity.as_mut().ok_or(IdentityError::Corrupt)?;
+        for device in &mut identity.devices {
+            if degraded_devices.contains(&device.device_id) {
+                device.requires_re_pair = true;
+            }
+        }
+        updated.revision = updated
+            .revision
+            .checked_add(1)
+            .ok_or(IdentityError::Overflow)?;
+        updated.cas_epoch = observed.checked_add(1).ok_or(IdentityError::Overflow)?;
+        let encoded = encode_identity_document(&updated)?;
+        self.persistence.compare_and_swap(observed, &encoded)?;
+        *document = updated;
+        Ok(())
     }
 
     pub fn recover_corrupt<V: CredentialVault>(
@@ -301,9 +376,10 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         }
     }
 
-    /// Explicitly abandon an interrupted vault transition and require setup
-    /// again. Already-created vault slots named by the pending marker are
-    /// rolled back first; a rollback failure leaves the pending marker.
+    /// Explicitly abandon an interrupted vault transition. Register preserves
+    /// the committed identity, Rotate/Repair restore their exact previous
+    /// snapshot when the new vault slot is not committed, and Enable clears
+    /// only its uncommitted host. A rollback failure leaves the marker.
     pub fn abandon_pending_transition<V: CredentialVault>(
         &mut self,
         binding: &MachineBinding,
@@ -319,17 +395,84 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 return Err(IdentityError::CopiedProfile);
             }
         }
-        let claimed_pending = self.claim_pending_transition()?;
-        rollback_pending_vault(vault, &pending)?;
+        let claimed_pending = self.claim_pending_transition(&pending)?;
         let observed_after_claim = self.persistence.current_revision();
         let mut document = self.read_document()?;
-        if document.pending_transition != Some(claimed_pending) {
+        if document.pending_transition.as_ref() != Some(&claimed_pending) {
             return Err(IdentityError::RevisionConflict);
         }
-        document.identity = None;
-        document.receipts.clear();
+        let vault_already_matches_document = match claimed_pending.kind {
+            PendingIdentityTransitionKind::RotateHostIdentity => document
+                .identity
+                .as_ref()
+                .zip(claimed_pending.previous_identity.as_deref())
+                .filter(|(identity, previous)| *identity != *previous)
+                .map(|(identity, _)| verify_identity_host(identity, vault).is_ok())
+                .unwrap_or(false),
+            PendingIdentityTransitionKind::RepairDevice => claimed_pending
+                .device_id
+                .and_then(|device_id| {
+                    document
+                        .identity
+                        .as_ref()
+                        .map(|identity| (identity, device_id))
+                })
+                .zip(claimed_pending.previous_identity.as_deref())
+                .filter(|((identity, _), previous)| *identity != *previous)
+                .map(|((identity, device_id), _)| {
+                    let Some(device) = identity.device(device_id) else {
+                        return false;
+                    };
+                    let proof = DeviceKeyProof::from_parts(
+                        device.device_id,
+                        device.kind,
+                        device.public_key.fingerprint().to_string(),
+                    );
+                    vault
+                        .device_repair_committed(device_id, &proof)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            PendingIdentityTransitionKind::Enable
+            | PendingIdentityTransitionKind::RegisterDevice => false,
+        };
+        if !vault_already_matches_document {
+            rollback_pending_vault(vault, &claimed_pending)?;
+        }
+        match claimed_pending.kind {
+            PendingIdentityTransitionKind::Enable => {
+                document.identity = None;
+                document.receipts.clear();
+                document.requires_explicit_reestablish = true;
+            }
+            PendingIdentityTransitionKind::RotateHostIdentity => {
+                if !vault_already_matches_document {
+                    if let Some(previous) = claimed_pending.previous_identity.clone() {
+                        verify_identity_host(&previous, vault)?;
+                        document.identity = Some(*previous);
+                    }
+                    document
+                        .receipts
+                        .retain(|receipt| receipt.command_id() != claimed_pending.command_id);
+                }
+                document.requires_explicit_reestablish = false;
+            }
+            PendingIdentityTransitionKind::RegisterDevice => {}
+            PendingIdentityTransitionKind::RepairDevice => {
+                if !vault_already_matches_document {
+                    if let Some(previous) = claimed_pending.previous_identity.clone() {
+                        if let Some(device_id) = claimed_pending.device_id {
+                            verify_identity_device(&previous, device_id, vault)?;
+                        }
+                        document.identity = Some(*previous);
+                    }
+                    document
+                        .receipts
+                        .retain(|receipt| receipt.command_id() != claimed_pending.command_id);
+                }
+            }
+        }
         document.pending_transition = None;
-        document.requires_explicit_reestablish = true;
         document.revision = document
             .revision
             .checked_add(1)
@@ -352,7 +495,7 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         let observed_persistence_revision = self.persistence.current_revision();
         let mut document = self.read_document()?;
         let command_digest = command.payload_digest();
-        let pending_retry = if let Some(pending) = document.pending_transition {
+        let pending_retry = if let Some(pending) = document.pending_transition.clone() {
             if let Some(identity) = &document.identity {
                 identity.validate_structure()?;
                 if identity.profile_binding_hash != binding.binding_hash() {
@@ -361,10 +504,12 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
             }
             if pending.command_id == command.command_id && pending.command_digest == command_digest
             {
-                if pending.kind == PendingIdentityTransitionKind::RotateHostIdentity {
-                    self.claim_pending_transition()?;
-                    document = self.read_document()?;
-                }
+                // Every retry claims the exact opaque marker before touching
+                // vault state. This serializes retry/abandon and prevents a
+                // stale transition from settling a newer marker in the same
+                // command slot.
+                self.claim_pending_transition(&pending)?;
+                document = self.read_document()?;
                 if let Some(existing) = document
                     .receipts
                     .iter()
@@ -373,11 +518,15 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 {
                     if pending.kind == PendingIdentityTransitionKind::RotateHostIdentity {
                         vault.commit_host_rotation()?;
+                    } else if pending.kind == PendingIdentityTransitionKind::RepairDevice {
+                        if let Some(device_id) = pending.device_id {
+                            vault.commit_device_repair(device_id)?;
+                        }
                     }
                     if let Some(identity) = &document.identity {
                         verify_bound_identity(identity, binding, vault)?;
                     }
-                    self.clear_pending_transition(document.revision)?;
+                    self.clear_pending_transition(&pending, document.revision)?;
                     return Ok(existing);
                 }
             } else if pending.command_id == command.command_id {
@@ -394,7 +543,7 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         };
         if pending_retry.is_some() {
             if PendingIdentityTransitionKind::from_operation(&command.op)
-                != pending_retry.map(|pending| pending.kind)
+                != pending_retry.as_ref().map(|pending| pending.kind)
             {
                 return Err(IdentityError::CommandConflict);
             }
@@ -435,30 +584,49 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         }
         let pending_kind = PendingIdentityTransitionKind::from_operation(&command.op);
         let pending_was_preexisting = pending_retry.is_some();
-        let (pending_marker, durable_revision) = if let Some(pending) = pending_retry {
+        let (pending_marker, durable_revision) = if let Some(pending) = pending_retry.clone() {
             (Some(pending), command.expected_revision)
         } else if let Some(kind) = pending_kind {
             let pending = PendingIdentityTransition {
                 command_id: command.command_id,
                 command_digest,
                 kind,
+                transition_nonce: generate_transition_nonce()?,
                 host_public_id: match kind {
                     PendingIdentityTransitionKind::Enable => Some(HostPublicId::new()),
                     PendingIdentityTransitionKind::RegisterDevice
+                    | PendingIdentityTransitionKind::RepairDevice
                     | PendingIdentityTransitionKind::RotateHostIdentity => None,
                 },
                 device_id: match kind {
                     PendingIdentityTransitionKind::RegisterDevice => {
                         Some(super::identity::DeviceId::new())
                     }
+                    PendingIdentityTransitionKind::RepairDevice => match &command.op {
+                        IdentityOp::RepairDevice(request) => Some(request.device_id),
+                        _ => return Err(IdentityError::Corrupt),
+                    },
                     PendingIdentityTransitionKind::Enable
                     | PendingIdentityTransitionKind::RotateHostIdentity => None,
                 },
+                previous_identity: match kind {
+                    PendingIdentityTransitionKind::RotateHostIdentity => {
+                        document.identity.clone().map(Box::new)
+                    }
+                    PendingIdentityTransitionKind::Enable
+                    | PendingIdentityTransitionKind::RegisterDevice => None,
+                    PendingIdentityTransitionKind::RepairDevice => {
+                        document.identity.clone().map(Box::new)
+                    }
+                },
             };
-            let pending_revision =
-                self.persist_pending_transition(&document, pending, observed_persistence_revision)?;
+            let pending_revision = self.persist_pending_transition(
+                &document,
+                pending.clone(),
+                observed_persistence_revision,
+            )?;
             document.revision = pending_revision;
-            document.pending_transition = Some(pending);
+            document.pending_transition = Some(pending.clone());
             (Some(pending), pending_revision)
         } else {
             (None, command.expected_revision)
@@ -484,15 +652,23 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                     && pending_kind.is_some()
                     && !pending_was_preexisting
                 {
-                    if self.clear_pending_transition(durable_revision).is_err() {
+                    if self
+                        .clear_pending_transition(
+                            pending_marker.as_ref().ok_or(IdentityError::Corrupt)?,
+                            durable_revision,
+                        )
+                        .is_err()
+                    {
                         return Err(IdentityError::TransitionRollbackFailed);
                     }
                 }
                 return Err(error);
             }
         };
-        let keep_pending_until_vault_commit =
-            matches!(&transition, Some(VaultTransition::HostRotation));
+        let keep_pending_until_vault_commit = matches!(
+            &transition,
+            Some(VaultTransition::HostRotation) | Some(VaultTransition::DeviceRepair { .. })
+        );
         if !keep_pending_until_vault_commit {
             // Establishment has no second vault commit phase. The marker is
             // needed until this CAS, then the durable identity is complete.
@@ -512,7 +688,12 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 if rollback_transition(vault, transition).is_ok() {
                     if pending_kind.is_some()
                         && !pending_was_preexisting
-                        && self.clear_pending_transition(durable_revision).is_err()
+                        && self
+                            .clear_pending_transition(
+                                pending_marker.as_ref().ok_or(IdentityError::Corrupt)?,
+                                durable_revision,
+                            )
+                            .is_err()
                     {
                         return Err(IdentityError::TransitionRollbackFailed);
                     }
@@ -532,6 +713,10 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                         // rotation so a matching retry can commit.
                         return Err(error);
                     }
+                } else if let Some(VaultTransition::DeviceRepair { device_id, .. }) = &transition {
+                    if let Err(error) = vault.commit_device_repair(*device_id) {
+                        return Err(error);
+                    }
                 }
                 let mut receipt = receipt;
                 let logical_revision = document.revision;
@@ -544,7 +729,12 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                     stored.revision = logical_revision;
                 }
                 if keep_pending_until_vault_commit
-                    && self.clear_pending_transition(logical_revision).is_err()
+                    && self
+                        .clear_pending_transition(
+                            pending_marker.as_ref().ok_or(IdentityError::Corrupt)?,
+                            logical_revision,
+                        )
+                        .is_err()
                 {
                     // The identity/vault transition committed. Retain the
                     // durable marker so a retry can clear it idempotently.
@@ -556,7 +746,12 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 if rollback_transition(vault, transition).is_ok() {
                     if pending_kind.is_some()
                         && !pending_was_preexisting
-                        && self.clear_pending_transition(durable_revision).is_err()
+                        && self
+                            .clear_pending_transition(
+                                pending_marker.as_ref().ok_or(IdentityError::Corrupt)?,
+                                durable_revision,
+                            )
+                            .is_err()
                     {
                         return Err(IdentityError::TransitionRollbackFailed);
                     }
@@ -568,12 +763,19 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         }
     }
 
-    fn claim_pending_transition(&mut self) -> Result<PendingIdentityTransition, IdentityError> {
+    fn claim_pending_transition(
+        &mut self,
+        expected: &PendingIdentityTransition,
+    ) -> Result<PendingIdentityTransition, IdentityError> {
         let observed_persistence_revision = self.persistence.current_revision();
         let mut document = self.read_document()?;
         let pending = document
             .pending_transition
+            .clone()
             .ok_or(IdentityError::TransitionPending)?;
+        if &pending != expected {
+            return Err(IdentityError::RevisionConflict);
+        }
         document.cas_epoch = observed_persistence_revision
             .checked_add(1)
             .ok_or(IdentityError::Overflow)?;
@@ -604,11 +806,18 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         Ok(original.revision)
     }
 
-    fn clear_pending_transition(&mut self, expected_revision: u64) -> Result<u64, IdentityError> {
+    fn clear_pending_transition(
+        &mut self,
+        expected_pending: &PendingIdentityTransition,
+        expected_revision: u64,
+    ) -> Result<u64, IdentityError> {
         let expected_persistence_revision = self.persistence.current_revision();
         let mut document = self.read_document()?;
         if document.pending_transition.is_none() {
             return Ok(document.revision);
+        }
+        if document.pending_transition.as_ref() != Some(expected_pending) {
+            return Err(IdentityError::RevisionConflict);
         }
         if document.revision != expected_revision {
             return Err(IdentityError::RevisionConflict);
@@ -663,6 +872,11 @@ fn rollback_pending_vault<V: CredentialVault>(
                     .map_err(|_| IdentityError::TransitionRollbackFailed)?;
             }
         }
+        PendingIdentityTransitionKind::RepairDevice => {
+            if let Some(device_id) = pending.device_id {
+                vault.abort_device_repair(device_id)?;
+            }
+        }
         PendingIdentityTransitionKind::RotateHostIdentity => {
             vault.abort_host_rotation()?;
         }
@@ -681,6 +895,9 @@ fn rollback_transition<V: CredentialVault>(
             .map_err(|_| IdentityError::TransitionRollbackFailed),
         Some(VaultTransition::DeviceEstablishment { device_id, proof }) => vault
             .rollback_device_establishment(device_id, &proof)
+            .map_err(|_| IdentityError::TransitionRollbackFailed),
+        Some(VaultTransition::DeviceRepair { device_id, proof }) => vault
+            .rollback_device_repair(device_id, &proof)
             .map_err(|_| IdentityError::TransitionRollbackFailed),
         Some(VaultTransition::HostRotation) => vault.abort_host_rotation(),
     }
@@ -760,31 +977,78 @@ impl LoadedRemoteDocument {
     }
 }
 
+fn verify_identity_host<V: CredentialVault>(
+    identity: &ConnectIdentity,
+    vault: &V,
+) -> Result<(), IdentityError> {
+    let generation = identity.host_key.generation.ok_or(IdentityError::Corrupt)?;
+    if generation == 0 {
+        return Err(IdentityError::Corrupt);
+    }
+    let proof = HostKeyProof::from_parts(
+        identity.host_public_id,
+        generation,
+        identity.host_key.fingerprint.clone(),
+    );
+    vault.verify_host(identity.host_public_id, &proof)
+}
+
+fn verify_identity_device<V: CredentialVault>(
+    identity: &ConnectIdentity,
+    device_id: super::identity::DeviceId,
+    vault: &V,
+) -> Result<(), IdentityError> {
+    let device = identity
+        .device(device_id)
+        .ok_or(IdentityError::UnknownDevice)?;
+    let proof = DeviceKeyProof::from_parts(
+        device.device_id,
+        device.kind,
+        device.public_key.fingerprint().to_string(),
+    );
+    vault.verify_device(device.device_id, &proof)
+}
+
 fn verify_bound_identity<V: CredentialVault>(
     identity: &ConnectIdentity,
     binding: &MachineBinding,
     vault: &V,
-) -> Result<(), IdentityError> {
+) -> Result<Vec<super::identity::DeviceId>, IdentityError> {
     identity.validate_structure()?;
     if identity.profile_binding_hash != binding.binding_hash() {
         return Err(IdentityError::CopiedProfile);
     }
     let proof = HostKeyProof::from_parts(
+        identity.host_public_id,
         identity.host_key.generation.unwrap_or(0),
         identity.host_key.fingerprint.clone(),
     );
     vault.verify_host(identity.host_public_id, &proof)?;
+    let mut degraded = Vec::new();
     for device in identity.devices() {
-        if device.revoked {
+        if device.revoked || device.requires_re_pair {
             continue;
         }
         let proof = super::identity::DeviceKeyProof::from_parts(
+            device.device_id,
             device.kind,
             device.public_key.fingerprint().to_string(),
         );
-        vault.verify_device(device.device_id, &proof)?;
+        if let Err(error) = vault.verify_device(device.device_id, &proof) {
+            if device.kind == DeviceKind::Browser
+                && matches!(
+                    error,
+                    IdentityError::MissingCredentialProof
+                        | IdentityError::WrongCredentialGeneration
+                )
+            {
+                degraded.push(device.device_id);
+            } else {
+                return Err(error);
+            }
+        }
     }
-    Ok(())
+    Ok(degraded)
 }
 
 fn recoverable_identity_corruption(error: &IdentityError) -> bool {
@@ -845,6 +1109,12 @@ fn apply_command<V: CredentialVault>(
                 .and_then(|pending| pending.host_public_id)
                 .unwrap_or_else(HostPublicId::new);
             let proof = vault.establish_host(host_public_id)?;
+            if proof.host_public_id() != host_public_id {
+                let rollback = vault.rollback_host_establishment(host_public_id, &proof);
+                return Err(rollback
+                    .map(|_| IdentityError::MissingCredentialProof)
+                    .unwrap_or(IdentityError::TransitionRollbackFailed));
+            }
             let host_key = match KeyReference::from_host_proof(&proof) {
                 Ok(host_key) => host_key,
                 Err(error) => {
@@ -898,6 +1168,14 @@ fn apply_command<V: CredentialVault>(
             });
             device_receipt(command.command_id, next_revision, device)
         }
+        IdentityOp::RepairDevice(request) => {
+            let (device, proof) = repair_device(document, vault, request)?;
+            transition = Some(VaultTransition::DeviceRepair {
+                device_id: device.device_id,
+                proof,
+            });
+            device_receipt(command.command_id, next_revision, device)
+        }
         IdentityOp::RotatePairingCode { .. } => {
             let identity = document
                 .identity
@@ -919,6 +1197,12 @@ fn apply_command<V: CredentialVault>(
                 .ok_or(IdentityError::NotEnabled)?
                 .host_public_id;
             let proof = vault.prepare_host_rotation(host_id)?;
+            if proof.host_public_id() != host_id {
+                let rollback = vault.abort_host_rotation();
+                return Err(rollback
+                    .map(|_| IdentityError::MissingCredentialProof)
+                    .unwrap_or(IdentityError::TransitionRollbackFailed));
+            }
             let identity = document
                 .identity
                 .as_mut()
@@ -1075,7 +1359,7 @@ fn register_device<V: CredentialVault>(
     }
     let device_id = pending_device_id.unwrap_or_else(super::identity::DeviceId::new);
     let proof = vault.establish_device(device_id, request.kind)?;
-    if proof.kind() != request.kind {
+    if proof.device_id() != device_id || proof.kind() != request.kind {
         let rollback = vault.rollback_device_establishment(device_id, &proof);
         return Err(rollback
             .map(|_| IdentityError::InvalidDevice)
@@ -1129,6 +1413,165 @@ fn register_device<V: CredentialVault>(
     }
     identity.devices.push(record.clone());
     Ok((record, proof))
+}
+
+fn repair_device<V: CredentialVault>(
+    document: &mut IdentityDocument,
+    vault: &mut V,
+    request: &RepairDevice,
+) -> Result<(DeviceRecord, DeviceKeyProof), IdentityError> {
+    let existing = document
+        .identity
+        .as_ref()
+        .ok_or(IdentityError::NotEnabled)?
+        .device(request.device_id)
+        .cloned()
+        .ok_or(IdentityError::UnknownDevice)?;
+    if existing.revoked || !existing.requires_re_pair || existing.kind != request.kind {
+        return Err(IdentityError::InvalidDevice);
+    }
+    validate_repair_metadata(request)?;
+    let proof = vault.prepare_device_repair(request.device_id, request.kind)?;
+    if proof.device_id() != request.device_id || proof.kind() != request.kind {
+        let rollback = vault.rollback_device_repair(request.device_id, &proof);
+        return Err(rollback
+            .map(|_| IdentityError::InvalidDevice)
+            .unwrap_or(IdentityError::TransitionRollbackFailed));
+    }
+    let public_key = match KeyReference::from_device_proof(&proof) {
+        Ok(public_key) => public_key,
+        Err(error) => {
+            let rollback = vault.rollback_device_repair(request.device_id, &proof);
+            return Err(rollback
+                .map(|_| error)
+                .unwrap_or(IdentityError::TransitionRollbackFailed));
+        }
+    };
+    if let Err(error) = vault.verify_device(request.device_id, &proof) {
+        let rollback = vault.rollback_device_repair(request.device_id, &proof);
+        return Err(rollback
+            .map(|_| error)
+            .unwrap_or(IdentityError::TransitionRollbackFailed));
+    }
+    let record = DeviceRecord {
+        device_id: existing.device_id,
+        kind: request.kind,
+        label: request.label.clone(),
+        legacy_client_id: request.legacy_client_id.clone(),
+        public_key,
+        revoked: false,
+        revoked_at_epoch_ms: None,
+        requires_re_pair: false,
+        browser: request.browser.clone(),
+    };
+    if let Err(error) = validate_device_record(&record) {
+        let rollback = vault.rollback_device_repair(request.device_id, &proof);
+        return Err(rollback
+            .map(|_| error)
+            .unwrap_or(IdentityError::TransitionRollbackFailed));
+    }
+    let identity = document
+        .identity
+        .as_ref()
+        .ok_or(IdentityError::NotEnabled)?;
+    if record.legacy_client_id.as_deref().is_some_and(|legacy| {
+        identity.devices.iter().any(|existing| {
+            existing.device_id != record.device_id
+                && existing.legacy_client_id.as_deref() == Some(legacy)
+        })
+    }) || record.browser.as_ref().is_some_and(|browser| {
+        identity.devices.iter().any(|existing| {
+            existing.device_id != record.device_id
+                && existing
+                    .browser
+                    .as_ref()
+                    .is_some_and(|current| current.browser_install_id == browser.browser_install_id)
+        })
+    }) || identity.devices.iter().any(|existing| {
+        existing.device_id != record.device_id
+            && existing.public_key.fingerprint() == record.public_key.fingerprint()
+    }) {
+        let rollback = vault.rollback_device_repair(request.device_id, &proof);
+        return Err(rollback
+            .map(|_| IdentityError::DuplicateDevice)
+            .unwrap_or(IdentityError::TransitionRollbackFailed));
+    }
+    let identity = document
+        .identity
+        .as_mut()
+        .ok_or(IdentityError::NotEnabled)?;
+    let slot = identity
+        .devices
+        .iter_mut()
+        .find(|device| device.device_id == request.device_id)
+        .ok_or(IdentityError::UnknownDevice)?;
+    *slot = record.clone();
+    Ok((record, proof))
+}
+
+fn validate_repair_metadata(request: &RepairDevice) -> Result<(), IdentityError> {
+    if request.label.chars().any(char::is_control) {
+        return Err(IdentityError::InvalidDevice);
+    }
+    if request.label.len() > MAX_LABEL_BYTES {
+        return Err(IdentityError::LimitExceeded {
+            field: IdentityLimitField::Label,
+        });
+    }
+    if let Some(legacy) = request.legacy_client_id.as_deref() {
+        if legacy.is_empty()
+            || legacy.chars().any(char::is_control)
+            || legacy.len() > super::identity::MAX_ID_BYTES
+        {
+            return Err(IdentityError::LimitExceeded {
+                field: IdentityLimitField::Id,
+            });
+        }
+    }
+    match request.kind {
+        DeviceKind::Browser => {
+            let browser = request
+                .browser
+                .as_ref()
+                .ok_or(IdentityError::InvalidDevice)?;
+            if browser.private_identity_storage
+                != BrowserPrivateStorage::WebCryptoNonExportableIndexedDb
+                || !browser.cleared_storage_requires_visible_repair
+                || browser.browser_install_id.is_empty()
+            {
+                return Err(IdentityError::InvalidDevice);
+            }
+            if browser.browser_install_id.chars().any(char::is_control) {
+                return Err(IdentityError::InvalidDevice);
+            }
+            if browser.browser_install_id.len() > super::identity::MAX_ID_BYTES {
+                return Err(IdentityError::LimitExceeded {
+                    field: IdentityLimitField::Id,
+                });
+            }
+            if browser
+                .nickname
+                .as_deref()
+                .is_some_and(|nickname| nickname.len() > MAX_LABEL_BYTES)
+            {
+                return Err(IdentityError::LimitExceeded {
+                    field: IdentityLimitField::Label,
+                });
+            }
+            if browser
+                .nickname
+                .as_deref()
+                .is_some_and(|nickname| nickname.chars().any(char::is_control))
+            {
+                return Err(IdentityError::InvalidDevice);
+            }
+        }
+        DeviceKind::Native if request.browser.is_some() => {
+            return Err(IdentityError::InvalidDevice);
+        }
+        DeviceKind::Native => {}
+    }
+    Ok(())
 }
 
 fn push_receipt(
