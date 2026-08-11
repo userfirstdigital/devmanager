@@ -627,6 +627,7 @@ fn registry_authenticates_loopback_nonce_caps_bodies_and_expires_entries() {
     let registry = ClaudeHookRegistry::with_limits(ClaudeRegistryLimits {
         max_registrations: 2,
         max_body_bytes: 1024,
+        max_cleanup_paths: 8,
         registration_ttl: Duration::from_secs(30),
         reducer: ClaudeReducerLimits::default(),
     });
@@ -805,6 +806,98 @@ fn resume_and_continue_flags_pass_through_the_overlay_untouched() {
     }
 }
 
+fn prebound_registration(
+    registry: &ClaudeHookRegistry,
+    tab: &str,
+    provider_session_id: &str,
+) -> devmanager::ai::claude_hooks::ClaudeCorrelatedRegistration {
+    registry
+        .register_correlated_at(
+            StableSessionKey::from_tab(tab),
+            ClaudeCorrelationBinding::new(
+                TaskId::new(),
+                AgentSessionId::new(),
+                1,
+                1,
+                ResourceId::new(),
+            ),
+            None,
+            Some(provider_session_id.to_string()),
+            Instant::now(),
+        )
+        .expect("prebound correlated registration")
+}
+
+#[test]
+fn claude_launch_debug_redacts_nonce_command_endpoint_and_paths() {
+    let temp = TempDir::new("debug-redaction");
+    let registry = ClaudeHookRegistry::default();
+    let startup = "npx -y @anthropic-ai/claude-code@2.1.207 --model secret-model";
+    let endpoint = "http://127.0.0.1:43873/internal/claude-hook";
+    let executable = Path::new("C:/Program Files/DevManager/secret-devmanager.exe");
+    let overlay = prepare_claude_launch_overlay(
+        &registry,
+        StableSessionKey::from_tab("debug-redaction-tab"),
+        startup,
+        ClaudeShellKind::Posix,
+        executable,
+        endpoint,
+        temp.path(),
+        Instant::now(),
+    );
+    let registration = overlay.registration.as_ref().expect("registration");
+    let settings_path = overlay.settings_path.as_ref().expect("settings path");
+    let debug = format!("{overlay:?}");
+
+    for secret in [
+        startup,
+        endpoint,
+        executable.to_string_lossy().as_ref(),
+        registration.nonce.as_str(),
+        settings_path.to_string_lossy().as_ref(),
+        "session-1",
+    ] {
+        assert!(!debug.contains(secret), "launch debug leaked {secret}");
+    }
+    assert!(format!("{registration:?}").contains("<redacted>"));
+    assert!(registry.unregister(&registration.nonce).is_some());
+}
+
+#[test]
+fn cleanup_paths_are_bounded_and_oldest_paths_are_evicted() {
+    let temp = TempDir::new("cleanup-bound");
+    let registry = ClaudeHookRegistry::with_limits(ClaudeRegistryLimits {
+        max_cleanup_paths: 2,
+        ..ClaudeRegistryLimits::default()
+    });
+    let registration = registry
+        .register_at(
+            StableSessionKey::from_tab("cleanup-bound-tab"),
+            Instant::now(),
+        )
+        .expect("registration");
+    let first = temp.path().join("first.json");
+    let second = temp.path().join("second.json");
+    let third = temp.path().join("third.json");
+    for path in [&first, &second, &third] {
+        fs::write(path, b"fixture").unwrap();
+    }
+
+    assert!(registry.attach_cleanup_path(&registration.nonce, first.clone()));
+    assert!(registry.attach_cleanup_path(&registration.nonce, second.clone()));
+    assert!(registry.attach_cleanup_path(&registration.nonce, third.clone()));
+    assert!(
+        !first.exists(),
+        "oldest cleanup path must be evicted immediately"
+    );
+    assert!(second.exists());
+    assert!(third.exists());
+
+    registry.unregister(&registration.nonce);
+    assert!(!second.exists());
+    assert!(!third.exists());
+}
+
 #[test]
 fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce() {
     let temp = TempDir::new("eviction");
@@ -867,16 +960,16 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
         )
         .unwrap();
 
-    ureq::post(listener.endpoint())
+    let before_start = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", registration.nonce())
-        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-1","prompt":"before start"}"#)
-        .unwrap();
-    wait_for(Duration::from_secs(2), || {
-        events.lock().unwrap().iter().any(|event| {
-            matches!(event, ClaudeRegistryEvent::Semantic(draft)
-                if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "before start"))
-        })
-    });
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-1","prompt":"before start"}"#);
+    assert!(matches!(before_start, Err(ureq::Error::StatusCode(401))));
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(!events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::Semantic(draft)
+            if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "before start")
+    )));
     assert!(!events.lock().unwrap().iter().any(|event| matches!(
         event,
         ClaudeRegistryEvent::AdapterHealth {
@@ -961,18 +1054,39 @@ fn superseded_registration_is_rejected_and_cannot_publish_to_replacement_key() {
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
     let stable_key = StableSessionKey::from_tab("shared-tab");
+    let binding = ClaudeCorrelationBinding::new(
+        TaskId::new(),
+        AgentSessionId::new(),
+        1,
+        1,
+        ResourceId::new(),
+    );
     let old = registry
-        .register_at(stable_key.clone(), Instant::now())
+        .register_correlated_at(
+            stable_key.clone(),
+            binding.clone(),
+            None,
+            Some("session-1".to_string()),
+            Instant::now(),
+        )
         .unwrap();
-    let replacement = registry.register_at(stable_key, Instant::now()).unwrap();
+    let replacement = registry
+        .register_correlated_at(
+            stable_key,
+            binding,
+            None,
+            Some("session-1".to_string()),
+            Instant::now(),
+        )
+        .unwrap();
 
-    assert!(replacement.generation > old.generation);
+    assert!(replacement.relay_generation() > old.relay_generation());
     let old_response = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &old.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"old event"}"#);
+        .header("x-devmanager-claude-nonce", old.nonce())
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","prompt":"old event"}"#);
     let replacement_response = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &replacement.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"replacement event"}"#)
+        .header("x-devmanager-claude-nonce", replacement.nonce())
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","prompt":"replacement event"}"#)
         .unwrap();
 
     assert!(matches!(old_response, Err(ureq::Error::StatusCode(401))));
@@ -1018,18 +1132,41 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
             max_optional_events: 1,
             max_critical_bytes: 4 * 1024,
             max_optional_bytes: 4 * 1024,
+            max_connections: 8,
+            max_in_flight: 8,
         },
     )
     .unwrap();
     let stable_key = StableSessionKey::from_tab("shared-capacity-tab");
+    let binding = ClaudeCorrelationBinding::new(
+        TaskId::new(),
+        AgentSessionId::new(),
+        1,
+        1,
+        ResourceId::new(),
+    );
     let old = registry
-        .register_at(stable_key.clone(), Instant::now())
+        .register_correlated_at(
+            stable_key.clone(),
+            binding.clone(),
+            None,
+            Some("session-1".to_string()),
+            Instant::now(),
+        )
         .unwrap();
-    let replacement = registry.register_at(stable_key, Instant::now()).unwrap();
+    let replacement = registry
+        .register_correlated_at(
+            stable_key,
+            binding,
+            None,
+            Some("session-1".to_string()),
+            Instant::now(),
+        )
+        .unwrap();
 
     ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &replacement.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"blocker"}"#)
+        .header("x-devmanager-claude-nonce", replacement.nonce())
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","prompt":"blocker"}"#)
         .unwrap();
     {
         let (lock, condition) = &*gate;
@@ -1040,11 +1177,11 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
     }
 
     let stale = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &old.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"stale queued"}"#);
+        .header("x-devmanager-claude-nonce", old.nonce())
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","prompt":"stale queued"}"#);
     let current = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &replacement.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"current queued"}"#)
+        .header("x-devmanager-claude-nonce", replacement.nonce())
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","prompt":"current queued"}"#)
         .unwrap();
     assert!(matches!(stale, Err(ureq::Error::StatusCode(401))));
     assert_eq!(current.status().as_u16(), 204);
@@ -1228,6 +1365,7 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
     let registry = Arc::new(ClaudeHookRegistry::with_limits(ClaudeRegistryLimits {
         max_registrations: 4,
         max_body_bytes: 1024,
+        max_cleanup_paths: 8,
         registration_ttl: Duration::from_secs(30),
         reducer: ClaudeReducerLimits::default(),
     }));
@@ -1240,12 +1378,10 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
         callback_events.lock().unwrap().push(event);
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
-    let registration = registry
-        .register_at(StableSessionKey::from_tab("claude-tab"), Instant::now())
-        .unwrap();
+    let registration = prebound_registration(&registry, "claude-tab", "session-1");
 
     let accepted = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .header("content-type", "application/json")
         .send(fixture("prompt"));
     assert_eq!(accepted.unwrap().status().as_u16(), 204);
@@ -1263,17 +1399,17 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
         .send(fixture("prompt"));
     assert!(matches!(rejected, Err(ureq::Error::StatusCode(401))));
     let oversized = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(vec![b'x'; 1025]);
     assert!(matches!(oversized, Err(ureq::Error::StatusCode(413))));
 
     let malformed = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(br#"{"hook_event_name":"PreToolUse""#);
     assert!(matches!(malformed, Err(ureq::Error::StatusCode(400))));
 
     let ended = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(fixture("session_end"));
     assert_eq!(ended.unwrap().status().as_u16(), 204);
     wait_for(Duration::from_secs(2), || {
@@ -1286,11 +1422,11 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
     assert_eq!(registry.registration_count(), 1);
 
     let resumed = ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(br#"{"hook_event_name":"SessionStart","source":"clear"}"#);
     assert!(matches!(resumed, Err(ureq::Error::StatusCode(401))));
     assert_eq!(registry.registration_count(), 1);
-    registry.unregister(&registration.nonce);
+    registry.unregister(registration.nonce());
 }
 
 #[test]
@@ -1325,13 +1461,11 @@ fn saturated_ingress_sheds_message_display_before_critical_events() {
         },
     )
     .unwrap();
-    let registration = registry
-        .register_at(StableSessionKey::from_tab("priority-tab"), Instant::now())
-        .unwrap();
+    let registration = prebound_registration(&registry, "priority-tab", "session-1");
 
     assert_eq!(
         ureq::post(listener.endpoint())
-            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .header("x-devmanager-claude-nonce", registration.nonce())
             .send(fixture("prompt"))
             .unwrap()
             .status()
@@ -1349,6 +1483,7 @@ fn saturated_ingress_sheds_message_display_before_critical_events() {
     for index in 0..8 {
         let body = serde_json::to_vec(&serde_json::json!({
             "hook_event_name": "MessageDisplay",
+            "session_id": "session-1",
             "turn_id": "turn-1",
             "message_id": format!("optional-{index}"),
             "index": 0,
@@ -1358,7 +1493,7 @@ fn saturated_ingress_sheds_message_display_before_critical_events() {
         .unwrap();
         assert_eq!(
             ureq::post(listener.endpoint())
-                .header("x-devmanager-claude-nonce", &registration.nonce)
+                .header("x-devmanager-claude-nonce", registration.nonce())
                 .send(body)
                 .unwrap()
                 .status()
@@ -1368,7 +1503,7 @@ fn saturated_ingress_sheds_message_display_before_critical_events() {
     }
     assert_eq!(
         ureq::post(listener.endpoint())
-            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .header("x-devmanager-claude-nonce", registration.nonce())
             .send(fixture("permission"))
             .unwrap()
             .status()
@@ -1438,12 +1573,10 @@ fn critical_ingress_overflow_is_fail_open_and_degrades_exact_adapter() {
     )
     .unwrap();
     let stable_key = StableSessionKey::from_tab("overflow-tab");
-    let registration = registry
-        .register_at(stable_key.clone(), Instant::now())
-        .unwrap();
+    let registration = prebound_registration(&registry, "overflow-tab", "session-1");
 
     ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(fixture("prompt"))
         .unwrap();
     {
@@ -1455,7 +1588,7 @@ fn critical_ingress_overflow_is_fail_open_and_degrades_exact_adapter() {
     }
     assert_eq!(
         ureq::post(listener.endpoint())
-            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .header("x-devmanager-claude-nonce", registration.nonce())
             .send(fixture("permission"))
             .unwrap()
             .status()
@@ -1464,7 +1597,7 @@ fn critical_ingress_overflow_is_fail_open_and_degrades_exact_adapter() {
     );
     assert_eq!(
         ureq::post(listener.endpoint())
-            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .header("x-devmanager-claude-nonce", registration.nonce())
             .send(fixture("notification"))
             .unwrap()
             .status()

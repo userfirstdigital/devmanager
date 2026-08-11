@@ -26,7 +26,7 @@ use crate::providers::registry::ProviderObservation;
 use crate::remote::presentation::StableSessionKey;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const CLAUDE_LAUNCH_NONCE_BYTES: usize = 32;
+const MAX_CLAUDE_BOUND_SESSIONS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeAdapterError {
@@ -235,8 +236,14 @@ pub enum ClaudeRuntimeSettlement {
     ResumeFailed(ClaudeResumeFailure),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClaudeLaunchNonce(String);
+
+impl fmt::Debug for ClaudeLaunchNonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClaudeLaunchNonce(<redacted>)")
+    }
+}
 
 impl ClaudeLaunchNonce {
     pub fn generate() -> Result<Self, ClaudeAdapterError> {
@@ -307,12 +314,6 @@ impl ClaudeLaunchRegistration {
         self.inner.journal_key()
     }
 
-    pub fn correlated_registration(
-        &self,
-    ) -> &crate::ai::claude_hooks::ClaudeCorrelatedRegistration {
-        &self.inner
-    }
-
     fn bound_key(&self, identity: &AttestedIdentity) -> BoundKey {
         BoundKey::from_registration(&self.inner, identity)
     }
@@ -351,6 +352,7 @@ struct ClaudeAdapterState {
     probed: Option<ProviderCapabilities>,
     identity: Option<AttestedIdentity>,
     bound: HashMap<BoundKey, ProviderSessionId>,
+    bound_order: VecDeque<BoundKey>,
 }
 
 pub struct ClaudeCodeAdapter {
@@ -363,24 +365,24 @@ impl ClaudeCodeAdapter {
     pub fn from_attested_observation(
         observation: ProviderObservation,
     ) -> Result<Self, ProviderError> {
-        if observation.kind != ProviderKind::ClaudeCode
-            || observation.capabilities.kind != ProviderKind::ClaudeCode
+        if observation.kind() != ProviderKind::ClaudeCode
+            || observation.capabilities().kind != ProviderKind::ClaudeCode
         {
             return Err(ProviderError::CapabilityKindMismatch {
                 expected: ProviderKind::ClaudeCode,
-                actual: observation.kind,
+                actual: observation.kind(),
             });
         }
-        observation.capabilities.validate()?;
+        observation.capabilities().validate()?;
         let adapter = Self::from_runner(Arc::new(UnusableProbeRunner), default_now_ms);
         let mut state = adapter.state.lock().map_err(|_| {
             ProviderError::Probe(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
         })?;
         state.identity = Some(AttestedIdentity {
-            executable: observation.executable,
-            version: observation.version,
+            executable: observation.executable().clone(),
+            version: observation.version().clone(),
         });
-        state.probed = Some(observation.capabilities);
+        state.probed = Some(observation.capabilities().clone());
         drop(state);
         Ok(adapter)
     }
@@ -409,6 +411,7 @@ impl ClaudeCodeAdapter {
                 probed: None,
                 identity: None,
                 bound: HashMap::new(),
+                bound_order: VecDeque::new(),
             }),
         }
     }
@@ -464,7 +467,12 @@ impl ClaudeCodeAdapter {
             .lock()
             .map_err(|_| ClaudeAdapterError::RelayUnavailable)?;
         if let Some(bound) = state.bound.get(&current.bound_key(&identity)).cloned() {
-            replace_bound(&mut state.bound, rotated.bound_key(&identity), bound);
+            let ClaudeAdapterState {
+                bound: bound_map,
+                bound_order,
+                ..
+            } = &mut *state;
+            replace_bound(bound_map, bound_order, rotated.bound_key(&identity), bound);
         }
         Ok(rotated)
     }
@@ -503,8 +511,14 @@ impl ClaudeCodeAdapter {
             .state
             .lock()
             .map_err(|_| ClaudeBindError::RelayRejected)?;
+        let ClaudeAdapterState {
+            bound: bound_map,
+            bound_order,
+            ..
+        } = &mut *state;
         replace_bound(
-            &mut state.bound,
+            bound_map,
+            bound_order,
             presented.bound_key(&identity),
             delivery.provider_session_id().clone(),
         );
@@ -721,13 +735,22 @@ fn is_exact_resume_spec(spec: &ProviderLaunchSpec) -> bool {
 
 fn replace_bound(
     bound: &mut HashMap<BoundKey, ProviderSessionId>,
+    order: &mut VecDeque<BoundKey>,
     key: BoundKey,
     id: ProviderSessionId,
 ) {
     bound.retain(|existing, _| {
         existing.task_id != key.task_id || existing.agent_session_id != key.agent_session_id
     });
-    bound.insert(key, id);
+    order.retain(|existing| bound.contains_key(existing));
+    while bound.len() >= MAX_CLAUDE_BOUND_SESSIONS {
+        let Some(evicted) = order.pop_front() else {
+            break;
+        };
+        bound.remove(&evicted);
+    }
+    bound.insert(key.clone(), id);
+    order.push_back(key);
 }
 
 fn physically_bound_json(body: &[u8]) -> Result<(), ClaudeBindError> {
@@ -1105,11 +1128,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            observation.capabilities.auth_state,
+            observation.capabilities().auth_state,
             ProviderAuthState::AuthenticatedSubscription
         );
         assert_eq!(
-            observation.capabilities.exact_resume,
+            observation.capabilities().exact_resume,
             CapabilitySupport::Supported
         );
     }
@@ -1146,17 +1169,58 @@ mod tests {
             version,
         };
         let mut bound = HashMap::new();
+        let mut order = VecDeque::new();
         replace_bound(
             &mut bound,
+            &mut order,
             first,
             ProviderSessionId::new("session-1").unwrap(),
         );
         replace_bound(
             &mut bound,
+            &mut order,
             second,
             ProviderSessionId::new("session-1").unwrap(),
         );
         assert_eq!(bound.len(), 1);
         assert!(bound.keys().all(|key| key.nonce == "nonce-b"));
+    }
+
+    #[test]
+    fn bound_correlations_evict_oldest_at_the_capacity() {
+        let executable =
+            ProviderExecutable::new(r"C:\bin\claude.exe", [0x11; 32]).expect("executable");
+        let version = ProviderVersion::from_probe_output(fixture("version")).unwrap();
+        let mut bound = HashMap::new();
+        let mut order = VecDeque::new();
+        let mut oldest = None;
+        let mut newest = None;
+        for index in 0..=MAX_CLAUDE_BOUND_SESSIONS {
+            let key = BoundKey {
+                task_id: TaskId::new(),
+                agent_session_id: AgentSessionId::new(),
+                runtime_generation: index as u64,
+                action_epoch: 1,
+                process_root: ResourceId::new(),
+                nonce: format!("nonce-{index}"),
+                relay_generation: index as u64,
+                provider: ProviderKind::ClaudeCode,
+                executable: executable.clone(),
+                version: version.clone(),
+            };
+            if index == 0 {
+                oldest = Some(key.clone());
+            }
+            newest = Some(key.clone());
+            replace_bound(
+                &mut bound,
+                &mut order,
+                key,
+                ProviderSessionId::new("session-1").unwrap(),
+            );
+        }
+        assert_eq!(bound.len(), MAX_CLAUDE_BOUND_SESSIONS);
+        assert!(!bound.contains_key(&oldest.expect("oldest key")));
+        assert!(bound.contains_key(&newest.expect("newest key")));
     }
 }

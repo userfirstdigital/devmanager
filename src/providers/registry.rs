@@ -144,6 +144,14 @@ pub struct ProviderObservation {
 }
 
 impl ProviderObservation {
+    pub fn kind(&self) -> ProviderKind { self.kind }
+    pub fn executable(&self) -> &ProviderExecutable { &self.executable }
+    pub fn version(&self) -> &ProviderVersion { &self.version }
+    pub fn adapter_revision(&self) -> AdapterRevision { self.adapter_revision }
+    pub fn semantic_schema_version(&self) -> SemanticSchemaVersion { self.semantic_schema_version }
+    pub fn capabilities(&self) -> &ProviderCapabilities { &self.capabilities }
+    pub fn cache_status(&self) -> CacheStatus { self.cache_status }
+
     pub fn validate(&self) -> Result<(), ProviderError> {
         if self.capabilities.kind != self.kind {
             return Err(ProviderError::CapabilityKindMismatch {

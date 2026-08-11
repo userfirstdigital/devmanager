@@ -370,11 +370,11 @@ async fn configured_direct_executable_wins_over_path_discovery() {
         .unwrap();
 
     assert_eq!(
-        observation.executable.canonical_path(),
+        observation.executable().canonical_path(),
         std::fs::canonicalize(override_executable).unwrap()
     );
     assert_ne!(
-        observation.executable.canonical_path(),
+        observation.executable().canonical_path(),
         std::fs::canonicalize(path_executable).unwrap()
     );
 }
@@ -493,8 +493,8 @@ async fn capability_cache_hits_while_refreshing_auth_probe() {
         .await
         .unwrap();
 
-    assert_eq!(first.cache_status, CacheStatus::Miss);
-    assert_eq!(second.cache_status, CacheStatus::Hit);
+    assert_eq!(first.cache_status(), CacheStatus::Miss);
+    assert_eq!(second.cache_status(), CacheStatus::Hit);
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 2);
 }
 
@@ -555,8 +555,10 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
         .iter()
         .any(|evidence| evidence.source() == EvidenceSourceId::AuthStatusProbe));
     assert_eq!(second.cache_status, CacheStatus::Hit);
+    assert_eq!(first.cache_status(), CacheStatus::Miss);
+    assert_eq!(second.cache_status(), CacheStatus::Hit);
     assert_eq!(
-        second.capabilities.auth_state,
+        second.capabilities().auth_state,
         ProviderAuthState::AuthRequired
     );
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 5);
@@ -1146,7 +1148,7 @@ async fn adapter_without_lightweight_version_probe_still_gets_a_cache_hit() {
         .await
         .unwrap();
 
-    assert_eq!(second.cache_status, CacheStatus::Hit);
+    assert_eq!(second.cache_status(), CacheStatus::Hit);
     assert_eq!(adapter.probes.load(Ordering::Relaxed), 2);
 }
 
@@ -1217,7 +1219,7 @@ async fn provider_version_change_invalidates_capability_cache() {
         .await
         .unwrap();
 
-    assert_eq!(second.cache_status, CacheStatus::Miss);
+    assert_eq!(second.cache_status(), CacheStatus::Miss);
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 2);
 }
 
@@ -1567,7 +1569,7 @@ async fn executable_presence_and_version_do_not_infer_subscription_auth() {
         .unwrap();
 
     assert_eq!(
-        observation.capabilities.auth_state,
+        observation.capabilities().auth_state,
         ProviderAuthState::Unknown
     );
 }

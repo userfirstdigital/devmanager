@@ -6,8 +6,10 @@ use crate::remote::presentation::{
     SemanticSource, SemanticToolState, StableSessionKey,
 };
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use serde_json::Value;
@@ -21,6 +23,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 pub const MAX_CLAUDE_HOOK_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_CLAUDE_HOOK_JSON_NESTING: usize = 8;
@@ -1027,6 +1030,7 @@ fn json_string_character_bytes(character: char) -> usize {
 pub struct ClaudeRegistryLimits {
     pub max_registrations: usize,
     pub max_body_bytes: usize,
+    pub max_cleanup_paths: usize,
     pub registration_ttl: Duration,
     pub reducer: ClaudeReducerLimits,
 }
@@ -1036,17 +1040,28 @@ impl Default for ClaudeRegistryLimits {
         Self {
             max_registrations: 128,
             max_body_bytes: MAX_CLAUDE_HOOK_BODY_BYTES,
+            max_cleanup_paths: 8,
             registration_ttl: Duration::from_secs(24 * 60 * 60),
             reducer: ClaudeReducerLimits::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeHookRegistration {
     pub nonce: String,
     pub stable_session_key: StableSessionKey,
     pub generation: u64,
+}
+
+impl fmt::Debug for ClaudeHookRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeHookRegistration")
+            .field("nonce", &"<redacted>")
+            .field("stable_session_key", &self.stable_session_key)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1193,16 +1208,6 @@ impl ClaudeAdmittedDelivery {
 
     pub fn registration(&self) -> &ClaudeCorrelatedRegistration {
         &self.registration
-    }
-
-    pub fn forge_for_test(
-        registration: ClaudeCorrelatedRegistration,
-        provider_session_id: ProviderSessionId,
-    ) -> Self {
-        Self {
-            registration,
-            provider_session_id,
-        }
     }
 }
 
@@ -1898,13 +1903,20 @@ impl ClaudeHookRegistry {
         if !context_is_current(&state, &context) {
             return Err(RelayIngestStatus::Rejected);
         }
-        if let Err(status) = reject_uncorrelated_or_rebinding_session_start(registration, body) {
-            return Err(status);
-        }
+        let observed_session_id =
+            match reject_uncorrelated_or_mismatched_http_event(registration, body) {
+                Ok(observed) => observed,
+                Err(status) => return Err(status),
+            };
         let registration = state
             .registrations
             .get_mut(nonce)
             .expect("registration checked above");
+        if registration.bound_provider_session_id.is_none() {
+            if let Some(observed) = observed_session_id {
+                registration.bound_provider_session_id = Some(observed);
+            }
+        }
         if registration.activated {
             registration.expires_at = now + self.limits.registration_ttl;
         }
@@ -2035,15 +2047,28 @@ impl ClaudeHookRegistry {
     }
 
     pub fn attach_cleanup_path(&self, nonce: &str, path: PathBuf) -> bool {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|mut state| {
-                state.registrations.get_mut(nonce).map(|registration| {
-                    registration.cleanup_paths.push(path);
-                })
+        let evicted = self.state.lock().ok().and_then(|mut state| {
+            state.registrations.get_mut(nonce).map(|registration| {
+                let evicted =
+                    if registration.cleanup_paths.len() >= self.limits.max_cleanup_paths.max(1) {
+                        registration.cleanup_paths.first().cloned()
+                    } else {
+                        None
+                    };
+                if evicted.is_some() {
+                    registration.cleanup_paths.remove(0);
+                }
+                registration.cleanup_paths.push(path);
+                evicted
             })
-            .is_some()
+        });
+        let Some(evicted) = evicted else {
+            return false;
+        };
+        if let Some(path) = evicted {
+            remove_cleanup_paths(vec![path]);
+        }
+        true
     }
 
     fn dispatch_captured(&self, captured: CapturedClaudeIngest) -> RelayIngestStatus {
@@ -2438,19 +2463,17 @@ impl CapturedClaudeIngest {
     }
 }
 
-fn reject_uncorrelated_or_rebinding_session_start(
+fn reject_uncorrelated_or_mismatched_http_event(
     registration: &RegisteredClaudeSession,
     body: &[u8],
-) -> Result<(), RelayIngestStatus> {
+) -> Result<Option<String>, RelayIngestStatus> {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return Ok(());
+        return Err(RelayIngestStatus::Rejected);
     };
-    if value.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
-        return Ok(());
-    }
     let Some(sealed) = registration.sealed.as_ref() else {
         return Err(RelayIngestStatus::Rejected);
     };
+    let event_name = value.get("hook_event_name").and_then(Value::as_str);
     let raw = match official_session_id_str(&value) {
         Ok(Some(raw)) => raw,
         Ok(None) | Err(OfficialSessionIdError::TooLong) => {
@@ -2460,17 +2483,26 @@ fn reject_uncorrelated_or_rebinding_session_start(
     if ProviderSessionId::new(raw.to_string()).is_err() {
         return Err(RelayIngestStatus::Rejected);
     }
-    if let Some(expected) = sealed.expected_provider_session_id.as_ref() {
-        if expected.as_str() != raw {
-            return Err(RelayIngestStatus::Rejected);
+    if event_name == Some("SessionStart") {
+        if let Some(expected) = sealed.expected_provider_session_id.as_ref() {
+            if expected.as_str() != raw {
+                return Err(RelayIngestStatus::Rejected);
+            }
         }
-    }
-    if let Some(bound) = registration.bound_provider_session_id.as_deref() {
+        if let Some(bound) = registration.bound_provider_session_id.as_deref() {
+            if bound != raw {
+                return Err(RelayIngestStatus::Rejected);
+            }
+        }
+    } else {
+        let Some(bound) = registration.bound_provider_session_id.as_deref() else {
+            return Err(RelayIngestStatus::Rejected);
+        };
         if bound != raw {
             return Err(RelayIngestStatus::Rejected);
         }
     }
-    Ok(())
+    Ok(Some(raw.to_string()))
 }
 
 fn compare_correlation_binding(
@@ -2590,6 +2622,8 @@ pub struct ClaudeIngressLimits {
     pub max_optional_events: usize,
     pub max_critical_bytes: usize,
     pub max_optional_bytes: usize,
+    pub max_connections: usize,
+    pub max_in_flight: usize,
 }
 
 impl Default for ClaudeIngressLimits {
@@ -2599,6 +2633,8 @@ impl Default for ClaudeIngressLimits {
             max_optional_events: 64,
             max_critical_bytes: 4 * 1024 * 1024,
             max_optional_bytes: 1024 * 1024,
+            max_connections: 64,
+            max_in_flight: 64,
         }
     }
 }
@@ -2720,6 +2756,8 @@ struct ClaudeIngressState {
     registry: Arc<ClaudeHookRegistry>,
     queue: Arc<ClaudeIngressQueue>,
     limits: ClaudeIngressLimits,
+    connection_slots: Arc<Semaphore>,
+    in_flight_slots: Arc<Semaphore>,
 }
 
 pub struct ClaudeHookRelayListener {
@@ -2781,6 +2819,8 @@ impl ClaudeHookRelayListener {
             registry,
             queue: queue.clone(),
             limits,
+            connection_slots: Arc::new(Semaphore::new(limits.max_connections.max(1))),
+            in_flight_slots: Arc::new(Semaphore::new(limits.max_in_flight.max(1))),
         };
         let server_thread_result = thread::Builder::new()
             .name("claude-hook-relay".to_string())
@@ -2792,6 +2832,10 @@ impl ClaudeHookRelayListener {
                     let app = Router::new()
                         .route("/internal/claude-hook", post(handle_claude_hook))
                         .layer(DefaultBodyLimit::max(body_limit))
+                        .layer(middleware::from_fn_with_state(
+                            ingress_state.clone(),
+                            limit_claude_connections,
+                        ))
                         .with_state(ingress_state);
                     let shutdown = async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -2855,6 +2899,9 @@ async fn handle_claude_hook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    let Ok(_in_flight_permit) = ingress.in_flight_slots.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
     let Some(nonce) = headers
         .get("x-devmanager-claude-nonce")
         .and_then(|value| value.to_str().ok())
@@ -2872,18 +2919,16 @@ async fn handle_claude_hook(
     let queue_registry = ingress.registry.clone();
     let queue = ingress.queue.clone();
     let limits = ingress.limits;
-    let admitted_body = body.to_vec();
-    let queued_body = admitted_body.clone();
     ClaudeHookRegistry::http_hook_status(admission_registry.admit_ingress_at(
         peer,
         nonce,
-        &admitted_body,
+        &body,
         Instant::now(),
-        move |context| {
+        |context| {
             queue.enqueue(
                 AdmittedClaudeHook {
                     context,
-                    body: queued_body,
+                    body: body.to_vec(),
                     occurred_at_epoch_ms: unix_epoch_ms(),
                 },
                 optional,
@@ -2892,6 +2937,17 @@ async fn handle_claude_hook(
             );
         },
     ))
+}
+
+async fn limit_claude_connections(
+    State(ingress): State<ClaudeIngressState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_connection_permit) = ingress.connection_slots.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    next.run(request).await
 }
 
 fn is_optional_claude_hook(body: &[u8]) -> bool {
@@ -3035,7 +3091,7 @@ pub enum ClaudeShellKind {
     Cmd,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClaudeLaunchOverlay {
     pub startup_command: String,
     pub endpoint: String,
@@ -3043,6 +3099,19 @@ pub struct ClaudeLaunchOverlay {
     pub settings_path: Option<PathBuf>,
     pub health: SemanticAdapterHealth,
     pub diagnostic: Option<String>,
+}
+
+impl fmt::Debug for ClaudeLaunchOverlay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeLaunchOverlay")
+            .field("has_startup_command", &(!self.startup_command.is_empty()))
+            .field("has_endpoint", &(!self.endpoint.is_empty()))
+            .field("has_registration", &self.registration.is_some())
+            .field("has_settings_path", &self.settings_path.is_some())
+            .field("health", &self.health)
+            .field("has_diagnostic", &self.diagnostic.is_some())
+            .finish()
+    }
 }
 
 impl ClaudeLaunchOverlay {
