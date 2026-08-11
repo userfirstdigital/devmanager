@@ -4,9 +4,10 @@ pub mod header;
 pub mod inbox;
 
 pub use header::{
-    HeaderField, HeaderHighWaterLedger, HighWaterDecision, PendingHeaderActionOutcome,
-    PendingHeaderActionQueue, ProjectedAction, SpecialistProjection, TaskHeaderModel, TaskIdentity,
-    TopBarModel, TopBarProjectionController, TopBarProjectionInput,
+    HeaderActionEnvelope, HeaderField, HeaderHighWaterLedger, HeaderOverflowControl,
+    HeaderOverflowItem, HighWaterDecision, PendingHeaderActionOutcome, PendingHeaderActionQueue,
+    ProjectedAction, SpecialistProjection, TaskHeaderModel, TaskIdentity, TopBarModel,
+    TopBarProjectionController, TopBarProjectionInput, WorkspacePath, WorkspaceWorktree,
 };
 
 pub use inbox::{

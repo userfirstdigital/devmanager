@@ -8,14 +8,14 @@ use devmanager::domain::task::{
 use devmanager::ui::components::ActionRequest;
 use devmanager::ui::task_cockpit::header::{
     presentation_text, ActionTarget, AgentObservation, AgentResourceField, ConnectObservation,
-    ConnectState, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout, HeaderObservation,
-    HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
+    ConnectState, HeaderActionEnvelope, HeaderFieldKey, HeaderHighWaterLedger, HeaderLayout,
+    HeaderObservation, HighWaterDecision, HostHealth, HostObservation, HostObservationIdentity,
     HostResourceObservation, OpaqueProviderSessionRef, PendingHeaderActionOutcome,
     PendingHeaderActionQueue, ProjectProjection, ProjectedAction, QuotaObservation, RemoteHealth,
     SpecialistProjection, TaskHeaderModel, TaskIdentity, TitleLayout, TopBarModel,
     TopBarProjectionController, TopBarProjectionInput, UpdateObservation, UpdateState,
     WorkspaceProjection, HEADER_HIGH_WATER_TTL_MS, MAX_HEADER_SPECIALISTS,
-    MAX_SPECIALIST_VIRTUAL_WINDOW,
+    MAX_SPECIALIST_VIRTUAL_WINDOW, MAX_TOP_BAR_QUOTA_CACHE, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -218,6 +218,27 @@ fn high_water_capacity_resync_retires_omitted_keys_without_revival() {
 }
 
 #[test]
+fn full_resync_retirement_is_keyed_and_unknown_keys_request_resync() {
+    let mut ledger = HeaderHighWaterLedger::new(4, HEADER_HIGH_WATER_TTL_MS);
+    let retired = HeaderFieldKey::Task(task_id(31));
+    let replacement = HeaderFieldKey::Task(task_id(32));
+    let unrelated = HeaderFieldKey::Task(task_id(33));
+    assert_eq!(
+        ledger.observe(retired, 1, 100, 100, 100, false),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        ledger.apply_full_resync(1, 1, [observation(replacement, 1, 1, false)]),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(
+        ledger.observe(unrelated, 1, 1, 101, 1, false),
+        HighWaterDecision::Accepted,
+        "a retired key's floor must not suppress an unrelated key"
+    );
+}
+
+#[test]
 fn full_resync_retirement_floor_rejects_older_reintroduced_keys() {
     let retired = HeaderFieldKey::Task(task_id(8));
     let replacement = HeaderFieldKey::Task(task_id(9));
@@ -317,10 +338,11 @@ fn specialists_keep_bounded_stable_id_order_and_keyset_windows() {
         });
     }
     let first = SpecialistProjection::from_observations(&observations);
-    assert_eq!(first.scanned(), 100_000);
-    assert_eq!(first.unique_count(), 100_000);
+    assert!(first.scanned() <= MAX_HEADER_SPECIALISTS + 1);
+    assert!(first.unique_count() <= MAX_HEADER_SPECIALISTS + 1);
     assert!(first.overflowed());
-    assert!(first.source_available());
+    assert!(!first.source_available());
+    assert!(first.requires_full_resync());
     assert_eq!(first.retained().len(), MAX_HEADER_SPECIALISTS);
     assert_eq!(first.retained().first().unwrap().id, agent_id(0));
     assert_eq!(first.retained().last().unwrap().id, agent_id(4_999));
@@ -357,17 +379,20 @@ fn specialists_keep_bounded_stable_id_order_and_keyset_windows() {
         "reorder/relabel/add-before-anchor must not change keyset identity"
     );
 
-    observations.push(AgentObservation {
-        id: agent_id(3),
-        task_id: task,
-        label: "removed",
-        provider: "claude",
-        provider_session_id: None,
-        lifecycle: AgentSessionLifecycle::Closed,
-        runtime_generation: 1,
-        revision: 3,
-        removed: true,
-    });
+    observations.insert(
+        3,
+        AgentObservation {
+            id: agent_id(3),
+            task_id: task,
+            label: "removed",
+            provider: "claude",
+            provider_session_id: None,
+            lifecycle: AgentSessionLifecycle::Closed,
+            runtime_generation: 1,
+            revision: 3,
+            removed: true,
+        },
+    );
     let removed = SpecialistProjection::from_observations(&observations);
     assert!(removed.removed_ids().contains(&agent_id(3)));
 }
@@ -616,6 +641,96 @@ fn controller_constructor_never_retains_over_cap_quota_input() {
 }
 
 #[test]
+fn idle_controller_tick_hides_expired_quota_without_new_observations() {
+    let session = OpaqueProviderSessionRef::try_from_raw("idle-quota").unwrap();
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        quotas: vec![QuotaObservation::new("claude", session, 1, 1, 100, "fresh")],
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    assert_eq!(controller.model().quotas.len(), 1);
+
+    let expired = controller.model_at(100 + PROVIDER_QUOTA_MAX_AGE_MS + 1);
+    assert!(expired.quotas.is_empty());
+    assert!(expired
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::Quota));
+    assert!(controller.high_water().requires_full_resync());
+}
+
+#[test]
+fn quota_flood_enters_visible_unavailable_resync_state_instead_of_stale_display() {
+    let mut quotas = Vec::new();
+    for index in 0..MAX_TOP_BAR_QUOTA_CACHE {
+        let session = OpaqueProviderSessionRef::try_from_raw(&format!("flood-{index}")).unwrap();
+        quotas.push(QuotaObservation::new(
+            &format!("provider-{index}"),
+            session,
+            1,
+            index as u64 + 1,
+            100,
+            "fresh",
+        ));
+    }
+    let mut controller = TopBarProjectionController::try_new(TopBarProjectionInput {
+        now_ms: 100,
+        generation: 1,
+        quotas,
+        ..TopBarProjectionInput::default()
+    })
+    .unwrap();
+    let new_session = OpaqueProviderSessionRef::try_from_raw("flood-new").unwrap();
+    assert_eq!(
+        controller.observe_quota(QuotaObservation::new(
+            "new-provider",
+            new_session,
+            1,
+            100,
+            200,
+            "new",
+        )),
+        HighWaterDecision::NeedsFullResync
+    );
+    let model = controller.model();
+    assert!(
+        model.quotas.is_empty(),
+        "stale quota must not remain visible"
+    );
+    assert!(model.quota_overflow_count >= 1);
+    assert!(model
+        .unavailable
+        .contains(&devmanager::ui::task_cockpit::header::TopBarUnavailable::Quota));
+    assert!(model.quota_overflow_action.is_some());
+
+    assert_eq!(
+        controller
+            .apply_full_resync(
+                1,
+                TopBarProjectionInput {
+                    now_ms: 200,
+                    generation: 1,
+                    quotas: vec![QuotaObservation::new(
+                        "new-provider",
+                        new_session,
+                        1,
+                        100,
+                        200,
+                        "new",
+                    )],
+                    ..TopBarProjectionInput::default()
+                },
+                std::iter::empty(),
+            )
+            .unwrap(),
+        HighWaterDecision::Accepted
+    );
+    assert_eq!(controller.model().quota_overflow_count, 0);
+    assert_eq!(controller.model().quotas.len(), 1);
+}
+
+#[test]
 fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     let identity = TaskIdentity {
         task_id: task_id(5),
@@ -649,7 +764,8 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     let bounded = ProjectedAction::task_rename(identity, huge_title);
     assert!(bounded.is_err());
     let bounded = ProjectedAction::task_rename(identity, "bounded title").unwrap();
-    let ActionRequest::TaskRename(arguments) = bounded.request() else {
+    let bounded_envelope = bounded.into_envelope();
+    let ActionRequest::TaskRename(arguments) = bounded_envelope.request() else {
         panic!("rename action")
     };
     assert!(arguments.title.chars().count() <= 160);
@@ -668,6 +784,37 @@ fn action_epochs_and_queue_coalesce_only_safe_equivalents() {
     assert_eq!(
         PendingHeaderActionOutcome::from_high_water(HighWaterDecision::NeedsFullResync),
         PendingHeaderActionOutcome::Uncertain
+    );
+
+    let mut typed_queue = PendingHeaderActionQueue::new(1);
+    typed_queue.push(ProjectedAction::task_show(identity));
+    let envelopes = typed_queue.drain_envelopes_for_tick(1);
+    assert!(matches!(
+        envelopes.first().map(HeaderActionEnvelope::target),
+        Some(ActionTarget::Task(captured)) if *captured == identity
+    ));
+}
+
+#[test]
+fn projected_action_exposes_only_a_fenced_typed_envelope() {
+    let identity = TaskIdentity {
+        task_id: task_id(34),
+        revision: 10,
+        resource_generation: 2,
+        connection_epoch: 3,
+        focus_epoch: 4,
+        client_epoch: 5,
+        navigation_epoch: 6,
+        request_epoch: 7,
+        action_epoch: 8,
+    };
+    let envelope: HeaderActionEnvelope = ProjectedAction::task_show(identity).into_envelope();
+    assert!(matches!(
+        envelope.target(),
+        ActionTarget::Task(captured) if *captured == identity
+    ));
+    assert!(
+        matches!(envelope.request(), ActionRequest::TaskShow { task_id } if task_id == &identity.task_id)
     );
 }
 
@@ -759,18 +906,18 @@ fn task_header_uses_snapshot_identity_filters_nested_agents_and_bounds_workspace
         resources: BTreeMap::new(),
     };
     let model = TaskHeaderModel::from_snapshot(caller_task, &snapshot, Default::default());
-    assert_eq!(model.identity.task_id, snapshot_task);
-    assert_eq!(model.specialists.unique_count(), 1);
-    let WorkspaceProjection::External { path } = model.workspace else {
+    assert_eq!(model.identity().task_id, snapshot_task);
+    assert_eq!(model.specialists().unique_count(), 1);
+    let WorkspaceProjection::External(path) = model.workspace() else {
         panic!("external workspace")
     };
-    assert!(path.to_string_lossy().chars().count() <= 512);
+    assert!(path.as_path().to_string_lossy().chars().count() <= 512);
 }
 
 #[test]
 fn long_unbroken_titles_wrap_and_ellipsis_with_bounded_lines() {
-    let task = TaskHeaderModel {
-        identity: TaskIdentity {
+    let task = TaskHeaderModel::new(
+        TaskIdentity {
             task_id: task_id(12),
             revision: 1,
             resource_generation: 1,
@@ -781,20 +928,20 @@ fn long_unbroken_titles_wrap_and_ellipsis_with_bounded_lines() {
             request_epoch: 1,
             action_epoch: 1,
         },
-        title: "x".repeat(220),
-        project: ProjectProjection {
-            id: ProjectId::from_bytes([
+        "x".repeat(220),
+        ProjectProjection::new(
+            ProjectId::from_bytes([
                 0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x0d,
             ])
             .unwrap(),
-            label: "project".into(),
-        },
-        workspace: WorkspaceProjection::Main,
-        specialists: SpecialistProjection::from_iter(std::iter::empty()),
-        status: VisibleTaskStatus::Idle,
-        accessible_description: "task".into(),
-    };
+            "project",
+        ),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_iter(std::iter::empty()),
+        VisibleTaskStatus::Idle,
+        "task",
+    );
     let wrapped = HeaderLayout::for_model(&task, 400);
     let TitleLayout::Wrapped(lines) = wrapped.title else {
         panic!("expected wrapped title")
@@ -1119,8 +1266,8 @@ fn oversize_rename_reports_only_the_bounded_probe() {
 
 #[test]
 fn task_header_accessibility_names_every_rendered_sibling() {
-    let model = TaskHeaderModel {
-        identity: TaskIdentity {
+    let model = TaskHeaderModel::new(
+        TaskIdentity {
             task_id: task_id(22),
             revision: 1,
             resource_generation: 1,
@@ -1131,22 +1278,20 @@ fn task_header_accessibility_names_every_rendered_sibling() {
             request_epoch: 1,
             action_epoch: 1,
         },
-        title: "Task title".into(),
-        project: ProjectProjection {
-            id: ProjectId::from_bytes([
+        "Task title",
+        ProjectProjection::new(
+            ProjectId::from_bytes([
                 0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x16,
             ])
             .unwrap(),
-            label: "Project".into(),
-        },
-        workspace: WorkspaceProjection::External {
-            path: PathBuf::from("C:/workspace"),
-        },
-        specialists: SpecialistProjection::from_iter(std::iter::empty()),
-        status: VisibleTaskStatus::Idle,
-        accessible_description: "Task title. Project. Workspace. Idle.".into(),
-    };
+            "Project",
+        ),
+        WorkspaceProjection::external("C:/workspace"),
+        SpecialistProjection::from_iter(std::iter::empty()),
+        VisibleTaskStatus::Idle,
+        "Task title. Project. Workspace. Idle.",
+    );
     let tree = model.accessibility_tree();
     let labels: Vec<_> = tree
         .children
@@ -1159,10 +1304,94 @@ fn task_header_accessibility_names_every_rendered_sibling() {
 }
 
 #[test]
+fn accessibility_tree_rebounds_untrusted_public_projection_text() {
+    let secret = "TOKEN=header-secret ".to_string() + &"x".repeat(20_000);
+    let model = TaskHeaderModel::new(
+        TaskIdentity {
+            task_id: task_id(35),
+            revision: 1,
+            resource_generation: 1,
+            connection_epoch: 1,
+            focus_epoch: 1,
+            client_epoch: 1,
+            navigation_epoch: 1,
+            request_epoch: 1,
+            action_epoch: 1,
+        },
+        secret.clone(),
+        ProjectProjection::new(
+            ProjectId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x18,
+            ])
+            .unwrap(),
+            secret.clone(),
+        ),
+        WorkspaceProjection::external(secret.clone()),
+        SpecialistProjection::from_iter(std::iter::empty()),
+        VisibleTaskStatus::Idle,
+        secret,
+    );
+    let tree = model.accessibility_tree();
+    for node in std::iter::once(&tree).chain(tree.children.iter()) {
+        assert!(node.label.chars().count() <= 512);
+        assert!(node.description.chars().count() <= 512);
+        assert!(!node.label.contains("header-secret"));
+        assert!(!node.description.contains("header-secret"));
+    }
+}
+
+#[test]
+fn narrow_layout_provides_a_focusable_overflow_control_with_the_task_fence() {
+    let identity = TaskIdentity {
+        task_id: task_id(36),
+        revision: 1,
+        resource_generation: 1,
+        connection_epoch: 1,
+        focus_epoch: 1,
+        client_epoch: 1,
+        navigation_epoch: 1,
+        request_epoch: 1,
+        action_epoch: 1,
+    };
+    let model = TaskHeaderModel::new(
+        identity,
+        "Task",
+        ProjectProjection::new(
+            ProjectId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x19,
+            ])
+            .unwrap(),
+            "Project",
+        ),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_iter(std::iter::empty()),
+        VisibleTaskStatus::Idle,
+        "Task header",
+    );
+    let layout = HeaderLayout::for_model(&model, 320);
+    let overflow = layout.overflow_control.as_ref().expect("overflow control");
+    assert!(overflow.focusable);
+    assert_eq!(overflow.action.target(), &ActionTarget::Task(identity));
+    assert!(overflow.label.chars().count() <= 256);
+    assert_eq!(layout.overflow_items.len(), layout.overflow.len());
+    assert!(layout
+        .overflow_items
+        .iter()
+        .all(|item| item.focusable && item.label.chars().count() <= 512));
+    assert!(model
+        .accessibility_tree()
+        .children
+        .iter()
+        .all(|node| node.focusable));
+}
+
+#[test]
 fn header_layout_does_not_split_grapheme_clusters_and_accepts_scale() {
     let title = "👩‍💻".repeat(80);
-    let model = TaskHeaderModel {
-        identity: TaskIdentity {
+    let model = TaskHeaderModel::new(
+        TaskIdentity {
             task_id: task_id(23),
             revision: 1,
             resource_generation: 1,
@@ -1174,19 +1403,19 @@ fn header_layout_does_not_split_grapheme_clusters_and_accepts_scale() {
             action_epoch: 1,
         },
         title,
-        project: ProjectProjection {
-            id: ProjectId::from_bytes([
+        ProjectProjection::new(
+            ProjectId::from_bytes([
                 0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x17,
             ])
             .unwrap(),
-            label: "Project".into(),
-        },
-        workspace: WorkspaceProjection::Main,
-        specialists: SpecialistProjection::from_iter(std::iter::empty()),
-        status: VisibleTaskStatus::Idle,
-        accessible_description: "Task".into(),
-    };
+            "Project",
+        ),
+        WorkspaceProjection::main(),
+        SpecialistProjection::from_iter(std::iter::empty()),
+        VisibleTaskStatus::Idle,
+        "Task",
+    );
     let layout = HeaderLayout::for_model_at_scale(&model, 800, 2.0);
     let TitleLayout::Wrapped(lines) = layout.title else {
         panic!("expected wrapped title")

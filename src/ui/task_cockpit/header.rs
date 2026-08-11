@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::client::action::{ActionDescriptor, ActionRisk, TaskRenameArguments, ACTION_TASK_SHOW};
 use crate::client::ClientModel;
@@ -29,6 +30,10 @@ pub const MAX_OBSERVATION_AGE_MS: i64 = PROVIDER_QUOTA_MAX_AGE_MS;
 /// Retain enough specialist identity to support large tasks without an
 /// unbounded projection.  Rendering is a smaller keyset window.
 pub const MAX_HEADER_SPECIALISTS: usize = 5_000;
+/// A projection consumes at most one sentinel beyond the retained bound so a
+/// common flood becomes explicitly approximate without scanning the rest of a
+/// borrowed source on the render path.
+pub const MAX_HEADER_SPECIALIST_SCAN: usize = MAX_HEADER_SPECIALISTS + 1;
 pub const MAX_SPECIALIST_VIRTUAL_WINDOW: usize = 128;
 pub const MAX_PENDING_HEADER_ACTIONS: usize = 64;
 pub const MAX_HEADER_HIGH_WATER_ENTRIES: usize = 4_096;
@@ -324,13 +329,6 @@ struct MonotonicFloor {
     retirement_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RetirementFloor {
-    generation: u64,
-    revision: u64,
-    retirement_epoch: u64,
-}
-
 /// Bounded detailed marks plus a bounded monotonic floor.  Expiring a
 /// detailed mark never deletes its floor; future incremental observations for
 /// that key are fail-closed until a newer authoritative full-resync epoch.
@@ -338,9 +336,10 @@ struct RetirementFloor {
 pub struct HeaderHighWaterLedger {
     marks: BTreeMap<HeaderFieldKey, HeaderWaterMark>,
     floors: BTreeMap<HeaderFieldKey, MonotonicFloor>,
-    /// One bounded fallback floor protects keys retired when a full resync
-    /// replaces more detailed entries than the configured capacity allows.
-    retirement_floor: Option<RetirementFloor>,
+    /// Retired floors remain keyed by the identity they protect.  A global
+    /// stamp would incorrectly suppress a newer, unrelated key.
+    retired_floors: BTreeMap<HeaderFieldKey, MonotonicFloor>,
+    retirement_overflow: bool,
     capacity: usize,
     ttl_ms: i64,
     last_full_resync_epoch: u64,
@@ -352,7 +351,8 @@ impl HeaderHighWaterLedger {
         Self {
             marks: BTreeMap::new(),
             floors: BTreeMap::new(),
-            retirement_floor: None,
+            retired_floors: BTreeMap::new(),
+            retirement_overflow: false,
             capacity: capacity.clamp(1, MAX_HEADER_HIGH_WATER_ENTRIES),
             ttl_ms: ttl_ms.max(1),
             last_full_resync_epoch: 0,
@@ -396,21 +396,32 @@ impl HeaderHighWaterLedger {
                 return HighWaterDecision::NeedsFullResync;
             }
         } else {
-            if let Some(retirement_floor) = self.retirement_floor {
+            if let Some(retired_floor) = self.retired_floors.get(&key).copied() {
                 match compare_stamp(
                     generation,
                     revision,
-                    retirement_floor.generation,
-                    retirement_floor.revision,
+                    retired_floor.generation,
+                    retired_floor.revision,
                 ) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                        return HighWaterDecision::IgnoredStale;
+                    std::cmp::Ordering::Less => return HighWaterDecision::IgnoredStale,
+                    std::cmp::Ordering::Equal => {
+                        return if retired_floor.fingerprint == fingerprint
+                            && retired_floor.removed == removed
+                        {
+                            HighWaterDecision::IgnoredStale
+                        } else {
+                            HighWaterDecision::RejectedConflict
+                        };
                     }
                     std::cmp::Ordering::Greater => {
                         self.needs_full_resync = true;
                         return HighWaterDecision::NeedsFullResync;
                     }
                 }
+            }
+            if self.retirement_overflow {
+                self.needs_full_resync = true;
+                return HighWaterDecision::NeedsFullResync;
             }
             if self.needs_full_resync {
                 return HighWaterDecision::NeedsFullResync;
@@ -498,10 +509,11 @@ impl HeaderHighWaterLedger {
         let incoming_keys: BTreeSet<_> =
             bounded.iter().map(|observation| &observation.key).collect();
         let mut candidate = self.clone();
+        candidate.retirement_overflow = false;
         let prior_floors = candidate.floors.clone();
         for (key, floor) in &prior_floors {
             if !incoming_keys.contains(key) {
-                candidate.retire_floor(*floor, full_resync_epoch);
+                candidate.retire_floor(key.clone(), *floor, full_resync_epoch);
             }
         }
         candidate.marks.clear();
@@ -551,18 +563,29 @@ impl HeaderHighWaterLedger {
                     }
                     std::cmp::Ordering::Greater => {}
                 }
-            } else if let Some(retirement_floor) = candidate.retirement_floor {
+            } else if let Some(retired_floor) =
+                candidate.retired_floors.get(&observation.key).copied()
+            {
                 match compare_stamp(
                     observation.generation,
                     observation.revision,
-                    retirement_floor.generation,
-                    retirement_floor.revision,
+                    retired_floor.generation,
+                    retired_floor.revision,
                 ) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                    std::cmp::Ordering::Less => {
+                        return HighWaterDecision::IgnoredStale;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if retired_floor.fingerprint != observation.fingerprint
+                            || retired_floor.removed != observation.removed
+                        {
+                            return HighWaterDecision::RejectedConflict;
+                        }
                         return HighWaterDecision::IgnoredStale;
                     }
                     std::cmp::Ordering::Greater => {}
                 }
+                candidate.retired_floors.remove(&observation.key);
             }
             if !candidate.floors.contains_key(&observation.key)
                 && candidate.floors.len() >= candidate.capacity
@@ -619,12 +642,23 @@ impl HeaderHighWaterLedger {
         self.floors.len()
     }
 
+    pub fn retired_floor_len(&self) -> usize {
+        self.retired_floors.len()
+    }
+
     pub fn tombstone_count(&self) -> usize {
-        self.floors.values().filter(|floor| floor.removed).count()
+        self.floors
+            .values()
+            .chain(self.retired_floors.values())
+            .filter(|floor| floor.removed)
+            .count()
     }
 
     pub fn contains_tombstone(&self, key: &HeaderFieldKey) -> bool {
-        self.floors.get(key).is_some_and(|floor| floor.removed)
+        self.floors
+            .get(key)
+            .or_else(|| self.retired_floors.get(key))
+            .is_some_and(|floor| floor.removed)
     }
 
     pub fn capacity(&self) -> usize {
@@ -643,13 +677,30 @@ impl HeaderHighWaterLedger {
         self.needs_full_resync
     }
 
-    fn retire_floor(&mut self, floor: MonotonicFloor, retirement_epoch: u64) {
-        let candidate = RetirementFloor {
-            generation: floor.generation,
-            revision: floor.revision,
+    /// Mark the ledger uncertain when an adapter cannot admit the next
+    /// bounded observation.  The next authoritative bundle remains the only
+    /// operation that can clear this state.
+    pub fn require_full_resync(&mut self) {
+        self.needs_full_resync = true;
+    }
+
+    fn retire_floor(&mut self, key: HeaderFieldKey, floor: MonotonicFloor, retirement_epoch: u64) {
+        if self.retired_floors.len() >= self.capacity && !self.retired_floors.contains_key(&key) {
+            let oldest_key = self
+                .retired_floors
+                .iter()
+                .min_by_key(|(_, floor)| floor.retirement_epoch)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest_key) = oldest_key {
+                self.retired_floors.remove(&oldest_key);
+            }
+            self.retirement_overflow = true;
+        }
+        let candidate = MonotonicFloor {
             retirement_epoch,
+            ..floor
         };
-        let replace = self.retirement_floor.is_none_or(|current| {
+        let replace = self.retired_floors.get(&key).is_none_or(|current| {
             compare_stamp(
                 candidate.generation,
                 candidate.revision,
@@ -658,7 +709,7 @@ impl HeaderHighWaterLedger {
             ) == std::cmp::Ordering::Greater
         });
         if replace {
-            self.retirement_floor = Some(candidate);
+            self.retired_floors.insert(key, candidate);
         }
     }
 }
@@ -673,7 +724,8 @@ impl fmt::Debug for HeaderHighWaterLedger {
             .field("capacity", &self.capacity)
             .field("ttl_ms", &self.ttl_ms)
             .field("last_full_resync_epoch", &self.last_full_resync_epoch)
-            .field("has_retirement_floor", &self.retirement_floor.is_some())
+            .field("retired_floor_entries", &self.retired_floors.len())
+            .field("retirement_overflow", &self.retirement_overflow)
             .field("requires_full_resync", &self.needs_full_resync)
             .finish()
     }
@@ -882,14 +934,20 @@ impl SpecialistProjection {
         let mut conflicts_rejected = 0_usize;
         let mut requires_full_resync = false;
         // When a candidate leaves the bounded top-k set its detailed
-        // watermark is retired.  Keep one coarse monotonic floor so a stale
-        // replay cannot revive that identity after the map eviction.  A
-        // newer unknown stamp is ambiguous and therefore also fails closed.
-        let mut coarse_floor: Option<AgentWaterMark> = None;
+        // watermark is retired by identity.  A global floor would suppress a
+        // legitimate update for an unrelated specialist.
+        let mut retired_watermarks: BTreeMap<AgentSessionId, AgentWaterMark> = BTreeMap::new();
         let mut last_id = None;
         let mut ordered = true;
 
         for observation in observations {
+            if scanned >= MAX_HEADER_SPECIALIST_SCAN {
+                overflowed = true;
+                source_available = false;
+                unique_count_exact = false;
+                requires_full_resync = true;
+                break;
+            }
             scanned = scanned.saturating_add(1);
             let previous_id = last_id;
             if previous_id.is_some_and(|last| observation.id < last) {
@@ -936,15 +994,23 @@ impl SpecialistProjection {
 
             let fingerprint = agent_observation_fingerprint(observation);
             if !watermarks.contains_key(&observation.id) {
-                if let Some(floor) = coarse_floor {
+                if let Some(floor) = retired_watermarks.get(&observation.id).copied() {
                     match compare_stamp(
                         observation.runtime_generation,
                         observation.revision,
                         floor.runtime_generation,
                         floor.revision,
                     ) {
-                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                            overflowed = true;
+                        std::cmp::Ordering::Less => {
+                            continue;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if floor.fingerprint == fingerprint
+                                && floor.removed == observation.removed
+                            {
+                                continue;
+                            }
+                            conflicts_rejected = conflicts_rejected.saturating_add(1);
                             source_available = false;
                             unique_count_exact = false;
                             requires_full_resync = true;
@@ -1011,8 +1077,9 @@ impl SpecialistProjection {
                     source_available = false;
                     unique_count_exact = false;
                     requires_full_resync = true;
-                    update_agent_coarse_floor(
-                        &mut coarse_floor,
+                    retire_agent_watermark(
+                        &mut retired_watermarks,
+                        observation.id,
                         AgentWaterMark {
                             runtime_generation: observation.runtime_generation,
                             revision: observation.revision,
@@ -1061,7 +1128,12 @@ impl SpecialistProjection {
                     largest_ids.pop();
                     candidates.remove(&largest);
                     if let Some(retired) = watermarks.remove(&largest) {
-                        update_agent_coarse_floor(&mut coarse_floor, retired);
+                        if !retire_agent_watermark(&mut retired_watermarks, largest, retired) {
+                            overflowed = true;
+                            source_available = false;
+                            unique_count_exact = false;
+                            requires_full_resync = true;
+                        }
                     }
                     largest_ids.push(observation.id);
                     candidates.insert(observation.id, candidate);
@@ -1178,8 +1250,15 @@ struct AgentWaterMark {
     removed: bool,
 }
 
-fn update_agent_coarse_floor(floor: &mut Option<AgentWaterMark>, candidate: AgentWaterMark) {
-    let replace = floor.is_none_or(|current| {
+fn retire_agent_watermark(
+    floors: &mut BTreeMap<AgentSessionId, AgentWaterMark>,
+    id: AgentSessionId,
+    candidate: AgentWaterMark,
+) -> bool {
+    if floors.len() >= MAX_HEADER_SPECIALISTS && !floors.contains_key(&id) {
+        return false;
+    }
+    let replace = floors.get(&id).is_none_or(|current| {
         compare_stamp(
             candidate.runtime_generation,
             candidate.revision,
@@ -1188,8 +1267,9 @@ fn update_agent_coarse_floor(floor: &mut Option<AgentWaterMark>, candidate: Agen
         ) == std::cmp::Ordering::Greater
     });
     if replace {
-        *floor = Some(candidate);
+        floors.insert(id, candidate);
     }
+    true
 }
 
 fn agent_observation_fingerprint(observation: AgentObservation<'_>) -> u64 {
@@ -1261,6 +1341,25 @@ pub enum ActionTarget {
 pub struct ProjectedAction {
     request: ActionRequest,
     target: ActionTarget,
+}
+
+/// Typed hand-off to the canonical shell.  The request is intentionally not
+/// exposed from `ProjectedAction` by itself: a shell adapter must receive the
+/// captured target and enforce its fence in the same dispatch operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderActionEnvelope {
+    request: ActionRequest,
+    target: ActionTarget,
+}
+
+impl HeaderActionEnvelope {
+    pub fn request(&self) -> &ActionRequest {
+        &self.request
+    }
+
+    pub fn target(&self) -> &ActionTarget {
+        &self.target
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1362,12 +1461,15 @@ impl ProjectedAction {
             .expect("quota-status factory always captures a matching quota stamp")
     }
 
-    pub fn request(&self) -> &ActionRequest {
-        &self.request
-    }
-
     pub fn target(&self) -> &ActionTarget {
         &self.target
+    }
+
+    pub fn into_envelope(self) -> HeaderActionEnvelope {
+        HeaderActionEnvelope {
+            request: self.request,
+            target: self.target,
+        }
     }
 
     pub fn descriptor(&self) -> &'static ActionDescriptor {
@@ -1479,6 +1581,15 @@ impl PendingHeaderActionQueue {
     pub fn drain_for_tick(&mut self, limit: usize) -> Vec<ProjectedAction> {
         let count = limit.min(self.actions.len());
         self.actions.drain(..count).collect()
+    }
+
+    /// The canonical shell consumes captures as typed envelopes so a raw
+    /// request cannot be detached from its observation/task fence.
+    pub fn drain_envelopes_for_tick(&mut self, limit: usize) -> Vec<HeaderActionEnvelope> {
+        self.drain_for_tick(limit)
+            .into_iter()
+            .map(ProjectedAction::into_envelope)
+            .collect()
     }
 }
 
@@ -2467,8 +2578,8 @@ impl TopBarModel {
                     health: observation.health,
                     label,
                     age_ms: stamp.age_ms(input.now_ms),
-                    role: AccessibleRole::Status,
-                    focusable: false,
+                    role: AccessibleRole::Button,
+                    focusable: true,
                     action: ProjectedAction::remote_status(stamp),
                     accessible_description: presentation_text(
                         &accessible_description,
@@ -2540,8 +2651,8 @@ impl TopBarModel {
                     provider_session_ref: observation.identity.provider_session_ref,
                     detail: bounded_label(&observation.detail, MAX_DETAIL_SCALARS),
                     age_ms: stamp.age_ms(input.now_ms),
-                    role: AccessibleRole::Status,
-                    focusable: false,
+                    role: AccessibleRole::Button,
+                    focusable: true,
                     action: ProjectedAction::quota_status(stamp),
                 })
             })
@@ -2763,6 +2874,8 @@ impl TopBarProjectionController {
                     == observation.identity.provider_session_ref
         });
         if !same_identity && self.input.quotas.len() >= MAX_TOP_BAR_QUOTA_CACHE {
+            self.quota_overflow_count = self.quota_overflow_count.saturating_add(1);
+            self.high_water.require_full_resync();
             return HighWaterDecision::NeedsFullResync;
         }
         let decision = self.high_water.observe(
@@ -2988,16 +3101,41 @@ impl TopBarProjectionController {
         let mut model = TopBarModel::from_input(&self.input);
         model.quota_overflow_count = self.quota_overflow_count;
         if self.quota_overflow_count != 0 {
+            let stale_quota_count = model.quotas.len();
+            let overflow_action = model
+                .quota_overflow_action
+                .clone()
+                .or_else(|| model.quotas.first().map(|quota| quota.action.clone()));
+            model.quotas.clear();
             model.quota_hidden_count = model
                 .quota_hidden_count
+                .saturating_add(stale_quota_count)
                 .saturating_add(self.quota_overflow_count);
             model.quotas_truncated = true;
-            if model.quota_overflow_action.is_none() {
-                model.quota_overflow_action =
-                    model.quotas.first().map(|quota| quota.action.clone());
+            model.quota_overflow_action = overflow_action;
+            if !model.unavailable.contains(&TopBarUnavailable::Quota) {
+                model.unavailable.push(TopBarUnavailable::Quota);
             }
+            model.accessible_description = presentation_text(
+                &format!(
+                    "Provider quota observations are unavailable; a full resync is required. {}",
+                    model.accessible_description
+                ),
+                MAX_ACCESSIBLE_SCALARS,
+            );
         }
         model
+    }
+
+    /// Advance the borrowed observation clock without requiring a new source
+    /// observation.  The canonical shell calls this from its existing tick;
+    /// it never starts a poller or a second runtime.
+    pub fn model_at(&mut self, now_ms: i64) -> TopBarModel {
+        if now_ms >= self.input.now_ms {
+            self.input.now_ms = now_ms;
+            self.high_water.expire(now_ms);
+        }
+        self.model()
     }
 
     fn seed_high_water(&mut self) {
@@ -3478,8 +3616,8 @@ fn status_link(status: TopBarStatus, label: &str, stamp: ObservationStamp) -> To
             &format!("{label} status is {}.", status_label(status)),
             MAX_ACCESSIBLE_SCALARS,
         ),
-        role: AccessibleRole::Status,
-        focusable: false,
+        role: AccessibleRole::Button,
+        focusable: true,
         action: ProjectedAction::host_status(stamp),
     }
 }
@@ -3565,29 +3703,143 @@ impl Default for TaskProjectionContext {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskHeaderModel {
-    pub identity: TaskIdentity,
-    pub title: String,
-    pub project: ProjectProjection,
-    pub workspace: WorkspaceProjection,
-    pub specialists: SpecialistProjection,
-    pub status: VisibleTaskStatus,
-    pub accessible_description: String,
+    identity: TaskIdentity,
+    title: String,
+    project: ProjectProjection,
+    workspace: WorkspaceProjection,
+    specialists: SpecialistProjection,
+    status: VisibleTaskStatus,
+    accessible_description: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectProjection {
-    pub id: ProjectId,
-    pub label: String,
+    id: ProjectId,
+    label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceProjection {
     Main,
-    Worktree { path: PathBuf, branch: String },
-    External { path: PathBuf },
+    Worktree(WorkspaceWorktree),
+    External(WorkspacePath),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceWorktree {
+    path: PathBuf,
+    branch: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspacePath(PathBuf);
+
+impl WorkspaceWorktree {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+}
+
+impl WorkspacePath {
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl ProjectProjection {
+    pub fn new(id: ProjectId, label: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            label: bounded_label(label.as_ref(), MAX_LABEL_SCALARS),
+        }
+    }
+
+    pub fn id(&self) -> ProjectId {
+        self.id
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+impl WorkspaceProjection {
+    pub fn main() -> Self {
+        Self::Main
+    }
+
+    pub fn worktree(path: impl AsRef<std::path::Path>, branch: impl AsRef<str>) -> Self {
+        Self::Worktree(WorkspaceWorktree {
+            path: bounded_path(path.as_ref()),
+            branch: bounded_label(branch.as_ref(), MAX_PROVIDER_SCALARS),
+        })
+    }
+
+    pub fn external(path: impl AsRef<std::path::Path>) -> Self {
+        Self::External(WorkspacePath(bounded_path(path.as_ref())))
+    }
+
+    fn bounded(self) -> Self {
+        match self {
+            Self::Main => Self::Main,
+            Self::Worktree(worktree) => Self::worktree(worktree.path, worktree.branch),
+            Self::External(path) => Self::external(path.0),
+        }
+    }
 }
 
 impl TaskHeaderModel {
+    pub fn new(
+        identity: TaskIdentity,
+        title: impl AsRef<str>,
+        project: ProjectProjection,
+        workspace: WorkspaceProjection,
+        specialists: SpecialistProjection,
+        status: VisibleTaskStatus,
+        accessible_description: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            identity,
+            title: bounded_label(title.as_ref(), MAX_LABEL_SCALARS),
+            project: ProjectProjection::new(project.id, project.label),
+            workspace: workspace.bounded(),
+            specialists,
+            status,
+            accessible_description: presentation_text(
+                accessible_description.as_ref(),
+                MAX_ACCESSIBLE_SCALARS,
+            ),
+        }
+    }
+
+    pub fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn project(&self) -> &ProjectProjection {
+        &self.project
+    }
+
+    pub fn workspace(&self) -> &WorkspaceProjection {
+        &self.workspace
+    }
+
+    pub fn specialists(&self) -> &SpecialistProjection {
+        &self.specialists
+    }
+
+    pub fn status(&self) -> VisibleTaskStatus {
+        self.status
+    }
+
     pub fn from_model(
         model: &ClientModel,
         task_id: TaskId,
@@ -3634,10 +3886,10 @@ impl TaskHeaderModel {
                     removed: false,
                 }),
         );
-        let project = ProjectProjection {
-            id: snapshot.task.project_id,
-            label: format!("project-{}", snapshot.task.project_id),
-        };
+        let project = ProjectProjection::new(
+            snapshot.task.project_id,
+            format!("project-{}", snapshot.task.project_id),
+        );
         let workspace = workspace_projection(&snapshot.task.workspace);
         let title = bounded_label(&snapshot.task.title, MAX_LABEL_SCALARS);
         let status = snapshot.visible_status();
@@ -3645,7 +3897,7 @@ impl TaskHeaderModel {
             &format!("Task {}. {}. Status {:?}.", title, project.label, status),
             MAX_ACCESSIBLE_SCALARS,
         );
-        Self {
+        Self::new(
             identity,
             title,
             project,
@@ -3653,7 +3905,7 @@ impl TaskHeaderModel {
             specialists,
             status,
             accessible_description,
-        }
+        )
     }
 
     pub fn task_show_action(&self) -> ProjectedAction {
@@ -3679,56 +3931,72 @@ impl TaskHeaderModel {
             "Specialists are navigated by stable session identity."
         };
         let task_action = Some(self.task_show_action());
-        let workspace_label = match &self.workspace {
-            WorkspaceProjection::Main => "Workspace: main".to_string(),
-            WorkspaceProjection::Worktree { path, branch } => {
-                format!("Workspace: {path:?} ({branch})")
-            }
-            WorkspaceProjection::External { path } => {
-                format!("Workspace: external {path:?}")
-            }
-        };
+        let workspace_label = workspace_accessible_label(&self.workspace);
         SemanticNode {
             role: AccessibleRole::Region,
             label: "Task header".to_string(),
-            description: self.accessible_description.clone(),
+            description: presentation_text(&self.accessible_description, MAX_ACCESSIBLE_SCALARS),
+            focusable: false,
             children: vec![
                 SemanticNode {
-                    role: AccessibleRole::Status,
-                    label: format!("Title: {}", self.title),
-                    description: self.accessible_description.clone(),
+                    role: AccessibleRole::Button,
+                    label: presentation_text(
+                        &format!("Title: {}", self.title),
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    description: presentation_text(
+                        &self.accessible_description,
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    focusable: true,
                     children: Vec::new(),
                     action: task_action.clone(),
                     unavailable: false,
                 },
                 SemanticNode {
-                    role: AccessibleRole::Status,
-                    label: format!("Project: {}", self.project.label),
-                    description: format!("Project {}.", self.project.label),
+                    role: AccessibleRole::Button,
+                    label: presentation_text(
+                        &format!("Project: {}", self.project.label),
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    description: presentation_text(
+                        &format!("Project {}.", self.project.label),
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    focusable: true,
                     children: Vec::new(),
                     action: task_action.clone(),
                     unavailable: false,
                 },
                 SemanticNode {
-                    role: AccessibleRole::Status,
-                    label: workspace_label,
+                    role: AccessibleRole::Button,
+                    label: presentation_text(&workspace_label, MAX_ACCESSIBLE_SCALARS),
                     description: "Workspace location.".to_string(),
+                    focusable: true,
                     children: Vec::new(),
                     action: task_action.clone(),
                     unavailable: false,
                 },
                 SemanticNode {
-                    role: AccessibleRole::Status,
-                    label: format!("Status: {:?}", self.status),
-                    description: format!("Task status is {:?}.", self.status),
+                    role: AccessibleRole::Button,
+                    label: presentation_text(
+                        &format!("Status: {:?}", self.status),
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    description: presentation_text(
+                        &format!("Task status is {:?}.", self.status),
+                        MAX_ACCESSIBLE_SCALARS,
+                    ),
+                    focusable: true,
                     children: Vec::new(),
                     action: task_action.clone(),
                     unavailable: false,
                 },
                 SemanticNode {
-                    role: AccessibleRole::Status,
+                    role: AccessibleRole::Button,
                     label: format!("{} specialist sessions", self.specialists.total_seen()),
-                    description: specialist_description.to_string(),
+                    description: presentation_text(specialist_description, MAX_ACCESSIBLE_SCALARS),
+                    focusable: true,
                     children: Vec::new(),
                     action: Some(self.task_show_action()),
                     unavailable: !self.specialists.source_available(),
@@ -3742,22 +4010,17 @@ impl TaskHeaderModel {
 
 fn workspace_projection(workspace: &WorkspaceRef) -> WorkspaceProjection {
     match workspace {
-        WorkspaceRef::Main => WorkspaceProjection::Main,
-        WorkspaceRef::Worktree { path, branch } => WorkspaceProjection::Worktree {
-            path: bounded_path(path),
-            branch: bounded_label(branch, MAX_PROVIDER_SCALARS),
-        },
-        WorkspaceRef::External { path } => WorkspaceProjection::External {
-            path: bounded_path(path),
-        },
+        WorkspaceRef::Main => WorkspaceProjection::main(),
+        WorkspaceRef::Worktree { path, branch } => WorkspaceProjection::worktree(path, branch),
+        WorkspaceRef::External { path } => WorkspaceProjection::external(path),
     }
 }
 
 fn bounded_path(path: &std::path::Path) -> PathBuf {
-    PathBuf::from(presentation_text(
-        &path.to_string_lossy(),
-        MAX_WORKSPACE_PATH_SCALARS,
-    ))
+    let Some(path) = path.to_str() else {
+        return PathBuf::from("Unavailable");
+    };
+    PathBuf::from(presentation_text(path, MAX_WORKSPACE_PATH_SCALARS))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3777,11 +4040,30 @@ pub enum TitleLayout {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderOverflowControl {
+    pub label: String,
+    pub description: String,
+    pub focusable: bool,
+    pub action: HeaderAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderOverflowItem {
+    pub field: HeaderField,
+    pub label: String,
+    pub description: String,
+    pub focusable: bool,
+    pub action: HeaderAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderLayout {
     pub inline: Vec<HeaderField>,
     pub overflow: Vec<HeaderField>,
     pub title: TitleLayout,
     pub overflow_label: Option<String>,
+    pub overflow_control: Option<HeaderOverflowControl>,
+    pub overflow_items: Vec<HeaderOverflowItem>,
     pub accessible_description: String,
 }
 
@@ -3834,11 +4116,35 @@ impl HeaderLayout {
         };
         let overflow_label =
             (!overflow.is_empty()).then(|| format!("{} more task header fields", overflow.len()));
+        let overflow_control = overflow_label.as_ref().map(|label| HeaderOverflowControl {
+            label: presentation_text(label, MAX_ACCESSIBLE_SCALARS),
+            description: presentation_text(
+                "Open the task header fields menu.",
+                MAX_ACCESSIBLE_SCALARS,
+            ),
+            focusable: true,
+            action: model.task_show_action(),
+        });
+        let overflow_items = overflow
+            .iter()
+            .map(|field| HeaderOverflowItem {
+                field: *field,
+                label: header_field_label(model, *field),
+                description: presentation_text(
+                    &format!("Open the {} task header field.", header_field_name(*field)),
+                    MAX_ACCESSIBLE_SCALARS,
+                ),
+                focusable: true,
+                action: model.task_show_action(),
+            })
+            .collect();
         Self {
             inline,
             overflow,
             title,
             overflow_label,
+            overflow_control,
+            overflow_items,
             accessible_description: presentation_text(
                 &model.accessible_description,
                 MAX_ACCESSIBLE_SCALARS,
@@ -3857,6 +4163,45 @@ impl HeaderLayout {
         };
         Self::for_model(model, logical_width)
     }
+}
+
+fn workspace_accessible_label(workspace: &WorkspaceProjection) -> String {
+    match workspace {
+        WorkspaceProjection::Main => "Workspace: main".to_string(),
+        WorkspaceProjection::Worktree(worktree) => {
+            format!(
+                "Workspace: {} ({})",
+                worktree.path.to_string_lossy(),
+                worktree.branch
+            )
+        }
+        WorkspaceProjection::External(path) => {
+            format!("Workspace: external {}", path.0.to_string_lossy())
+        }
+    }
+}
+
+fn header_field_name(field: HeaderField) -> &'static str {
+    match field {
+        HeaderField::Title => "title",
+        HeaderField::Project => "project",
+        HeaderField::Workspace => "workspace",
+        HeaderField::Specialists => "specialists",
+        HeaderField::Status => "status",
+    }
+}
+
+fn header_field_label(model: &TaskHeaderModel, field: HeaderField) -> String {
+    let label = match field {
+        HeaderField::Title => format!("Title: {}", model.title),
+        HeaderField::Project => format!("Project: {}", model.project.label),
+        HeaderField::Workspace => workspace_accessible_label(&model.workspace),
+        HeaderField::Specialists => {
+            format!("{} specialist sessions", model.specialists.total_seen())
+        }
+        HeaderField::Status => format!("Status: {:?}", model.status),
+    };
+    presentation_text(&label, MAX_ACCESSIBLE_SCALARS)
 }
 
 fn truncate_with_ellipsis(value: &str, max_scalars: usize) -> String {
@@ -3913,76 +4258,14 @@ fn wrap_title(value: &str, max_line_scalars: usize) -> Vec<String> {
 }
 
 /// Small, allocation-bounded grapheme segmentation for header text.  The
-/// component cannot add a second Unicode dependency just for layout, so this
-/// handles the cluster classes relevant to task titles: combining marks,
-/// variation selectors, emoji modifiers, ZWJ sequences, and flag pairs.
+/// audited Unicode crate handles the complete extended-grapheme rules,
+/// including combining, Indic, Hangul, emoji, and regional-indicator
+/// sequences; the caller never needs more than one over-bound sentinel.
 fn grapheme_slices(value: &str) -> Vec<&str> {
-    if value.is_empty() {
-        return Vec::new();
-    }
-    let mut starts = vec![0_usize];
-    let mut characters = value.char_indices();
-    let (_, first) = characters
-        .next()
-        .expect("nonempty value has a first scalar");
-    let mut previous = Some(first);
-    let mut regional_run = usize::from(is_regional_indicator(first));
-    for (index, character) in characters {
-        let joins = is_grapheme_extend(character)
-            || previous == Some('\u{200d}')
-            || character == '\u{200d}'
-            || (is_regional_indicator(character)
-                && previous.is_some_and(is_regional_indicator)
-                && regional_run % 2 == 1);
-        if !joins {
-            starts.push(index);
-        }
-        if is_regional_indicator(character) {
-            regional_run = regional_run.saturating_add(1);
-        } else {
-            regional_run = 0;
-        }
-        previous = Some(character);
-    }
-    starts.push(value.len());
-    starts
-        .windows(2)
-        .map(|window| &value[window[0]..window[1]])
+    value
+        .graphemes(true)
+        .take(MAX_LABEL_SCALARS.saturating_add(1))
         .collect()
-}
-
-fn is_regional_indicator(character: char) -> bool {
-    matches!(character as u32, 0x1f1e6..=0x1f1ff)
-}
-
-fn is_grapheme_extend(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x0300..=0x036f
-            | 0x0483..=0x0489
-            | 0x0591..=0x05bd
-            | 0x05bf
-            | 0x05c1..=0x05c2
-            | 0x05c4..=0x05c5
-            | 0x0610..=0x061a
-            | 0x064b..=0x065f
-            | 0x0670
-            | 0x06d6..=0x06dc
-            | 0x06df..=0x06e4
-            | 0x06e7..=0x06e8
-            | 0x06ea..=0x06ed
-            | 0x1ab0..=0x1aff
-            | 0x1dc0..=0x1dff
-            | 0x20d0..=0x20ff
-            | 0x2cef..=0x2cf1
-            | 0x302a..=0x302f
-            | 0xa66f..=0xa67f
-            | 0xa69e..=0xa69f
-            | 0xfe00..=0xfe0f
-            | 0xff9e..=0xff9f
-            | 0x1f3fb..=0x1f3ff
-            | 0xe0100..=0xe01ef
-    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3990,6 +4273,7 @@ pub struct SemanticNode {
     pub role: AccessibleRole,
     pub label: String,
     pub description: String,
+    pub focusable: bool,
     pub children: Vec<SemanticNode>,
     pub action: Option<HeaderAction>,
     pub unavailable: bool,
