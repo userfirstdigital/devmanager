@@ -1,0 +1,49 @@
+{
+  "host": {
+    "enabled": true,
+    "bindAddress": "127.0.0.1",
+    "port": 43871,
+    "keepHostingInBackground": false,
+    "serverId": "fixture-host-server-id",
+    "pairingToken": "H4K7M2NP",
+    "certificatePem": "SANITIZED-NOT-A-CERTIFICATE",
+    "privateKeyPem": "SANITIZED-NOT-A-PRIVATE-KEY",
+    "certificateFingerprint": "fixture-cert-fingerprint",
+    "pairedClients": [
+      {
+        "clientId": "fixture-native-client",
+        "label": "Office desktop",
+        "authToken": "SANITIZED-NATIVE-AUTH-TOKEN",
+        "lastSeenEpochMs": 1700000001000
+      }
+    ],
+    "web": {
+      "enabled": true,
+      "bindAddress": "127.0.0.1",
+      "port": 43872,
+      "pairingToken": "X3Y8Z2QW",
+      "cookieSecretHex": "00",
+      "pairedClients": [
+        {
+          "clientId": "fixture-web-client",
+          "browserInstallId": "fixture-browser-install",
+          "nickname": "Kitchen phone",
+          "label": "Safari iPhone",
+          "issuedAtEpochMs": 1700000002000,
+          "lastSeenEpochMs": 1700000003000,
+          "lastSeenIp": "203.0.113.10",
+          "userAgent": "fixture-user-agent",
+          "browserFamily": "Safari",
+          "browserVersion": "17.4",
+          "osFamily": "iOS",
+          "deviceClass": "phone"
+        }
+      ],
+      "activityLog": [],
+      "push": {
+        "enabled": false
+      }
+    }
+  },
+  "knownHosts": []
+}

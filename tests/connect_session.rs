@@ -162,14 +162,16 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::PairedOwner,
             task_id: None,
             action: ActionId::APPROVE_DANGEROUS,
+            credential: None,
         }),
-        PermissionDecision::Allow
+        PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
     );
     assert_eq!(
         evaluator.evaluate(PermissionRequest {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::READ_TASK,
+            credential: None,
         }),
         PermissionDecision::Allow
     );
@@ -178,6 +180,7 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
+            credential: None,
         }),
         PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
     ));
@@ -186,6 +189,7 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::Collaborator { task_id: task },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
+            credential: None,
         }),
         PermissionDecision::Allow
     );
@@ -196,6 +200,7 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             },
             task_id: Some(task),
             action: ActionId::MUTATE_TASK,
+            credential: None,
         }),
         PermissionDecision::Denied(PermissionDenyReason::TaskScopeMismatch)
     ));
@@ -204,6 +209,7 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::Collaborator { task_id: task },
             task_id: Some(task),
             action: ActionId::APPROVE_DANGEROUS,
+            credential: None,
         }),
         PermissionDecision::Denied(PermissionDenyReason::OwnerOnly)
     ));
@@ -212,6 +218,7 @@ fn permission_evaluator_is_task_scoped_and_watcher_never_mutates() {
             role: ConnectRole::Watcher { task_id: task },
             task_id: Some(task),
             action: ActionId::new(0x7fff).expect("unknown action"),
+            credential: None,
         }),
         PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
     ));

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU16;
 
+use crate::connect::DeviceCredentialProof;
 use crate::domain::id::TaskId;
 
 /// Stable action discriminant. Unknown nonzero values are denied, never
@@ -98,6 +99,10 @@ pub struct PermissionRequest {
     pub role: ConnectRole,
     pub task_id: Option<TaskId>,
     pub action: ActionId,
+    /// Opaque current registered, non-revoked, host-bound credential.
+    /// A raw DeviceId is never sufficient; mint via `bind_device_credential`.
+    /// HOLD: live connection/session/epoch wiring remains outside this slice.
+    pub credential: Option<DeviceCredentialProof>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +113,7 @@ pub enum PermissionDenyReason {
     WatcherReadOnly,
     OwnerOnly,
     CollaboratorWriteDisabled,
+    DeviceCredentialRequired,
 }
 
 impl fmt::Display for PermissionDenyReason {
@@ -119,6 +125,9 @@ impl fmt::Display for PermissionDenyReason {
             Self::WatcherReadOnly => "Watcher grants are read-only",
             Self::OwnerOnly => "the action is Owner-only",
             Self::CollaboratorWriteDisabled => "Collaborator writes are disabled",
+            Self::DeviceCredentialRequired => {
+                "PairedOwner actions require a verified device credential"
+            }
         })
     }
 }
@@ -160,7 +169,12 @@ impl PermissionEvaluator {
         };
 
         match request.role {
-            ConnectRole::PairedOwner => PermissionDecision::Allow,
+            ConnectRole::PairedOwner => match request.credential {
+                Some(proof) if proof.session_epoch() != 0 && proof.host_generation() != 0 => {
+                    PermissionDecision::Allow
+                }
+                _ => PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired),
+            },
             ConnectRole::Watcher { task_id } => {
                 if !matches!(request.task_id, Some(requested) if requested == task_id) {
                     return PermissionDecision::Denied(match request.task_id {
@@ -204,5 +218,54 @@ impl PermissionEvaluator {
 impl Default for PermissionEvaluator {
     fn default() -> Self {
         Self::new(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connect::DeviceId;
+
+    #[test]
+    fn paired_owner_cannot_approve_dangerous_without_device_credential() {
+        let decision = PermissionEvaluator::owner_only().evaluate(PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id: None,
+            action: ActionId::APPROVE_DANGEROUS,
+            credential: None,
+        });
+        assert_eq!(
+            decision,
+            PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+        );
+    }
+
+    #[test]
+    fn paired_owner_does_not_authorize_arbitrary_device_id() {
+        let _forged = DeviceId::new();
+        let decision = PermissionEvaluator::owner_only().evaluate(PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id: None,
+            action: ActionId::APPROVE_DANGEROUS,
+            credential: None,
+        });
+        assert_eq!(
+            decision,
+            PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+        );
+    }
+
+    #[test]
+    fn paired_owner_cannot_read_without_device_credential() {
+        let decision = PermissionEvaluator::owner_only().evaluate(PermissionRequest {
+            role: ConnectRole::PairedOwner,
+            task_id: None,
+            action: ActionId::READ_TASK,
+            credential: None,
+        });
+        assert_eq!(
+            decision,
+            PermissionDecision::Denied(PermissionDenyReason::DeviceCredentialRequired)
+        );
     }
 }
