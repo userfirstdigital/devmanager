@@ -2,7 +2,7 @@ use crate::models::{PortStatus, TabType};
 use crate::remote::presentation::{
     SemanticAdapterHealth, SemanticAttention, SemanticSessionMetadata, StableSessionKey,
 };
-use crate::remote::{RemotePortAuthority, RemotePortAuthorityKind};
+use crate::remote::{RemotePortAuthority, RemotePortAuthorityKind, RemotePortDiagnostic};
 use crate::state::{
     AiActivity, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
     SessionStatus,
@@ -218,6 +218,20 @@ pub enum WebPortAuthorityKind {
     Occupied,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebPortDiagnostic {
+    ProbeError,
+}
+
+impl From<RemotePortDiagnostic> for WebPortDiagnostic {
+    fn from(value: RemotePortDiagnostic) -> Self {
+        match value {
+            RemotePortDiagnostic::ProbeError => Self::ProbeError,
+        }
+    }
+}
+
 impl From<RemotePortAuthorityKind> for WebPortAuthorityKind {
     fn from(value: RemotePortAuthorityKind) -> Self {
         match value {
@@ -250,6 +264,7 @@ pub enum WebPortControlReason {
 pub struct WebPortAuthority {
     pub port: u16,
     pub kind: WebPortAuthorityKind,
+    pub diagnostic: Option<WebPortDiagnostic>,
     pub resource_generation: Option<u64>,
     pub listeners: Vec<WebPortListenerIdentity>,
     pub session_id: Option<String>,
@@ -337,6 +352,7 @@ impl WebPortAuthority {
         Self {
             port: authority.port,
             kind,
+            diagnostic: authority.diagnostic.map(WebPortDiagnostic::from),
             resource_generation: authority
                 .resource
                 .map(|resource| resource.runtime_generation),
@@ -704,6 +720,7 @@ mod tests {
         let authority = RemotePortAuthority {
             port: 43872,
             kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(crate::domain::operation::ResourceFence::new(
                 crate::domain::id::ResourceId::new(),
                 7,

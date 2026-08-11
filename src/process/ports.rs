@@ -1270,7 +1270,7 @@ fn status_for_authority(
 ) -> PortStatus {
     let kind = match authority {
         PortAuthority::Free => PortStatusKind::Stopped,
-        PortAuthority::ProbeError => PortStatusKind::Unknown,
+        PortAuthority::ProbeError => PortStatusKind::ProbeError,
         PortAuthority::ProvenExternal => PortStatusKind::ProvenExternal,
         PortAuthority::Unknown => PortStatusKind::Unknown,
         PortAuthority::Managed => {
@@ -1365,7 +1365,7 @@ pub fn project_port_status_at(
         PortObservation::ProbeError(detail) => PortStatus {
             port: target.port,
             resource: target.resource,
-            kind: PortStatusKind::Unknown,
+            kind: PortStatusKind::ProbeError,
             listeners: Arc::from([]),
             error: Some(bounded_sanitized_detail(detail)),
         },

@@ -10,9 +10,10 @@ use devmanager::domain::id::ResourceId;
 use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::ports::{
-    classify_port_authority, classify_port_authority_from_snapshot, ensure_managed_start_allowed,
-    launch_if_port_free, launch_if_port_free_with_revalidation, project_port_status,
-    project_port_status_at, project_port_status_from_snapshot,
+    classify_port_authority, classify_port_authority_from_snapshot,
+    classify_port_authority_from_snapshot_with_membership_reconciliation_at,
+    ensure_managed_start_allowed, launch_if_port_free, launch_if_port_free_with_revalidation,
+    project_port_status, project_port_status_at, project_port_status_from_snapshot,
     project_port_status_from_snapshot_with_membership_reconciliation_at, ListenerIdentity,
     ManagedPortHealth, ManagedProcessSnapshotValidity, ManagedResourceSnapshot, PortAuthority,
     PortInventorySnapshot, PortObservation, PortObservationIssue, PortScanError, PortStartError,
@@ -502,11 +503,13 @@ fn valid_registry_snapshot_can_prove_a_listener_external() {
 #[test]
 fn membership_change_after_listener_scan_cannot_paint_external_blue() {
     let resource = fence(19, 1);
-    let (mut registry, managed_fence) = registry_with_root(resource, 11_019, 1_919);
+    let (mut registry, managed_fence, active) =
+        registry_with_root_control(resource, 11_019, 1_919, true, true);
     registry
         .commit_resumed_exact(&managed_fence)
         .expect("resume generation");
     let first = current_registry_snapshot(&registry, resource);
+    active.store(false, Ordering::Release);
     let second = current_registry_snapshot(&registry, resource);
     let port = 43_019;
     let snapshot = PortInventorySnapshot::with_endpoints(
@@ -545,6 +548,56 @@ fn membership_change_after_listener_scan_cannot_paint_external_blue() {
     );
     assert_eq!(status.kind(), PortStatusKind::Unknown);
     assert_eq!(status.listener(), Some(listener(11_020, 2_020)));
+}
+
+#[test]
+fn unchanged_registry_membership_reconciles_against_same_stable_revision() {
+    let resource = fence(190, 1);
+    let (mut registry, managed_fence) = registry_with_root(resource, 11_190, 1_990);
+    registry
+        .commit_resumed_exact(&managed_fence)
+        .expect("resume generation");
+    let first = current_registry_snapshot(&registry, resource);
+    let second = current_registry_snapshot(&registry, resource);
+    assert_eq!(
+        first.membership_revision(),
+        second.membership_revision(),
+        "unchanged membership must retain its revision"
+    );
+    assert_eq!(
+        first.observation_sequence(),
+        second.observation_sequence(),
+        "unchanged membership must retain its observation sequence"
+    );
+
+    let port = 43_190;
+    let snapshot = PortInventorySnapshot::with_endpoints(
+        BTreeMap::from([(port, single_listener(listener(11_190, 1_990)))]),
+        BTreeMap::from([(
+            port,
+            vec![TcpEndpoint::tcp(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                listener(11_190, 1_990),
+            )],
+        )]),
+    );
+    let target = PortTarget::new(port, resource, ManagedPortHealth::Ready);
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(1);
+
+    assert!(first.same_authoritative_membership(&second, now, deadline));
+    assert_eq!(
+        classify_port_authority_from_snapshot_with_membership_reconciliation_at(
+            &target,
+            &snapshot,
+            Some(&first),
+            Some(&second),
+            now,
+            deadline,
+        ),
+        PortAuthority::Managed
+    );
 }
 
 #[test]
@@ -590,7 +643,7 @@ fn probe_failure_is_not_treated_as_free() {
         None,
     );
 
-    assert_eq!(status.kind(), PortStatusKind::Unknown);
+    assert_eq!(status.kind(), PortStatusKind::ProbeError);
     assert_eq!(status.error(), Some("listener table unavailable"));
 }
 

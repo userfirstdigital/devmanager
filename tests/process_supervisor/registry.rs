@@ -45,6 +45,7 @@ struct DropSpy {
     id: u8,
     dropped: Arc<Mutex<Vec<u8>>>,
     membership: Arc<Mutex<Result<Vec<u32>, String>>>,
+    root_identity: Option<ManagedProcessIdentity>,
 }
 
 impl DropSpy {
@@ -69,6 +70,7 @@ impl DropSpy {
             id,
             dropped: Arc::clone(dropped),
             membership,
+            root_identity: None,
         }
     }
 }
@@ -76,6 +78,18 @@ impl DropSpy {
 impl JobMembership for DropSpy {
     fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.membership.lock().expect("membership state").clone()
+    }
+
+    fn inspect_process(
+        &self,
+        pid: u32,
+    ) -> Result<devmanager::process::registry::JobMemberInfo, String> {
+        self.root_identity
+            .as_ref()
+            .filter(|identity| identity.id().pid() == pid)
+            .cloned()
+            .map(|identity| devmanager::process::registry::JobMemberInfo::new(identity, None))
+            .ok_or_else(|| format!("process identity for PID {pid} is inaccessible"))
     }
 }
 
@@ -92,6 +106,8 @@ fn registration(
     root: ManagedProcessIdentity,
     job: DropSpy,
 ) -> RegisteredProcess<DropSpy> {
+    let mut job = job;
+    job.root_identity = Some(root.clone());
     RegisteredProcess::new(
         ResourceFence::new(resource_id, generation),
         owner,

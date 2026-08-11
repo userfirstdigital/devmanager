@@ -149,6 +149,8 @@ export interface WebPortListenerIdentity {
 export interface WebPortAuthority {
   port: number;
   kind: WebPortAuthorityKind;
+  /** Typed, path-free diagnostic; older hosts may omit this additive field. */
+  diagnostic?: "probeError" | null;
   resourceGeneration: number | null;
   listeners: WebPortListenerIdentity[];
   sessionId: string | null;

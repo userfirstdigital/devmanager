@@ -205,7 +205,7 @@ pub struct RemoteWorkspaceDelta {
     pub you_have_control: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum RemotePortAuthorityKind {
     Managed,
@@ -215,6 +215,15 @@ pub enum RemotePortAuthorityKind {
     ProbeError,
     Free,
     Occupied,
+}
+
+/// Wire-safe, path-free diagnostics for an authority that could not be
+/// established. The concrete probe text remains host-local and never crosses
+/// the remote/web boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum RemotePortDiagnostic {
+    ProbeError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +267,8 @@ impl VerifiedPortAuthority {
 pub struct RemotePortAuthority {
     pub port: u16,
     pub kind: RemotePortAuthorityKind,
+    #[serde(default)]
+    pub diagnostic: Option<RemotePortDiagnostic>,
     pub resource: Option<ResourceFence>,
     pub listeners: Vec<RemoteListenerIdentity>,
     /// The host session that owns this listener authority. This is explicit
@@ -307,9 +318,12 @@ impl RemotePortAuthority {
             RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
         )
         .then_some(status.resource);
+        let diagnostic = (kind == RemotePortAuthorityKind::ProbeError)
+            .then_some(RemotePortDiagnostic::ProbeError);
         Self {
             port: status.port,
             kind,
+            diagnostic,
             resource,
             listeners: status
                 .listeners()
@@ -333,7 +347,10 @@ impl RemotePortAuthority {
                 .saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
             managed_fence_fingerprint: None,
             verified: None,
-            error: status.error().map(str::to_string),
+            error: diagnostic
+                .is_none()
+                .then(|| status.error().map(str::to_string))
+                .flatten(),
         }
     }
 
@@ -404,6 +421,7 @@ impl RemotePortAuthority {
             self.kind,
             RemotePortAuthorityKind::Managed | RemotePortAuthorityKind::ManagedUnready
         ) || self.resource.is_none()
+            || self.diagnostic.is_some()
             || self
                 .resource
                 .is_some_and(|resource| resource.runtime_generation == 0)
@@ -551,6 +569,7 @@ fn remote_authority_projection_fingerprint(authority: &RemotePortAuthority) -> u
     authority.observed_at_epoch_ms.hash(&mut hasher);
     authority.freshness_deadline_epoch_ms.hash(&mut hasher);
     authority.managed_fence_fingerprint.hash(&mut hasher);
+    authority.diagnostic.hash(&mut hasher);
     authority.error.hash(&mut hasher);
     hasher.finish()
 }
@@ -9406,6 +9425,28 @@ mod tests {
     }
 
     #[test]
+    fn remote_probe_error_is_typed_and_does_not_export_raw_detail() {
+        let status = crate::process::ports::PortStatus {
+            port: 43124,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: Arc::from([]),
+            error: Some("C:\\private\\listener-table.txt".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::ProbeError);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
+        assert_eq!(authority.error, None);
+        let wire = serde_json::to_string(&authority).expect("serialize remote authority");
+        assert!(wire.contains("probeError"));
+        assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
     fn legacy_pid_only_port_status_cannot_prove_remote_forward_authority() {
         let mut session = SessionRuntimeState::new(
             "remote-port-authority",
@@ -9419,6 +9460,7 @@ mod tests {
         let authority = RemotePortAuthority {
             port: 43123,
             kind: RemotePortAuthorityKind::Unknown,
+            diagnostic: None,
             resource: None,
             listeners: Vec::new(),
             session_id: None,
@@ -9452,6 +9494,7 @@ mod tests {
         let authority = RemotePortAuthority {
             port: 43123,
             kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
             listeners: vec![RemoteListenerIdentity {
                 pid: 4242,
@@ -9521,6 +9564,7 @@ mod tests {
         let authority = RemotePortAuthority {
             port: 43123,
             kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(resource),
             listeners: vec![RemoteListenerIdentity {
                 pid: 4242,
@@ -9704,6 +9748,7 @@ mod tests {
         let mut authority = RemotePortAuthority {
             port: 43123,
             kind: RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(ResourceFence::new(crate::domain::id::ResourceId::new(), 7)),
             listeners: vec![RemoteListenerIdentity {
                 pid: 4242,

@@ -9,8 +9,8 @@ use devmanager::domain::operation::ResourceFence;
 use devmanager::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use devmanager::process::registry::{
     JobCompletionEvent, JobCompletionMessage, JobMemberInfo, JobMembership, ManagedProcessFence,
-    ManagedProcessState, ProcessDisplayLabel, ProcessRegistry, RegisteredProcess,
-    UnregisterOutcome,
+    ManagedProcessState, OwnershipFault, ProcessClassification, ProcessDisplayLabel,
+    ProcessRegistry, RegisteredProcess, UnregisterOutcome,
 };
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
@@ -152,6 +152,31 @@ fn member(pid: u32, creation_time_100ns: u64, command_line: &str) -> JobMemberIn
         identity(pid, creation_time_100ns, &executable()),
         Some(command_line.to_string()),
     )
+}
+
+#[test]
+fn classify_root_rejects_live_job_root_pid_reuse() {
+    let resource = resource_id(200);
+    let root = identity(1_200, 12_000, &executable());
+    let replacement = member(1_200, 12_001, "replacement");
+    let job = ScriptedJob::with_root(root.id().pid());
+    let mut registry = ProcessRegistry::new();
+    registry
+        .register(registration(resource, 1, root.clone(), job.clone()))
+        .expect("registration");
+
+    job.set_snapshot(
+        vec![root.id().pid()],
+        vec![(root.id().pid(), Ok(replacement))],
+    );
+
+    assert!(matches!(
+        registry.classify_root(&root),
+        ProcessClassification::ReconciliationFault {
+            reason: OwnershipFault::IdentityMismatch,
+            ..
+        }
+    ));
 }
 
 #[test]

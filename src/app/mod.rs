@@ -553,6 +553,10 @@ struct ServerPortSnapshotState {
     refresh_generation: u64,
     task_action_epoch: u64,
     active_refresh: Option<PortRefreshFence>,
+    /// Stable sentinel for a port with no host-verified managed resource.
+    /// This is never a managed authority; it only keeps typed projections
+    /// from minting a new wire identity on every refresh.
+    no_managed_resource: Option<crate::domain::operation::ResourceFence>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7084,6 +7088,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         if focus {
                             self.interrupt_active_browser_replay_before_route_change(None);
                         }
@@ -7106,6 +7115,11 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::StopServer { command_id } => {
+                    let port = self
+                        .state
+                        .find_command(&command_id)
+                        .and_then(|lookup| lookup.command.port);
+                    self.invalidate_server_port_snapshot(port);
                     match self.process_manager.enqueue_stop_server_and_wait(
                         &command_id,
                         Duration::ZERO,
@@ -7130,6 +7144,11 @@ impl NativeShell {
                     {
                         RemoteActionResult::error(error)
                     } else {
+                        let port = self
+                            .state
+                            .find_command(&command_id)
+                            .and_then(|lookup| lookup.command.port);
+                        self.invalidate_server_port_snapshot(port);
                         self.interrupt_active_browser_replay_before_route_change(None);
                         match self.process_manager.restart_server_with_remote_response(
                             &mut self.state,
@@ -12056,6 +12075,15 @@ impl NativeShell {
         let resource_generation = local_stable_hash(&runtime.sessions);
         let managed_snapshot_generation =
             local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let no_managed_resource = *self
+            .server_port_snapshot
+            .no_managed_resource
+            .get_or_insert_with(|| {
+                crate::domain::operation::ResourceFence::new(
+                    crate::domain::id::ResourceId::new(),
+                    0,
+                )
+            });
         let refresh_fence = PortRefreshFence {
             generation: self
                 .server_port_snapshot
@@ -12094,6 +12122,7 @@ impl NativeShell {
                                 Ok(snapshot) => project_typed_port_snapshot(
                                     &snapshot,
                                     &ports,
+                                    no_managed_resource,
                                     &HashMap::new(),
                                     &managed_candidate_ports,
                                 ),
@@ -12959,7 +12988,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::StartServer {
                 command_id: command_id.to_string(),
@@ -12976,10 +13010,6 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         if focus_started_server {
             self.interrupt_active_browser_replay_before_route_change(None);
         }
@@ -13011,7 +13041,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             self.remote_send_action(RemoteAction::StopServer {
                 command_id: command_id.to_string(),
             });
@@ -13020,10 +13055,6 @@ impl NativeShell {
             return;
         }
 
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         let command_id = command_id.to_string();
         if let Some(state) = self.active_port_state.as_mut() {
@@ -13065,7 +13096,12 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
         if self.remote_mode.is_some() {
+            self.invalidate_server_port_snapshot(port);
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::RestartServer {
                 command_id: command_id.to_string(),
@@ -13078,10 +13114,6 @@ impl NativeShell {
 
         self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
-        let port = self
-            .state
-            .find_command(command_id)
-            .and_then(|lookup| lookup.command.port);
         self.invalidate_server_port_snapshot(port);
         match self
             .process_manager
@@ -16825,6 +16857,7 @@ fn project_legacy_port_snapshot(
 fn project_typed_port_snapshot(
     snapshot: &crate::process::ports::PortInventorySnapshot,
     ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
     managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
     managed_candidate_ports: &std::collections::HashSet<u16>,
 ) -> PortRefreshProjection {
@@ -16838,12 +16871,7 @@ fn project_typed_port_snapshot(
         let resource = managed
             .get(&port)
             .map(crate::process::ports::ManagedResourceSnapshot::resource)
-            .unwrap_or_else(|| {
-                crate::domain::operation::ResourceFence::new(
-                    crate::domain::id::ResourceId::new(),
-                    1,
-                )
-            });
+            .unwrap_or(no_managed_resource);
         let target = crate::process::ports::PortTarget::new(
             port,
             resource,
@@ -21484,6 +21512,7 @@ mod tests {
         let projection = project_typed_port_snapshot(
             &snapshot,
             &[port],
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
             &HashMap::new(),
             &std::collections::HashSet::new(),
         );
@@ -21503,6 +21532,44 @@ mod tests {
                 &HashMap::new(),
             ),
             sidebar::ServerIndicatorState::Unknown
+        );
+    }
+
+    #[test]
+    fn no_managed_projection_reuses_stable_sentinel_fence() {
+        let port = 5175;
+        let snapshot =
+            crate::process::ports::PortInventorySnapshot::new(std::collections::BTreeMap::from([
+                (port, crate::process::ports::PortObservation::Free),
+            ]))
+            .with_publication_sequence(1);
+        let sentinel =
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0);
+        let first = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let second = project_typed_port_snapshot(
+            &snapshot,
+            &[port],
+            sentinel,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            first.authorities.get(&port).map(|status| status.resource),
+            second.authorities.get(&port).map(|status| status.resource)
+        );
+        assert_eq!(
+            first
+                .authorities
+                .get(&port)
+                .map(|status| status.resource.runtime_generation),
+            Some(0)
         );
     }
 
@@ -21538,6 +21605,7 @@ mod tests {
         let authority = remote::RemotePortAuthority {
             port: 5174,
             kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
             resource: None,
             listeners: Vec::new(),
             session_id: None,
@@ -21564,6 +21632,7 @@ mod tests {
         let authority = remote::RemotePortAuthority {
             port: 5174,
             kind: remote::RemotePortAuthorityKind::ProvenExternal,
+            diagnostic: None,
             resource: None,
             listeners: vec![remote::RemoteListenerIdentity {
                 pid: 42,
@@ -21625,6 +21694,7 @@ mod tests {
         let mut authority = remote::RemotePortAuthority {
             port: 5174,
             kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(crate::domain::operation::ResourceFence::new(
                 crate::domain::id::ResourceId::new(),
                 7,
@@ -21688,6 +21758,7 @@ mod tests {
         let mut authority = remote::RemotePortAuthority {
             port: 5174,
             kind: remote::RemotePortAuthorityKind::Managed,
+            diagnostic: None,
             resource: Some(crate::domain::operation::ResourceFence::new(
                 crate::domain::id::ResourceId::new(),
                 7,
