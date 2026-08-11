@@ -23,6 +23,13 @@ pub const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 pub const PREVIEW_WINDOW_WIDTH: i32 = 640;
 pub const PREVIEW_WINDOW_HEIGHT: i32 = 360;
 
+pub const PREVIEW_CONTENT_WIDTH: u32 = PREVIEW_WINDOW_WIDTH as u32;
+pub const PREVIEW_CONTENT_HEIGHT: u32 = PREVIEW_WINDOW_HEIGHT as u32;
+
+pub const fn preview_content_size_is_exact(width: u32, height: u32) -> bool {
+    width == PREVIEW_CONTENT_WIDTH && height == PREVIEW_CONTENT_HEIGHT
+}
+
 /// Maximum byte length of any capture diagnostic rendered for the UI.
 pub const MAX_CLEANUP_DIAGNOSTIC_BYTES: usize = 4096;
 /// Marker appended when a capture diagnostic reaches its byte or depth limit.
@@ -234,12 +241,18 @@ pub struct ValidatedWindow {
     pub hwnd: NativeHwnd,
     pub width: u32,
     pub height: u32,
+    pub client_width: u32,
+    pub client_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureReport {
     pub width: u32,
     pub height: u32,
+    pub window_width: u32,
+    pub window_height: u32,
+    pub client_width: u32,
+    pub client_height: u32,
     pub foreground_before: isize,
     pub foreground_after: isize,
 }
@@ -612,6 +625,75 @@ mod windows_capture_impl {
         bgra: Vec<u8>,
     }
 
+    fn normalize_captured_frame(
+        frame: CapturedFrame,
+    ) -> Result<CapturedFrame, PreviewCaptureError> {
+        if preview_content_size_is_exact(frame.width, frame.height) {
+            return Ok(frame);
+        }
+        if frame.width < PREVIEW_CONTENT_WIDTH || frame.height < PREVIEW_CONTENT_HEIGHT {
+            return Err(PreviewCaptureError::CaptureFailed(format!(
+                "captured frame is {}x{}, smaller than exact {}x{} content",
+                frame.width, frame.height, PREVIEW_CONTENT_WIDTH, PREVIEW_CONTENT_HEIGHT
+            )));
+        }
+
+        let source_width = usize::try_from(frame.width).map_err(|_| {
+            PreviewCaptureError::CaptureFailed("captured frame width overflowed".into())
+        })?;
+        let source_height = usize::try_from(frame.height).map_err(|_| {
+            PreviewCaptureError::CaptureFailed("captured frame height overflowed".into())
+        })?;
+        let source_row_bytes = source_width.checked_mul(4).ok_or_else(|| {
+            PreviewCaptureError::CaptureFailed("captured frame row size overflowed".into())
+        })?;
+        let expected_row_bytes = usize::try_from(PREVIEW_CONTENT_WIDTH)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| {
+                PreviewCaptureError::CaptureFailed("content row size overflowed".into())
+            })?;
+        let expected_bytes = expected_row_bytes
+            .checked_mul(usize::try_from(PREVIEW_CONTENT_HEIGHT).unwrap_or(0))
+            .ok_or_else(|| {
+                PreviewCaptureError::CaptureFailed("content frame size overflowed".into())
+            })?;
+        if frame.bgra.len() != source_row_bytes.saturating_mul(source_height) {
+            return Err(PreviewCaptureError::CaptureFailed(
+                "captured frame bytes do not match its dimensions".into(),
+            ));
+        }
+
+        let left = usize::try_from((frame.width - PREVIEW_CONTENT_WIDTH) / 2).unwrap_or(0);
+        let top = usize::try_from((frame.height - PREVIEW_CONTENT_HEIGHT) / 2).unwrap_or(0);
+        let mut bgra = Vec::with_capacity(expected_bytes);
+        for row in 0..usize::try_from(PREVIEW_CONTENT_HEIGHT).unwrap_or(0) {
+            let source_row = top.checked_add(row).ok_or_else(|| {
+                PreviewCaptureError::CaptureFailed("captured frame row offset overflowed".into())
+            })?;
+            let start = source_row
+                .checked_mul(source_row_bytes)
+                .and_then(|offset| offset.checked_add(left.saturating_mul(4)))
+                .ok_or_else(|| {
+                    PreviewCaptureError::CaptureFailed("captured frame offset overflowed".into())
+                })?;
+            let end = start.checked_add(expected_row_bytes).ok_or_else(|| {
+                PreviewCaptureError::CaptureFailed("captured frame row end overflowed".into())
+            })?;
+            let Some(bytes) = frame.bgra.get(start..end) else {
+                return Err(PreviewCaptureError::CaptureFailed(
+                    "captured frame crop exceeded its byte buffer".into(),
+                ));
+            };
+            bgra.extend_from_slice(bytes);
+        }
+        Ok(CapturedFrame {
+            width: PREVIEW_CONTENT_WIDTH,
+            height: PREVIEW_CONTENT_HEIGHT,
+            bgra,
+        })
+    }
+
     struct FirstFrameHandler {
         sender: Sender<Result<CapturedFrame, HandlerError>>,
         hwnd: NativeHwnd,
@@ -911,6 +993,8 @@ mod windows_capture_impl {
             hwnd: NativeHwnd(hwnd.0 as isize),
             width: u32::try_from(width).unwrap_or(0),
             height: u32::try_from(height).unwrap_or(0),
+            client_width: u32::try_from(client_width).unwrap_or(0),
+            client_height: u32::try_from(client_height).unwrap_or(0),
         })
     }
 
@@ -963,7 +1047,45 @@ mod windows_capture_impl {
                 "WS_EX_NOACTIVATE was not retained".into(),
             ));
         }
-        let validated = validate_native_window(NativeHwnd(hwnd.0 as isize))?;
+        let mut validated = validate_native_window(NativeHwnd(hwnd.0 as isize))?;
+        // SetWindowPos receives the outer frame size, while the WGC frame is
+        // the client/content size. Measure the non-client frame after the
+        // style is applied, then converge on the exact physical content size
+        // at each DPI (the old fixed 640x360 outer request produced 624x352).
+        for _ in 0..4 {
+            if preview_content_size_is_exact(validated.client_width, validated.client_height) {
+                break;
+            }
+            deadline.remaining()?;
+            let frame_width = validated.width.saturating_sub(validated.client_width);
+            let frame_height = validated.height.saturating_sub(validated.client_height);
+            let outer_width = i32::try_from(
+                u64::from(PREVIEW_CONTENT_WIDTH).saturating_add(u64::from(frame_width)),
+            )
+            .unwrap_or(i32::MAX);
+            let outer_height = i32::try_from(
+                u64::from(PREVIEW_CONTENT_HEIGHT).saturating_add(u64::from(frame_height)),
+            )
+            .unwrap_or(i32::MAX);
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    outer_width,
+                    outer_height,
+                    SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
+                )
+            }
+            .map_err(|error| PreviewCaptureError::ApplicationFailed(error.to_string()))?;
+            validated = validate_native_window(NativeHwnd(hwnd.0 as isize))?;
+        }
+        if !preview_content_size_is_exact(validated.client_width, validated.client_height) {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "client frame did not converge to 640x360",
+            });
+        }
         deadline.remaining()?;
         Ok(validated)
     }
@@ -987,7 +1109,12 @@ mod windows_capture_impl {
         expected_foreground: isize,
         deadline: CaptureDeadline,
     ) -> Result<CaptureReport, PreviewCaptureError> {
-        let _validated = validate_native_window(hwnd)?;
+        let validated = validate_native_window(hwnd)?;
+        if !preview_content_size_is_exact(validated.client_width, validated.client_height) {
+            return Err(PreviewCaptureError::InvalidWindowState {
+                reason: "client frame is not the exact 640x360 preview surface",
+            });
+        }
         deadline.remaining()?;
         let contract = capture_contract();
         let (sender, receiver) = mpsc::channel();
@@ -1019,7 +1146,8 @@ mod windows_capture_impl {
                 Err(error) => Err(error),
             },
             deadline,
-        )?;
+        )
+        .and_then(normalize_captured_frame)?;
 
         deadline.remaining()?;
         let after = foreground_hwnd();
@@ -1035,6 +1163,10 @@ mod windows_capture_impl {
         Ok(CaptureReport {
             width: frame.width,
             height: frame.height,
+            window_width: validated.width,
+            window_height: validated.height,
+            client_width: validated.client_width,
+            client_height: validated.client_height,
             foreground_before: expected_foreground,
             foreground_after: after,
         })
@@ -1053,12 +1185,21 @@ mod windows_capture_impl {
         let hwnd_slot = Rc::new(RefCell::new(None));
         let hwnd_for_window = Rc::clone(&hwnd_slot);
         let result_for_window = Arc::clone(&result_for_app);
-        let fallback_root = root.clone();
         let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
 
         let run_result = catch_unwind(AssertUnwindSafe(|| {
             application.run(move |cx| {
                 crate::ui::preview::register_preview_environment(cx);
+                let root = match root.instantiate_native_shell_for_capture(cx) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        let _ = result_for_app.lock().unwrap().replace(Err(
+                            PreviewCaptureError::ApplicationFailed(error.to_string()),
+                        ));
+                        cx.quit();
+                        return;
+                    }
+                };
                 let root_entity = cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -1086,16 +1227,11 @@ mod windows_capture_impl {
                                 let _ = result_for_window.lock().unwrap().replace(Err(error));
                             }
                         }
-                        let root = match root.instantiate_native_shell(cx) {
-                            Ok(root) => root,
-                            Err(error) => {
-                                let _ = result_for_window.lock().unwrap().replace(Err(
-                                    PreviewCaptureError::ApplicationFailed(error.to_string()),
-                                ));
-                                fallback_root
-                            }
-                        };
-                        cx.new(|_| root)
+                        let entity = cx.new(|_| root);
+                        let _ = entity.update(cx, |shell, cx| {
+                            shell.install_window_observers(window, cx);
+                        });
+                        entity
                     },
                 );
 

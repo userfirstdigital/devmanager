@@ -1,15 +1,22 @@
-use devmanager::domain::id::TaskId;
+use devmanager::client::{ClientModel, ClientModelBuilder};
+use devmanager::domain::id::{EnvironmentId, ProjectId, SnapshotId, TaskId};
+use devmanager::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection};
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+    TaskLifecycle, WorkspaceRef,
+};
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
-    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHostLaunchSpec,
-    NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeStub, NativeHostState,
-    NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
+    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHeaderAttachment,
+    NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeStub,
+    NativeHostState, NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::TaskList;
 use devmanager::ui::tokens::{Density, RuntimePreferencesSnapshot, Scale, ThemeMode};
 use gpui::AppContext;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 fn task_id(tail: u8) -> TaskId {
@@ -29,6 +36,78 @@ fn task_id_index(index: usize) -> TaskId {
     let encoded = (index as u64).to_be_bytes();
     bytes[9..16].copy_from_slice(&encoded[1..]);
     TaskId::from_bytes(bytes).expect("unique UUIDv7 task id")
+}
+
+fn model_with_tasks(ids: &[TaskId]) -> ClientModel {
+    let snapshot_id = SnapshotId::from_bytes([
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x20,
+    ])
+    .expect("snapshot id");
+    let mut builder = ClientModelBuilder::new();
+    builder
+        .ingest_page(SnapshotPage {
+            snapshot_id,
+            through_sequence: 7,
+            section: SnapshotSection::Tasks,
+            after_item: None,
+            items: ids
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| {
+                    SnapshotItem::Task(devmanager::domain::snapshot::TaskSnapshotItem {
+                        task: TaskFacts {
+                            id: *id,
+                            environment_id: EnvironmentId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x10,
+                            ])
+                            .expect("environment id"),
+                            title: format!("Task {ordinal}"),
+                            description: None,
+                            project_id: ProjectId::from_bytes([
+                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x11,
+                            ])
+                            .expect("project id"),
+                            workspace: WorkspaceRef::Main,
+                            assignment: TaskAssignment::LocalOwner,
+                            lifecycle: TaskLifecycle::Open,
+                            action_epoch: 3,
+                            revision: 4,
+                            created_at_ms: 1_725_000_000_000 + ordinal as i64,
+                        },
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                        primary_agent_id: None,
+                    })
+                })
+                .collect(),
+            encoded_bytes: 1,
+            next_cursor: None,
+        })
+        .expect("task page");
+    for section in [
+        SnapshotSection::AgentSessions,
+        SnapshotSection::Artifacts,
+        SnapshotSection::Resources,
+        SnapshotSection::Operations,
+    ] {
+        builder
+            .ingest_page(SnapshotPage {
+                snapshot_id,
+                through_sequence: 7,
+                section,
+                after_item: None,
+                items: Vec::new(),
+                encoded_bytes: 1,
+                next_cursor: None,
+            })
+            .expect("empty related section");
+    }
+    builder.finish().expect("complete client model")
 }
 
 #[test]
@@ -118,6 +197,38 @@ fn native_headless_render_smoke_constructs_the_real_gpui_shell() {
         .gpui_accessibility_nodes
         .iter()
         .any(|node| node.element_id == "native-task-inbox" && node.label == "Task inbox"));
+}
+
+#[test]
+fn native_shell_header_uses_typed_attachment_and_explicit_unavailable_state() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let result = entity.update(cx, |shell, _cx| {
+            assert!(matches!(
+                shell.header_attachment(),
+                NativeHeaderAttachment::Unavailable { .. }
+            ));
+            shell.attach_header_projection(NativeHeaderAttachment::projection(
+                "Task Cockpit",
+                "Connected",
+                "Remote unavailable",
+                "Quota unavailable",
+            ));
+            shell.header_attachment().clone()
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
+        cx.quit();
+    });
+    assert!(matches!(
+        report_slot.borrow_mut().take().expect("header attachment"),
+        NativeHeaderAttachment::Projection { .. }
+    ));
 }
 
 #[test]
@@ -266,6 +377,43 @@ fn native_action_dispatch_is_selection_and_interaction_fenced() {
 }
 
 #[test]
+fn native_mutating_action_captures_model_revision_and_epochs() {
+    let selected = task_id(31);
+    let mut interaction = NativeInteraction::new(Some(selected));
+    interaction.set_client_model(Some(Arc::new(model_with_tasks(&[selected]))));
+    let record = interaction
+        .action(ActionRequest::TaskRename(
+            devmanager::client::action::TaskRenameArguments {
+                task_id: selected,
+                title: "captured rename".to_string(),
+            },
+        ))
+        .expect("model-backed rename should be accepted");
+
+    assert_eq!(record.task_id, Some(selected));
+    assert_eq!(record.expected_task_revision, Some(4));
+    assert_eq!(record.captured_task_action_epoch, Some(3));
+    assert!(record.action_epoch > 0);
+    assert!(record.disabled_reason.is_none());
+    assert!(matches!(record.capability, None));
+    assert!(matches!(
+        record.command,
+        Some(
+            devmanager::ui::native_shell::NativeHostCommand::TaskRename {
+                expected_task_revision: 4,
+                ..
+            }
+        )
+    ));
+
+    let newer = interaction
+        .action(ActionRequest::HostStatus)
+        .expect("new action should be accepted");
+    assert!(!interaction.accepts_action_record(&record));
+    assert!(interaction.accepts_action_record(&newer));
+}
+
+#[test]
 fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     let workspace = tempdir().expect("workspace tempdir");
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
@@ -342,6 +490,51 @@ fn controller_tick_consumes_a_fenced_action_once_and_applies_projection() {
 }
 
 #[test]
+fn immutable_client_model_projection_drives_shell_rows_and_sequence() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let model = Arc::new(model_with_tasks(&[task_id(21), task_id(22)]));
+    let mut fake = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    fake.push_model_projection(Arc::clone(&model));
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(fake),
+                RuntimePreferencesSnapshot::default(),
+                cx,
+            )
+        });
+        let result = entity.update(cx, |shell, _cx| {
+            shell.controller_tick_for_test(32);
+            (
+                shell
+                    .client_model_snapshot()
+                    .map(|model| model.last_applied_sequence()),
+                shell.rendered_task_count(),
+            )
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
+        cx.quit();
+    });
+    let (sequence, rendered) = report_slot
+        .borrow_mut()
+        .take()
+        .expect("model projection report");
+    assert_eq!(sequence, Some(7));
+    assert_eq!(rendered, 2);
+}
+
+#[test]
 fn virtual_shell_uses_full_source_count_and_stable_task_keys() {
     let source = (0..100_000).map(task_id_index).collect::<Vec<_>>();
     let task_list = TaskList::from_virtual_task_ids(source).expect("bounded virtual source");
@@ -384,7 +577,10 @@ fn appearance_and_scale_preferences_are_applied_by_controller_not_paint() {
 fn platform_accessibility_bridge_reports_actual_window_tree_contract() {
     let workspace = tempdir().expect("workspace tempdir");
     let report = headless_render_smoke(workspace.path()).expect("headless native shell render");
-    assert!(report.platform_accessibility_bridge);
+    // Headless GPUI has the same rendered AccessKit tree, but no OS window is
+    // attached. The bridge must not claim availability until the real window
+    // adapter is installed.
+    assert!(!report.platform_accessibility_bridge);
     assert!(report.platform_accessibility_nodes >= report.semantic_nodes);
     assert!(report
         .platform_accessibility_roles

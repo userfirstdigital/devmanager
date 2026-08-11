@@ -8,9 +8,7 @@ use devmanager::domain::task::{
 use devmanager::ui::shell::{
     NavigationRejection, NavigationResult, PointerButton, ReleaseRejection, Shell, TerminalRelease,
 };
-use devmanager::ui::task_cockpit::{
-    TaskList, VirtualListViewport, VirtualWindow, MAX_TASK_LIST_ITEMS,
-};
+use devmanager::ui::task_cockpit::{TaskList, VirtualListViewport, VirtualWindow};
 use serde::Deserialize;
 use std::fs;
 
@@ -287,19 +285,32 @@ fn task_list_consumes_only_model_ids_and_keeps_deterministic_order() {
 }
 
 #[test]
-fn task_list_reports_overflow_instead_of_silently_dropping_tasks() {
+fn task_list_retains_all_model_ids_instead_of_using_a_5000_cap() {
     let fixture = fixture("task-list-5000.json");
     let mut ids = fixture.task_ids;
     ids.push(task_id_from_index(5_000));
     let model = model_from_ids(&ids);
     let list = TaskList::from_model(&model);
 
-    assert_eq!(list.len(), MAX_TASK_LIST_ITEMS);
-    let overflow = list.overflow().expect("overflow must be explicit");
-    assert_eq!(overflow.limit, MAX_TASK_LIST_ITEMS);
-    assert_eq!(overflow.total_count, 5_001);
-    assert_eq!(overflow.retained_count, MAX_TASK_LIST_ITEMS);
-    assert_eq!(list.task_ids().last(), ids.get(MAX_TASK_LIST_ITEMS - 1));
+    assert_eq!(list.len(), 5_001);
+    assert_eq!(list.overflow(), None);
+    assert_eq!(list.task_ids(), ids.as_slice());
+}
+
+#[test]
+fn task_list_keyset_windows_are_task_id_anchored_and_bound_missing_anchor() {
+    let ids: Vec<TaskId> = (0..10).map(task_id_from_index).collect();
+    let list = TaskList::from_virtual_task_ids(ids.clone()).expect("full virtual source");
+
+    let window = list.window_after_id(Some(ids[2]), 3);
+    assert_eq!(window.ids, ids[3..6]);
+    assert_eq!(window.next_after_id, Some(ids[5]));
+    assert!(window.anchor_found);
+
+    let missing = list.window_after_id(Some(task_id_from_index(99)), 3);
+    assert!(missing.ids.is_empty());
+    assert_eq!(missing.next_after_id, None);
+    assert!(!missing.anchor_found);
 }
 
 #[test]
@@ -333,9 +344,9 @@ fn virtual_window_keeps_visible_rows_and_fixed_bounded_overscan_local() {
 }
 
 #[test]
-fn virtual_viewport_scrolls_100k_rows_without_materializing_the_source() {
-    let mut viewport = VirtualListViewport::new(100_000, 40).expect("valid viewport");
-    assert_eq!(viewport.total_rows(), 100_000);
+fn virtual_viewport_scrolls_beyond_100k_rows_without_materializing_the_source() {
+    let mut viewport = VirtualListViewport::new(100_005, 40).expect("valid viewport");
+    assert_eq!(viewport.total_rows(), 100_005);
     assert_eq!(viewport.materialized_rows(), 0);
 
     viewport
@@ -344,6 +355,5 @@ fn virtual_viewport_scrolls_100k_rows_without_materializing_the_source() {
 
     assert_eq!(viewport.visible_range(), 125..165);
     assert!(viewport.render_range().len() <= 104);
-    assert_eq!(viewport.stable_key(125), "task-row-00000125");
     assert_eq!(viewport.materialized_rows(), 0);
 }

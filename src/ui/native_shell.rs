@@ -6,7 +6,6 @@
 //! complete terminal model through the explicit seams below.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
@@ -14,6 +13,7 @@ use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -21,19 +21,20 @@ use std::time::Duration;
 
 use gpui::{
     div, point, px, size, uniform_list, AnyElement, AppContext, Application, ClickEvent, Context,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled,
-    Subscription, Task, Timer, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    ElementId, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseUpEvent, ParentElement, Render, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, Subscription, Task, Timer, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use uuid::Uuid;
 
 use crate::assets::AppAssets;
 use crate::client::action;
-use crate::client::UnsolicitedServerMessage;
-use crate::client::{HostClient, HostClientConfig};
+use crate::client::{
+    ClientModel, ClientSubscription, HostClient, HostClientConfig, SubscriptionUpdate,
+};
 use crate::domain::id::TaskId;
-use crate::domain::snapshot::SnapshotItem;
-use crate::domain::task::TaskLifecycle;
 use crate::domain::ClientId;
 use crate::host::IpcError;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -51,9 +52,7 @@ use crate::ui::components::{
 use crate::ui::shell::{
     NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
 };
-use crate::ui::task_cockpit::{
-    TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN, MAX_VIRTUAL_SOURCE_ROWS,
-};
+use crate::ui::task_cockpit::{TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::tokens::RuntimePreferencesSnapshot;
@@ -65,16 +64,13 @@ const NATIVE_POINTER_ID: u64 = 1;
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
-const MAX_HOST_SNAPSHOT_PAGES: usize = 512;
+const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
 
-fn stable_task_element_id(task_id: TaskId) -> (&'static str, u64) {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in task_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    ("native-task-row", hash)
+fn stable_task_element_id(task_id: TaskId) -> ElementId {
+    // GPUI has a UUID element identity, so retain all 128 bits of the domain
+    // TaskId instead of collapsing it to an offset or a lossy hash.
+    ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -316,7 +312,7 @@ pub trait NativeHostBootstrap {
 }
 
 #[derive(Debug, Default)]
-struct ProcessNativeHostBootstrap;
+pub(crate) struct ProcessNativeHostBootstrap;
 
 impl NativeHostBootstrap for ProcessNativeHostBootstrap {
     fn start(
@@ -440,6 +436,7 @@ pub struct HandlerTrace {
     pub focus_epoch: FocusEpoch,
     pub task_id: Option<TaskId>,
     pub request_generation: u64,
+    pub action_epoch: u64,
     pub consumed: bool,
     pub propagation_stopped: bool,
 }
@@ -479,6 +476,19 @@ pub struct NativeActionRecord {
     pub id: &'static str,
     pub focus_epoch: FocusEpoch,
     pub request_generation: u64,
+    /// Monotonic UI action capture. A later action invalidates an older one.
+    pub action_epoch: u64,
+    /// Task identity captured at activation time, never reconstructed by the
+    /// transport worker from mutable selection state.
+    pub task_id: Option<TaskId>,
+    /// Durable task revision and task action epoch observed by the immutable
+    /// client model when this action was captured.
+    pub expected_task_revision: Option<u64>,
+    pub captured_task_action_epoch: Option<u64>,
+    /// Capability required by the catalog entry and an explicit disabled
+    /// reason when a caller ever records a disabled action.
+    pub capability: Option<Capability>,
+    pub disabled_reason: Option<String>,
     pub event: ActionEvent,
     pub command: Option<NativeHostCommand>,
 }
@@ -521,6 +531,7 @@ pub enum NativeHostProjectionKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeHostProjection {
     pub kind: NativeHostProjectionKind,
+    pub client_model: Option<Arc<ClientModel>>,
     pub task_list: Option<TaskList>,
     pub error: Option<String>,
 }
@@ -530,10 +541,84 @@ enum NativeHostWorkerCommand {
     Shutdown,
 }
 
+/// Borrowed seam for the canonical header projection. The shell owns only the
+/// attachment lifecycle; the later header component can convert its bounded
+/// immutable projection into this value without opening another client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeHeaderAttachment {
+    Unavailable {
+        reason: String,
+    },
+    Projection {
+        title: String,
+        status: String,
+        remote: String,
+        quota: String,
+    },
+}
+
+impl NativeHeaderAttachment {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: bounded_header_text(reason.into()),
+        }
+    }
+
+    pub fn projection(
+        title: impl Into<String>,
+        status: impl Into<String>,
+        remote: impl Into<String>,
+        quota: impl Into<String>,
+    ) -> Self {
+        Self::Projection {
+            title: bounded_header_text(title.into()),
+            status: bounded_header_text(status.into()),
+            remote: bounded_header_text(remote.into()),
+            quota: bounded_header_text(quota.into()),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Unavailable { reason } => format!("Header unavailable: {reason}"),
+            Self::Projection { title, .. } => title.clone(),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Unavailable { .. } => {
+                "The canonical header projection is not attached to this shell.".to_string()
+            }
+            Self::Projection {
+                status,
+                remote,
+                quota,
+                ..
+            } => format!("{status} · {remote} · {quota}")
+                .chars()
+                .take(512)
+                .collect(),
+        }
+    }
+}
+
+impl Default for NativeHeaderAttachment {
+    fn default() -> Self {
+        Self::unavailable("waiting for the canonical client-model attachment")
+    }
+}
+
+fn bounded_header_text(value: String) -> String {
+    const MAX_HEADER_TEXT_SCALARS: usize = 256;
+    value.chars().take(MAX_HEADER_TEXT_SCALARS).collect()
+}
+
 impl NativeHostProjection {
     pub fn kind(kind: NativeHostProjectionKind) -> Self {
         Self {
             kind,
+            client_model: None,
             task_list: None,
             error: None,
         }
@@ -542,9 +627,23 @@ impl NativeHostProjection {
     pub fn task_list(task_list: TaskList) -> Self {
         Self {
             kind: NativeHostProjectionKind::Snapshot,
+            client_model: None,
             task_list: Some(task_list),
             error: None,
         }
+    }
+
+    pub fn model(kind: NativeHostProjectionKind, model: Arc<ClientModel>) -> Self {
+        Self {
+            kind,
+            client_model: Some(model),
+            task_list: None,
+            error: None,
+        }
+    }
+
+    pub fn client_model(model: Arc<ClientModel>) -> Self {
+        Self::model(NativeHostProjectionKind::Snapshot, model)
     }
 }
 
@@ -558,9 +657,13 @@ impl NativeHostProjection {
 pub struct NativeHostClientRuntime {
     endpoint: String,
     client: Arc<Mutex<HostClient>>,
+    subscription: Arc<Mutex<ClientSubscription>>,
+    client_model: Arc<Mutex<Option<Arc<ClientModel>>>>,
+    bootstrapped: Arc<AtomicBool>,
     pending: VecDeque<NativeActionRecord>,
     ready_projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
     command_tx: SyncSender<NativeHostWorkerCommand>,
+    cancellation: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     host_process: Option<NativeHostProcess>,
@@ -619,6 +722,10 @@ impl NativeHostRuntimeStub {
         if self.projections.len() < MAX_HOST_PROJECTIONS {
             self.projections.push_back(projection);
         }
+    }
+
+    pub fn push_model_projection(&mut self, model: Arc<ClientModel>) {
+        self.push_projection_message(NativeHostProjection::client_model(model));
     }
 
     pub fn handle(&self) -> NativeHostRuntimeStubHandle {
@@ -732,12 +839,14 @@ impl NativeHostClientRuntime {
     /// isolated config base. No production/default profile lookup is performed
     /// and no second connection is created by this type.
     pub async fn connect(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
-        HostClient::connect(profile.host_client_config())
+        let client = HostClient::connect(profile.host_client_config())
             .await
-            .map(Self::new)
             .map_err(|error| NativeShellError::HostConnect {
                 message: error.to_string(),
-            })
+            })?;
+        let mut runtime = Self::new(client);
+        runtime.bootstrap_projection().await?;
+        Ok(runtime)
     }
 
     /// Synchronous bootstrap for the default binary. The multi-thread Tokio
@@ -815,9 +924,17 @@ impl NativeHostClientRuntime {
     ) -> Self {
         let endpoint = client.endpoint().to_string();
         let client = Arc::new(Mutex::new(client));
+        let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        let client_model = Arc::new(Mutex::new(None));
+        let bootstrapped = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = std::sync::mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
         let client_for_worker = Arc::clone(&client);
+        let subscription_for_worker = Arc::clone(&subscription);
+        let client_model_for_worker = Arc::clone(&client_model);
+        let bootstrapped_for_worker = Arc::clone(&bootstrapped);
         let runtime_for_worker = runtime_guard.clone();
+        let cancellation_for_worker = Arc::clone(&cancellation);
         let projections_for_worker = Arc::new(Mutex::new(VecDeque::new()));
         let projections_for_worker_thread = Arc::clone(&projections_for_worker);
         let worker = std::thread::Builder::new()
@@ -825,7 +942,11 @@ impl NativeHostClientRuntime {
             .spawn(move || {
                 native_host_worker_loop(
                     client_for_worker,
+                    subscription_for_worker,
+                    client_model_for_worker,
+                    bootstrapped_for_worker,
                     runtime_for_worker,
+                    cancellation_for_worker,
                     command_rx,
                     projections_for_worker_thread,
                 )
@@ -834,9 +955,13 @@ impl NativeHostClientRuntime {
         Self {
             endpoint,
             client,
+            subscription,
+            client_model,
+            bootstrapped,
             pending: VecDeque::new(),
             ready_projections: projections_for_worker,
             command_tx,
+            cancellation,
             worker,
             runtime_guard,
             host_process: None,
@@ -930,128 +1055,57 @@ impl NativeHostClientRuntime {
             .unwrap_or_default()
     }
 
-    /// Perform the initial bounded paged snapshot and durable replay handoff
-    /// on the controller lane. The worker retains only stable task IDs and
-    /// sends one immutable projection to GPUI; row elements are still created
-    /// solely by the uniform-list viewport.
+    /// Perform the initial bounded five-section snapshot/replay handoff owned
+    /// by the one client subscription. GPUI receives an immutable model; it
+    /// never observes raw snapshot pages or a task-only transport projection.
     pub async fn bootstrap_projection(
         &mut self,
     ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|_| NativeShellError::HostConnect {
-                message: "native host client lock poisoned".to_string(),
-            })?;
-        let mut projection = Vec::with_capacity(2);
-        let mut snapshot_id = None;
-        let mut cursor = None;
-        let mut seen_cursors = HashSet::new();
-        let mut task_ids = Vec::new();
-        let mut pages_read = 0;
-        loop {
-            pages_read += 1;
-            if pages_read > MAX_HOST_SNAPSHOT_PAGES {
-                return Err(NativeShellError::HostConnect {
-                    message: format!(
-                        "native host task snapshot exceeded {} pages",
-                        MAX_HOST_SNAPSHOT_PAGES
-                    ),
-                });
-            }
-            let page = match client
-                .snapshot_page(
-                    crate::domain::snapshot::SnapshotSection::Tasks,
-                    snapshot_id,
-                    cursor.clone(),
-                )
+        {
+            let mut client = self
+                .client
+                .lock()
+                .map_err(|_| NativeShellError::HostConnect {
+                    message: "native host client lock poisoned".to_string(),
+                })?;
+            let mut subscription =
+                self.subscription
+                    .lock()
+                    .map_err(|_| NativeShellError::HostConnect {
+                        message: "native host subscription lock poisoned".to_string(),
+                    })?;
+            subscription
+                .synchronize(&mut client)
                 .await
                 .map_err(|error| NativeShellError::HostConnect {
                     message: error.to_string(),
-                })? {
-                Ok(page) => page,
-                Err(error) => {
-                    return Err(NativeShellError::HostConnect {
-                        message: format!("{error:?}"),
-                    })
+                })?;
+            let model = Arc::new(subscription.model().cloned().ok_or_else(|| {
+                NativeShellError::HostConnect {
+                    message: "native host subscription produced no client model".to_string(),
                 }
-            };
-            snapshot_id = Some(page.snapshot_id);
-            for item in page.items {
-                if let SnapshotItem::Task(task) = item {
-                    if task.task.lifecycle != TaskLifecycle::Archived {
-                        task_ids.push(task.task.id);
-                    }
+            })?);
+            if let Ok(mut current) = self.client_model.lock() {
+                *current = Some(Arc::clone(&model));
+            }
+            if let Ok(mut projections) = self.ready_projections.lock() {
+                if projections.len() < MAX_HOST_PROJECTIONS {
+                    projections.push_back(NativeHostProjection::client_model(Arc::clone(&model)));
                 }
+                let remaining = MAX_HOST_PROJECTIONS.saturating_sub(projections.len());
+                projections.extend(
+                    std::iter::once(NativeHostProjectionKind::Replay)
+                        .take(remaining)
+                        .map(NativeHostProjection::kind),
+                );
             }
-            if task_ids.len() >= MAX_VIRTUAL_SOURCE_ROWS {
-                task_ids.truncate(MAX_VIRTUAL_SOURCE_ROWS);
-                break;
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            if !seen_cursors.insert(next_cursor.clone()) {
-                return Err(NativeShellError::HostConnect {
-                    message: "native host task snapshot repeated a cursor".to_string(),
-                });
-            }
-            cursor = Some(next_cursor);
+            self.bootstrapped.store(true, Ordering::Release);
         }
-        let task_list = TaskList::from_virtual_task_ids(task_ids).map_err(|overflow| {
-            NativeShellError::HostConnect {
-                message: format!(
-                    "native host task snapshot exceeded {} rows (observed {})",
-                    overflow.limit, overflow.total_count
-                ),
-            }
-        })?;
-        let snapshot_id = snapshot_id.ok_or_else(|| NativeShellError::HostConnect {
-            message: "native host task snapshot returned no snapshot identity".to_string(),
-        })?;
-        client
-            .release_snapshot(snapshot_id)
-            .await
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })?
-            .map_err(|error| NativeShellError::HostConnect {
-                message: format!("{error:?}"),
-            })?;
-        projection.push(NativeHostProjectionKind::Snapshot);
-        let snapshot_projection = NativeHostProjection {
-            kind: NativeHostProjectionKind::Snapshot,
-            task_list: Some(task_list),
-            error: None,
-        };
-        match client
-            .open_event_replay(0)
-            .await
-            .map_err(|error| NativeShellError::HostConnect {
-                message: error.to_string(),
-            })? {
-            Ok(_) => projection.push(NativeHostProjectionKind::Replay),
-            Err(error) => {
-                return Err(NativeShellError::HostConnect {
-                    message: format!("{error:?}"),
-                })
-            }
-        }
-        if let Ok(mut projections) = self.ready_projections.lock() {
-            if projections.len() < MAX_HOST_PROJECTIONS {
-                projections.push_back(snapshot_projection);
-            }
-            let remaining = MAX_HOST_PROJECTIONS.saturating_sub(projections.len());
-            projections.extend(
-                projection
-                    .iter()
-                    .copied()
-                    .filter(|kind| *kind != NativeHostProjectionKind::Snapshot)
-                    .take(remaining)
-                    .map(NativeHostProjection::kind),
-            );
-        }
-        Ok(projection)
+        Ok([
+            NativeHostProjectionKind::Snapshot,
+            NativeHostProjectionKind::Replay,
+        ]
+        .to_vec())
     }
 
     /// Execute a caller-created, revision-fenced command on this same client.
@@ -1105,11 +1159,28 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
 
 impl Drop for NativeHostClientRuntime {
     fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
         if self.worker.is_some() {
-            let _ = self.command_tx.send(NativeHostWorkerCommand::Shutdown);
+            // The bounded queue must never make shutdown wait behind pending
+            // actions. The worker also observes the cancellation flag while
+            // an in-flight async command is running.
+            let _ = self.command_tx.try_send(NativeHostWorkerCommand::Shutdown);
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(runtime) = self.runtime_guard.as_ref() {
+            if let (Ok(mut client), Ok(mut subscription)) =
+                (self.client.lock(), self.subscription.lock())
+            {
+                let _ = runtime.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        subscription.release(&mut client),
+                    )
+                    .await
+                });
+            }
         }
     }
 }
@@ -1131,30 +1202,47 @@ async fn connect_with_startup_retry(profile: &IsolatedDevProfile) -> Result<Host
 
 fn native_host_worker_loop(
     client: Arc<Mutex<HostClient>>,
+    subscription: Arc<Mutex<ClientSubscription>>,
+    client_model: Arc<Mutex<Option<Arc<ClientModel>>>>,
+    bootstrapped: Arc<AtomicBool>,
     runtime: Option<Arc<tokio::runtime::Runtime>>,
+    cancellation: Arc<AtomicBool>,
     command_rx: Receiver<NativeHostWorkerCommand>,
     projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
 ) {
     let Some(runtime) = runtime else {
         return;
     };
-    loop {
+    while !cancellation.load(Ordering::Acquire) {
+        if !bootstrapped.load(Ordering::Acquire) {
+            std::thread::sleep(CONTROLLER_TICK_INTERVAL);
+            continue;
+        }
         match command_rx.recv_timeout(CONTROLLER_TICK_INTERVAL) {
             Ok(NativeHostWorkerCommand::Shutdown) => break,
             Ok(NativeHostWorkerCommand::Execute(action)) => {
+                if cancellation.load(Ordering::Acquire) {
+                    break;
+                }
                 if let Some(command) = action.command {
                     let result = client.lock().ok().map(|mut client| {
-                        runtime.block_on(execute_native_command(&mut client, command))
+                        runtime.block_on(execute_native_command_cancellable(
+                            &mut client,
+                            command,
+                            &cancellation,
+                        ))
                     });
                     let projection = match result {
                         Some(Ok(())) => NativeHostProjection::kind(NativeHostProjectionKind::Live),
                         Some(Err(error)) => NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
+                            client_model: None,
                             task_list: None,
                             error: Some(bounded_host_error(error.to_string())),
                         },
                         None => NativeHostProjection {
                             kind: NativeHostProjectionKind::Error,
+                            client_model: None,
                             task_list: None,
                             error: Some("native host client lock poisoned".to_string()),
                         },
@@ -1166,29 +1254,208 @@ fn native_host_worker_loop(
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        let message = client.lock().ok().and_then(|client| {
-            runtime
-                .block_on(tokio::time::timeout(
-                    Duration::ZERO,
-                    client.recv_unsolicited(),
-                ))
-                .ok()
-                .and_then(Result::ok)
-        });
-        if let Some(message) = message {
-            let kind = match message {
-                UnsolicitedServerMessage::DurableEvent { .. }
-                | UnsolicitedServerMessage::Stream(_) => NativeHostProjectionKind::Live,
-                UnsolicitedServerMessage::ResyncRequired { .. } => NativeHostProjectionKind::Replay,
-            };
-            if let Ok(mut queue) = projections.lock() {
-                if queue.len() < MAX_HOST_PROJECTIONS {
-                    queue.push_back(NativeHostProjection::kind(kind));
+            Err(RecvTimeoutError::Timeout) => {
+                if cancellation.load(Ordering::Acquire) {
+                    break;
                 }
             }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if cancellation.load(Ordering::Acquire) {
+            break;
+        }
+        pump_subscription_once(
+            &client,
+            &subscription,
+            &client_model,
+            &runtime,
+            &cancellation,
+            &projections,
+        );
+    }
+}
+
+fn pump_subscription_once(
+    client: &Arc<Mutex<HostClient>>,
+    subscription: &Arc<Mutex<ClientSubscription>>,
+    client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &Arc<AtomicBool>,
+    projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+) {
+    if cancellation.load(Ordering::Acquire) {
+        return;
+    }
+    let update = {
+        let Ok(client_guard) = client.lock() else {
+            publish_projection(
+                projections,
+                NativeHostProjection {
+                    kind: NativeHostProjectionKind::Error,
+                    client_model: None,
+                    task_list: None,
+                    error: Some("native host client lock poisoned".to_string()),
+                },
+            );
+            return;
+        };
+        let Ok(mut subscription_guard) = subscription.lock() else {
+            publish_projection(
+                projections,
+                NativeHostProjection {
+                    kind: NativeHostProjectionKind::Error,
+                    client_model: None,
+                    task_list: None,
+                    error: Some("native host subscription lock poisoned".to_string()),
+                },
+            );
+            return;
+        };
+        runtime.block_on(tokio::time::timeout(
+            Duration::from_millis(2),
+            subscription_guard.recv_and_apply(&client_guard),
+        ))
+    };
+
+    let update = match update {
+        Ok(Ok(update)) => update,
+        Ok(Err(error)) => {
+            if matches!(
+                error,
+                crate::client::SubscriptionError::NeedsResync
+                    | crate::client::SubscriptionError::Model(_)
+                    | crate::client::SubscriptionError::ForeignSubscription(_)
+                    | crate::client::SubscriptionError::InvalidResync
+                    | crate::client::SubscriptionError::Transport(_)
+                    | crate::client::SubscriptionError::Query(_)
+                    | crate::client::SubscriptionError::IncompleteSnapshot
+                    | crate::client::SubscriptionError::MissingCapabilities
+            ) {
+                match resynchronize_subscription(client, subscription, runtime, cancellation) {
+                    Ok(model) => {
+                        if let Ok(mut current) = client_model.lock() {
+                            *current = Some(Arc::clone(&model));
+                        }
+                        publish_projection(projections, NativeHostProjection::client_model(model));
+                        publish_projection(
+                            projections,
+                            NativeHostProjection::kind(NativeHostProjectionKind::Replay),
+                        );
+                    }
+                    Err(resync_error)
+                        if resync_error != "native host subscription resync cancelled" =>
+                    {
+                        publish_projection(
+                            projections,
+                            NativeHostProjection {
+                                kind: NativeHostProjectionKind::Error,
+                                client_model: None,
+                                task_list: None,
+                                error: Some(resync_error),
+                            },
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
+            return;
+        }
+        Err(_) => return,
+    };
+    match update {
+        SubscriptionUpdate::DurableEvent(_) => {
+            let model = subscription
+                .lock()
+                .ok()
+                .and_then(|subscription| subscription.model().cloned())
+                .map(Arc::new);
+            if let Some(model) = model {
+                if let Ok(mut current) = client_model.lock() {
+                    *current = Some(Arc::clone(&model));
+                }
+                publish_projection(
+                    projections,
+                    NativeHostProjection::model(NativeHostProjectionKind::Live, model),
+                );
+            }
+        }
+        SubscriptionUpdate::ResyncRequired { .. } => {
+            let model = resynchronize_subscription(client, subscription, runtime, cancellation);
+            match model {
+                Ok(model) => {
+                    if let Ok(mut current) = client_model.lock() {
+                        *current = Some(Arc::clone(&model));
+                    }
+                    publish_projection(projections, NativeHostProjection::client_model(model));
+                    publish_projection(
+                        projections,
+                        NativeHostProjection::kind(NativeHostProjectionKind::Replay),
+                    );
+                }
+                Err(error) => publish_projection(
+                    projections,
+                    NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        task_list: None,
+                        error: Some(error),
+                    },
+                ),
+            }
+        }
+        SubscriptionUpdate::Stream(_) => {
+            publish_projection(
+                projections,
+                NativeHostProjection::kind(NativeHostProjectionKind::Live),
+            );
+        }
+    }
+}
+
+fn resynchronize_subscription(
+    client: &Arc<Mutex<HostClient>>,
+    subscription: &Arc<Mutex<ClientSubscription>>,
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<Arc<ClientModel>, String> {
+    let mut client_guard = client
+        .lock()
+        .map_err(|_| "native host client lock poisoned".to_string())?;
+    let mut subscription_guard = subscription
+        .lock()
+        .map_err(|_| "native host subscription lock poisoned".to_string())?;
+    runtime.block_on(async {
+        tokio::select! {
+            result = async {
+                subscription_guard
+                    .release(&mut client_guard)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                *subscription_guard = ClientSubscription::new();
+                subscription_guard
+                    .synchronize(&mut client_guard)
+                    .await
+                    .map_err(|error| error.to_string())
+            } => result,
+            _ = wait_for_cancellation(Arc::clone(cancellation)) => {
+                Err("native host subscription resync cancelled".to_string())
+            }
+        }
+    })?;
+    subscription_guard
+        .model()
+        .cloned()
+        .map(Arc::new)
+        .ok_or_else(|| "native host resync produced no client model".to_string())
+}
+
+fn publish_projection(
+    projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+    projection: NativeHostProjection,
+) {
+    if let Ok(mut queue) = projections.lock() {
+        if queue.len() < MAX_HOST_PROJECTIONS {
+            queue.push_back(projection);
         }
     }
 }
@@ -1219,6 +1486,23 @@ async fn execute_native_command(
         .map_err(|_| IpcError::Unavailable)?,
     };
     client.execute_command(envelope).await.map(|_| ())
+}
+
+async fn execute_native_command_cancellable(
+    client: &mut HostClient,
+    command: NativeHostCommand,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<(), IpcError> {
+    tokio::select! {
+        result = execute_native_command(client, command) => result,
+        _ = wait_for_cancellation(Arc::clone(cancellation)) => Err(IpcError::Unavailable),
+    }
+}
+
+async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn unix_time_ms() -> i64 {
@@ -1259,6 +1543,8 @@ pub struct NativeInteraction {
     focus_epochs: FocusEpochSource,
     interaction: InteractionStateModel,
     request_generation: u64,
+    action_epoch: u64,
+    client_model: Option<Arc<ClientModel>>,
     pointer_owner: Option<PointerOwner>,
     last_handler: Option<HandlerTrace>,
     keyboard_state: NativeKeyboardState,
@@ -1272,6 +1558,8 @@ impl NativeInteraction {
             focus_epochs: FocusEpochSource::new(),
             interaction: InteractionStateModel::default(),
             request_generation: 0,
+            action_epoch: 0,
+            client_model: None,
             pointer_owner: None,
             last_handler: None,
             keyboard_state: NativeKeyboardState::default(),
@@ -1295,9 +1583,17 @@ impl NativeInteraction {
         self.last_handler.as_ref().is_some_and(|trace| {
             trace.focus_epoch == record.focus_epoch
                 && trace.request_generation == record.request_generation
+                && trace.action_epoch == record.action_epoch
                 && trace.consumed
                 && trace.propagation_stopped
         })
+    }
+
+    /// Provide the immutable transport projection used to capture mutation
+    /// fences. A task-only attachment deliberately clears this value so a
+    /// rename cannot be synthesized with revision zero.
+    pub fn set_client_model(&mut self, model: Option<Arc<ClientModel>>) {
+        self.client_model = model;
     }
 
     pub fn set_disabled(&mut self, disabled: bool) {
@@ -1335,11 +1631,16 @@ impl NativeInteraction {
             .checked_add(1)
             .expect("native action request generation exhausted");
         self.request_generation = request_generation;
+        self.action_epoch = self
+            .action_epoch
+            .checked_add(1)
+            .expect("native action epoch exhausted");
         self.focus_epochs.advance();
         self.last_handler = Some(HandlerTrace {
             focus_epoch,
             task_id,
             request_generation,
+            action_epoch: self.action_epoch,
             consumed: true,
             propagation_stopped: true,
         });
@@ -1493,6 +1794,19 @@ impl NativeInteraction {
         if request_task.is_some() && request_task != selected_task {
             return None;
         }
+        let (expected_task_revision, captured_task_action_epoch) = match &request {
+            ActionRequest::TaskRename(arguments) => {
+                let model = self.client_model.as_ref()?;
+                let task = model.tasks().get(&arguments.task_id)?;
+                // A valid host mutation must always carry a real durable
+                // revision. Revision zero is an invalid/unfenced sentinel.
+                if task.task.revision == 0 {
+                    return None;
+                }
+                (Some(task.task.revision), Some(task.task.action_epoch))
+            }
+            _ => (None, None),
+        };
         let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
         let command = match &request {
             ActionRequest::TaskCreate(arguments) => {
@@ -1500,7 +1814,8 @@ impl NativeInteraction {
             }
             ActionRequest::TaskRename(arguments) => Some(NativeHostCommand::TaskRename {
                 arguments: arguments.clone(),
-                expected_task_revision: 0,
+                expected_task_revision: expected_task_revision
+                    .expect("rename revision was validated above"),
             }),
             _ => None,
         };
@@ -1509,6 +1824,12 @@ impl NativeInteraction {
             id: descriptor.id,
             focus_epoch,
             request_generation,
+            action_epoch: self.action_epoch,
+            task_id: request_task,
+            expected_task_revision,
+            captured_task_action_epoch,
+            capability: descriptor.required_capability,
+            disabled_reason: None,
             event,
             command,
         })
@@ -1599,10 +1920,21 @@ pub struct NativeAccessibilityNode {
 pub struct AccessibilityTree {
     root: AccessibilityNode,
     rendered_task_count: usize,
+    task_node_ids: Vec<(accesskit::NodeId, TaskId)>,
 }
 
 impl AccessibilityTree {
     pub fn for_task_list(task_list: &TaskList, selected_task: Option<TaskId>) -> Self {
+        let header = NativeHeaderAttachment::default();
+        Self::for_task_list_with_header(task_list, selected_task, &header)
+    }
+
+    pub fn for_task_list_with_header(
+        task_list: &TaskList,
+        selected_task: Option<TaskId>,
+        header: &NativeHeaderAttachment,
+    ) -> Self {
+        let rendered_task_ids = task_list.rendered_task_ids();
         let rows = task_list
             .rendered_task_ids()
             .iter()
@@ -1648,7 +1980,13 @@ impl AccessibilityTree {
             "Task cockpit actions",
             "Actions are dispatched through the shared client action catalog.",
         )
-        .gpui("native-shell-toolbar", false, false);
+        .gpui("native-shell-toolbar", false, false)
+        .with_children(vec![AccessibilityNode::new(
+            AccessibleRole::Status,
+            header.label(),
+            header.detail(),
+        )
+        .gpui("native-shell-header-attachment", false, false)]);
         let terminal = AccessibilityNode::new(
             AccessibleRole::Status,
             "Terminal dock",
@@ -1664,7 +2002,15 @@ impl AccessibilityTree {
         .with_children(vec![toolbar, inbox, terminal]);
         Self {
             root,
-            rendered_task_count: task_list.rendered_task_ids().len(),
+            rendered_task_count: rendered_task_ids.len(),
+            // `accesskit_tree_update` assigns IDs in pre-order. The shell's
+            // root, toolbar, header, inbox, and inbox-status occupy 0..=4,
+            // making the row mapping stable while the same tree is rendered.
+            task_node_ids: rendered_task_ids
+                .iter()
+                .enumerate()
+                .map(|(index, task_id)| (accesskit::NodeId::from(5 + index as u64), *task_id))
+                .collect(),
         }
     }
 
@@ -1674,6 +2020,12 @@ impl AccessibilityTree {
 
     pub fn rendered_task_count(&self) -> usize {
         self.rendered_task_count
+    }
+
+    fn task_for_platform_node(&self, node_id: accesskit::NodeId) -> Option<TaskId> {
+        self.task_node_ids
+            .iter()
+            .find_map(|(candidate, task_id)| (*candidate == node_id).then_some(*task_id))
     }
 
     pub fn nodes(&self) -> Vec<&AccessibilityNode> {
@@ -1716,6 +2068,7 @@ impl AccessibilityTree {
 
 struct NativePlatformAccessibilityBridge {
     tree: Arc<Mutex<accesskit::TreeUpdate>>,
+    pending_actions: Arc<Mutex<VecDeque<accesskit::ActionRequest>>>,
     node_count: usize,
     attached: bool,
     #[cfg(windows)]
@@ -1727,6 +2080,7 @@ impl NativePlatformAccessibilityBridge {
         let update = accesskit_tree_update(tree);
         Self {
             tree: Arc::new(Mutex::new(update)),
+            pending_actions: Arc::new(Mutex::new(VecDeque::new())),
             node_count: tree.nodes().len(),
             attached: false,
             #[cfg(windows)]
@@ -1735,7 +2089,17 @@ impl NativePlatformAccessibilityBridge {
     }
 
     fn is_available(&self) -> bool {
-        true
+        self.attached
+    }
+
+    fn take_actions(&mut self, max: usize) -> Vec<accesskit::ActionRequest> {
+        self.pending_actions
+            .lock()
+            .map(|mut actions| {
+                let count = max.min(MAX_ACCESSIBILITY_ACTIONS).min(actions.len());
+                actions.drain(..count).collect()
+            })
+            .unwrap_or_default()
     }
 
     fn node_count(&self) -> usize {
@@ -1766,10 +2130,13 @@ impl NativePlatformAccessibilityBridge {
             let activation = NativeAccessKitActivation {
                 tree: Arc::clone(&self.tree),
             };
+            let action_handler = NativeAccessKitActionHandler {
+                pending: Arc::clone(&self.pending_actions),
+            };
             self.adapter = Some(accesskit_windows::SubclassingAdapter::new(
                 hwnd,
                 activation,
-                NativeAccessKitActionHandler,
+                action_handler,
             ));
             self.attached = true;
         }
@@ -1853,11 +2220,19 @@ impl accesskit::ActivationHandler for NativeAccessKitActivation {
 }
 
 #[cfg(windows)]
-struct NativeAccessKitActionHandler;
+struct NativeAccessKitActionHandler {
+    pending: Arc<Mutex<VecDeque<accesskit::ActionRequest>>>,
+}
 
 #[cfg(windows)]
 impl accesskit::ActionHandler for NativeAccessKitActionHandler {
-    fn do_action(&mut self, _request: accesskit::ActionRequest) {}
+    fn do_action(&mut self, request: accesskit::ActionRequest) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending.len() < MAX_ACCESSIBILITY_ACTIONS {
+                pending.push_back(request);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1932,6 +2307,8 @@ pub struct NativeShell {
     host_runtime: Option<NativeHostRuntimeAttachment>,
     host_state: NativeHostState,
     preferences: RuntimePreferencesSnapshot,
+    header_attachment: NativeHeaderAttachment,
+    client_model: Option<Arc<ClientModel>>,
     task_list: TaskList,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
@@ -2056,7 +2433,9 @@ impl NativeShell {
         start_controller: bool,
     ) -> Self {
         let task_list = TaskList::empty();
-        let accessibility_tree = AccessibilityTree::for_task_list(&task_list, None);
+        let header_attachment = NativeHeaderAttachment::default();
+        let accessibility_tree =
+            AccessibilityTree::for_task_list_with_header(&task_list, None, &header_attachment);
         let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
         let mut shell = Self {
             host_connection: profile.host_connection(),
@@ -2064,6 +2443,8 @@ impl NativeShell {
             host_runtime,
             host_state,
             preferences,
+            header_attachment,
+            client_model: None,
             task_list,
             interaction: NativeInteraction::new(None),
             keyboard: KeyboardModel::default(),
@@ -2110,6 +2491,22 @@ impl NativeShell {
 
     pub fn preferences(&self) -> RuntimePreferencesSnapshot {
         self.preferences
+    }
+
+    pub fn header_attachment(&self) -> &NativeHeaderAttachment {
+        &self.header_attachment
+    }
+
+    /// Attach a bounded immutable header projection supplied by the canonical
+    /// runtime. This is an adapter-only mutation; it never touches transport.
+    pub fn attach_header_projection(&mut self, attachment: NativeHeaderAttachment) {
+        self.header_attachment = attachment;
+        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
+            &self.task_list,
+            self.interaction.selected_task(),
+            &self.header_attachment,
+        );
+        self.platform_accessibility.sync(&self.accessibility_tree);
     }
 
     pub fn last_keyboard_action(&self) -> Option<KeyboardAction> {
@@ -2182,7 +2579,11 @@ impl NativeShell {
                 .collect();
         }
         for projection in projections {
-            if let Some(task_list) = projection.task_list {
+            if let Some(model) = projection.client_model {
+                if let Err(error) = self.apply_client_model(model) {
+                    self.host_state = NativeHostState::Error { message: error };
+                }
+            } else if let Some(task_list) = projection.task_list {
                 self.apply_task_list(task_list);
             }
             if let Some(error) = projection.error {
@@ -2214,6 +2615,28 @@ impl NativeShell {
             }
         }
 
+        // AccessKit invokes its OS action handler from the platform thread.
+        // The handler only queues bounded requests; this controller tick is
+        // the sole GPUI/input owner that resolves them against the current
+        // rendered tree and focus capture.
+        for request in self.platform_accessibility.take_actions(max) {
+            if !matches!(
+                request.action,
+                accesskit::Action::Click | accesskit::Action::Focus
+            ) {
+                continue;
+            }
+            let Some(task_id) = self
+                .accessibility_tree
+                .task_for_platform_node(request.target_node)
+            else {
+                continue;
+            };
+            let _ = self
+                .interaction
+                .navigation_mouse_down(task_id, &self.task_list);
+        }
+
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
         let metrics = self.preferences.tokens().density.physical();
         let _ = self.task_list.set_scroll_offset_pixels(
@@ -2221,12 +2644,15 @@ impl NativeShell {
             metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
             metrics.row_height as f32,
         );
-        self.accessibility_tree =
-            AccessibilityTree::for_task_list(&self.task_list, self.interaction.selected_task());
+        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
+            &self.task_list,
+            self.interaction.selected_task(),
+            &self.header_attachment,
+        );
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
 
-    fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.platform_accessibility.attach_window(window);
         let appearance = cx.observe_window_appearance(window, |shell, window, _cx| {
             shell.queue_preferences(RuntimePreferencesSnapshot::from_system(
@@ -2343,15 +2769,33 @@ impl NativeShell {
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
     pub fn apply_task_list(&mut self, task_list: TaskList) {
+        self.client_model = None;
+        self.interaction.set_client_model(None);
         let selected_task = self
             .interaction
             .selected_task()
             .filter(|task_id| task_list.task_ids().contains(task_id));
         self.interaction.sync_selected_task(selected_task);
         self.task_list = task_list;
-        self.accessibility_tree =
-            AccessibilityTree::for_task_list(&self.task_list, self.interaction.selected_task());
+        self.accessibility_tree = AccessibilityTree::for_task_list_with_header(
+            &self.task_list,
+            self.interaction.selected_task(),
+            &self.header_attachment,
+        );
         self.platform_accessibility.sync(&self.accessibility_tree);
+    }
+
+    pub fn apply_client_model(&mut self, model: Arc<ClientModel>) -> Result<(), String> {
+        let task_list = TaskList::from_client_model_virtual(&model)
+            .map_err(|error| format!("client model task projection failed: {error:?}"))?;
+        self.apply_task_list(task_list);
+        self.client_model = Some(Arc::clone(&model));
+        self.interaction.set_client_model(Some(model));
+        Ok(())
+    }
+
+    pub fn client_model_snapshot(&self) -> Option<Arc<ClientModel>> {
+        self.client_model.clone()
     }
 
     pub fn task_list(&self) -> &TaskList {
@@ -2376,6 +2820,7 @@ impl NativeShell {
             .id("native-shell-toolbar")
             .w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(tokens.density.spacing.md))
             .p(px(metrics.control_padding as f32))
@@ -2388,9 +2833,17 @@ impl NativeShell {
             )
             .child(
                 div()
-                    .id("native-shell-header-placeholder")
+                    .id("native-shell-header-attachment")
                     .text_color(tokens.text.secondary.to_gpui())
-                    .child("Header"),
+                    .whitespace_normal()
+                    .child(self.header_attachment.label()),
+            )
+            .child(
+                div()
+                    .id("native-shell-header-detail")
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .whitespace_normal()
+                    .child(self.header_attachment.detail()),
             )
             .child(
                 Button::new("native-shell-host-status")
@@ -2461,10 +2914,12 @@ impl NativeShell {
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
-                                        shell.accessibility_tree = AccessibilityTree::for_task_list(
-                                            &shell.task_list,
-                                            shell.interaction.selected_task(),
-                                        );
+                                        shell.accessibility_tree =
+                                            AccessibilityTree::for_task_list_with_header(
+                                                &shell.task_list,
+                                                shell.interaction.selected_task(),
+                                                &shell.header_attachment,
+                                            );
                                         shell
                                             .platform_accessibility
                                             .sync(&shell.accessibility_tree);
@@ -2481,10 +2936,12 @@ impl NativeShell {
                                         let _ = shell
                                             .interaction
                                             .navigation_mouse_down(task_id, &shell.task_list);
-                                        shell.accessibility_tree = AccessibilityTree::for_task_list(
-                                            &shell.task_list,
-                                            shell.interaction.selected_task(),
-                                        );
+                                        shell.accessibility_tree =
+                                            AccessibilityTree::for_task_list_with_header(
+                                                &shell.task_list,
+                                                shell.interaction.selected_task(),
+                                                &shell.header_attachment,
+                                            );
                                         shell
                                             .platform_accessibility
                                             .sync(&shell.accessibility_tree);
@@ -2537,9 +2994,10 @@ impl NativeShell {
             scroll_state
                 .base_handle
                 .set_offset(point(offset.x, offset.y - delta));
-            shell.accessibility_tree = AccessibilityTree::for_task_list(
+            shell.accessibility_tree = AccessibilityTree::for_task_list_with_header(
                 &shell.task_list,
                 shell.interaction.selected_task(),
+                &shell.header_attachment,
             );
             shell.platform_accessibility.sync(&shell.accessibility_tree);
         });
@@ -2689,6 +3147,7 @@ impl NativeShell {
                     .id("native-shell-toolbar")
                     .w_full()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(tokens.density.spacing.md))
                     .p(px(metrics.control_padding as f32))
@@ -2701,9 +3160,17 @@ impl NativeShell {
                     )
                     .child(
                         div()
-                            .id("native-shell-header-placeholder")
+                            .id("native-shell-header-attachment")
                             .text_color(tokens.text.secondary.to_gpui())
-                            .child("Header"),
+                            .whitespace_normal()
+                            .child(self.header_attachment.label()),
+                    )
+                    .child(
+                        div()
+                            .id("native-shell-header-detail")
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .whitespace_normal()
+                            .child(self.header_attachment.detail()),
                     )
                     .child(
                         Button::new("native-shell-host-status")
@@ -2929,7 +3396,10 @@ fn bounded_host_error(message: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_isolated_host_config_base, isolated_dev_profile};
+    use super::{ensure_isolated_host_config_base, isolated_dev_profile, wait_for_cancellation};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn default_host_bootstrap_prepares_only_the_isolated_config_base() {
@@ -2942,6 +3412,24 @@ mod tests {
         assert!(std::fs::canonicalize(profile.host_config_base())
             .expect("canonical isolated config base")
             .starts_with(profile.workspace_root()));
+    }
+
+    #[test]
+    fn native_worker_cancellation_wait_observes_shutdown_without_a_long_sleep() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_for_thread = Arc::clone(&cancellation);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancellation_for_thread.store(true, Ordering::Release);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let started = Instant::now();
+        runtime.block_on(wait_for_cancellation(cancellation));
+        setter.join().expect("cancellation setter");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 

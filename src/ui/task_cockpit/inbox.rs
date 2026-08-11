@@ -7,10 +7,9 @@ use crate::client::ClientModel;
 use crate::domain::id::TaskId;
 use crate::domain::task::TaskLifecycle;
 
-pub const MAX_TASK_LIST_ITEMS: usize = 5_000;
 pub const FIXED_VIRTUAL_OVERSCAN: usize = 32;
 pub const DEFAULT_VISIBLE_ROWS: usize = 40;
-pub const MAX_VIRTUAL_SOURCE_ROWS: usize = 100_000;
+pub const MAX_VIRTUAL_WINDOW_ROWS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskListOverflow {
@@ -75,7 +74,6 @@ impl VirtualListViewport {
         if visible_rows == 0 {
             return Err(ViewportError::ZeroVisibleRows);
         }
-        let total_rows = total_rows.min(MAX_VIRTUAL_SOURCE_ROWS);
         Ok(Self {
             total_rows,
             visible_rows,
@@ -98,10 +96,6 @@ impl VirtualListViewport {
 
     pub fn render_range(&self) -> Range<usize> {
         self.window.render_range(self.total_rows)
-    }
-
-    pub fn stable_key(&self, index: usize) -> String {
-        format!("task-row-{index:08}")
     }
 
     pub fn scroll_offset(&self) -> f32 {
@@ -153,46 +147,30 @@ impl TaskList {
         }
     }
 
-    /// Project only the ordered task identities from one immutable client
-    /// model. Snapshot facts, host status, and subscriptions are not retained.
+    /// Project all ordered task identities from one immutable client model.
+    /// Snapshot facts, host status, and subscriptions are not retained here;
+    /// the model owner remains the source of truth and the GPUI viewport only
+    /// materializes its bounded visible range.
     pub fn from_model(model: &ClientModel) -> Self {
-        let total_count = model
-            .tasks()
-            .values()
-            .filter(|task| task.task.lifecycle != TaskLifecycle::Archived)
-            .count();
         let task_ids: Vec<TaskId> = model
             .tasks()
             .iter()
             .filter(|(_, task)| task.task.lifecycle != TaskLifecycle::Archived)
             .map(|(task_id, _)| *task_id)
-            .take(MAX_TASK_LIST_ITEMS)
             .collect();
-        let overflow = (total_count > MAX_TASK_LIST_ITEMS).then_some(TaskListOverflow {
-            limit: MAX_TASK_LIST_ITEMS,
-            total_count,
-            retained_count: task_ids.len(),
-        });
         let viewport = VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, task_ids.len());
         Self {
             task_ids: Arc::new(task_ids),
             viewport,
-            overflow,
+            overflow: None,
             virtual_source: false,
         }
     }
 
-    /// Construct the source consumed by the real GPUI uniform list. The
-    /// source is bounded at the host contract's 100k row limit, while the
-    /// uniform list only asks for its visible range during layout.
+    /// Construct the full source consumed by the real GPUI uniform list. The
+    /// source keeps identity-bearing task IDs; only the uniform-list closure
+    /// creates row elements for its current viewport.
     pub fn from_virtual_task_ids(task_ids: Vec<TaskId>) -> Result<Self, TaskListOverflow> {
-        if task_ids.len() > MAX_VIRTUAL_SOURCE_ROWS {
-            return Err(TaskListOverflow {
-                limit: MAX_VIRTUAL_SOURCE_ROWS,
-                total_count: task_ids.len(),
-                retained_count: MAX_VIRTUAL_SOURCE_ROWS,
-            });
-        }
         let total_count = task_ids.len();
         Ok(Self {
             task_ids: Arc::new(task_ids),
@@ -202,10 +180,9 @@ impl TaskList {
         })
     }
 
-    /// Build the full bounded source used by the native uniform list when a
-    /// live client model is available. The legacy `from_model` projection
-    /// keeps its smaller compatibility bound; this explicit path is the
-    /// canonical native shell path and never materializes row elements.
+    /// Build the full source used by the native uniform list when a live
+    /// immutable client model is available. This path never materializes row
+    /// elements outside the current viewport.
     pub fn from_client_model_virtual(model: &ClientModel) -> Result<Self, TaskListOverflow> {
         let task_ids = model
             .tasks()
@@ -237,6 +214,38 @@ impl TaskList {
             .get(index)
             .map(|task_id| format!("native-task-row-{task_id}"))
             .unwrap_or_else(|| format!("native-task-row-missing-{index}"))
+    }
+
+    /// Return a bounded keyset page after an identity anchor. A removed anchor
+    /// is explicit and yields no rows; callers must request a fresh anchor
+    /// rather than silently falling back to an offset that could click through.
+    pub fn window_after_id(&self, anchor: Option<TaskId>, limit: usize) -> VirtualKeysetWindow {
+        let limit = limit.min(MAX_VIRTUAL_WINDOW_ROWS);
+        let start = match anchor {
+            None => 0,
+            Some(anchor) => match self.task_ids.iter().position(|task_id| *task_id == anchor) {
+                Some(index) => index.saturating_add(1),
+                None => {
+                    return VirtualKeysetWindow {
+                        ids: Vec::new(),
+                        next_after_id: None,
+                        anchor_found: false,
+                    }
+                }
+            },
+        };
+        let ids: Vec<TaskId> = self
+            .task_ids
+            .iter()
+            .skip(start)
+            .take(limit)
+            .copied()
+            .collect();
+        VirtualKeysetWindow {
+            next_after_id: ids.last().copied(),
+            ids,
+            anchor_found: true,
+        }
     }
 
     pub fn uses_gpui_uniform_list(&self) -> bool {
@@ -316,6 +325,13 @@ impl TaskList {
         let offset = offset_pixels.clamp(0.0, max_offset);
         self.set_viewport((offset / row_height).floor() as usize, visible_rows)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualKeysetWindow {
+    pub ids: Vec<TaskId>,
+    pub next_after_id: Option<TaskId>,
+    pub anchor_found: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

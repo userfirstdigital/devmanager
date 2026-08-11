@@ -18,7 +18,8 @@ use crate::client::action;
 use crate::terminal::terminal_font;
 use crate::ui::actions::{register_task_cockpit_bindings, TASK_COCKPIT_ACTION_NAMES};
 use crate::ui::native_shell::{
-    isolated_dev_profile, NativeHostRuntimeStub, NativeHostState, NativeShell,
+    isolated_dev_profile, NativeHostBootstrap, NativeHostRuntimeAttachment, NativeShell,
+    ProcessNativeHostBootstrap,
 };
 use crate::ui::preview_capture;
 use crate::ui::tokens::{RuntimePreferencesSnapshot, PREVIEW_SENTINEL};
@@ -326,6 +327,7 @@ pub struct PreviewApplication {
     resources: PreviewResources,
     capture: PreviewCaptureFixture,
     init_report: RefCell<Option<PreviewInitReport>>,
+    host_started: RefCell<bool>,
 }
 
 impl PreviewApplication {
@@ -367,7 +369,7 @@ impl PreviewApplication {
         let is_task_cockpit = fixture.root.kind == "task-cockpit";
         let body = if is_task_cockpit {
             format!(
-                "Task Cockpit\nHeader\nTask Inbox\nContext Dock\nDisconnected\n{}",
+                "Task Cockpit\nHeader unavailable\nTask Inbox\nContext Dock\nHost unavailable\n{}",
                 fixture.title
             )
         } else {
@@ -386,6 +388,7 @@ impl PreviewApplication {
             resources: PreviewResources::new(),
             capture: fixture.capture,
             init_report: RefCell::new(None),
+            host_started: RefCell::new(false),
         })
     }
 
@@ -417,7 +420,7 @@ impl PreviewApplication {
                 PreviewOutputCapability::HeadlessProjectionOnly
             },
             output_written: false,
-            host_started: false,
+            host_started: *self.host_started.borrow(),
         }
     }
 
@@ -491,7 +494,9 @@ impl PreviewApplication {
 
     pub fn render_to_output(&self) -> Result<(), PreviewError> {
         preview_capture::capture_preview(self.root(), &self.request)
-            .map(|_| ())
+            .map(|_| {
+                *self.host_started.borrow_mut() = self.root_snapshot.root_kind == "task-cockpit";
+            })
             .map_err(|error| PreviewError::from_capture_error(error, self.request.output_path()))
     }
 }
@@ -545,18 +550,56 @@ impl PreviewRoot {
                 reason: format!("preview native shell profile: {error}"),
             }
         })?;
-        let runtime =
-            NativeHostRuntimeStub::new("preview://disconnected", NativeHostState::Disconnected);
-        let shell = cx.new(|cx| {
-            NativeShell::new_with_host_runtime_port(
-                profile,
-                Box::new(runtime),
-                RuntimePreferencesSnapshot::default(),
-                cx,
-            )
-        });
+        let shell = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
         self.native_shell = Some(shell);
         Ok(self)
+    }
+
+    /// Visible capture owns the one real isolated host/runtime. The host
+    /// attachment is moved into the shell exactly once and is dropped with
+    /// the GPUI entity; no disconnected fake transport is used for capture.
+    pub(crate) fn instantiate_native_shell_for_capture(
+        mut self,
+        cx: &mut gpui::App,
+    ) -> Result<Self, PreviewError> {
+        if self.snapshot.root_kind != "task-cockpit" {
+            return Ok(self);
+        }
+        let profile = isolated_dev_profile(&self.workspace_root).map_err(|error| {
+            PreviewError::ApplicationFailed {
+                reason: format!("preview native shell profile: {error}"),
+            }
+        })?;
+        let mut bootstrap = ProcessNativeHostBootstrap;
+        let attachment =
+            bootstrap
+                .start(&profile)
+                .map_err(|error| PreviewError::ApplicationFailed {
+                    reason: error.to_string(),
+                })?;
+        let shell = match attachment {
+            NativeHostRuntimeAttachment::Client(runtime) => {
+                cx.new(|cx| NativeShell::new_with_host_runtime(profile, Some(runtime), cx))
+            }
+            NativeHostRuntimeAttachment::Injected(runtime) => cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    runtime,
+                    RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            }),
+        };
+        self.native_shell = Some(shell);
+        Ok(self)
+    }
+
+    pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(shell) = self.native_shell.clone() {
+            let _ = shell.update(cx, |shell, cx| {
+                shell.install_window_observers(window, cx);
+            });
+        }
     }
 
     fn has_native_shell(&self) -> bool {
@@ -577,10 +620,10 @@ impl PreviewRoot {
                 .flex_col()
                 .gap(px(12.0))
                 .child(div().id("preview-shell-title").child("Task Cockpit"))
-                .child(div().id("preview-header").child("Header"))
+                .child(div().id("preview-header").child("Header unavailable"))
                 .child(div().id("preview-inbox").child("Task Inbox"))
                 .child(div().id("preview-dock").child("Context Dock"))
-                .child(div().id("preview-host-state").child("Disconnected"))
+                .child(div().id("preview-host-state").child("Host unavailable"))
                 .into_any_element()
         } else {
             div().child(self.snapshot.body.clone()).into_any_element()
