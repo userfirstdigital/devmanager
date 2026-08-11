@@ -1,5 +1,13 @@
 # Third-party notices
 
+## caseless 0.2.2 and unicode-normalization 0.1.24
+
+- Sources: `https://crates.io/crates/caseless/0.2.2` and `https://crates.io/crates/unicode-normalization/0.1.24`
+- Upstream repositories: `https://github.com/unicode-rs/rust-caseless` and `https://github.com/unicode-rs/unicode-normalization`
+- The exact versions are pinned in `Cargo.toml` and recorded in `Cargo.lock`.
+- `caseless` is MIT licensed; `unicode-normalization` is dual MIT/Apache-2.0 licensed. The published license texts were reviewed from the resolved registry packages.
+- The Inbox search path uses the crates only for bounded compatibility-caseless Unicode normalization and full default case folding; no unbounded input or output is admitted.
+
 ## gpui-component 0.5.1
 
 - Source: `https://github.com/longbridge/gpui-component/releases/tag/v0.5.1`

@@ -6,9 +6,10 @@ use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
-    Arc, Mutex,
+    Arc, Mutex, TryLockError,
 };
 use std::thread;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -580,6 +581,40 @@ struct BackgroundSearchRequest {
     continuation: Option<SearchContinuation>,
 }
 
+const BACKGROUND_WORKER_JOIN_BUDGET: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum SearchWorkerState {
+    #[default]
+    Idle,
+    Running,
+    Retiring,
+}
+
+#[derive(Debug)]
+struct BackgroundSearchWorker {
+    cancellation: Arc<AtomicU64>,
+    results: Receiver<BackgroundSearchResult>,
+    join: Option<thread::JoinHandle<()>>,
+    retiring: bool,
+}
+
+impl BackgroundSearchWorker {
+    fn cancel(&mut self, invalid_generation: u64) {
+        self.retiring = true;
+        self.cancellation
+            .store(invalid_generation, AtomicOrdering::Release);
+    }
+
+    fn state(&self) -> SearchWorkerState {
+        if self.retiring {
+            SearchWorkerState::Retiring
+        } else {
+            SearchWorkerState::Running
+        }
+    }
+}
+
 fn run_background_search_page(
     model: Arc<ClientModel>,
     filter: InboxFilter,
@@ -611,6 +646,7 @@ pub struct SearchProgress {
     pub published: bool,
     pub requested: bool,
     pub complete: bool,
+    pub worker_state: SearchWorkerState,
 }
 
 /// The production Inbox projection bridge. The canonical lane owns one
@@ -627,8 +663,7 @@ pub struct InboxRuntime {
     projection_stale: bool,
     projection_updates: u64,
     search_generation: u64,
-    background_cancel: Option<Arc<AtomicU64>>,
-    background_results: Option<Receiver<BackgroundSearchResult>>,
+    background_worker: Option<BackgroundSearchWorker>,
     background_model: Option<Arc<ClientModel>>,
     background_active_page: Option<SearchPage>,
     background_archived_page: Option<SearchPage>,
@@ -700,6 +735,7 @@ impl InboxRuntime {
     }
 
     pub fn restore_unread_cursor(&mut self, cursor: UnreadCursor) {
+        self.cancel_background_search();
         self.unread = cursor;
         self.rebuild_projection();
         self.start_background_search();
@@ -787,7 +823,6 @@ impl InboxRuntime {
 
     pub fn set_filter(&mut self, filter: InboxFilter) {
         self.cancel_background_search();
-        self.search_generation = self.search_generation.wrapping_add(1);
         self.filter = filter;
         self.rebuild_projection();
         self.start_background_search();
@@ -799,24 +834,26 @@ impl InboxRuntime {
     /// or model-revision mismatch is discarded and can never replace rows for
     /// a newer filter or subscription generation.
     pub fn poll_background_search(&mut self) -> bool {
-        let Some(results) = self.background_results.take() else {
+        let (result, disconnected) = {
+            let Some(worker) = self.background_worker.as_mut() else {
+                return false;
+            };
+            match worker.results.try_recv() {
+                Ok(result) => (Some(result), false),
+                Err(TryRecvError::Empty) => (None, false),
+                Err(TryRecvError::Disconnected) => (None, true),
+            }
+        };
+        if disconnected {
+            self.reap_background_worker();
+            return false;
+        }
+        let Some(result) = result else {
+            self.reap_background_worker();
             return false;
         };
-        let result = match results.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => {
-                self.background_results = Some(results);
-                return false;
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.background_cancel = None;
-                return false;
-            }
-        };
-        // A page worker always returns after one result. Clearing the in-flight
-        // slot here makes the next request an explicit canonical-lane demand.
-        self.background_cancel = None;
         if result.generation != self.search_generation || self.projection_stale {
+            self.reap_background_worker();
             return false;
         }
         if let Some(subscription) = self.live_subscription.clone() {
@@ -834,20 +871,27 @@ impl InboxRuntime {
                 self.rebuild_projection();
                 self.background_active_page = None;
                 self.background_archived_page = None;
+                self.reap_background_worker();
                 return false;
             }
-            return self.publish_background_result(result, model);
+            let published = self.publish_background_result(result, model);
+            self.reap_background_worker();
+            return published;
         }
         let Some(model) = self.background_model.clone() else {
+            self.reap_background_worker();
             return false;
         };
         if model.task_projection_index().revision() != result.model_revision {
             self.rebuild_projection();
             self.background_active_page = None;
             self.background_archived_page = None;
+            self.reap_background_worker();
             return false;
         }
-        self.publish_background_result(result, &model)
+        let published = self.publish_background_result(result, &model);
+        self.reap_background_worker();
+        published
     }
 
     /// Advance one bounded continuation on the canonical controller lane.
@@ -860,6 +904,7 @@ impl InboxRuntime {
             published,
             requested,
             complete: self.background_search_complete(),
+            worker_state: self.background_search_state(),
         }
     }
 
@@ -884,7 +929,7 @@ impl InboxRuntime {
     pub fn request_background_search_page(&mut self) -> bool {
         if self.projection_stale
             || self.filter.query().trim().is_empty()
-            || self.background_results.is_some()
+            || self.background_worker.is_some()
         {
             return false;
         }
@@ -928,17 +973,30 @@ impl InboxRuntime {
         let generation = self.search_generation;
         let cancellation = Arc::new(AtomicU64::new(generation));
         let (results_tx, results_rx) = mpsc::sync_channel(1);
-        self.background_cancel = Some(Arc::clone(&cancellation));
-        self.background_results = Some(results_rx);
         let filter = self.filter.clone();
-        thread::spawn(move || {
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker_cancellation_for_model = Arc::clone(&worker_cancellation);
+        let join = thread::spawn(move || {
             let model = model.or_else(|| {
                 subscription.and_then(|subscription| {
-                    subscription
-                        .lock()
-                        .ok()
-                        .and_then(|subscription| subscription.model().cloned())
-                        .map(Arc::new)
+                    loop {
+                        if worker_cancellation_for_model.load(AtomicOrdering::Acquire) != generation
+                        {
+                            return None;
+                        }
+                        match subscription.try_lock() {
+                            Ok(subscription) => {
+                                break subscription.model().cloned().map(Arc::new);
+                            }
+                            Err(TryLockError::Poisoned(_)) => return None,
+                            Err(TryLockError::WouldBlock) => {
+                                // Keep the owned worker cancellable while the
+                                // controller briefly holds the borrowed
+                                // subscription for transport handoff.
+                                thread::park_timeout(Duration::from_millis(1));
+                            }
+                        }
+                    }
                 })
             });
             if let Some(model) = model {
@@ -950,10 +1008,16 @@ impl InboxRuntime {
                         archived,
                         continuation,
                     },
-                    cancellation,
+                    worker_cancellation,
                     results_tx,
                 );
             }
+        });
+        self.background_worker = Some(BackgroundSearchWorker {
+            cancellation,
+            results: results_rx,
+            join: Some(join),
+            retiring: false,
         });
         true
     }
@@ -985,7 +1049,14 @@ impl InboxRuntime {
     }
 
     pub fn background_search_pending(&self) -> bool {
-        self.background_results.is_some()
+        self.background_worker.is_some()
+    }
+
+    pub fn background_search_state(&self) -> SearchWorkerState {
+        self.background_worker
+            .as_ref()
+            .map(BackgroundSearchWorker::state)
+            .unwrap_or(SearchWorkerState::Idle)
     }
 
     /// Mark one task read in the bounded client-local cursor and update only
@@ -1007,6 +1078,7 @@ impl InboxRuntime {
         first_visible: usize,
         visible_rows: usize,
     ) -> Result<(), ViewportError> {
+        self.cancel_background_search();
         self.projection
             .as_mut()
             .ok_or(ViewportError::ZeroVisibleRows)?
@@ -1018,6 +1090,7 @@ impl InboxRuntime {
         first_visible: usize,
         visible_rows: usize,
     ) -> Result<(), ViewportError> {
+        self.cancel_background_search();
         self.projection
             .as_mut()
             .ok_or(ViewportError::ZeroVisibleRows)?
@@ -1168,19 +1241,64 @@ impl InboxRuntime {
     }
 
     fn cancel_background_search(&mut self) {
-        if let Some(cancel) = self.background_cancel.take() {
-            cancel.store(
-                self.search_generation.wrapping_add(1),
-                AtomicOrdering::Release,
-            );
+        self.search_generation = self.search_generation.wrapping_add(1);
+        if let Some(worker) = self.background_worker.as_mut() {
+            worker.cancel(self.search_generation);
         }
-        self.background_results = None;
+        self.join_background_worker_until(Instant::now() + BACKGROUND_WORKER_JOIN_BUDGET);
         self.background_active_page = None;
         self.background_archived_page = None;
     }
 
+    fn reap_background_worker(&mut self) -> bool {
+        let finished = self.background_worker.as_ref().is_some_and(|worker| {
+            worker
+                .join
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
+        });
+        if !finished {
+            return false;
+        }
+        let Some(mut worker) = self.background_worker.take() else {
+            return false;
+        };
+        if let Some(join) = worker.join.take() {
+            let _ = join.join();
+        }
+        true
+    }
+
+    fn join_background_worker_until(&mut self, deadline: Instant) {
+        while self.background_worker.is_some() && Instant::now() < deadline {
+            if self.reap_background_worker() {
+                return;
+            }
+            thread::park_timeout(Duration::from_millis(1));
+        }
+        let _ = self.reap_background_worker();
+    }
+
     fn start_background_search(&mut self) {
         let _ = self.request_background_search_page();
+    }
+}
+
+impl Drop for InboxRuntime {
+    fn drop(&mut self) {
+        self.cancel_background_search();
+        if let Some(mut worker) = self.background_worker.take() {
+            worker.cancel(self.search_generation);
+            if let Some(join) = worker.join.take() {
+                let deadline = Instant::now() + BACKGROUND_WORKER_JOIN_BUDGET;
+                while !join.is_finished() && Instant::now() < deadline {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                if join.is_finished() {
+                    let _ = join.join();
+                }
+            }
+        }
     }
 }
 
@@ -2357,26 +2475,14 @@ mod tests {
             SearchPage::pending(),
             None,
         ));
-        let (results_tx, results_rx) = mpsc::sync_channel(1);
-        runtime.background_results = Some(results_rx);
-        let cancellation = Arc::new(AtomicU64::new(runtime.search_generation));
-        runtime.background_cancel = Some(Arc::clone(&cancellation));
-        results_tx
-            .send(BackgroundSearchResult {
-                generation: runtime.search_generation,
-                model_revision: model.task_projection_index().revision(),
-                archived: false,
-                page: model.search_task_ids_page("task", false, None),
-            })
-            .expect("old result is queued before the filter changes");
+        assert!(runtime.request_background_search_page());
 
         runtime.set_filter(InboxFilter::new("different"));
 
         assert!(
             runtime.background_search_pending(),
-            "the new generation may have one page in flight, but the old result is gone"
+            "the replacement generation may have one page in flight"
         );
-        assert!(cancellation.load(AtomicOrdering::Acquire) != 0);
         assert_eq!(runtime.filter().query(), "different");
         assert_eq!(
             runtime
@@ -2387,6 +2493,99 @@ mod tests {
             0
         );
         runtime.cancel_background_search();
+    }
+
+    #[test]
+    fn cancelled_search_retains_worker_ownership_until_the_worker_exits() {
+        let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        let model = search_model(1);
+        let mut runtime = InboxRuntime::new();
+        runtime.live_subscription = Some(Arc::clone(&subscription));
+        runtime.filter = InboxFilter::new("task");
+        runtime.projection_stale = false;
+        runtime.projection = Some(Inbox::from_model_with_search_pages(
+            &model,
+            &runtime.filter,
+            &runtime.unread,
+            SearchPage::pending(),
+            None,
+        ));
+
+        let guard = subscription.lock().expect("hold subscription lock");
+        assert!(runtime.request_background_search_page());
+        runtime.cancel_background_search();
+
+        assert!(
+            !runtime.background_search_pending(),
+            "a worker waiting for the borrowed subscription must observe cancellation"
+        );
+        assert_eq!(runtime.background_search_state(), SearchWorkerState::Idle);
+        drop(guard);
+    }
+
+    #[test]
+    fn cancelled_search_retains_owned_worker_when_join_budget_expires() {
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (results_tx, results_rx) = mpsc::sync_channel(1);
+        let cancellation = Arc::new(AtomicU64::new(4));
+        let join = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let mut runtime = InboxRuntime::new();
+        runtime.background_worker = Some(BackgroundSearchWorker {
+            cancellation: Arc::clone(&cancellation),
+            results: results_rx,
+            join: Some(join),
+            retiring: false,
+        });
+
+        runtime.cancel_background_search();
+        assert!(runtime.background_search_pending());
+        assert_eq!(
+            runtime.background_search_state(),
+            SearchWorkerState::Retiring
+        );
+        assert_ne!(cancellation.load(AtomicOrdering::Acquire), 4);
+
+        release_tx.send(()).expect("release exact worker");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while runtime.background_search_pending() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retiring worker must exit"
+            );
+            runtime.poll_background_search();
+            thread::yield_now();
+        }
+        assert_eq!(runtime.background_search_state(), SearchWorkerState::Idle);
+        drop(results_tx);
+    }
+
+    #[test]
+    fn dropping_runtime_cancels_a_worker_waiting_on_the_borrowed_subscription() {
+        let subscription = Arc::new(Mutex::new(ClientSubscription::new()));
+        let guard = subscription.lock().expect("hold subscription lock");
+        let start = std::time::Instant::now();
+        {
+            let model = search_model(1);
+            let mut runtime = InboxRuntime::new();
+            runtime.live_subscription = Some(Arc::clone(&subscription));
+            runtime.filter = InboxFilter::new("task");
+            runtime.projection_stale = false;
+            runtime.projection = Some(Inbox::from_model_with_search_pages(
+                &model,
+                &runtime.filter,
+                &runtime.unread,
+                SearchPage::pending(),
+                None,
+            ));
+            assert!(runtime.request_background_search_page());
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "Drop must not wait on a borrowed subscription lock"
+        );
+        drop(guard);
     }
 
     #[test]

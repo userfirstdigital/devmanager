@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
 use crate::domain::id::{CommandId, RequestId, SubscriptionId};
+#[cfg(test)]
+use crate::domain::query::{Query, QueryError, QueryOutcome};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::domain::{ClientId, MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::host::{
@@ -44,6 +46,8 @@ pub(crate) enum ScriptedDetachBehavior {
     WrongConnectionAck,
     /// Reject enqueue immediately (closed write queue / transport unavailable).
     ClosedWriteQueue,
+    /// Return a correlated application error for ReleaseEventReplay.
+    ReleaseQueryError,
 }
 
 /// Unsolicited server→client messages (not correlated replies).
@@ -295,7 +299,14 @@ impl UnsolicitedInbox {
             };
             let message = match lane {
                 UnsolicitedLane::Retained => durable.retained_durable.pop_front(),
-                UnsolicitedLane::Durable => durable.durable_rx.try_recv().ok(),
+                // Retirement moves still-valid older durable frames into the
+                // retained lane. Do not let a newer wire frame leapfrog that
+                // retained truth, even when round-robin currently starts on
+                // the durable lane.
+                UnsolicitedLane::Durable if durable.retained_durable.is_empty() => {
+                    durable.durable_rx.try_recv().ok()
+                }
+                UnsolicitedLane::Durable => None,
                 UnsolicitedLane::Stream => {
                     let mut streams = streams.lock().expect("stream inbox");
                     let key = streams.keys().next().copied();
@@ -576,38 +587,65 @@ impl ClientConnection {
                 drop(write_rx);
                 None
             }
-            ScriptedDetachBehavior::MatchingAck | ScriptedDetachBehavior::WrongConnectionAck => {
+            ScriptedDetachBehavior::MatchingAck
+            | ScriptedDetachBehavior::WrongConnectionAck
+            | ScriptedDetachBehavior::ReleaseQueryError => {
                 let reader_state = Arc::clone(&state);
                 let terminal_state = Arc::clone(&state);
                 let reader_unsolicited = Arc::clone(&unsolicited);
                 let wrong_connection =
                     matches!(behavior, ScriptedDetachBehavior::WrongConnectionAck);
+                let release_query_error =
+                    matches!(behavior, ScriptedDetachBehavior::ReleaseQueryError);
                 Some(tokio::spawn(async move {
                     let mut write_rx = write_rx;
                     while let Some(job) = write_rx.recv().await {
-                        let ClientRequest::Detach(request) = job.request else {
-                            continue;
-                        };
-                        let connection_id = if wrong_connection {
-                            uuid::Uuid::from_bytes([
-                                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0xff,
-                            ])
-                        } else {
-                            request.connection_id
-                        };
-                        if dispatch_server_message(
-                            &reader_state,
-                            &reader_unsolicited,
-                            ServerMessage::Detached(DetachAck {
-                                request_id: request.request_id,
-                                connection_id,
-                            }),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
+                        match job.request {
+                            ClientRequest::Detach(request) => {
+                                let connection_id = if wrong_connection {
+                                    uuid::Uuid::from_bytes([
+                                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00,
+                                        0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+                                    ])
+                                } else {
+                                    request.connection_id
+                                };
+                                if dispatch_server_message(
+                                    &reader_state,
+                                    &reader_unsolicited,
+                                    ServerMessage::Detached(DetachAck {
+                                        request_id: request.request_id,
+                                        connection_id,
+                                    }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            ClientRequest::Query(request)
+                                if release_query_error
+                                    && matches!(
+                                        request.query,
+                                        Query::ReleaseEventReplay { .. }
+                                    ) =>
+                            {
+                                if dispatch_server_message(
+                                    &reader_state,
+                                    &reader_unsolicited,
+                                    ServerMessage::QueryReply(QueryReply {
+                                        request_id: request.request_id,
+                                        outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                                    }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     reader_unsolicited.close();
@@ -631,6 +669,14 @@ impl ClientConnection {
     #[cfg(test)]
     pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_durable_for_test(
+        &self,
+        message: UnsolicitedServerMessage,
+    ) -> Result<(), IpcError> {
+        self.shared.unsolicited.push_durable(message)
     }
 
     #[cfg(test)]
@@ -1780,6 +1826,65 @@ mod tests {
             stream_count >= 32,
             "current stream lane must receive a fair share while durables stay continuous; got {stream_count}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_durable_truth_is_delivered_before_newer_durable_frames() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+
+        let inbox = UnsolicitedInbox::new_for_test(4, 1);
+        let old_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x11,
+        ])
+        .expect("old subscription");
+        let new_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x12,
+        ])
+        .expect("new subscription");
+        let durable = |subscription_id, sequence| UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event: DomainEvent {
+                id: EventId::from_bytes([
+                    0x01,
+                    0x8f,
+                    0x60,
+                    0xb0,
+                    0x9c,
+                    0x1a,
+                    0x70,
+                    0x01,
+                    0x80,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    sequence as u8,
+                ])
+                .expect("event"),
+                task_id: None,
+                sequence,
+                task_revision: None,
+                occurred_at_ms: sequence as i64,
+                payload: Event::TaskReopened,
+            },
+        };
+        let retained = durable(new_id, 1);
+        let newer = durable(new_id, 2);
+
+        inbox.push_durable(retained.clone()).expect("old frame");
+        inbox
+            .retire_subscription_id(old_id)
+            .expect("retire old generation");
+        inbox.push_durable(newer.clone()).expect("new frame");
+
+        assert_eq!(inbox.recv().await.expect("retained frame"), retained);
+        assert_eq!(inbox.recv().await.expect("new frame"), newer);
     }
 
     #[tokio::test(flavor = "current_thread")]

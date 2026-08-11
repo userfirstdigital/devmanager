@@ -6,6 +6,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use caseless::Caseless;
+use unicode_normalization::UnicodeNormalization;
+
 use crate::domain::agent::AgentSessionFacts;
 use crate::domain::artifact::ArtifactSummary;
 use crate::domain::event::{apply, DomainEvent, Event};
@@ -43,11 +46,18 @@ pub const MAX_CLIENT_SEARCH_WORK: usize = MAX_CLIENT_SEARCH_RESULTS;
 pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
 /// Exact postings cover common longer queries without a candidate scan.
 const MAX_INDEXED_GRAM_CHARS: usize = 8;
+/// Index only a bounded title prefix for substring candidates. Titles beyond
+/// this bound remain searchable through the canonical continuation scan, so
+/// this is an allocation/performance bound, never a correctness bound.
+const MAX_INDEXED_SUBSTRING_SOURCE_CHARS: usize = 32;
+/// Exact one-scalar totals are kept separately so short substring queries do
+/// not mistake prefix-only postings for exhaustive candidates.
+const MAX_INDEXED_SCALAR_KEYS: usize = 4_096;
 /// Hard resident allocation budget for the compact search index. This includes
 /// the hash table slots, owned key capacities, and posting vector capacities.
 pub const MAX_CLIENT_SEARCH_POSTING_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum key records admitted to the compact prefix table. Additional
-/// prefixes use the bounded canonical-order continuation scan.
+/// Maximum key records admitted to the compact substring table. Additional
+/// substrings use the bounded canonical-order continuation scan.
 pub const MAX_CLIENT_SEARCH_INDEX_KEYS: usize = 100_000;
 /// Hard upper bound for the number of compact TaskId identities retained by
 /// one model's postings. The resident byte estimate remains authoritative.
@@ -157,6 +167,56 @@ struct SearchPosting {
     archived_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SearchScalarTotal {
+    active: usize,
+    archived: usize,
+}
+
+impl SearchScalarTotal {
+    fn from_entry(archived: bool) -> Self {
+        if archived {
+            Self {
+                active: 0,
+                archived: 1,
+            }
+        } else {
+            Self {
+                active: 1,
+                archived: 0,
+            }
+        }
+    }
+
+    fn increment(&mut self, archived: bool) {
+        if archived {
+            self.archived = self.archived.saturating_add(1);
+        } else {
+            self.active = self.active.saturating_add(1);
+        }
+    }
+
+    fn decrement(&mut self, archived: bool) {
+        if archived {
+            self.archived = self.archived.saturating_sub(1);
+        } else {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    fn len(self, archived: bool) -> usize {
+        if archived {
+            self.archived
+        } else {
+            self.active
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.active == 0 && self.archived == 0
+    }
+}
+
 impl SearchPosting {
     fn insert(
         &mut self,
@@ -257,6 +317,7 @@ impl SearchPosting {
 // conservative is what makes the resident estimate a hard admission fence,
 // rather than a nominal TaskId-only counter.
 const SEARCH_MAP_SLOT_BYTES: usize = std::mem::size_of::<(String, SearchPosting)>() + 32;
+const SEARCH_SCALAR_MAP_SLOT_BYTES: usize = std::mem::size_of::<(char, SearchScalarTotal)>() + 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskProjectionEntry {
@@ -347,11 +408,14 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
-    /// Compact normalized-title prefix postings. Each posting stores only a
-    /// bounded TaskId prefix; title/order strings remain in `entries` and the
-    /// canonical order sets exactly once. Missing keys use bounded fallback
-    /// scans instead of allocating beyond the resident search budget.
+    /// Compact normalized-title substring postings. Each posting stores only
+    /// a bounded TaskId set; title/order strings remain in `entries` and the
+    /// canonical order sets exactly once. Missing or saturated keys use
+    /// bounded fallback scans instead of allocating beyond the resident budget.
     search: HashMap<String, SearchPosting>,
+    search_scalar_totals: HashMap<char, SearchScalarTotal>,
+    search_scalar_map_bytes: usize,
+    unindexed_suffix_entries: usize,
     search_posting_entries: usize,
     search_index_map_bytes: usize,
     search_index_key_bytes: usize,
@@ -376,6 +440,12 @@ impl TaskProjectionIndex {
         let archived_order = BTreeSet::new();
         let search = HashMap::<String, SearchPosting>::with_capacity(MAX_CLIENT_SEARCH_INDEX_KEYS);
         let search_index_map_bytes = search.capacity().saturating_mul(SEARCH_MAP_SLOT_BYTES);
+        let search_scalar_totals =
+            HashMap::<char, SearchScalarTotal>::with_capacity(MAX_INDEXED_SCALAR_KEYS);
+        let search_scalar_map_bytes = search_scalar_totals
+            .capacity()
+            .saturating_mul(SEARCH_SCALAR_MAP_SLOT_BYTES);
+        let unindexed_suffix_entries = 0usize;
         let search_index_key_bytes = 0usize;
         let search_index_posting_storage_bytes = 0usize;
         let search_posting_entries: usize = 0;
@@ -386,6 +456,9 @@ impl TaskProjectionIndex {
             active_order,
             archived_order,
             search,
+            search_scalar_totals,
+            search_scalar_map_bytes,
+            unindexed_suffix_entries,
             search_posting_entries,
             search_index_map_bytes,
             search_index_key_bytes,
@@ -407,6 +480,7 @@ impl TaskProjectionIndex {
             } else {
                 index.active_order.insert(key);
             }
+            index.insert_search_scalar_totals(&entry);
             index.insert_search_tokens(task_id, &entry);
         }
         index
@@ -416,11 +490,64 @@ impl TaskProjectionIndex {
         self.search_index_map_bytes
             .saturating_add(self.search_index_key_bytes)
             .saturating_add(self.search_index_posting_storage_bytes)
+            .saturating_add(self.search_scalar_map_bytes)
     }
 
     fn insert_search_tokens(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
         for token in search_tokens(&entry.lower_title) {
             self.insert_search_token(task_id, entry, token);
+        }
+    }
+
+    fn insert_search_scalar_totals(&mut self, entry: &TaskProjectionEntry) {
+        let archived = entry.lifecycle == TaskLifecycle::Archived;
+        let mut seen = HashSet::new();
+        for scalar in entry.lower_title.chars() {
+            if !seen.insert(scalar) {
+                continue;
+            }
+            if let Some(total) = self.search_scalar_totals.get_mut(&scalar) {
+                total.increment(archived);
+                continue;
+            }
+            if self.search_scalar_totals.len() >= MAX_INDEXED_SCALAR_KEYS
+                || self
+                    .resident_search_bytes()
+                    .saturating_add(SEARCH_SCALAR_MAP_SLOT_BYTES)
+                    > MAX_CLIENT_SEARCH_POSTING_BYTES
+            {
+                continue;
+            }
+            self.search_scalar_totals
+                .insert(scalar, SearchScalarTotal::from_entry(archived));
+            self.search_scalar_map_bytes = self
+                .search_scalar_totals
+                .capacity()
+                .saturating_mul(SEARCH_SCALAR_MAP_SLOT_BYTES);
+        }
+        if entry.lower_title.chars().count() > MAX_INDEXED_SUBSTRING_SOURCE_CHARS {
+            self.unindexed_suffix_entries = self.unindexed_suffix_entries.saturating_add(1);
+        }
+    }
+
+    fn remove_search_scalar_totals(&mut self, entry: &TaskProjectionEntry) {
+        let archived = entry.lifecycle == TaskLifecycle::Archived;
+        let mut seen = HashSet::new();
+        for scalar in entry.lower_title.chars() {
+            if !seen.insert(scalar) {
+                continue;
+            }
+            let mut empty = false;
+            if let Some(total) = self.search_scalar_totals.get_mut(&scalar) {
+                total.decrement(archived);
+                empty = total.is_empty();
+            }
+            if empty {
+                self.search_scalar_totals.remove(&scalar);
+            }
+        }
+        if entry.lower_title.chars().count() > MAX_INDEXED_SUBSTRING_SOURCE_CHARS {
+            self.unindexed_suffix_entries = self.unindexed_suffix_entries.saturating_sub(1);
         }
     }
 
@@ -571,22 +698,35 @@ impl TaskProjectionIndex {
             .unwrap_or_default();
         let start_cursor = continuation.and_then(|continuation| continuation.cursor.as_ref());
         let mut last_cursor = start_cursor.cloned();
+        // A posting is only a candidate accelerator. It is exhaustive for an
+        // exact indexed token only after the canonical title `contains` check;
+        // a shorter prefix/gram is never allowed to stand in for the query.
+        // Titles beyond the indexed source prefix fence the posting path too;
+        // their canonical continuation scan remains the correctness source.
         let query_chars = query.chars().count();
-        let query_tokens = search_tokens(&query);
-        let indexed_prefix = query_tokens
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, token)| self.search.get(token).map(|posting| (index + 1, posting)));
-        let first = indexed_prefix.map(|(_, posting)| posting);
-        let exact_prefix_total = if query.is_empty() {
+        let indexed_token = (query_chars >= 4)
+            .then(|| {
+                search_tokens(&query)
+                    .into_iter()
+                    .filter_map(|token| self.search.get(&token).map(|posting| (token, posting)))
+                    .max_by_key(|(token, _)| token.chars().count())
+            })
+            .flatten()
+            .filter(|(_, _)| self.unindexed_suffix_entries == 0);
+        let first = indexed_token.as_ref().map(|(_, posting)| *posting);
+        let exact_indexed_total = if query.is_empty() {
             Some(order.len())
-        } else if indexed_prefix.is_some_and(|(length, _)| length == query_chars)
-            && query_chars <= MAX_INDEXED_GRAM_CHARS
-        {
-            first.map(|posting| posting.len(archived))
+        } else if query_chars == 1 {
+            query
+                .chars()
+                .next()
+                .and_then(|scalar| self.search_scalar_totals.get(&scalar))
+                .map(|total| total.len(archived))
         } else {
-            None
+            indexed_token
+                .as_ref()
+                .filter(|(token, _)| *token == query)
+                .map(|(_, posting)| posting.len(archived))
         };
 
         // A small complete posting can be materialized and sorted by the
@@ -639,7 +779,7 @@ impl TaskProjectionIndex {
             } else {
                 Box::new(order.iter())
             };
-        let exact_single_posting_total = exact_prefix_total;
+        let exact_single_posting_total = exact_indexed_total;
         let mut work = 0usize;
         for key in candidates.by_ref().take(MAX_CLIENT_SEARCH_WORK) {
             work = work.saturating_add(1);
@@ -688,8 +828,9 @@ impl TaskProjectionIndex {
     }
 
     /// Search with observable bounded candidate work for diagnostics/tests.
-    /// Exact grams return the complete truthful total and only the retained
-    /// first page; longer queries return a lower bound until continued.
+    /// Exact indexed tokens return the complete truthful total and only the
+    /// retained first page; longer or unindexed queries return a lower bound
+    /// until continued.
     pub fn search_task_ids_with_work(
         &self,
         query: &str,
@@ -766,12 +907,14 @@ impl TaskProjectionIndex {
             .get(&task_id)
             .expect("inserted task projection entry")
             .clone();
+        self.insert_search_scalar_totals(&entry);
         self.insert_search_tokens(task_id, &entry);
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
     fn remove_task_id(&mut self, task_id: TaskId) {
         if let Some(entry) = self.entries.remove(&task_id) {
+            self.remove_search_scalar_totals(&entry);
             let key = TaskOrderKey::new(task_id, &entry);
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
@@ -807,11 +950,19 @@ impl TaskProjectionIndex {
 fn search_tokens(value: &str) -> Vec<String> {
     let chars = value
         .chars()
-        .take(MAX_INDEXED_GRAM_CHARS)
+        .take(MAX_INDEXED_SUBSTRING_SOURCE_CHARS)
         .collect::<Vec<_>>();
-    (1..=chars.len())
-        .map(|length| chars[..length].iter().collect::<String>())
-        .collect()
+    let mut tokens = BTreeSet::new();
+    let prefix_len = MAX_INDEXED_GRAM_CHARS.min(chars.len());
+    for length in 1..=prefix_len {
+        tokens.insert(chars[..length].iter().collect::<String>());
+    }
+    for start in 1..chars.len() {
+        for length in 4..=MAX_INDEXED_GRAM_CHARS.min(chars.len().saturating_sub(start)) {
+            tokens.insert(chars[start..start + length].iter().collect::<String>());
+        }
+    }
+    tokens.into_iter().collect()
 }
 
 fn next_posting_capacity(capacity: usize) -> usize {
@@ -822,40 +973,32 @@ fn next_posting_capacity(capacity: usize) -> usize {
     }
 }
 
-/// Lowercase one bounded source scalar at a time and stop at the shared output
-/// bound. Unicode lowercase can expand a scalar (for example, `İ`), so the
-/// source bound prevents hostile input work while the output bound keeps the
-/// title/query representation compact and consistent.
+/// Apply bounded Unicode compatibility caseless matching semantics: the same
+/// NFD/default-fold/NFKD/default-fold/NFKD sequence used by the pinned
+/// `caseless` crate. The source scalar bound prevents hostile input work,
+/// while the output bound is enforced while consuming the streaming
+/// iterators so an expanding fold never performs an unbounded pre-allocation.
+/// The same representation is used for index keys, queries, filtering, and
+/// ordering.
 pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, bool) {
     if max_chars == 0 {
         return (String::new(), value.chars().next().is_some());
     }
+    let source_truncated = value.chars().nth(max_chars).is_some();
+    let mut normalized = value
+        .chars()
+        .take(max_chars)
+        .nfd()
+        .default_case_fold()
+        .nfkd()
+        .default_case_fold()
+        .nfkd();
     let mut output = String::new();
-    let mut source = value.chars();
-    let mut source_seen = 0usize;
-    let mut output_chars = 0usize;
-    let mut truncated = false;
-    while source_seen < max_chars {
-        let Some(ch) = source.next() else {
-            return (output, false);
-        };
-        source_seen = source_seen.saturating_add(1);
-        for lowered in ch.to_lowercase() {
-            if output_chars >= max_chars {
-                truncated = true;
-                break;
-            }
-            output.push(lowered);
-            output_chars = output_chars.saturating_add(1);
-        }
-        if truncated {
-            break;
-        }
+    for ch in normalized.by_ref().take(max_chars) {
+        output.push(ch);
     }
-    if !truncated && source.next().is_some() {
-        truncated = true;
-    }
-    (output, truncated)
+    let output_truncated = normalized.next().is_some();
+    (output, source_truncated || output_truncated)
 }
 
 impl TaskProjectionEntry {

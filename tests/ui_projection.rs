@@ -1491,6 +1491,127 @@ fn indexed_search_keeps_common_and_adversarial_100k_queries_bounded_and_ordered(
 }
 
 #[test]
+fn indexed_search_is_exact_for_interior_substrings() {
+    let items = vec![
+        inbox_task_item(
+            inbox_task_id(0),
+            "Task Alpha",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            0,
+        ),
+        inbox_task_item(
+            inbox_task_id(1),
+            "X task",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            1,
+        ),
+    ];
+    let model = inbox_model(items);
+
+    let page = model.search_task_ids_page("task", false, None);
+
+    assert_eq!(page.exact_total, Some(2));
+    assert_eq!(page.ids.len(), 2);
+    assert!(page.ids.contains(&inbox_task_id(0)));
+    assert!(page.ids.contains(&inbox_task_id(1)));
+}
+
+#[test]
+fn indexed_search_short_scalar_queries_include_interior_matches() {
+    let items = vec![
+        inbox_task_item(
+            inbox_task_id(0),
+            "Task Alpha",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            0,
+        ),
+        inbox_task_item(
+            inbox_task_id(1),
+            "X task",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            1,
+        ),
+    ];
+    let model = inbox_model(items);
+
+    let page = model.search_task_ids_page("t", false, None);
+
+    assert_eq!(page.exact_total, Some(2));
+    assert_eq!(page.ids.len(), 2);
+    assert!(page.ids.contains(&inbox_task_id(0)));
+    assert!(page.ids.contains(&inbox_task_id(1)));
+}
+
+#[test]
+fn indexed_search_does_not_treat_a_prefix_posting_as_exhaustive_past_the_source_fence() {
+    let items = vec![
+        inbox_task_item(
+            inbox_task_id(0),
+            "task",
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            0,
+        ),
+        inbox_task_item(
+            inbox_task_id(1),
+            &format!("{}task", "x".repeat(40)),
+            TaskLifecycle::Open,
+            TaskConnectivity::Connected,
+            TaskAttention::None,
+            TaskActivity::Idle,
+            ReviewReadiness::NotReady,
+            1,
+        ),
+    ];
+    let model = inbox_model(items);
+
+    let page = model.search_task_ids_page("task", false, None);
+
+    assert_eq!(page.exact_total, Some(2));
+    assert_eq!(page.ids.len(), 2);
+    assert!(page.ids.contains(&inbox_task_id(0)));
+    assert!(page.ids.contains(&inbox_task_id(1)));
+}
+
+#[test]
+fn indexed_search_uses_full_unicode_casefold_for_expanding_mappings() {
+    let model = inbox_model(vec![inbox_task_item(
+        inbox_task_id(0),
+        "Straße",
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        0,
+    )]);
+
+    let page = model.search_task_ids_page("STRASSE", false, None);
+
+    assert_eq!(page.exact_total, Some(1));
+    assert_eq!(page.ids, vec![inbox_task_id(0)]);
+}
+
+#[test]
 fn indexed_search_repeated_titles_never_scan_a_full_long_query_posting() {
     let items = (0..100_000)
         .map(|index| {

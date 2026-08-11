@@ -447,11 +447,11 @@ impl ClientSubscription {
             match client.release_event_replay(subscription_id).await {
                 Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {}
                 Ok(Err(error)) => {
-                    self.subscription_id = Some(subscription_id);
+                    self.retire_without_transport();
                     return Err(SubscriptionError::Query(error));
                 }
                 Err(error) => {
-                    self.subscription_id = Some(subscription_id);
+                    self.retire_without_transport();
                     return Err(SubscriptionError::Transport(error));
                 }
             }

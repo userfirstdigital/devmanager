@@ -564,6 +564,13 @@ impl HostClient {
         subscription_id: SubscriptionId,
     ) -> Result<Result<(), QueryError>, IpcError> {
         if !self.server_hello.granted.contains(Capability::EventReplay) {
+            // The capability may have disappeared during reconnect while the
+            // caller still owns an older generation. Fence its borrowed queue
+            // before surfacing the capability error, so replacement can never
+            // observe a foreign late frame.
+            if self.connection.is_some() {
+                self.fence_retired_subscription(subscription_id).await?;
+            }
             return Err(IpcError::UnsupportedCapability);
         }
 
@@ -583,6 +590,11 @@ impl HostClient {
         let reply = match outcome {
             Ok(reply) => reply,
             Err(error) => {
+                // A response timeout/transport failure still retires the exact
+                // generation in the borrowed queue before this connection is
+                // discarded. Cloned test/bridge handles must not be able to
+                // deliver that old tail into a later replacement.
+                let _ = self.fence_retired_subscription(subscription_id).await;
                 self.retire_connection();
                 return Err(error);
             }
@@ -593,7 +605,10 @@ impl HostClient {
                 self.fence_retired_subscription(subscription_id).await?;
                 Ok(Err(error))
             }
-            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Err(error) => {
+                self.fence_retired_subscription(subscription_id).await?;
+                Ok(Err(error))
+            }
             QueryOutcome::Ok(QueryResult::EventReplayReleased {
                 subscription_id: released,
             }) if released == subscription_id => {
@@ -1662,5 +1677,117 @@ mod tests {
         assert!(matches!(client.detach().await, Err(IpcError::Unavailable)));
         assert!(!client.is_connected());
         assert_eq!(client.tracked(), &tracked);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_errors_always_fence_old_subscription_queue() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::client::UnsolicitedServerMessage;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+        use crate::domain::query::QueryError;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+        use std::time::Duration;
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe2,
+        ]);
+        let subscription_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe3,
+        ])
+        .expect("subscription");
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::EventReplay]),
+            connection_id,
+        );
+        let connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello.clone(),
+            ScriptedDetachBehavior::ReleaseQueryError,
+        );
+        let old_frame = UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event: DomainEvent {
+                id: EventId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xe4,
+                ])
+                .expect("event"),
+                task_id: None,
+                sequence: 1,
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: Event::TaskReopened,
+            },
+        };
+        connection
+            .push_durable_for_test(old_frame.clone())
+            .expect("queue old frame");
+        let mut client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "release-error-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::EventReplay]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(connection.clone()),
+            BTreeMap::new(),
+        );
+
+        assert!(matches!(
+            client.release_event_replay(subscription_id).await,
+            Ok(Err(QueryError::Unauthorized))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), connection.recv_unsolicited())
+                .await
+                .is_err(),
+            "application release errors must still fence queued old frames"
+        );
+
+        let transport_connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello.clone(),
+            ScriptedDetachBehavior::ClosedWriteQueue,
+        );
+        transport_connection
+            .push_durable_for_test(old_frame)
+            .expect("queue old frame before transport failure");
+        let mut transport_client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "release-transport-error-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::EventReplay]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(transport_connection.clone()),
+            BTreeMap::new(),
+        );
+        assert!(matches!(
+            transport_client.release_event_replay(subscription_id).await,
+            Err(IpcError::Unavailable)
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                transport_connection.recv_unsolicited()
+            )
+            .await
+            .is_err(),
+            "transport release failures must fence queued old frames before replacement"
+        );
     }
 }
