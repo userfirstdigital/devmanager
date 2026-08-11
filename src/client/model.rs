@@ -2,7 +2,7 @@
 //! and advanced by ordered durable events.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
@@ -43,12 +43,17 @@ pub const MAX_CLIENT_SEARCH_WORK: usize = MAX_CLIENT_SEARCH_RESULTS;
 pub const MAX_CLIENT_SEARCH_POSTING_IDS: usize = MAX_CLIENT_MODEL_ITEMS;
 /// Exact postings cover common longer queries without a candidate scan.
 const MAX_INDEXED_GRAM_CHARS: usize = 8;
-/// Hard upper bound for the number of compact TaskId identities retained by
-/// one model's substring postings. Saturated postings degrade to bounded
-/// ordered-title continuation scans instead of allocating past this budget.
+/// Hard resident allocation budget for the compact search index. This includes
+/// the hash table slots, owned key capacities, and posting vector capacities.
 pub const MAX_CLIENT_SEARCH_POSTING_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum key records admitted to the compact prefix table. Additional
+/// prefixes use the bounded canonical-order continuation scan.
+pub const MAX_CLIENT_SEARCH_INDEX_KEYS: usize = 100_000;
+/// Hard upper bound for the number of compact TaskId identities retained by
+/// one model's postings. The resident byte estimate remains authoritative.
 pub const MAX_CLIENT_SEARCH_POSTING_ENTRIES: usize =
     MAX_CLIENT_SEARCH_POSTING_BYTES / std::mem::size_of::<TaskId>();
+const MAX_STORED_IDS_PER_POSTING: usize = MAX_CLIENT_SEARCH_RESULTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientModelError {
@@ -144,8 +149,8 @@ impl std::error::Error for ClientModelError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SearchPosting {
-    active: BTreeSet<TaskId>,
-    archived: BTreeSet<TaskId>,
+    active: Vec<TaskId>,
+    archived: Vec<TaskId>,
     active_total: usize,
     archived_total: usize,
     active_truncated: bool,
@@ -177,11 +182,12 @@ impl SearchPosting {
         } else {
             self.active_total = self.active_total.saturating_add(1);
         }
-        if set.len() >= MAX_CLIENT_SEARCH_POSTING_IDS || !budget_available {
+        if set.len() >= MAX_STORED_IDS_PER_POSTING || !budget_available {
             *truncated = true;
             return false;
         }
-        set.insert(task_id)
+        set.push(task_id);
+        true
     }
 
     fn remove(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) -> bool {
@@ -192,17 +198,35 @@ impl SearchPosting {
         };
         if entry.lifecycle == TaskLifecycle::Archived {
             self.archived_total = self.archived_total.saturating_sub(1);
+            if self.archived_total == 0 {
+                self.archived_truncated = false;
+            }
         } else {
             self.active_total = self.active_total.saturating_sub(1);
+            if self.active_total == 0 {
+                self.active_truncated = false;
+            }
         }
-        set.remove(&task_id)
+        let Some(index) = set.iter().position(|stored| *stored == task_id) else {
+            return false;
+        };
+        set.remove(index);
+        true
     }
 
-    fn ids(&self, archived: bool) -> &BTreeSet<TaskId> {
+    fn ids(&self, archived: bool) -> &[TaskId] {
         if archived {
             &self.archived
         } else {
             &self.active
+        }
+    }
+
+    fn ids_capacity(&self, archived: bool) -> usize {
+        if archived {
+            self.archived.capacity()
+        } else {
+            self.active.capacity()
         }
     }
 
@@ -214,16 +238,8 @@ impl SearchPosting {
         }
     }
 
-    fn contains(&self, archived: bool, task_id: TaskId) -> bool {
-        self.ids(archived).contains(&task_id)
-    }
-
-    fn complete(&self, archived: bool) -> bool {
-        if archived {
-            !self.archived_truncated
-        } else {
-            !self.active_truncated
-        }
+    fn ids_complete(&self, archived: bool) -> bool {
+        self.ids(archived).len() == self.len(archived)
     }
 
     fn is_empty(&self) -> bool {
@@ -235,6 +251,12 @@ impl SearchPosting {
             && !self.archived_truncated
     }
 }
+
+// `HashMap` stores the key/value pair inline in its bucket table. The extra
+// allowance covers control bytes and allocator/node metadata; keeping this
+// conservative is what makes the resident estimate a hard admission fence,
+// rather than a nominal TaskId-only counter.
+const SEARCH_MAP_SLOT_BYTES: usize = std::mem::size_of::<(String, SearchPosting)>() + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskProjectionEntry {
@@ -313,12 +335,15 @@ pub struct TaskProjectionIndex {
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
-    /// Compact substring postings. Each posting stores only bounded TaskIds;
-    /// title/order strings remain in `entries` and the canonical order sets
-    /// exactly once. Saturated postings are marked and use bounded fallback
-    /// scans instead of allocating beyond the global entry budget.
-    search: BTreeMap<String, SearchPosting>,
+    /// Compact normalized-title prefix postings. Each posting stores only a
+    /// bounded TaskId prefix; title/order strings remain in `entries` and the
+    /// canonical order sets exactly once. Missing keys use bounded fallback
+    /// scans instead of allocating beyond the resident search budget.
+    search: HashMap<String, SearchPosting>,
     search_posting_entries: usize,
+    search_index_map_bytes: usize,
+    search_index_key_bytes: usize,
+    search_index_posting_storage_bytes: usize,
     search_index_saturated: bool,
     full_rebuilds: u64,
     incremental_updates: u64,
@@ -335,46 +360,116 @@ impl TaskProjectionIndex {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let mut active_order = BTreeSet::new();
-        let mut archived_order = BTreeSet::new();
-        let mut search = BTreeMap::<String, SearchPosting>::new();
-        let mut search_posting_entries: usize = 0;
-        let mut search_index_saturated = false;
-        for (task_id, entry) in &entries {
-            let key = TaskOrderKey::new(*task_id, entry);
-            if entry.lifecycle == TaskLifecycle::Archived {
-                archived_order.insert(key);
-            } else {
-                active_order.insert(key);
-            }
-            for token in search_tokens(&entry.lower_title) {
-                if !search.contains_key(&token)
-                    && search_posting_entries >= MAX_CLIENT_SEARCH_POSTING_ENTRIES
-                {
-                    search_index_saturated = true;
-                    continue;
-                }
-                let budget_available = search_posting_entries < MAX_CLIENT_SEARCH_POSTING_ENTRIES;
-                if search
-                    .entry(token)
-                    .or_default()
-                    .insert(*task_id, entry, budget_available)
-                {
-                    search_posting_entries = search_posting_entries.saturating_add(1);
-                }
-            }
-        }
-        Self {
+        let active_order = BTreeSet::new();
+        let archived_order = BTreeSet::new();
+        let search = HashMap::<String, SearchPosting>::with_capacity(MAX_CLIENT_SEARCH_INDEX_KEYS);
+        let search_index_map_bytes = search.capacity().saturating_mul(SEARCH_MAP_SLOT_BYTES);
+        let search_index_key_bytes = 0usize;
+        let search_index_posting_storage_bytes = 0usize;
+        let search_posting_entries: usize = 0;
+        let search_index_saturated = false;
+        let mut index = Self {
             revision,
             entries,
             active_order,
             archived_order,
             search,
             search_posting_entries,
+            search_index_map_bytes,
+            search_index_key_bytes,
+            search_index_posting_storage_bytes,
             search_index_saturated,
             full_rebuilds: 1,
             incremental_updates: 0,
+        };
+        let task_ids = index.entries.keys().copied().collect::<Vec<_>>();
+        for task_id in task_ids {
+            let entry = index
+                .entries
+                .get(&task_id)
+                .expect("entry from index")
+                .clone();
+            let key = TaskOrderKey::new(task_id, &entry);
+            if entry.lifecycle == TaskLifecycle::Archived {
+                index.archived_order.insert(key);
+            } else {
+                index.active_order.insert(key);
+            }
+            index.insert_search_tokens(task_id, &entry);
         }
+        index
+    }
+
+    fn resident_search_bytes(&self) -> usize {
+        self.search_index_map_bytes
+            .saturating_add(self.search_index_key_bytes)
+            .saturating_add(self.search_index_posting_storage_bytes)
+    }
+
+    fn insert_search_tokens(&mut self, task_id: TaskId, entry: &TaskProjectionEntry) {
+        for token in search_tokens(&entry.lower_title) {
+            self.insert_search_token(task_id, entry, token);
+        }
+    }
+
+    fn insert_search_token(&mut self, task_id: TaskId, entry: &TaskProjectionEntry, token: String) {
+        let resident_bytes = self.resident_search_bytes();
+        if let Some(posting) = self.search.get_mut(&token) {
+            let before_capacity = posting.ids_capacity(entry.lifecycle == TaskLifecycle::Archived);
+            let required_capacity = posting
+                .ids(entry.lifecycle == TaskLifecycle::Archived)
+                .len()
+                .eq(&before_capacity)
+                .then(|| next_posting_capacity(before_capacity))
+                .unwrap_or(before_capacity);
+            let additional_bytes = required_capacity
+                .saturating_sub(before_capacity)
+                .saturating_mul(std::mem::size_of::<TaskId>());
+            let stored = posting.insert(
+                task_id,
+                entry,
+                resident_bytes.saturating_add(additional_bytes) <= MAX_CLIENT_SEARCH_POSTING_BYTES,
+            );
+            if stored {
+                self.search_posting_entries = self.search_posting_entries.saturating_add(1);
+                self.search_index_posting_storage_bytes = self
+                    .search_index_posting_storage_bytes
+                    .saturating_add(additional_bytes);
+            }
+            return;
+        }
+
+        if self.search.len() >= MAX_CLIENT_SEARCH_INDEX_KEYS {
+            self.search_index_saturated = true;
+            return;
+        }
+        let key_capacity = token.capacity();
+        let initial_posting_capacity = next_posting_capacity(0);
+        let initial_posting_bytes =
+            initial_posting_capacity.saturating_mul(std::mem::size_of::<TaskId>());
+        if self
+            .resident_search_bytes()
+            .saturating_add(key_capacity)
+            .saturating_add(initial_posting_bytes)
+            > MAX_CLIENT_SEARCH_POSTING_BYTES
+        {
+            self.search_index_saturated = true;
+            return;
+        }
+
+        let mut posting = SearchPosting::default();
+        let stored = posting.insert(task_id, entry, true);
+        self.search_index_key_bytes = self.search_index_key_bytes.saturating_add(key_capacity);
+        self.search_index_posting_storage_bytes =
+            self.search_index_posting_storage_bytes.saturating_add(
+                posting
+                    .ids_capacity(entry.lifecycle == TaskLifecycle::Archived)
+                    .saturating_mul(std::mem::size_of::<TaskId>()),
+            );
+        if stored {
+            self.search_posting_entries = self.search_posting_entries.saturating_add(1);
+        }
+        self.search.insert(token, posting);
     }
 
     pub fn revision(&self) -> u64 {
@@ -430,7 +525,9 @@ impl TaskProjectionIndex {
         archived: bool,
         continuation: Option<&SearchContinuation>,
     ) -> SearchPage {
-        let (query, query_truncated) = normalize_search_query(query);
+        let (query, query_truncated) =
+            normalize_bounded_search_text(query, MAX_CLIENT_SEARCH_CHARS);
+        let query = query.trim().to_string();
         if let Some(continuation) = continuation {
             if continuation.query != query
                 || continuation.archived != archived
@@ -448,48 +545,11 @@ impl TaskProjectionIndex {
             }
         }
 
-        if query.trim().is_empty() {
-            let order = if archived {
-                &self.archived_order
-            } else {
-                &self.active_order
-            };
-            let count = order.len();
-            let ids = order
-                .iter()
-                .take(MAX_CLIENT_SEARCH_RESULTS)
-                .map(|key| key.task_id)
-                .collect();
-            return SearchPage {
-                ids,
-                known_total: count,
-                exact_total: Some(count),
-                work: count.min(MAX_CLIENT_SEARCH_WORK),
-                status: SearchPageStatus::Complete,
-                query_truncated,
-                continuation: None,
-            };
-        }
-
-        let tokens = search_tokens(&query);
-        let missing_token = tokens.iter().any(|token| !self.search.contains_key(token));
-        if missing_token && !self.search_index_saturated {
-            return SearchPage {
-                ids: Vec::new(),
-                known_total: 0,
-                exact_total: Some(0),
-                work: 0,
-                status: SearchPageStatus::Complete,
-                query_truncated,
-                continuation: None,
-            };
-        }
-        let first = tokens
-            .iter()
-            .filter_map(|token| self.search.get(token).map(|posting| (token, posting)))
-            .min_by_key(|(_, posting)| posting.len(archived))
-            .map(|(_, posting)| posting);
-
+        let order = if archived {
+            &self.archived_order
+        } else {
+            &self.active_order
+        };
         let mut ids = continuation
             .map(|continuation| continuation.retained_ids.clone())
             .unwrap_or_default();
@@ -499,26 +559,30 @@ impl TaskProjectionIndex {
             .unwrap_or_default();
         let start_cursor = continuation.and_then(|continuation| continuation.cursor.as_ref());
         let mut last_cursor = start_cursor.cloned();
-        let all_postings_complete = tokens.iter().all(|token| {
-            self.search
-                .get(token)
-                .is_some_and(|posting| posting.complete(archived))
-        });
-        let exact_gram_total = (query.chars().count() <= MAX_INDEXED_GRAM_CHARS)
-            .then(|| self.search.get(&query))
-            .flatten()
-            .map(|posting| posting.len(archived));
+        let query_chars = query.chars().count();
+        let query_tokens = search_tokens(&query);
+        let indexed_prefix = query_tokens
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, token)| self.search.get(token).map(|posting| (index + 1, posting)));
+        let first = indexed_prefix.map(|(_, posting)| posting);
+        let exact_prefix_total = if query.is_empty() {
+            Some(order.len())
+        } else if indexed_prefix.is_some_and(|(length, _)| length == query_chars)
+            && query_chars <= MAX_INDEXED_GRAM_CHARS
+        {
+            first.map(|posting| posting.len(archived))
+        } else {
+            None
+        };
 
         // A small complete posting can be materialized and sorted by the
-        // canonical order key without exceeding the page work bound. This
-        // keeps specific searches ordered even though postings store only
-        // compact TaskIds.
+        // canonical order key without exceeding the page work bound. Longer
+        // or saturated postings use the bounded canonical-order scan below.
         if continuation.is_none()
-            && !missing_token
             && first.is_some_and(|first| {
-                first.len(archived) <= MAX_CLIENT_SEARCH_WORK
-                    && (first.complete(archived)
-                        || first.ids(archived).len() == first.len(archived))
+                first.len(archived) <= MAX_CLIENT_SEARCH_WORK && first.ids_complete(archived)
             })
         {
             let first = first.expect("small posting candidate");
@@ -536,16 +600,10 @@ impl TaskProjectionIndex {
                 Vec::with_capacity(candidate_keys.len().min(MAX_CLIENT_SEARCH_RESULTS));
             let mut count = 0usize;
             for key in &candidate_keys {
-                let matches = (!all_postings_complete
-                    || tokens.iter().all(|token| {
-                        self.search
-                            .get(token)
-                            .is_some_and(|posting| posting.contains(archived, key.task_id))
-                    }))
-                    && self
-                        .entries
-                        .get(&key.task_id)
-                        .is_some_and(|entry| entry.lower_title.contains(&query));
+                let matches = self
+                    .entries
+                    .get(&key.task_id)
+                    .is_some_and(|entry| entry.lower_title.contains(&query));
                 if matches {
                     count = count.saturating_add(1);
                     if page_ids.len() < MAX_CLIENT_SEARCH_RESULTS {
@@ -563,40 +621,21 @@ impl TaskProjectionIndex {
                 continuation: None,
             };
         }
-
-        let order = if archived {
-            &self.archived_order
-        } else {
-            &self.active_order
-        };
         let mut candidates: Box<dyn Iterator<Item = &TaskOrderKey> + '_> =
             if let Some(cursor) = start_cursor {
                 Box::new(order.range((Excluded(cursor), Unbounded)))
             } else {
                 Box::new(order.iter())
             };
-        let posting_filter = all_postings_complete;
-        let exact_single_posting_total = exact_gram_total.or_else(|| {
-            if tokens.len() == 1 && posting_filter {
-                first.map(|posting| posting.len(archived))
-            } else {
-                None
-            }
-        });
+        let exact_single_posting_total = exact_prefix_total;
         let mut work = 0usize;
         for key in candidates.by_ref().take(MAX_CLIENT_SEARCH_WORK) {
             work = work.saturating_add(1);
             last_cursor = Some(key.clone());
-            let matches = (!posting_filter
-                || tokens.iter().all(|token| {
-                    self.search
-                        .get(token)
-                        .is_some_and(|posting| posting.contains(archived, key.task_id))
-                }))
-                && self
-                    .entries
-                    .get(&key.task_id)
-                    .is_some_and(|entry| entry.lower_title.contains(&query));
+            let matches = self
+                .entries
+                .get(&key.task_id)
+                .is_some_and(|entry| entry.lower_title.contains(&query));
             if !matches {
                 continue;
             }
@@ -609,14 +648,8 @@ impl TaskProjectionIndex {
         if exhausted {
             SearchPage {
                 ids,
-                known_total: count,
-                exact_total: exact_single_posting_total.or_else(|| {
-                    if posting_filter {
-                        Some(count)
-                    } else {
-                        None
-                    }
-                }),
+                known_total: exact_single_posting_total.unwrap_or(count),
+                exact_total: exact_single_posting_total.or(Some(count)),
                 work,
                 status: SearchPageStatus::Complete,
                 query_truncated,
@@ -625,7 +658,7 @@ impl TaskProjectionIndex {
         } else {
             SearchPage {
                 ids: ids.clone(),
-                known_total: count,
+                known_total: exact_single_posting_total.unwrap_or(count),
                 exact_total: exact_single_posting_total,
                 work,
                 status: SearchPageStatus::Partial,
@@ -684,6 +717,18 @@ impl TaskProjectionIndex {
         self.search_posting_entries
     }
 
+    /// Conservative resident allocation estimate for the compact search index.
+    /// It includes the actual hash-table capacity, owned key capacities, and
+    /// posting vector capacities; it is suitable for admission and diagnostics,
+    /// not merely a count of TaskId payload bytes.
+    pub fn search_index_resident_bytes(&self) -> usize {
+        self.resident_search_bytes()
+    }
+
+    pub fn search_index_keys(&self) -> usize {
+        self.search.len()
+    }
+
     pub fn search_index_saturated(&self) -> bool {
         self.search_index_saturated
     }
@@ -698,7 +743,6 @@ impl TaskProjectionIndex {
         let entry = TaskProjectionEntry::from_snapshot(snapshot, occurred_at_ms);
         let archived = entry.lifecycle == TaskLifecycle::Archived;
         let key = TaskOrderKey::new(task_id, &entry);
-        let search_title = entry.lower_title.clone();
         self.entries.insert(task_id, entry);
         if archived {
             self.archived_order.insert(key.clone());
@@ -708,24 +752,9 @@ impl TaskProjectionIndex {
         let entry = self
             .entries
             .get(&task_id)
-            .expect("inserted task projection entry");
-        for token in search_tokens(&search_title) {
-            if !self.search.contains_key(&token)
-                && self.search_posting_entries >= MAX_CLIENT_SEARCH_POSTING_ENTRIES
-            {
-                self.search_index_saturated = true;
-                continue;
-            }
-            let budget_available = self.search_posting_entries < MAX_CLIENT_SEARCH_POSTING_ENTRIES;
-            if self
-                .search
-                .entry(token)
-                .or_default()
-                .insert(task_id, entry, budget_available)
-            {
-                self.search_posting_entries = self.search_posting_entries.saturating_add(1);
-            }
-        }
+            .expect("inserted task projection entry")
+            .clone();
+        self.insert_search_tokens(task_id, &entry);
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
@@ -735,19 +764,28 @@ impl TaskProjectionIndex {
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
             for token in search_tokens(&entry.lower_title) {
-                let remove_token = self
-                    .search
-                    .get_mut(&token)
-                    .map(|keys| {
-                        if keys.remove(task_id, &entry) {
-                            self.search_posting_entries =
-                                self.search_posting_entries.saturating_sub(1);
-                        }
-                        keys.is_empty()
-                    })
-                    .unwrap_or(false);
-                if remove_token {
-                    self.search.remove(&token);
+                let mut empty = false;
+                if let Some(posting) = self.search.get_mut(&token) {
+                    let was_stored = posting.remove(task_id, &entry);
+                    empty = posting.is_empty();
+                    if was_stored {
+                        self.search_posting_entries = self.search_posting_entries.saturating_sub(1);
+                    }
+                }
+                if empty {
+                    if let Some((removed_key, posting)) = self.search.remove_entry(&token) {
+                        self.search_index_key_bytes = self
+                            .search_index_key_bytes
+                            .saturating_sub(removed_key.capacity());
+                        self.search_index_posting_storage_bytes =
+                            self.search_index_posting_storage_bytes.saturating_sub(
+                                posting
+                                    .active
+                                    .capacity()
+                                    .saturating_add(posting.archived.capacity())
+                                    .saturating_mul(std::mem::size_of::<TaskId>()),
+                            );
+                    }
                 }
             }
         }
@@ -757,36 +795,47 @@ impl TaskProjectionIndex {
 fn search_tokens(value: &str) -> Vec<String> {
     let chars = value
         .chars()
-        .take(MAX_INDEXED_TITLE_CHARS)
+        .take(MAX_INDEXED_GRAM_CHARS)
         .collect::<Vec<_>>();
-    let mut tokens = BTreeSet::new();
-    for index in 0..chars.len() {
-        for length in 1..=MAX_INDEXED_GRAM_CHARS {
-            let Some(end) = index.checked_add(length) else {
-                break;
-            };
-            if end > chars.len() {
-                break;
-            }
-            tokens.insert(chars[index..end].iter().collect());
-        }
-    }
-    tokens.into_iter().collect()
+    (1..=chars.len())
+        .map(|length| chars[..length].iter().collect::<String>())
+        .collect()
 }
 
-/// Lowercase first, then apply the scalar bound. Lowercase can expand a
-/// Unicode scalar (for example, `İ`), so bounding before normalization would
-/// make the authoritative title index and the UI query disagree.
-fn normalize_search_query(value: &str) -> (String, bool) {
-    let lowered = value.to_lowercase();
-    let truncated = lowered.chars().count() > MAX_CLIENT_SEARCH_CHARS;
-    (
-        lowered
-            .chars()
-            .take(MAX_CLIENT_SEARCH_CHARS)
-            .collect::<String>(),
-        truncated || value.chars().count() > MAX_CLIENT_SEARCH_CHARS,
-    )
+fn next_posting_capacity(capacity: usize) -> usize {
+    if capacity == 0 {
+        4
+    } else {
+        capacity.saturating_mul(2)
+    }
+}
+
+/// Lowercase one scalar at a time and stop after the shared scalar bound.
+/// Unicode lowercase can expand a scalar (for example, `İ`), so this avoids
+/// both pre-bound mismatch and whole-input allocation for hostile strings.
+pub fn normalize_bounded_search_text(value: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), value.chars().next().is_some());
+    }
+    let mut output = String::new();
+    let mut source = value.chars();
+    let mut retained = 0usize;
+    let mut truncated = false;
+    'source: while let Some(ch) = source.next() {
+        for lowered in ch.to_lowercase() {
+            if retained >= max_chars {
+                truncated = true;
+                break 'source;
+            }
+            output.push(lowered);
+            retained = retained.saturating_add(1);
+        }
+        if retained >= max_chars {
+            truncated = source.next().is_some();
+            break;
+        }
+    }
+    (output, truncated)
 }
 
 impl TaskProjectionEntry {
@@ -797,7 +846,8 @@ impl TaskProjectionEntry {
             .chars()
             .take(MAX_INDEXED_TITLE_CHARS)
             .collect::<String>();
-        let lower_title = normalize_search_query(&title).0;
+        let lower_title =
+            normalize_bounded_search_text(&snapshot.task.title, MAX_INDEXED_TITLE_CHARS).0;
         Self {
             lifecycle: snapshot.task.lifecycle,
             attention_rank: attention_rank(snapshot.visible_status()),
@@ -924,6 +974,14 @@ impl ClientModel {
 
     pub fn task_projection_index_search_saturated(&self) -> bool {
         self.task_projection_index.search_index_saturated()
+    }
+
+    pub fn task_projection_index_search_resident_bytes(&self) -> usize {
+        self.task_projection_index.search_index_resident_bytes()
+    }
+
+    pub fn task_projection_index_search_index_keys(&self) -> usize {
+        self.task_projection_index.search_index_keys()
     }
 
     pub fn task_last_occurred_at_ms(&self, task_id: TaskId) -> Option<i64> {

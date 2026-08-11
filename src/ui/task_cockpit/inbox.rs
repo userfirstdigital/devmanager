@@ -3,7 +3,13 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
 
 use gpui::{
     div, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -11,7 +17,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::client::ClientModel;
+use crate::client::{normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage};
 use crate::client::{
     ClientSubscription, InboxHostController, SubscriptionError, SubscriptionUpdate,
 };
@@ -331,9 +337,11 @@ pub struct InboxFilter {
 }
 
 impl InboxFilter {
-    pub fn new(query: impl Into<String>) -> Self {
+    pub fn new(query: impl AsRef<str>) -> Self {
+        let query = normalize_bounded_search_text(query.as_ref(), MAX_SEARCH_CHARS).0;
+        let query = sanitize_bounded_text(&query, MAX_SEARCH_CHARS);
         Self {
-            query: sanitize_bounded_text(&query.into(), MAX_SEARCH_CHARS),
+            query,
             include_archived: false,
         }
     }
@@ -355,11 +363,9 @@ impl InboxFilter {
         if lifecycle == TaskLifecycle::Archived && !self.include_archived {
             return false;
         }
-        let query = self.query.trim().to_lowercase();
-        query.is_empty()
-            || sanitize_bounded_text(title, MAX_SEARCH_CHARS)
-                .to_lowercase()
-                .contains(&query)
+        let query = self.query.trim();
+        let title = normalize_bounded_search_text(title, MAX_SEARCH_CHARS).0;
+        query.is_empty() || title.contains(query)
     }
 
     fn is_filtered(&self) -> bool {
@@ -560,6 +566,75 @@ pub type InboxRowMouseDownHandler =
 
 pub type LiveClientSubscription = Arc<Mutex<ClientSubscription>>;
 
+#[derive(Debug)]
+struct BackgroundSearchResult {
+    generation: u64,
+    model_revision: u64,
+    active: SearchPage,
+    archived: Option<SearchPage>,
+}
+
+fn run_background_search(
+    model: Arc<ClientModel>,
+    filter: InboxFilter,
+    generation: u64,
+    cancelled_generation: Arc<AtomicU64>,
+    results: mpsc::SyncSender<BackgroundSearchResult>,
+) {
+    let model_revision = model.task_projection_index().revision();
+    let mut active: Option<SearchPage> = None;
+    let mut archived: Option<SearchPage> = None;
+    loop {
+        if cancelled_generation.load(AtomicOrdering::Acquire) != generation {
+            return;
+        }
+        if active
+            .as_ref()
+            .is_none_or(|page| page.continuation().is_some())
+        {
+            let continuation = active.as_ref().and_then(|page| page.continuation());
+            active = Some(model.search_task_ids_page(filter.query(), false, continuation));
+        }
+        if filter.includes_archived()
+            && archived
+                .as_ref()
+                .is_none_or(|page| page.continuation().is_some())
+        {
+            let continuation = archived.as_ref().and_then(|page| page.continuation());
+            archived = Some(model.search_task_ids_page(filter.query(), true, continuation));
+        }
+        let active_page = active.clone().expect("active search page");
+        let archived_page = archived.clone();
+        let done = active_page.continuation().is_none()
+            && (!filter.includes_archived()
+                || archived_page
+                    .as_ref()
+                    .is_some_and(|page| page.continuation().is_none()));
+        let mut result = BackgroundSearchResult {
+            generation,
+            model_revision,
+            active: active_page,
+            archived: archived_page,
+        };
+        loop {
+            match results.try_send(result) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(next)) => {
+                    result = next;
+                    if cancelled_generation.load(AtomicOrdering::Acquire) != generation {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        if done {
+            return;
+        }
+    }
+}
+
 /// The production native-shell bridge. A shell owns one subscription and one
 /// projection; no legacy task-list cache is permitted beside it. Host IO is
 /// caller-driven, while this object keeps the durable cursor and performs the
@@ -573,6 +648,10 @@ pub struct InboxRuntime {
     projection: Option<Inbox>,
     projection_stale: bool,
     projection_updates: u64,
+    search_generation: u64,
+    background_cancel: Option<Arc<AtomicU64>>,
+    background_results: Option<Receiver<BackgroundSearchResult>>,
+    background_model: Option<Arc<ClientModel>>,
 }
 
 impl InboxRuntime {
@@ -581,7 +660,9 @@ impl InboxRuntime {
     }
 
     pub fn attach_subscription(&mut self, subscription: ClientSubscription) {
+        self.cancel_background_search();
         self.live_subscription = None;
+        self.background_model = subscription.model().cloned().map(Arc::new);
         self.subscription = Some(subscription);
         self.projection_stale = false;
         self.rebuild_projection();
@@ -592,7 +673,9 @@ impl InboxRuntime {
     /// HostClient IO; the UI only takes a short `try_lock` during update/render
     /// handoff and therefore never waits on transport from paint/input.
     pub fn attach_live_subscription(&mut self, subscription: LiveClientSubscription) {
+        self.cancel_background_search();
         self.subscription = None;
+        self.background_model = None;
         self.live_subscription = Some(subscription);
         self.projection_stale = false;
         self.refresh_from_subscription();
@@ -626,6 +709,7 @@ impl InboxRuntime {
     }
 
     pub fn invalidate_for_resync(&mut self) {
+        self.cancel_background_search();
         self.projection_stale = true;
         self.projection = None;
         self.projection_updates = self.projection_updates.saturating_add(1);
@@ -638,6 +722,7 @@ impl InboxRuntime {
     pub fn restore_unread_cursor(&mut self, cursor: UnreadCursor) {
         self.unread = cursor;
         self.rebuild_projection();
+        self.start_background_search();
     }
 
     pub fn restore_unread_cursor_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -681,6 +766,7 @@ impl InboxRuntime {
     /// event. This keeps the GPUI render path deterministic and allocation-free
     /// with respect to transport state.
     pub fn refresh_from_subscription(&mut self) {
+        self.cancel_background_search();
         if let Some(subscription) = self.live_subscription.clone() {
             if let Ok(mut subscription) = subscription.try_lock() {
                 if subscription.state() != crate::client::ClientSubscriptionState::Ready {
@@ -702,6 +788,7 @@ impl InboxRuntime {
         } else {
             self.rebuild_projection();
         }
+        self.start_background_search();
     }
 
     pub fn encode_unread_cursor(&self) -> Result<Vec<u8>, String> {
@@ -709,8 +796,93 @@ impl InboxRuntime {
     }
 
     pub fn set_filter(&mut self, filter: InboxFilter) {
+        self.cancel_background_search();
+        self.search_generation = self.search_generation.wrapping_add(1);
         self.filter = filter;
         self.rebuild_projection();
+        self.start_background_search();
+    }
+
+    /// Apply one bounded continuation result produced by the background search
+    /// worker. Callers invoke this from their task/controller lane; rendering
+    /// and input only consume the already-published projection. A generation
+    /// or model-revision mismatch is discarded and can never replace rows for
+    /// a newer filter or subscription generation.
+    pub fn poll_background_search(&mut self) -> bool {
+        let result = match self.background_results.as_ref() {
+            Some(results) => match results.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    self.background_results = None;
+                    self.background_cancel = None;
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        if result.generation != self.search_generation || self.projection_stale {
+            return false;
+        }
+        if let Some(subscription) = self.live_subscription.clone() {
+            let Ok(subscription) = subscription.try_lock() else {
+                return false;
+            };
+            if subscription.state() != crate::client::ClientSubscriptionState::Ready {
+                return false;
+            }
+            let Some(model) = subscription.model() else {
+                return false;
+            };
+            if model.task_projection_index().revision() != result.model_revision {
+                drop(subscription);
+                self.cancel_background_search();
+                self.rebuild_projection();
+                self.start_background_search();
+                return false;
+            }
+            return self.publish_background_result(result, model);
+        }
+        let Some(model) = self.background_model.clone() else {
+            return false;
+        };
+        if model.task_projection_index().revision() != result.model_revision {
+            self.cancel_background_search();
+            self.rebuild_projection();
+            self.start_background_search();
+            return false;
+        }
+        self.publish_background_result(result, &model)
+    }
+
+    fn publish_background_result(
+        &mut self,
+        result: BackgroundSearchResult,
+        model: &ClientModel,
+    ) -> bool {
+        let done = result.active.continuation().is_none()
+            && result
+                .archived
+                .as_ref()
+                .is_none_or(|page| page.continuation().is_none());
+        self.projection = Some(Inbox::from_model_with_search_pages(
+            model,
+            &self.filter,
+            &self.unread,
+            result.active,
+            result.archived,
+        ));
+        self.projection_stale = false;
+        self.projection_updates = self.projection_updates.saturating_add(1);
+        if done {
+            self.background_results = None;
+            self.background_cancel = None;
+        }
+        true
+    }
+
+    pub fn background_search_pending(&self) -> bool {
+        self.background_results.is_some()
     }
 
     /// Mark one task read in the bounded client-local cursor and update only
@@ -799,9 +971,19 @@ impl InboxRuntime {
                 } else {
                     self.rebuild_projection();
                 }
+                if self.live_subscription.is_none() {
+                    self.background_model = self
+                        .subscription
+                        .as_ref()
+                        .and_then(|subscription| subscription.model().cloned())
+                        .map(Arc::new);
+                }
+                self.cancel_background_search();
+                self.start_background_search();
                 Ok(observed)
             }
             SubscriptionUpdate::ResyncRequired { .. } => {
+                self.cancel_background_search();
                 self.projection_stale = true;
                 self.projection = None;
                 self.projection_updates = self.projection_updates.saturating_add(1);
@@ -848,6 +1030,47 @@ impl InboxRuntime {
         }
         self.projection_stale = self.projection.is_none();
         self.projection_updates = self.projection_updates.saturating_add(1);
+    }
+
+    fn cancel_background_search(&mut self) {
+        if let Some(cancel) = self.background_cancel.take() {
+            cancel.store(
+                self.search_generation.wrapping_add(1),
+                AtomicOrdering::Release,
+            );
+        }
+        self.background_results = None;
+    }
+
+    fn start_background_search(&mut self) {
+        if self.projection_stale || self.filter.query().trim().is_empty() {
+            return;
+        }
+        let subscription = self.live_subscription.clone();
+        let model = self.background_model.clone();
+        if subscription.is_none() && model.is_none() {
+            return;
+        }
+        let generation = self.search_generation;
+        let cancellation = Arc::new(AtomicU64::new(generation));
+        let (results_tx, results_rx) = mpsc::sync_channel(2);
+        self.background_cancel = Some(Arc::clone(&cancellation));
+        self.background_results = Some(results_rx);
+        let filter = self.filter.clone();
+        thread::spawn(move || {
+            let model = model.or_else(|| {
+                subscription.and_then(|subscription| {
+                    subscription
+                        .lock()
+                        .ok()
+                        .and_then(|subscription| subscription.model().cloned())
+                        .map(Arc::new)
+                })
+            });
+            if let Some(model) = model {
+                run_background_search(model, filter, generation, cancellation, results_tx);
+            }
+        });
     }
 }
 
@@ -943,6 +1166,65 @@ impl TaskRowModel {
     }
 }
 
+#[derive(Clone, Debug)]
+struct InboxSearchProjection {
+    ids: Vec<TaskId>,
+    total_count: usize,
+}
+
+impl InboxSearchProjection {
+    fn from_page(page: SearchPage) -> Self {
+        let total_count = page.exact_total.unwrap_or_else(|| {
+            // A partial page that filled the retained window knows only that
+            // there is at least one more match. Preserve that truth in the
+            // UI overflow contract instead of presenting 5,000 as complete.
+            if page.is_partial() && page.ids.len() >= MAX_TASK_LIST_ITEMS {
+                // The index may know a large posting count while the page is
+                // still ordering/filtering only a bounded prefix. Do not
+                // manufacture a more precise total from that lower bound.
+                MAX_TASK_LIST_ITEMS.saturating_add(1)
+            } else {
+                page.known_total
+            }
+        });
+        Self {
+            ids: page.ids,
+            total_count,
+        }
+    }
+}
+
+fn search_projection_page(
+    model: &ClientModel,
+    filter: &InboxFilter,
+    archived: bool,
+    continuation: Option<&SearchContinuation>,
+) -> InboxSearchProjection {
+    if filter.query().trim().is_empty() && continuation.is_none() {
+        return InboxSearchProjection {
+            ids: if archived {
+                model
+                    .task_projection_index()
+                    .top_archived_task_ids(MAX_TASK_LIST_ITEMS)
+            } else {
+                model
+                    .task_projection_index()
+                    .top_active_task_ids(MAX_TASK_LIST_ITEMS)
+            },
+            total_count: if archived {
+                model.task_projection_index().archived_count()
+            } else {
+                model.task_projection_index().active_count()
+            },
+        };
+    }
+    InboxSearchProjection::from_page(model.search_task_ids_page(
+        filter.query(),
+        archived,
+        continuation,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inbox {
     task_list: InboxList,
@@ -983,42 +1265,28 @@ impl Inbox {
             Ok(model) => model,
             Err(error) => return Self::empty(filter, InboxState::Error(error)),
         };
-        let (active_ids, active_total_count) = if filter.query().trim().is_empty() {
-            (
-                model
-                    .task_projection_index()
-                    .top_active_task_ids(MAX_TASK_LIST_ITEMS),
-                model.task_projection_index().active_count(),
-            )
-        } else {
-            model.search_task_ids(filter.query(), false)
-        };
+        let active_page = search_projection_page(model, filter, false, None);
         let (rows, total_count) = project_rows(
             model,
-            &active_ids,
+            &active_page.ids,
             filter,
             unread,
             false,
-            active_total_count,
+            active_page.total_count,
         );
-        let (history_rows, history_total_count) = if filter.includes_archived() {
-            let (archived_ids, archived_total_count) = if filter.query().trim().is_empty() {
-                (
-                    model
-                        .task_projection_index()
-                        .top_archived_task_ids(MAX_TASK_LIST_ITEMS),
-                    model.task_projection_index().archived_count(),
-                )
-            } else {
-                model.search_task_ids(filter.query(), true)
-            };
+        let archived_page = if filter.includes_archived() {
+            Some(search_projection_page(model, filter, true, None))
+        } else {
+            None
+        };
+        let (history_rows, history_total_count) = if let Some(archived_page) = archived_page {
             project_rows(
                 model,
-                &archived_ids,
+                &archived_page.ids,
                 filter,
                 unread,
                 true,
-                archived_total_count,
+                archived_page.total_count,
             )
         } else {
             (Vec::new(), 0)
@@ -1069,6 +1337,70 @@ impl Inbox {
         }
     }
 
+    fn from_model_with_search_pages(
+        model: &ClientModel,
+        filter: &InboxFilter,
+        unread: &UnreadCursor,
+        active_page: SearchPage,
+        archived_page: Option<SearchPage>,
+    ) -> Self {
+        let active_page = InboxSearchProjection::from_page(active_page);
+        let archived_page = archived_page.map(InboxSearchProjection::from_page);
+        let (rows, total_count) = project_rows(
+            model,
+            &active_page.ids,
+            filter,
+            unread,
+            false,
+            active_page.total_count,
+        );
+        let (history_rows, history_total_count) = archived_page
+            .as_ref()
+            .map(|page| project_rows(model, &page.ids, filter, unread, true, page.total_count))
+            .unwrap_or_else(|| (Vec::new(), 0));
+
+        let mut grouped: [Vec<TaskRowModel>; 4] = std::array::from_fn(|_| Vec::new());
+        for row in rows {
+            grouped[row.section.index()].push(row);
+        }
+        for rows in &mut grouped {
+            rows.sort_by(compare_rows);
+        }
+
+        let mut active_rows = Vec::with_capacity(total_count.min(MAX_TASK_LIST_ITEMS));
+        let mut section_ranges = [0..0, 0..0, 0..0, 0..0];
+        for section in InboxSection::ALL {
+            let start = active_rows.len();
+            active_rows.extend(grouped[section.index()].drain(..));
+            section_ranges[section.index()] = start..active_rows.len();
+        }
+        let state = if active_rows.is_empty() && history_rows.is_empty() {
+            if filter.is_filtered() {
+                InboxState::FilteredEmpty
+            } else {
+                InboxState::Empty
+            }
+        } else {
+            InboxState::Ready
+        };
+        let task_ids = active_rows.iter().map(|row| row.task_id).collect();
+        Self {
+            task_list: InboxList::from_ordered_ids(task_ids, total_count),
+            rows: active_rows,
+            archived_list: InboxList::from_ordered_ids(
+                history_rows.iter().map(|row| row.task_id).collect(),
+                history_total_count,
+            ),
+            history_rows,
+            unread: unread.clone(),
+            section_ranges,
+            filter: filter.clone(),
+            state,
+            full_rebuilds: 1,
+            incremental_updates: 0,
+        }
+    }
+
     pub fn from_error(error: InboxError) -> Self {
         Self::from_projection(
             Err(error),
@@ -1085,44 +1417,32 @@ impl Inbox {
         if task_id.is_none() {
             return;
         }
-        let (active_ids, active_total_count) = if self.filter.query().trim().is_empty() {
-            (
-                model
-                    .task_projection_index()
-                    .top_active_task_ids(MAX_TASK_LIST_ITEMS),
-                model.task_projection_index().active_count(),
-            )
+        let active_page = search_projection_page(model, &self.filter, false, None);
+        let archived_page = if self.filter.includes_archived() {
+            Some(search_projection_page(model, &self.filter, true, None))
         } else {
-            model.search_task_ids(self.filter.query(), false)
-        };
-        let (archived_ids, archived_total_count) = if self.filter.includes_archived() {
-            if self.filter.query().trim().is_empty() {
-                (
-                    model
-                        .task_projection_index()
-                        .top_archived_task_ids(MAX_TASK_LIST_ITEMS),
-                    model.task_projection_index().archived_count(),
-                )
-            } else {
-                model.search_task_ids(self.filter.query(), true)
-            }
-        } else {
-            (Vec::new(), 0)
+            None
         };
         // Refill only the bounded pages affected by one index update. This
         // handles a task entering/leaving the retained cap without rebuilding
         // the complete model or scanning 100k tasks.
-        self.rows = project_indexed_page(model, &active_ids, &self.filter, &self.unread, false);
-        self.history_rows =
-            project_indexed_page(model, &archived_ids, &self.filter, &self.unread, true);
+        self.rows =
+            project_indexed_page(model, &active_page.ids, &self.filter, &self.unread, false);
+        self.history_rows = archived_page
+            .as_ref()
+            .map(|page| project_indexed_page(model, &page.ids, &self.filter, &self.unread, true))
+            .unwrap_or_default();
         self.rebuild_section_ranges();
         self.task_list = InboxList::from_ordered_ids(
             self.rows.iter().map(|row| row.task_id).collect(),
-            active_total_count,
+            active_page.total_count,
         );
         self.archived_list = InboxList::from_ordered_ids(
             self.history_rows.iter().map(|row| row.task_id).collect(),
-            archived_total_count,
+            archived_page
+                .as_ref()
+                .map(|page| page.total_count)
+                .unwrap_or(0),
         );
         self.state = if self.rows.is_empty() && self.history_rows.is_empty() {
             if self.filter.is_filtered() {
@@ -1716,11 +2036,13 @@ fn attention_rank(status: VisibleTaskStatus) -> u8 {
 }
 
 fn compare_rows(left: &TaskRowModel, right: &TaskRowModel) -> Ordering {
+    let left_title = normalize_bounded_search_text(&left.title, MAX_ACCESSIBLE_NAME_CHARS).0;
+    let right_title = normalize_bounded_search_text(&right.title, MAX_ACCESSIBLE_NAME_CHARS).0;
     attention_rank(left.status)
         .cmp(&attention_rank(right.status))
         .then_with(|| right.occurred_at_ms.cmp(&left.occurred_at_ms))
         .then_with(|| right.revision.cmp(&left.revision))
-        .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        .then_with(|| left_title.cmp(&right_title))
         .then_with(|| left.title.cmp(&right.title))
         .then_with(|| left.task_id.cmp(&right.task_id))
 }

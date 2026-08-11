@@ -11,7 +11,7 @@ use crate::client::{
 };
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 
-use super::{InboxPresentationWidth, InboxRenderModel, InboxRuntime};
+use super::{InboxFilter, InboxPresentationWidth, InboxRenderModel, InboxRuntime};
 
 /// Native-next Task Cockpit state and its caller-driven client pump.
 #[derive(Debug)]
@@ -87,7 +87,17 @@ impl NativeNextTaskCockpit {
         self.runtime
             .apply_subscription_update(update.clone())
             .map_err(InboxControllerError::Subscription)?;
+        // Advance one bounded Inbox continuation on the caller-driven pump
+        // lane. GPUI paint/input only reads the projection published here.
+        self.runtime.poll_background_search();
         Ok(update)
+    }
+
+    /// Advance one bounded search continuation from the controller/task lane.
+    /// This is intentionally separate from `render_model` so no paint path can
+    /// perform model search or transport work.
+    pub fn pump_background_search(&mut self) -> bool {
+        self.runtime.poll_background_search()
     }
 
     pub async fn reconnect_and_synchronize(&mut self) -> Result<(), InboxControllerError> {
@@ -121,6 +131,10 @@ impl NativeNextTaskCockpit {
 
     pub fn render_model(&self, width: InboxPresentationWidth) -> InboxRenderModel {
         self.runtime.render_model(width)
+    }
+
+    pub fn set_filter(&mut self, filter: InboxFilter) {
+        self.runtime.set_filter(filter);
     }
 
     pub fn runtime(&self) -> &InboxRuntime {

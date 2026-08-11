@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,7 +33,6 @@ const UNSOLICITED_STREAM_CAPACITY: usize = 16;
 const MAX_RETIRED_SUBSCRIPTION_IDS: usize = 64;
 const MAX_RETIRED_DRAIN_WORK: usize = UNSOLICITED_QUEUE_CAPACITY;
 const MAX_RETAINED_DURABLE_MESSAGES: usize = UNSOLICITED_QUEUE_CAPACITY * 2;
-const RETIRED_DRAIN_DEADLINE: Duration = Duration::from_millis(25);
 
 /// Scripted detach I/O behavior for unit tests.
 #[cfg(test)]
@@ -63,38 +62,57 @@ pub enum UnsolicitedServerMessage {
 }
 
 /// Durable-priority unsolicited inbox with a separate coalescing stream lane.
-struct UnsolicitedInbox {
+struct DurableInboxState {
     durable_tx: mpsc::Sender<UnsolicitedServerMessage>,
-    durable_rx: tokio::sync::Mutex<mpsc::Receiver<UnsolicitedServerMessage>>,
+    durable_rx: mpsc::Receiver<UnsolicitedServerMessage>,
     /// Non-retired durable messages removed while fencing an old generation.
     /// They are drained before newly queued messages to preserve wire order.
-    retained_durable: Mutex<VecDeque<UnsolicitedServerMessage>>,
+    retained_durable: VecDeque<UnsolicitedServerMessage>,
     /// Subscription ids fenced at release. This set is deliberately bounded;
     /// exhausting it forces a typed reconnect instead of allowing an old tail
     /// to poison a replacement generation.
-    retired_subscription_ids: Mutex<HashSet<SubscriptionId>>,
+    retired_subscription_ids: HashSet<SubscriptionId>,
+}
+
+struct UnsolicitedInbox {
+    /// Admission, retirement, and dequeue share one short synchronous fence.
+    /// This makes the retired check plus nonblocking send atomic with the
+    /// retirement mark plus queue drain: an old frame is either linearized
+    /// before retirement and drained, or observes the retired id.
+    durable: Mutex<DurableInboxState>,
     stream_capacity: usize,
     streams: Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
     notify: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     close_gap_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    admission_barrier: Mutex<
+        Option<(
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+    >,
 }
 
 impl UnsolicitedInbox {
     fn new(durable_capacity: usize, stream_capacity: usize) -> Self {
         let (durable_tx, durable_rx) = mpsc::channel(durable_capacity.max(1));
         Self {
-            durable_tx,
-            durable_rx: tokio::sync::Mutex::new(durable_rx),
-            retained_durable: Mutex::new(VecDeque::new()),
-            retired_subscription_ids: Mutex::new(HashSet::new()),
+            durable: Mutex::new(DurableInboxState {
+                durable_tx,
+                durable_rx,
+                retained_durable: VecDeque::new(),
+                retired_subscription_ids: HashSet::new(),
+            }),
             stream_capacity: stream_capacity.max(1),
             streams: Mutex::new(std::collections::HashMap::new()),
             notify: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             close_gap_hook: Mutex::new(None),
+            #[cfg(test)]
+            admission_barrier: Mutex::new(None),
         }
     }
 
@@ -106,6 +124,15 @@ impl UnsolicitedInbox {
     #[cfg(test)]
     fn install_close_gap_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.close_gap_hook.lock().expect("close gap hook") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn install_admission_barrier(
+        &self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *self.admission_barrier.lock().expect("admission barrier") = Some((entered, release));
     }
 
     fn close(&self) {
@@ -134,66 +161,59 @@ impl UnsolicitedInbox {
             } => *subscription_id,
             UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
         };
-        if self
-            .retired_subscription_ids
+        let durable = self.durable.lock().expect("durable inbox");
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .admission_barrier
             .lock()
-            .expect("retired subscription ids")
-            .contains(&subscription_id)
+            .expect("admission barrier")
+            .take()
         {
+            // The barrier is deliberately inside the durable fence. Tests can
+            // then start retirement and prove it cannot interleave between the
+            // retired check and the nonblocking send.
+            entered.wait();
+            release.wait();
+        }
+        if durable.retired_subscription_ids.contains(&subscription_id) {
             // A late exact old-generation tail is fenced at admission. Do not
             // notify a consumer when there is no message to receive.
             return Ok(());
         }
-        self.durable_tx
+        durable
+            .durable_tx
             .try_send(message)
             .map_err(|_| IpcError::Unavailable)?;
+        drop(durable);
         self.notify.notify_one();
         Ok(())
     }
 
-    async fn retire_subscription_id(
-        &self,
-        subscription_id: SubscriptionId,
-    ) -> Result<(), IpcError> {
-        {
-            let mut retired = self
-                .retired_subscription_ids
-                .lock()
-                .expect("retired subscription ids");
-            if !retired.contains(&subscription_id) {
-                if retired.len() >= MAX_RETIRED_SUBSCRIPTION_IDS {
-                    return Err(IpcError::RetiredSubscriptionFlood {
-                        limit: MAX_RETIRED_SUBSCRIPTION_IDS,
-                    });
-                }
-                retired.insert(subscription_id);
+    fn retire_subscription_id(&self, subscription_id: SubscriptionId) -> Result<(), IpcError> {
+        let mut durable = self.durable.lock().expect("durable inbox");
+        if !durable.retired_subscription_ids.contains(&subscription_id) {
+            if durable.retired_subscription_ids.len() >= MAX_RETIRED_SUBSCRIPTION_IDS {
+                return Err(IpcError::RetiredSubscriptionFlood {
+                    limit: MAX_RETIRED_SUBSCRIPTION_IDS,
+                });
             }
+            durable.retired_subscription_ids.insert(subscription_id);
         }
 
-        let mut durable =
-            match tokio::time::timeout(RETIRED_DRAIN_DEADLINE, self.durable_rx.lock()).await {
-                Ok(receiver) => receiver,
-                Err(_) => {
-                    return Err(IpcError::RetiredSubscriptionFlood {
-                        limit: MAX_RETIRED_DRAIN_WORK,
-                    })
-                }
-            };
-        let retained_len = self
+        if durable
             .retained_durable
-            .lock()
-            .expect("retained durable messages")
-            .len();
-        if retained_len.saturating_add(durable.len()) > MAX_RETAINED_DURABLE_MESSAGES {
+            .len()
+            .saturating_add(durable.durable_rx.len())
+            > MAX_RETAINED_DURABLE_MESSAGES
+        {
             return Err(IpcError::RetiredSubscriptionFlood {
                 limit: MAX_RETAINED_DURABLE_MESSAGES,
             });
         }
 
-        let deadline = Instant::now() + RETIRED_DRAIN_DEADLINE;
         let mut work = 0usize;
-        while work < MAX_RETIRED_DRAIN_WORK && Instant::now() < deadline {
-            let message = match durable.try_recv() {
+        while work < MAX_RETIRED_DRAIN_WORK {
+            let message = match durable.durable_rx.try_recv() {
                 Ok(message) => message,
                 Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                     break;
@@ -212,14 +232,11 @@ impl UnsolicitedInbox {
                     } if *observed == subscription_id
             );
             if !exact_retired {
-                self.retained_durable
-                    .lock()
-                    .expect("retained durable messages")
-                    .push_back(message);
+                durable.retained_durable.push_back(message);
             }
         }
 
-        if !durable.is_empty() {
+        if !durable.durable_rx.is_empty() {
             return Err(IpcError::RetiredSubscriptionFlood {
                 limit: MAX_RETIRED_DRAIN_WORK,
             });
@@ -242,19 +259,14 @@ impl UnsolicitedInbox {
         Ok(())
     }
 
-    fn try_dequeue(
-        durable: &mut mpsc::Receiver<UnsolicitedServerMessage>,
-        retained_durable: &Mutex<VecDeque<UnsolicitedServerMessage>>,
+    fn try_dequeue_from_state(
+        durable: &mut DurableInboxState,
         streams: &Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
     ) -> Option<UnsolicitedServerMessage> {
-        if let Some(message) = retained_durable
-            .lock()
-            .expect("retained durable messages")
-            .pop_front()
-        {
+        if let Some(message) = durable.retained_durable.pop_front() {
             return Some(message);
         }
-        if let Ok(message) = durable.try_recv() {
+        if let Ok(message) = durable.durable_rx.try_recv() {
             return Some(message);
         }
         let mut streams = streams.lock().expect("stream inbox");
@@ -264,14 +276,8 @@ impl UnsolicitedInbox {
     }
 
     async fn recv(&self) -> Result<UnsolicitedServerMessage, IpcError> {
-        // Serialize durable-receiver ownership across the whole recv loop so a
-        // concurrent caller cannot miss a queued durable via try_lock and then
-        // sleep on a consumed Notify permit.
-        let mut durable = self.durable_rx.lock().await;
         loop {
-            if let Some(message) =
-                Self::try_dequeue(&mut durable, &self.retained_durable, &self.streams)
-            {
+            if let Some(message) = self.try_dequeue() {
                 return Ok(message);
             }
 
@@ -280,9 +286,7 @@ impl UnsolicitedInbox {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if let Some(message) =
-                Self::try_dequeue(&mut durable, &self.retained_durable, &self.streams)
-            {
+            if let Some(message) = self.try_dequeue() {
                 return Ok(message);
             }
 
@@ -292,9 +296,7 @@ impl UnsolicitedInbox {
             }
 
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                if let Some(message) =
-                    Self::try_dequeue(&mut durable, &self.retained_durable, &self.streams)
-                {
+                if let Some(message) = self.try_dequeue() {
                     return Ok(message);
                 }
                 return Err(IpcError::Unavailable);
@@ -302,6 +304,11 @@ impl UnsolicitedInbox {
 
             notified.await;
         }
+    }
+
+    fn try_dequeue(&self) -> Option<UnsolicitedServerMessage> {
+        let mut durable = self.durable.lock().expect("durable inbox");
+        Self::try_dequeue_from_state(&mut durable, &self.streams)
     }
 }
 
@@ -700,7 +707,6 @@ impl ClientConnection {
         self.shared
             .unsolicited
             .retire_subscription_id(subscription_id)
-            .await
     }
 
     fn register_waiter(
@@ -1123,6 +1129,7 @@ mod tests {
 
     use super::{
         PendingKey, PendingRegistration, PendingReply, SharedState, UnsolicitedServerMessage,
+        MAX_RETIRED_DRAIN_WORK, MAX_RETIRED_SUBSCRIPTION_IDS,
     };
     use crate::domain::command::CommandReceipt;
     use crate::domain::id::CommandId;
@@ -1677,5 +1684,165 @@ mod tests {
             Ok(Err(other)) => panic!("expected Unavailable, got {other:?}"),
             Err(_) => panic!("recv hung after close in the former check/wait gap"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_admission_barrier_never_leaks_an_old_generation_frame() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, SubscriptionId};
+        use std::sync::{Arc, Barrier};
+
+        let inbox = Arc::new(UnsolicitedInbox::new_for_test(4, 1));
+        let subscription_id = SubscriptionId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ])
+        .expect("subscription id");
+        let event = DomainEvent {
+            id: EventId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x02,
+            ])
+            .expect("event id"),
+            task_id: None,
+            sequence: 1,
+            task_revision: None,
+            occurred_at_ms: 1,
+            payload: Event::TaskReopened,
+        };
+        let frame = UnsolicitedServerMessage::DurableEvent {
+            subscription_id,
+            event,
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        inbox.install_admission_barrier(Arc::clone(&entered), Arc::clone(&release));
+
+        let producer = {
+            let inbox = Arc::clone(&inbox);
+            let frame = frame.clone();
+            tokio::task::spawn_blocking(move || inbox.push_durable(frame))
+        };
+        entered.wait();
+        let retire = {
+            let inbox = Arc::clone(&inbox);
+            tokio::task::spawn_blocking(move || inbox.retire_subscription_id(subscription_id))
+        };
+        // The producer is paused while holding the same fence as retirement.
+        // Releasing the barrier chooses a deterministic linearization point:
+        // either the old frame is queued and drained, or it sees retired.
+        release.wait();
+        producer
+            .await
+            .expect("producer join")
+            .expect("admission must remain bounded");
+        retire
+            .await
+            .expect("retirement join")
+            .expect("retirement must remain bounded");
+
+        let next = tokio::time::timeout(Duration::from_millis(50), inbox.recv()).await;
+        assert!(next.is_err(), "retired old frame must not reach a consumer");
+        assert!(
+            inbox.push_durable(frame).is_ok(),
+            "late old frame is fenced"
+        );
+        let next = tokio::time::timeout(Duration::from_millis(50), inbox.recv()).await;
+        assert!(next.is_err(), "late retired frame must be dropped");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_id_and_queued_frame_floods_are_typed_and_streams_survive() {
+        use super::UnsolicitedInbox;
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::{EventId, ResourceId, SubscriptionId};
+        use crate::protocol::{StreamFrame, StreamKey, StreamPayloadKind};
+
+        let subscription = |tail: u8| {
+            SubscriptionId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ])
+            .expect("subscription id")
+        };
+        let durable =
+            |subscription_id: SubscriptionId, tail: u8| UnsolicitedServerMessage::DurableEvent {
+                subscription_id,
+                event: DomainEvent {
+                    id: EventId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, tail,
+                    ])
+                    .expect("event id"),
+                    task_id: None,
+                    sequence: u64::from(tail),
+                    task_revision: None,
+                    occurred_at_ms: i64::from(tail),
+                    payload: Event::TaskReopened,
+                },
+            };
+
+        let ids = UnsolicitedInbox::new_for_test(128, 1);
+        for tail in 0..MAX_RETIRED_SUBSCRIPTION_IDS as u8 {
+            ids.retire_subscription_id(subscription(tail))
+                .expect("the bounded retired-id set admits its limit");
+        }
+        let retired_overflow = ids
+            .retire_subscription_id(subscription(MAX_RETIRED_SUBSCRIPTION_IDS as u8))
+            .expect_err("the 65th retired id must force typed resync");
+        assert!(matches!(
+            retired_overflow,
+            IpcError::RetiredSubscriptionFlood { limit } if limit == MAX_RETIRED_SUBSCRIPTION_IDS
+        ));
+        ids.push_durable(durable(subscription(0), 0xf1))
+            .expect("old ids remain harmless after the typed flood");
+        let dropped = tokio::time::timeout(Duration::from_millis(25), ids.recv()).await;
+        assert!(dropped.is_err(), "retired ids must not reach the consumer");
+
+        let flood = UnsolicitedInbox::new_for_test(128, 1);
+        let queued_id = subscription(0xe1);
+        for tail in 0..(MAX_RETIRED_DRAIN_WORK as u8 + 1) {
+            flood
+                .push_durable(durable(queued_id, tail))
+                .expect("test queue admits more than one drain quantum");
+        }
+        let queue_overflow = flood
+            .retire_subscription_id(subscription(0xe2))
+            .expect_err("more than one drain quantum must force typed resync");
+        assert!(matches!(
+            queue_overflow,
+            IpcError::RetiredSubscriptionFlood { limit } if limit == MAX_RETIRED_DRAIN_WORK
+        ));
+
+        let stream_key = StreamKey::from(
+            ResourceId::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xe3,
+            ])
+            .expect("stream resource"),
+        );
+        flood
+            .push_stream(StreamFrame {
+                subscription_id: queued_id,
+                stream: stream_key,
+                generation: 2,
+                sequence: 1,
+                payload_kind: StreamPayloadKind::new(1).expect("payload kind"),
+                schema_version: 1,
+                payload: vec![0xe3],
+            })
+            .expect("current stream must remain admissible after durable flood");
+        for _ in 0..MAX_RETIRED_DRAIN_WORK {
+            flood.recv().await.expect("retained current durable frame");
+        }
+        flood
+            .recv()
+            .await
+            .expect("queued frame after drain quantum");
+        assert!(matches!(
+            flood.recv().await.expect("current stream frame"),
+            UnsolicitedServerMessage::Stream(frame) if frame.stream == stream_key
+        ));
     }
 }

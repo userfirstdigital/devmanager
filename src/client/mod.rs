@@ -20,6 +20,7 @@ pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };
 pub use inbox_controller::{InboxControllerError, InboxHostController, SharedInboxSubscription};
+pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
     ClientModel, ClientModelBuilder, ClientModelError, SearchContinuation, SearchPage,
     SearchPageStatus,

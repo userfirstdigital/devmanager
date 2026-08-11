@@ -1,6 +1,4 @@
-use devmanager::client::model::{
-    MAX_CLIENT_SEARCH_POSTING_BYTES, MAX_CLIENT_SEARCH_POSTING_ENTRIES,
-};
+use devmanager::client::model::MAX_CLIENT_SEARCH_POSTING_BYTES;
 use devmanager::client::{
     ClientModel, ClientModelBuilder, HostClientConfig, InboxHostController, InboxPreferenceStore,
 };
@@ -1406,13 +1404,8 @@ fn client_projection_index_is_reused_for_100k_models_without_wall_clock_assertio
     assert_eq!(model.task_projection_index_len(), 100_000);
     assert_eq!(model.task_projection_index_rebuilds(), 1);
     assert!(
-        model.task_projection_index_search_posting_entries() <= MAX_CLIENT_SEARCH_POSTING_ENTRIES,
-        "search posting identities must remain within the bounded index budget"
-    );
-    assert!(
-        model.task_projection_index_search_posting_entries() * std::mem::size_of::<TaskId>()
-            <= MAX_CLIENT_SEARCH_POSTING_BYTES,
-        "compact posting identities must stay within the byte budget"
+        model.task_projection_index_search_resident_bytes() <= MAX_CLIENT_SEARCH_POSTING_BYTES,
+        "compact search resident allocations must stay within the byte budget"
     );
 
     let first = Inbox::from_model(&model);
@@ -1542,6 +1535,33 @@ fn indexed_search_repeated_titles_never_scan_a_full_long_query_posting() {
 }
 
 #[test]
+fn inbox_partial_search_exposes_5000_plus_overflow_until_exact_continuation() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                "aaaaaaaaa",
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+    let inbox =
+        Inbox::from_model_with_filter(&model, &InboxFilter::new("aaaaaaaaa"), &Default::default());
+    let overflow = inbox
+        .overflow()
+        .expect("partial page must be marked over limit");
+    assert_eq!(overflow.limit, 5_000);
+    assert_eq!(overflow.retained_count, 5_000);
+    assert!(overflow.total_count > 5_000, "partial total must be 5000+");
+}
+
+#[test]
 fn indexed_search_normalizes_expanding_unicode_before_the_shared_bound() {
     let title = "İ".repeat(160);
     let model = inbox_model(vec![inbox_task_item(
@@ -1606,6 +1626,113 @@ fn indexed_search_continuations_are_bounded_and_fenced_to_the_current_query() {
     assert!(page.is_complete());
     assert_eq!(page.exact_total, Some(100_000));
     assert_eq!(page.ids.len(), 5_000);
+}
+
+#[test]
+fn indexed_search_empty_page_reports_overflow_and_can_reach_exact_total() {
+    let items = (0..100_000)
+        .map(|index| {
+            inbox_task_item(
+                inbox_task_id(index),
+                &format!("Task {index}"),
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+
+    let mut page = model.search_task_ids_page("", false, None);
+    assert!(page.is_partial(), "5000+ results must be visibly partial");
+    assert_eq!(page.exact_total, Some(100_000));
+    assert!(page.continuation().is_some());
+
+    let mut pages = 1;
+    while let Some(continuation) = page.continuation().cloned() {
+        page = model.search_task_ids_page("", false, Some(&continuation));
+        pages += 1;
+        assert!(page.work <= 5_000);
+        assert!(pages <= 21, "empty search must make bounded progress");
+    }
+    assert!(page.is_complete());
+    assert_eq!(page.exact_total, Some(100_000));
+}
+
+#[test]
+fn search_index_resident_estimate_accounts_for_keys_nodes_and_capacities() {
+    let items = (0..100_000)
+        .map(|index| {
+            let title = format!("{index:08x}-{}", "x".repeat(152));
+            inbox_task_item(
+                inbox_task_id(index),
+                &title,
+                TaskLifecycle::Open,
+                TaskConnectivity::Connected,
+                TaskAttention::None,
+                TaskActivity::Idle,
+                ReviewReadiness::NotReady,
+                index as i64,
+            )
+        })
+        .collect();
+    let model = inbox_model(items);
+
+    assert!(
+        model.task_projection_index_search_resident_bytes() <= MAX_CLIENT_SEARCH_POSTING_BYTES,
+        "resident search allocation estimate must include map nodes, keys, and vector capacities"
+    );
+    assert!(
+        model.task_projection_index_search_index_keys() <= 100_000,
+        "search key table must remain compact under adversarial titles"
+    );
+}
+
+#[test]
+fn inbox_filter_normalizes_expanding_unicode_with_the_indexed_title_bound() {
+    let title = "İ".repeat(160);
+    let model = inbox_model(vec![inbox_task_item(
+        inbox_task_id(0),
+        &title,
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        0,
+    )]);
+    let inbox =
+        Inbox::from_model_with_filter(&model, &InboxFilter::new(&title), &Default::default());
+    assert_eq!(
+        inbox.len(),
+        1,
+        "UI filter and index must share normalization"
+    );
+}
+
+#[test]
+fn search_and_filter_bound_multi_megabyte_expanding_unicode_before_work() {
+    let hostile = "İ".repeat(2_000_000);
+    let model = inbox_model(vec![inbox_task_item(
+        inbox_task_id(0),
+        &hostile,
+        TaskLifecycle::Open,
+        TaskConnectivity::Connected,
+        TaskAttention::None,
+        TaskActivity::Idle,
+        ReviewReadiness::NotReady,
+        0,
+    )]);
+    let (ids, total, work) = model.search_task_ids_with_work(&hostile, false);
+    assert_eq!(ids, vec![inbox_task_id(0)]);
+    assert_eq!(total, 1);
+    assert!(work <= 5_000);
+    let inbox =
+        Inbox::from_model_with_filter(&model, &InboxFilter::new(&hostile), &Default::default());
+    assert_eq!(inbox.len(), 1);
 }
 
 #[test]
