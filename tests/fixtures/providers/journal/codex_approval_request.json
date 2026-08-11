@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source_type": "approval_request",
+  "provider_event_id": "codex_evt_approval_1",
+  "occurred_at_ms": 1725000001300,
+  "payload": {
+    "kind": "approval_request",
+    "request_id": "approval_codex_1",
+    "summary": "Run cargo test"
+  },
+  "extensions": {
+    "codex_item": "command_approval"
+  }
+}

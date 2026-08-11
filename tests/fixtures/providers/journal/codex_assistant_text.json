@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_type": "assistant_text",
+  "provider_event_id": "codex_evt_asst_1",
+  "occurred_at_ms": 1725000001200,
+  "payload": {
+    "kind": "assistant_text",
+    "text": "Codex projected this assistant turn"
+  },
+  "extensions": {
+    "codex_item": "agent_message"
+  }
+}

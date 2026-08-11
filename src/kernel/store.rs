@@ -386,6 +386,92 @@ impl KernelStore {
         Ok(out)
     }
 
+    pub(crate) fn semantic_journal_ensure_session(
+        &mut self,
+        record: &crate::kernel::semantic_journal::SemanticJournalAuthorityRecord,
+    ) -> Result<[u8; 16], StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::ensure_session(tx, record)
+        })
+    }
+
+    pub(crate) fn semantic_journal_high_water(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<(u64, Option<i64>), StoreError> {
+        crate::kernel::semantic_journal::high_water(&self.conn, digest)
+    }
+
+    pub(crate) fn semantic_journal_retained_len(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<usize, StoreError> {
+        crate::kernel::semantic_journal::retained_len(&self.conn, digest)
+    }
+
+    pub(crate) fn semantic_journal_write_fact(
+        &mut self,
+        digest: &[u8; 32],
+        delivery_id: &str,
+        provider_event_id: Option<&str>,
+        payload_hash: [u8; 32],
+        row: crate::kernel::semantic_journal::SemanticJournalFactRow,
+        max_events: u32,
+        max_dedupe_keys: u32,
+    ) -> Result<crate::kernel::semantic_journal::SemanticJournalWrite, StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::write_fact(
+                tx,
+                digest,
+                delivery_id,
+                provider_event_id,
+                payload_hash,
+                row,
+                max_events,
+                max_dedupe_keys,
+            )
+        })
+    }
+
+    pub(crate) fn semantic_journal_load_fact(
+        &self,
+        digest: &[u8; 32],
+        sequence: i64,
+    ) -> Result<Option<crate::kernel::semantic_journal::SemanticJournalFactRow>, StoreError> {
+        crate::kernel::semantic_journal::load_fact(&self.conn, digest, sequence)
+    }
+
+    pub(crate) fn semantic_journal_load_page(
+        &self,
+        digest: &[u8; 32],
+        after_sequence: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::kernel::semantic_journal::SemanticJournalFactRow>, StoreError> {
+        crate::kernel::semantic_journal::load_page(&self.conn, digest, after_sequence, limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_delete_semantic_journal_fact(
+        &mut self,
+        digest: &[u8; 32],
+        sequence: i64,
+    ) -> Result<(), StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::debug_delete_fact(tx, digest, sequence)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_zero_semantic_journal_event_id(
+        &mut self,
+        digest: &[u8; 32],
+        sequence: i64,
+    ) -> Result<(), StoreError> {
+        self.with_immediate_transaction(|tx| {
+            crate::kernel::semantic_journal::debug_zero_event_id(tx, digest, sequence)
+        })
+    }
+
     fn migrate(&mut self) -> Result<(), StoreError> {
         let manifest = schema::migration_manifest();
         loop {
@@ -393,6 +479,7 @@ impl KernelStore {
             validate_applied_history(&applied, manifest)?;
 
             if applied.len() >= manifest.len() {
+                detect_interrupted_partial_schema(&self.conn, &applied)?;
                 return Ok(());
             }
 
@@ -419,9 +506,7 @@ impl KernelStore {
                 });
             }
 
-            if applied.is_empty() {
-                detect_interrupted_partial_schema(&self.conn, &applied)?;
-            }
+            detect_interrupted_partial_schema(&self.conn, &applied)?;
 
             // Apply only the next migration inside its own transaction.
             let tx = self.conn.transaction()?;
@@ -682,20 +767,38 @@ fn detect_interrupted_partial_schema(
     conn: &Connection,
     applied: &[AppliedMigration],
 ) -> Result<(), StoreError> {
-    if !applied.is_empty() {
-        return Ok(());
-    }
-    // Empty migration history but projection/event tables already present => interrupted apply.
     let partial: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_schema
          WHERE type = 'table'
            AND name IN ('events', 'tasks', 'operations', 'command_receipts', 'outbox',
                         'agent_sessions', 'artifacts', 'resources', 'event_retention',
-                        'host_admission', 'host_cleanup_branches')",
+                        'host_admission', 'host_cleanup_branches',
+                        'semantic_journal_sessions', 'semantic_journal_facts')",
         [],
         |row| row.get(0),
     )?;
-    if partial > 0 {
+    let semantic_objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+         WHERE (type = 'table' AND name IN ('semantic_journal_sessions', 'semantic_journal_facts'))
+            OR (type = 'index' AND name = 'idx_semantic_journal_facts_sequence')",
+        [],
+        |row| row.get(0),
+    )?;
+    let applied_version = applied
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+
+    // Empty migration history or a migration that predates V7 with any
+    // semantic-journal object present indicates an interrupted apply. Once V7
+    // is recorded, require all of its objects to remain present before opening
+    // the store; otherwise the history would claim a schema that is not there.
+    if (applied_version < 7 && semantic_objects > 0)
+        || (applied_version >= 7 && semantic_objects != 3)
+    {
+        return Err(StoreError::MigrationInterrupted);
+    }
+    if applied.is_empty() && partial > 0 {
         return Err(StoreError::MigrationInterrupted);
     }
     Ok(())

@@ -8,6 +8,11 @@ use devmanager::providers::adapter::{
     ProviderInput, ProviderLaunchSpec, ProviderProbeError, ProviderProbeRequest,
     ProviderProbeResult, ProviderProbeRunner, ProviderRuntime, ProviderSignal, QuotaObservation,
     StopStrategy,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError, ProviderInput,
+    ProviderLaunchSpec,
+    ProviderProbeError, ProviderProbeRequest, ProviderProbeResult, ProviderProbeRunner,
+    ProviderRuntime, QuotaObservation, StopStrategy,
 };
 use devmanager::providers::capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport,
@@ -184,8 +189,14 @@ impl ProviderAdapter for FakeAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -228,8 +239,14 @@ impl ProviderAdapter for ProbeOnlyAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -1814,8 +1831,14 @@ impl ProviderAdapter for BoundaryAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {
@@ -1848,8 +1871,9 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
         ))
     ));
 
-    let signal = adapter.parse_signal(ProviderSignal::SessionEnded);
-    assert!(signal.is_empty());
+    // Production permits are minted only by the authenticated adapter/relay.
+    // Integration tests cannot forge one; the fake implements typed unavailability
+    // instead of returning JournalEvent. Object-safety is the check here.
 
     let stop = adapter.cooperative_stop(&ProviderRuntime);
     assert_eq!(stop, StopStrategy::Unsupported);
@@ -2126,8 +2150,14 @@ impl ProviderAdapter for OrderedAdapter {
         ))
     }
 
-    fn parse_signal(&self, _signal: ProviderSignal) -> Vec<JournalEvent> {
-        Vec::new()
+    fn normalize_delivery(
+        &self,
+        _permit: &AdapterDeliveryPermit,
+        _bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError> {
+        Err(JournalNormalizeError::Unavailable(
+            AdapterIngressUnavailable,
+        ))
     }
 
     fn cooperative_stop(&self, _session: &ProviderRuntime) -> StopStrategy {

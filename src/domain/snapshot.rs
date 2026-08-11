@@ -6,9 +6,12 @@ use serde::ser::{self, SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSessionFacts;
+use crate::domain::artifact::PrivacyClass;
 use crate::domain::artifact::{ArtifactFacts, ArtifactSummary};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{AgentSessionId, ArtifactId, OperationId, ResourceId, SnapshotId, TaskId};
+use crate::domain::id::{
+    AgentSessionId, ArtifactId, EventId, OperationId, ResourceId, SnapshotId, TaskId,
+};
 use crate::domain::operation::OperationFacts;
 use crate::domain::resource::ResourceFacts;
 use crate::domain::task::{
@@ -191,6 +194,31 @@ pub struct SnapshotPage {
     /// Exact canonical MessagePack size of this page body.
     pub encoded_bytes: u32,
     pub next_cursor: Option<Vec<u8>>,
+}
+
+/// Bounded semantic-journal projection. This is intentionally not a
+/// `SnapshotSection`: the global Task snapshot must never carry raw provider
+/// payloads, terminal bytes, or unknown event bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalFact {
+    pub id: EventId,
+    pub sequence: u64,
+    pub kind: String,
+    pub visibility: String,
+    pub privacy_class: PrivacyClass,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticJournalPage {
+    pub after_sequence: u64,
+    pub through_sequence: u64,
+    pub high_water: u64,
+    pub encoded_bytes: u32,
+    pub next_sequence: Option<u64>,
+    pub facts: Vec<SemanticJournalFact>,
 }
 
 /// One bounded page from a replay session pinned to a durable high-water mark.

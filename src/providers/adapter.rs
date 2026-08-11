@@ -11,6 +11,10 @@ use crate::providers::capabilities::{
     ProviderExecutableError, ProviderExecutableHandle, ProviderExecutablePolicy,
     ProviderExecutablePolicyError, ProviderKind, ProviderVersion, ProviderVersionError,
 };
+pub use crate::providers::journal::{
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError,
+    NormalizedAdapterDelivery,
+};
 use async_trait::async_trait;
 use std::fmt;
 use std::io::{self, Read};
@@ -220,11 +224,6 @@ pub enum ProviderSignal {
     TurnCompleted,
     PermissionRequired,
 }
-
-/// Task 4.1 keeps the normalized journal event opaque until the journal task
-/// owns its concrete event model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JournalEvent;
 
 /// Task 4.1 keeps runtime ownership opaque until provider runtime startup is
 /// implemented by the later provider-session task.
@@ -2820,7 +2819,13 @@ pub trait ProviderAdapter: Send + Sync {
         request: LaunchProviderRequest,
     ) -> Result<ProviderLaunchSpec, ProviderError>;
 
-    fn parse_signal(&self, signal: ProviderSignal) -> Vec<JournalEvent>;
+    /// Binding-required normalize seam. Must not mint EventId/sequence.
+    /// Stock adapters return typed unavailability until Tasks 4.3–4.5 exist.
+    fn normalize_delivery(
+        &self,
+        permit: &AdapterDeliveryPermit,
+        bytes: &[u8],
+    ) -> Result<NormalizedAdapterDelivery, JournalNormalizeError>;
 
     fn cooperative_stop(&self, session: &ProviderRuntime) -> StopStrategy;
 

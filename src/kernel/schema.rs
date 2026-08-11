@@ -165,6 +165,42 @@ CREATE TABLE host_cleanup_branches (\n\
 );\n\
 ";
 
+const V7_SQL: &str = "\
+CREATE TABLE semantic_journal_sessions (\n\
+  authority_digest BLOB PRIMARY KEY CHECK(length(authority_digest) = 32),\n\
+  provider_kind TEXT NOT NULL,\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16),\n\
+  agent_session_id BLOB NOT NULL CHECK(length(agent_session_id) = 16),\n\
+  resource_id BLOB NOT NULL CHECK(length(resource_id) = 16),\n\
+  runtime_generation INTEGER NOT NULL CHECK(runtime_generation >= 0),\n\
+  action_epoch INTEGER NOT NULL CHECK(action_epoch >= 0),\n\
+  managed_root BLOB NOT NULL CHECK(length(managed_root) = 32),\n\
+  opened_at_ms INTEGER NOT NULL\n\
+);\n\
+CREATE TABLE semantic_journal_facts (\n\
+  authority_digest BLOB NOT NULL REFERENCES semantic_journal_sessions(authority_digest),\n\
+  sequence INTEGER NOT NULL CHECK(sequence > 0),\n\
+  event_id BLOB NOT NULL CHECK(length(event_id) = 16),\n\
+  delivery_id TEXT NOT NULL,\n\
+  provider_event_id TEXT,\n\
+  content_hash BLOB NOT NULL CHECK(length(content_hash) = 32),\n\
+  kind TEXT NOT NULL,\n\
+  visibility TEXT NOT NULL,\n\
+  privacy_class TEXT NOT NULL,\n\
+  redaction_class TEXT NOT NULL,\n\
+  occurred_at_ms INTEGER NOT NULL,\n\
+  ingested_at_ms INTEGER NOT NULL,\n\
+  schema_version INTEGER NOT NULL,\n\
+  payload BLOB NOT NULL,\n\
+  PRIMARY KEY (authority_digest, sequence),\n\
+  UNIQUE (authority_digest, event_id),\n\
+  UNIQUE (authority_digest, delivery_id),\n\
+  UNIQUE (authority_digest, provider_event_id)\n\
+);\n\
+CREATE INDEX idx_semantic_journal_facts_sequence\n\
+  ON semantic_journal_facts(authority_digest, sequence);\n\
+";
+
 /// Compiled SHA-256 of [`V1_SQL`]. Do not change V1_SQL without updating this literal.
 pub(crate) const V1_SHA256: [u8; 32] = [
     0x79, 0xf0, 0xa3, 0x8f, 0x10, 0x92, 0xf7, 0x70, 0xa8, 0x84, 0xef, 0x3a, 0x12, 0x84, 0x81, 0x84,
@@ -201,10 +237,20 @@ pub(crate) const V6_SHA256: [u8; 32] = [
     0x0b, 0x27, 0x47, 0x02, 0x05, 0x31, 0xad, 0x6f, 0x68, 0x34, 0x16, 0x4c, 0xa0, 0xe6, 0x2e, 0x67,
 ];
 
+/// Compiled SHA-256 of [`V7_SQL`]. Do not change V7_SQL without updating this literal.
+pub(crate) const V7_SHA256: [u8; 32] = [
+    0xe5, 0x15, 0x64, 0xcc, 0x51, 0x8f, 0x00, 0xa8, 0xb2, 0x40, 0x50, 0x6d, 0xda, 0x22, 0x3b, 0x96,
+    0x4f, 0x6f, 0xd5, 0x9e, 0xa6, 0xde, 0xf9, 0xa6, 0x4a, 0x70, 0x26, 0x05, 0x23, 0x41, 0x0e, 0x2c,
+];
+
 /// Stable hex form of [`V1_SHA256`] for internal diagnostics.
 pub(crate) const V1_SHA256_HEX: &str =
     "79f0a38f1092f770a884ef3a12848184f00e7741270ffb07b0de823263e2521f";
 
+/// Digest of the compiled `&str` bytes. Callers must not hash checkout-file
+/// bytes: CRLF vs LF on disk must not change an applied migration digest.
+/// [`verify_manifest`] rejects compiled SQL that contains CR so the digest
+/// stays LF-canonical without rewriting existing V1–V7 SQL or hash literals.
 fn sha256_bytes(input: &str) -> [u8; 32] {
     let digest = Sha256::digest(input.as_bytes());
     let mut out = [0u8; 32];
@@ -253,6 +299,11 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                 sha256_bytes(V6_SQL),
                 "V6_SHA256 literal must match V6_SQL bytes"
             );
+            assert_eq!(
+                V7_SHA256,
+                sha256_bytes(V7_SQL),
+                "V7_SHA256 literal must match V7_SQL bytes"
+            );
             let migrations = vec![
                 Migration {
                     version: 1,
@@ -290,6 +341,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     sql: V6_SQL,
                     sha256: V6_SHA256,
                 },
+                Migration {
+                    version: 7,
+                    name: "v7_semantic_journal",
+                    sql: V7_SQL,
+                    sha256: V7_SHA256,
+                },
             ];
             verify_manifest(&migrations);
             migrations
@@ -321,6 +378,11 @@ fn verify_manifest(migrations: &[Migration]) {
         );
         assert!(!migration.name.is_empty(), "migration name required");
         assert!(!migration.sql.is_empty(), "migration sql required");
+        assert!(
+            !migration.sql.as_bytes().contains(&b'\r'),
+            "migration {} SQL must be LF-canonical compiled bytes",
+            migration.name
+        );
         if idx > 0 {
             assert_eq!(
                 migration.version,
@@ -498,7 +560,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 6);
+        assert_eq!(history.len(), 7);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -516,6 +578,9 @@ mod tests {
         assert_eq!(history[5].0, 6);
         assert_eq!(history[5].1, "v6_host_cleanup_branches");
         assert_eq!(history[5].2, V6_SHA256.to_vec());
+        assert_eq!(history[6].0, 7);
+        assert_eq!(history[6].1, "v7_semantic_journal");
+        assert_eq!(history[6].2, V7_SHA256.to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -641,6 +706,28 @@ mod tests {
             })
             .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn schema_v7_partial_tables_fail_closed_even_when_history_claims_v7() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v7-partial.sqlite3");
+        drop(crate::kernel::KernelStore::open(&path).expect("open"));
+
+        {
+            let conn = Connection::open(&path).expect("reopen raw");
+            conn.execute("DROP TABLE semantic_journal_facts", [])
+                .expect("remove one V7 table");
+        }
+
+        let error = crate::kernel::KernelStore::open(&path).expect_err("partial V7 schema");
+        assert!(
+            matches!(
+                error,
+                StoreError::MigrationInterrupted | StoreError::Corruption
+            ),
+            "partial V7 schema must fail closed, got {error:?}"
         );
     }
 }

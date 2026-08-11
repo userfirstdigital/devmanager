@@ -1,25 +1,23 @@
-//! Provider-neutral boundaries for stock CLI discovery and capability facts.
-//!
-//! This module deliberately stops before launching or owning a provider
-//! runtime. Later phases can wire these typed observations into the kernel and
-//! process services without replacing a provider's native harness.
+//! Provider-neutral boundaries for stock CLI discovery, capability facts,
+//! and the semantic journal contract.
 
 pub mod adapter;
 pub mod capabilities;
 pub mod claude;
 pub mod cursor;
+pub mod journal;
 pub mod registry;
 pub mod session;
 
 pub use adapter::{
-    JournalEvent, LaunchProviderRequest, ProviderAdapter, ProviderArgument, ProviderError,
-    ProviderInput, ProviderInputError, ProviderLaunchSpec, ProviderProbeError,
-    ProviderProbeFailureCode, ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest,
-    ProviderProbeRequestError, ProviderProbeResult, ProviderProbeRunner, ProviderProbeStatus,
-    ProviderQuotaStatus, ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy,
-    WindowsProviderProbeRunner, MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES,
-    MAX_PROVIDER_INPUT_BYTES, MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT,
-    MAX_PROVIDER_SIGNAL_BYTES,
+    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError, ProviderInput,
+    ProviderInputError, ProviderLaunchSpec, ProviderProbeError, ProviderProbeFailureCode,
+    ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError,
+    ProviderProbeResult, ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus,
+    ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
+    MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES, MAX_PROVIDER_INPUT_BYTES,
+    MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT, MAX_PROVIDER_SIGNAL_BYTES,
 };
 pub use capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilityState,
@@ -45,6 +43,11 @@ pub use capabilities::{
     PROVIDER_OBSERVATION_SCHEMA_VERSION,
 };
 pub use cursor::CursorAdapter;
+pub use journal::{
+    JournalBackpressure, JournalEvent, JournalIngestOutcome, JournalLimits, JournalRedactionClass,
+    JournalRejectReason, JournalSemanticKind, JournalVisibility, SemanticJournal,
+    JOURNAL_SCHEMA_VERSION,
+};
 pub use registry::{
     CacheStatus, CapabilityCacheKey, ExecutableInspector, FileSystemExecutableInspector,
     ProviderDiscoveryConfig, ProviderObservation, ProviderRegistry,

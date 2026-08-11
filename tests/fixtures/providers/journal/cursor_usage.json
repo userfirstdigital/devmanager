@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source_type": "usage_observation",
+  "provider_event_id": "cursor_evt_usage_1",
+  "occurred_at_ms": 1725000001500,
+  "payload": {
+    "kind": "usage_observation",
+    "remaining_percent": 80
+  },
+  "extensions": {}
+}
