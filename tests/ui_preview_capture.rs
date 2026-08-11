@@ -208,9 +208,10 @@ fn window_probe_joins_after_bounded_discovery_and_writes_failure_evidence() {
     .expect("preview capture script");
     for marker in [
         "MainWindowHandle",
-        "WaitForExit(4000)",
-        "Kill($true)",
-        "WaitForExit(1000)",
+        "WaitForExitAsync",
+        "Get-PreviewRemainingMilliseconds",
+        "Job",
+        "preview.process.join-unconfirmed",
         "probe-failed",
         "HoldEvidence",
         "JoinState",
@@ -221,12 +222,12 @@ fn window_probe_joins_after_bounded_discovery_and_writes_failure_evidence() {
         );
     }
     assert!(
-        script.contains("if (-not $joined)") || script.contains("if(-not $joined)"),
+        script.contains("if (-not $joined -or") || script.contains("if(-not $joined -or"),
         "ExitCode must only be read after WaitForExit reports completion"
     );
     assert!(
-        !script.contains("WaitForExit()"),
-        "window probe cleanup joins must remain bounded"
+        !script.contains("WaitForExit(1000)") && !script.contains("Kill($true)"),
+        "window probe cleanup joins must remain job-owned and deadline-bounded"
     );
 }
 
@@ -449,6 +450,219 @@ fn preview_script_retains_output_ancestor_chain_and_publishes_relative_to_handle
 }
 
 #[test]
+fn preview_children_are_created_and_reopened_relative_to_retained_no_follow_handles() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    let capture_source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    for marker in [
+        "CreateFileRelative",
+        "NtCreateFile",
+        "OpenReadRelativeNoFollow",
+        "WriteAtomicPreviewReceiptRelative",
+    ] {
+        assert!(
+            script.contains(marker),
+            "PowerShell publication must provide {marker}"
+        );
+    }
+    assert!(
+        !script.contains("Path.Combine(directory, temporaryName)"),
+        "PowerShell receipt temps must not be created by re-resolving a directory path"
+    );
+    for marker in [
+        "open_temp_output_relative",
+        "next_temp_name",
+        "FILE_CREATE",
+        "ancestor_handles",
+        "verify_ancestor_chain",
+    ] {
+        assert!(
+            capture_source.contains(marker),
+            "Rust publication must provide {marker}"
+        );
+    }
+    assert!(
+        !capture_source.contains("open_temp_output(&temp_path)"),
+        "Rust PNG temps must not be opened through a path after authority capture"
+    );
+}
+
+#[test]
+fn preview_publication_reuses_retained_parent_handle_without_path_reopen() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        source.contains("self.parent_handle.try_clone()"),
+        "publication must clone the already-retained parent authority"
+    );
+    assert!(
+        !source.contains("open_directory_authority(&self.parent_path)"),
+        "publication must not re-resolve the parent path after authority capture"
+    );
+}
+
+#[test]
+fn preview_script_final_cleanup_attempts_every_owned_resource() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Invoke-PreviewFinalCleanup",
+        "Invoke-PreviewCleanupStep",
+        "Close-PreviewTrackedProcesses -Deadline $Deadline",
+        "preview.cleanup.failed",
+        "OldBuildIdentity",
+    ] {
+        assert!(
+            script.contains(marker),
+            "final cleanup must attempt all resources and retain a fixed failure code: {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_processes_are_job_owned_and_descendant_count_is_join_verified() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "CreateJobObjectW",
+        "AssignProcessToJobObject",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+        "ActiveProcessCount",
+        "StartProcessInJob",
+        ".Job",
+    ] {
+        assert!(
+            script.contains(marker),
+            "job ownership must provide {marker}"
+        );
+    }
+    assert!(
+        !script.contains("Start-Process -FilePath $authority.Path")
+            && !script.contains("Kill($true)"),
+        "preview process cleanup must use the owned job and one bounded join"
+    );
+}
+
+#[test]
+fn preview_external_io_is_stream_bounded_and_uses_one_absolute_deadline() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "ReadBoundedUtf8Async",
+        "ReadAsync",
+        "WaitForExitAsync",
+        "Get-PreviewRemainingMilliseconds",
+        "Wait-PreviewBackoff",
+    ] {
+        assert!(
+            script.contains(marker),
+            "bounded process I/O needs {marker}"
+        );
+    }
+    for forbidden in ["ReadToEndAsync", "WaitForExit(1000)", "Start-Sleep"] {
+        assert!(
+            !script.contains(forbidden),
+            "process I/O must not retain unbounded/fixed wait {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn preview_diagnostics_are_fixed_code_redacted_and_child_environment_is_allowlisted() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "ConvertTo-PreviewSafeDiagnostic",
+        "preview.command.exit-nonzero",
+        "Environment.Clear",
+        "PreviewEnvironmentAllowlist",
+    ] {
+        assert!(
+            script.contains(marker),
+            "diagnostics/environment need {marker}"
+        );
+    }
+    for forbidden in [
+        "Error = $_.Exception.Message",
+        "Error = $stderr",
+        "$FilePath $stderr",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "diagnostics must not expose attacker-controlled data: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn preview_fixture_enumeration_streams_before_cap_then_sorts_the_bounded_set() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Get-PreviewFixtureFilesBounded",
+        "MAX_SOURCE_DIGEST_FILES",
+        "Sort-Object -Property Name",
+        "preview.fixture.enumeration-failed",
+    ] {
+        assert!(
+            script.contains(marker),
+            "fixture enumeration needs {marker}"
+        );
+    }
+    assert!(
+        !script.contains("foreach ($candidate in (Get-ChildItem"),
+        "fixture enumeration must not materialize an unbounded provider result"
+    );
+}
+
+#[test]
+fn minimized_probe_is_deferred_when_the_window_does_not_support_minimize() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "CanMinimize",
+        "WS_MINIMIZEBOX",
+        "window-not-minimizable",
+        "Outcome = 'deferred'",
+    ] {
+        assert!(
+            script.contains(marker),
+            "minimized proof must expose {marker}"
+        );
+    }
+    assert!(
+        script.contains("if ([DevManagerPreviewWindow]::CanMinimize($window))"),
+        "ShowWindow(SW_MINIMIZE) must only run after a truthful capability check"
+    );
+}
+
+#[test]
 fn preview_script_joins_every_capture_process_before_manifest_publication() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -498,8 +712,8 @@ fn preview_script_enumerates_fixtures_sorted_and_fails_visible_on_invalid_input(
     for marker in [
         "Sort-Object -Property Name",
         "FixtureRecord",
-        "fixture enumeration failed",
-        "unsupported schema",
+        "preview.fixture.enumeration-failed",
+        "preview.fixture.unsupported-schema",
     ] {
         assert!(
             script.contains(marker),
@@ -880,7 +1094,7 @@ fn preview_forged_receipts_and_caller_build_overrides_cannot_authorize_warm_laun
     .expect("preview capture script");
     for marker in [
         "caller-supplied warm binary paths are disabled",
-        "caller build override",
+        "preview.identity.caller-build-override",
         "Assert-PreviewReceiptSchema",
         "binaryFileIdentity",
         "binarySha256",

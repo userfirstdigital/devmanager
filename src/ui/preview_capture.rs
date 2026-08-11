@@ -8,7 +8,9 @@ use image::ImageEncoder;
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -326,6 +328,11 @@ pub struct CaptureOutputAuthority {
     /// parent.  The path is only an ancestry assertion; all later mutation
     /// uses the retained/reopened directory handle below.
     parent_relative_to_root: PathBuf,
+    /// Every directory from the trusted root through the publication parent.
+    /// Keeping this chain open prevents a swapped intermediate directory from
+    /// becoming the authority between validation and publication.
+    ancestor_paths: Vec<PathBuf>,
+    ancestor_identities: Vec<CaptureFileIdentity>,
     output_name: OsString,
     root_identity: CaptureFileIdentity,
     parent_identity: CaptureFileIdentity,
@@ -337,6 +344,10 @@ pub struct CaptureOutputAuthority {
     root_handle: Arc<std::os::fd::OwnedFd>,
     #[cfg(unix)]
     parent_handle: Arc<std::os::fd::OwnedFd>,
+    #[cfg(windows)]
+    ancestor_handles: Vec<Arc<std::os::windows::io::OwnedHandle>>,
+    #[cfg(unix)]
+    ancestor_handles: Vec<Arc<std::os::fd::OwnedFd>>,
 }
 
 impl PartialEq for CaptureOutputAuthority {
@@ -377,6 +388,17 @@ impl std::fmt::Display for CaptureOutputAuthority {
     }
 }
 
+fn ancestor_chain_change_error(index: usize, length: usize) -> PreviewCaptureError {
+    let message = if index == 0 {
+        "trusted preview output root changed during capture"
+    } else if index + 1 == length {
+        "trusted preview output parent changed during capture"
+    } else {
+        "trusted preview output ancestor changed during capture"
+    };
+    PreviewCaptureError::OutputFailed(message.into())
+}
+
 impl CaptureOutputAuthority {
     pub fn new(output: &Path, trusted_root: &Path) -> Result<Self, PreviewCaptureError> {
         let parent = output
@@ -392,46 +414,85 @@ impl CaptureOutputAuthority {
         let root_path = trusted_root.to_path_buf();
         let parent_path = parent.to_path_buf();
         let parent_relative_to_root = verify_parent_descendant(&root_path, &parent_path)?;
+        let ancestor_paths = directory_path_chain(&root_path, &parent_path)?;
         #[cfg(windows)]
         {
-            let (root_handle, root_identity) = open_directory_authority(&root_path)?;
-            let (parent_handle, parent_identity) = open_directory_authority(&parent_path)?;
+            let mut opened = ancestor_paths
+                .iter()
+                .map(|path| open_directory_authority(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            opened.pop();
+            opened.push(open_directory_authority_for_publication(&parent_path)?);
+            let ancestor_identities: Vec<CaptureFileIdentity> =
+                opened.iter().map(|(_, identity)| *identity).collect();
+            let ancestor_handles = opened
+                .into_iter()
+                .map(|(handle, _)| Arc::new(handle))
+                .collect::<Vec<_>>();
+            let root_handle = Arc::clone(&ancestor_handles[0]);
+            let parent_handle = Arc::clone(ancestor_handles.last().expect("ancestor chain"));
+            let root_identity = *ancestor_identities.first().expect("ancestor identity");
+            let parent_identity = *ancestor_identities.last().expect("ancestor identity");
             return Ok(Self {
                 root_path,
                 parent_path,
                 parent_relative_to_root,
+                ancestor_paths,
+                ancestor_identities,
                 output_name,
                 root_identity,
                 parent_identity,
-                root_handle: Arc::new(root_handle),
-                parent_handle: Arc::new(parent_handle),
+                root_handle,
+                parent_handle,
+                ancestor_handles,
             });
         }
         #[cfg(not(windows))]
         {
             #[cfg(unix)]
             {
-                let (root_handle, root_identity) = open_directory_authority(&root_path)?;
-                let (parent_handle, parent_identity) = open_directory_authority(&parent_path)?;
+                let opened = ancestor_paths
+                    .iter()
+                    .map(|path| open_directory_authority(path))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ancestor_identities: Vec<CaptureFileIdentity> =
+                    opened.iter().map(|(_, identity)| *identity).collect();
+                let ancestor_handles = opened
+                    .into_iter()
+                    .map(|(handle, _)| Arc::new(handle))
+                    .collect::<Vec<_>>();
+                let root_handle = Arc::clone(&ancestor_handles[0]);
+                let parent_handle = Arc::clone(ancestor_handles.last().expect("ancestor chain"));
+                let root_identity = *ancestor_identities.first().expect("ancestor identity");
+                let parent_identity = *ancestor_identities.last().expect("ancestor identity");
                 return Ok(Self {
                     root_path,
                     parent_path,
                     parent_relative_to_root,
+                    ancestor_paths,
+                    ancestor_identities,
                     output_name,
                     root_identity,
                     parent_identity,
-                    root_handle: Arc::new(root_handle),
-                    parent_handle: Arc::new(parent_handle),
+                    root_handle,
+                    parent_handle,
+                    ancestor_handles,
                 });
             }
             #[cfg(not(unix))]
             {
-                let root_identity = capture_file_identity(&root_path)?;
-                let parent_identity = capture_file_identity(&parent_path)?;
+                let ancestor_identities = ancestor_paths
+                    .iter()
+                    .map(|path| capture_file_identity(path))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let root_identity = *ancestor_identities.first().expect("ancestor identity");
+                let parent_identity = *ancestor_identities.last().expect("ancestor identity");
                 Ok(Self {
                     root_path,
                     parent_path,
                     parent_relative_to_root,
+                    ancestor_paths,
+                    ancestor_identities,
                     output_name,
                     root_identity,
                     parent_identity,
@@ -450,6 +511,84 @@ impl CaptureOutputAuthority {
             return Err(PreviewCaptureError::OutputFailed(
                 "trusted preview output parent is no longer beneath its root".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn verify_ancestor_chain(&self) -> Result<(), PreviewCaptureError> {
+        self.verify_parent_descendant()?;
+        if self.ancestor_paths.len() != self.ancestor_identities.len() {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output ancestor chain is incomplete".into(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            if self.ancestor_handles.len() != self.ancestor_paths.len() {
+                return Err(PreviewCaptureError::OutputFailed(
+                    "trusted preview output ancestor handles are incomplete".into(),
+                ));
+            }
+            for (index, ((path, expected), handle)) in self
+                .ancestor_paths
+                .iter()
+                .zip(&self.ancestor_identities)
+                .zip(&self.ancestor_handles)
+                .enumerate()
+            {
+                let (_, current) = open_directory_authority(path)
+                    .map_err(|_| ancestor_chain_change_error(index, self.ancestor_paths.len()))?;
+                let retained = directory_identity_from_handle(handle)
+                    .map_err(|_| ancestor_chain_change_error(index, self.ancestor_paths.len()))?;
+                if current != *expected || retained != *expected {
+                    return Err(ancestor_chain_change_error(
+                        index,
+                        self.ancestor_paths.len(),
+                    ));
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            if self.ancestor_handles.len() != self.ancestor_paths.len() {
+                return Err(PreviewCaptureError::OutputFailed(
+                    "trusted preview output ancestor handles are incomplete".into(),
+                ));
+            }
+            for (index, ((path, expected), handle)) in self
+                .ancestor_paths
+                .iter()
+                .zip(&self.ancestor_identities)
+                .zip(&self.ancestor_handles)
+                .enumerate()
+            {
+                let (_, current) = open_directory_authority(path)
+                    .map_err(|_| ancestor_chain_change_error(index, self.ancestor_paths.len()))?;
+                let retained = directory_identity_from_handle(handle)
+                    .map_err(|_| ancestor_chain_change_error(index, self.ancestor_paths.len()))?;
+                if current != *expected || retained != *expected {
+                    return Err(ancestor_chain_change_error(
+                        index,
+                        self.ancestor_paths.len(),
+                    ));
+                }
+            }
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            for (index, (path, expected)) in self
+                .ancestor_paths
+                .iter()
+                .zip(&self.ancestor_identities)
+                .enumerate()
+            {
+                if capture_file_identity(path).ok() != Some(*expected) {
+                    return Err(ancestor_chain_change_error(
+                        index,
+                        self.ancestor_paths.len(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -492,7 +631,7 @@ impl CaptureOutputAuthority {
     }
 
     fn verify_reopened(&self) -> Result<(), PreviewCaptureError> {
-        self.verify_parent_descendant()?;
+        self.verify_ancestor_chain()?;
         #[cfg(windows)]
         {
             let _ = self.reopen_parent_for_publication()?;
@@ -523,74 +662,22 @@ impl CaptureOutputAuthority {
     fn reopen_parent_for_publication(
         &self,
     ) -> Result<std::os::windows::io::OwnedHandle, PreviewCaptureError> {
-        self.verify_parent_descendant()?;
-        let (_, root_identity) = open_directory_authority(&self.root_path).map_err(|_| {
+        self.verify_ancestor_chain()?;
+        self.parent_handle.try_clone().map_err(|_| {
             PreviewCaptureError::OutputFailed(
-                "trusted preview output root changed during capture".into(),
+                "trusted preview output parent handle changed during capture".into(),
             )
-        })?;
-        let retained_root_identity =
-            directory_identity_from_handle(&self.root_handle).map_err(|_| {
-                PreviewCaptureError::OutputFailed(
-                    "trusted preview output root handle changed during capture".into(),
-                )
-            })?;
-        let (parent_handle, parent_identity) = open_directory_authority(&self.parent_path)
-            .map_err(|_| {
-                PreviewCaptureError::OutputFailed(
-                    "trusted preview output parent changed during capture".into(),
-                )
-            })?;
-        let retained_parent_identity = directory_identity_from_handle(&self.parent_handle)
-            .map_err(|_| {
-                PreviewCaptureError::OutputFailed(
-                    "trusted preview output parent handle changed during capture".into(),
-                )
-            })?;
-        if root_identity != self.root_identity || retained_root_identity != self.root_identity {
-            return Err(PreviewCaptureError::OutputFailed(
-                "trusted preview output root changed during capture".into(),
-            ));
-        }
-        if parent_identity != self.parent_identity
-            || retained_parent_identity != self.parent_identity
-        {
-            return Err(PreviewCaptureError::OutputFailed(
-                "trusted preview output parent changed during capture".into(),
-            ));
-        }
-        Ok(parent_handle)
+        })
     }
 
     #[cfg(unix)]
     fn reopen_parent_for_publication(&self) -> Result<std::os::fd::OwnedFd, PreviewCaptureError> {
-        self.verify_parent_descendant()?;
-        let (_, root_identity) = open_directory_authority(&self.root_path).map_err(|_| {
+        self.verify_ancestor_chain()?;
+        self.parent_handle.try_clone().map_err(|_| {
             PreviewCaptureError::OutputFailed(
-                "trusted preview output root changed during capture".into(),
+                "trusted preview output parent handle changed during capture".into(),
             )
-        })?;
-        let retained_root_identity = directory_identity_from_handle(&self.root_handle)?;
-        let (parent_handle, parent_identity) = open_directory_authority(&self.parent_path)
-            .map_err(|_| {
-                PreviewCaptureError::OutputFailed(
-                    "trusted preview output parent changed during capture".into(),
-                )
-            })?;
-        let retained_parent_identity = directory_identity_from_handle(&self.parent_handle)?;
-        if root_identity != self.root_identity || retained_root_identity != self.root_identity {
-            return Err(PreviewCaptureError::OutputFailed(
-                "trusted preview output root changed during capture".into(),
-            ));
-        }
-        if parent_identity != self.parent_identity
-            || retained_parent_identity != self.parent_identity
-        {
-            return Err(PreviewCaptureError::OutputFailed(
-                "trusted preview output parent changed during capture".into(),
-            ));
-        }
-        Ok(parent_handle)
+        })
     }
 }
 
@@ -654,6 +741,47 @@ fn verify_parent_descendant(root: &Path, parent: &Path) -> Result<PathBuf, Previ
                     relative
                 });
         Ok(relative)
+    }
+}
+
+fn directory_path_chain(root: &Path, parent: &Path) -> Result<Vec<PathBuf>, PreviewCaptureError> {
+    verify_parent_descendant(root, parent)?;
+    let normalize = |path: &Path| {
+        #[cfg(windows)]
+        {
+            let value = path.to_string_lossy();
+            value
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&value)
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase()
+                .replace('/', "\\")
+        }
+        #[cfg(not(windows))]
+        {
+            path.to_string_lossy().trim_end_matches('/').to_string()
+        }
+    };
+    let root_key = normalize(root);
+    let mut cursor = parent.to_path_buf();
+    let mut reverse = Vec::new();
+    loop {
+        reverse.push(cursor.clone());
+        if normalize(&cursor) == root_key {
+            reverse.reverse();
+            return Ok(reverse);
+        }
+        let next = cursor.parent().map(Path::to_path_buf).ok_or_else(|| {
+            PreviewCaptureError::OutputFailed(
+                "trusted preview output ancestor chain could not reach its root".into(),
+            )
+        })?;
+        if next == cursor {
+            return Err(PreviewCaptureError::OutputFailed(
+                "trusted preview output ancestor chain could not reach its root".into(),
+            ));
+        }
+        cursor = next;
     }
 }
 
@@ -833,6 +961,118 @@ fn delete_relative_windows(
 }
 
 #[cfg(windows)]
+fn open_relative_windows(
+    parent: &std::os::windows::io::OwnedHandle,
+    name: &OsString,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+
+    #[repr(C)]
+    struct NativeUnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct NativeObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *mut NativeUnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *mut NativeObjectAttributes,
+            io_status_block: *mut NativeIoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    let byte_length = wide
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "preview temp name too long",
+            )
+        })?;
+    let mut unicode = NativeUnicodeString {
+        length: byte_length,
+        maximum_length: byte_length,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = NativeObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<NativeObjectAttributes>()).unwrap_or(u32::MAX),
+        root_directory: HANDLE(parent.as_raw_handle()),
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = NativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = HANDLE::default();
+    let mut allocation_size = 0_i64;
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            FILE_READ_DATA | FILE_WRITE_DATA | DELETE | SYNCHRONIZE,
+            &mut attributes,
+            &mut io_status,
+            &mut allocation_size,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw.0 as *mut std::ffi::c_void) };
+    Ok(std::fs::File::from(handle))
+}
+
+#[cfg(windows)]
 fn directory_identity_from_handle(
     handle: &std::os::windows::io::OwnedHandle,
 ) -> Result<CaptureFileIdentity, PreviewCaptureError> {
@@ -893,14 +1133,41 @@ fn capture_file_identity(path: &Path) -> std::io::Result<CaptureFileIdentity> {
 fn open_directory_authority(
     path: &Path,
 ) -> Result<(std::os::windows::io::OwnedHandle, CaptureFileIdentity), PreviewCaptureError> {
+    open_directory_authority_with_access(
+        path,
+        (windows::Win32::Storage::FileSystem::FILE_TRAVERSE
+            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES)
+            .0,
+    )
+}
+
+#[cfg(windows)]
+fn open_directory_authority_for_publication(
+    path: &Path,
+) -> Result<(std::os::windows::io::OwnedHandle, CaptureFileIdentity), PreviewCaptureError> {
+    open_directory_authority_with_access(
+        path,
+        (windows::Win32::Storage::FileSystem::FILE_TRAVERSE
+            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES)
+            .0
+            | 0x0000_0002
+            | 0x0000_0040,
+    )
+}
+
+#[cfg(windows)]
+fn open_directory_authority_with_access(
+    path: &Path,
+    desired_access: u32,
+) -> Result<(std::os::windows::io::OwnedHandle, CaptureFileIdentity), PreviewCaptureError> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
     };
 
     let wide: Vec<u16> = path
@@ -911,7 +1178,7 @@ fn open_directory_authority(
     let raw = unsafe {
         CreateFileW(
             windows::core::PCWSTR(wide.as_ptr()),
-            (FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
@@ -1155,7 +1422,12 @@ mod publication_tests {
 
         fs::rename(&temp, &moved_temp).expect("move trusted temp path");
         fs::write(&temp, b"attacker replacement").expect("attacker temp replacement");
-        atomic_publish_temp(&temp, &authority, &file).expect("handle-relative publication");
+        atomic_publish_temp(
+            temp.file_name().expect("temporary file name"),
+            &authority,
+            &file,
+        )
+        .expect("handle-relative publication");
         drop(file);
 
         assert_eq!(
@@ -2079,9 +2351,6 @@ fn encode_bgra_png_atomic_sync(
             "BGRA frame dimensions do not match its byte length".into(),
         ));
     }
-    if output.exists() {
-        return Err(PreviewCaptureError::OutputAlreadyExists);
-    }
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2100,13 +2369,9 @@ fn encode_bgra_png_atomic_sync(
     authority.verify_reopened()?;
     lease.check(deadline)?;
 
-    let temp_path = next_temp_path(output, parent, deadline, lease)?;
-    reject_reparse_ancestors(&temp_path)?;
-    let mut temp = TempOutput::new(temp_path.clone(), Arc::clone(&authority));
+    let (temp_name, mut file) = open_temp_output_relative(&authority, output, deadline, lease)?;
+    let mut temp = TempOutput::new(temp_name.clone(), Arc::clone(&authority));
     lease.check(deadline)?;
-    let mut file = open_temp_output(&temp_path).map_err(|error| {
-        PreviewCaptureError::OutputFailed(format!("preview temp open failed: {error}"))
-    })?;
 
     let mut rgba = Vec::with_capacity(expected_bytes);
     for pixel in bgra.chunks_exact(4) {
@@ -2126,11 +2391,8 @@ fn encode_bgra_png_atomic_sync(
     file.sync_all()
         .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
     lease.check(deadline)?;
-    if output.exists() {
-        return Err(PreviewCaptureError::OutputAlreadyExists);
-    }
     lease.publish_with(deadline, || {
-        atomic_publish_temp(&temp_path, &authority, &file)
+        atomic_publish_temp(&temp_name, &authority, &file)
             .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
         temp.renamed = true;
         drop(file);
@@ -2143,6 +2405,7 @@ fn encode_bgra_png_atomic_sync(
     Ok(())
 }
 
+#[cfg(test)]
 fn open_temp_output(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -2163,6 +2426,86 @@ fn open_temp_output(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+fn open_temp_output_relative(
+    authority: &CaptureOutputAuthority,
+    output: &Path,
+    deadline: CaptureDeadline,
+    lease: &CaptureLease,
+) -> Result<(OsString, std::fs::File), PreviewCaptureError> {
+    let stem = output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("preview");
+    for _ in 0..32 {
+        lease.check(deadline)?;
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = next_temp_name(stem, counter);
+        #[cfg(windows)]
+        {
+            let parent = authority.reopen_parent_for_publication()?;
+            match open_relative_windows(&parent, &name) {
+                Ok(file) => return Ok((name, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(PreviewCaptureError::OutputFailed(format!(
+                        "preview temp open failed: {error}"
+                    )));
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+
+            let name_c = CString::new(name.as_os_str().as_bytes()).map_err(|_| {
+                PreviewCaptureError::OutputFailed("preview temp name contains NUL".into())
+            })?;
+            let parent = authority.reopen_parent_for_publication()?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(PreviewCaptureError::OutputFailed(format!(
+                    "preview temp open failed: {error}"
+                )));
+            }
+            return Ok((
+                name,
+                std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+            ));
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = name;
+            return Err(PreviewCaptureError::OutputFailed(
+                "handle-relative preview temp creation is unsupported on this platform".into(),
+            ));
+        }
+    }
+    Err(PreviewCaptureError::OutputFailed(
+        "could not allocate a unique temporary PNG entry".into(),
+    ))
+}
+
+fn next_temp_name(stem: &str, counter: usize) -> OsString {
+    OsString::from(format!(".{stem}.{counter}.tmp"))
+}
+
 /// Publish a fully synced temporary PNG without following a reparse point at
 /// the final file boundary. Windows uses the open temporary-file handle and a
 /// no-follow parent handle. Linux uses the held parent descriptor plus the
@@ -2170,7 +2513,7 @@ fn open_temp_output(path: &Path) -> std::io::Result<std::fs::File> {
 /// replace the source. Other Unix platforms fail closed rather than resolving
 /// an absolute parent path after validation.
 fn atomic_publish_temp(
-    temp: &Path,
+    temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<()> {
@@ -2197,7 +2540,7 @@ fn atomic_publish_temp(
 
 #[cfg(unix)]
 fn atomic_publish_temp_unix(
-    temp: &Path,
+    temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<()> {
@@ -2208,13 +2551,7 @@ fn atomic_publish_temp_unix(
     let parent = authority.reopen_parent_for_publication().map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
     })?;
-    let temp_name = temp.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "temporary preview has no name",
-        )
-    })?;
-    let temp_name = CString::new(temp_name.as_bytes()).map_err(|_| {
+    let temp_name = CString::new(temp.as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "temporary preview name is invalid",
@@ -2261,7 +2598,7 @@ fn atomic_publish_temp_unix(
 
 #[cfg(windows)]
 fn atomic_publish_temp_windows(
-    _temp: &Path,
+    _temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
 ) -> std::io::Result<()> {
@@ -2386,29 +2723,6 @@ fn reject_reparse_ancestors(path: &Path) -> Result<(), PreviewCaptureError> {
     Ok(())
 }
 
-fn next_temp_path(
-    output: &Path,
-    parent: &Path,
-    deadline: CaptureDeadline,
-    lease: &CaptureLease,
-) -> Result<PathBuf, PreviewCaptureError> {
-    let stem = output
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("preview");
-    for _ in 0..32 {
-        lease.check(deadline)?;
-        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{stem}.{counter}.tmp"));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(PreviewCaptureError::OutputFailed(
-        "could not allocate a unique temporary PNG path".into(),
-    ))
-}
-
 struct TempOutput {
     temp_name: OsString,
     authority: Arc<CaptureOutputAuthority>,
@@ -2417,9 +2731,9 @@ struct TempOutput {
 }
 
 impl TempOutput {
-    fn new(path: PathBuf, authority: Arc<CaptureOutputAuthority>) -> Self {
+    fn new(temp_name: OsString, authority: Arc<CaptureOutputAuthority>) -> Self {
         Self {
-            temp_name: path.file_name().unwrap_or_default().to_os_string(),
+            temp_name,
             authority,
             renamed: false,
             committed: false,
