@@ -176,6 +176,12 @@ pub const GALLERY_PAGE_ROWS: u16 = 3;
 const GALLERY_PAGE_GAP_PX: f32 = 8.0;
 const GALLERY_CONTENT_WIDTH_PX: f32 = 608.0;
 const GALLERY_SAMPLE_VALUE_WIDTH_PX: f32 = 400.0;
+const GALLERY_SAMPLE_SEGMENT_COLUMNS: usize = 3;
+const GALLERY_SAMPLE_SEGMENT_WIDTH_PX: f32 = 192.0;
+const GALLERY_SAMPLE_SEGMENT_GAP_PX: f32 = 8.0;
+const GALLERY_SAMPLE_SEGMENT_SCALARS: usize = 72;
+const GALLERY_SAMPLE_SEGMENTS_PER_PAGE: usize = 3;
+const GALLERY_SAMPLE_SEGMENT_MAX_LINES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1059,7 +1065,6 @@ impl PreviewRoot {
             .child(
                 div()
                     .w(physical_px(GALLERY_CONTENT_WIDTH_PX))
-                    .line_clamp(2)
                     .child(self.snapshot.title.clone()),
             );
         if let Some(gallery) = gallery {
@@ -1116,7 +1121,16 @@ fn render_component_gallery(
     }
 
     let mut samples = div().flex().flex_col().gap_y_1().w_full();
+    let long_text_segments = split_gallery_sample(&gallery.samples.long_text);
     let sample_start = usize::from(page.sample_page) * 4;
+    if page.sample_page == 1 {
+        let continuation_start = GALLERY_SAMPLE_SEGMENTS_PER_PAGE;
+        samples = samples.child(render_gallery_long_text_segments(
+            &long_text_segments,
+            continuation_start,
+            scale_factor,
+        ));
+    }
     for (name, sample) in [
         ("unicode", gallery.samples.unicode.clone()),
         ("long text", gallery.samples.long_text.clone()),
@@ -1130,16 +1144,21 @@ fn render_component_gallery(
     .skip(sample_start)
     .take(4)
     {
+        if name == "long text" {
+            samples = samples.child(render_gallery_long_text_segments(
+                &long_text_segments,
+                0,
+                scale_factor,
+            ));
+            continue;
+        }
         let mut sample_value = div()
             .flex_shrink_0()
             .w(px(GALLERY_SAMPLE_VALUE_WIDTH_PX / scale_factor))
             .text_xs();
-        if name == "long text" || name == "unicode" {
+        if name == "unicode" {
             sample_value = sample_value
-                .max_h(px(32.0))
-                .overflow_hidden()
                 .whitespace_normal()
-                .line_clamp(2)
                 .child(wrapped_gallery_sample(&sample));
         } else {
             sample_value = sample_value
@@ -1235,7 +1254,7 @@ fn bounded_gallery_sample(value: &str) -> String {
 }
 
 fn wrapped_gallery_sample(value: &str) -> String {
-    const MAX_LINE_SCALARS: usize = 20;
+    const MAX_LINE_SCALARS: usize = 30;
     let mut wrapped = String::with_capacity(value.len());
     let mut line_scalars = 0;
     for word in value.split_whitespace() {
@@ -1253,6 +1272,73 @@ fn wrapped_gallery_sample(value: &str) -> String {
     wrapped
 }
 
+fn split_gallery_sample(value: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let word_scalars = word.chars().count();
+        if !current.is_empty()
+            && current.chars().count() + 1 + word_scalars > GALLERY_SAMPLE_SEGMENT_SCALARS
+        {
+            segments.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn render_gallery_long_text_segments(
+    segments: &[String],
+    continuation_start: usize,
+    scale_factor: f32,
+) -> gpui::AnyElement {
+    let segment_count = segments.len();
+    let continuation_end =
+        (continuation_start + GALLERY_SAMPLE_SEGMENTS_PER_PAGE).min(segment_count);
+    let mut segment_grid = div()
+        .flex()
+        .flex_wrap()
+        .gap(px(GALLERY_SAMPLE_SEGMENT_GAP_PX / scale_factor))
+        .w_full();
+    for (index, segment) in segments
+        .iter()
+        .enumerate()
+        .skip(continuation_start)
+        .take(GALLERY_SAMPLE_SEGMENTS_PER_PAGE)
+    {
+        segment_grid = segment_grid.child(
+            div()
+                .flex_none()
+                .w(px(GALLERY_SAMPLE_SEGMENT_WIDTH_PX / scale_factor))
+                .child(div().text_xs().child(format!(
+                    "long text continuation {}/{}",
+                    index + 1,
+                    segment_count
+                )))
+                .child(div().text_xs().whitespace_normal().child(segment.clone())),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_y_1()
+        .w_full()
+        .child(div().text_xs().child(format!(
+            "long text continuation segments {}-{}/{} (all content shown)",
+            continuation_start + 1,
+            continuation_end,
+            segment_count
+        )))
+        .child(segment_grid)
+        .into_any_element()
+}
+
 fn gallery_layout_assertion(gallery: &ComponentGalleryFixture) {
     // The page contract is intentionally explicit: all nine states occupy a
     // bounded pages, with each cell wrapping its production controls.
@@ -1265,6 +1351,48 @@ fn gallery_layout_assertion(gallery: &ComponentGalleryFixture) {
             / f32::from(GALLERY_PAGE_COLUMNS)
             >= 180.0,
         "gallery page layout assertion: columns exceed the 640px content width"
+    );
+    assert!(
+        GALLERY_SAMPLE_SEGMENT_WIDTH_PX * GALLERY_SAMPLE_SEGMENT_COLUMNS as f32
+            + GALLERY_SAMPLE_SEGMENT_GAP_PX * (GALLERY_SAMPLE_SEGMENT_COLUMNS - 1) as f32
+            <= GALLERY_CONTENT_WIDTH_PX,
+        "gallery sample continuation segments exceed the 640px content width"
+    );
+    let segments = split_gallery_sample(&gallery.samples.long_text);
+    assert!(
+        !segments.is_empty(),
+        "long gallery sample must have visible segments"
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|segment| segment.chars().count() <= GALLERY_SAMPLE_SEGMENT_SCALARS),
+        "long gallery sample continuation segment exceeds its bounded scalar budget"
+    );
+    assert!(
+        segments.iter().all(|segment| {
+            wrapped_gallery_sample(segment).lines().count() <= GALLERY_SAMPLE_SEGMENT_MAX_LINES
+        }),
+        "long gallery sample continuation segment exceeds its bounded line budget"
+    );
+    assert!(
+        segments.len() <= GALLERY_SAMPLE_SEGMENTS_PER_PAGE * 2,
+        "long gallery sample continuation pages must expose every segment"
+    );
+    let normalized_original = gallery
+        .samples
+        .long_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized_segments = segments
+        .iter()
+        .flat_map(|segment| segment.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        normalized_original, normalized_segments,
+        "long gallery sample continuation segments must cover the complete source"
     );
 }
 
@@ -1421,14 +1549,58 @@ impl Render for PreviewRoot {
     }
 }
 
+struct CaptureExecutorShutdownGuard {
+    finished: bool,
+}
+
+impl CaptureExecutorShutdownGuard {
+    fn new() -> Self {
+        Self { finished: false }
+    }
+
+    fn finish(mut self) -> preview_capture::CaptureExecutorShutdownReport {
+        self.finished = true;
+        preview_capture::shutdown_capture_executor()
+    }
+}
+
+impl Drop for CaptureExecutorShutdownGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let report = preview_capture::shutdown_capture_executor();
+            if report.workers_leaked != 0 {
+                eprintln!("preview capture executor shutdown retained {report}");
+            }
+        }
+    }
+}
+
 pub fn run_cli<I, S>(args: I, policy: &PreviewPathPolicy) -> Result<(), PreviewError>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let request = parse_preview_args(args, policy)?;
-    let preview = PreviewApplication::load(request, policy)?;
-    preview.render_to_output()
+    let shutdown = CaptureExecutorShutdownGuard::new();
+    let result = (|| {
+        let request = parse_preview_args(args, policy)?;
+        let preview = PreviewApplication::load(request, policy)?;
+        preview.render_to_output()
+    })();
+    let report = shutdown.finish();
+    if report.workers_leaked == 0 {
+        return result;
+    }
+    let reason = report.to_string();
+    match result {
+        Ok(()) => Err(PreviewError::ApplicationFailed {
+            reason: format!("preview capture executor did not join: {reason}"),
+        }),
+        Err(primary) => Err(PreviewError::CaptureCleanupFailed {
+            primary: Box::new(primary),
+            operation: "capture executor shutdown",
+            reason,
+        }),
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, PreviewError> {

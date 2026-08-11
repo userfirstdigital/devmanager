@@ -12,7 +12,7 @@
       "states": ["default", "hover", "pressed", "focused", "disabled", "loading", "destructive", "selected", "status"],
       "samples": {
         "long_text": "This intentionally long component-gallery label exercises bounded wrapping without clipping across the full native preview surface. It includes enough content to verify that controls remain readable at every supported Windows scale, including a second sentence with a project name, task title, provider description, and recovery guidance that must wrap instead of escaping its semantic container.",
-        "unicode": "界面 • Привет • مرحبا • हिन्दी • emoji 🙂",
+        "unicode": "界面 • Привет • مرحبا • हिन्दी • e\u0301 • क\u094Dष • emoji 🙂",
         "missing": "No provider description supplied",
         "error": "The task could not be loaded. Try again.",
         "loading": "Loading task details",

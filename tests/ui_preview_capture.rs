@@ -217,7 +217,7 @@ fn window_probe_joins_after_bounded_discovery_and_writes_failure_evidence() {
 }
 
 #[test]
-fn gallery_keeps_long_unicode_text_for_bounded_wrap_and_uses_theme_canvas() {
+fn gallery_keeps_full_long_text_in_visible_continuation_segments() {
     let source =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
             .expect("preview source");
@@ -226,12 +226,119 @@ fn gallery_keeps_long_unicode_text_for_bounded_wrap_and_uses_theme_canvas() {
         "gallery must route the real long and Unicode fixture values through rendering"
     );
     assert!(
-        source.contains("overflow_hidden") && source.contains("max_h"),
-        "long sample presentation must use bounded wrapping rather than source truncation"
+        source.contains("split_gallery_sample")
+            && source.contains("continuation")
+            && source.contains("GALLERY_SAMPLE_SEGMENT_COLUMNS"),
+        "the long sample must be rendered as explicitly labeled visible continuation segments"
+    );
+    assert!(
+        !source.contains(".max_h(px(32.0))")
+            && !source.contains(".overflow_hidden()")
+            && !source.contains(".line_clamp(2)"),
+        "the required long sample must not hide its remainder behind clipping"
+    );
+    assert!(
+        source.contains("GALLERY_SAMPLE_SEGMENT_WIDTH_PX")
+            && source.contains("GALLERY_CONTENT_WIDTH_PX"),
+        "segment width must participate in an explicit physical layout bound"
+    );
+    assert!(
+        source.contains("GALLERY_SAMPLE_SEGMENTS_PER_PAGE")
+            && source.contains("continuation_start"),
+        "long text remainder must be explicitly paged with continuation semantics"
+    );
+    assert!(
+        source.contains("const MAX_LINE_SCALARS: usize = 30"),
+        "unicode wrapping must leave enough vertical room for the full continuation row"
+    );
+    assert!(
+        source.contains("GALLERY_SAMPLE_SEGMENT_MAX_LINES"),
+        "long text must assert a deterministic vertical line budget per continuation segment"
     );
     assert!(
         source.contains("surfaces.canvas"),
         "gallery canvas must follow the selected theme, including light mode"
+    );
+}
+
+#[test]
+fn gallery_fixture_preserves_decomposed_combining_sequences_alongside_unicode_coverage() {
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/component-gallery.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture_path).expect("component gallery fixture"))
+            .expect("component gallery JSON");
+    let unicode = fixture["root"]["gallery"]["samples"]["unicode"]
+        .as_str()
+        .expect("unicode gallery sample");
+    assert!(
+        unicode.contains('\u{0301}'),
+        "fixture must include e + U+0301"
+    );
+    assert!(
+        unicode.contains('\u{094d}'),
+        "fixture must include a non-Latin combining cluster"
+    );
+    for expected in ['界', 'م', '🙂'] {
+        assert!(
+            unicode.contains(expected),
+            "fixture must retain the existing CJK/RTL/emoji coverage"
+        );
+    }
+}
+
+#[test]
+fn capture_script_never_path_deletes_outputs_and_uses_unique_retry_names() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for forbidden in [
+        "Remove-CaptureOutputBestEffort",
+        "Test-Path -LiteralPath $output",
+        "Test-Path -LiteralPath $OutputPath",
+        "Remove-Item -LiteralPath $output",
+        "Remove-Item -LiteralPath $OutputPath",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "capture script must not path-delete or path-probe output via {forbidden}"
+        );
+    }
+    for required in [
+        "attempt-$attempt",
+        "OutputEvidence",
+        "output-name-unique-per-attempt",
+        "BinaryPath",
+        "warm isolated binary",
+    ] {
+        assert!(
+            script.contains(required),
+            "capture retries must retain unique output evidence via {required}"
+        );
+    }
+}
+
+#[test]
+fn preview_cli_raii_shutdown_joins_capture_executor_on_every_exit() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    for marker in [
+        "CaptureExecutorShutdownGuard",
+        "shutdown_capture_executor",
+        "finish()",
+        "run_cli",
+    ] {
+        assert!(
+            source.contains(marker),
+            "preview CLI must route every success/failure exit through {marker}"
+        );
+    }
+    assert!(
+        source.contains("workers_leaked") && source.contains("CaptureCleanupFailed"),
+        "executor shutdown leaks must remain typed and visible rather than detached"
     );
 }
 
@@ -894,6 +1001,37 @@ fn trusted_output_parent_identity_blocks_regular_directory_substitution() {
 
     fs::remove_dir(&parent).expect("remove substituted output parent");
     fs::rename(&moved_parent, &parent).expect("restore trusted output parent");
+}
+
+#[cfg(windows)]
+#[test]
+fn output_cleanup_refuses_a_parent_junction_substitution() {
+    let (_root, policy) = temporary_policy();
+    let parent = policy.output_root().join("cleanup-parent");
+    fs::create_dir_all(&parent).expect("cleanup parent");
+    let output = parent.join("cleanup.png");
+    fs::write(&output, b"must remain in the moved directory").expect("cleanup output");
+    let moved_parent = policy.output_root().join("cleanup-parent-before-swap");
+    fs::rename(&parent, &moved_parent).expect("move cleanup parent");
+    create_directory_junction(&moved_parent, &parent);
+
+    let error = cleanup_output_after_deadline(
+        &output,
+        PreviewCaptureError::DeadlineExceeded,
+        CaptureDeadline::from_now(Duration::ZERO),
+    );
+    assert!(matches!(
+        error,
+        PreviewCaptureError::CleanupFailed(context)
+            if matches!(context.secondary(), PreviewCaptureError::OutputFailed(_))
+    ));
+    assert!(
+        moved_parent.join("cleanup.png").exists(),
+        "junction substitution must not delete the moved output"
+    );
+
+    remove_directory_junction(&parent);
+    fs::rename(&moved_parent, &parent).expect("restore cleanup parent");
 }
 
 #[test]

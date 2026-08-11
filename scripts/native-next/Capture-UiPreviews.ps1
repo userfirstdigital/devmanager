@@ -5,6 +5,7 @@ param(
     [switch]$AllScales,
     [switch]$AutomateWindowStates,
     [string]$TargetDir = 'C:\Temp\devmanager-phase5-ui-capture-correction3',
+    [string]$BinaryPath,
     [string]$OutputRoot
 )
 
@@ -35,16 +36,38 @@ New-Item -ItemType Directory -Force -Path $TargetRunDir | Out-Null
 $oldTargetDir = $env:CARGO_TARGET_DIR
 $oldBuildJobs = $env:CARGO_BUILD_JOBS
 try {
-    $env:CARGO_TARGET_DIR = $TargetRunDir
-    $env:CARGO_BUILD_JOBS = '1'
+    if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
+        $env:CARGO_TARGET_DIR = $TargetRunDir
+        $env:CARGO_BUILD_JOBS = '1'
 
-    & cargo build --locked --offline --bin devmanager-next --target-dir $env:CARGO_TARGET_DIR
-    if ($LASTEXITCODE -ne 0) {
-        throw "isolated devmanager-next build failed with exit code $LASTEXITCODE"
-    }
-    $binary = Join-Path $env:CARGO_TARGET_DIR 'debug\devmanager-next.exe'
-    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-        throw 'isolated devmanager-next binary was not produced.'
+        & cargo build --locked --offline --bin devmanager-next --target-dir $env:CARGO_TARGET_DIR
+        if ($LASTEXITCODE -ne 0) {
+            throw "isolated devmanager-next build failed with exit code $LASTEXITCODE"
+        }
+        $binary = Join-Path $env:CARGO_TARGET_DIR 'debug\devmanager-next.exe'
+        if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw 'isolated devmanager-next binary was not produced.'
+        }
+    } else {
+        # A warm isolated binary is allowed only from this worktree; never launch an installed app.
+        $warmBinaryPath = if ([IO.Path]::IsPathRooted($BinaryPath)) {
+            $BinaryPath
+        } else {
+            Join-Path (Get-Location).Path $BinaryPath
+        }
+        $binary = [IO.Path]::GetFullPath($warmBinaryPath)
+        $repoPrefix = ([IO.Path]::GetFullPath($repoRoot)).TrimEnd('\') + '\'
+        if (-not ($binary.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $binary.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'warm isolated binary must remain beneath this worktree.'
+        }
+        $binaryItem = Get-Item -LiteralPath $binary -ErrorAction Stop
+        if (-not $binaryItem.PSIsContainer -and
+            (($binaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+            Write-Verbose ("using warm isolated binary {0}" -f $binary)
+        } else {
+            throw 'warm isolated binary must be a non-reparse file.'
+        }
     }
 
     $fixtureFiles = @(Get-ChildItem -LiteralPath $fixtureRoot -Filter '*.json' -File |
@@ -105,18 +128,6 @@ public static class DevManagerPreviewWindow {
         [pscustomobject]@{ Width = [uint32]$width; Height = [uint32]$height }
     }
 
-    function Remove-CaptureOutputBestEffort {
-        param([string]$Path)
-        try {
-            if (Test-Path -LiteralPath $Path) {
-                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-            }
-            return $null
-        } catch {
-            return $_.Exception.Message
-        }
-    }
-
     function Invoke-WindowStateProbe {
         param(
             [string]$State,
@@ -163,7 +174,16 @@ public static class DevManagerPreviewWindow {
             if ($exitCode -eq 0) {
                 throw "isolated $State probe unexpectedly published a frame"
             }
-            if (Test-Path -LiteralPath $OutputPath) {
+            $outputPresent = $false
+            try {
+                $null = Get-Item -LiteralPath $OutputPath -ErrorAction Stop
+                $outputPresent = $true
+            } catch {
+                if ($_.CategoryInfo.Category -ne 'ObjectNotFound') {
+                    throw
+                }
+            }
+            if ($outputPresent) {
                 throw "isolated $State probe left an output after an unavailable window state"
             }
             $outcome = 'rejected'
@@ -189,6 +209,12 @@ public static class DevManagerPreviewWindow {
             Error = $failure
             ExitCode = $exitCode
             JoinState = if ($joined) { 'joined' } else { 'join-unconfirmed' }
+            Output = [IO.Path]::GetFileName($OutputPath)
+            OutputEvidence = if ($outcome -eq 'rejected') {
+                'output-absent-after-state-transition'
+            } else {
+                'probe-output-state-unconfirmed'
+            }
             Bytes = 0
             Width = 0
             Height = 0
@@ -237,49 +263,40 @@ public static class DevManagerPreviewWindow {
             } else {
                 "$($page.Theme)-$($page.Density)-$($page.Scale)-states-$($page.StatePage)"
             }
-            $output = Join-Path $OutputRoot "$baseName-$suffix.png"
-            $arguments = @('--ui-preview', $fixtureFile.FullName, '--output', $output)
-            if ($null -ne $page.Theme) {
-                $arguments += @('--theme', $page.Theme, '--density', $page.Density, '--scale', [string]$page.Scale, '--section', $page.Section)
-                if ($page.Section -eq 'states') {
-                    $arguments += @('--state-page', [string]$page.StatePage)
-                } elseif ($page.Section -eq 'status') {
-                    $arguments += @('--status-page', [string]$page.StatusPage)
-                } elseif ($page.Section -eq 'samples') {
-                    $arguments += @('--sample-page', [string]$page.SamplePage)
-                }
-            }
-
             $attempt = 0
+            $output = $null
             do {
+                $attempt++
+                $output = Join-Path $OutputRoot "$baseName-$suffix-attempt-$attempt.png"
+                $arguments = @('--ui-preview', $fixtureFile.FullName, '--output', $output)
+                if ($null -ne $page.Theme) {
+                    $arguments += @('--theme', $page.Theme, '--density', $page.Density, '--scale', [string]$page.Scale, '--section', $page.Section)
+                    if ($page.Section -eq 'states') {
+                        $arguments += @('--state-page', [string]$page.StatePage)
+                    } elseif ($page.Section -eq 'status') {
+                        $arguments += @('--status-page', [string]$page.StatusPage)
+                    } elseif ($page.Section -eq 'samples') {
+                        $arguments += @('--sample-page', [string]$page.SamplePage)
+                    }
+                }
                 & $binary @arguments
                 $exitCode = $LASTEXITCODE
                 if ($exitCode -eq 0) { break }
-                $attempt++
                 if ($attempt -lt 3) {
-                    [void](Remove-CaptureOutputBestEffort -Path $output)
                     Start-Sleep -Milliseconds 150
                 }
             } while ($attempt -lt 3)
             if ($exitCode -ne 0) {
-                $cleanupError = Remove-CaptureOutputBestEffort -Path $output
-                $holdEvidence = if ($null -eq $cleanupError) {
-                    'output-not-published-after-capture-failure'
-                } else {
-                    'capture-failed-output-cleanup-unconfirmed'
-                }
-                $failureError = "isolated preview failed with exit $exitCode"
-                if ($null -ne $cleanupError) {
-                    $failureError = "$failureError; output cleanup failed: $cleanupError"
-                }
                 $captureFailures++
                 [void]$manifest.Add([pscustomobject]@{
                     Fixture = $baseName
                     Page = $suffix
                     ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
                     Outcome = 'capture-failed'
-                    HoldEvidence = $holdEvidence
-                    Error = $failureError
+                    HoldEvidence = 'rust-retained-authority-failure-evidence'
+                    Error = "isolated preview failed with exit $exitCode after $attempt unique attempts"
+                    Output = [IO.Path]::GetFileName($output)
+                    OutputEvidence = 'output-left-for-forensics-no-script-delete'
                     Bytes = 0
                     Width = 0
                     Height = 0
@@ -303,6 +320,8 @@ public static class DevManagerPreviewWindow {
                     ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
                     Outcome = 'captured'
                     HoldEvidence = 'frame-published'
+                    Output = [IO.Path]::GetFileName($output)
+                    OutputEvidence = 'published-output-name-unique-per-attempt'
                     Bytes = $image.Length
                     Width = $dimensions.Width
                     Height = $dimensions.Height
@@ -310,22 +329,16 @@ public static class DevManagerPreviewWindow {
                     ExpectedHeight = 360
                 })
             } catch {
-                try {
-                    if (Test-Path -LiteralPath $output) {
-                        Remove-Item -LiteralPath $output -Force
-                    }
-                } catch {
-                    # Keep the capture failure visible in the manifest even if
-                    # an external file lock prevents cleanup.
-                }
                 $captureFailures++
                 [void]$manifest.Add([pscustomobject]@{
                     Fixture = $baseName
                     Page = $suffix
                     ScaleMode = if ($null -eq $page.Theme) { 'default' } else { 'fixture-token-scale' }
                     Outcome = 'capture-failed'
-                    HoldEvidence = 'output-not-published-after-png-validation-failure'
+                    HoldEvidence = 'png-validation-failed-output-left-for-forensics'
                     Error = $_.Exception.Message
+                    Output = [IO.Path]::GetFileName($output)
+                    OutputEvidence = 'png-validation-failed-output-left-for-forensics'
                     Bytes = 0
                     Width = 0
                     Height = 0
