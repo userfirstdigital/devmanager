@@ -919,6 +919,43 @@ struct SupervisorManifest {
     scenario_catalog: Vec<SupervisorScenario>,
 }
 
+#[derive(Debug, Clone)]
+struct ExternalAttestation {
+    git_revision: String,
+    source_tree_state: String,
+    build_id: String,
+    binary_sha256: String,
+}
+
+fn external_attestation_from_parts(
+    git_revision: Option<String>,
+    source_tree_state: Option<String>,
+    build_id: Option<String>,
+    binary_sha256: Option<String>,
+) -> Result<Option<ExternalAttestation>, String> {
+    let supplied = [
+        git_revision.is_some(),
+        source_tree_state.is_some(),
+        build_id.is_some(),
+        binary_sha256.is_some(),
+    ];
+    if supplied.iter().all(|value| !value) {
+        return Ok(None);
+    }
+    if supplied.iter().any(|value| !value) {
+        return Err(
+            "external attestation requires git revision, source tree state, build id, and binary hash"
+                .to_string(),
+        );
+    }
+    Ok(Some(ExternalAttestation {
+        git_revision: git_revision.expect("attestation git revision"),
+        source_tree_state: source_tree_state.expect("attestation source tree state"),
+        build_id: build_id.expect("attestation build id"),
+        binary_sha256: binary_sha256.expect("attestation binary hash"),
+    }))
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct SupervisorEnvironment {
@@ -1062,6 +1099,37 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn redact_bounded_error(value: &str) -> String {
+    let mut text = value.replace('\0', "_");
+    if let Ok(current) = std::env::current_dir() {
+        text = text.replace(current.to_string_lossy().as_ref(), "<worktree>");
+        text = text.replace(&current.to_string_lossy().replace('\\', "/"), "<worktree>");
+    }
+    for marker in ["password", "token", "secret", "api_key", "private_key"] {
+        let mut offset = 0usize;
+        while let Some(relative) = text[offset..].to_ascii_lowercase().find(marker) {
+            let start = offset + relative;
+            let tail = &text[start..];
+            let delimiter = tail.find(|character: char| character == '=' || character == ':');
+            let Some(delimiter) = delimiter else {
+                break;
+            };
+            let value_start = start + delimiter + 1;
+            let value_end = text[value_start..]
+                .find(|character: char| character.is_whitespace() || ",;\"'".contains(character))
+                .map(|end| value_start + end)
+                .unwrap_or(text.len());
+            text.replace_range(value_start..value_end, "<redacted>");
+            offset = value_start + "<redacted>".len();
+        }
+    }
+    text.retain(|character| !character.is_control() || character == '\n' || character == '\r');
+    if text.len() > 512 {
+        text.truncate(512);
+    }
+    text
+}
+
 fn source_tree_digest(root: &std::path::Path) -> Result<String, String> {
     fn collect(
         root: &std::path::Path,
@@ -1130,7 +1198,7 @@ fn source_tree_digest(root: &std::path::Path) -> Result<String, String> {
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
     collect(&root, &root, &mut files, &mut total_bytes)?;
-    files.sort();
+    files.sort_by_cached_key(|relative| relative.to_string_lossy().replace('\\', "/"));
     let mut hasher = Sha256::new();
     for relative in files {
         let bytes = fs::read(root.join(&relative))
@@ -1285,30 +1353,51 @@ fn current_git_revision(start: &std::path::Path) -> Result<String, String> {
     Ok(revision.to_ascii_lowercase())
 }
 
-fn materialize_manifest_attestation(manifest: &mut SupervisorManifest) -> Result<(), String> {
-    let revision = current_git_revision(&manifest.working_directory)?;
-    let source_root = find_worktree_root(&manifest.working_directory)?;
-    if manifest.git_revision == "CURRENT" {
-        manifest.git_revision = revision;
-    }
-    if manifest.source_tree_state == "CURRENT" {
-        manifest.source_tree_state = format!("sha256:{}", source_tree_digest(&source_root)?);
-    }
-    if manifest.build_id == "CURRENT" {
-        let executable = canonical_file(&manifest.supervisor_executable, "supervisorExecutable")?;
-        manifest.build_id = format!("sha256:{}", sha256_file(&executable)?);
-    }
-    let executable = canonical_file(&manifest.supervisor_executable, "supervisorExecutable")?;
-    let actual_hash = sha256_file(&executable)?;
-    for expected in [
-        &mut manifest.supervisor_sha256,
-        &mut manifest.helper_sha256,
-        &mut manifest.cycle_sha256,
-    ] {
-        if *expected == "CURRENT" {
-            *expected = actual_hash.clone();
+fn apply_external_attestation(
+    manifest: &mut SupervisorManifest,
+    external: Option<&ExternalAttestation>,
+) -> Result<(), String> {
+    let apply = |label: &str, value: &mut String, expected: Option<&str>| {
+        if value == "CURRENT" {
+            return Err(format!(
+                "{label} uses the self-attestation sentinel CURRENT; an external pin is required"
+            ));
         }
-    }
+        if value == "EXTERNAL" {
+            let expected = expected
+                .ok_or_else(|| format!("{label} requires an external attestation before launch"))?;
+            if expected.trim().is_empty() {
+                return Err(format!("external {label} attestation is empty"));
+            }
+            *value = expected.trim().to_string();
+        } else if let Some(expected) = expected {
+            if value.trim() != expected.trim() {
+                return Err(format!(
+                    "external {label} attestation mismatch: manifest is pinned to a different value"
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    };
+
+    let expected_git = external.map(|value| value.git_revision.as_str());
+    let expected_source = external.map(|value| value.source_tree_state.as_str());
+    let expected_build = external.map(|value| value.build_id.as_str());
+    let expected_hash = external.map(|value| value.binary_sha256.as_str());
+    apply("gitRevision", &mut manifest.git_revision, expected_git)?;
+    apply(
+        "sourceTreeState",
+        &mut manifest.source_tree_state,
+        expected_source,
+    )?;
+    apply("buildId", &mut manifest.build_id, expected_build)?;
+    apply(
+        "supervisorSha256",
+        &mut manifest.supervisor_sha256,
+        expected_hash,
+    )?;
+    apply("helperSha256", &mut manifest.helper_sha256, expected_hash)?;
+    apply("cycleSha256", &mut manifest.cycle_sha256, expected_hash)?;
     Ok(())
 }
 
@@ -1885,6 +1974,27 @@ mod windows_supervisor {
         completion_port: RawHandle,
     }
 
+    // Protected system listeners can reject PROCESS_QUERY_LIMITED_INFORMATION.
+    // The kernel process table supplies their exact creation timestamp without
+    // degrading listener identity to PID-only matching.
+    #[repr(C)]
+    struct SystemProcessInformationHeader {
+        next_entry_offset: u32,
+        number_of_threads: u32,
+        working_set_private_size: i64,
+        hard_fault_count: u32,
+        number_of_threads_high_watermark: u32,
+        cycle_time: u64,
+        create_time: i64,
+        user_time: i64,
+        kernel_time: i64,
+        image_name_length: u16,
+        image_name_maximum_length: u16,
+        image_name_buffer: *mut u16,
+        base_priority: i32,
+        unique_process_id: *mut c_void,
+    }
+
     #[repr(C)]
     #[derive(Default)]
     struct JobObjectBasicLimitInformation {
@@ -1983,6 +2093,7 @@ mod windows_supervisor {
             kernel_time: *mut FileTime,
             user_time: *mut FileTime,
         ) -> i32;
+        fn GetSystemTimeAsFileTime(system_time: *mut FileTime);
         fn QueryFullProcessImageNameW(
             process: RawHandle,
             flags: u32,
@@ -2002,6 +2113,16 @@ mod windows_supervisor {
             flags_and_attributes: u32,
             template_file: RawHandle,
         ) -> RawHandle;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySystemInformation(
+            system_information_class: u32,
+            system_information: *mut c_void,
+            system_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
     }
 
     #[link(name = "iphlpapi")]
@@ -2539,13 +2660,139 @@ mod windows_supervisor {
                 std::ptr::read_unaligned(storage.as_ptr().add(offset) as *const MibTcpRowOwnerPid)
             };
             let port = u16::from_be_bytes([row.local_port[0], row.local_port[1]]);
+            let process_creation_time_100ns = listener_process_creation_time_100ns(row.owning_pid)?;
             listeners.push(json!({
                 "processId": row.owning_pid,
+                "processCreationTime100ns": process_creation_time_100ns,
                 "address": format!("{}.{}.{}.{}", row.local_addr & 0xff, (row.local_addr >> 8) & 0xff, (row.local_addr >> 16) & 0xff, (row.local_addr >> 24) & 0xff),
                 "port": port,
             }));
         }
         Ok(listeners)
+    }
+
+    fn current_system_time_100ns() -> Result<u64, String> {
+        let mut value = FileTime { low: 0, high: 0 };
+        unsafe { GetSystemTimeAsFileTime(&mut value) };
+        Ok(((value.high as u64) << 32) | value.low as u64)
+    }
+
+    fn system_process_creation_time_100ns(pid: u32) -> Result<u64, String> {
+        const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+        const STATUS_INFO_LENGTH_MISMATCH: i32 = -1_073_741_820;
+        let mut capacity = 1024 * 1024usize;
+        for _ in 0..6 {
+            if capacity > 16 * 1024 * 1024 {
+                return Err("system process table exceeds bounded size".to_string());
+            }
+            let mut storage = vec![0u8; capacity];
+            let mut returned = 0u32;
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_PROCESS_INFORMATION,
+                    storage.as_mut_ptr() as _,
+                    storage.len() as u32,
+                    &mut returned,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                capacity = capacity.saturating_mul(2).max(returned as usize + 4096);
+                continue;
+            }
+            if status != 0 {
+                return Err(format!(
+                    "NtQuerySystemInformation failed for listener owner {pid}: NTSTATUS {status:#x}"
+                ));
+            }
+            let mut offset = 0usize;
+            loop {
+                if offset
+                    .checked_add(std::mem::size_of::<SystemProcessInformationHeader>())
+                    .is_none_or(|end| end > storage.len())
+                {
+                    return Err("system process table entry exceeds bounded buffer".to_string());
+                }
+                let entry = unsafe {
+                    &*(storage.as_ptr().add(offset) as *const SystemProcessInformationHeader)
+                };
+                if entry.unique_process_id as usize == pid as usize {
+                    if entry.create_time < 0 {
+                        return Err(format!(
+                            "system process table returned invalid creation time for listener owner {pid}"
+                        ));
+                    }
+                    return Ok(entry.create_time as u64);
+                }
+                let next = entry.next_entry_offset as usize;
+                if next == 0 {
+                    break;
+                }
+                if next < std::mem::size_of::<u32>()
+                    || offset
+                        .checked_add(next)
+                        .is_none_or(|end| end > storage.len())
+                {
+                    return Err("system process table linked entry is invalid".to_string());
+                }
+                offset += next;
+            }
+            return Err(format!(
+                "listener owner {pid} was absent from the system process table"
+            ));
+        }
+        Err("system process table did not settle at a bounded size".to_string())
+    }
+
+    fn listener_process_creation_time_100ns(pid: u32) -> Result<u64, String> {
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            static PROTECTED_PROCESS_CREATION_TIMES: std::sync::OnceLock<
+                std::sync::Mutex<BTreeMap<u32, u64>>,
+            > = std::sync::OnceLock::new();
+            let cache = PROTECTED_PROCESS_CREATION_TIMES
+                .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+            if let Some(value) = cache
+                .lock()
+                .map_err(|_| "protected process creation cache was poisoned".to_string())?
+                .get(&pid)
+                .copied()
+            {
+                return Ok(value);
+            }
+            let value = system_process_creation_time_100ns(pid).map_err(|fallback| {
+                format!(
+                    "OpenProcess listener owner {pid} failed: {}; exact system fallback failed: {fallback}",
+                    io::Error::last_os_error()
+                )
+            })?;
+            cache
+                .lock()
+                .map_err(|_| "protected process creation cache was poisoned".to_string())?
+                .insert(pid, value);
+            return Ok(value);
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok = unsafe {
+            GetProcessTimes(
+                handle.as_raw_handle() as _,
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            Err(format!(
+                "GetProcessTimes listener owner {pid} failed: {}",
+                io::Error::last_os_error()
+            ))
+        } else {
+            Ok(((creation.high as u64) << 32) | creation.low as u64)
+        }
     }
 
     fn filter_owned_listeners(
@@ -2575,13 +2822,37 @@ mod windows_supervisor {
         let port = listener["port"]
             .as_u64()
             .ok_or_else(|| "listener row omitted port".to_string())?;
-        Ok(format!("{pid}|{address}|{port}"))
+        let creation = listener["processCreationTime100ns"]
+            .as_u64()
+            .ok_or_else(|| "listener row omitted exact processCreationTime100ns".to_string())?;
+        Ok(format!("{pid}|{creation}|{address}|{port}"))
+    }
+
+    fn listener_owner_key(listener: &Value) -> Result<String, String> {
+        let pid = listener["processId"]
+            .as_u64()
+            .ok_or_else(|| "listener row omitted processId".to_string())?;
+        let creation = listener["processCreationTime100ns"]
+            .as_u64()
+            .ok_or_else(|| "listener row omitted exact processCreationTime100ns".to_string())?;
+        Ok(format!("{pid}|{creation}"))
+    }
+
+    fn listener_digest(listeners: &[Value]) -> Result<String, String> {
+        let mut keys = listeners
+            .iter()
+            .map(listener_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        Ok(sha256_bytes(keys.join("\n").as_bytes()))
     }
 
     fn verify_external_listeners_unchanged(
         before: &[Value],
         after: &[Value],
-        owned_pids: &[u32],
+        baseline: &[Value],
+        owned_identities: &[ProcessIdentity],
+        preexisting_cutoff_100ns: u64,
     ) -> Result<(), String> {
         let after_keys = after
             .iter()
@@ -2591,26 +2862,49 @@ mod windows_supervisor {
             .iter()
             .map(listener_key)
             .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let baseline_owners = baseline
+            .iter()
+            .map(listener_owner_key)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let owned_owners = owned_identities
+            .iter()
+            .map(|identity| format!("{}|{}", identity.process_id, identity.creation_time_100ns))
+            .collect::<std::collections::BTreeSet<_>>();
         for listener in before {
-            let pid = listener["processId"]
-                .as_u64()
-                .ok_or_else(|| "listener row omitted processId".to_string())?
-                as u32;
-            if !owned_pids.contains(&pid) && !after_keys.contains(&listener_key(listener)?) {
+            let owner = listener_owner_key(listener)?;
+            if !owned_owners.contains(&owner) && !after_keys.contains(&listener_key(listener)?) {
+                // External listeners belong to processes outside this Job. A
+                // process that was already present in the suite baseline is
+                // not a cycle-caused leak; its exact PID/creation-time owner
+                // remains in the baseline digest for post-run review.
+                if baseline_owners.contains(&owner)
+                    || listener["processCreationTime100ns"]
+                        .as_u64()
+                        .is_some_and(|value| value <= preexisting_cutoff_100ns)
+                {
+                    continue;
+                }
                 return Err(format!(
-                    "external listener disappeared during cycle: {}",
+                    "cycle-created external listener disappeared during cycle: {}",
                     listener_key(listener)?
                 ));
             }
         }
         for listener in after {
-            let pid = listener["processId"]
-                .as_u64()
-                .ok_or_else(|| "listener row omitted processId".to_string())?
-                as u32;
-            if !owned_pids.contains(&pid) && !before_keys.contains(&listener_key(listener)?) {
+            let owner = listener_owner_key(listener)?;
+            if !owned_owners.contains(&owner) && !before_keys.contains(&listener_key(listener)?) {
+                // A new port on an already-existing external process is
+                // unrelated host activity. A listener owned by a process not
+                // present in the suite baseline is a cycle-created leak.
+                if baseline_owners.contains(&owner)
+                    || listener["processCreationTime100ns"]
+                        .as_u64()
+                        .is_some_and(|value| value <= preexisting_cutoff_100ns)
+                {
+                    continue;
+                }
                 return Err(format!(
-                    "external listener appeared during cycle: {}",
+                    "cycle-created external listener appeared during cycle: {}",
                     listener_key(listener)?
                 ));
             }
@@ -2916,7 +3210,8 @@ mod windows_supervisor {
             "processId": identity.process_id,
             "creationTime100ns": identity.creation_time_100ns,
             "executablePath": redacted_path,
-            "executablePathHash": sha256_file(&identity.executable_path).unwrap_or_default(),
+            "executablePathHash": sha256_file(&identity.executable_path)
+                .unwrap_or_else(|error| format!("unavailable:{}", redact_bounded_error(&error))),
         })
     }
 
@@ -2930,6 +3225,122 @@ mod windows_supervisor {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "unknown.exe".to_string())
             })
+    }
+
+    struct CycleAggregate {
+        count: u32,
+        passed: u32,
+        failed: u32,
+        durations_ms: Vec<u64>,
+        cpu_samples: Vec<Value>,
+        conformance: Vec<Value>,
+        audit_hasher: Sha256,
+        baseline_digest: Option<String>,
+        last_after_digest: Option<String>,
+        all_external_listeners_unchanged: bool,
+        first_error: Option<String>,
+    }
+
+    impl CycleAggregate {
+        fn new(iterations: u32) -> Self {
+            let capacity = iterations.min(SUPERVISOR_MAX_ITERATIONS) as usize;
+            Self {
+                count: 0,
+                passed: 0,
+                failed: 0,
+                durations_ms: Vec::with_capacity(capacity),
+                cpu_samples: Vec::with_capacity(capacity),
+                conformance: Vec::with_capacity(capacity),
+                audit_hasher: Sha256::new(),
+                baseline_digest: None,
+                last_after_digest: None,
+                all_external_listeners_unchanged: true,
+                first_error: None,
+            }
+        }
+
+        fn record(&mut self, cycle: &Value) {
+            self.count = self.count.saturating_add(1);
+            if cycle["status"] == "passed" {
+                self.passed = self.passed.saturating_add(1);
+            } else {
+                self.failed = self.failed.saturating_add(1);
+            }
+            self.durations_ms
+                .push(cycle["durationMs"].as_u64().unwrap_or_default());
+            self.cpu_samples
+                .push(cycle.get("cpu").cloned().unwrap_or(Value::Null));
+            self.conformance.push(json!({
+                "iteration": cycle["iteration"],
+                "name": cycle["scenario"],
+                "status": cycle["status"],
+                "outcome": cycle["outcome"],
+            }));
+            let audit = cycle.get("jobAudit").cloned().unwrap_or(Value::Null);
+            if let Some(audit_object) = audit.as_object() {
+                self.all_external_listeners_unchanged &= audit_object
+                    .get("externalListenersUnchanged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if self.baseline_digest.is_none() {
+                    self.baseline_digest = audit_object
+                        .get("externalListenerBaselineDigest")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                self.last_after_digest = audit_object
+                    .get("externalListenerAfterDigest")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            } else {
+                self.all_external_listeners_unchanged = false;
+            }
+            if self.first_error.is_none() {
+                self.first_error = cycle["error"].as_str().map(redact_bounded_error);
+            }
+            let compact = json!({
+                "iteration": cycle["iteration"],
+                "scenario": cycle["scenario"],
+                "status": cycle["status"],
+                "outcome": cycle["outcome"],
+                "exitCode": cycle["exitCode"],
+                "durationMs": cycle["durationMs"],
+                "activeProcessZero": cycle["activeProcessZero"],
+                "jobAudit": audit,
+            });
+            if let Ok(bytes) = serde_json::to_vec(&compact) {
+                self.audit_hasher.update(bytes);
+                self.audit_hasher.update([0u8]);
+            }
+        }
+
+        fn finish(self) -> Value {
+            json!({
+                "count": self.count,
+                "passed": self.passed,
+                "failed": self.failed,
+                "digest": format!("{:x}", self.audit_hasher.finalize()),
+                "durationsMs": self.durations_ms,
+                "cpuSamples": self.cpu_samples,
+                "conformance": self.conformance,
+                "externalListenersUnchanged": self.all_external_listeners_unchanged,
+                "externalListenerBaselineDigest": self.baseline_digest,
+                "externalListenerLastAfterDigest": self.last_after_digest,
+                "firstError": self.first_error,
+            })
+        }
+    }
+
+    fn record_cycle(
+        details: &mut Vec<Value>,
+        aggregate: &mut CycleAggregate,
+        retain_details: bool,
+        cycle: Value,
+    ) {
+        aggregate.record(&cycle);
+        if retain_details {
+            details.push(cycle);
+        }
     }
 
     fn run_manifest(manifest: &SupervisorManifest) -> Result<Value, Value> {
@@ -2969,7 +3380,16 @@ mod windows_supervisor {
                 }));
             }
         };
-        let _listener_baseline = match query_tcp_listeners() {
+        let suite_start_time_100ns = current_system_time_100ns().map_err(|error| {
+            json!({
+                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                "status": "rejected",
+                "revision": manifest.revision,
+                "launched": false,
+                "error": format!("listener timestamp baseline failed: {error}"),
+            })
+        })?;
+        let listener_baseline = match query_tcp_listeners() {
             Ok(listeners) => listeners,
             Err(error) => {
                 return Err(json!({
@@ -2993,7 +3413,17 @@ mod windows_supervisor {
         let suite_deadline = Instant::now()
             .checked_add(Duration::from_millis(manifest.budgets.suite_deadline_ms))
             .ok_or_else(|| json!({"schemaVersion": 1, "status": "rejected", "launched": false, "error": "suite deadline overflow"}))?;
-        let mut cycles = Vec::with_capacity(manifest.iterations as usize);
+        // Short diagnostic runs retain detailed cycle records for focused
+        // assertions. The 100-cycle release path keeps only bounded aggregate
+        // metrics and an audit digest; it never accumulates full per-cycle
+        // identities, results, or listener tables.
+        let retain_cycle_details = manifest.iterations <= 16;
+        let mut cycles = Vec::with_capacity(if retain_cycle_details {
+            manifest.iterations as usize
+        } else {
+            0
+        });
+        let mut aggregate = CycleAggregate::new(manifest.iterations);
         let mut status = "passed";
         for iteration in 0..manifest.iterations {
             let scenario =
@@ -3004,21 +3434,26 @@ mod windows_supervisor {
                 || suite_deadline.saturating_duration_since(launch_now) <= cycle_budget
             {
                 status = "failed";
-                cycles.push(json!({
-                    "iteration": iteration + 1,
-                    "scenario": scenario.name,
-                    "status": "failed",
-                    "outcome": "suite-timeout",
-                    "exitCode": null,
-                    "durationMs": 0,
-                    "stdoutBytes": 0,
-                    "stderrBytes": 0,
-                    "activeProcessZero": true,
-                    "rootIdentity": null,
-                    "memberIdentities": [],
-                    "result": null,
-                    "error": "suite deadline exceeded before launch",
-                }));
+                record_cycle(
+                    &mut cycles,
+                    &mut aggregate,
+                    retain_cycle_details,
+                    json!({
+                        "iteration": iteration + 1,
+                        "scenario": scenario.name,
+                        "status": "failed",
+                        "outcome": "suite-timeout",
+                        "exitCode": null,
+                        "durationMs": 0,
+                        "stdoutBytes": 0,
+                        "stderrBytes": 0,
+                        "activeProcessZero": true,
+                        "rootIdentity": null,
+                        "memberIdentities": [],
+                        "result": null,
+                        "error": "suite deadline exceeded before launch",
+                    }),
+                );
                 break;
             }
             let cycle_deadline = (launch_now + cycle_budget).min(suite_deadline);
@@ -3034,21 +3469,26 @@ mod windows_supervisor {
             arguments.push((iteration + 1).to_string());
             if arguments.len() > SUPERVISOR_MAX_ARGUMENTS {
                 status = "failed";
-                cycles.push(json!({
-                    "iteration": iteration + 1,
-                    "scenario": scenario.name,
-                    "status": "failed",
-                    "outcome": "invalid-arguments",
-                    "exitCode": null,
-                    "durationMs": 0,
-                    "stdoutBytes": 0,
-                    "stderrBytes": 0,
-                    "activeProcessZero": false,
-                    "rootIdentity": null,
-                    "memberIdentities": [],
-                    "result": null,
-                    "error": "scenario argument count exceeded bound",
-                }));
+                record_cycle(
+                    &mut cycles,
+                    &mut aggregate,
+                    retain_cycle_details,
+                    json!({
+                        "iteration": iteration + 1,
+                        "scenario": scenario.name,
+                        "status": "failed",
+                        "outcome": "invalid-arguments",
+                        "exitCode": null,
+                        "durationMs": 0,
+                        "stdoutBytes": 0,
+                        "stderrBytes": 0,
+                        "activeProcessZero": false,
+                        "rootIdentity": null,
+                        "memberIdentities": [],
+                        "result": null,
+                        "error": "scenario argument count exceeded bound",
+                    }),
+                );
                 break;
             }
             let host_process_handle_count_before =
@@ -3072,21 +3512,26 @@ mod windows_supervisor {
                 Ok(child) => child,
                 Err(error) => {
                     status = "failed";
-                    cycles.push(json!({
-                        "iteration": iteration + 1,
-                        "scenario": scenario.name,
-                        "status": "failed",
-                        "outcome": "launch-failed",
-                        "exitCode": null,
-                        "durationMs": started.elapsed().as_millis(),
-                        "stdoutBytes": 0,
-                        "stderrBytes": 0,
-                        "activeProcessZero": false,
-                        "rootIdentity": null,
-                        "memberIdentities": [],
-                        "result": null,
-                        "error": error,
-                    }));
+                    record_cycle(
+                        &mut cycles,
+                        &mut aggregate,
+                        retain_cycle_details,
+                        json!({
+                            "iteration": iteration + 1,
+                            "scenario": scenario.name,
+                            "status": "failed",
+                            "outcome": "launch-failed",
+                            "exitCode": null,
+                            "durationMs": started.elapsed().as_millis(),
+                            "stdoutBytes": 0,
+                            "stderrBytes": 0,
+                            "activeProcessZero": false,
+                            "rootIdentity": null,
+                            "memberIdentities": [],
+                            "result": null,
+                            "error": error,
+                        }),
+                    );
                     break;
                 }
             };
@@ -3235,25 +3680,30 @@ mod windows_supervisor {
                             format!("{error}; Job cleanup failed: {cleanup_error}")
                         }
                     };
-                    cycles.push(json!({
-                        "iteration": iteration + 1,
-                        "scenario": scenario.name,
-                        "status": "failed",
-                        "outcome": outcome,
-                        "exitCode": null,
-                        "durationMs": started.elapsed().as_millis(),
-                        "stdoutBytes": 0,
-                        "stderrBytes": 0,
-                        "activeProcessZero": active_process_zero,
-                        "rootIdentity": identity_json(&child.root_identity),
-                        "memberIdentities": json!(child
-                            .member_identities
-                            .iter()
-                            .map(identity_json)
-                            .collect::<Vec<_>>()),
-                        "result": null,
-                        "error": error,
-                    }));
+                    record_cycle(
+                        &mut cycles,
+                        &mut aggregate,
+                        retain_cycle_details,
+                        json!({
+                            "iteration": iteration + 1,
+                            "scenario": scenario.name,
+                            "status": "failed",
+                            "outcome": outcome,
+                            "exitCode": null,
+                            "durationMs": started.elapsed().as_millis(),
+                            "stdoutBytes": 0,
+                            "stderrBytes": 0,
+                            "activeProcessZero": active_process_zero,
+                            "rootIdentity": identity_json(&child.root_identity),
+                            "memberIdentities": json!(child
+                                .member_identities
+                                .iter()
+                                .map(identity_json)
+                                .collect::<Vec<_>>()),
+                            "result": null,
+                            "error": error,
+                        }),
+                    );
                     status = "failed";
                     finish_capped_reader(stdout_reader, stdout_thread, cleanup_deadline, "stdout")
                         .map_err(|error| {
@@ -3410,10 +3860,15 @@ mod windows_supervisor {
             owned_pids.extend(member_identities.iter().map(|identity| identity.process_id));
             owned_pids.sort_unstable();
             owned_pids.dedup();
+            let mut owned_identities = Vec::with_capacity(member_identities.len() + 1);
+            owned_identities.push(root_identity.clone());
+            owned_identities.extend(member_identities.iter().cloned());
             let external_listeners_unchanged = match verify_external_listeners_unchanged(
                 &listeners_before,
                 &listeners_after,
-                &owned_pids,
+                &listener_baseline,
+                &owned_identities,
+                suite_start_time_100ns,
             ) {
                 Ok(()) => true,
                 Err(error) => {
@@ -3442,6 +3897,46 @@ mod windows_supervisor {
                         "revision": manifest.revision,
                         "launched": true,
                         "error": format!("owned listener after inspection failed: {error}"),
+                    })
+                })?;
+            let external_listener_baseline_digest =
+                listener_digest(&listener_baseline).map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("listener baseline digest failed: {error}"),
+                    })
+                })?;
+            let external_listener_before_digest =
+                listener_digest(&listeners_before).map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("listener before digest failed: {error}"),
+                    })
+                })?;
+            let external_listener_during_digest =
+                listener_digest(&listeners_during).map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("listener during digest failed: {error}"),
+                    })
+                })?;
+            let external_listener_after_digest =
+                listener_digest(&listeners_after).map_err(|error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("listener after digest failed: {error}"),
                     })
                 })?;
             let parsed = if stderr.truncated {
@@ -3548,8 +4043,16 @@ mod windows_supervisor {
                         }))?,
                     "ownedListenersAfter": owned_listeners_after,
                     "externalListenersUnchanged": external_listeners_unchanged,
-                    "externalListenersBefore": listeners_before,
-                    "externalListenersAfter": listeners_after,
+                    "externalListenerIdentity": "processId + processCreationTime100ns + address + port",
+                    "externalListenerPreexistingCutoff100ns": suite_start_time_100ns,
+                    "externalListenerBaselineDigest": external_listener_baseline_digest,
+                    "externalListenerBeforeDigest": external_listener_before_digest,
+                    "externalListenerDuringDigest": external_listener_during_digest,
+                    "externalListenerAfterDigest": external_listener_after_digest,
+                    "externalListenerBaselineCount": listener_baseline.len(),
+                    "externalListenerBeforeCount": listeners_before.len(),
+                    "externalListenerDuringCount": listeners_during.len(),
+                    "externalListenerAfterCount": listeners_after.len(),
                 }),
             );
             cycle_document.insert("rootIdentity".to_string(), identity_json(&root_identity));
@@ -3568,7 +4071,12 @@ mod windows_supervisor {
             if let Ok(parsed) = parsed {
                 cycle_document.insert("result".to_string(), parsed);
             }
-            cycles.push(Value::Object(cycle_document));
+            record_cycle(
+                &mut cycles,
+                &mut aggregate,
+                retain_cycle_details,
+                Value::Object(cycle_document),
+            );
             if status == "failed" {
                 break;
             }
@@ -3576,6 +4084,8 @@ mod windows_supervisor {
             // hash-verified once per suite, not imported into this process.
             let _ = (&supervisor, &helper, manifest.seed);
         }
+        let completed_cycles = aggregate.count;
+        let cycle_aggregate = aggregate.finish();
         Ok(json!({
             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
             "status": status,
@@ -3585,9 +4095,10 @@ mod windows_supervisor {
             "sourceTreeState": manifest.source_tree_state,
             "seed": manifest.seed,
             "iterations": manifest.iterations,
-            "completedCycles": cycles.len(),
+            "completedCycles": completed_cycles,
             "ansiCorpus": ansi_corpus,
             "cycles": cycles,
+            "cycleAggregate": cycle_aggregate,
         }))
     }
 
@@ -3658,6 +4169,19 @@ mod windows_supervisor {
         Err("could not allocate a unique evidence run directory".to_string())
     }
 
+    struct AtomicEvidenceTemp {
+        path: PathBuf,
+        committed: bool,
+    }
+
+    impl Drop for AtomicEvidenceTemp {
+        fn drop(&mut self) {
+            if !self.committed {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
     fn write_atomic_json(run_directory: &Path, name: &str, value: &Value) -> Result<(), String> {
         if !name.ends_with(".json") || name.contains('\\') || name.contains('/') {
             return Err("unsafe evidence artifact name".to_string());
@@ -3671,6 +4195,10 @@ mod windows_supervisor {
             ));
         }
         let temporary = run_directory.join(format!(".{name}.{}.tmp", Uuid::now_v7().simple()));
+        let mut temporary_guard = AtomicEvidenceTemp {
+            path: temporary.clone(),
+            committed: false,
+        };
         let bytes =
             serde_json::to_vec(value).map_err(|error| format!("serialize {name}: {error}"))?;
         if bytes.len() > SUPERVISOR_MAX_RESULT_BYTES {
@@ -3689,15 +4217,15 @@ mod windows_supervisor {
             .map_err(|error| format!("flush temporary evidence artifact: {error}"))?;
         drop(file);
         if destination.exists() {
-            fs::remove_file(&temporary)
-                .map_err(|error| format!("remove temporary evidence artifact: {error}"))?;
             return Err(format!(
                 "evidence artifact appeared during atomic publish: {}",
                 destination.display()
             ));
         }
         fs::rename(&temporary, &destination)
-            .map_err(|error| format!("atomically publish evidence artifact {name}: {error}"))
+            .map_err(|error| format!("atomically publish evidence artifact {name}: {error}"))?;
+        temporary_guard.committed = true;
+        Ok(())
     }
 
     fn percentile(values: &[u64], fraction: f64) -> u64 {
@@ -3749,16 +4277,66 @@ mod windows_supervisor {
 
         let cycles = result["cycles"]
             .as_array()
+            .cloned()
             .ok_or_else(|| "supervisor result cycles are not an array".to_string())?;
-        let mut durations = Vec::with_capacity(cycles.len());
-        for cycle in cycles {
-            durations.push(
-                cycle["durationMs"]
-                    .as_u64()
-                    .ok_or_else(|| "cycle result omitted durationMs".to_string())?,
-            );
+        let aggregate = result["cycleAggregate"].as_object();
+        if cycles.is_empty() && aggregate.is_none() {
+            return Err("supervisor result omitted cycle details and aggregate".to_string());
         }
+        let mut durations = if cycles.is_empty() {
+            aggregate
+                .and_then(|value| value.get("durationsMs"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| "cycle aggregate omitted durationsMs".to_string())?
+                .iter()
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        "cycle aggregate contained an invalid durationMs".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            cycles
+                .iter()
+                .map(|cycle| {
+                    cycle["durationMs"]
+                        .as_u64()
+                        .ok_or_else(|| "cycle result omitted durationMs".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         durations.sort_unstable();
+        let cpu_samples = if cycles.is_empty() {
+            aggregate
+                .and_then(|value| value.get("cpuSamples"))
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| "cycle aggregate omitted cpuSamples".to_string())?
+        } else {
+            cycles
+                .iter()
+                .map(|cycle| cycle["cpu"].clone())
+                .collect::<Vec<_>>()
+        };
+        let scenarios = if cycles.is_empty() {
+            aggregate
+                .and_then(|value| value.get("conformance"))
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| "cycle aggregate omitted conformance".to_string())?
+        } else {
+            cycles
+                .iter()
+                .map(|cycle| {
+                    json!({
+                        "iteration": cycle["iteration"],
+                        "name": cycle["scenario"],
+                        "status": cycle["status"],
+                        "outcome": cycle["outcome"],
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
         let performance = json!({
             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
             "sampleCount": durations.len(),
@@ -3769,7 +4347,7 @@ mod windows_supervisor {
                 "maximum": durations.last().copied().unwrap_or_default(),
             },
             "cpu": {
-                "samples": cycles.iter().map(|cycle| cycle["cpu"].clone()).collect::<Vec<_>>(),
+                "samples": cpu_samples,
                 "denominators": "raw child CPU time / monotonic wall interval / logical processors",
             },
         });
@@ -3794,12 +4372,7 @@ mod windows_supervisor {
                 "cycle": manifest.budgets.cycle_deadline_ms,
                 "cleanup": manifest.budgets.cleanup_deadline_ms,
             },
-            "scenarios": cycles.iter().map(|cycle| json!({
-                "iteration": cycle["iteration"],
-                "name": cycle["scenario"],
-                "status": cycle["status"],
-                "outcome": cycle["outcome"],
-            })).collect::<Vec<_>>(),
+            "scenarios": scenarios,
         });
         write_atomic_json(&run_directory, "conformance.json", &conformance)?;
         result["runId"] = json!(run_id);
@@ -3855,10 +4428,334 @@ mod windows_supervisor {
         Ok(())
     }
 
+    fn read_manifest_for_wrapper(path: &Path) -> Result<SupervisorManifest, String> {
+        reject_reparse_ancestors(path, "manifest")?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|error| format!("read manifest: {error}"))?;
+        let length = file
+            .metadata()
+            .map_err(|error| format!("inspect manifest: {error}"))?
+            .len();
+        if length > 1024 * 1024 {
+            return Err("manifest exceeds 1 MiB".to_string());
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("read manifest: {error}"))?;
+        serde_json::from_slice(&bytes).map_err(|error| format!("manifest JSON malformed: {error}"))
+    }
+
+    fn wrapper_attestation_arguments(attestation: Option<&ExternalAttestation>) -> Vec<String> {
+        let Some(attestation) = attestation else {
+            return Vec::new();
+        };
+        vec![
+            "--expected-git-revision".to_string(),
+            attestation.git_revision.clone(),
+            "--expected-source-tree-state".to_string(),
+            attestation.source_tree_state.clone(),
+            "--expected-build-id".to_string(),
+            attestation.build_id.clone(),
+            "--expected-helper-sha256".to_string(),
+            attestation.binary_sha256.clone(),
+        ]
+    }
+
+    pub(super) fn run_bounded_supervisor(
+        path: &Path,
+        iterations_override: Option<u32>,
+        seed_override: Option<u64>,
+        attestation: Option<&ExternalAttestation>,
+        timeout_ms: u64,
+    ) -> (Value, i32) {
+        let mut manifest = match read_manifest_for_wrapper(path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": false,
+                        "wrapperTimedOut": false,
+                        "jobZero": true,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                )
+            }
+        };
+        if let Some(iterations) = iterations_override {
+            manifest.iterations = iterations;
+        }
+        if let Some(seed) = seed_override {
+            manifest.seed = seed;
+        }
+        if let Err(error) = apply_external_attestation(&mut manifest, attestation) {
+            return (
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "launched": false,
+                    "wrapperTimedOut": false,
+                    "jobZero": true,
+                    "error": redact_bounded_error(&error),
+                }),
+                2,
+            );
+        }
+        let (supervisor, _helper, _cycle) = match validate_supervisor_manifest(&manifest) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": false,
+                        "wrapperTimedOut": false,
+                        "jobZero": true,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                )
+            }
+        };
+        let environment = match environment_block(&manifest.environment) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": false,
+                        "wrapperTimedOut": false,
+                        "jobZero": true,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                )
+            }
+        };
+        let mut arguments = vec![
+            "supervise".to_string(),
+            "--manifest".to_string(),
+            path.to_string_lossy().into_owned(),
+        ];
+        if let Some(iterations) = iterations_override {
+            arguments.extend(["--iterations".to_string(), iterations.to_string()]);
+        }
+        if let Some(seed) = seed_override {
+            arguments.extend(["--seed".to_string(), seed.to_string()]);
+        }
+        arguments.extend(wrapper_attestation_arguments(attestation));
+        let wrapper_deadline = Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
+        let cleanup_deadline = wrapper_deadline
+            .checked_add(Duration::from_millis(manifest.budgets.cleanup_deadline_ms))
+            .unwrap_or(wrapper_deadline);
+        let mut child = match spawn_child(
+            &supervisor,
+            &arguments,
+            &manifest.working_directory,
+            &supervisor,
+            &environment,
+            cleanup_deadline,
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": false,
+                        "wrapperTimedOut": false,
+                        "jobZero": true,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                )
+            }
+        };
+        let (stdout_thread, stdout_receiver) = spawn_capped_reader(
+            child.stdout.take().expect("wrapper stdout pipe"),
+            SUPERVISOR_MAX_RESULT_BYTES,
+        );
+        let (stderr_thread, stderr_receiver) = spawn_capped_reader(
+            child.stderr.take().expect("wrapper stderr pipe"),
+            SUPERVISOR_MAX_OUTPUT_BYTES,
+        );
+        let exit_code = match wait_process(child.process.as_raw_handle() as _, wrapper_deadline) {
+            Ok(Some(code)) => code,
+            Ok(None) => {
+                let cleanup = child.job.terminate_and_wait(cleanup_deadline);
+                let job_zero = child
+                    .job
+                    .active_process_ids()
+                    .map(|members| members.is_empty())
+                    .unwrap_or(false)
+                    && cleanup.is_ok();
+                let _ = finish_capped_reader(
+                    stdout_receiver,
+                    stdout_thread,
+                    cleanup_deadline,
+                    "bounded supervisor stdout",
+                );
+                let _ = finish_capped_reader(
+                    stderr_receiver,
+                    stderr_thread,
+                    cleanup_deadline,
+                    "bounded supervisor stderr",
+                );
+                drop(child);
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": true,
+                        "wrapperTimedOut": true,
+                        "jobZero": job_zero,
+                        "error": "Rust wrapper deadline exceeded; owned Job was terminated and joined",
+                    }),
+                    1,
+                );
+            }
+            Err(error) => {
+                let _ = child.job.terminate_and_wait(cleanup_deadline);
+                let _ = finish_capped_reader(
+                    stdout_receiver,
+                    stdout_thread,
+                    cleanup_deadline,
+                    "bounded supervisor stdout",
+                );
+                let _ = finish_capped_reader(
+                    stderr_receiver,
+                    stderr_thread,
+                    cleanup_deadline,
+                    "bounded supervisor stderr",
+                );
+                drop(child);
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": true,
+                        "wrapperTimedOut": false,
+                        "jobZero": false,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                );
+            }
+        };
+        let job_zero = match child.job.wait_active_process_zero(cleanup_deadline) {
+            Ok(()) => true,
+            Err(_) => {
+                let _ = child.job.terminate_and_wait(cleanup_deadline);
+                false
+            }
+        };
+        let stdout = finish_capped_reader(
+            stdout_receiver,
+            stdout_thread,
+            cleanup_deadline,
+            "bounded supervisor stdout",
+        );
+        let stderr = finish_capped_reader(
+            stderr_receiver,
+            stderr_thread,
+            cleanup_deadline,
+            "bounded supervisor stderr",
+        );
+        drop(child);
+        let stdout = match stdout {
+            Ok(output) if !output.truncated => output,
+            Ok(_output) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": true,
+                        "wrapperTimedOut": false,
+                        "jobZero": job_zero,
+                        "error": format!("bounded supervisor stdout exceeded {} bytes", SUPERVISOR_MAX_RESULT_BYTES),
+                    }),
+                    2,
+                )
+            }
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": true,
+                        "wrapperTimedOut": false,
+                        "jobZero": job_zero,
+                        "error": redact_bounded_error(&error),
+                    }),
+                    2,
+                )
+            }
+        };
+        if stderr.is_err() || !job_zero {
+            return (
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "launched": true,
+                    "wrapperTimedOut": false,
+                    "jobZero": job_zero,
+                    "error": "bounded supervisor did not settle cleanly",
+                }),
+                2,
+            );
+        }
+        let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+        let lines = stdout_text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.len() != 1 {
+            return (
+                json!({
+                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                    "status": "rejected",
+                    "launched": true,
+                    "wrapperTimedOut": false,
+                    "jobZero": job_zero,
+                    "error": "bounded supervisor emitted more than one JSON result",
+                }),
+                2,
+            );
+        }
+        let mut result: Value = match serde_json::from_str(lines[0]) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "launched": true,
+                        "wrapperTimedOut": false,
+                        "jobZero": job_zero,
+                        "error": format!("bounded supervisor JSON malformed: {error}"),
+                    }),
+                    2,
+                )
+            }
+        };
+        if !job_zero {
+            result["status"] = json!("rejected");
+        }
+        (result, exit_code as i32)
+    }
+
     pub(super) fn run_manifest_file(
         path: &Path,
         iterations_override: Option<u32>,
         seed_override: Option<u64>,
+        external_attestation: Option<&ExternalAttestation>,
     ) -> (Value, i32) {
         if let Err(error) = reject_reparse_ancestors(path, "manifest") {
             return (
@@ -3918,7 +4815,7 @@ mod windows_supervisor {
         if let Some(seed) = seed_override {
             manifest.seed = seed;
         }
-        if let Err(error) = materialize_manifest_attestation(&mut manifest) {
+        if let Err(error) = apply_external_attestation(&mut manifest, external_attestation) {
             return (
                 json!({
                     "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
@@ -3932,6 +4829,23 @@ mod windows_supervisor {
         let result_limit = manifest.budgets.result_bytes;
         match run_manifest(&manifest) {
             Ok(mut result) => {
+                let encoded_length = serde_json::to_vec(&result)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(usize::MAX);
+                if encoded_length > result_limit {
+                    return (
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "launched": true,
+                            "error": format!(
+                                "supervisor result exceeds {} bytes",
+                                result_limit
+                            ),
+                        }),
+                        2,
+                    );
+                }
                 if let Err(error) =
                     publish_evidence(&manifest, &bytes, &sha256_bytes(&bytes), &mut result)
                 {
@@ -3945,23 +4859,6 @@ mod windows_supervisor {
                         2,
                     );
                 }
-                let encoded_length = serde_json::to_vec(&result)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(usize::MAX);
-                if encoded_length > result_limit {
-                    return (
-                        json!({
-                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                            "status": "rejected",
-                            "launched": false,
-                            "error": format!(
-                                "supervisor result exceeds {} bytes",
-                                result_limit
-                            ),
-                        }),
-                        2,
-                    );
-                }
                 let code = if result["status"] == "passed" { 0 } else { 1 };
                 (result, code)
             }
@@ -3970,10 +4867,11 @@ mod windows_supervisor {
                 // exact protocol shape. Internal validation details are
                 // reduced to the safe error string; callers must not need to
                 // accept a second rejection schema.
-                let error = result["error"]
-                    .as_str()
-                    .unwrap_or("supervisor manifest rejected")
-                    .to_string();
+                let error = redact_bounded_error(
+                    result["error"]
+                        .as_str()
+                        .unwrap_or("supervisor manifest rejected"),
+                );
                 let mut visible = json!({
                     "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                     "status": "rejected",
@@ -4002,6 +4900,10 @@ fn main() {
                 let mut manifest: Option<std::path::PathBuf> = None;
                 let mut iterations: Option<u32> = None;
                 let mut seed: Option<u64> = None;
+                let mut expected_git_revision: Option<String> = None;
+                let mut expected_source_tree_state: Option<String> = None;
+                let mut expected_build_id: Option<String> = None;
+                let mut expected_binary_sha256: Option<String> = None;
                 while let Some(argument) = args.next() {
                     let argument = argument
                         .into_string()
@@ -4034,6 +4936,58 @@ fn main() {
                                 }
                             }
                         }
+                        "--expected-git-revision" => {
+                            expected_git_revision = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-git-revision requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-source-tree-state" => {
+                            expected_source_tree_state = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-source-tree-state requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-build-id" => {
+                            expected_build_id = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-build-id requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-helper-sha256" => {
+                            expected_binary_sha256 = Some(
+                                args.next()
+                                    .and_then(|value| value.into_string().ok())
+                                    .ok_or_else(|| {
+                                        "--expected-helper-sha256 requires a value".to_string()
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
                         other => {
                             eprintln!("unknown supervise argument `{other}`");
                             std::process::exit(2);
@@ -4044,10 +4998,23 @@ fn main() {
                     eprintln!("supervise requires --manifest <path>");
                     std::process::exit(2);
                 }
+                let external_attestation = match external_attestation_from_parts(
+                    expected_git_revision,
+                    expected_source_tree_state,
+                    expected_build_id,
+                    expected_binary_sha256,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(2);
+                    }
+                };
                 let (result, exit_code) = windows_supervisor::run_manifest_file(
                     &manifest.expect("manifest path"),
                     iterations,
                     seed,
+                    external_attestation.as_ref(),
                 );
                 let encoded = serde_json::to_string(&result).expect("serialize supervisor result");
                 println!("{encoded}");
@@ -4057,6 +5024,175 @@ fn main() {
             {
                 eprintln!("supervisor requires Windows Job Objects");
                 std::process::exit(78);
+            }
+        }
+        "bounded-supervise" => {
+            #[cfg(windows)]
+            {
+                let mut manifest: Option<std::path::PathBuf> = None;
+                let mut iterations: Option<u32> = None;
+                let mut seed: Option<u64> = None;
+                let mut timeout_ms: Option<u64> = None;
+                let mut expected_git_revision: Option<String> = None;
+                let mut expected_source_tree_state: Option<String> = None;
+                let mut expected_build_id: Option<String> = None;
+                let mut expected_binary_sha256: Option<String> = None;
+                while let Some(argument) = args.next() {
+                    let argument = argument
+                        .into_string()
+                        .unwrap_or_else(|_| "<non-UTF8>".to_string());
+                    let next_string = |args: &mut std::iter::Skip<std::env::ArgsOs>,
+                                       label: &str| {
+                        args.next()
+                            .and_then(|value| value.into_string().ok())
+                            .ok_or_else(|| format!("{label} requires a value"))
+                    };
+                    match argument.as_str() {
+                        "--manifest" => {
+                            manifest = Some(
+                                next_string(&mut args, "--manifest")
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    })
+                                    .into(),
+                            );
+                        }
+                        "--iterations" => {
+                            let value =
+                                next_string(&mut args, "--iterations").unwrap_or_else(|error| {
+                                    eprintln!("{error}");
+                                    std::process::exit(2);
+                                });
+                            iterations = Some(value.parse::<u32>().unwrap_or_else(|_| {
+                                eprintln!("--iterations requires a bounded integer");
+                                std::process::exit(2);
+                            }));
+                        }
+                        "--seed" => {
+                            let value = next_string(&mut args, "--seed").unwrap_or_else(|error| {
+                                eprintln!("{error}");
+                                std::process::exit(2);
+                            });
+                            seed = Some(value.parse::<u64>().unwrap_or_else(|_| {
+                                eprintln!("--seed requires an unsigned integer");
+                                std::process::exit(2);
+                            }));
+                        }
+                        "--timeout-ms" => {
+                            let value =
+                                next_string(&mut args, "--timeout-ms").unwrap_or_else(|error| {
+                                    eprintln!("{error}");
+                                    std::process::exit(2);
+                                });
+                            timeout_ms = Some(value.parse::<u64>().unwrap_or_else(|_| {
+                                eprintln!("--timeout-ms requires an unsigned integer");
+                                std::process::exit(2);
+                            }));
+                        }
+                        "--expected-git-revision" => {
+                            expected_git_revision = Some(
+                                next_string(&mut args, "--expected-git-revision").unwrap_or_else(
+                                    |error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    },
+                                ),
+                            );
+                        }
+                        "--expected-source-tree-state" => {
+                            expected_source_tree_state = Some(
+                                next_string(&mut args, "--expected-source-tree-state")
+                                    .unwrap_or_else(|error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    }),
+                            );
+                        }
+                        "--expected-build-id" => {
+                            expected_build_id = Some(
+                                next_string(&mut args, "--expected-build-id").unwrap_or_else(
+                                    |error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    },
+                                ),
+                            );
+                        }
+                        "--expected-helper-sha256" => {
+                            expected_binary_sha256 = Some(
+                                next_string(&mut args, "--expected-helper-sha256").unwrap_or_else(
+                                    |error| {
+                                        eprintln!("{error}");
+                                        std::process::exit(2);
+                                    },
+                                ),
+                            );
+                        }
+                        other => {
+                            eprintln!("unknown bounded-supervise argument `{other}`");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                let Some(manifest) = manifest else {
+                    eprintln!("bounded-supervise requires --manifest <path>");
+                    std::process::exit(2);
+                };
+                let Some(timeout_ms) = timeout_ms else {
+                    eprintln!("bounded-supervise requires --timeout-ms <milliseconds>");
+                    std::process::exit(2);
+                };
+                let external_attestation = match external_attestation_from_parts(
+                    expected_git_revision,
+                    expected_source_tree_state,
+                    expected_build_id,
+                    expected_binary_sha256,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(2);
+                    }
+                };
+                let (result, exit_code) = windows_supervisor::run_bounded_supervisor(
+                    &manifest,
+                    iterations,
+                    seed,
+                    external_attestation.as_ref(),
+                    timeout_ms,
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).expect("serialize bounded supervisor result")
+                );
+                std::process::exit(exit_code);
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("bounded supervisor requires Windows Job Objects");
+                std::process::exit(78);
+            }
+        }
+        "attest-source" => {
+            let path = match args.next() {
+                Some(value) if value == "--path" => required_path(&mut args, "worktree path"),
+                Some(value) => value.into(),
+                None => {
+                    eprintln!("attest-source requires --path <worktree>");
+                    std::process::exit(2);
+                }
+            };
+            let root = find_worktree_root(&path);
+            match root.and_then(|root| source_tree_digest(&root)) {
+                Ok(digest) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"sourceTreeState": format!("sha256:{digest}")})
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(error),
             }
         }
         "cycle" => run_cycle(args),

@@ -105,6 +105,51 @@ fn current_build_id() -> String {
 }
 
 #[cfg(windows)]
+fn current_source_tree_state() -> String {
+    fn collect(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(current).expect("read source tree") {
+            let entry = entry.expect("read source tree entry");
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git"
+                || name == ".devmanager-next"
+                || name == "target"
+                || name == "target-native-next"
+                || name.starts_with(".tmp")
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).expect("inspect source tree entry");
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "source tree reparse point"
+            );
+            if metadata.is_dir() {
+                collect(root, &path, files);
+            } else if metadata.is_file() {
+                files.push(
+                    path.strip_prefix(root)
+                        .expect("relative source path")
+                        .into(),
+                );
+            }
+        }
+    }
+
+    let root = std::env::current_dir().expect("current worktree");
+    let mut files = Vec::new();
+    collect(&root, &root, &mut files);
+    files.sort_by_cached_key(|relative| relative.to_string_lossy().replace('\\', "/"));
+    let mut hasher = Sha256::new();
+    for relative in files {
+        hasher.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0u8]);
+        hasher.update(fs::read(root.join(relative)).expect("read source tree file"));
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+#[cfg(windows)]
 fn supervisor_manifest(
     directory: &tempfile::TempDir,
     scenario: &str,
@@ -123,7 +168,7 @@ fn supervisor_manifest(
         "gitRevision": current_git_revision(),
         "buildId": current_build_id(),
         "targetDirectory": "target-native-next",
-        "sourceTreeState": "CURRENT",
+        "sourceTreeState": current_source_tree_state(),
         "supervisorExecutable": executable,
         "supervisorSha256": sha256_file(&executable),
         "helperExecutable": executable,
@@ -290,8 +335,8 @@ fn rust_supervisor_runs_allowlisted_cycle_and_reports_real_identity() {
         result["cycles"][0]["jobAudit"]["externalListenersUnchanged"],
         true
     );
-    assert!(result["cycles"][0]["jobAudit"]["externalListenersBefore"].is_array());
-    assert!(result["cycles"][0]["jobAudit"]["externalListenersAfter"].is_array());
+    assert!(result["cycles"][0]["jobAudit"]["externalListenerBaselineDigest"].is_string());
+    assert!(result["cycles"][0]["jobAudit"]["externalListenerAfterDigest"].is_string());
     assert_eq!(result["ansiCorpus"]["revision"], "phase3.10-ansi-v1");
     assert!(result["ansiCorpus"]["sha256"].as_str().is_some());
     assert!(result["ansiCorpus"]["caseHashes"].as_object().is_some());
@@ -756,7 +801,7 @@ fn process_soak_script_dispatches_immutable_manifest_and_publishes_atomic_report
         &fs::read(run_directory.join("conformance.json")).expect("read conformance artifact"),
     )
     .expect("parse conformance artifact");
-    assert_eq!(conformance["readerCaps"]["resultBytes"], 16 * 1024);
+    assert_eq!(conformance["readerCaps"]["resultBytes"], 262144);
     assert_eq!(conformance["activeProcessZeroRequired"], true);
     assert_eq!(before_hash, sha256_file(&manifest));
 }
@@ -1145,4 +1190,122 @@ fn phase3_process_supervisor_entrypoint_lists_real_tests() {
         "gate output: {combined}"
     );
     assert!(combined.contains("tests="), "gate output: {combined}");
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_supervisor_rejects_self_attestation_sentinels() {
+    let directory = temporary_soak_environment();
+    let manifest = supervisor_manifest(&directory, "natural", 1, 2_000, 16 * 1024);
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).expect("read manifest"))
+        .expect("parse manifest");
+    for field in [
+        "gitRevision",
+        "buildId",
+        "sourceTreeState",
+        "supervisorSha256",
+        "helperSha256",
+        "cycleSha256",
+    ] {
+        value[field] = Value::String("CURRENT".to_string());
+    }
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&value).expect("serialize self-attestation manifest"),
+    )
+    .expect("write self-attestation manifest");
+    let output = run_supervisor(&directory, &manifest);
+    assert!(!output.status.success(), "CURRENT must never self-attest");
+    let result = supervisor_result(&output);
+    assert_eq!(result["status"], "rejected");
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("external"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_supervisor_100_cycle_summary_is_bounded_and_does_not_retain_listener_tables() {
+    let directory = temporary_soak_environment();
+    let manifest = supervisor_manifest(&directory, "natural", 100, 2_000, 16 * 1024);
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).expect("read manifest"))
+        .expect("parse manifest");
+    value["budgets"]["suiteDeadlineMs"] = Value::from(60_000);
+    value["budgets"]["resultBytes"] = Value::from(256 * 1024);
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&value).expect("serialize 100-cycle manifest"),
+    )
+    .expect("write 100-cycle manifest");
+    let output = run_supervisor(&directory, &manifest);
+    assert!(
+        output.status.success(),
+        "100-cycle supervisor output: {output:?}"
+    );
+    let result = supervisor_result(&output);
+    assert_eq!(result["status"], "passed");
+    assert_eq!(result["completedCycles"], 100);
+    let encoded = serde_json::to_vec(&result).expect("encode bounded summary");
+    assert!(
+        encoded.len() <= 256 * 1024,
+        "summary is not bounded: {}",
+        encoded.len()
+    );
+    assert!(result["cycles"]
+        .as_array()
+        .map(Vec::is_empty)
+        .unwrap_or(false));
+    assert_eq!(result["cycleAggregate"]["count"], 100);
+    assert_eq!(
+        result["cycleAggregate"]["conformance"]
+            .as_array()
+            .map(Vec::len),
+        Some(100)
+    );
+    assert!(result["cycleAggregate"]["digest"].is_string());
+    assert_eq!(result["cycleAggregate"]["externalListenersUnchanged"], true);
+    assert!(result["cycleAggregate"]["externalListenerBaselineDigest"].is_string());
+    assert!(result["cycleAggregate"]["externalListenerLastAfterDigest"].is_string());
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_bounded_supervisor_timeout_reports_owned_job_zero() {
+    let directory = temporary_soak_environment();
+    let manifest = supervisor_manifest(&directory, "tree-hang", 1, 5_000, 16 * 1024);
+    let mut command = Command::new(helper_path());
+    command.args(["bounded-supervise", "--manifest"]);
+    command.arg(&manifest);
+    command.args(["--timeout-ms", "50"]);
+    configure_helper(&mut command);
+    let output = command.output().expect("run bounded supervisor wrapper");
+    assert!(!output.status.success(), "wrapper timeout must fail closed");
+    let result = supervisor_result(&output);
+    assert_eq!(result["status"], "rejected");
+    assert_eq!(result["wrapperTimedOut"], true);
+    assert_eq!(result["jobZero"], true);
+}
+
+#[test]
+fn phase3_gate_executes_full_soak_suite_and_declares_union_hold() {
+    let source = fs::read_to_string("scripts/native-next/Invoke-Phase3ProcessSupervisorGate.ps1")
+        .expect("phase3 supervisor gate");
+    assert!(source.contains("--test-threads=1"));
+    assert!(source.contains("--nocapture"));
+    assert!(source.contains("dependency"));
+    assert!(source.contains("HOLD"));
+    assert!(source.contains("100"));
+}
+
+#[test]
+fn process_soak_wrapper_uses_external_attestation_and_owned_timeout_cleanup() {
+    let source = fs::read_to_string("scripts/native-next/Invoke-ProcessSoak.ps1")
+        .expect("process soak script");
+    assert!(source.contains("bounded-supervise"));
+    assert!(source.contains("expected-git-revision"));
+    assert!(source.contains("expected-helper-sha256"));
+    assert!(source.contains("wrapperTimedOut"));
+    assert!(source.contains("jobZero"));
+    assert!(source.contains("HOLD"));
 }

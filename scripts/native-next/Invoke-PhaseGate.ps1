@@ -358,7 +358,8 @@ Command: $($plan.executable) $($plan.arguments -join ' ')
                 '-Iterations',
                 [string]$iterations,
                 '-Seed',
-                [string]$seed)) {
+                [string]$seed,
+                '-SyntheticOnly')) {
             [void]$soakInfo.ArgumentList.Add($argument)
         }
         $soakResult = Invoke-DevManagerPhaseGateBoundedCommand `

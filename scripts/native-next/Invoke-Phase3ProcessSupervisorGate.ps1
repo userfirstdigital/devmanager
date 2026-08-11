@@ -1,5 +1,6 @@
 # Phase 3 process-supervisor gate entrypoint.
 # The list preflight is behavioral: a recipe that selects zero tests is never green.
+# The final union is dependency-gated: unavailable host/client inputs produce an explicit HOLD.
 
 [CmdletBinding()]
 param(
@@ -40,13 +41,22 @@ function Resolve-ProcessSoakHarness {
     }
     $candidate = $candidates | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     Assert-DevManagerPathHasNoReparsePoints -LiteralPath $candidate.FullName
+    $helper = Join-Path $WorktreeRoot 'target-native-next\debug\devmanager-process-test-helper.exe'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        throw 'typed-unavailable: fixed Rust process supervisor helper is absent.'
+    }
+    Assert-DevManagerPathHasNoReparsePoints -LiteralPath $helper
     return [System.IO.Path]::GetFullPath($candidate.FullName)
 }
 
-function Invoke-ProcessSupervisorTestList {
+function Invoke-ProcessSupervisorHarness {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$WorktreeRoot
+        [string]$WorktreeRoot,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutMilliseconds
     )
 
     $listInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -73,11 +83,17 @@ function Invoke-ProcessSupervisorTestList {
         $debugDirectory,
         (Join-Path $debugDirectory 'deps')
     ) -join ';'
-    foreach ($argument in [string[]]@('--list')) {
+    foreach ($argument in $Arguments) {
         [void]$listInfo.ArgumentList.Add($argument)
     }
 
-    $listResult = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $listInfo -TimeoutMilliseconds 120000
+    $listResult = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $listInfo -TimeoutMilliseconds $TimeoutMilliseconds -StdoutBytes 262144 -StderrBytes 65536
+    return $listResult
+}
+
+function Invoke-ProcessSupervisorTestList {
+    param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+    $listResult = Invoke-ProcessSupervisorHarness -WorktreeRoot $WorktreeRoot -Arguments @('--list') -TimeoutMilliseconds 120000
     if ($listResult.ExitCode -ne 0) {
         throw ("process-supervisor test-list preflight failed ({0}): {1}" -f $listResult.ExitCode, $listResult.Stderr.Trim())
     }
@@ -91,6 +107,66 @@ function Invoke-ProcessSupervisorTestList {
     return [int]$testLines.Count
 }
 
+function Invoke-ProcessSupervisorTestSuite {
+    param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+    $result = Invoke-ProcessSupervisorHarness `
+        -WorktreeRoot $WorktreeRoot `
+        -Arguments @('--test-threads=1', '--nocapture') `
+        -TimeoutMilliseconds 600000
+    if ($result.ExitCode -ne 0 -or $result.StderrBytes -ne 0) {
+        throw ("process-soak focused suite failed ({0}): {1}" -f $result.ExitCode, $result.Stderr.Trim())
+    }
+    $match = [regex]::Match($result.Stdout, 'test result:\s+ok\.\s+(\d+) passed;\s+0 failed')
+    if (-not $match.Success) {
+        throw 'process-soak focused suite did not publish an all-green test result.'
+    }
+    $passed = [int]$match.Groups[1].Value
+    if ($passed -lt 32) { throw "process-soak focused suite executed only $passed tests; expected at least 32." }
+    return $passed
+}
+
+function Invoke-Phase3FinalUnion {
+    param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+    $pwshCommands = @(
+        Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
+    )
+    if ($pwshCommands.Count -ne 1) { throw "final union requires exactly one pwsh.exe (found $($pwshCommands.Count))." }
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = [IO.Path]::GetFullPath([string]$pwshCommands[0].Source)
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.WorkingDirectory = $WorktreeRoot
+    $info.Environment.Clear()
+    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw 'final union cannot establish SystemRoot.' }
+    $info.Environment['SystemRoot'] = $systemRoot
+    $temp = Join-Path $WorktreeRoot '.tmp-phase3-soak'
+    $info.Environment['TEMP'] = $temp
+    $info.Environment['TMP'] = $temp
+    $info.Environment['PATH'] = @((Join-Path $systemRoot 'System32'), (Split-Path -Parent $info.FileName)) -join ';'
+    foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $soakScript, '-Iterations', '100', '-Seed', [string]$Seed)) {
+        [void]$info.ArgumentList.Add([string]$argument)
+    }
+    $result = Invoke-DevManagerPhaseGateBoundedCommand -StartInfo $info -TimeoutMilliseconds 600000 -StdoutBytes 65536 -StderrBytes 16384
+    $lines = @($result.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($result.ExitCode -eq 78 -and $lines.Count -eq 1) {
+        $document = $lines[0] | ConvertFrom-Json
+        if ([string]$document.status -eq 'hold') {
+            Write-Host ("{0} HOLD: {1}" -f $phase, [string]$document.error)
+            return 78
+        }
+    }
+    if ($result.ExitCode -ne 0 -or $result.StderrBytes -ne 0 -or $lines.Count -ne 1) {
+        throw "final host/client union failed closed (exit=$($result.ExitCode) stderrBytes=$($result.StderrBytes) lines=$($lines.Count))."
+    }
+    $document = $lines[0] | ConvertFrom-Json
+    if ([string]$document.status -ne 'passed') { throw 'final host/client union did not report passed.' }
+    return 0
+}
+
 try {
     if (-not $ListOnly) {
         $plan = Resolve-DevManagerPhaseGateRecipe -Recipe $recipe -WorktreeRoot $worktreeRoot
@@ -101,6 +177,8 @@ try {
         Write-Output ("{0} tests={1}" -f $phase, $testCount)
         exit 0
     }
+    $focusedTestCount = Invoke-ProcessSupervisorTestSuite -WorktreeRoot $worktreeRoot
+    Write-Output ("{0} focused-tests={1}" -f $phase, $focusedTestCount)
 }
 catch {
     Write-Error -Message ("{0} unavailable/failed closed: {1}" -f $phase, $_.Exception.Message) -ErrorAction Continue
@@ -129,6 +207,9 @@ try {
     $exitCode = $LASTEXITCODE
     if ($null -eq $exitCode) {
         $exitCode = 0
+    }
+    if ([int]$exitCode -eq 0) {
+        $exitCode = Invoke-Phase3FinalUnion -WorktreeRoot $worktreeRoot
     }
 }
 finally {

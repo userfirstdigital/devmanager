@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "revision": "phase3.10-supervisor-v3",
-  "gitRevision": "CURRENT",
-  "buildId": "CURRENT",
+  "gitRevision": "EXTERNAL",
+  "buildId": "EXTERNAL",
   "targetDirectory": "target-native-next",
-  "sourceTreeState": "CURRENT",
+  "sourceTreeState": "EXTERNAL",
   "supervisorExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
-  "supervisorSha256": "CURRENT",
+  "supervisorSha256": "EXTERNAL",
   "helperExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
-  "helperSha256": "CURRENT",
+  "helperSha256": "EXTERNAL",
   "cycleExecutable": "target-native-next\\debug\\devmanager-process-test-helper.exe",
-  "cycleSha256": "CURRENT",
+  "cycleSha256": "EXTERNAL",
   "workingDirectory": ".",
   "evidenceRoot": ".devmanager-next\\evidence",
   "environment": {
@@ -35,7 +35,7 @@
     "cleanupDeadlineMs": 5000,
     "stdoutBytes": 65536,
     "stderrBytes": 16384,
-    "resultBytes": 16384
+    "resultBytes": 262144
   },
   "scenarioCatalog": [
     {
