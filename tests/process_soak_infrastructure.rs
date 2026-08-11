@@ -1361,3 +1361,210 @@ fn process_soak_powershell_children_have_owned_bounded_cleanup() {
     assert!(helper.contains("AF_INET6"));
     assert!(helper.contains("MibTcp6RowOwnerPid"));
 }
+
+#[cfg(windows)]
+#[test]
+fn phase_gate_assigns_a_suspended_child_before_resuming_it() {
+    let script = std::env::current_dir()
+        .expect("current worktree")
+        .join("scripts/native-next/PhaseGate.ps1");
+    let command = format!(
+        r#"
+. '{script}'
+Ensure-DevManagerPhaseGateJobType
+$pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop |
+    Where-Object {{ -not [string]::IsNullOrWhiteSpace([string]$_.Source) }} |
+    Select-Object -First 1).Source
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = $pwsh
+$info.UseShellExecute = $false
+$info.CreateNoWindow = $true
+$info.RedirectStandardOutput = $true
+$info.RedirectStandardError = $true
+$info.WorkingDirectory = (Get-Location).Path
+$info.Environment.Clear()
+$info.Environment['SystemRoot'] = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+$info.Environment['PATH'] = Join-Path $info.Environment['SystemRoot'] 'System32'
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-NonInteractive')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add('Write-Output suspended-assignment-probe')
+$job = [DevManagerPhaseGateJob]::new()
+$launch = [DevManagerPhaseGateJob]::StartSuspended($info)
+try {{
+    if ($launch.Process.HasExited) {{ throw 'probe exited before Job assignment' }}
+    $job.Assign($launch.Process)
+    $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64](2000 * [Diagnostics.Stopwatch]::Frequency / 1000)
+    if ([uint32]$job.ActiveProcessCount($deadline) -ne 1) {{ throw 'suspended root was not a Job member' }}
+    $launch.Resume()
+    if (-not $launch.Process.WaitForExit(2000)) {{ throw 'resumed probe did not exit' }}
+}} finally {{
+    if ($null -ne $launch) {{ $launch.Stdout.Dispose(); $launch.Stderr.Dispose() }}
+    if ($null -ne $launch) {{ $launch.Dispose() }}
+    if ($null -ne $job) {{ $job.Dispose() }}
+}}
+Write-Output PASS
+"#,
+        script = script.display().to_string().replace('\'', "''"),
+    );
+    let output = Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+        .output()
+        .expect("run suspended assignment probe");
+    assert!(
+        output.status.success(),
+        "suspended assignment probe failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_membership_probe_rejects_an_expired_caller_deadline() {
+    let captured = run_helper(&["membership-deadline-probe"]);
+    assert!(
+        captured.status.success(),
+        "expired membership probe must fail closed with a typed result: stdout={} stderr={}",
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let events = parse_json_lines(&captured.stdout);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["status"], "passed");
+    assert_eq!(events[0]["deadlineChecked"], true);
+}
+
+#[cfg(windows)]
+#[test]
+fn rust_reader_cancel_probe_closes_and_joins_before_its_deadline() {
+    let started = Instant::now();
+    let captured = run_helper(&["reader-cancel-probe"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "reader cancellation exceeded its bounded harness: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        captured.status.success(),
+        "reader cancellation probe failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let events = parse_json_lines(&captured.stdout);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["status"], "passed");
+    assert_eq!(events[0]["readerCancelled"], true);
+    assert_eq!(events[0]["readerJoined"], true);
+}
+
+#[cfg(windows)]
+#[test]
+fn final_union_validation_rejects_wrong_schema_or_iteration_count() {
+    let phase_gate = std::env::current_dir()
+        .expect("current worktree")
+        .join("scripts/native-next/PhaseGate.ps1");
+    let command = format!(
+        r#"
+. '{phase_gate}'
+function New-UnionResult([object]$schema, [object]$iterations) {{
+    [pscustomobject]@{{
+        schemaVersion = $schema
+        status = 'passed'
+        jobZero = $true
+        releaseEligible = $true
+        realLifecycle = $true
+        completedCycles = 100
+        iterations = $iterations
+    }}
+}}
+foreach ($invalid in @((New-UnionResult 2 100), (New-UnionResult 1 99), (New-UnionResult '1' 100))) {{
+    try {{
+        Assert-DevManagerPhase3FinalUnionDocument -Document $invalid
+        throw 'invalid final union document was accepted'
+    }} catch [System.Management.Automation.RuntimeException] {{
+        if ($_.Exception.Message -eq 'invalid final union document was accepted') {{ throw }}
+    }}
+}}
+Assert-DevManagerPhase3FinalUnionDocument -Document (New-UnionResult 1 100)
+Write-Output PASS
+"#,
+        phase_gate = phase_gate.display().to_string().replace('\'', "''"),
+    );
+    let output = Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+        .output()
+        .expect("run final union validation probe");
+    assert!(
+        output.status.success(),
+        "final union validation probe failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS"));
+}
+
+#[cfg(windows)]
+#[test]
+fn missing_final_union_binaries_publish_a_typed_hold_without_launching_100_cycles() {
+    let script = std::env::current_dir()
+        .expect("current worktree")
+        .join("scripts/native-next/Invoke-ProcessSoak.ps1");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script.to_str().expect("soak script path"),
+            "-Iterations",
+            "100",
+        ])
+        .output()
+        .expect("run missing dependency soak hold");
+    assert_eq!(output.status.code(), Some(78));
+    let lines = parse_json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["schemaVersion"], 1);
+    assert_eq!(lines[0]["status"], "hold");
+    assert_eq!(lines[0]["launched"], false);
+    assert!(lines[0]["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("HOLD"));
+}
+
+#[cfg(windows)]
+#[test]
+fn outer_phase_gate_publishes_missing_binary_hold_before_any_production_guard() {
+    let worktree = std::env::current_dir().expect("current worktree");
+    let live_root = worktree.join("target-live-native-next");
+    if live_root.join("devmanager-host.exe").is_file()
+        || live_root.join("devmanager-next.exe").is_file()
+    {
+        eprintln!("skipping missing-binary outer-gate probe: live inputs are present");
+        return;
+    }
+    let script = worktree.join("scripts/native-next/Invoke-Phase3ProcessSupervisorGate.ps1");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script.to_str().expect("outer gate script path"),
+            "-Iterations",
+            "100",
+        ])
+        .output()
+        .expect("run outer missing dependency hold");
+    assert_eq!(output.status.code(), Some(78));
+    let lines = parse_json_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "outer gate must publish one typed HOLD");
+    assert_eq!(lines[0]["schemaVersion"], 1);
+    assert_eq!(lines[0]["status"], "hold");
+    assert_eq!(lines[0]["launched"], false);
+    assert!(lines[0]["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("HOLD"));
+}

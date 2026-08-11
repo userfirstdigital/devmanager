@@ -25,6 +25,32 @@ $captureBaselineScript = Join-Path $PSScriptRoot 'Capture-ProductionBaseline.ps1
 $assertUnchangedScript = Join-Path $PSScriptRoot 'Assert-ProductionUnchanged.ps1'
 $worktreeRoot = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
 $plan = $null
+$script:phase3FinalUnionHold = $null
+
+function Set-Phase3FinalUnionHold {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+    $script:phase3FinalUnionHold = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        phase = $phase
+        status = 'hold'
+        launched = $false
+        error = "HOLD: $Reason"
+    }
+    Write-Host ("{0} {1}" -f $phase, $script:phase3FinalUnionHold.error)
+    return 78
+}
+
+if (-not $ListOnly -and $Iterations -eq 100) {
+    foreach ($dependency in @(
+            @{ label = 'host'; path = (Join-Path $worktreeRoot 'target-live-native-next\devmanager-host.exe') },
+            @{ label = 'client'; path = (Join-Path $worktreeRoot 'target-live-native-next\devmanager-next.exe') })) {
+        if (-not (Test-Path -LiteralPath $dependency.path -PathType Leaf)) {
+            [void](Set-Phase3FinalUnionHold -Reason "$($dependency.label) executable is unavailable: $($dependency.path)")
+            Write-Output ($script:phase3FinalUnionHold | ConvertTo-Json -Depth 16 -Compress)
+            exit 78
+        }
+    }
+}
 
 function Resolve-ProcessSoakHarness {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
@@ -147,17 +173,27 @@ function Resolve-Phase3CallerPinnedBinary {
 
 function Invoke-Phase3FinalUnion {
     param([Parameter(Mandatory = $true)][string]$WorktreeRoot)
+    $hostPath = Join-Path $WorktreeRoot 'target-live-native-next\devmanager-host.exe'
+    $clientPath = Join-Path $WorktreeRoot 'target-live-native-next\devmanager-next.exe'
+    if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+        return Set-Phase3FinalUnionHold -Reason "host executable is unavailable: $hostPath"
+    }
+    if (-not (Test-Path -LiteralPath $clientPath -PathType Leaf)) {
+        return Set-Phase3FinalUnionHold -Reason "client executable is unavailable: $clientPath"
+    }
     $pwshCommands = @(
         Get-Command -Name 'pwsh' -All -CommandType Application -ErrorAction SilentlyContinue |
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) }
     )
-    if ($pwshCommands.Count -ne 1) { throw "final union requires exactly one pwsh.exe (found $($pwshCommands.Count))." }
+    if ($pwshCommands.Count -ne 1) {
+        return Set-Phase3FinalUnionHold -Reason "exactly one pwsh.exe is required (found $($pwshCommands.Count))."
+    }
     $hostPin = Resolve-Phase3CallerPinnedBinary `
-        -Path (Join-Path $WorktreeRoot 'target-live-native-next\devmanager-host.exe') `
+        -Path $hostPath `
         -Label 'host' `
         -WorktreeRoot $WorktreeRoot
     $clientPin = Resolve-Phase3CallerPinnedBinary `
-        -Path (Join-Path $WorktreeRoot 'target-live-native-next\devmanager-next.exe') `
+        -Path $clientPath `
         -Label 'client' `
         -WorktreeRoot $WorktreeRoot
     $unionEntrypoint = Join-Path $PSScriptRoot 'Invoke-HostClientProcessSoak.ps1'
@@ -192,6 +228,8 @@ function Invoke-Phase3FinalUnion {
     if ($result.ExitCode -eq 78 -and $lines.Count -eq 1) {
         $document = $lines[0] | ConvertFrom-Json
         if ([string]$document.status -eq 'hold') {
+            if ([int]$document.schemaVersion -ne 1) { throw 'final host/client HOLD schema mismatch.' }
+            $script:phase3FinalUnionHold = $document
             Write-Host ("{0} HOLD: {1}" -f $phase, [string]$document.error)
             return 78
         }
@@ -200,7 +238,7 @@ function Invoke-Phase3FinalUnion {
         throw "final host/client union failed closed (exit=$($result.ExitCode) stderrBytes=$($result.StderrBytes) lines=$($lines.Count))."
     }
     $document = $lines[0] | ConvertFrom-Json
-    if ([string]$document.status -ne 'passed') { throw 'final host/client union did not report passed.' }
+    Assert-DevManagerPhase3FinalUnionDocument -Document $document
     return 0
 }
 
@@ -284,6 +322,9 @@ try {
     }
     if ([int]$exitCode -eq 0) {
         $exitCode = Invoke-Phase3GuardedFinalUnion -WorktreeRoot $worktreeRoot
+    }
+    if ([int]$exitCode -eq 78 -and $null -ne $script:phase3FinalUnionHold) {
+        Write-Output ($script:phase3FinalUnionHold | ConvertTo-Json -Depth 16 -Compress)
     }
 }
 finally {

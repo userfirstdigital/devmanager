@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 
 use devmanager::process::job::ManagedProcessJob;
 use serde::{Deserialize, Serialize};
@@ -1050,6 +1054,43 @@ struct CappedOutput {
     truncated: bool,
 }
 
+#[cfg(windows)]
+const ERROR_BROKEN_PIPE: i32 = 109;
+
+#[cfg(windows)]
+const ERROR_NO_DATA: i32 = 232;
+
+#[cfg(windows)]
+const PIPE_NOWAIT: u32 = 0x00000001;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetNamedPipeHandleState(
+        pipe: *mut c_void,
+        mode: *mut u32,
+        max_collection_count: *mut u32,
+        collection_data_timeout: *mut u32,
+    ) -> i32;
+    fn PeekNamedPipe(
+        pipe: *mut c_void,
+        buffer: *mut u8,
+        buffer_size: u32,
+        bytes_read: *mut u32,
+        total_bytes_available: *mut u32,
+        bytes_left_this_message: *mut u32,
+    ) -> i32;
+    fn ReadFile(
+        file: *mut c_void,
+        buffer: *mut u8,
+        bytes_to_read: u32,
+        bytes_read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(not(windows))]
 fn read_capped<R: std::io::Read>(mut reader: R, limit: usize) -> CappedOutput {
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     let mut total_bytes = 0u64;
@@ -1083,15 +1124,143 @@ fn read_capped<R: std::io::Read>(mut reader: R, limit: usize) -> CappedOutput {
     }
 }
 
-fn spawn_capped_reader<R: std::io::Read + Send + 'static>(
-    reader: R,
-    limit: usize,
-) -> (std::thread::JoinHandle<()>, Receiver<CappedOutput>) {
+#[cfg(windows)]
+fn pipe_closed(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_BROKEN_PIPE) | Some(ERROR_NO_DATA)
+    )
+}
+
+#[cfg(windows)]
+fn read_capped_pipe(handle: *mut c_void, cancelled: &AtomicBool, limit: usize) -> CappedOutput {
+    // Anonymous-pipe reads may be synchronous and cannot be reliably
+    // interrupted from another thread. Explicitly switch the inherited pipe
+    // to PIPE_NOWAIT before polling availability; if that contract is not
+    // available, fail closed rather than risk a blocking ReadFile call.
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total_bytes = 0u64;
+    let mut truncated = false;
+    let mut chunk = [0u8; 16 * 1024];
+    let mut mode = PIPE_NOWAIT;
+    let set_mode = unsafe {
+        SetNamedPipeHandleState(
+            handle,
+            &mut mode,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if set_mode == 0 {
+        return CappedOutput {
+            bytes,
+            total_bytes,
+            truncated: true,
+        };
+    }
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+
+        let mut available = 0u32;
+        let peeked = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked == 0 {
+            let error = io::Error::last_os_error();
+            if !pipe_closed(&error) {
+                truncated = true;
+            }
+            break;
+        }
+        if available == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
+        let requested = available.min(chunk.len() as u32);
+        let mut read_count = 0u32;
+        let read = unsafe {
+            ReadFile(
+                handle,
+                chunk.as_mut_ptr(),
+                requested,
+                &mut read_count,
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            let error = io::Error::last_os_error();
+            if !pipe_closed(&error) && !cancelled.load(Ordering::Acquire) {
+                truncated = true;
+            }
+            break;
+        }
+        if read_count == 0 {
+            continue;
+        }
+
+        let count = read_count as usize;
+        total_bytes = total_bytes.saturating_add(read_count as u64);
+        if bytes.len() < limit {
+            let accepted = (limit - bytes.len()).min(count);
+            bytes.extend_from_slice(&chunk[..accepted]);
+            if accepted < count {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    CappedOutput {
+        bytes,
+        total_bytes,
+        truncated,
+    }
+}
+
+struct CappedReaderTask {
+    receiver: Receiver<CappedOutput>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    reader_handle: Arc<AtomicUsize>,
+    #[cfg(windows)]
+    cancelled: Arc<AtomicBool>,
+}
+
+fn spawn_capped_reader(reader: fs::File, limit: usize) -> CappedReaderTask {
     let (sender, receiver) = mpsc::sync_channel(1);
+    #[cfg(windows)]
+    let reader_handle = Arc::new(AtomicUsize::new(reader.as_raw_handle() as usize));
+    #[cfg(windows)]
+    let reader_raw = reader.into_raw_handle() as usize;
+    #[cfg(windows)]
+    let cancelled = Arc::new(AtomicBool::new(false));
+    #[cfg(windows)]
+    let worker_cancelled = Arc::clone(&cancelled);
     let thread = std::thread::spawn(move || {
-        let _ = sender.send(read_capped(reader, limit));
+        #[cfg(windows)]
+        let output = read_capped_pipe(reader_raw as *mut c_void, &worker_cancelled, limit);
+        #[cfg(not(windows))]
+        let output = read_capped(reader, limit);
+        let _ = sender.send(output);
     });
-    (thread, receiver)
+    CappedReaderTask {
+        receiver,
+        thread: Some(thread),
+        #[cfg(windows)]
+        reader_handle,
+        #[cfg(windows)]
+        cancelled,
+    }
 }
 
 fn receive_capped_reader(
@@ -1106,25 +1275,110 @@ fn receive_capped_reader(
         })
 }
 
+impl CappedReaderTask {
+    fn cancel(&self, deadline: Instant, label: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let expired = Instant::now() >= deadline;
+            self.cancelled.store(true, Ordering::Release);
+            let reader_handle = self.reader_handle.swap(0, Ordering::SeqCst) as *mut c_void;
+            let close_error = if reader_handle.is_null() {
+                None
+            } else if unsafe { CloseHandle(reader_handle) } == 0 {
+                Some(io::Error::last_os_error())
+            } else {
+                None
+            };
+            if expired {
+                return Err(format!(
+                    "{label} reader cancellation exceeded the absolute deadline"
+                ));
+            }
+            if let Some(error) = close_error {
+                return Err(format!("{label} reader close failed: {error}"));
+            }
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (deadline, label);
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.is_finished())
+            {
+                Ok(())
+            } else {
+                Err("reader cancellation is unsupported on this platform".to_string())
+            }
+        }
+    }
+
+    fn join_until(&mut self, deadline: Instant, label: &str) -> Result<(), String> {
+        let Some(thread) = self.thread.as_mut() else {
+            return Ok(());
+        };
+        while !thread.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "{label} reader thread did not join before the absolute deadline"
+                ));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        let thread = self.thread.take().expect("reader thread handle present");
+        thread
+            .join()
+            .map_err(|_| format!("{label} reader thread panicked"))
+    }
+}
+
 fn finish_capped_reader(
-    receiver: Receiver<CappedOutput>,
-    thread: std::thread::JoinHandle<()>,
+    mut task: CappedReaderTask,
     deadline: Instant,
     label: &str,
 ) -> Result<CappedOutput, String> {
-    // The child Job has already been settled on every timeout/error path
-    // before this function is called.  Always join the capped reader even if
-    // receiving its bounded result failed; dropping a JoinHandle would hide a
-    // blocked/panicked reader and make the cleanup claim unauthoritative.
-    let output = receive_capped_reader(&receiver, deadline, label);
-    let joined = thread
-        .join()
-        .map_err(|_| format!("{label} reader thread panicked"));
+    // Reserve a scheduler-safe slice of the caller's one absolute deadline for
+    // cancellation, pipe-handle close (when the cancelled read unwinds), and
+    // the bounded JoinHandle settlement. A receive timeout is never followed
+    // by an unconditional join.
+    let receive_deadline = deadline
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or(deadline);
+    let output = receive_capped_reader(&task.receiver, receive_deadline, label);
+    let cancellation = task.cancel(deadline, label);
+    let joined = task.join_until(deadline, label);
     match (output, joined) {
-        (Ok(output), Ok(())) => Ok(output),
-        (Err(error), Ok(())) => Err(error),
+        (Ok(output), Ok(())) if cancellation.is_ok() => Ok(output),
+        (Err(error), Ok(())) if cancellation.is_ok() => Err(error),
+        (Err(error), Ok(())) => Err(format!("{error}; cancellation={cancellation:?}")),
         (Ok(_), Err(error)) => Err(error),
-        (Err(output_error), Err(join_error)) => Err(format!("{output_error}; {join_error}")),
+        (Err(output_error), Err(join_error)) => Err(format!(
+            "{output_error}; cancellation={cancellation:?}; {join_error}"
+        )),
+        (Ok(_), Ok(())) => Err(format!(
+            "{label} reader cancellation failed: {cancellation:?}"
+        )),
+    }
+}
+
+fn finish_capped_readers(
+    stdout: CappedReaderTask,
+    stderr: CappedReaderTask,
+    deadline: Instant,
+    label: &str,
+) -> Result<(CappedOutput, CappedOutput), String> {
+    // Settle both owned readers even when the first one reports an error. A
+    // short receive/cleanup failure must never skip the other inherited pipe
+    // handle and leave its worker detached.
+    let stdout_result = finish_capped_reader(stdout, deadline, &format!("{label} stdout"));
+    let stderr_result = finish_capped_reader(stderr, deadline, &format!("{label} stderr"));
+    match (stdout_result, stderr_result) {
+        (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
+        (Err(stdout), Ok(_)) => Err(stdout),
+        (Ok(_), Err(stderr)) => Err(stderr),
+        (Err(stdout), Err(stderr)) => Err(format!("{stdout}; {stderr}")),
     }
 }
 
@@ -2461,9 +2715,12 @@ mod windows_supervisor {
             }
         }
 
-        fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+        fn active_process_ids(&self, deadline: Instant) -> Result<Vec<u32>, String> {
             let mut capacity = 16usize;
             loop {
+                if Instant::now() >= deadline {
+                    return Err("Job member inspection deadline exceeded".to_string());
+                }
                 if capacity > 4096 {
                     return Err("Job active member count exceeds 4096".to_string());
                 }
@@ -2493,6 +2750,9 @@ mod windows_supervisor {
                 if ok == 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() == Some(ERROR_MORE_DATA) {
+                        if Instant::now() >= deadline {
+                            return Err("Job member inspection deadline exceeded".to_string());
+                        }
                         let assigned = u32::from_ne_bytes(buffer[..4].try_into().unwrap()) as usize;
                         capacity = capacity.saturating_mul(2).max(assigned).min(4096);
                         continue;
@@ -2501,6 +2761,9 @@ mod windows_supervisor {
                 }
                 let count = u32::from_ne_bytes(buffer[4..8].try_into().unwrap()) as usize;
                 if count > capacity {
+                    if Instant::now() >= deadline {
+                        return Err("Job member inspection deadline exceeded".to_string());
+                    }
                     capacity = count;
                     continue;
                 }
@@ -2514,6 +2777,9 @@ mod windows_supervisor {
                 }
                 ids.sort_unstable();
                 ids.dedup();
+                if Instant::now() >= deadline {
+                    return Err("Job member inspection deadline exceeded".to_string());
+                }
                 return Ok(ids);
             }
         }
@@ -2568,7 +2834,7 @@ mod windows_supervisor {
                 // the membership query becomes observable. Retry only a
                 // bounded number of times and keep the same absolute
                 // deadline; never turn a transient query error into a pass.
-                if let Err(error) = self.active_process_ids() {
+                if let Err(error) = self.active_process_ids(deadline) {
                     member_query_failures = member_query_failures.saturating_add(1);
                     if member_query_failures >= MAX_JOB_MEMBER_RETRIES {
                         return Err(format!(
@@ -2585,7 +2851,7 @@ mod windows_supervisor {
                 if Instant::now() >= deadline {
                     return Err("Job member inspection deadline exceeded".to_string());
                 }
-                match self.active_process_ids() {
+                match self.active_process_ids(deadline) {
                     Ok(ids) => return Ok(ids),
                     Err(error) => last_error = Some(error),
                 }
@@ -2597,7 +2863,7 @@ mod windows_supervisor {
         }
 
         fn terminate_and_wait(&self, deadline: Instant) -> Result<(), String> {
-            let initial_members = self.active_process_ids();
+            let initial_members = self.active_process_ids(deadline);
             let initial_error = initial_members.as_ref().err().cloned();
             let needs_termination = initial_members
                 .as_ref()
@@ -2606,20 +2872,20 @@ mod windows_supervisor {
             if needs_termination {
                 let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 124) };
                 if terminated == 0 {
-                    let final_members = self.active_process_ids();
+                    let final_members = self.active_process_ids(deadline);
                     return Err(format!(
                         "TerminateJobObject failed: {}; initial-members={initial_error:?}; final-members={final_members:?}",
                         io::Error::last_os_error()
                     ));
                 }
                 if let Err(wait_error) = self.wait_active_process_zero(deadline) {
-                    let final_members = self.active_process_ids();
+                    let final_members = self.active_process_ids(deadline);
                     return Err(format!(
                         "ACTIVE_PROCESS_ZERO cleanup failed: {wait_error}; initial-members={initial_error:?}; final-members={final_members:?}"
                     ));
                 }
             }
-            let final_members = self.active_process_ids()?;
+            let final_members = self.active_process_ids(deadline)?;
             if !final_members.is_empty() {
                 return Err(format!(
                     "Job remained non-empty after termination: {final_members:?}"
@@ -2638,6 +2904,64 @@ mod windows_supervisor {
         fn drop(&mut self) {
             // The kill-on-close policy is the last-resort fence if a caller is
             // interrupted between an error and explicit Job settlement.
+        }
+    }
+
+    pub(super) fn membership_deadline_probe() -> Result<(), String> {
+        let job = SupervisorJob::create()?;
+        let deadline = Instant::now();
+        match job.active_process_ids(deadline) {
+            Err(error) if error.contains("deadline") => {
+                println!(
+                    "{}",
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "passed",
+                        "deadlineChecked": true,
+                    })
+                );
+                Ok(())
+            }
+            Ok(members) => Err(format!(
+                "expired membership query unexpectedly returned members: {members:?}"
+            )),
+            Err(error) => Err(format!(
+                "expired membership query returned the wrong error: {error}"
+            )),
+        }
+    }
+
+    pub(super) fn reader_cancel_probe() -> Result<(), String> {
+        let (stdout_read, stdout_write, _stderr_read, stderr_write) = open_pipes()?;
+        drop(stderr_write);
+        let reader = unsafe { File::from_raw_handle(stdout_read.into_raw_handle()) };
+        let task = spawn_capped_reader(reader, 1024);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(2_000))
+            .ok_or_else(|| "reader probe deadline overflow".to_string())?;
+        let result = finish_capped_reader(task, deadline, "reader-cancel-probe");
+        drop(stdout_write);
+        match result {
+            Err(error)
+                if error.contains("reader did not settle")
+                    && !error.contains("cancellation=Err")
+                    && !error.contains("did not join") =>
+            {
+                println!(
+                    "{}",
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "passed",
+                        "readerCancelled": true,
+                        "readerJoined": true,
+                    })
+                );
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "reader cancellation probe did not settle cleanly: {error}"
+            )),
+            Ok(_) => Err("reader cancellation probe unexpectedly reached EOF".to_string()),
         }
     }
 
@@ -3286,7 +3610,11 @@ mod windows_supervisor {
         Ok(block)
     }
 
-    fn inspect_member(job: &SupervisorJob, pid: u32) -> Result<ProcessIdentity, String> {
+    fn inspect_member(
+        job: &SupervisorJob,
+        pid: u32,
+        deadline: Instant,
+    ) -> Result<ProcessIdentity, String> {
         let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if raw.is_null() {
             return Err(format!(
@@ -3296,7 +3624,7 @@ mod windows_supervisor {
         }
         let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
         let identity = capture_identity(handle.as_raw_handle() as _, pid)?;
-        if !job.active_process_ids()?.contains(&pid) {
+        if !job.active_process_ids(deadline)?.contains(&pid) {
             return Err(format!(
                 "Job member PID {pid} changed during identity capture"
             ));
@@ -3389,14 +3717,14 @@ mod windows_supervisor {
                     root_identity.executable_path.display()
                 ));
             }
-            let members = job.active_process_ids()?;
+            let members = job.active_process_ids(cleanup_deadline)?;
             if !members.contains(&pid) {
                 return Err(format!("launched PID {pid} was not assigned to its Job"));
             }
             let member_identities = members
                 .into_iter()
                 .filter(|member| *member != pid)
-                .map(|member| inspect_member(&job, member))
+                .map(|member| inspect_member(&job, member, cleanup_deadline))
                 .collect::<Result<Vec<_>, _>>()?;
             let resumed = unsafe { ResumeThread(thread.as_raw_handle() as _) };
             if resumed != 1 {
@@ -3418,7 +3746,9 @@ mod windows_supervisor {
                     // empty before the Job handle is closed.
                     let terminated = unsafe { TerminateProcess(process.as_raw_handle() as _, 127) };
                     let waited = wait_process(process.as_raw_handle() as _, cleanup_deadline);
-                    let zero = job.active_process_ids().map(|ids| ids.is_empty());
+                    let zero = job
+                        .active_process_ids(cleanup_deadline)
+                        .map(|ids| ids.is_empty());
                     if terminated == 0 {
                         Err(format!(
                             "TerminateProcess(handle) failed: {}",
@@ -3441,7 +3771,7 @@ mod windows_supervisor {
                         }
                     }
                 };
-                let remaining = job.active_process_ids();
+                let remaining = job.active_process_ids(cleanup_deadline);
                 return Err(format!(
                     "{error}; owned Job cleanup={cleanup:?}; active-members={remaining:?}"
                 ));
@@ -3916,7 +4246,7 @@ mod windows_supervisor {
                 Ok(count) => count,
                 Err(error) => {
                     let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                    let remaining = child.job.active_process_ids();
+                    let remaining = child.job.active_process_ids(cleanup_deadline);
                     return Err(json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                         "status": "rejected",
@@ -3926,11 +4256,11 @@ mod windows_supervisor {
                     }));
                 }
             };
-            let job_members_before = match child.job.active_process_ids() {
+            let job_members_before = match child.job.active_process_ids(cleanup_deadline) {
                 Ok(members) => members,
                 Err(error) => {
                     let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                    let remaining = child.job.active_process_ids();
+                    let remaining = child.job.active_process_ids(cleanup_deadline);
                     return Err(json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                         "status": "rejected",
@@ -3944,7 +4274,7 @@ mod windows_supervisor {
                 Ok(listeners) => listeners,
                 Err(error) => {
                     let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                    let remaining = child.job.active_process_ids();
+                    let remaining = child.job.active_process_ids(cleanup_deadline);
                     return Err(json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                         "status": "rejected",
@@ -3958,7 +4288,7 @@ mod windows_supervisor {
                 Ok(listeners) => listeners,
                 Err(error) => {
                     let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                    let remaining = child.job.active_process_ids();
+                    let remaining = child.job.active_process_ids(cleanup_deadline);
                     return Err(json!({
                         "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                         "status": "rejected",
@@ -3968,21 +4298,21 @@ mod windows_supervisor {
                     }));
                 }
             };
-            let (stdout_thread, stdout_reader) = spawn_capped_reader(
+            let stdout_reader = spawn_capped_reader(
                 {
                     let stdout = child.stdout.take().expect("supervisor stdout pipe");
                     stdout
                 },
                 manifest.budgets.stdout_bytes,
             );
-            let (stderr_thread, stderr_reader) = spawn_capped_reader(
+            let stderr_reader = spawn_capped_reader(
                 {
                     let stderr = child.stderr.take().expect("supervisor stderr pipe");
                     stderr
                 },
                 manifest.budgets.stderr_bytes,
             );
-            let _reader_threads = (&stdout_thread, &stderr_thread);
+            let _reader_threads = (&stdout_reader, &stderr_reader);
             let mut outcome = "completed";
             let mut active_process_zero = false;
             let mut settlement_error = None::<String>;
@@ -3991,7 +4321,7 @@ mod windows_supervisor {
                 Ok(None) => {
                     outcome = "timeout";
                     let inspection = (|| {
-                        let member_ids = child.job.active_process_ids()?;
+                        let member_ids = child.job.active_process_ids(cleanup_deadline)?;
                         for member in member_ids {
                             if member == child.root_identity.process_id
                                 || child
@@ -4001,9 +4331,11 @@ mod windows_supervisor {
                             {
                                 continue;
                             }
-                            child
-                                .member_identities
-                                .push(inspect_member(&child.job, member)?);
+                            child.member_identities.push(inspect_member(
+                                &child.job,
+                                member,
+                                cleanup_deadline,
+                            )?);
                         }
                         Ok::<(), String>(())
                     })();
@@ -4013,7 +4345,7 @@ mod windows_supervisor {
                         ));
                     }
                     match child.job.terminate_and_wait(cleanup_deadline) {
-                        Ok(()) => match child.job.active_process_ids() {
+                        Ok(()) => match child.job.active_process_ids(cleanup_deadline) {
                             Ok(ids) => active_process_zero = ids.is_empty(),
                             Err(error) => {
                                 active_process_zero = false;
@@ -4038,7 +4370,10 @@ mod windows_supervisor {
                 Err(error) => {
                     outcome = "wait-failed";
                     let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                    let members_after_cleanup = child.job.active_process_ids().map_err(|error| {
+                    let members_after_cleanup = child
+                        .job
+                        .active_process_ids(cleanup_deadline)
+                        .map_err(|error| {
                         json!({
                             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
                             "status": "rejected",
@@ -4079,26 +4414,21 @@ mod windows_supervisor {
                         }),
                     );
                     status = "failed";
-                    finish_capped_reader(stdout_reader, stdout_thread, cleanup_deadline, "stdout")
-                        .map_err(|error| {
-                            json!({
-                                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                                "status": "rejected",
-                                "revision": manifest.revision,
-                                "launched": true,
-                                "error": format!("stdout reader failed after wait error: {error}"),
-                            })
-                        })?;
-                    finish_capped_reader(stderr_reader, stderr_thread, cleanup_deadline, "stderr")
-                        .map_err(|error| {
-                            json!({
-                                "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                                "status": "rejected",
-                                "revision": manifest.revision,
-                                "launched": true,
-                                "error": format!("stderr reader failed after wait error: {error}"),
-                            })
-                        })?;
+                    finish_capped_readers(
+                        stdout_reader,
+                        stderr_reader,
+                        cleanup_deadline,
+                        "wait-error",
+                    )
+                    .map_err(|error| {
+                        json!({
+                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                            "status": "rejected",
+                            "revision": manifest.revision,
+                            "launched": true,
+                            "error": format!("reader cleanup failed after wait error: {error}"),
+                        })
+                    })?;
                     break;
                 }
             };
@@ -4112,7 +4442,7 @@ mod windows_supervisor {
                             Ok(()) => {
                                 active_process_zero = child
                                     .job
-                                    .active_process_ids()
+                                    .active_process_ids(cleanup_deadline)
                                     .map_err(|error| {
                                         json!({
                                             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
@@ -4136,19 +4466,8 @@ mod windows_supervisor {
                     }
                 }
             }
-            let stdout =
-                finish_capped_reader(stdout_reader, stdout_thread, cleanup_deadline, "stdout")
-                    .map_err(|error| {
-                        json!({
-                            "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                            "status": "rejected",
-                            "revision": manifest.revision,
-                            "launched": true,
-                            "error": error,
-                        })
-                    })?;
-            let stderr =
-                finish_capped_reader(stderr_reader, stderr_thread, cleanup_deadline, "stderr")
+            let (stdout, stderr) =
+                finish_capped_readers(stdout_reader, stderr_reader, cleanup_deadline, "cycle")
                     .map_err(|error| {
                         json!({
                             "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
@@ -4180,15 +4499,17 @@ mod windows_supervisor {
             };
             let whole_machine_percent =
                 core_equivalent_percent / logical_processor_count.max(1) as f64;
-            let job_members_after = child.job.active_process_ids().map_err(|error| {
-                json!({
-                    "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
-                    "status": "rejected",
-                    "revision": manifest.revision,
-                    "launched": true,
-                    "error": format!("Job member inspection failed after reader join: {error}"),
-                })
-            })?;
+            let job_members_after = child.job.active_process_ids(cleanup_deadline).map_err(
+                |error| {
+                    json!({
+                        "schemaVersion": SUPERVISOR_SCHEMA_VERSION,
+                        "status": "rejected",
+                        "revision": manifest.revision,
+                        "launched": true,
+                        "error": format!("Job member inspection failed after reader join: {error}"),
+                    })
+                },
+            )?;
             if !job_members_after.is_empty() {
                 active_process_zero = false;
                 settlement_error = Some(format!(
@@ -5004,11 +5325,11 @@ mod windows_supervisor {
                 )
             }
         };
-        let (stdout_thread, stdout_receiver) = spawn_capped_reader(
+        let stdout_receiver = spawn_capped_reader(
             child.stdout.take().expect("wrapper stdout pipe"),
             SUPERVISOR_MAX_RESULT_BYTES,
         );
-        let (stderr_thread, stderr_receiver) = spawn_capped_reader(
+        let stderr_receiver = spawn_capped_reader(
             child.stderr.take().expect("wrapper stderr pipe"),
             SUPERVISOR_MAX_OUTPUT_BYTES,
         );
@@ -5016,7 +5337,7 @@ mod windows_supervisor {
             Ok(Some(code)) => code,
             Ok(None) => {
                 let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                let members = child.job.active_process_ids();
+                let members = child.job.active_process_ids(cleanup_deadline);
                 let job_zero = cleanup.is_ok()
                     && members
                         .as_ref()
@@ -5030,13 +5351,11 @@ mod windows_supervisor {
                 };
                 let stdout_join = finish_capped_reader(
                     stdout_receiver,
-                    stdout_thread,
                     cleanup_deadline,
                     "bounded supervisor stdout",
                 );
                 let stderr_join = finish_capped_reader(
                     stderr_receiver,
-                    stderr_thread,
                     cleanup_deadline,
                     "bounded supervisor stderr",
                 );
@@ -5063,7 +5382,7 @@ mod windows_supervisor {
             }
             Err(error) => {
                 let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                let members = child.job.active_process_ids();
+                let members = child.job.active_process_ids(cleanup_deadline);
                 let job_zero = cleanup.is_ok()
                     && members
                         .as_ref()
@@ -5077,13 +5396,11 @@ mod windows_supervisor {
                 };
                 let stdout_join = finish_capped_reader(
                     stdout_receiver,
-                    stdout_thread,
                     cleanup_deadline,
                     "bounded supervisor stdout",
                 );
                 let stderr_join = finish_capped_reader(
                     stderr_receiver,
-                    stderr_thread,
                     cleanup_deadline,
                     "bounded supervisor stderr",
                 );
@@ -5114,7 +5431,7 @@ mod windows_supervisor {
             Ok(()) => true,
             Err(error) => {
                 let cleanup = child.job.terminate_and_wait(cleanup_deadline);
-                let members = child.job.active_process_ids();
+                let members = child.job.active_process_ids(cleanup_deadline);
                 let zero = cleanup.is_ok()
                     && members
                         .as_ref()
@@ -5128,13 +5445,11 @@ mod windows_supervisor {
         };
         let stdout = finish_capped_reader(
             stdout_receiver,
-            stdout_thread,
             cleanup_deadline,
             "bounded supervisor stdout",
         );
         let stderr = finish_capped_reader(
             stderr_receiver,
-            stderr_thread,
             cleanup_deadline,
             "bounded supervisor stderr",
         );
@@ -5369,6 +5684,26 @@ fn main() {
     let mode = args.next().expect("process-test helper mode");
     let mode = mode.to_string_lossy().to_string();
     let result = match mode.as_str() {
+        "membership-deadline-probe" => {
+            #[cfg(windows)]
+            {
+                windows_supervisor::membership_deadline_probe()
+            }
+            #[cfg(not(windows))]
+            {
+                Err("membership deadline probe requires Windows Job Objects".to_string())
+            }
+        }
+        "reader-cancel-probe" => {
+            #[cfg(windows)]
+            {
+                windows_supervisor::reader_cancel_probe()
+            }
+            #[cfg(not(windows))]
+            {
+                Err("reader cancellation probe requires Windows pipe cancellation".to_string())
+            }
+        }
         "supervise" => {
             #[cfg(windows)]
             {

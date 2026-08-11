@@ -426,7 +426,7 @@ function Invoke-BoundedFinalUnion {
     $lines = @($bounded.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($lines.Count -ne 1) { throw "final host/client union emitted $($lines.Count) JSON results; exactly one is required." }
     $result = $lines[0] | ConvertFrom-Json
-    if ([string]$result.status -ne 'passed' -or [string]$result.jobZero -ne 'True' -or [string]$result.releaseEligible -ne 'True' -or [string]$result.realLifecycle -ne 'True' -or [int]$result.completedCycles -ne 100) { throw 'final host/client union did not prove 100 real release-eligible cycles + Job zero.' }
+    Assert-DevManagerPhase3FinalUnionDocument -Document $result
     [pscustomobject][ordered]@{ result = $result; exitCode = [int]$bounded.ExitCode; stderr = ConvertTo-BoundedError $bounded.Stderr }
 }
 
@@ -552,6 +552,11 @@ try {
 catch {
     $failure = ConvertTo-BoundedError $_.Exception.Message
     $finalStatus = if ($failure -match '(?i)manifest does not exist|requires Windows|unavailable') { 'unavailable' } else { 'failed' }
+    if ($Iterations -eq 100 -and -not $SyntheticOnly -and
+        $failure -match '(?i)(host|client).*(absent|unavailable|caller.?pinned)') {
+        $finalStatus = 'hold'
+        if ($failure -notmatch '(?i)HOLD') { $failure = "HOLD: $failure" }
+    }
 }
 
 $supervisorResult = if ($null -eq $supervisorDocument) { $null } else { $supervisorDocument.result }
@@ -564,5 +569,6 @@ $summary = New-SoakSummary `
     -RunDirectory $runDirectory
 Write-Output ($summary | ConvertTo-Json -Depth 32 -Compress)
 if ($finalStatus -eq 'passed') { exit 0 }
+if ($finalStatus -eq 'hold') { exit 78 }
 if ($finalStatus -eq 'unavailable') { exit 78 }
 exit 1
