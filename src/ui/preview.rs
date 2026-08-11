@@ -1,8 +1,8 @@
 //! Deterministic, isolated native UI preview contracts.
 
 use gpui::{
-    div, px, Action, Context, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    Styled, Window,
+    div, px, Action, AppContext, Context, InteractiveElement, IntoElement, KeyBinding,
+    ParentElement, Render, Styled, Window,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -17,8 +17,11 @@ use crate::assets::AppAssets;
 use crate::client::action;
 use crate::terminal::terminal_font;
 use crate::ui::actions::{register_task_cockpit_bindings, TASK_COCKPIT_ACTION_NAMES};
+use crate::ui::native_shell::{
+    isolated_dev_profile, NativeHostRuntimeStub, NativeHostState, NativeShell,
+};
 use crate::ui::preview_capture;
-use crate::ui::tokens::{theme, Density, Scale, ThemeMode, PREVIEW_SENTINEL};
+use crate::ui::tokens::{RuntimePreferencesSnapshot, PREVIEW_SENTINEL};
 
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
@@ -292,6 +295,7 @@ pub struct PreviewInitReport {
     pub fonts_registered: bool,
     pub actions_registered: bool,
     pub root_constructed: bool,
+    pub native_shell_instantiated: bool,
     pub production_host_started: bool,
 }
 
@@ -317,6 +321,7 @@ pub struct PreviewOutputMetadata {
 #[derive(Debug)]
 pub struct PreviewApplication {
     request: PreviewRequest,
+    workspace_root: PathBuf,
     root_snapshot: PreviewRootSnapshot,
     resources: PreviewResources,
     capture: PreviewCaptureFixture,
@@ -376,6 +381,7 @@ impl PreviewApplication {
         };
         Ok(Self {
             request,
+            workspace_root: preview_workspace_root(policy.fixture_root()),
             root_snapshot,
             resources: PreviewResources::new(),
             capture: fixture.capture,
@@ -416,7 +422,7 @@ impl PreviewApplication {
     }
 
     pub fn root(&self) -> PreviewRoot {
-        PreviewRoot::new(self.root_snapshot.clone())
+        PreviewRoot::new(self.root_snapshot.clone(), self.workspace_root.clone())
     }
 
     pub fn initialize_headless(&self) -> Result<PreviewInitReport, PreviewError> {
@@ -425,6 +431,7 @@ impl PreviewApplication {
         }
 
         let root_snapshot = self.root_snapshot.clone();
+        let workspace_root = self.workspace_root.clone();
         let report = Rc::new(RefCell::new(None));
         let report_slot = Rc::clone(&report);
         let application = gpui::Application::headless().with_assets(AppAssets::new());
@@ -447,7 +454,16 @@ impl PreviewApplication {
                 && cx
                     .all_action_names()
                     .contains(&PreviewDismiss::name_for_type());
-            let root = PreviewRoot::new(root_snapshot);
+            let root = match PreviewRoot::new(root_snapshot, workspace_root)
+                .instantiate_native_shell(cx)
+            {
+                Ok(root) => root,
+                Err(_error) => {
+                    cx.quit();
+                    return;
+                }
+            };
+            let native_shell_instantiated = root.has_native_shell();
             let _root_element = root.element();
             let after = crate::ui::component_init_count();
 
@@ -457,6 +473,7 @@ impl PreviewApplication {
                 fonts_registered,
                 actions_registered,
                 root_constructed: true,
+                native_shell_instantiated,
                 production_host_started: false,
             });
             cx.quit();
@@ -485,19 +502,76 @@ pub(crate) fn register_preview_environment(cx: &mut gpui::App) {
     cx.bind_keys([KeyBinding::new("escape", PreviewDismiss, None)]);
 }
 
+fn preview_workspace_root(fixture_root: &Path) -> PathBuf {
+    let fixture_root = fixture_root.to_path_buf();
+    let Some(fixtures_root) = fixture_root.parent() else {
+        return fixture_root;
+    };
+    let Some(candidate) = fixtures_root.parent() else {
+        return fixture_root;
+    };
+    if candidate.file_name().and_then(OsStr::to_str) == Some("tests") {
+        candidate.parent().unwrap_or(candidate).to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PreviewRoot {
     snapshot: PreviewRootSnapshot,
+    workspace_root: PathBuf,
+    native_shell: Option<gpui::Entity<NativeShell>>,
 }
 
 impl PreviewRoot {
-    fn new(snapshot: PreviewRootSnapshot) -> Self {
-        Self { snapshot }
+    fn new(snapshot: PreviewRootSnapshot, workspace_root: PathBuf) -> Self {
+        Self {
+            snapshot,
+            workspace_root,
+            native_shell: None,
+        }
+    }
+
+    pub(crate) fn instantiate_native_shell(
+        mut self,
+        cx: &mut gpui::App,
+    ) -> Result<Self, PreviewError> {
+        if self.snapshot.root_kind != "task-cockpit" {
+            return Ok(self);
+        }
+        let profile = isolated_dev_profile(&self.workspace_root).map_err(|error| {
+            PreviewError::ApplicationFailed {
+                reason: format!("preview native shell profile: {error}"),
+            }
+        })?;
+        let runtime =
+            NativeHostRuntimeStub::new("preview://disconnected", NativeHostState::Disconnected);
+        let shell = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(runtime),
+                RuntimePreferencesSnapshot::default(),
+                cx,
+            )
+        });
+        self.native_shell = Some(shell);
+        Ok(self)
+    }
+
+    fn has_native_shell(&self) -> bool {
+        self.native_shell.is_some()
     }
 
     pub fn element(&self) -> impl IntoElement {
-        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
-        let shell = if self.snapshot.root_kind == "task-cockpit" {
+        let tokens = RuntimePreferencesSnapshot::default().tokens();
+        let shell = if let Some(native_shell) = self.native_shell.clone() {
+            div()
+                .id("preview-task-cockpit")
+                .size_full()
+                .child(native_shell)
+                .into_any_element()
+        } else if self.snapshot.root_kind == "task-cockpit" {
             div()
                 .id("preview-task-cockpit")
                 .flex_col()
@@ -511,19 +585,23 @@ impl PreviewRoot {
         } else {
             div().child(self.snapshot.body.clone()).into_any_element()
         };
-        div()
+        let preview = div()
             .size_full()
             .p(px(16.0))
             .bg(tokens.surfaces.canvas.to_gpui())
             .text_color(tokens.text.primary.to_gpui())
             .on_action::<PreviewDismiss>(|_, _, cx: &mut gpui::App| cx.quit())
-            .child(
+            .child(shell);
+        if self.native_shell.is_none() {
+            preview.child(
                 div()
                     .flex_none()
                     .size(px(PREVIEW_SENTINEL_SIZE))
                     .bg(PREVIEW_SENTINEL.to_gpui()),
             )
-            .child(shell)
+        } else {
+            preview
+        }
     }
 }
 

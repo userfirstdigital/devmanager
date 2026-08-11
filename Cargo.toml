@@ -6,6 +6,7 @@ description = "Native GPUI rewrite of DevManager"
 license = "Apache-2.0"
 
 [dependencies]
+accesskit = "0.24.1"
 alacritty_terminal = "0.25.1"
 arboard = "3.6.1"
 cargo-packager-resource-resolver = "0.1.2"
@@ -50,6 +51,7 @@ getrandom = "0.3.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
+accesskit_windows = "0.34.0"
 raw-window-handle = "0.6"
 wry = { version = "=0.55.1", default-features = false, features = ["devtools", "protocol", "os-webview"] }
 webview2-com = "=0.38.2"

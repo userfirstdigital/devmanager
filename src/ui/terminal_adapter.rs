@@ -7,7 +7,7 @@
 //! WebView.
 
 use crate::terminal::view::{render_terminal_surface, TerminalPaneModel};
-use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
+use crate::ui::tokens::RuntimePreferencesSnapshot;
 use gpui::{
     div, px, App, Component, InteractiveElement, IntoElement, ParentElement, RenderOnce, Styled,
     Window,
@@ -51,17 +51,35 @@ impl TerminalDockState {
 #[derive(Debug, Default)]
 pub struct TerminalDockAdapter {
     model: Option<TerminalPaneModel>,
+    preferences: RuntimePreferencesSnapshot,
 }
 
 impl TerminalDockAdapter {
     pub fn unavailable() -> Self {
-        Self { model: None }
+        Self {
+            model: None,
+            preferences: RuntimePreferencesSnapshot::default(),
+        }
+    }
+
+    pub fn unavailable_with_preferences(preferences: RuntimePreferencesSnapshot) -> Self {
+        Self {
+            model: None,
+            preferences,
+        }
     }
 
     /// Create a live adapter only when the caller already owns a complete
     /// model from the established renderer. No model transformation occurs.
     pub fn live(model: TerminalPaneModel) -> Self {
-        Self { model: Some(model) }
+        Self {
+            model: Some(model),
+            preferences: RuntimePreferencesSnapshot::default(),
+        }
+    }
+
+    pub fn set_preferences(&mut self, preferences: RuntimePreferencesSnapshot) {
+        self.preferences = preferences;
     }
 
     pub fn state(&self) -> TerminalDockState {
@@ -75,34 +93,36 @@ impl TerminalDockAdapter {
     pub fn element(&self) -> gpui::AnyElement {
         match self.model.as_ref() {
             Some(model) => render_terminal_surface(model, None).into_any_element(),
-            None => Component::new(TerminalDockUnavailable).into_any_element(),
+            None => Component::new(TerminalDockUnavailable {
+                preferences: self.preferences,
+            })
+            .into_any_element(),
         }
     }
 }
 
 /// A visible failure state for the isolated shell. This keeps the dependency
 /// and the missing capability discoverable to both a user and a screen reader.
-struct TerminalDockUnavailable;
-
-fn unavailable_element() -> impl IntoElement {
-    let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
-    let metrics = tokens.density.physical();
-    div()
-        .id("terminal-dock-unavailable")
-        .w_full()
-        .h(px((metrics.row_height.saturating_mul(3)) as f32))
-        .p(px(metrics.control_padding as f32))
-        .flex_col()
-        .gap(px(tokens.density.spacing.md))
-        .bg(tokens.surfaces.sunken.to_gpui())
-        .text_color(tokens.text.primary.to_gpui())
-        .whitespace_normal()
-        .child("Terminal dock unavailable")
-        .child(TERMINAL_UNAVAILABLE_MESSAGE)
+struct TerminalDockUnavailable {
+    preferences: RuntimePreferencesSnapshot,
 }
 
 impl RenderOnce for TerminalDockUnavailable {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        unavailable_element()
+        let tokens = self.preferences.tokens();
+        let metrics = tokens.density.physical();
+        div()
+            .id("terminal-dock-unavailable")
+            .w_full()
+            .h(px((metrics.row_height.saturating_mul(3)) as f32))
+            .p(px(metrics.control_padding as f32))
+            .flex_col()
+            .gap(px(tokens.density.spacing.md))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .text_color(tokens.text.primary.to_gpui())
+            .whitespace_normal()
+            .child("Terminal dock unavailable")
+            .child("Raw terminal unavailable")
+            .child("The existing adapter needs a complete TerminalPaneModel.")
     }
 }

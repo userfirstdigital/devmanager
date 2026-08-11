@@ -1,6 +1,7 @@
 //! Bounded, deterministic task-list projection and local virtual viewport.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::client::ClientModel;
 use crate::domain::id::TaskId;
@@ -134,9 +135,10 @@ impl VirtualListViewport {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskList {
-    task_ids: Vec<TaskId>,
+    task_ids: Arc<Vec<TaskId>>,
     viewport: VirtualWindow,
     overflow: Option<TaskListOverflow>,
+    virtual_source: bool,
 }
 
 impl TaskList {
@@ -144,9 +146,10 @@ impl TaskList {
     /// its explicitly scoped dev/test host supplies a snapshot.
     pub fn empty() -> Self {
         Self {
-            task_ids: Vec::new(),
+            task_ids: Arc::new(Vec::new()),
             viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, 0),
             overflow: None,
+            virtual_source: false,
         }
     }
 
@@ -172,18 +175,72 @@ impl TaskList {
         });
         let viewport = VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, task_ids.len());
         Self {
-            task_ids,
+            task_ids: Arc::new(task_ids),
             viewport,
             overflow,
+            virtual_source: false,
         }
     }
 
+    /// Construct the source consumed by the real GPUI uniform list. The
+    /// source is bounded at the host contract's 100k row limit, while the
+    /// uniform list only asks for its visible range during layout.
+    pub fn from_virtual_task_ids(task_ids: Vec<TaskId>) -> Result<Self, TaskListOverflow> {
+        if task_ids.len() > MAX_VIRTUAL_SOURCE_ROWS {
+            return Err(TaskListOverflow {
+                limit: MAX_VIRTUAL_SOURCE_ROWS,
+                total_count: task_ids.len(),
+                retained_count: MAX_VIRTUAL_SOURCE_ROWS,
+            });
+        }
+        let total_count = task_ids.len();
+        Ok(Self {
+            task_ids: Arc::new(task_ids),
+            viewport: VirtualWindow::for_item_count(0, DEFAULT_VISIBLE_ROWS, total_count),
+            overflow: None,
+            virtual_source: true,
+        })
+    }
+
+    /// Build the full bounded source used by the native uniform list when a
+    /// live client model is available. The legacy `from_model` projection
+    /// keeps its smaller compatibility bound; this explicit path is the
+    /// canonical native shell path and never materializes row elements.
+    pub fn from_client_model_virtual(model: &ClientModel) -> Result<Self, TaskListOverflow> {
+        let task_ids = model
+            .tasks()
+            .iter()
+            .filter(|(_, task)| task.task.lifecycle != TaskLifecycle::Archived)
+            .map(|(task_id, _)| *task_id)
+            .collect();
+        Self::from_virtual_task_ids(task_ids)
+    }
+
     pub fn task_ids(&self) -> &[TaskId] {
-        &self.task_ids
+        self.task_ids.as_slice()
+    }
+
+    pub(crate) fn shared_task_ids(&self) -> Arc<Vec<TaskId>> {
+        Arc::clone(&self.task_ids)
     }
 
     pub fn len(&self) -> usize {
         self.task_ids.len()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.task_ids.len()
+    }
+
+    pub fn stable_key_for(&self, index: usize) -> String {
+        self.task_ids
+            .get(index)
+            .map(|task_id| format!("native-task-row-{task_id}"))
+            .unwrap_or_else(|| format!("native-task-row-missing-{index}"))
+    }
+
+    pub fn uses_gpui_uniform_list(&self) -> bool {
+        self.virtual_source
     }
 
     pub fn is_empty(&self) -> bool {
@@ -240,6 +297,24 @@ impl TaskList {
     pub fn rendered_task_ids(&self) -> &[TaskId] {
         let range = self.viewport.render_range(self.len());
         &self.task_ids[range]
+    }
+
+    pub fn set_scroll_offset_pixels(
+        &mut self,
+        offset_pixels: f32,
+        viewport_height: f32,
+        row_height: f32,
+    ) -> Result<(), ViewportError> {
+        if viewport_height <= 0.0 || row_height <= 0.0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        let visible_rows = (viewport_height / row_height).ceil().max(1.0) as usize;
+        let max_offset = self
+            .len()
+            .saturating_sub(visible_rows)
+            .saturating_mul(row_height as usize) as f32;
+        let offset = offset_pixels.clamp(0.0, max_offset);
+        self.set_viewport((offset / row_height).floor() as usize, visible_rows)
     }
 }
 

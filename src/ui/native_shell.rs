@@ -6,19 +6,24 @@
 //! complete terminal model through the explicit seams below.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use gpui::{
-    div, px, size, AnyElement, AppContext, Application, ClickEvent, Context, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
-    WindowBounds, WindowOptions,
+    div, point, px, size, uniform_list, AnyElement, AppContext, Application, ClickEvent, Context,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled,
+    Subscription, Task, Timer, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 
@@ -27,6 +32,8 @@ use crate::client::action;
 use crate::client::UnsolicitedServerMessage;
 use crate::client::{HostClient, HostClientConfig};
 use crate::domain::id::TaskId;
+use crate::domain::snapshot::SnapshotItem;
+use crate::domain::task::TaskLifecycle;
 use crate::domain::ClientId;
 use crate::host::IpcError;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
@@ -44,10 +51,12 @@ use crate::ui::components::{
 use crate::ui::shell::{
     NavigationResult, PointerButton, PointerOwner, Shell, TerminalPressRejection, TerminalRelease,
 };
-use crate::ui::task_cockpit::{TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
+use crate::ui::task_cockpit::{
+    TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN, MAX_VIRTUAL_SOURCE_ROWS,
+};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
-use crate::ui::tokens::{Density, RuntimePreferencesSnapshot};
+use crate::ui::tokens::RuntimePreferencesSnapshot;
 
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME: &str = "native-next-dev";
@@ -55,6 +64,18 @@ const NATIVE_HOST_SCHEME: &str = "devtest";
 const NATIVE_POINTER_ID: u64 = 1;
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
+const MAX_HOST_PROJECTIONS: usize = 64;
+const MAX_HOST_SNAPSHOT_PAGES: usize = 512;
+const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
+
+fn stable_task_element_id(task_id: TaskId) -> (&'static str, u64) {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in task_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    ("native-task-row", hash)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeShellError {
@@ -188,6 +209,187 @@ impl DevTestHostConnection {
     }
 }
 
+/// Exact command line used by the default native-next binary to own the
+/// development host. Keeping this as a value object makes the process seam
+/// injectable without allowing tests to start an installed host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHostLaunchSpec {
+    pub executable: PathBuf,
+    pub profile: String,
+    pub instance_label: String,
+    pub parent_pid: u32,
+    pub config_base: PathBuf,
+}
+
+impl NativeHostLaunchSpec {
+    pub fn for_profile(
+        profile: &IsolatedDevProfile,
+        parent_pid: u32,
+    ) -> Result<Self, NativeShellError> {
+        if parent_pid == 0 {
+            return Err(NativeShellError::HostConnect {
+                message: "native host parent PID must be nonzero".to_string(),
+            });
+        }
+        Ok(Self {
+            executable: native_host_executable(),
+            profile: profile.named_profile().to_string(),
+            instance_label: "Native Next".to_string(),
+            parent_pid,
+            config_base: profile.host_config_base().to_path_buf(),
+        })
+    }
+
+    pub fn arguments(&self) -> Vec<String> {
+        vec![
+            "--profile".to_string(),
+            self.profile.clone(),
+            "--instance-label".to_string(),
+            self.instance_label.clone(),
+            "--parent-pid".to_string(),
+            self.parent_pid.to_string(),
+            "--foreground".to_string(),
+            "--config-base".to_string(),
+            self.config_base.display().to_string(),
+        ]
+    }
+}
+
+fn native_host_executable() -> PathBuf {
+    if let Ok(current) = std::env::current_exe() {
+        let sibling = current
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(if cfg!(windows) {
+                "devmanager-host.exe"
+            } else {
+                "devmanager-host"
+            });
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    PathBuf::from(if cfg!(windows) {
+        "devmanager-host.exe"
+    } else {
+        "devmanager-host"
+    })
+}
+
+enum NativeHostProcessKind {
+    Child(Child),
+}
+
+/// Owns the one host child for the native shell. Drop always joins the child
+/// after requesting termination, so no detached host survives a shell close.
+pub struct NativeHostProcess {
+    kind: NativeHostProcessKind,
+}
+
+impl std::fmt::Debug for NativeHostProcess {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeHostProcess")
+            .field(
+                "kind",
+                &match self.kind {
+                    NativeHostProcessKind::Child(_) => "child",
+                },
+            )
+            .finish()
+    }
+}
+
+impl Drop for NativeHostProcess {
+    fn drop(&mut self) {
+        let NativeHostProcessKind::Child(child) = &mut self.kind;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+pub trait NativeHostBootstrap {
+    fn start(
+        &mut self,
+        profile: &IsolatedDevProfile,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError>;
+}
+
+#[derive(Debug, Default)]
+struct ProcessNativeHostBootstrap;
+
+impl NativeHostBootstrap for ProcessNativeHostBootstrap {
+    fn start(
+        &mut self,
+        profile: &IsolatedDevProfile,
+    ) -> Result<NativeHostRuntimeAttachment, NativeShellError> {
+        ensure_isolated_host_config_base(profile)?;
+        let spec = NativeHostLaunchSpec::for_profile(profile, std::process::id())?;
+        let mut command = Command::new(&spec.executable);
+        command.args(spec.arguments());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|error| NativeShellError::HostConnect {
+                message: format!("isolated devmanager-host launch failed: {error}"),
+            })?;
+        let process = NativeHostProcess {
+            kind: NativeHostProcessKind::Child(child),
+        };
+        let runtime = NativeHostClientRuntime::connect_blocking_with_process(profile, process)?;
+        Ok(NativeHostRuntimeAttachment::Client(runtime))
+    }
+}
+
+fn ensure_isolated_host_config_base(profile: &IsolatedDevProfile) -> Result<(), NativeShellError> {
+    let config_base = profile.host_config_base();
+    let workspace_root = profile.workspace_root();
+    if let Some(parent) = config_base.parent() {
+        if parent.exists() {
+            let canonical_parent =
+                std::fs::canonicalize(parent).map_err(|error| NativeShellError::HostConnect {
+                    message: format!(
+                        "isolated native host parent cannot be resolved {}: {error}",
+                        parent.display()
+                    ),
+                })?;
+            if !canonical_parent.starts_with(workspace_root) {
+                return Err(NativeShellError::HostConnect {
+                    message: format!(
+                        "isolated native host parent escaped workspace: {}",
+                        canonical_parent.display()
+                    ),
+                });
+            }
+        }
+    }
+    std::fs::create_dir_all(config_base).map_err(|error| NativeShellError::HostConnect {
+        message: format!(
+            "isolated native host config base could not be created {}: {error}",
+            config_base.display()
+        ),
+    })?;
+    let canonical_base =
+        std::fs::canonicalize(config_base).map_err(|error| NativeShellError::HostConnect {
+            message: format!(
+                "isolated native host config base cannot be resolved {}: {error}",
+                config_base.display()
+            ),
+        })?;
+    if !canonical_base.starts_with(workspace_root) || canonical_base == workspace_root {
+        return Err(NativeShellError::HostConnect {
+            message: format!(
+                "isolated native host config base escaped workspace: {}",
+                canonical_base.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Resolve only the generated profile under the caller's workspace. No
 /// directory or config/session file is created by this function.
 pub fn isolated_dev_profile(
@@ -278,6 +480,17 @@ pub struct NativeActionRecord {
     pub focus_epoch: FocusEpoch,
     pub request_generation: u64,
     pub event: ActionEvent,
+    pub command: Option<NativeHostCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub enum NativeHostCommand {
+    Envelope(crate::domain::command::CommandEnvelope),
+    TaskCreate(crate::client::action::TaskCreateArguments),
+    TaskRename {
+        arguments: crate::client::action::TaskRenameArguments,
+        expected_task_revision: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -305,6 +518,36 @@ pub enum NativeHostProjectionKind {
     Error,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHostProjection {
+    pub kind: NativeHostProjectionKind,
+    pub task_list: Option<TaskList>,
+    pub error: Option<String>,
+}
+
+enum NativeHostWorkerCommand {
+    Execute(NativeActionRecord),
+    Shutdown,
+}
+
+impl NativeHostProjection {
+    pub fn kind(kind: NativeHostProjectionKind) -> Self {
+        Self {
+            kind,
+            task_list: None,
+            error: None,
+        }
+    }
+
+    pub fn task_list(task_list: TaskList) -> Self {
+        Self {
+            kind: NativeHostProjectionKind::Snapshot,
+            task_list: Some(task_list),
+            error: None,
+        }
+    }
+}
+
 /// The sole native-next transport/action owner.
 ///
 /// GPUI paint and event callbacks never await [`HostClient`]. They enqueue a
@@ -313,10 +556,14 @@ pub enum NativeHostProjectionKind {
 /// Keeping the client in this one owner prevents header, inbox, and shell
 /// attachments from silently opening a second connection.
 pub struct NativeHostClientRuntime {
-    client: HostClient,
-    pending: std::collections::VecDeque<NativeActionRecord>,
-    ready_projections: std::collections::VecDeque<NativeHostProjectionKind>,
+    endpoint: String,
+    client: Arc<Mutex<HostClient>>,
+    pending: VecDeque<NativeActionRecord>,
+    ready_projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
+    command_tx: SyncSender<NativeHostWorkerCommand>,
+    worker: Option<JoinHandle<()>>,
     runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
+    host_process: Option<NativeHostProcess>,
 }
 
 /// Injectable runtime seam used by deterministic shell tests. Production uses
@@ -327,14 +574,26 @@ pub trait NativeHostRuntimePort: Send {
     fn host_state(&self) -> NativeHostState;
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
+    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
+        self.drain_ready(max)
+            .into_iter()
+            .map(NativeHostProjection::kind)
+            .collect()
+    }
+    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord>;
+    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
+    fn executed_count(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Debug)]
 pub struct NativeHostRuntimeStub {
     endpoint: String,
     state: NativeHostState,
-    pending: std::collections::VecDeque<NativeActionRecord>,
-    projections: std::collections::VecDeque<NativeHostProjectionKind>,
+    pending: VecDeque<NativeActionRecord>,
+    projections: VecDeque<NativeHostProjection>,
+    executed: Arc<Mutex<Vec<NativeActionRecord>>>,
 }
 
 impl NativeHostRuntimeStub {
@@ -342,8 +601,9 @@ impl NativeHostRuntimeStub {
         Self {
             endpoint: endpoint.into(),
             state,
-            pending: std::collections::VecDeque::new(),
-            projections: std::collections::VecDeque::new(),
+            pending: VecDeque::new(),
+            projections: VecDeque::new(),
+            executed: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -352,7 +612,33 @@ impl NativeHostRuntimeStub {
     }
 
     pub fn push_projection(&mut self, projection: NativeHostProjectionKind) {
-        self.projections.push_back(projection);
+        self.push_projection_message(NativeHostProjection::kind(projection));
+    }
+
+    pub fn push_projection_message(&mut self, projection: NativeHostProjection) {
+        if self.projections.len() < MAX_HOST_PROJECTIONS {
+            self.projections.push_back(projection);
+        }
+    }
+
+    pub fn handle(&self) -> NativeHostRuntimeStubHandle {
+        NativeHostRuntimeStubHandle {
+            executed: Arc::clone(&self.executed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeHostRuntimeStubHandle {
+    executed: Arc<Mutex<Vec<NativeActionRecord>>>,
+}
+
+impl NativeHostRuntimeStubHandle {
+    pub fn executed_count(&self) -> usize {
+        self.executed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -377,9 +663,38 @@ impl NativeHostRuntimePort for NativeHostRuntimeStub {
     }
 
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
+        let count = max
+            .min(MAX_PENDING_HOST_ACTIONS)
+            .min(self.projections.len());
         self.projections
-            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
+            .drain(..count)
+            .map(|projection| projection.kind)
             .collect()
+    }
+
+    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
+        let count = max.min(MAX_HOST_PROJECTIONS).min(self.projections.len());
+        self.projections.drain(..count).collect()
+    }
+
+    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord> {
+        let count = max.min(MAX_PENDING_HOST_ACTIONS).min(self.pending.len());
+        self.pending.drain(..count).collect()
+    }
+
+    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+        self.executed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(action);
+        NativeHostActionResult::Queued
+    }
+
+    fn executed_count(&self) -> usize {
+        self.executed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -387,10 +702,25 @@ impl std::fmt::Debug for NativeHostClientRuntime {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NativeHostClientRuntime")
-            .field("connected", &self.client.is_connected())
+            .field(
+                "connected",
+                &self
+                    .client
+                    .lock()
+                    .map(|client| client.is_connected())
+                    .unwrap_or(false),
+            )
             .field("pending_count", &self.pending.len())
-            .field("ready_projection_count", &self.ready_projections.len())
+            .field(
+                "ready_projection_count",
+                &self
+                    .ready_projections
+                    .lock()
+                    .map(|projections| projections.len())
+                    .unwrap_or_default(),
+            )
             .field("runtime_guard", &self.runtime_guard.is_some())
+            .field("worker", &self.worker.is_some())
             .finish()
     }
 }
@@ -437,8 +767,42 @@ impl NativeHostClientRuntime {
         Ok(runtime_owner)
     }
 
+    fn connect_blocking_with_process(
+        profile: &IsolatedDevProfile,
+        process: NativeHostProcess,
+    ) -> Result<Self, NativeShellError> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("runtime bootstrap failed: {error}"),
+                })?,
+        );
+        let client = runtime.block_on(connect_with_startup_retry(profile));
+        let client = client.map_err(|error| NativeShellError::HostConnect {
+            message: error.to_string(),
+        })?;
+        let mut runtime_owner =
+            Self::new_with_runtime_and_process(client, runtime.clone(), process);
+        runtime
+            .block_on(runtime_owner.bootstrap_projection())
+            .map_err(|error| NativeShellError::HostConnect {
+                message: error.to_string(),
+            })?;
+        Ok(runtime_owner)
+    }
+
     pub fn new(client: HostClient) -> Self {
-        Self::new_with_runtime_guard(client, None)
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("native host runtime must be constructible"),
+        );
+        Self::new_with_runtime(client, runtime)
     }
 
     fn new_with_runtime(client: HostClient, runtime: Arc<tokio::runtime::Runtime>) -> Self {
@@ -449,28 +813,55 @@ impl NativeHostClientRuntime {
         client: HostClient,
         runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Self {
+        let endpoint = client.endpoint().to_string();
+        let client = Arc::new(Mutex::new(client));
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(MAX_PENDING_HOST_ACTIONS);
+        let client_for_worker = Arc::clone(&client);
+        let runtime_for_worker = runtime_guard.clone();
+        let projections_for_worker = Arc::new(Mutex::new(VecDeque::new()));
+        let projections_for_worker_thread = Arc::clone(&projections_for_worker);
+        let worker = std::thread::Builder::new()
+            .name("devmanager-native-host-worker".to_string())
+            .spawn(move || {
+                native_host_worker_loop(
+                    client_for_worker,
+                    runtime_for_worker,
+                    command_rx,
+                    projections_for_worker_thread,
+                )
+            })
+            .ok();
         Self {
+            endpoint,
             client,
-            pending: std::collections::VecDeque::new(),
-            ready_projections: std::collections::VecDeque::new(),
+            pending: VecDeque::new(),
+            ready_projections: projections_for_worker,
+            command_tx,
+            worker,
             runtime_guard,
+            host_process: None,
         }
     }
 
-    pub fn client(&self) -> &HostClient {
-        &self.client
-    }
-
-    pub fn client_mut(&mut self) -> &mut HostClient {
-        &mut self.client
+    fn new_with_runtime_and_process(
+        client: HostClient,
+        runtime: Arc<tokio::runtime::Runtime>,
+        process: NativeHostProcess,
+    ) -> Self {
+        let mut runtime_owner = Self::new_with_runtime_guard(client, Some(runtime));
+        runtime_owner.host_process = Some(process);
+        runtime_owner
     }
 
     pub fn is_connected(&self) -> bool {
-        self.client.is_connected()
+        self.client
+            .lock()
+            .map(|client| client.is_connected())
+            .unwrap_or(false)
     }
 
     pub fn endpoint(&self) -> &str {
-        self.client.endpoint()
+        &self.endpoint
     }
 
     pub fn pending_count(&self) -> usize {
@@ -479,7 +870,7 @@ impl NativeHostClientRuntime {
 
     /// Queue one action without performing transport work on the UI thread.
     pub fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
-        if !self.client.is_connected() {
+        if !self.is_connected() {
             return NativeHostActionResult::Disconnected;
         }
         if self.pending.len() >= MAX_PENDING_HOST_ACTIONS {
@@ -495,9 +886,15 @@ impl NativeHostClientRuntime {
     }
 
     pub fn take_pending_bounded(&mut self, max: usize) -> Vec<NativeActionRecord> {
-        self.pending
-            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
-            .collect()
+        let count = max.min(MAX_PENDING_HOST_ACTIONS).min(self.pending.len());
+        self.pending.drain(..count).collect()
+    }
+
+    pub fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+        self.command_tx
+            .try_send(NativeHostWorkerCommand::Execute(action))
+            .map(|_| NativeHostActionResult::Queued)
+            .unwrap_or(NativeHostActionResult::QueueFull)
     }
 
     /// Drain only already-buffered unsolicited host projections. This method
@@ -507,59 +904,132 @@ impl NativeHostClientRuntime {
         &mut self,
         max: usize,
     ) -> Result<Vec<NativeHostProjectionKind>, IpcError> {
-        let mut drained = Vec::with_capacity(max.min(MAX_PENDING_HOST_ACTIONS));
-        for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
-            let message =
-                tokio::time::timeout(Duration::ZERO, self.client.recv_unsolicited()).await;
-            let Ok(message) = message else {
-                break;
-            };
-            let message = message?;
-            let kind = match message {
-                UnsolicitedServerMessage::DurableEvent { .. } => NativeHostProjectionKind::Live,
-                UnsolicitedServerMessage::ResyncRequired { .. } => NativeHostProjectionKind::Replay,
-                UnsolicitedServerMessage::Stream(_) => NativeHostProjectionKind::Live,
-            };
-            if self.ready_projections.len() < MAX_PENDING_HOST_ACTIONS {
-                self.ready_projections.push_back(kind);
-            }
-            drained.push(kind);
-        }
-        Ok(drained)
+        Ok(self.take_ready_projections(max))
     }
 
     pub fn take_ready_projections(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
         self.ready_projections
-            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
-            .collect()
+            .lock()
+            .map(|mut projections| {
+                let count = max.min(MAX_PENDING_HOST_ACTIONS).min(projections.len());
+                projections
+                    .drain(..count)
+                    .map(|projection| projection.kind)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Perform the initial paged snapshot and durable replay handoff on the
-    /// controller lane. The shell receives only the typed projection kinds;
-    /// decoding into the local TaskList remains an explicit projection seam.
+    pub fn take_ready_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
+        self.ready_projections
+            .lock()
+            .map(|mut projections| {
+                let count = max.min(MAX_HOST_PROJECTIONS).min(projections.len());
+                projections.drain(..count).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Perform the initial bounded paged snapshot and durable replay handoff
+    /// on the controller lane. The worker retains only stable task IDs and
+    /// sends one immutable projection to GPUI; row elements are still created
+    /// solely by the uniform-list viewport.
     pub async fn bootstrap_projection(
         &mut self,
     ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
-        let mut projection = Vec::with_capacity(2);
-        match self
+        let mut client = self
             .client
-            .snapshot_page(crate::domain::snapshot::SnapshotSection::Tasks, None, None)
+            .lock()
+            .map_err(|_| NativeShellError::HostConnect {
+                message: "native host client lock poisoned".to_string(),
+            })?;
+        let mut projection = Vec::with_capacity(2);
+        let mut snapshot_id = None;
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut task_ids = Vec::new();
+        let mut pages_read = 0;
+        loop {
+            pages_read += 1;
+            if pages_read > MAX_HOST_SNAPSHOT_PAGES {
+                return Err(NativeShellError::HostConnect {
+                    message: format!(
+                        "native host task snapshot exceeded {} pages",
+                        MAX_HOST_SNAPSHOT_PAGES
+                    ),
+                });
+            }
+            let page = match client
+                .snapshot_page(
+                    crate::domain::snapshot::SnapshotSection::Tasks,
+                    snapshot_id,
+                    cursor.clone(),
+                )
+                .await
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: error.to_string(),
+                })? {
+                Ok(page) => page,
+                Err(error) => {
+                    return Err(NativeShellError::HostConnect {
+                        message: format!("{error:?}"),
+                    })
+                }
+            };
+            snapshot_id = Some(page.snapshot_id);
+            for item in page.items {
+                if let SnapshotItem::Task(task) = item {
+                    if task.task.lifecycle != TaskLifecycle::Archived {
+                        task_ids.push(task.task.id);
+                    }
+                }
+            }
+            if task_ids.len() >= MAX_VIRTUAL_SOURCE_ROWS {
+                task_ids.truncate(MAX_VIRTUAL_SOURCE_ROWS);
+                break;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(NativeShellError::HostConnect {
+                    message: "native host task snapshot repeated a cursor".to_string(),
+                });
+            }
+            cursor = Some(next_cursor);
+        }
+        let task_list = TaskList::from_virtual_task_ids(task_ids).map_err(|overflow| {
+            NativeShellError::HostConnect {
+                message: format!(
+                    "native host task snapshot exceeded {} rows (observed {})",
+                    overflow.limit, overflow.total_count
+                ),
+            }
+        })?;
+        let snapshot_id = snapshot_id.ok_or_else(|| NativeShellError::HostConnect {
+            message: "native host task snapshot returned no snapshot identity".to_string(),
+        })?;
+        client
+            .release_snapshot(snapshot_id)
+            .await
+            .map_err(|error| NativeShellError::HostConnect {
+                message: error.to_string(),
+            })?
+            .map_err(|error| NativeShellError::HostConnect {
+                message: format!("{error:?}"),
+            })?;
+        projection.push(NativeHostProjectionKind::Snapshot);
+        let snapshot_projection = NativeHostProjection {
+            kind: NativeHostProjectionKind::Snapshot,
+            task_list: Some(task_list),
+            error: None,
+        };
+        match client
+            .open_event_replay(0)
             .await
             .map_err(|error| NativeShellError::HostConnect {
                 message: error.to_string(),
             })? {
-            Ok(_) => projection.push(NativeHostProjectionKind::Snapshot),
-            Err(error) => {
-                return Err(NativeShellError::HostConnect {
-                    message: format!("{error:?}"),
-                })
-            }
-        }
-        match self.client.open_event_replay(0).await.map_err(|error| {
-            NativeShellError::HostConnect {
-                message: error.to_string(),
-            }
-        })? {
             Ok(_) => projection.push(NativeHostProjectionKind::Replay),
             Err(error) => {
                 return Err(NativeShellError::HostConnect {
@@ -567,8 +1037,20 @@ impl NativeHostClientRuntime {
                 })
             }
         }
-        self.ready_projections
-            .extend(projection.iter().copied().take(MAX_PENDING_HOST_ACTIONS));
+        if let Ok(mut projections) = self.ready_projections.lock() {
+            if projections.len() < MAX_HOST_PROJECTIONS {
+                projections.push_back(snapshot_projection);
+            }
+            let remaining = MAX_HOST_PROJECTIONS.saturating_sub(projections.len());
+            projections.extend(
+                projection
+                    .iter()
+                    .copied()
+                    .filter(|kind| *kind != NativeHostProjectionKind::Snapshot)
+                    .take(remaining)
+                    .map(NativeHostProjection::kind),
+            );
+        }
         Ok(projection)
     }
 
@@ -580,7 +1062,8 @@ impl NativeHostClientRuntime {
         &mut self,
         envelope: crate::domain::command::CommandEnvelope,
     ) -> Result<crate::domain::command::CommandReceipt, IpcError> {
-        self.client.execute_command(envelope).await
+        let mut client = self.client.lock().map_err(|_| IpcError::Unavailable)?;
+        client.execute_command(envelope).await
     }
 }
 
@@ -590,7 +1073,7 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
     }
 
     fn host_state(&self) -> NativeHostState {
-        if self.client.is_connected() {
+        if self.is_connected() {
             NativeHostState::Connected {
                 endpoint: self.endpoint().to_string(),
             }
@@ -606,6 +1089,145 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
     fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
         self.take_ready_projections(max)
     }
+
+    fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
+        self.take_ready_projection_messages(max)
+    }
+
+    fn take_pending(&mut self, max: usize) -> Vec<NativeActionRecord> {
+        self.take_pending_bounded(max)
+    }
+
+    fn dispatch_pending(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+        NativeHostClientRuntime::dispatch_pending(self, action)
+    }
+}
+
+impl Drop for NativeHostClientRuntime {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.command_tx.send(NativeHostWorkerCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+async fn connect_with_startup_retry(profile: &IsolatedDevProfile) -> Result<HostClient, IpcError> {
+    let config = profile.host_client_config();
+    let mut last_error = None;
+    for _ in 0..40 {
+        match HostClient::connect(config.clone()).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or(IpcError::Unavailable))
+}
+
+fn native_host_worker_loop(
+    client: Arc<Mutex<HostClient>>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+    command_rx: Receiver<NativeHostWorkerCommand>,
+    projections: Arc<Mutex<VecDeque<NativeHostProjection>>>,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    loop {
+        match command_rx.recv_timeout(CONTROLLER_TICK_INTERVAL) {
+            Ok(NativeHostWorkerCommand::Shutdown) => break,
+            Ok(NativeHostWorkerCommand::Execute(action)) => {
+                if let Some(command) = action.command {
+                    let result = client.lock().ok().map(|mut client| {
+                        runtime.block_on(execute_native_command(&mut client, command))
+                    });
+                    let projection = match result {
+                        Some(Ok(())) => NativeHostProjection::kind(NativeHostProjectionKind::Live),
+                        Some(Err(error)) => NativeHostProjection {
+                            kind: NativeHostProjectionKind::Error,
+                            task_list: None,
+                            error: Some(bounded_host_error(error.to_string())),
+                        },
+                        None => NativeHostProjection {
+                            kind: NativeHostProjectionKind::Error,
+                            task_list: None,
+                            error: Some("native host client lock poisoned".to_string()),
+                        },
+                    };
+                    if let Ok(mut queue) = projections.lock() {
+                        if queue.len() < MAX_HOST_PROJECTIONS {
+                            queue.push_back(projection);
+                        }
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let message = client.lock().ok().and_then(|client| {
+            runtime
+                .block_on(tokio::time::timeout(
+                    Duration::ZERO,
+                    client.recv_unsolicited(),
+                ))
+                .ok()
+                .and_then(Result::ok)
+        });
+        if let Some(message) = message {
+            let kind = match message {
+                UnsolicitedServerMessage::DurableEvent { .. }
+                | UnsolicitedServerMessage::Stream(_) => NativeHostProjectionKind::Live,
+                UnsolicitedServerMessage::ResyncRequired { .. } => NativeHostProjectionKind::Replay,
+            };
+            if let Ok(mut queue) = projections.lock() {
+                if queue.len() < MAX_HOST_PROJECTIONS {
+                    queue.push_back(NativeHostProjection::kind(kind));
+                }
+            }
+        }
+    }
+}
+
+async fn execute_native_command(
+    client: &mut HostClient,
+    command: NativeHostCommand,
+) -> Result<(), IpcError> {
+    let envelope = match command {
+        NativeHostCommand::Envelope(envelope) => envelope,
+        NativeHostCommand::TaskCreate(arguments) => crate::client::action::task_create_command(
+            crate::domain::id::CommandId::new(),
+            client.client_id(),
+            unix_time_ms(),
+            arguments,
+        )
+        .map_err(|_| IpcError::Unavailable)?,
+        NativeHostCommand::TaskRename {
+            arguments,
+            expected_task_revision,
+        } => crate::client::action::task_rename_command(
+            crate::domain::id::CommandId::new(),
+            client.client_id(),
+            unix_time_ms(),
+            expected_task_revision,
+            arguments,
+        )
+        .map_err(|_| IpcError::Unavailable)?,
+    };
+    client.execute_command(envelope).await.map(|_| ())
+}
+
+fn unix_time_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 pub enum NativeHostRuntimeAttachment {
@@ -669,6 +1291,15 @@ impl NativeInteraction {
         self.last_handler.as_ref()
     }
 
+    pub fn accepts_action_record(&self, record: &NativeActionRecord) -> bool {
+        self.last_handler.as_ref().is_some_and(|trace| {
+            trace.focus_epoch == record.focus_epoch
+                && trace.request_generation == record.request_generation
+                && trace.consumed
+                && trace.propagation_stopped
+        })
+    }
+
     pub fn set_disabled(&mut self, disabled: bool) {
         self.interaction.set_disabled(disabled);
     }
@@ -693,6 +1324,10 @@ impl NativeInteraction {
     }
 
     fn begin_handler(&mut self, task_id: Option<TaskId>) -> (FocusEpoch, u64) {
+        // Any pointer, terminal, or keyboard event advances the capture
+        // generation. Invalidate a previously resolved key intent before the
+        // new handler can mutate shell state.
+        self.pending_keyboard = None;
         let focus_epoch = self.focus_epochs.current();
         self.interaction.set_focus_epoch(focus_epoch);
         let request_generation = self
@@ -859,12 +1494,23 @@ impl NativeInteraction {
             return None;
         }
         let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+        let command = match &request {
+            ActionRequest::TaskCreate(arguments) => {
+                Some(NativeHostCommand::TaskCreate(arguments.clone()))
+            }
+            ActionRequest::TaskRename(arguments) => Some(NativeHostCommand::TaskRename {
+                arguments: arguments.clone(),
+                expected_task_revision: 0,
+            }),
+            _ => None,
+        };
         let event = ActionEvent::new(request, source, focus_epoch);
         Some(NativeActionRecord {
             id: descriptor.id,
             focus_epoch,
             request_generation,
             event,
+            command,
         })
     }
 }
@@ -960,14 +1606,13 @@ impl AccessibilityTree {
         let rows = task_list
             .rendered_task_ids()
             .iter()
-            .enumerate()
-            .map(|(row_index, task_id)| {
+            .map(|task_id| {
                 let mut row = AccessibilityNode::new(
                     AccessibleRole::Button,
                     format!("Task {task_id}"),
                     "Select this task and open its native task cockpit.",
                 )
-                .gpui(format!("native-task-row-{row_index}"), true, true);
+                .gpui(format!("native-task-row-{}", task_id), true, true);
                 row.metadata.focused = selected_task == Some(*task_id);
                 row
             })
@@ -1043,6 +1688,13 @@ impl AccessibilityTree {
         nodes
     }
 
+    /// Return the platform update produced from this same semantic tree. This
+    /// is used by inspectable accessibility tests and by the Windows bridge;
+    /// it is not a second metadata model.
+    pub fn platform_update_for_test(&self) -> accesskit::TreeUpdate {
+        accesskit_tree_update(self)
+    }
+
     /// The GPUI 0.2.2 element API exposes stable IDs, labels, and focus/tab
     /// hooks rather than a platform accessibility namespace. This projection
     /// is built from those exact IDs and hooks and is used by headless tests to
@@ -1062,6 +1714,152 @@ impl AccessibilityTree {
     }
 }
 
+struct NativePlatformAccessibilityBridge {
+    tree: Arc<Mutex<accesskit::TreeUpdate>>,
+    node_count: usize,
+    attached: bool,
+    #[cfg(windows)]
+    adapter: Option<accesskit_windows::SubclassingAdapter>,
+}
+
+impl NativePlatformAccessibilityBridge {
+    fn new(tree: &AccessibilityTree) -> Self {
+        let update = accesskit_tree_update(tree);
+        Self {
+            tree: Arc::new(Mutex::new(update)),
+            node_count: tree.nodes().len(),
+            attached: false,
+            #[cfg(windows)]
+            adapter: None,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    fn tree_update(&self) -> accesskit::TreeUpdate {
+        self.tree
+            .lock()
+            .map(|tree| tree.clone())
+            .unwrap_or_else(|_| {
+                accesskit_tree_update(&AccessibilityTree::for_task_list(&TaskList::empty(), None))
+            })
+    }
+
+    fn attach_window(&mut self, window: &Window) {
+        #[cfg(windows)]
+        {
+            use accesskit_windows::HWND;
+            use raw_window_handle::RawWindowHandle;
+            let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+                return;
+            };
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return;
+            };
+            let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+            let activation = NativeAccessKitActivation {
+                tree: Arc::clone(&self.tree),
+            };
+            self.adapter = Some(accesskit_windows::SubclassingAdapter::new(
+                hwnd,
+                activation,
+                NativeAccessKitActionHandler,
+            ));
+            self.attached = true;
+        }
+        #[cfg(not(windows))]
+        let _ = window;
+    }
+
+    fn sync(&mut self, tree: &AccessibilityTree) {
+        self.node_count = tree.nodes().len();
+        let update = accesskit_tree_update(tree);
+        if let Ok(mut current) = self.tree.lock() {
+            *current = update.clone();
+        }
+        #[cfg(windows)]
+        if let Some(adapter) = self.adapter.as_mut() {
+            if let Some(events) = adapter.update_if_active(|| update) {
+                events.raise();
+            }
+        }
+    }
+}
+
+fn accesskit_tree_update(tree: &AccessibilityTree) -> accesskit::TreeUpdate {
+    use accesskit::{Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+    fn role(role: AccessibleRole) -> Role {
+        match role {
+            AccessibleRole::Button => Role::Button,
+            AccessibleRole::TextField => Role::TextInput,
+            AccessibleRole::Status => Role::Status,
+            AccessibleRole::Alert => Role::Alert,
+            AccessibleRole::Region => Role::Region,
+        }
+    }
+    fn visit(
+        source: &AccessibilityNode,
+        nodes: &mut Vec<(NodeId, Node)>,
+        next: &mut u64,
+        focused: &mut Option<NodeId>,
+    ) -> NodeId {
+        let id = NodeId::from(*next);
+        *next += 1;
+        let children = source
+            .children()
+            .iter()
+            .map(|child| visit(child, nodes, next, focused))
+            .collect::<Vec<_>>();
+        let mut node = Node::new(role(source.role()));
+        node.set_label(source.name().to_string());
+        node.set_description(source.description().to_string());
+        node.set_author_id(source.element_id().to_string());
+        if source.metadata().focused {
+            node.set_selected(true);
+            *focused = Some(id);
+        }
+        node.set_children(children);
+        nodes.push((id, node));
+        id
+    }
+    let mut nodes = Vec::new();
+    let mut next = 0;
+    let mut focused = None;
+    let root = visit(tree.root(), &mut nodes, &mut next, &mut focused);
+    TreeUpdate {
+        nodes,
+        tree: Some(Tree::new(root)),
+        tree_id: TreeId::ROOT,
+        focus: focused.unwrap_or(root),
+    }
+}
+
+#[cfg(windows)]
+struct NativeAccessKitActivation {
+    tree: Arc<Mutex<accesskit::TreeUpdate>>,
+}
+
+#[cfg(windows)]
+impl accesskit::ActivationHandler for NativeAccessKitActivation {
+    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        self.tree.lock().ok().map(|tree| tree.clone())
+    }
+}
+
+#[cfg(windows)]
+struct NativeAccessKitActionHandler;
+
+#[cfg(windows)]
+impl accesskit::ActionHandler for NativeAccessKitActionHandler {
+    fn do_action(&mut self, _request: accesskit::ActionRequest) {}
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeRenderSmokeReport {
     pub root_constructed: bool,
@@ -1071,6 +1869,10 @@ pub struct NativeRenderSmokeReport {
     pub profile_root: PathBuf,
     pub host_state: NativeHostState,
     pub gpui_accessibility_nodes: Vec<NativeAccessibilityNode>,
+    pub platform_accessibility_bridge: bool,
+    pub platform_accessibility_nodes: usize,
+    pub platform_accessibility_roles: Vec<accesskit::Role>,
+    pub platform_accessibility_focus_is_root: bool,
 }
 
 /// Build a real GPUI element tree without opening a window or touching a host.
@@ -1087,9 +1889,10 @@ pub fn headless_render_smoke(
         .with_assets(AppAssets::new())
         .run(move |cx| {
             crate::ui::init(cx);
-            let entity = cx.new(|cx| NativeShell::new(profile.clone(), cx));
+            let entity = cx.new(|cx| NativeShell::new_for_headless(profile.clone(), cx));
             let report = entity.update(cx, |shell, _cx| {
                 let _root = shell.element_without_handlers();
+                let platform_tree = shell.platform_accessibility_tree_for_test();
                 NativeRenderSmokeReport {
                     root_constructed: true,
                     semantic_nodes: shell.accessibility_tree.nodes().len(),
@@ -1098,9 +1901,19 @@ pub fn headless_render_smoke(
                     profile_root: shell.profile.root().to_path_buf(),
                     host_state: shell.host_state.clone(),
                     gpui_accessibility_nodes: shell.accessibility_tree.gpui_nodes(),
+                    platform_accessibility_bridge: shell.platform_accessibility.is_available(),
+                    platform_accessibility_nodes: shell.platform_accessibility.node_count(),
+                    platform_accessibility_roles: platform_tree
+                        .nodes
+                        .iter()
+                        .map(|(_, node)| node.role())
+                        .collect(),
+                    platform_accessibility_focus_is_root: platform_tree.focus
+                        == accesskit::NodeId::from(0),
                 }
             });
             *report_slot_for_app.borrow_mut() = Some(report);
+            drop(entity);
             cx.quit();
         });
     let report = report_slot
@@ -1122,9 +1935,18 @@ pub struct NativeShell {
     task_list: TaskList,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
+    last_keyboard_action: Option<KeyboardAction>,
     accessibility_tree: AccessibilityTree,
     terminal: TerminalDockAdapter,
     focus_handle: FocusHandle,
+    task_scroll_handle: UniformListScrollHandle,
+    controller_task: Option<Task<()>>,
+    controller_ticks: usize,
+    last_projection_kinds: Vec<NativeHostProjectionKind>,
+    pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
+    appearance_subscription: Option<Subscription>,
+    bounds_subscription: Option<Subscription>,
+    platform_accessibility: NativePlatformAccessibilityBridge,
 }
 
 impl NativeShell {
@@ -1134,6 +1956,19 @@ impl NativeShell {
             None,
             RuntimePreferencesSnapshot::default(),
             cx,
+        )
+    }
+
+    /// Construct the real shell tree for deterministic/headless inspection
+    /// without leaving a periodic controller task alive after GPUI teardown.
+    pub fn new_for_headless(profile: IsolatedDevProfile, cx: &mut Context<Self>) -> Self {
+        Self::new_with_attachment_and_state_and_preferences(
+            profile,
+            None,
+            NativeHostState::Disconnected,
+            RuntimePreferencesSnapshot::default(),
+            cx,
+            false,
         )
     }
 
@@ -1191,6 +2026,7 @@ impl NativeShell {
             host_state,
             preferences,
             cx,
+            true,
         )
     }
 
@@ -1207,6 +2043,7 @@ impl NativeShell {
             host_state,
             preferences,
             cx,
+            false,
         )
     }
 
@@ -1216,10 +2053,12 @@ impl NativeShell {
         host_state: NativeHostState,
         preferences: RuntimePreferencesSnapshot,
         cx: &mut Context<Self>,
+        start_controller: bool,
     ) -> Self {
         let task_list = TaskList::empty();
         let accessibility_tree = AccessibilityTree::for_task_list(&task_list, None);
-        Self {
+        let platform_accessibility = NativePlatformAccessibilityBridge::new(&accessibility_tree);
+        let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
             host_runtime,
@@ -1228,10 +2067,23 @@ impl NativeShell {
             task_list,
             interaction: NativeInteraction::new(None),
             keyboard: KeyboardModel::default(),
+            last_keyboard_action: None,
             accessibility_tree,
-            terminal: TerminalDockAdapter::unavailable(),
+            terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
             focus_handle: cx.focus_handle().tab_stop(true),
+            task_scroll_handle: UniformListScrollHandle::new(),
+            controller_task: None,
+            controller_ticks: 0,
+            last_projection_kinds: Vec::new(),
+            pending_preferences: VecDeque::new(),
+            appearance_subscription: None,
+            bounds_subscription: None,
+            platform_accessibility,
+        };
+        if start_controller {
+            shell.start_controller(cx);
         }
+        shell
     }
 
     pub fn profile(&self) -> &IsolatedDevProfile {
@@ -1258,6 +2110,140 @@ impl NativeShell {
 
     pub fn preferences(&self) -> RuntimePreferencesSnapshot {
         self.preferences
+    }
+
+    pub fn last_keyboard_action(&self) -> Option<KeyboardAction> {
+        self.last_keyboard_action
+    }
+
+    fn start_controller(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(
+            |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    loop {
+                        Timer::after(CONTROLLER_TICK_INTERVAL).await;
+                        if this
+                            .update(&mut async_cx, |shell, _cx| {
+                                shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            },
+        );
+        self.controller_task = Some(task);
+    }
+
+    pub fn controller_tick_for_test(&mut self, max: usize) {
+        self.controller_tick(max);
+    }
+
+    pub fn controller_tick_count(&self) -> usize {
+        self.controller_ticks
+    }
+
+    pub fn last_projection_kinds(&self) -> Vec<NativeHostProjectionKind> {
+        self.last_projection_kinds.clone()
+    }
+
+    pub fn queue_preferences(&mut self, preferences: RuntimePreferencesSnapshot) {
+        self.pending_preferences.push_back(preferences);
+    }
+
+    pub fn queue_preferences_for_test(&mut self, preferences: RuntimePreferencesSnapshot) {
+        self.queue_preferences(preferences);
+    }
+
+    fn controller_tick(&mut self, max: usize) {
+        self.controller_ticks = self.controller_ticks.saturating_add(1);
+        if let Some(preferences) = self.pending_preferences.pop_back() {
+            self.pending_preferences.clear();
+            self.preferences = preferences;
+            self.terminal.set_preferences(preferences);
+        }
+
+        let projections = match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                runtime.drain_projection_messages(max)
+            }
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.take_ready_projection_messages(max)
+            }
+            None => Vec::new(),
+        };
+        if !projections.is_empty() {
+            self.last_projection_kinds = projections
+                .iter()
+                .map(|projection| projection.kind)
+                .collect();
+        }
+        for projection in projections {
+            if let Some(task_list) = projection.task_list {
+                self.apply_task_list(task_list);
+            }
+            if let Some(error) = projection.error {
+                self.host_state = NativeHostState::Error { message: error };
+            }
+        }
+
+        let pending = match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.take_pending(max),
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.take_pending_bounded(max),
+            None => Vec::new(),
+        };
+        for action in pending {
+            if !self.interaction.accepts_action_record(&action) {
+                continue;
+            }
+            if let Some(runtime) = self.host_runtime.as_mut() {
+                let result = match runtime {
+                    NativeHostRuntimeAttachment::Injected(runtime) => {
+                        runtime.dispatch_pending(action)
+                    }
+                    NativeHostRuntimeAttachment::Client(runtime) => {
+                        runtime.dispatch_pending(action)
+                    }
+                };
+                if matches!(result, NativeHostActionResult::Disconnected) {
+                    self.host_state = NativeHostState::Disconnected;
+                }
+            }
+        }
+
+        let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
+        let metrics = self.preferences.tokens().density.physical();
+        let _ = self.task_list.set_scroll_offset_pixels(
+            -offset,
+            metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
+            metrics.row_height as f32,
+        );
+        self.accessibility_tree =
+            AccessibilityTree::for_task_list(&self.task_list, self.interaction.selected_task());
+        self.platform_accessibility.sync(&self.accessibility_tree);
+    }
+
+    fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.platform_accessibility.attach_window(window);
+        let appearance = cx.observe_window_appearance(window, |shell, window, _cx| {
+            shell.queue_preferences(RuntimePreferencesSnapshot::from_system(
+                window.appearance(),
+                window.scale_factor(),
+                shell.preferences.density(),
+            ));
+        });
+        let bounds = cx.observe_window_bounds(window, |shell, window, _cx| {
+            shell.queue_preferences(RuntimePreferencesSnapshot::from_system(
+                window.appearance(),
+                window.scale_factor(),
+                shell.preferences.density(),
+            ));
+        });
+        self.appearance_subscription = Some(appearance);
+        self.bounds_subscription = Some(bounds);
     }
 
     pub fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
@@ -1346,6 +2332,13 @@ impl NativeShell {
         &self.accessibility_tree
     }
 
+    /// Return the same AccessKit update sent to the Windows adapter. This is
+    /// an inspectable platform-tree seam for acceptance tests; it is not a
+    /// second accessibility model.
+    pub fn platform_accessibility_tree_for_test(&self) -> accesskit::TreeUpdate {
+        self.platform_accessibility.tree_update()
+    }
+
     /// Replace the bounded host projection supplied by the inbox attachment.
     /// This is a pure handoff; no client, subscription, or second connection
     /// is created by the shell.
@@ -1358,6 +2351,7 @@ impl NativeShell {
         self.task_list = task_list;
         self.accessibility_tree =
             AccessibilityTree::for_task_list(&self.task_list, self.interaction.selected_task());
+        self.platform_accessibility.sync(&self.accessibility_tree);
     }
 
     pub fn task_list(&self) -> &TaskList {
@@ -1387,9 +2381,21 @@ impl NativeShell {
             .p(px(metrics.control_padding as f32))
             .bg(tokens.surfaces.raised.to_gpui())
             .child(
+                div()
+                    .id("native-shell-header-title")
+                    .text_size(px(18.0))
+                    .child("Task Cockpit"),
+            )
+            .child(
+                div()
+                    .id("native-shell-header-placeholder")
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child("Header"),
+            )
+            .child(
                 Button::new("native-shell-host-status")
                     .label("Host status")
-                    .ghost(),
+                    .info(),
             )
             .child(
                 div()
@@ -1403,6 +2409,12 @@ impl NativeShell {
             .flex_col()
             .gap(px(tokens.density.spacing.xs))
             .overflow_y_scroll()
+            .child(
+                div()
+                    .id("native-task-inbox-label")
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child("Task Inbox"),
+            )
             .children(task_rows);
         let terminal = div()
             .id("native-shell-terminal-dock")
@@ -1425,53 +2437,78 @@ impl NativeShell {
     fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
         let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
-        let task_rows = self
-            .task_list
-            .rendered_task_ids()
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(row_index, task_id)| {
-                let handler = cx.listener(move |shell, event: &MouseDownEvent, window, cx| {
-                    if event.button == MouseButton::Left {
-                        cx.stop_propagation();
-                        shell.focus_handle.focus(window);
-                        let _ = shell
-                            .interaction
-                            .navigation_mouse_down(task_id, &shell.task_list);
-                        shell.accessibility_tree = AccessibilityTree::for_task_list(
-                            &shell.task_list,
-                            shell.interaction.selected_task(),
-                        );
-                    }
-                });
-                let key_handler = cx.listener(move |shell, event: &KeyDownEvent, _window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        cx.stop_propagation();
-                        let _ = shell
-                            .interaction
-                            .navigation_mouse_down(task_id, &shell.task_list);
-                        shell.accessibility_tree = AccessibilityTree::for_task_list(
-                            &shell.task_list,
-                            shell.interaction.selected_task(),
-                        );
-                    }
-                });
-                div()
-                    .id(("native-task-row", row_index as u64))
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(metrics.row_height as f32))
-                    .p(px(metrics.row_padding as f32))
-                    .border_b_1()
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .whitespace_normal()
-                    .on_mouse_down(MouseButton::Left, handler)
-                    .on_key_down(key_handler)
-                    .child(format!("Task {task_id}"))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let task_ids = self.task_list.shared_task_ids();
+        let shell_entity = cx.entity().downgrade();
+        let task_list_element = uniform_list(
+            "native-task-uniform-list",
+            task_ids.len(),
+            move |range, _window, _app| {
+                range
+                    .filter_map(|index| {
+                        task_ids.get(index).copied().map(|task_id| (index, task_id))
+                    })
+                    .map(|(_index, task_id)| {
+                        let shell_for_mouse = shell_entity.clone();
+                        let shell_for_key = shell_entity.clone();
+                        let mouse_handler =
+                            move |event: &MouseDownEvent,
+                                  window: &mut Window,
+                                  app: &mut gpui::App| {
+                                if event.button == MouseButton::Left {
+                                    let _ = shell_for_mouse.update(app, |shell, cx| {
+                                        cx.stop_propagation();
+                                        shell.focus_handle.focus(window);
+                                        let _ = shell
+                                            .interaction
+                                            .navigation_mouse_down(task_id, &shell.task_list);
+                                        shell.accessibility_tree = AccessibilityTree::for_task_list(
+                                            &shell.task_list,
+                                            shell.interaction.selected_task(),
+                                        );
+                                        shell
+                                            .platform_accessibility
+                                            .sync(&shell.accessibility_tree);
+                                    });
+                                }
+                            };
+                        let key_handler =
+                            move |event: &KeyDownEvent,
+                                  _window: &mut Window,
+                                  app: &mut gpui::App| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    let _ = shell_for_key.update(app, |shell, cx| {
+                                        cx.stop_propagation();
+                                        let _ = shell
+                                            .interaction
+                                            .navigation_mouse_down(task_id, &shell.task_list);
+                                        shell.accessibility_tree = AccessibilityTree::for_task_list(
+                                            &shell.task_list,
+                                            shell.interaction.selected_task(),
+                                        );
+                                        shell
+                                            .platform_accessibility
+                                            .sync(&shell.accessibility_tree);
+                                    });
+                                }
+                            };
+                        div()
+                            .id(stable_task_element_id(task_id))
+                            .tab_stop(true)
+                            .w_full()
+                            .h(px(metrics.row_height as f32))
+                            .p(px(metrics.row_padding as f32))
+                            .border_b_1()
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .whitespace_normal()
+                            .on_mouse_down(MouseButton::Left, mouse_handler)
+                            .on_key_down(key_handler)
+                            .child(format!("Task {task_id}"))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .track_scroll(self.task_scroll_handle.clone());
 
         let terminal_down = cx.listener(|shell, event: &MouseDownEvent, window, cx| {
             cx.stop_propagation();
@@ -1491,18 +2528,20 @@ impl NativeShell {
             cx.stop_propagation();
             shell.interaction.terminal_mouse_up();
         });
+        let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
             cx.stop_propagation();
-            let delta = -(event.delta.pixel_delta(px(metrics.row_height as f32)).y / px(1.0));
-            let _ = shell.task_list.apply_scroll_delta(
-                delta,
-                metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
-                metrics.row_height as f32,
-            );
+            let delta = event.delta.pixel_delta(px(metrics.row_height as f32)).y;
+            let scroll_state = scroll_handle.0.borrow_mut();
+            let offset = scroll_state.base_handle.offset();
+            scroll_state
+                .base_handle
+                .set_offset(point(offset.x, offset.y - delta));
             shell.accessibility_tree = AccessibilityTree::for_task_list(
                 &shell.task_list,
                 shell.interaction.selected_task(),
             );
+            shell.platform_accessibility.sync(&shell.accessibility_tree);
         });
 
         let host_actions = cx.listener(|shell, _action: &HostActions, _window, cx| {
@@ -1655,9 +2694,21 @@ impl NativeShell {
                     .p(px(metrics.control_padding as f32))
                     .bg(tokens.surfaces.raised.to_gpui())
                     .child(
+                        div()
+                            .id("native-shell-header-title")
+                            .text_size(px(18.0))
+                            .child("Task Cockpit"),
+                    )
+                    .child(
+                        div()
+                            .id("native-shell-header-placeholder")
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child("Header"),
+                    )
+                    .child(
                         Button::new("native-shell-host-status")
                             .label("Host status")
-                            .ghost()
+                            .info()
                             .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                                 cx.stop_propagation();
                                 shell.dispatch_pointer_action(
@@ -1674,9 +2725,14 @@ impl NativeShell {
                     .w_full()
                     .flex_col()
                     .gap(px(tokens.density.spacing.xs))
-                    .overflow_y_scroll()
                     .on_scroll_wheel(inbox_scroll)
-                    .children(task_rows),
+                    .child(
+                        div()
+                            .id("native-task-inbox-label")
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child("Task Inbox"),
+                    )
+                    .child(task_list_element),
             )
             .child(
                 div()
@@ -1688,6 +2744,10 @@ impl NativeShell {
                     .bg(tokens.surfaces.sunken.to_gpui())
                     .child(self.terminal.element()),
             )
+    }
+
+    pub fn dispatch_action_for_test(&mut self, request: ActionRequest) {
+        self.dispatch_action(request);
     }
 
     fn dispatch_action(&mut self, request: ActionRequest) {
@@ -1713,9 +2773,12 @@ impl NativeShell {
         else {
             return;
         };
-        let _ = self
+        if self
             .interaction
-            .commit_keyboard_action(focus_epoch, request_generation, action);
+            .commit_keyboard_action(focus_epoch, request_generation, action)
+        {
+            self.last_keyboard_action = Some(action);
+        }
     }
 
     fn enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
@@ -1728,18 +2791,9 @@ impl NativeShell {
 
     fn host_status_text(&self) -> String {
         match &self.host_state {
-            NativeHostState::Connected { endpoint } => {
-                format!(
-                    "{} · isolated endpoint: {endpoint}",
-                    self.host_state.label()
-                )
-            }
-            NativeHostState::Disconnected => {
-                "Disconnected · isolated Phase 2 host unavailable".to_string()
-            }
-            NativeHostState::Error { message } => {
-                format!("Error · isolated Phase 2 host: {message}")
-            }
+            NativeHostState::Connected { .. } => "Connected · host".to_string(),
+            NativeHostState::Disconnected => "Disconnected · host".to_string(),
+            NativeHostState::Error { .. } => "Error · host".to_string(),
         }
     }
 }
@@ -1754,9 +2808,20 @@ impl Render for NativeShell {
 /// dev/test profile. The preview CLI remains a separate host-free path.
 pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeShellError> {
     let profile = isolated_dev_profile(workspace_root)?;
-    let (host_runtime, host_state) = match NativeHostClientRuntime::connect_blocking(&profile) {
+    let mut bootstrap = ProcessNativeHostBootstrap;
+    run_native_shell_with_bootstrap(profile, &mut bootstrap)
+}
+
+pub fn run_native_shell_with_bootstrap(
+    profile: IsolatedDevProfile,
+    bootstrap: &mut dyn NativeHostBootstrap,
+) -> Result<(), NativeShellError> {
+    let (host_runtime, host_state) = match bootstrap.start(&profile) {
         Ok(runtime) => {
-            let endpoint = runtime.endpoint().to_string();
+            let endpoint = match &runtime {
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.endpoint().to_string(),
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.endpoint().to_string(),
+            };
             (Some(runtime), NativeHostState::Connected { endpoint })
         }
         Err(NativeShellError::HostConnect { message }) => (
@@ -1791,12 +2856,16 @@ pub fn run_native_shell_with_runtime(
             endpoint: runtime.endpoint().to_string(),
         })
         .unwrap_or(NativeHostState::Disconnected);
-    launch_native_shell(profile, host_runtime, host_state)
+    launch_native_shell(
+        profile,
+        host_runtime.map(NativeHostRuntimeAttachment::Client),
+        host_state,
+    )
 }
 
 fn launch_native_shell(
     profile: IsolatedDevProfile,
-    host_runtime: Option<NativeHostClientRuntime>,
+    host_runtime: Option<NativeHostRuntimeAttachment>,
     host_state: NativeHostState,
 ) -> Result<(), NativeShellError> {
     eprintln!(
@@ -1822,17 +2891,22 @@ fn launch_native_shell(
                     let preferences = RuntimePreferencesSnapshot::from_system(
                         window.appearance(),
                         window.scale_factor(),
-                        Density::Comfortable,
+                        RuntimePreferencesSnapshot::default().density(),
                     );
-                    cx.new(|cx| {
-                        NativeShell::new_with_host_runtime_and_state_and_preferences(
+                    let entity = cx.new(|cx| {
+                        NativeShell::new_with_attachment_and_state_and_preferences(
                             profile_for_window,
                             host_runtime_for_window,
                             host_state_for_window,
                             preferences,
                             cx,
+                            true,
                         )
-                    })
+                    });
+                    let _ = entity.update(cx, |shell, cx| {
+                        shell.install_window_observers(window, cx);
+                    });
+                    entity
                 },
             );
             if let Err(error) = result {
@@ -1851,6 +2925,24 @@ fn launch_native_shell(
 fn bounded_host_error(message: String) -> String {
     const MAX_HOST_ERROR_CHARS: usize = 256;
     message.chars().take(MAX_HOST_ERROR_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_isolated_host_config_base, isolated_dev_profile};
+
+    #[test]
+    fn default_host_bootstrap_prepares_only_the_isolated_config_base() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+
+        assert!(!profile.host_config_base().exists());
+        ensure_isolated_host_config_base(&profile).expect("isolated config base");
+        assert!(profile.host_config_base().is_dir());
+        assert!(std::fs::canonicalize(profile.host_config_base())
+            .expect("canonical isolated config base")
+            .starts_with(profile.workspace_root()));
+    }
 }
 
 #[allow(dead_code)]

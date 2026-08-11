@@ -2,8 +2,9 @@ use devmanager::domain::id::TaskId;
 use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
-    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHostRuntimeStub,
-    NativeHostState, NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
+    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHostLaunchSpec,
+    NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeStub, NativeHostState,
+    NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::TaskList;
@@ -18,6 +19,16 @@ fn task_id(tail: u8) -> TaskId {
     ];
     bytes[15] = tail;
     TaskId::from_bytes(bytes).expect("fixed UUIDv7 task id")
+}
+
+fn task_id_index(index: usize) -> TaskId {
+    let mut bytes = [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let encoded = (index as u64).to_be_bytes();
+    bytes[9..16].copy_from_slice(&encoded[1..]);
+    TaskId::from_bytes(bytes).expect("unique UUIDv7 task id")
 }
 
 #[test]
@@ -143,6 +154,7 @@ fn native_shell_accepts_one_injected_runtime_seam_without_opening_a_second_clien
             )
         });
         *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
         cx.quit();
     });
     let (endpoint, state, concrete_runtime_absent) = report_slot
@@ -207,6 +219,19 @@ fn keyboard_dispatch_commits_only_the_captured_action_and_epoch() {
 }
 
 #[test]
+fn pointer_capture_invalidates_a_pending_keyboard_intent() {
+    let mut interaction = NativeInteraction::new(None);
+    let model = devmanager::ui::actions::KeyboardModel::default();
+    let (focus_epoch, request_generation, action) = interaction
+        .keyboard(&model, KeyboardShortcut::ctrl(ShortcutKey::Character('k')))
+        .expect("ctrl-k should resolve to the palette action");
+
+    let navigation = interaction.navigation_mouse_down(task_id(8), &TaskList::empty());
+    assert!(navigation.propagation_stopped);
+    assert!(!interaction.commit_keyboard_action(focus_epoch, request_generation, action));
+}
+
+#[test]
 fn native_action_dispatch_is_selection_and_interaction_fenced() {
     let selected = task_id(3);
     let foreign = task_id(4);
@@ -249,4 +274,141 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     assert_eq!(profile.named_profile(), "native-next-dev");
     assert_eq!(config.named_profile, profile.named_profile());
     assert!(config.client_build.starts_with("devmanager-next/"));
+}
+
+#[test]
+fn native_host_launch_spec_is_explicitly_isolated_and_single_owner() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let spec = NativeHostLaunchSpec::for_profile(&profile, 42).expect("launch spec");
+
+    assert_eq!(spec.profile, "native-next-dev");
+    assert_eq!(spec.config_base, profile.root());
+    assert_eq!(spec.parent_pid, 42);
+    assert!(spec
+        .arguments()
+        .windows(2)
+        .any(|pair| pair == ["--profile", "native-next-dev"]));
+    assert!(!spec.arguments().iter().any(|arg| arg == "production"));
+}
+
+#[test]
+fn controller_tick_consumes_a_fenced_action_once_and_applies_projection() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let mut fake = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    fake.push_projection_message(NativeHostProjection::kind(NativeHostProjectionKind::Replay));
+    let fake_handle = fake.handle();
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(fake),
+                RuntimePreferencesSnapshot::default(),
+                cx,
+            )
+        });
+        let result = entity.update(cx, |shell, _cx| {
+            shell.dispatch_action_for_test(ActionRequest::TaskCreate(
+                devmanager::client::action::TaskCreateArguments {
+                    task_id: task_id(9),
+                    environment_id: devmanager::domain::id::EnvironmentId::new(),
+                    title: "created once".to_string(),
+                    description: None,
+                    project_id: devmanager::domain::id::ProjectId::new(),
+                    workspace: devmanager::domain::task::WorkspaceRef::Main,
+                },
+            ));
+            shell.controller_tick_for_test(32);
+            shell.controller_tick_for_test(32);
+            (shell.controller_tick_count(), shell.last_projection_kinds())
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
+        cx.quit();
+    });
+    let (ticks, projections) = report_slot.borrow_mut().take().expect("controller report");
+    assert!(ticks >= 2);
+    assert_eq!(projections, vec![NativeHostProjectionKind::Replay]);
+    assert_eq!(fake_handle.executed_count(), 1);
+}
+
+#[test]
+fn virtual_shell_uses_full_source_count_and_stable_task_keys() {
+    let source = (0..100_000).map(task_id_index).collect::<Vec<_>>();
+    let task_list = TaskList::from_virtual_task_ids(source).expect("bounded virtual source");
+    assert_eq!(task_list.total_count(), 100_000);
+    assert!(task_list.rendered_task_ids().len() <= 104);
+    assert_ne!(task_list.stable_key_for(0), task_list.stable_key_for(1));
+    assert!(task_list.uses_gpui_uniform_list());
+}
+
+#[test]
+fn appearance_and_scale_preferences_are_applied_by_controller_not_paint() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
+        let result = entity.update(cx, |shell, _cx| {
+            let next = RuntimePreferencesSnapshot::new(
+                ThemeMode::Light,
+                Density::Compact,
+                Scale::Scale150,
+            );
+            shell.queue_preferences_for_test(next);
+            shell.controller_tick_for_test(32);
+            shell.preferences()
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        drop(entity);
+        cx.quit();
+    });
+    assert_eq!(
+        report_slot.borrow_mut().take().expect("preferences"),
+        RuntimePreferencesSnapshot::new(ThemeMode::Light, Density::Compact, Scale::Scale150)
+    );
+}
+
+#[test]
+fn platform_accessibility_bridge_reports_actual_window_tree_contract() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let report = headless_render_smoke(workspace.path()).expect("headless native shell render");
+    assert!(report.platform_accessibility_bridge);
+    assert!(report.platform_accessibility_nodes >= report.semantic_nodes);
+    assert!(report
+        .platform_accessibility_roles
+        .contains(&accesskit::Role::Region));
+    assert!(report
+        .platform_accessibility_roles
+        .contains(&accesskit::Role::Status));
+    assert!(report.platform_accessibility_focus_is_root);
+}
+
+#[test]
+fn platform_accessibility_tree_exposes_the_focused_task_node() {
+    let task = task_id(12);
+    let task_list = TaskList::from_virtual_task_ids(vec![task]).expect("bounded task source");
+    let tree = AccessibilityTree::for_task_list(&task_list, Some(task));
+    let update = tree.platform_update_for_test();
+
+    assert_ne!(update.focus, accesskit::NodeId::from(0));
+    let focused = update
+        .nodes
+        .iter()
+        .find(|(node_id, _)| *node_id == update.focus)
+        .map(|(_, node)| node)
+        .expect("focused platform node");
+    assert_eq!(focused.is_selected(), Some(true));
+    assert_eq!(focused.label(), Some(format!("Task {task}").as_str()));
 }

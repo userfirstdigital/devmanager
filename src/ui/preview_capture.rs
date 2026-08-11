@@ -1053,6 +1053,7 @@ mod windows_capture_impl {
         let hwnd_slot = Rc::new(RefCell::new(None));
         let hwnd_for_window = Rc::clone(&hwnd_slot);
         let result_for_window = Arc::clone(&result_for_app);
+        let fallback_root = root.clone();
         let application = gpui::Application::new().with_assets(crate::assets::AppAssets::new());
 
         let run_result = catch_unwind(AssertUnwindSafe(|| {
@@ -1085,6 +1086,15 @@ mod windows_capture_impl {
                                 let _ = result_for_window.lock().unwrap().replace(Err(error));
                             }
                         }
+                        let root = match root.instantiate_native_shell(cx) {
+                            Ok(root) => root,
+                            Err(error) => {
+                                let _ = result_for_window.lock().unwrap().replace(Err(
+                                    PreviewCaptureError::ApplicationFailed(error.to_string()),
+                                ));
+                                fallback_root
+                            }
+                        };
                         cx.new(|_| root)
                     },
                 );
