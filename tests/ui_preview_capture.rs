@@ -558,6 +558,123 @@ fn preview_processes_are_job_owned_and_descendant_count_is_join_verified() {
 }
 
 #[test]
+fn preview_capture_new_processes_are_suspended_before_job_assignment() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "CreateProcessW",
+        "CREATE_SUSPENDED",
+        "AssignProcessToJobObject",
+        "ResumeThread",
+    ] {
+        assert!(
+            script.contains(marker),
+            "preview launch must provide {marker} before any child thread can run"
+        );
+    }
+    assert!(
+        !script.contains("Process.Start(startInfo)"),
+        "preview launch must not create a running process before job assignment"
+    );
+}
+
+#[test]
+fn preview_capture_new_external_reader_tasks_are_joined_on_every_exit() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "Join-PreviewReaderTasksBounded",
+        "preview.command.reader-join-failed",
+        "$stdoutTask = $null",
+        "$stderrTask = $null",
+        "$owned.Dispose()",
+    ] {
+        assert!(
+            script.contains(marker),
+            "external command cleanup must provide {marker}"
+        );
+    }
+    let dispose_start = script
+        .find("public void Dispose()")
+        .expect("owned process dispose implementation");
+    let dispose = &script[dispose_start..];
+    assert!(
+        dispose.find("Job.Dispose()") < dispose.find("StandardOutput.Dispose()"),
+        "owned job must terminate child writers before closing synchronous reader handles"
+    );
+}
+
+#[test]
+fn preview_capture_new_json_serialization_is_preflight_bounded() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    let preflight = script
+        .find("Assert-PreviewJsonValueBounded")
+        .expect("JSON graph preflight marker");
+    let serialization = script
+        .find("$json = $Value | ConvertTo-Json")
+        .expect("JSON serialization marker");
+    assert!(
+        preflight < serialization,
+        "bounded JSON preflight must run before ConvertTo-Json allocates the result"
+    );
+    for marker in ["MAX_PREVIEW_JSON_NODES", "preview JSON value exceeded"] {
+        assert!(
+            script.contains(marker),
+            "JSON preflight must enforce {marker}"
+        );
+    }
+    for serialization in [
+        "$Value | ConvertTo-Json",
+        "$entries | ConvertTo-Json",
+        "$contract | ConvertTo-Json",
+        "$receipt | ConvertTo-Json",
+    ] {
+        let serialization_offset = script
+            .find(serialization)
+            .unwrap_or_else(|| panic!("JSON serialization marker missing: {serialization}"));
+        assert!(
+            script[..serialization_offset].contains("Assert-PreviewJsonValueBounded"),
+            "JSON preflight must precede {serialization}"
+        );
+    }
+}
+
+#[test]
+fn preview_capture_new_unix_unlink_and_drop_cleanup_errors_remain_visible() {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview_capture.rs"),
+    )
+    .expect("preview capture source");
+    assert!(
+        source.contains("unlinkat"),
+        "Unix publication must retain handle-relative unlink"
+    );
+    assert!(
+        !source.contains("let _ = unsafe { libc::unlinkat")
+            && !source.contains("let _ = self.authority.remove_temp_relative")
+            && !source.contains("let _ = self.authority.remove_output_relative")
+            && !source.contains("let _ = cleanup_authorized_output_after_deadline"),
+        "publication and TempOutput cleanup failures must not be discarded"
+    );
+    for marker in ["record_cleanup_failure", "retry"] {
+        assert!(
+            source.contains(marker),
+            "cleanup failure handling must provide {marker}"
+        );
+    }
+}
+
+#[test]
 fn preview_external_io_is_stream_bounded_and_uses_one_absolute_deadline() {
     let script = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

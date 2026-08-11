@@ -1525,6 +1525,19 @@ fn cleanup_authorized_output_after_deadline(
     }
 }
 
+fn preserve_capture_error_after_authorized_cleanup(
+    authority: Arc<CaptureOutputAuthority>,
+    primary: PreviewCaptureError,
+    deadline: CaptureDeadline,
+) -> PreviewCaptureError {
+    let settled = cleanup_authorized_output_after_deadline(authority, primary.clone(), deadline);
+    if matches!(settled, PreviewCaptureError::CleanupFailed(_)) {
+        settled
+    } else {
+        primary
+    }
+}
+
 fn capture_executor() -> &'static CaptureExecutor {
     CAPTURE_EXECUTOR.get_or_init(|| {
         let (sender, receiver) =
@@ -2369,40 +2382,52 @@ fn encode_bgra_png_atomic_sync(
     authority.verify_reopened()?;
     lease.check(deadline)?;
 
-    let (temp_name, mut file) = open_temp_output_relative(&authority, output, deadline, lease)?;
-    let mut temp = TempOutput::new(temp_name.clone(), Arc::clone(&authority));
-    lease.check(deadline)?;
-
-    let mut rgba = Vec::with_capacity(expected_bytes);
-    for pixel in bgra.chunks_exact(4) {
+    let (temp_name, file) = open_temp_output_relative(&authority, output, deadline, lease)?;
+    let cleanup = TempCleanupState::default();
+    let mut temp = TempOutput::new(temp_name.clone(), Arc::clone(&authority), cleanup.clone());
+    let result = (|| -> Result<(), PreviewCaptureError> {
+        let mut file = file;
         lease.check(deadline)?;
-        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-    }
 
-    {
-        lease.check(deadline)?;
-        let encoder = image::codecs::png::PngEncoder::new(&mut file);
-        encoder
-            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
-            .map_err(|error| PreviewCaptureError::PngFailed(error.to_string()))?;
-    }
-
-    lease.check(deadline)?;
-    file.sync_all()
-        .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
-    lease.check(deadline)?;
-    lease.publish_with(deadline, || {
-        atomic_publish_temp(&temp_name, &authority, &file)
-            .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
-        temp.renamed = true;
-        drop(file);
-        if let Some(callback) = publication.take() {
-            callback();
+        let mut rgba = Vec::with_capacity(expected_bytes);
+        for pixel in bgra.chunks_exact(4) {
+            lease.check(deadline)?;
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
+
+        {
+            lease.check(deadline)?;
+            let encoder = image::codecs::png::PngEncoder::new(&mut file);
+            encoder
+                .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|error| PreviewCaptureError::PngFailed(error.to_string()))?;
+        }
+
+        lease.check(deadline)?;
+        file.sync_all()
+            .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+        lease.check(deadline)?;
+        lease.publish_with(deadline, || {
+            let publication_result = atomic_publish_temp(&temp_name, &authority, &file)
+                .map_err(|error| PreviewCaptureError::OutputFailed(error.to_string()))?;
+            temp.renamed = true;
+            temp.temp_removed = matches!(&publication_result, AtomicPublishOutcome::Published);
+            if let AtomicPublishOutcome::PublishedWithTempCleanupError = publication_result {
+                return Err(PreviewCaptureError::OutputFailed(
+                    "temporary preview entry cleanup did not settle".into(),
+                ));
+            }
+            drop(file);
+            if let Some(callback) = publication.take() {
+                callback();
+            }
+            Ok(())
+        })?;
+        temp.committed = true;
         Ok(())
-    })?;
-    temp.committed = true;
-    Ok(())
+    })();
+    drop(temp);
+    settle_temp_cleanup_result(result, &cleanup)
 }
 
 #[cfg(test)]
@@ -2512,11 +2537,17 @@ fn next_temp_name(stem: &str, counter: usize) -> OsString {
 /// open inode (`linkat(AT_EMPTY_PATH)`) so a swapped temporary path cannot
 /// replace the source. Other Unix platforms fail closed rather than resolving
 /// an absolute parent path after validation.
+#[allow(dead_code)]
+enum AtomicPublishOutcome {
+    Published,
+    PublishedWithTempCleanupError,
+}
+
 fn atomic_publish_temp(
     temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicPublishOutcome> {
     #[cfg(windows)]
     {
         return atomic_publish_temp_windows(temp, authority, file);
@@ -2543,7 +2574,7 @@ fn atomic_publish_temp_unix(
     temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicPublishOutcome> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -2582,8 +2613,28 @@ fn atomic_publish_temp_unix(
         if result != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0) };
-        return Ok(());
+        let mut cleanup_failed = false;
+        // A bounded retry keeps transient directory-entry contention
+        // retryable while preserving the published-state cleanup signal.
+        for attempt in 0..3 {
+            let unlink_result =
+                unsafe { libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0) };
+            if unlink_result == 0 {
+                return Ok(AtomicPublishOutcome::Published);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(AtomicPublishOutcome::Published);
+            }
+            cleanup_failed = true;
+            if attempt < 2 {
+                std::thread::yield_now();
+            }
+        }
+        if cleanup_failed {
+            return Ok(AtomicPublishOutcome::PublishedWithTempCleanupError);
+        }
+        return Ok(AtomicPublishOutcome::Published);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -2601,7 +2652,7 @@ fn atomic_publish_temp_windows(
     _temp: &std::ffi::OsStr,
     authority: &CaptureOutputAuthority,
     file: &std::fs::File,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicPublishOutcome> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
@@ -2683,7 +2734,7 @@ fn atomic_publish_temp_windows(
             ));
         }
     }
-    Ok(())
+    Ok(AtomicPublishOutcome::Published)
 }
 
 fn reject_reparse_ancestors(path: &Path) -> Result<(), PreviewCaptureError> {
@@ -2723,19 +2774,75 @@ fn reject_reparse_ancestors(path: &Path) -> Result<(), PreviewCaptureError> {
     Ok(())
 }
 
+struct TempCleanupFailure {
+    operation: &'static str,
+    error: PreviewCaptureError,
+}
+
+#[derive(Clone, Default)]
+struct TempCleanupState {
+    failures: Arc<Mutex<Vec<TempCleanupFailure>>>,
+}
+
+impl TempCleanupState {
+    fn record_cleanup_failure(&self, operation: &'static str, error: PreviewCaptureError) {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failures.len() < 2 {
+            failures.push(TempCleanupFailure { operation, error });
+        }
+    }
+
+    fn take(&self) -> Vec<TempCleanupFailure> {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *failures)
+    }
+}
+
+fn settle_temp_cleanup_result(
+    mut result: Result<(), PreviewCaptureError>,
+    state: &TempCleanupState,
+) -> Result<(), PreviewCaptureError> {
+    for failure in state.take() {
+        let primary = match result {
+            Ok(()) => {
+                PreviewCaptureError::CaptureFailed("capture output cleanup did not settle".into())
+            }
+            Err(error) => error,
+        };
+        result = Err(PreviewCaptureError::CleanupFailed(
+            CleanupFailureContext::from_settlement(primary, failure.operation, failure.error),
+        ));
+    }
+    result
+}
+
 struct TempOutput {
     temp_name: OsString,
     authority: Arc<CaptureOutputAuthority>,
+    cleanup: TempCleanupState,
     renamed: bool,
+    temp_removed: bool,
     committed: bool,
 }
 
 impl TempOutput {
-    fn new(temp_name: OsString, authority: Arc<CaptureOutputAuthority>) -> Self {
+    fn new(
+        temp_name: OsString,
+        authority: Arc<CaptureOutputAuthority>,
+        cleanup: TempCleanupState,
+    ) -> Self {
         Self {
             temp_name,
             authority,
+            cleanup,
             renamed: false,
+            temp_removed: false,
             committed: false,
         }
     }
@@ -2743,14 +2850,27 @@ impl TempOutput {
 
 impl Drop for TempOutput {
     fn drop(&mut self) {
-        if self.authority.verify_reopened().is_err() {
+        if self.committed {
             return;
         }
-        if !self.renamed {
-            let _ = self.authority.remove_temp_relative(&self.temp_name);
+        if let Err(error) = self.authority.verify_reopened() {
+            self.cleanup
+                .record_cleanup_failure("verify output authority", error);
+            return;
+        }
+        if !self.temp_removed {
+            if let Err(error) = self.authority.remove_temp_relative(&self.temp_name) {
+                self.cleanup
+                    .record_cleanup_failure("remove temporary output", error);
+            } else {
+                self.temp_removed = true;
+            }
         }
         if self.renamed && !self.committed {
-            let _ = self.authority.remove_output_relative();
+            if let Err(error) = self.authority.remove_output_relative() {
+                self.cleanup
+                    .record_cleanup_failure("remove published output", error);
+            }
         }
     }
 }
@@ -3456,30 +3576,27 @@ mod windows_capture_impl {
             Ok(result) => {
                 lease.cancel();
                 let _ = result;
-                let _ = cleanup_authorized_output_after_deadline(
+                return Err(preserve_capture_error_after_authorized_cleanup(
                     Arc::clone(&authority),
                     PreviewCaptureError::CaptureCancelled,
                     deadline,
-                );
-                Err(PreviewCaptureError::CaptureCancelled)
+                ));
             }
             Err(PreviewCaptureError::DeadlineExceeded) => {
                 lease.cancel();
-                let _ = cleanup_authorized_output_after_deadline(
+                return Err(preserve_capture_error_after_authorized_cleanup(
                     Arc::clone(&authority),
                     PreviewCaptureError::DeadlineExceeded,
                     deadline,
-                );
-                Err(PreviewCaptureError::DeadlineExceeded)
+                ));
             }
             Err(error) => {
                 lease.cancel();
-                let _ = cleanup_authorized_output_after_deadline(
+                return Err(preserve_capture_error_after_authorized_cleanup(
                     Arc::clone(&authority),
-                    PreviewCaptureError::CaptureClosed,
+                    error.clone(),
                     deadline,
-                );
-                Err(error)
+                ));
             }
         }
     }

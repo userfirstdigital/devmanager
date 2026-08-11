@@ -40,6 +40,7 @@ $SOURCE_DIGEST_DEADLINE_SECONDS = 30
 $MAX_PREVIEW_ARTIFACT_BYTES = 536870912
 $MAX_PREVIEW_RECEIPT_BYTES = 1048576
 $MAX_PREVIEW_MANIFEST_BYTES = 8388608
+$MAX_PREVIEW_JSON_NODES = 100000
 $MAX_PREVIEW_PNG_BYTES = 134217728
 $MAX_PREVIEW_FIXTURE_BYTES = 4194304
 $PREVIEW_HASH_CHUNK_BYTES = 65536
@@ -49,6 +50,7 @@ $runToken = '{0}-{1}' -f $PID, ([Guid]::NewGuid().ToString('N'))
 if ($env:OS -eq 'Windows_NT' -and $null -eq ('DevManagerPreviewArtifactNative' -as [type])) {
     Add-Type @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -168,6 +170,17 @@ public static class DevManagerPreviewArtifactNative
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private const int FileRenameInfo = 3;
     private const int FileDispositionInfo = 4;
+    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint CreateUnicodeEnvironment = 0x00000400;
+    private const uint CreateNoWindow = 0x08000000;
+    private const uint ExtendedStartupInfoPresent = 0x00080000;
+    private const uint StartfUseStdHandles = 0x00000100;
+    private const uint HandleFlagInherit = 0x00000001;
+    private const uint ProcThreadAttributeHandleList = 0x00020002;
+    private const uint FileOpenExisting = 3;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WriteFile(
@@ -413,6 +426,111 @@ public static class DevManagerPreviewArtifactNative
         public uint TotalTerminatedProcesses;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        public int InheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInfo
+    {
+        public uint Cb;
+        public IntPtr Reserved;
+        public IntPtr Desktop;
+        public IntPtr Title;
+        public uint X;
+        public uint Y;
+        public uint XSize;
+        public uint YSize;
+        public uint XCountChars;
+        public uint YCountChars;
+        public uint FillAttribute;
+        public uint Flags;
+        public ushort ShowWindow;
+        public ushort Reserved2;
+        public IntPtr Reserved2Pointer;
+        public IntPtr StdInput;
+        public IntPtr StdOutput;
+        public IntPtr StdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartupInfoEx
+    {
+        public StartupInfo StartupInfo;
+        public IntPtr AttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        public IntPtr Process;
+        public IntPtr Thread;
+        public uint ProcessId;
+        public uint ThreadId;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CreatePipe(
+        out SafeFileHandle readPipe,
+        out SafeFileHandle writePipe,
+        ref SecurityAttributes securityAttributes,
+        uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetHandleInformation(
+        SafeFileHandle handle,
+        uint mask,
+        uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcessW(
+        string applicationName,
+        StringBuilder commandLine,
+        IntPtr processAttributes,
+        IntPtr threadAttributes,
+        bool inheritHandles,
+        uint creationFlags,
+        byte[] environment,
+        string currentDirectory,
+        ref StartupInfoEx startupInfo,
+        out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetProcessId(IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool InitializeProcThreadAttributeList(
+        IntPtr attributeList,
+        int attributeCount,
+        uint flags,
+        ref IntPtr size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UpdateProcThreadAttribute(
+        IntPtr attributeList,
+        uint flags,
+        IntPtr attribute,
+        IntPtr value,
+        IntPtr size,
+        IntPtr previousValue,
+        IntPtr returnSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateJobObjectW(IntPtr attributes, string name);
 
@@ -473,15 +591,179 @@ public static class DevManagerPreviewArtifactNative
         return job;
     }
 
+    private static SafeFileHandle CreateInheritableNullHandle(uint access)
+    {
+        var handle = CreateFileW(
+            "NUL",
+            access,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            FileOpenExisting,
+            FileAttributeNormal,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid ||
+            !SetHandleInformation(handle, HandleFlagInherit, HandleFlagInherit))
+        {
+            if (handle != null) { handle.Dispose(); }
+            throw new InvalidOperationException("preview child standard-handle setup failed");
+        }
+        return handle;
+    }
+
+    private static void CreateInheritableOutputPipe(
+        out SafeFileHandle reader,
+        out SafeFileHandle writer)
+    {
+        var attributes = new SecurityAttributes
+        {
+            Length = Marshal.SizeOf<SecurityAttributes>(),
+            SecurityDescriptor = IntPtr.Zero,
+            InheritHandle = 1
+        };
+        if (!CreatePipe(out reader, out writer, ref attributes, 0) ||
+            reader == null || writer == null || reader.IsInvalid || writer.IsInvalid)
+        {
+            if (reader != null) { reader.Dispose(); }
+            if (writer != null) { writer.Dispose(); }
+            throw new InvalidOperationException("preview child output-pipe setup failed");
+        }
+        if (!SetHandleInformation(reader, HandleFlagInherit, 0))
+        {
+            reader.Dispose();
+            writer.Dispose();
+            throw new InvalidOperationException("preview child output-pipe inheritance setup failed");
+        }
+    }
+
+    private static string QuoteWindowsArgument(string value)
+    {
+        if (value == null) { return "\"\""; }
+        var needsQuotes = value.Length == 0 || value.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) >= 0;
+        if (!needsQuotes) { return value; }
+        var builder = new StringBuilder(value.Length + 2);
+        builder.Append('"');
+        var backslashes = 0;
+        foreach (var character in value)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+            {
+                builder.Append('\\', backslashes * 2 + 1);
+                builder.Append('"');
+                backslashes = 0;
+                continue;
+            }
+            builder.Append('\\', backslashes);
+            builder.Append(character);
+            backslashes = 0;
+        }
+        builder.Append('\\', backslashes * 2);
+        builder.Append('"');
+        return builder.ToString();
+    }
+
+    private static StringBuilder BuildCommandLine(ProcessStartInfo startInfo)
+    {
+        var builder = new StringBuilder();
+        builder.Append(QuoteWindowsArgument(startInfo.FileName));
+        foreach (var argument in startInfo.ArgumentList)
+        {
+            builder.Append(' ');
+            builder.Append(QuoteWindowsArgument(argument));
+        }
+        return builder;
+    }
+
+    private static byte[] BuildEnvironmentBlock(ProcessStartInfo startInfo)
+    {
+        var names = new List<string>();
+        foreach (var name in startInfo.Environment.Keys)
+        {
+            names.Add(name);
+        }
+        names.Sort(StringComparer.OrdinalIgnoreCase);
+        var builder = new StringBuilder();
+        foreach (var name in names)
+        {
+            var value = startInfo.Environment[name] ?? string.Empty;
+            if (name.IndexOf('\0') >= 0 || name.StartsWith("=", StringComparison.Ordinal) ||
+                value.IndexOf('\0') >= 0)
+            {
+                throw new InvalidOperationException("preview child environment contains an invalid entry");
+            }
+            builder.Append(name).Append('=').Append(value).Append('\0');
+        }
+        builder.Append('\0');
+        return Encoding.Unicode.GetBytes(builder.ToString());
+    }
+
+    private static IntPtr BuildHandleAttributeList(
+        IntPtr[] handles,
+        out IntPtr handleBuffer)
+    {
+        handleBuffer = IntPtr.Zero;
+        IntPtr size = IntPtr.Zero;
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+        if (size == IntPtr.Zero || size.ToInt64() > 1024 * 1024)
+        {
+            throw new InvalidOperationException("preview child handle-list setup failed");
+        }
+        var attributeList = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref size))
+            {
+                throw new InvalidOperationException("preview child handle-list initialization failed");
+            }
+            handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * handles.Length);
+            Marshal.Copy(handles, 0, handleBuffer, handles.Length);
+            if (!UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    (IntPtr)ProcThreadAttributeHandleList,
+                    handleBuffer,
+                    (IntPtr)(IntPtr.Size * handles.Length),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+            {
+                throw new InvalidOperationException("preview child handle-list update failed");
+            }
+            return attributeList;
+        }
+        catch
+        {
+            DeleteProcThreadAttributeList(attributeList);
+            Marshal.FreeHGlobal(attributeList);
+            if (handleBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(handleBuffer);
+                handleBuffer = IntPtr.Zero;
+            }
+            throw;
+        }
+    }
+
     public sealed class PreviewJobProcess : IDisposable
     {
         public Process Process { get; private set; }
         public SafeFileHandle Job { get; private set; }
+        public Stream StandardOutput { get; private set; }
+        public Stream StandardError { get; private set; }
 
-        internal PreviewJobProcess(Process process, SafeFileHandle job)
+        internal PreviewJobProcess(
+            Process process,
+            SafeFileHandle job,
+            Stream standardOutput,
+            Stream standardError)
         {
             Process = process;
             Job = job;
+            StandardOutput = standardOutput;
+            StandardError = standardError;
         }
 
         public void Terminate()
@@ -490,7 +772,7 @@ public static class DevManagerPreviewArtifactNative
             {
                 if (!TerminateJobObject(Job, 1))
                 {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "preview process job termination failed");
+                    throw new InvalidOperationException("preview process job termination failed");
                 }
             }
         }
@@ -508,7 +790,7 @@ public static class DevManagerPreviewArtifactNative
                 uint returned;
                 if (!QueryInformationJobObject(Job, JobObjectBasicAccountingInformationClass, buffer, (uint)size, out returned))
                 {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "preview process job query failed");
+                    throw new InvalidOperationException("preview process job query failed");
                 }
                 return Marshal.PtrToStructure<JobObjectBasicAccountingInformationData>(buffer).ActiveProcesses;
             }
@@ -525,6 +807,16 @@ public static class DevManagerPreviewArtifactNative
                 Job.Dispose();
                 Job = null;
             }
+            if (StandardOutput != null)
+            {
+                StandardOutput.Dispose();
+                StandardOutput = null;
+            }
+            if (StandardError != null)
+            {
+                StandardError.Dispose();
+                StandardError = null;
+            }
             if (Process != null)
             {
                 Process.Dispose();
@@ -535,33 +827,160 @@ public static class DevManagerPreviewArtifactNative
 
     public static PreviewJobProcess StartProcessInJob(ProcessStartInfo startInfo)
     {
+        if (startInfo == null || string.IsNullOrWhiteSpace(startInfo.FileName))
+        {
+            throw new InvalidOperationException("preview process launch arguments are invalid");
+        }
         var job = CreatePreviewJob();
+        SafeFileHandle stdin = null;
+        SafeFileHandle stdoutReader = null;
+        SafeFileHandle stdoutWriter = null;
+        SafeFileHandle stderrReader = null;
+        SafeFileHandle stderrWriter = null;
+        FileStream stdoutStream = null;
+        FileStream stderrStream = null;
+        IntPtr attributeList = IntPtr.Zero;
+        IntPtr handleBuffer = IntPtr.Zero;
+        IntPtr processHandle = IntPtr.Zero;
+        IntPtr threadHandle = IntPtr.Zero;
         Process process = null;
+        var assigned = false;
         try
         {
-            process = Process.Start(startInfo);
-            if (process == null || !AssignProcessToJobObject(job, process.Handle))
+            stdin = CreateInheritableNullHandle(GenericRead);
+            if (startInfo.RedirectStandardOutput)
             {
-                try { TerminateJobObject(job, 1); } catch { }
-                if (process != null)
+                CreateInheritableOutputPipe(out stdoutReader, out stdoutWriter);
+                stdoutStream = new FileStream(stdoutReader, FileAccess.Read, 65536, false);
+                stdoutReader = null;
+            }
+            else
+            {
+                stdoutWriter = CreateInheritableNullHandle(FILE_GENERIC_WRITE);
+            }
+            if (startInfo.RedirectStandardError)
+            {
+                CreateInheritableOutputPipe(out stderrReader, out stderrWriter);
+                stderrStream = new FileStream(stderrReader, FileAccess.Read, 65536, false);
+                stderrReader = null;
+            }
+            else
+            {
+                stderrWriter = CreateInheritableNullHandle(FILE_GENERIC_WRITE);
+            }
+
+            var childHandles = new[]
+            {
+                stdin.DangerousGetHandle(),
+                stdoutWriter.DangerousGetHandle(),
+                stderrWriter.DangerousGetHandle()
+            };
+            attributeList = BuildHandleAttributeList(childHandles, out handleBuffer);
+            var startup = new StartupInfoEx
+            {
+                StartupInfo = new StartupInfo
                 {
-                    try { process.Kill(true); } catch { }
-                    try { process.WaitForExit(0); } catch { }
-                    process.Dispose();
-                }
-                job.Dispose();
+                    Cb = (uint)Marshal.SizeOf<StartupInfoEx>(),
+                    Flags = StartfUseStdHandles,
+                    StdInput = stdin.DangerousGetHandle(),
+                    StdOutput = stdoutWriter.DangerousGetHandle(),
+                    StdError = stderrWriter.DangerousGetHandle()
+                },
+                AttributeList = attributeList
+            };
+            var creationFlags = CREATE_SUSPENDED | CreateUnicodeEnvironment | ExtendedStartupInfoPresent;
+            if (startInfo.CreateNoWindow)
+            {
+                creationFlags |= CreateNoWindow;
+            }
+            var commandLine = BuildCommandLine(startInfo);
+            var environment = BuildEnvironmentBlock(startInfo);
+            ProcessInformation information;
+            if (!CreateProcessW(
+                    null,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    creationFlags,
+                    environment,
+                    string.IsNullOrWhiteSpace(startInfo.WorkingDirectory) ? null : startInfo.WorkingDirectory,
+                    ref startup,
+                    out information))
+            {
+                throw new InvalidOperationException("preview process creation failed");
+            }
+            processHandle = information.Process;
+            threadHandle = information.Thread;
+
+            // The process is still suspended: no process or descendant can run
+            // until the job has accepted the exact native process handle.
+            if (!AssignProcessToJobObject(job, processHandle))
+            {
                 throw new InvalidOperationException("preview process job assignment failed");
             }
-            return new PreviewJobProcess(process, job);
+            assigned = true;
+            if (ResumeThread(threadHandle) == uint.MaxValue)
+            {
+                throw new InvalidOperationException("preview process resume failed");
+            }
+            CloseHandle(threadHandle);
+            threadHandle = IntPtr.Zero;
+            process = Process.GetProcessById((int)information.ProcessId);
+            if (process == null || GetProcessId(process.Handle) != information.ProcessId)
+            {
+                throw new InvalidOperationException("preview process identity could not be retained");
+            }
+            var result = new PreviewJobProcess(process, job, stdoutStream, stderrStream);
+            process = null;
+            stdoutStream = null;
+            stderrStream = null;
+            job = null;
+            return result;
         }
         catch
         {
+            if (assigned && job != null && !job.IsInvalid)
+            {
+                try { TerminateJobObject(job, 1); } catch { }
+            }
+            else if (processHandle != IntPtr.Zero)
+            {
+                try { TerminateProcess(processHandle, 1); } catch { }
+            }
             if (process != null)
             {
                 try { process.Dispose(); } catch { }
             }
-            job.Dispose();
-            throw;
+            throw new InvalidOperationException("preview process launch failed closed");
+        }
+        finally
+        {
+            if (attributeList != IntPtr.Zero)
+            {
+                DeleteProcThreadAttributeList(attributeList);
+                Marshal.FreeHGlobal(attributeList);
+            }
+            if (handleBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(handleBuffer);
+            }
+            if (threadHandle != IntPtr.Zero)
+            {
+                CloseHandle(threadHandle);
+            }
+            if (processHandle != IntPtr.Zero)
+            {
+                CloseHandle(processHandle);
+            }
+            if (stdoutReader != null) { stdoutReader.Dispose(); }
+            if (stderrReader != null) { stderrReader.Dispose(); }
+            if (stdoutWriter != null) { stdoutWriter.Dispose(); }
+            if (stderrWriter != null) { stderrWriter.Dispose(); }
+            if (stdin != null) { stdin.Dispose(); }
+            if (stdoutStream != null) { stdoutStream.Dispose(); }
+            if (stderrStream != null) { stderrStream.Dispose(); }
+            if (job != null) { job.Dispose(); }
         }
     }
 
@@ -866,6 +1285,47 @@ function New-PreviewProcessStartInfo {
     $startInfo
 }
 
+function Join-PreviewReaderTasksBounded {
+    param(
+        [Threading.Tasks.Task]$StdoutTask,
+        [Threading.Tasks.Task]$StderrTask,
+        [datetime]$Deadline
+    )
+
+    $joinFailure = $false
+    foreach ($task in @($StdoutTask, $StderrTask)) {
+        if ($null -eq $task) { continue }
+        while (-not $task.IsCompleted) {
+            $remaining = Get-PreviewRemainingMilliseconds -Deadline $Deadline
+            if ($remaining -le 0) {
+                $joinFailure = $true
+                break
+            }
+            try {
+                if (-not $task.Wait($remaining)) {
+                    $joinFailure = $true
+                    break
+                }
+            } catch {
+                $joinFailure = $true
+                break
+            }
+        }
+        if ($task.IsCompleted) {
+            try {
+                [void]$task.GetAwaiter().GetResult()
+            } catch {
+                # A bounded reader fault is already represented by the
+                # command's primary output/read error.  It is still observed
+                # here so no faulted task escapes the command scope.
+            }
+        }
+    }
+    if ($joinFailure) {
+        throw 'preview.command.reader-join-failed'
+    }
+}
+
 function Invoke-PreviewExternalCommand {
     param(
         [string]$FilePath,
@@ -880,6 +1340,9 @@ function Invoke-PreviewExternalCommand {
     $startInfo = New-PreviewProcessStartInfo -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -Environment $Environment -RedirectOutput
     $owned = $null
     $launch = $null
+    $stdoutTask = $null
+    $stderrTask = $null
+    $processWaitTask = $null
     try {
         $owned = [DevManagerPreviewArtifactNative]::StartProcessInJob($startInfo)
         $launch = [pscustomobject]@{
@@ -888,8 +1351,11 @@ function Invoke-PreviewExternalCommand {
             JoinState = 'started'
             ExitCode = $null
         }
-        $stdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.Process.StandardOutput.BaseStream, $MaxOutputBytes)
-        $stderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.Process.StandardError.BaseStream, $MaxOutputBytes)
+        if ($null -eq $owned.StandardOutput -or $null -eq $owned.StandardError) {
+            throw 'preview.command.output-stream-missing'
+        }
+        $stdoutTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardOutput, $MaxOutputBytes)
+        $stderrTask = [DevManagerPreviewArtifactNative]::ReadBoundedUtf8Async($owned.StandardError, $MaxOutputBytes)
         $processWaitTask = $owned.Process.WaitForExitAsync()
         while (-not ($stdoutTask.IsCompleted -and $stderrTask.IsCompleted -and $processWaitTask.IsCompleted)) {
             if ($stdoutTask.IsFaulted -or $stderrTask.IsFaulted) {
@@ -929,12 +1395,35 @@ function Invoke-PreviewExternalCommand {
             AbsoluteDeadline = $Deadline
         }
     } finally {
+        $cleanupFailure = $false
         if ($null -ne $launch) {
             try {
                 [void](Join-PreviewProcessBounded -Launch $launch -Deadline $Deadline -Label 'external command')
             } catch {
-                throw 'preview.cleanup.failed'
+                $cleanupFailure = $true
+                try {
+                    if ($null -ne $launch.Job) {
+                        $launch.Job.Dispose()
+                    }
+                } catch {
+                    $cleanupFailure = $true
+                }
             }
+        }
+        try {
+            Join-PreviewReaderTasksBounded -StdoutTask $stdoutTask -StderrTask $stderrTask -Deadline $Deadline
+        } catch {
+            $cleanupFailure = $true
+        }
+        try {
+            if ($null -ne $owned) {
+                $owned.Dispose()
+            }
+        } catch {
+            $cleanupFailure = $true
+        }
+        if ($cleanupFailure) {
+            throw 'preview.cleanup.failed'
         }
     }
 }
@@ -1360,6 +1849,88 @@ function Assert-PreviewOutputAuthorityStable {
     $hash
 }
 
+function Assert-PreviewJsonValueBounded {
+    param(
+        [object]$Value,
+        [long]$MaxBytes,
+        [int]$MaxNodes = $MAX_PREVIEW_JSON_NODES,
+        [int]$MaxDepth = 8
+    )
+
+    $state = [pscustomobject]@{
+        Nodes = [int64]0
+        EstimatedBytes = [int64]2
+    }
+    $addEstimate = {
+        param([long]$Bytes)
+        if ($Bytes -lt 0 -or $state.EstimatedBytes -gt ($MaxBytes - $Bytes)) {
+            throw 'preview JSON value exceeded its bounded byte count.'
+        }
+        $state.EstimatedBytes += $Bytes
+    }
+    $visit = $null
+    $visit = {
+        param(
+            [object]$Item,
+            [int]$Depth
+        )
+        if ($Depth -gt $MaxDepth) {
+            throw 'preview JSON value exceeded its bounded depth.'
+        }
+        $state.Nodes++
+        if ($state.Nodes -gt $MaxNodes) {
+            throw 'preview JSON value exceeded its bounded node count.'
+        }
+        if ($null -eq $Item) {
+            & $addEstimate 4
+            return
+        }
+        if ($Item -is [string]) {
+            $utf8Bytes = [int64][Text.Encoding]::UTF8.GetByteCount([string]$Item)
+            if ($utf8Bytes -gt ([int64]::MaxValue / 6)) {
+                throw 'preview JSON value exceeded its bounded byte count.'
+            }
+            & $addEstimate (($utf8Bytes * 6) + 2)
+            return
+        }
+        if ($Item -is [ValueType]) {
+            & $addEstimate 128
+            return
+        }
+        if ($Item -is [Collections.IDictionary]) {
+            & $addEstimate 2
+            foreach ($entry in $Item.GetEnumerator()) {
+                if ($entry.Key -isnot [string]) {
+                    throw 'preview JSON object key is not a bounded string.'
+                }
+                & $visit ([string]$entry.Key) ($Depth + 1)
+                & $visit $entry.Value ($Depth + 1)
+                & $addEstimate 2
+            }
+            return
+        }
+        if ($Item -is [Collections.IEnumerable]) {
+            & $addEstimate 2
+            foreach ($child in $Item) {
+                & $visit $child ($Depth + 1)
+                & $addEstimate 2
+            }
+            return
+        }
+        & $addEstimate 2
+        foreach ($property in $Item.PSObject.Properties) {
+            & $visit ([string]$property.Name) ($Depth + 1)
+            & $visit $property.Value ($Depth + 1)
+            & $addEstimate 2
+        }
+        & $addEstimate 2
+    }
+    & $visit $Value 0
+    if ($state.EstimatedBytes -gt $MaxBytes) {
+        throw 'preview JSON value exceeded its bounded byte count.'
+    }
+}
+
 function Write-PreviewAtomicJson {
     param(
         [string]$Path,
@@ -1380,6 +1951,7 @@ function Write-PreviewAtomicJson {
         [IO.Path]::GetDirectoryName($canonicalPath) -ne $parentPath) {
         throw 'preview JSON publication path is outside the retained output directory.'
     }
+    Assert-PreviewJsonValueBounded -Value $Value -MaxBytes $MaxBytes
     $json = $Value | ConvertTo-Json -Depth 8 -Compress
     $jsonBytes = [Text.Encoding]::UTF8.GetBytes($json)
     if ($jsonBytes.Length -gt $MaxBytes) {
@@ -1523,6 +2095,7 @@ function Get-PreviewSourceContentDigest {
                 $opened.Stream.Dispose()
             }
         }
+        Assert-PreviewJsonValueBounded -Value $entries -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxDepth 8
         $canonical = $entries | ConvertTo-Json -Depth 8 -Compress
         $canonicalBytes = [Text.Encoding]::UTF8.GetBytes($canonical)
         if ($canonicalBytes.Length -gt $MAX_PREVIEW_RECEIPT_BYTES) {
@@ -1816,6 +2389,7 @@ function Get-PreviewBuildIdentity {
         manifestPath = $manifestPath
         canonicalWorktree = $canonicalWorktree
     }
+    Assert-PreviewJsonValueBounded -Value $contract -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxDepth 12
     $canonical = $contract | ConvertTo-Json -Depth 12 -Compress
     $canonicalBytes = [Text.Encoding]::UTF8.GetBytes($canonical)
     if ($canonicalBytes.Length -gt $MAX_PREVIEW_RECEIPT_BYTES) {
@@ -2167,6 +2741,7 @@ function New-PreviewArtifactReceipt {
         embeddedBuildIdentity = $embedded
     }
     Assert-PreviewReceiptSchema -Receipt $receipt
+    Assert-PreviewJsonValueBounded -Value $receipt -MaxBytes $MAX_PREVIEW_RECEIPT_BYTES -MaxDepth 20
     $json = $receipt | ConvertTo-Json -Depth 20 -Compress
     $jsonBytes = [Text.Encoding]::UTF8.GetBytes($json)
     if ($jsonBytes.Length -gt $MAX_PREVIEW_RECEIPT_BYTES) {
