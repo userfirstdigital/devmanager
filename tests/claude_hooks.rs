@@ -1,9 +1,11 @@
 use devmanager::ai::claude_hooks::{
     is_valid_loopback_relay_url, prepare_claude_launch_overlay, quote_shell_argument,
-    run_hook_relay, run_hook_relay_subcommand, ClaudeHookRegistry, ClaudeHookRelayListener,
-    ClaudeIngressLimits, ClaudeReducer, ClaudeReducerLimits, ClaudeRegistryEvent,
-    ClaudeRegistryLimits, ClaudeShellKind, RelayIngestStatus, MAX_CLAUDE_HOOK_BODY_BYTES,
+    run_hook_relay, run_hook_relay_subcommand, ClaudeCorrelationBinding, ClaudeHookRegistry,
+    ClaudeHookRelayListener, ClaudeIngressLimits, ClaudeReducer, ClaudeReducerLimits,
+    ClaudeRegistryEvent, ClaudeRegistryLimits, ClaudeShellKind, RelayIngestStatus,
+    MAX_CLAUDE_HOOK_BODY_BYTES,
 };
+use devmanager::domain::{AgentSessionId, ResourceId, TaskId};
 use devmanager::remote::presentation::{
     SemanticAdapterHealth, SemanticEventKind, SemanticRetention, SemanticToolState,
     StableSessionKey,
@@ -848,12 +850,25 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
         observed.lock().unwrap().push(event);
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
+    let binding = ClaudeCorrelationBinding::new(
+        TaskId::new(),
+        AgentSessionId::new(),
+        1,
+        1,
+        ResourceId::new(),
+    );
     let registration = registry
-        .register_at(StableSessionKey::from_tab("activation-tab"), Instant::now())
+        .register_correlated_at(
+            StableSessionKey::from_tab("activation-tab"),
+            binding,
+            None,
+            None,
+            Instant::now(),
+        )
         .unwrap();
 
     ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .header("x-devmanager-claude-nonce", registration.nonce())
         .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-1","prompt":"before start"}"#)
         .unwrap();
     wait_for(Duration::from_secs(2), || {
@@ -870,10 +885,10 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
         }
     )));
 
-    ureq::post(listener.endpoint())
-        .header("x-devmanager-claude-nonce", &registration.nonce)
-        .send(br#"{"hook_event_name":"SessionStart","source":"startup"}"#)
-        .unwrap();
+    let incomplete = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", registration.nonce())
+        .send(br#"{"hook_event_name":"SessionStart","source":"startup"}"#);
+    assert!(matches!(incomplete, Err(ureq::Error::StatusCode(401))));
     std::thread::sleep(Duration::from_millis(25));
     assert!(
         !events.lock().unwrap().iter().any(|event| matches!(
@@ -888,7 +903,7 @@ fn adapter_health_promotes_only_after_current_session_start_handshake() {
 
     for _ in 0..2 {
         ureq::post(listener.endpoint())
-            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .header("x-devmanager-claude-nonce", registration.nonce())
             .send(br#"{"hook_event_name":"SessionStart","session_id":"provider-1","source":"startup"}"#)
             .unwrap();
     }
@@ -937,7 +952,7 @@ fn registration_without_session_start_expires_after_bounded_activation_grace() {
 }
 
 #[test]
-fn superseded_registration_is_acknowledged_but_cannot_publish_to_replacement_key() {
+fn superseded_registration_is_rejected_and_cannot_publish_to_replacement_key() {
     let registry = Arc::new(ClaudeHookRegistry::default());
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = events.clone();
@@ -954,14 +969,13 @@ fn superseded_registration_is_acknowledged_but_cannot_publish_to_replacement_key
     assert!(replacement.generation > old.generation);
     let old_response = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &old.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"old event"}"#)
-        .unwrap();
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"old event"}"#);
     let replacement_response = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &replacement.nonce)
         .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"replacement event"}"#)
         .unwrap();
 
-    assert_eq!(old_response.status().as_u16(), 204);
+    assert!(matches!(old_response, Err(ureq::Error::StatusCode(401))));
     assert_eq!(replacement_response.status().as_u16(), 204);
     wait_for(Duration::from_secs(2), || {
         events.lock().unwrap().iter().any(|event| matches!(
@@ -1027,13 +1041,12 @@ fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
 
     let stale = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &old.nonce)
-        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"stale queued"}"#)
-        .unwrap();
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"stale queued"}"#);
     let current = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &replacement.nonce)
         .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"current queued"}"#)
         .unwrap();
-    assert_eq!(stale.status().as_u16(), 204);
+    assert!(matches!(stale, Err(ureq::Error::StatusCode(401))));
     assert_eq!(current.status().as_u16(), 204);
 
     {
@@ -1257,18 +1270,7 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
     let malformed = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &registration.nonce)
         .send(br#"{"hook_event_name":"PreToolUse""#);
-    assert_eq!(malformed.unwrap().status().as_u16(), 204);
-    wait_for(Duration::from_secs(2), || {
-        events.lock().unwrap().iter().any(|event| {
-            matches!(
-                event,
-                ClaudeRegistryEvent::AdapterHealth {
-                    health: SemanticAdapterHealth::Degraded,
-                    ..
-                }
-            )
-        })
-    });
+    assert!(matches!(malformed, Err(ureq::Error::StatusCode(400))));
 
     let ended = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &registration.nonce)
@@ -1286,14 +1288,7 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
     let resumed = ureq::post(listener.endpoint())
         .header("x-devmanager-claude-nonce", &registration.nonce)
         .send(br#"{"hook_event_name":"SessionStart","source":"clear"}"#);
-    assert_eq!(resumed.unwrap().status().as_u16(), 204);
-    wait_for(Duration::from_secs(2), || {
-        events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            ClaudeRegistryEvent::Semantic(draft)
-                if matches!(&draft.kind, SemanticEventKind::Status { state, detail } if state == "started" && detail.as_deref() == Some("clear"))
-        ))
-    });
+    assert!(matches!(resumed, Err(ureq::Error::StatusCode(401))));
     assert_eq!(registry.registration_count(), 1);
     registry.unregister(&registration.nonce);
 }

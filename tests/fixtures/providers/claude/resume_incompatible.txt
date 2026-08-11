@@ -1,0 +1,1 @@
+Error: Session is incompatible with this Claude Code version

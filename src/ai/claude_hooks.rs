@@ -1,3 +1,6 @@
+use crate::domain::{
+    AgentSessionId, ProviderSessionId, ResourceId, TaskId, MAX_PROVIDER_SESSION_ID_BYTES,
+};
 use crate::remote::presentation::{
     SemanticAdapterHealth, SemanticEventDraft, SemanticEventKind, SemanticRetention,
     SemanticSource, SemanticToolState, StableSessionKey,
@@ -9,6 +12,7 @@ use axum::routing::post;
 use axum::Router;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -19,6 +23,155 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_CLAUDE_HOOK_BODY_BYTES: usize = 256 * 1024;
+pub const MAX_CLAUDE_HOOK_JSON_NESTING: usize = 8;
+pub const MAX_CLAUDE_HOOK_JSON_STRING_BYTES: usize = 4096;
+pub const MAX_CLAUDE_HOOK_JSON_MAP_ENTRIES: usize = 32;
+pub const MAX_CLAUDE_HOOK_JSON_ARRAY_ELEMENTS: usize = 32;
+pub const MAX_CLAUDE_HOOK_JSON_TOTAL_NODES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeHookJsonBound {
+    BodyTooLarge,
+    Invalid,
+}
+
+pub fn physically_bound_claude_hook_json(body: &[u8]) -> Result<(), ClaudeHookJsonBound> {
+    if body.len() > MAX_CLAUDE_HOOK_BODY_BYTES {
+        return Err(ClaudeHookJsonBound::BodyTooLarge);
+    }
+    scan_claude_hook_json_bounds(body)
+}
+
+fn scan_claude_hook_json_bounds(body: &[u8]) -> Result<(), ClaudeHookJsonBound> {
+    let mut depth = 0_usize;
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_bytes = 0_usize;
+    let mut total_nodes = 0_usize;
+    let mut object_entries = [0_usize; MAX_CLAUDE_HOOK_JSON_NESTING + 1];
+    let mut array_elements = [0_usize; MAX_CLAUDE_HOOK_JSON_NESTING + 1];
+    let mut expecting_key = [false; MAX_CLAUDE_HOOK_JSON_NESTING + 1];
+    let mut in_array = [false; MAX_CLAUDE_HOOK_JSON_NESTING + 1];
+    let mut awaiting_array_value = [false; MAX_CLAUDE_HOOK_JSON_NESTING + 1];
+    while index < body.len() {
+        let byte = body[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                if depth > 0 && expecting_key[depth] {
+                    object_entries[depth] = object_entries[depth].saturating_add(1);
+                    if object_entries[depth] > MAX_CLAUDE_HOOK_JSON_MAP_ENTRIES {
+                        return Err(ClaudeHookJsonBound::Invalid);
+                    }
+                    expecting_key[depth] = false;
+                }
+            }
+            string_bytes = string_bytes.saturating_add(1);
+            if string_bytes > MAX_CLAUDE_HOOK_JSON_STRING_BYTES {
+                return Err(ClaudeHookJsonBound::Invalid);
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b' ' | b'\n' | b'\r' | b'\t' => {}
+            b'"' => {
+                count_hook_json_node(&mut total_nodes)?;
+                note_array_element(
+                    &mut array_elements,
+                    &mut awaiting_array_value,
+                    depth,
+                    in_array,
+                )?;
+                in_string = true;
+                string_bytes = 0;
+            }
+            b'{' | b'[' => {
+                count_hook_json_node(&mut total_nodes)?;
+                note_array_element(
+                    &mut array_elements,
+                    &mut awaiting_array_value,
+                    depth,
+                    in_array,
+                )?;
+                depth = depth.saturating_add(1);
+                if depth > MAX_CLAUDE_HOOK_JSON_NESTING {
+                    return Err(ClaudeHookJsonBound::Invalid);
+                }
+                object_entries[depth] = 0;
+                array_elements[depth] = 0;
+                expecting_key[depth] = byte == b'{';
+                in_array[depth] = byte == b'[';
+                awaiting_array_value[depth] = byte == b'[';
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    return Err(ClaudeHookJsonBound::Invalid);
+                }
+                depth -= 1;
+            }
+            b',' => {
+                if depth > 0 {
+                    expecting_key[depth] = !in_array[depth];
+                    awaiting_array_value[depth] = in_array[depth];
+                }
+            }
+            b':' => {}
+            b't' | b'f' | b'n' | b'-' | b'0'..=b'9' => {
+                count_hook_json_node(&mut total_nodes)?;
+                note_array_element(
+                    &mut array_elements,
+                    &mut awaiting_array_value,
+                    depth,
+                    in_array,
+                )?;
+                while index + 1 < body.len() {
+                    let next = body[index + 1];
+                    if next == b',' || next == b'}' || next == b']' || next.is_ascii_whitespace() {
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            _ => return Err(ClaudeHookJsonBound::Invalid),
+        }
+        index += 1;
+    }
+    if in_string || depth != 0 {
+        return Err(ClaudeHookJsonBound::Invalid);
+    }
+    Ok(())
+}
+
+fn count_hook_json_node(total_nodes: &mut usize) -> Result<(), ClaudeHookJsonBound> {
+    *total_nodes = total_nodes.saturating_add(1);
+    if *total_nodes > MAX_CLAUDE_HOOK_JSON_TOTAL_NODES {
+        return Err(ClaudeHookJsonBound::Invalid);
+    }
+    Ok(())
+}
+
+fn note_array_element(
+    array_elements: &mut [usize],
+    awaiting_array_value: &mut [bool],
+    depth: usize,
+    in_array: [bool; MAX_CLAUDE_HOOK_JSON_NESTING + 1],
+) -> Result<(), ClaudeHookJsonBound> {
+    if depth == 0 || !in_array[depth] || !awaiting_array_value[depth] {
+        return Ok(());
+    }
+    array_elements[depth] = array_elements[depth].saturating_add(1);
+    if array_elements[depth] > MAX_CLAUDE_HOOK_JSON_ARRAY_ELEMENTS {
+        return Err(ClaudeHookJsonBound::Invalid);
+    }
+    awaiting_array_value[depth] = false;
+    Ok(())
+}
 const MAX_PROVIDER_TEXT_BYTES: usize = 48 * 1024;
 const MAX_CLAUDE_SETTINGS_BYTES: usize = 1024 * 1024;
 const CLAUDE_NONCE_BYTES: usize = 32;
@@ -739,8 +892,10 @@ impl ClaudeReducer {
     }
 
     fn provider_session_id(&self, value: &Value) -> String {
-        official_identifier(value, "session_id")
-            .unwrap_or_else(|| self.fallback_provider_session_id.clone())
+        match official_session_id_str(value) {
+            Ok(Some(id)) => id.to_string(),
+            Ok(None) | Err(_) => self.fallback_provider_session_id.clone(),
+        }
     }
 
     fn official_deduplication_key(
@@ -797,6 +952,24 @@ fn official_identifier(value: &Value, field: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(bounded_identifier)
         .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfficialSessionIdError {
+    TooLong,
+}
+
+fn official_session_id_str(value: &Value) -> Result<Option<&str>, OfficialSessionIdError> {
+    let Some(raw) = value.get("session_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() > MAX_PROVIDER_SESSION_ID_BYTES {
+        return Err(OfficialSessionIdError::TooLong);
+    }
+    Ok(Some(raw))
 }
 
 fn scoped_deduplication_key(prefix: &str, provider_session_id: &str, id: &str) -> String {
@@ -876,6 +1049,231 @@ pub struct ClaudeHookRegistration {
     pub generation: u64,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClaudeCorrelationBinding {
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    runtime_generation: u64,
+    action_epoch: u64,
+    process_root: ResourceId,
+}
+
+impl ClaudeCorrelationBinding {
+    pub fn new(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+        process_root: ResourceId,
+    ) -> Self {
+        Self {
+            task_id,
+            agent_session_id,
+            runtime_generation,
+            action_epoch,
+            process_root,
+        }
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn agent_session_id(&self) -> AgentSessionId {
+        self.agent_session_id
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+
+    pub fn action_epoch(&self) -> u64 {
+        self.action_epoch
+    }
+
+    pub fn process_root(&self) -> ResourceId {
+        self.process_root
+    }
+}
+
+impl fmt::Debug for ClaudeCorrelationBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeCorrelationBinding")
+            .field("runtime_generation", &self.runtime_generation)
+            .field("action_epoch", &self.action_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ClaudeSealedCorrelation {
+    binding: ClaudeCorrelationBinding,
+    expected_provider_session_id: Option<ProviderSessionId>,
+}
+
+impl fmt::Debug for ClaudeSealedCorrelation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeSealedCorrelation")
+            .field("binding", &self.binding)
+            .field(
+                "expected_provider_session_id",
+                &self
+                    .expected_provider_session_id
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClaudeCorrelatedRegistration {
+    nonce: String,
+    generation: u64,
+    sealed: ClaudeSealedCorrelation,
+    journal_key: StableSessionKey,
+}
+
+impl fmt::Debug for ClaudeCorrelatedRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeCorrelatedRegistration")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClaudeCorrelatedRegistration {
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    pub fn relay_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.sealed.binding.runtime_generation()
+    }
+
+    pub fn binding(&self) -> &ClaudeCorrelationBinding {
+        &self.sealed.binding
+    }
+
+    pub fn expected_provider_session_id(&self) -> Option<&ProviderSessionId> {
+        self.sealed.expected_provider_session_id.as_ref()
+    }
+
+    pub fn journal_key(&self) -> &StableSessionKey {
+        &self.journal_key
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClaudeAdmittedDelivery {
+    registration: ClaudeCorrelatedRegistration,
+    provider_session_id: ProviderSessionId,
+}
+
+impl ClaudeAdmittedDelivery {
+    pub fn provider_session_id(&self) -> &ProviderSessionId {
+        &self.provider_session_id
+    }
+
+    pub fn nonce(&self) -> &str {
+        self.registration.nonce()
+    }
+
+    pub fn relay_generation(&self) -> u64 {
+        self.registration.relay_generation()
+    }
+
+    pub fn binding(&self) -> &ClaudeCorrelationBinding {
+        self.registration.binding()
+    }
+
+    pub fn registration(&self) -> &ClaudeCorrelatedRegistration {
+        &self.registration
+    }
+
+    pub fn forge_for_test(
+        registration: ClaudeCorrelatedRegistration,
+        provider_session_id: ProviderSessionId,
+    ) -> Self {
+        Self {
+            registration,
+            provider_session_id,
+        }
+    }
+}
+
+impl fmt::Debug for ClaudeAdmittedDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeAdmittedDelivery")
+            .field("relay_generation", &self.registration.relay_generation())
+            .field("provider_session_id", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeBindingField {
+    Task,
+    Agent,
+    Generation,
+    ActionEpoch,
+    ProcessRoot,
+    RelayGeneration,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClaudeCorrelatedIngestError {
+    StaleRegistration,
+    Rejected,
+    Expired,
+    BodyTooLarge,
+    InvalidPayload,
+    ForeignEndpoint,
+    BindingMismatch(ClaudeBindingField),
+    LatePriorSession,
+    ExactResumeMismatch { expected: String, observed: String },
+    RebindRejected { bound: String, observed: String },
+    NotSessionStart,
+    MissingProviderSessionId,
+    CorrelationMismatch,
+    ProviderSessionIdTooLong,
+    SessionIdMismatch,
+}
+
+impl fmt::Debug for ClaudeCorrelatedIngestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExactResumeMismatch { .. } => f
+                .debug_struct("ExactResumeMismatch")
+                .field("expected", &"<redacted>")
+                .field("observed", &"<redacted>")
+                .finish(),
+            Self::RebindRejected { .. } => f
+                .debug_struct("RebindRejected")
+                .field("bound", &"<redacted>")
+                .field("observed", &"<redacted>")
+                .finish(),
+            Self::StaleRegistration => write!(f, "StaleRegistration"),
+            Self::Rejected => write!(f, "Rejected"),
+            Self::Expired => write!(f, "Expired"),
+            Self::BodyTooLarge => write!(f, "BodyTooLarge"),
+            Self::InvalidPayload => write!(f, "InvalidPayload"),
+            Self::ForeignEndpoint => write!(f, "ForeignEndpoint"),
+            Self::BindingMismatch(field) => f.debug_tuple("BindingMismatch").field(field).finish(),
+            Self::LatePriorSession => write!(f, "LatePriorSession"),
+            Self::NotSessionStart => write!(f, "NotSessionStart"),
+            Self::MissingProviderSessionId => write!(f, "MissingProviderSessionId"),
+            Self::CorrelationMismatch => write!(f, "CorrelationMismatch"),
+            Self::ProviderSessionIdTooLong => write!(f, "ProviderSessionIdTooLong"),
+            Self::SessionIdMismatch => write!(f, "SessionIdMismatch"),
+        }
+    }
+}
+
 struct RegisteredClaudeSession {
     stable_session_key: StableSessionKey,
     generation: u64,
@@ -884,6 +1282,8 @@ struct RegisteredClaudeSession {
     reducer: ClaudeReducer,
     ingress_degraded: bool,
     cleanup_paths: Vec<PathBuf>,
+    sealed: Option<ClaudeSealedCorrelation>,
+    bound_provider_session_id: Option<String>,
 }
 
 struct ClaudeRegistryState {
@@ -899,6 +1299,8 @@ pub struct ClaudeHookRegistry {
     ingress_generation_gate: RwLock<()>,
     state: Mutex<ClaudeRegistryState>,
     event_handler: RwLock<Option<ClaudeRegistryEventHandler>>,
+    insert_observer: RwLock<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    before_publication_observer: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct ClaudeGenerationWriteGuards<'a> {
@@ -909,7 +1311,7 @@ struct ClaudeGenerationWriteGuards<'a> {
 pub type ClaudeRegistryEventHandler =
     Arc<dyn Fn(ClaudeHookRegistration, ClaudeRegistryEvent) + Send + Sync>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ClaudeRegistryEvent {
     Semantic(SemanticEventDraft),
     SessionStarted {
@@ -925,6 +1327,37 @@ pub enum ClaudeRegistryEvent {
         generation: u64,
         was_latest: bool,
     },
+}
+
+impl fmt::Debug for ClaudeRegistryEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Semantic(draft) => f.debug_tuple("Semantic").field(draft).finish(),
+            Self::SessionStarted { .. } => f
+                .debug_struct("SessionStarted")
+                .field("provider_session_id", &"<redacted>")
+                .finish(),
+            Self::AdapterHealth {
+                stable_session_key,
+                health,
+            } => f
+                .debug_struct("AdapterHealth")
+                .field("stable_session_key", stable_session_key)
+                .field("health", health)
+                .finish(),
+            Self::RegistrationDropped {
+                stable_session_key,
+                generation,
+                was_latest,
+                ..
+            } => f
+                .debug_struct("RegistrationDropped")
+                .field("stable_session_key", stable_session_key)
+                .field("generation", generation)
+                .field("was_latest", was_latest)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 struct RemovedClaudeRegistration {
@@ -954,6 +1387,36 @@ impl ClaudeHookRegistry {
                 latest_generation_by_key: HashMap::new(),
             }),
             event_handler: RwLock::new(None),
+            insert_observer: RwLock::new(None),
+            before_publication_observer: RwLock::new(None),
+        }
+    }
+
+    pub fn set_insert_observer(&self, observer: impl Fn(bool) + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.insert_observer.write() {
+            *slot = Some(Arc::new(observer));
+        }
+    }
+
+    pub fn set_before_publication_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.before_publication_observer.write() {
+            *slot = Some(Arc::new(observer));
+        }
+    }
+
+    fn observe_insert(&self, sealed: bool) {
+        if let Ok(slot) = self.insert_observer.read() {
+            if let Some(observer) = slot.as_ref() {
+                observer(sealed);
+            }
+        }
+    }
+
+    fn observe_before_publication(&self) {
+        if let Ok(slot) = self.before_publication_observer.read() {
+            if let Some(observer) = slot.as_ref() {
+                observer();
+            }
         }
     }
 
@@ -1016,8 +1479,11 @@ impl ClaudeHookRegistry {
                 ),
                 ingress_degraded: false,
                 cleanup_paths: Vec::new(),
+                sealed: None,
+                bound_provider_session_id: None,
             },
         );
+        self.observe_insert(false);
         let registration = ClaudeHookRegistration {
             nonce,
             stable_session_key,
@@ -1027,6 +1493,285 @@ impl ClaudeHookRegistry {
         drop(publication_guard);
         self.finish_dropped_registrations(removed);
         Ok(registration)
+    }
+
+    pub fn register_correlated_at(
+        &self,
+        stable_session_key: StableSessionKey,
+        binding: ClaudeCorrelationBinding,
+        expected_provider_session_id: Option<ProviderSessionId>,
+        carry_bound_provider_session_id: Option<String>,
+        now: Instant,
+    ) -> Result<ClaudeCorrelatedRegistration, String> {
+        let publication_guard = self.lock_generation_write();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Claude hook registry lock is poisoned".to_string())?;
+        let mut removed = remove_expired(&mut state, now);
+        while state.registrations.len() >= self.limits.max_registrations.max(1) {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            if let Some(registration) = remove_registration(&mut state, &oldest) {
+                removed.push(registration);
+            }
+        }
+
+        let nonce = loop {
+            let candidate = match random_nonce() {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    drop(state);
+                    drop(publication_guard);
+                    self.finish_dropped_registrations(removed);
+                    return Err(error);
+                }
+            };
+            if !state.registrations.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let Some(generation) = state.next_generation.checked_add(1) else {
+            drop(state);
+            drop(publication_guard);
+            self.finish_dropped_registrations(removed);
+            return Err("Claude hook registration generation exhausted".to_string());
+        };
+        let sealed = ClaudeSealedCorrelation {
+            binding,
+            expected_provider_session_id,
+        };
+        state.next_generation = generation;
+        state
+            .latest_generation_by_key
+            .insert(stable_session_key.clone(), generation);
+        state.order.push_back(nonce.clone());
+        state.registrations.insert(
+            nonce.clone(),
+            RegisteredClaudeSession {
+                stable_session_key: stable_session_key.clone(),
+                generation,
+                expires_at: now + self.limits.registration_ttl.min(CLAUDE_ACTIVATION_GRACE),
+                activated: false,
+                reducer: ClaudeReducer::with_fallback_provider_session_id(
+                    stable_session_key.clone(),
+                    self.limits.reducer,
+                    format!("registration-{generation}"),
+                ),
+                ingress_degraded: false,
+                cleanup_paths: Vec::new(),
+                sealed: Some(sealed.clone()),
+                bound_provider_session_id: carry_bound_provider_session_id,
+            },
+        );
+        self.observe_insert(true);
+        drop(state);
+        drop(publication_guard);
+        self.finish_dropped_registrations(removed);
+        Ok(ClaudeCorrelatedRegistration {
+            nonce,
+            generation,
+            sealed,
+            journal_key: stable_session_key,
+        })
+    }
+
+    pub fn bound_provider_session_id(&self, nonce: &str) -> Option<String> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .registrations
+                .get(nonce)?
+                .bound_provider_session_id
+                .clone()
+        })
+    }
+
+    pub fn ingest_correlated_at(
+        &self,
+        peer: SocketAddr,
+        presented: &ClaudeCorrelatedRegistration,
+        expected: &ClaudeCorrelationBinding,
+        body: &[u8],
+        now: Instant,
+        occurred_at_epoch_ms: u64,
+    ) -> Result<ClaudeAdmittedDelivery, ClaudeCorrelatedIngestError> {
+        match physically_bound_claude_hook_json(body) {
+            Err(ClaudeHookJsonBound::BodyTooLarge) => {
+                return Err(ClaudeCorrelatedIngestError::BodyTooLarge);
+            }
+            Err(ClaudeHookJsonBound::Invalid) => {
+                return Err(ClaudeCorrelatedIngestError::InvalidPayload);
+            }
+            Ok(()) => {}
+        }
+        if !peer.ip().is_loopback() {
+            return Err(ClaudeCorrelatedIngestError::ForeignEndpoint);
+        }
+        let context = match self.admit_at(peer, presented.nonce(), body.len(), now) {
+            Ok(context) => context,
+            Err(RelayIngestStatus::BodyTooLarge) => {
+                return Err(ClaudeCorrelatedIngestError::BodyTooLarge);
+            }
+            Err(RelayIngestStatus::Expired) => {
+                return Err(ClaudeCorrelatedIngestError::Expired);
+            }
+            Err(RelayIngestStatus::Rejected) | Err(RelayIngestStatus::Accepted(_)) => {
+                return Err(ClaudeCorrelatedIngestError::Rejected);
+            }
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return Err(ClaudeCorrelatedIngestError::Rejected);
+        };
+        if !context_is_current(&state, &context) {
+            return Err(ClaudeCorrelatedIngestError::StaleRegistration);
+        }
+        let Some(registration) = state.registrations.get_mut(&context.nonce) else {
+            return Err(ClaudeCorrelatedIngestError::Rejected);
+        };
+        let Some(sealed) = registration.sealed.clone() else {
+            return Err(ClaudeCorrelatedIngestError::CorrelationMismatch);
+        };
+        if presented.sealed != sealed || presented.generation != registration.generation {
+            return Err(ClaudeCorrelatedIngestError::CorrelationMismatch);
+        }
+        if presented.generation != registration.generation {
+            return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+                ClaudeBindingField::RelayGeneration,
+            ));
+        }
+        if let Err(error) = compare_correlation_binding(expected, &sealed.binding) {
+            return Err(error);
+        }
+        let value: Value = serde_json::from_slice(body)
+            .map_err(|_| ClaudeCorrelatedIngestError::InvalidPayload)?;
+        if value.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
+            return Err(ClaudeCorrelatedIngestError::NotSessionStart);
+        }
+        let raw_session = match official_session_id_str(&value) {
+            Err(OfficialSessionIdError::TooLong) => {
+                return Err(ClaudeCorrelatedIngestError::ProviderSessionIdTooLong);
+            }
+            Ok(None) => {
+                return Err(ClaudeCorrelatedIngestError::MissingProviderSessionId);
+            }
+            Ok(Some(raw)) => raw,
+        };
+        let observed = ProviderSessionId::new(raw_session)
+            .map_err(|_| ClaudeCorrelatedIngestError::InvalidPayload)?;
+        if let Some(expected_id) = &sealed.expected_provider_session_id {
+            if expected_id != &observed {
+                return Err(ClaudeCorrelatedIngestError::ExactResumeMismatch {
+                    expected: expected_id.as_str().to_string(),
+                    observed: observed.as_str().to_string(),
+                });
+            }
+        }
+        if let Some(bound) = registration.bound_provider_session_id.clone() {
+            if bound != observed.as_str() {
+                return Err(ClaudeCorrelatedIngestError::RebindRejected {
+                    bound,
+                    observed: observed.as_str().to_string(),
+                });
+            }
+        } else {
+            registration.bound_provider_session_id = Some(observed.as_str().to_string());
+        }
+        let delivery = ClaudeAdmittedDelivery {
+            registration: presented.clone(),
+            provider_session_id: observed.clone(),
+        };
+        drop(state);
+        let mut captured = self.reduce_admitted(context.clone(), body, occurred_at_epoch_ms);
+        if matches!(
+            &captured.status,
+            RelayIngestStatus::Accepted(outcome) if outcome.drafts.is_empty() && !outcome.degraded
+        ) && captured.provider_session_id.is_none()
+        {
+            return Err(ClaudeCorrelatedIngestError::StaleRegistration);
+        }
+        if let RelayIngestStatus::Accepted(outcome) = &captured.status {
+            if outcome.degraded && captured.provider_session_id.is_none() {
+                return Err(ClaudeCorrelatedIngestError::InvalidPayload);
+            }
+        }
+        if !self.is_current_registration(&context) {
+            return Err(ClaudeCorrelatedIngestError::StaleRegistration);
+        }
+        captured.provider_session_id = Some(observed.as_str().to_string());
+        let status = self.dispatch_captured(captured);
+        if !self.is_current_registration(&context) {
+            return Err(ClaudeCorrelatedIngestError::StaleRegistration);
+        }
+        match status {
+            RelayIngestStatus::Accepted(_) => Ok(delivery),
+            RelayIngestStatus::BodyTooLarge => Err(ClaudeCorrelatedIngestError::BodyTooLarge),
+            RelayIngestStatus::Expired => Err(ClaudeCorrelatedIngestError::Expired),
+            RelayIngestStatus::Rejected => Err(ClaudeCorrelatedIngestError::Rejected),
+        }
+    }
+
+    pub fn validate_hook_session_at(
+        &self,
+        presented: &ClaudeCorrelatedRegistration,
+        expected: &ClaudeCorrelationBinding,
+        body: &[u8],
+        now: Instant,
+    ) -> Result<(), ClaudeCorrelatedIngestError> {
+        match physically_bound_claude_hook_json(body) {
+            Err(ClaudeHookJsonBound::BodyTooLarge) => {
+                return Err(ClaudeCorrelatedIngestError::BodyTooLarge);
+            }
+            Err(ClaudeHookJsonBound::Invalid) => {
+                return Err(ClaudeCorrelatedIngestError::InvalidPayload);
+            }
+            Ok(()) => {}
+        }
+        let value: Value = serde_json::from_slice(body)
+            .map_err(|_| ClaudeCorrelatedIngestError::InvalidPayload)?;
+        let raw_session = match official_session_id_str(&value) {
+            Err(OfficialSessionIdError::TooLong) => {
+                return Err(ClaudeCorrelatedIngestError::ProviderSessionIdTooLong);
+            }
+            Ok(None) => return Err(ClaudeCorrelatedIngestError::SessionIdMismatch),
+            Ok(Some(raw)) => raw,
+        };
+        let Ok(state) = self.state.lock() else {
+            return Err(ClaudeCorrelatedIngestError::Rejected);
+        };
+        let Some(registration) = state.registrations.get(presented.nonce()) else {
+            return Err(ClaudeCorrelatedIngestError::Rejected);
+        };
+        if registration.expires_at <= now {
+            return Err(ClaudeCorrelatedIngestError::Expired);
+        }
+        if presented.generation != registration.generation {
+            return Err(ClaudeCorrelatedIngestError::CorrelationMismatch);
+        }
+        let current = ClaudeHookRegistration {
+            nonce: presented.nonce().to_string(),
+            stable_session_key: registration.stable_session_key.clone(),
+            generation: registration.generation,
+        };
+        if !registration_is_current(&state, &current) {
+            return Err(ClaudeCorrelatedIngestError::StaleRegistration);
+        }
+        let Some(sealed) = registration.sealed.as_ref() else {
+            return Err(ClaudeCorrelatedIngestError::CorrelationMismatch);
+        };
+        if presented.sealed != *sealed {
+            return Err(ClaudeCorrelatedIngestError::CorrelationMismatch);
+        }
+        if let Err(error) = compare_correlation_binding(expected, &sealed.binding) {
+            return Err(error);
+        }
+        let Some(bound) = registration.bound_provider_session_id.as_deref() else {
+            return Err(ClaudeCorrelatedIngestError::SessionIdMismatch);
+        };
+        if bound != raw_session {
+            return Err(ClaudeCorrelatedIngestError::SessionIdMismatch);
+        }
+        Ok(())
     }
 
     pub fn ingest_at(
@@ -1115,14 +1860,23 @@ impl ClaudeHookRegistry {
         &self,
         peer: SocketAddr,
         nonce: &str,
-        body_len: usize,
+        body: &[u8],
         now: Instant,
         enqueue: impl FnOnce(ClaudeRegistrationContext) -> T,
     ) -> Result<T, RelayIngestStatus> {
         if !peer.ip().is_loopback() {
             return Err(RelayIngestStatus::Rejected);
         }
-        if body_len > self.limits.max_body_bytes {
+        match physically_bound_claude_hook_json(body) {
+            Ok(()) => {}
+            Err(ClaudeHookJsonBound::BodyTooLarge) => {
+                return Err(RelayIngestStatus::BodyTooLarge);
+            }
+            Err(ClaudeHookJsonBound::Invalid) => {
+                return Err(RelayIngestStatus::Rejected);
+            }
+        }
+        if body.len() > self.limits.max_body_bytes {
             return Err(RelayIngestStatus::BodyTooLarge);
         }
         let _ingress_guard = self.lock_ingress_generation_read();
@@ -1142,7 +1896,10 @@ impl ClaudeHookRegistry {
             admitted_at: now,
         };
         if !context_is_current(&state, &context) {
-            return Err(RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()));
+            return Err(RelayIngestStatus::Rejected);
+        }
+        if let Err(status) = reject_uncorrelated_or_rebinding_session_start(registration, body) {
+            return Err(status);
         }
         let registration = state
             .registrations
@@ -1153,6 +1910,27 @@ impl ClaudeHookRegistry {
         }
         drop(state);
         Ok(enqueue(context))
+    }
+
+    pub fn admit_http_hook_at(
+        &self,
+        peer: SocketAddr,
+        nonce: &str,
+        body: &[u8],
+        now: Instant,
+    ) -> Result<(), RelayIngestStatus> {
+        self.admit_ingress_at(peer, nonce, body, now, |_| ())
+    }
+
+    pub fn http_hook_status(result: Result<(), RelayIngestStatus>) -> StatusCode {
+        match result {
+            Ok(()) => StatusCode::NO_CONTENT,
+            Err(RelayIngestStatus::Rejected) | Err(RelayIngestStatus::Accepted(_)) => {
+                StatusCode::UNAUTHORIZED
+            }
+            Err(RelayIngestStatus::BodyTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
+            Err(RelayIngestStatus::Expired) => StatusCode::GONE,
+        }
     }
 
     fn reduce_admitted(
@@ -1172,19 +1950,65 @@ impl ClaudeHookRegistry {
                 provider_session_id: None,
             };
         }
-        let official_session_start_id =
-            serde_json::from_slice::<Value>(body)
-                .ok()
-                .and_then(|value| {
-                    (value.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart"))
-                        .then(|| official_identifier(&value, "session_id"))
-                        .flatten()
-                });
-        let is_session_start = official_session_start_id.is_some();
+        if physically_bound_claude_hook_json(body).is_err() {
+            return CapturedClaudeIngest {
+                status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::malformed()),
+                context: Some(context),
+                promoted_healthy: false,
+                provider_session_id: None,
+            };
+        }
+        let official_session_start_id = match serde_json::from_slice::<Value>(body) {
+            Ok(value)
+                if value.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart") =>
+            {
+                match official_session_id_str(&value) {
+                    Ok(id) => id.map(str::to_string),
+                    Err(OfficialSessionIdError::TooLong) => {
+                        return CapturedClaudeIngest {
+                            status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::malformed()),
+                            context: Some(context),
+                            promoted_healthy: false,
+                            provider_session_id: None,
+                        };
+                    }
+                }
+            }
+            _ => None,
+        };
         let registration = state
             .registrations
             .get_mut(&context.nonce)
             .expect("current registration exists");
+        if let Some(official) = official_session_start_id.as_deref() {
+            if let Some(expected) = registration
+                .sealed
+                .as_ref()
+                .and_then(|sealed| sealed.expected_provider_session_id.as_ref())
+            {
+                if expected.as_str() != official {
+                    return CapturedClaudeIngest {
+                        status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()),
+                        context: Some(context),
+                        promoted_healthy: false,
+                        provider_session_id: None,
+                    };
+                }
+            }
+            if let Some(bound) = registration.bound_provider_session_id.as_deref() {
+                if bound != official {
+                    return CapturedClaudeIngest {
+                        status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()),
+                        context: Some(context),
+                        promoted_healthy: false,
+                        provider_session_id: None,
+                    };
+                }
+            } else {
+                registration.bound_provider_session_id = Some(official.to_string());
+            }
+        }
+        let is_session_start = official_session_start_id.is_some();
         let outcome = registration.reducer.apply_json(body, occurred_at_epoch_ms);
         let promoted_healthy = is_session_start && !outcome.degraded && !registration.activated;
         let provider_session_id = if outcome.degraded {
@@ -1251,7 +2075,11 @@ impl ClaudeHookRegistry {
             .read()
             .ok()
             .and_then(|handler| handler.clone());
+        self.observe_before_publication();
         before_publication();
+        if !self.is_current_registration(&context) {
+            return status;
+        }
         if let Some(handler) = handler.as_ref() {
             let registration = context.registration();
             for draft in &outcome.drafts {
@@ -1610,6 +2438,76 @@ impl CapturedClaudeIngest {
     }
 }
 
+fn reject_uncorrelated_or_rebinding_session_start(
+    registration: &RegisteredClaudeSession,
+    body: &[u8],
+) -> Result<(), RelayIngestStatus> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return Ok(());
+    };
+    if value.get("hook_event_name").and_then(Value::as_str) != Some("SessionStart") {
+        return Ok(());
+    }
+    let Some(sealed) = registration.sealed.as_ref() else {
+        return Err(RelayIngestStatus::Rejected);
+    };
+    let raw = match official_session_id_str(&value) {
+        Ok(Some(raw)) => raw,
+        Ok(None) | Err(OfficialSessionIdError::TooLong) => {
+            return Err(RelayIngestStatus::Rejected);
+        }
+    };
+    if ProviderSessionId::new(raw.to_string()).is_err() {
+        return Err(RelayIngestStatus::Rejected);
+    }
+    if let Some(expected) = sealed.expected_provider_session_id.as_ref() {
+        if expected.as_str() != raw {
+            return Err(RelayIngestStatus::Rejected);
+        }
+    }
+    if let Some(bound) = registration.bound_provider_session_id.as_deref() {
+        if bound != raw {
+            return Err(RelayIngestStatus::Rejected);
+        }
+    }
+    Ok(())
+}
+
+fn compare_correlation_binding(
+    expected: &ClaudeCorrelationBinding,
+    sealed: &ClaudeCorrelationBinding,
+) -> Result<(), ClaudeCorrelatedIngestError> {
+    if expected.task_id != sealed.task_id {
+        return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+            ClaudeBindingField::Task,
+        ));
+    }
+    if expected.agent_session_id != sealed.agent_session_id {
+        return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+            ClaudeBindingField::Agent,
+        ));
+    }
+    if expected.runtime_generation < sealed.runtime_generation {
+        return Err(ClaudeCorrelatedIngestError::LatePriorSession);
+    }
+    if expected.runtime_generation != sealed.runtime_generation {
+        return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+            ClaudeBindingField::Generation,
+        ));
+    }
+    if expected.action_epoch != sealed.action_epoch {
+        return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+            ClaudeBindingField::ActionEpoch,
+        ));
+    }
+    if expected.process_root != sealed.process_root {
+        return Err(ClaudeCorrelatedIngestError::BindingMismatch(
+            ClaudeBindingField::ProcessRoot,
+        ));
+    }
+    Ok(())
+}
+
 fn context_is_current(state: &ClaudeRegistryState, context: &ClaudeRegistrationContext) -> bool {
     registration_is_current(state, &context.registration())
 }
@@ -1963,21 +2861,29 @@ async fn handle_claude_hook(
     else {
         return StatusCode::UNAUTHORIZED;
     };
+    if let Err(bound) = physically_bound_claude_hook_json(&body) {
+        return match bound {
+            ClaudeHookJsonBound::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ClaudeHookJsonBound::Invalid => StatusCode::BAD_REQUEST,
+        };
+    }
     let optional = is_optional_claude_hook(&body);
     let admission_registry = ingress.registry.clone();
     let queue_registry = ingress.registry.clone();
     let queue = ingress.queue.clone();
     let limits = ingress.limits;
-    match admission_registry.admit_ingress_at(
+    let admitted_body = body.to_vec();
+    let queued_body = admitted_body.clone();
+    ClaudeHookRegistry::http_hook_status(admission_registry.admit_ingress_at(
         peer,
         nonce,
-        body.len(),
+        &admitted_body,
         Instant::now(),
         move |context| {
             queue.enqueue(
                 AdmittedClaudeHook {
                     context,
-                    body: body.to_vec(),
+                    body: queued_body,
                     occurred_at_epoch_ms: unix_epoch_ms(),
                 },
                 optional,
@@ -1985,16 +2891,13 @@ async fn handle_claude_hook(
                 &queue_registry,
             );
         },
-    ) {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(RelayIngestStatus::Rejected) => StatusCode::UNAUTHORIZED,
-        Err(RelayIngestStatus::BodyTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
-        Err(RelayIngestStatus::Expired) => StatusCode::GONE,
-        Err(RelayIngestStatus::Accepted(_)) => StatusCode::NO_CONTENT,
-    }
+    ))
 }
 
 fn is_optional_claude_hook(body: &[u8]) -> bool {
+    if physically_bound_claude_hook_json(body).is_err() {
+        return false;
+    }
     serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| {
@@ -2835,5 +3738,333 @@ mod registry_race_tests {
                 "superseded {label} reached the publisher"
             );
         }
+    }
+
+    #[test]
+    fn array_heavy_hook_json_fails_physical_bounds_before_serde() {
+        let mut body =
+            br#"{"hook_event_name":"SessionStart","session_id":"session-1","pad":["#.to_vec();
+        for index in 0..40 {
+            if index > 0 {
+                body.push(b',');
+            }
+            body.push(b'0');
+        }
+        body.extend_from_slice(b"]}");
+        assert_eq!(
+            physically_bound_claude_hook_json(&body),
+            Err(ClaudeHookJsonBound::Invalid)
+        );
+    }
+
+    fn race_binding() -> ClaudeCorrelationBinding {
+        ClaudeCorrelationBinding::new(
+            TaskId::new(),
+            AgentSessionId::new(),
+            1,
+            1,
+            ResourceId::new(),
+        )
+    }
+
+    #[test]
+    fn register_correlated_insert_is_already_sealed() {
+        let registry = ClaudeHookRegistry::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        registry.set_insert_observer(move |sealed| {
+            observed.lock().unwrap().push(sealed);
+        });
+        let expected = ProviderSessionId::new("session-1").unwrap();
+        let registered = registry
+            .register_correlated_at(
+                StableSessionKey::from_tab("journal-tab"),
+                race_binding(),
+                Some(expected.clone()),
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![true]);
+        assert_eq!(
+            registered
+                .expected_provider_session_id()
+                .map(ProviderSessionId::as_str),
+            Some("session-1")
+        );
+        assert!(registered.binding().runtime_generation() == 1);
+        assert_eq!(registry.bound_provider_session_id(registered.nonce()), None);
+    }
+
+    #[test]
+    fn correlated_replacement_during_dispatch_is_stale_not_accepted_success() {
+        let registry = Arc::new(ClaudeHookRegistry::default());
+        let binding = race_binding();
+        let journal = StableSessionKey::from_tab("journal-tab");
+        let first = registry
+            .register_correlated_at(journal.clone(), binding.clone(), None, None, Instant::now())
+            .unwrap();
+        let events = Arc::new(Mutex::new(0_usize));
+        let observed = events.clone();
+        registry.set_event_handler(Some(Arc::new(move |_, event| {
+            if matches!(
+                event,
+                ClaudeRegistryEvent::SessionStarted { .. } | ClaudeRegistryEvent::Semantic(_)
+            ) {
+                *observed.lock().unwrap() += 1;
+            }
+        })));
+
+        let captured = registry.ingest_captured_at(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+            first.nonce(),
+            br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#,
+            Instant::now(),
+            1_800_000_000_000,
+        );
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let dispatch_registry = registry.clone();
+        let dispatch_gate = gate.clone();
+        let dispatch = thread::spawn(move || {
+            dispatch_registry.dispatch_captured_after_validation(captured, move || {
+                let (lock, condition) = &*dispatch_gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                condition.notify_all();
+                while !state.1 {
+                    state = condition.wait(state).unwrap();
+                }
+            })
+        });
+        {
+            let (lock, condition) = &*gate;
+            let state = lock.lock().unwrap();
+            let (state, timeout) = condition
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+                .unwrap();
+            assert!(!timeout.timed_out(), "dispatch never paused");
+            drop(state);
+        }
+        let _replacement = registry
+            .register_correlated_at(
+                journal,
+                ClaudeCorrelationBinding::new(
+                    binding.task_id(),
+                    binding.agent_session_id(),
+                    binding.runtime_generation() + 1,
+                    binding.action_epoch(),
+                    binding.process_root(),
+                ),
+                None,
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        {
+            let (lock, condition) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            condition.notify_all();
+        }
+        let _ = dispatch.join().unwrap();
+        assert_eq!(*events.lock().unwrap(), 0);
+
+        let error = registry
+            .ingest_correlated_at(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+                &first,
+                &binding,
+                br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#,
+                Instant::now(),
+                1_800_000_000_000,
+            )
+            .expect_err("replaced generation must not map Accepted(ignored) to success");
+        assert_eq!(error, ClaudeCorrelatedIngestError::StaleRegistration);
+    }
+
+    #[test]
+    fn correlated_queue_keeps_one_current_generation_per_journal_key() {
+        let registry = ClaudeHookRegistry::default();
+        let binding = race_binding();
+        let journal = StableSessionKey::from_tab("journal-tab");
+        let first = registry
+            .register_correlated_at(journal.clone(), binding.clone(), None, None, Instant::now())
+            .unwrap();
+        let second = registry
+            .register_correlated_at(
+                journal,
+                ClaudeCorrelationBinding::new(
+                    binding.task_id(),
+                    binding.agent_session_id(),
+                    binding.runtime_generation() + 1,
+                    binding.action_epoch(),
+                    binding.process_root(),
+                ),
+                None,
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(second.relay_generation() > first.relay_generation());
+        let error = registry
+            .ingest_correlated_at(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+                &first,
+                &binding,
+                br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#,
+                Instant::now(),
+                1_800_000_000_000,
+            )
+            .expect_err("only the latest sealed generation is current");
+        assert_eq!(error, ClaudeCorrelatedIngestError::StaleRegistration);
+    }
+
+    #[test]
+    fn drop_unregisters_before_dispatch_cannot_publish_or_succeed() {
+        let registry = ClaudeHookRegistry::default();
+        let binding = race_binding();
+        let registered = registry
+            .register_correlated_at(
+                StableSessionKey::from_tab("journal-tab"),
+                binding.clone(),
+                None,
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        let events = Arc::new(Mutex::new(0_usize));
+        let observed = events.clone();
+        registry.set_event_handler(Some(Arc::new(move |_, event| {
+            if matches!(event, ClaudeRegistryEvent::SessionStarted { .. }) {
+                *observed.lock().unwrap() += 1;
+            }
+        })));
+        let captured = registry.ingest_captured_at(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+            registered.nonce(),
+            br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#,
+            Instant::now(),
+            1_800_000_000_000,
+        );
+        registry.unregister(registered.nonce());
+        let _ = registry.dispatch_captured(captured);
+        assert_eq!(*events.lock().unwrap(), 0);
+        let error = registry
+            .ingest_correlated_at(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+                &registered,
+                &binding,
+                br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#,
+                Instant::now(),
+                1_800_000_000_000,
+            )
+            .expect_err("dropped registration cannot succeed after unregister");
+        assert!(matches!(
+            error,
+            ClaudeCorrelatedIngestError::Rejected | ClaudeCorrelatedIngestError::StaleRegistration
+        ));
+    }
+
+    #[test]
+    fn http_session_start_admission_rejects_stale_uncorrelated_and_rebind() {
+        let registry = ClaudeHookRegistry::default();
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000);
+        let session_start =
+            br#"{"hook_event_name":"SessionStart","session_id":"session-1","source":"startup"}"#;
+        let rebound =
+            br#"{"hook_event_name":"SessionStart","session_id":"session-other","source":"startup"}"#;
+        let resume_fresh =
+            br#"{"hook_event_name":"SessionStart","session_id":"session-fresh","source":"startup"}"#;
+
+        let unsealed = registry
+            .register_at(StableSessionKey::from_tab("journal-tab"), Instant::now())
+            .unwrap();
+        let uncorrelated = registry
+            .admit_ingress_at(peer, &unsealed.nonce, session_start, Instant::now(), |_| ())
+            .expect_err("uncorrelated SessionStart must not be HTTP-admitted");
+        assert!(matches!(uncorrelated, RelayIngestStatus::Rejected));
+        assert!(!matches!(uncorrelated, RelayIngestStatus::Accepted(_)));
+
+        let binding = race_binding();
+        let expected = ProviderSessionId::new("session-1").unwrap();
+        let sealed = registry
+            .register_correlated_at(
+                StableSessionKey::from_tab("journal-tab"),
+                binding.clone(),
+                Some(expected),
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        registry
+            .admit_ingress_at(peer, sealed.nonce(), session_start, Instant::now(), |_| ())
+            .expect("current sealed exact-resume SessionStart is admitted");
+
+        let resume_mismatch = registry
+            .admit_ingress_at(peer, sealed.nonce(), resume_fresh, Instant::now(), |_| ())
+            .expect_err("exact resume must not fall back fresh on HTTP admit");
+        assert!(matches!(resume_mismatch, RelayIngestStatus::Rejected));
+        assert!(!matches!(resume_mismatch, RelayIngestStatus::Accepted(_)));
+
+        registry
+            .ingest_correlated_at(
+                peer,
+                &sealed,
+                &binding,
+                session_start,
+                Instant::now(),
+                1_800_000_000_000,
+            )
+            .expect("first valid id binds");
+        let rebind = registry
+            .admit_ingress_at(peer, sealed.nonce(), rebound, Instant::now(), |_| ())
+            .expect_err("different-id rebind must not be HTTP-admitted");
+        assert!(matches!(rebind, RelayIngestStatus::Rejected));
+        assert!(!matches!(rebind, RelayIngestStatus::Accepted(_)));
+
+        let _replacement = registry
+            .register_correlated_at(
+                StableSessionKey::from_tab("journal-tab"),
+                ClaudeCorrelationBinding::new(
+                    binding.task_id(),
+                    binding.agent_session_id(),
+                    binding.runtime_generation() + 1,
+                    binding.action_epoch(),
+                    binding.process_root(),
+                ),
+                None,
+                None,
+                Instant::now(),
+            )
+            .unwrap();
+        let stale = registry
+            .admit_ingress_at(peer, sealed.nonce(), session_start, Instant::now(), |_| ())
+            .expect_err("stale SessionStart must not be HTTP-admitted");
+        assert!(matches!(stale, RelayIngestStatus::Rejected));
+        assert!(!matches!(stale, RelayIngestStatus::Accepted(_)));
+    }
+
+    #[test]
+    fn correlation_debug_redacts_provider_session_ids() {
+        let sealed = registry_debug_registration();
+        let rendered = format!("{sealed:?}");
+        assert!(!rendered.contains("session-secret"));
+        let event = ClaudeRegistryEvent::SessionStarted {
+            provider_session_id: "session-secret".to_string(),
+        };
+        assert!(!format!("{event:?}").contains("session-secret"));
+        assert!(format!("{event:?}").contains("<redacted>"));
+    }
+
+    fn registry_debug_registration() -> ClaudeCorrelatedRegistration {
+        ClaudeHookRegistry::default()
+            .register_correlated_at(
+                StableSessionKey::from_tab("journal-tab"),
+                race_binding(),
+                Some(ProviderSessionId::new("session-secret").unwrap()),
+                None,
+                Instant::now(),
+            )
+            .unwrap()
     }
 }

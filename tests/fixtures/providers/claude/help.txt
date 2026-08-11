@@ -1,0 +1,13 @@
+Usage: claude [options] [command] [prompt]
+
+Claude Code stock CLI
+
+Options:
+  --resume [sessionId]  Resume a specific conversation by provider session id
+  --continue            Continue the most recent conversation
+  --version             Print the CLI version
+  --help                Show this help
+
+Hooks:
+  SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
+  PermissionRequest, Stop, StopFailure, SessionEnd

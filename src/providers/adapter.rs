@@ -132,11 +132,21 @@ impl ProviderArgument {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchProviderRequest {
     executable: ProviderExecutableHandle,
     input: Option<ProviderInput>,
     provider_session_id: Option<ProviderSessionId>,
+}
+
+impl fmt::Debug for LaunchProviderRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LaunchProviderRequest")
+            .field("executable", &self.executable)
+            .field("has_input", &self.input.is_some())
+            .field("provider_session_id", &"<redacted>")
+            .finish()
+    }
 }
 
 impl LaunchProviderRequest {
@@ -165,10 +175,19 @@ impl LaunchProviderRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderLaunchSpec {
     executable: ProviderExecutableHandle,
     arguments: Vec<ProviderArgument>,
+}
+
+impl fmt::Debug for ProviderLaunchSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderLaunchSpec")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderLaunchSpec {
@@ -666,6 +685,25 @@ impl ProviderProbeResult {
             });
         }
         Ok(result)
+    }
+
+    /// Captures bounded stdout/stderr for an injected `ProviderProbeRunner`.
+    /// Status still follows exit code and the request byte bound.
+    #[cfg(test)]
+    pub fn from_bounded_output(
+        request: &ProviderProbeRequest,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Result<Self, ProviderProbeError> {
+        let output = ProviderProbeOutput::bounded(
+            request.max_output_bytes(),
+            stdout,
+            stderr,
+            exit_code,
+            false,
+        )?;
+        Self::with_output(request, output)
     }
 
     pub const fn status(&self) -> ProviderProbeStatus {

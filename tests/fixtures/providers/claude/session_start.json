@@ -1,0 +1,9 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-test-model",
+  "unknown_future_field": { "ignored": true }
+}

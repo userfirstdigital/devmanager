@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod capabilities;
+pub mod claude;
 pub mod registry;
 pub mod session;
 
