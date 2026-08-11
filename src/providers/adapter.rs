@@ -14,7 +14,7 @@ use crate::providers::capabilities::{
 use async_trait::async_trait;
 use std::fmt;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -426,6 +426,16 @@ impl ProviderProbeRequest {
     pub const fn max_output_bytes(&self) -> usize {
         self.max_output_bytes
     }
+
+    fn binding(&self) -> ProviderProbeRequestBinding {
+        ProviderProbeRequestBinding {
+            executable: self.executable.clone(),
+            kind: self.kind,
+            timeout: self.timeout,
+            max_output_bytes: self.max_output_bytes,
+            auth_binding: self.auth_binding.clone(),
+        }
+    }
 }
 
 impl ProviderAuthProbeInvocation {
@@ -535,6 +545,21 @@ pub struct ProviderProbeResult {
     stdout_bytes: usize,
     stderr_bytes: usize,
     output: Option<ProviderProbeOutput>,
+    auth_proof: Option<ProviderProbeProof>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderProbeRequestBinding {
+    executable: ProviderExecutableHandle,
+    kind: ProviderProbeKind,
+    timeout: Duration,
+    max_output_bytes: usize,
+    auth_binding: Option<ProviderAuthProbeBinding>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderProbeProof {
+    request: ProviderProbeRequestBinding,
 }
 
 impl fmt::Debug for ProviderProbeResult {
@@ -567,6 +592,7 @@ impl ProviderProbeResult {
             stdout_bytes,
             stderr_bytes,
             output: None,
+            auth_proof: None,
         })
     }
 
@@ -592,7 +618,24 @@ impl ProviderProbeResult {
             stdout_bytes: output.stdout.len(),
             stderr_bytes: output.stderr.len(),
             output: Some(output),
+            auth_proof: None,
         })
+    }
+
+    /// Marks output as observed by the crate-owned bounded runner.  The
+    /// request binding is private correlation material; public callers can
+    /// construct result metadata but cannot mint this proof.
+    fn with_trusted_output(
+        request: &ProviderProbeRequest,
+        output: ProviderProbeOutput,
+    ) -> Result<Self, ProviderProbeError> {
+        let mut result = Self::with_output(request, output)?;
+        if request.auth_binding.is_some() {
+            result.auth_proof = Some(ProviderProbeProof {
+                request: request.binding(),
+            });
+        }
+        Ok(result)
     }
 
     pub const fn status(&self) -> ProviderProbeStatus {
@@ -624,7 +667,7 @@ impl ProviderProbeResult {
     }
 
     pub(crate) fn into_auth_observation(
-        &self,
+        self,
         invocation: &ProviderAuthProbeInvocation,
         request: &ProviderProbeRequest,
     ) -> Result<ProviderAuthProbeObservation, ProviderAuthEvidenceError> {
@@ -632,6 +675,18 @@ impl ProviderProbeResult {
             || !request.auth_binding_matches(invocation)
         {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        }
+        let Some(proof) = self.auth_proof.as_ref() else {
+            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
+        };
+        if proof.request != request.binding()
+            || !proof
+                .request
+                .auth_binding
+                .as_ref()
+                .is_some_and(|binding| *binding == invocation.binding())
+        {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
         }
         if self.status != ProviderProbeStatus::Completed {
             return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
@@ -889,7 +944,11 @@ impl WindowsProviderProbeRunner {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut process = ProbeProcess::spawn(command, deadline)?;
+        let mut process = ProbeProcess::spawn(
+            command,
+            deadline,
+            Some(request.executable().launch_program().canonical_path()),
+        )?;
         // Windows keeps the no-delete handles open through CreateProcess;
         // Unix uses inherited descriptor paths from `prepare_unix_launch`.
         // Revalidate immediately after spawn as a final identity diagnostic.
@@ -914,33 +973,60 @@ impl WindowsProviderProbeRunner {
         let stderr_reader = spawn_probe_reader(stderr, Arc::clone(&capture), false);
 
         let mut timed_out = false;
+        let mut primary_error = None;
         let exit_code = loop {
-            match process
-                .child_mut()
-                .try_wait()
-                .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))?
-            {
-                Some(status) => break status.code(),
-                None if std::time::Instant::now()
-                    .checked_add(PROVIDER_PROBE_CLEANUP_RESERVE)
-                    .is_some_and(|cleanup_start| cleanup_start < deadline) =>
+            match process.child_mut().try_wait() {
+                Err(_) => {
+                    primary_error = Some(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed));
+                    let _ = process.terminate_tree(deadline);
+                    break None;
+                }
+                Ok(Some(status)) => break status.code(),
+                Ok(None)
+                    if std::time::Instant::now()
+                        .checked_add(PROVIDER_PROBE_CLEANUP_RESERVE)
+                        .is_some_and(|cleanup_start| cleanup_start < deadline) =>
                 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                None => {
+                Ok(None) => {
                     timed_out = true;
-                    process.terminate_tree(deadline)?;
+                    if let Err(error) = process.terminate_tree(deadline) {
+                        primary_error = Some(error);
+                    }
                     break None;
                 }
             }
         };
 
         if !timed_out {
-            process.terminate_tree(deadline)?;
+            if let Err(error) = process.terminate_tree(deadline) {
+                primary_error = Some(error);
+            }
         }
-        receive_probe_reader(stdout_reader)?;
-        receive_probe_reader(stderr_reader)?;
+        let stdout_join = receive_probe_reader(stdout_reader);
+        let stderr_join = receive_probe_reader(stderr_reader);
+        if let Some(error) = primary_error {
+            return Err(error);
+        }
+        if let Err(error) = stdout_join {
+            let _ = stderr_join;
+            return Err(error);
+        }
+        if let Err(error) = stderr_join {
+            return Err(error);
+        }
         let (stdout, stderr, overflowed) = capture.finish();
+        // Keep the entire attested graph alive through cleanup and perform a
+        // final identity/hash check before releasing it or issuing proof.  A
+        // wrapper target, interpreter, or script that changed during the
+        // observation cannot produce a trusted result even if the launched
+        // image path itself still matches.
+        if request.executable().revalidate().is_err() {
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
         let output = ProviderProbeOutput::bounded(
             request.max_output_bytes(),
             stdout,
@@ -951,7 +1037,7 @@ impl WindowsProviderProbeRunner {
         if timed_out {
             return Err(ProviderProbeError::TimedOut);
         }
-        ProviderProbeResult::with_output(&request, output)
+        ProviderProbeResult::with_trusted_output(&request, output)
     }
 }
 
@@ -980,6 +1066,54 @@ fn validate_probe_executable(
         .validate_canonical_path(&canonical)
         .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
     Ok(requested.launch_program().canonical_path().to_path_buf())
+}
+
+#[cfg(windows)]
+fn attest_launched_image(child: &Child, expected: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    // Query the process handle owned by Child rather than reopening by PID.
+    // This remains an exact-image attestation even when a short-lived probe
+    // exits before the PID-based OpenProcess race can complete.
+    let process = HANDLE(child.as_raw_handle());
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    if !result.is_ok() {
+        return false;
+    }
+    std::fs::canonicalize(std::ffi::OsString::from_wide(&buffer[..length as usize]))
+        .ok()
+        .is_some_and(|path| path == expected)
+}
+
+#[cfg(target_os = "linux")]
+fn attest_launched_image(child: &Child, expected: &std::path::Path) -> bool {
+    std::fs::read_link(format!("/proc/{}/exe", child.id()))
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .is_some_and(|path| path == expected)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn attest_launched_image(_child: &Child, _expected: &std::path::Path) -> bool {
+    true
+}
+
+#[cfg(not(any(windows, unix)))]
+fn attest_launched_image(_child: &Child, _expected: &std::path::Path) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1091,6 +1225,7 @@ impl ProbeProcess {
     fn spawn(
         mut command: std::process::Command,
         deadline: std::time::Instant,
+        expected: Option<&Path>,
     ) -> Result<Self, ProviderProbeError> {
         let mut child = command.spawn().map_err(|error| {
             ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
@@ -1101,6 +1236,16 @@ impl ProbeProcess {
                 ProviderProbeIoError::SpawnFailed
             })
         })?;
+        #[cfg(windows)]
+        if !expected.is_some_and(|expected| attest_launched_image(&child, expected)) {
+            let _ = child.kill();
+            reap_child_until(&mut child, deadline);
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = expected;
         let managed_job =
             match crate::services::platform_service::claim_suspended_process(child.id()) {
                 Ok(job) => job,
@@ -1131,26 +1276,47 @@ impl ProbeProcess {
 
     fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
         let mut job_empty = true;
+        let mut cleanup_failed = false;
+        #[cfg(unix)]
+        let now = std::time::Instant::now();
+        #[cfg(unix)]
+        let group_cleanup_deadline = deadline
+            .checked_sub(PROVIDER_PROBE_CLEANUP_RESERVE)
+            .filter(|candidate| *candidate > now)
+            .unwrap_or(now);
         if let Some(job) = self.managed_job.as_ref() {
-            let active_before = job.active_process_ids().map_err(|_| {
-                ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
-            })?;
-            if !active_before.is_empty() {
-                job.terminate_members().map_err(|_| {
-                    ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
-                })?;
+            match job.active_process_ids() {
+                Ok(active_before) => {
+                    if !active_before.is_empty() {
+                        if job.terminate_members().is_err() {
+                            cleanup_failed = true;
+                        }
+                    }
+                }
+                Err(_) => cleanup_failed = true,
             }
-            job_empty = job.wait_for_active_process_zero(deadline).map_err(|_| {
-                ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed)
-            })?;
+            job_empty = match job.wait_for_active_process_zero(deadline) {
+                Ok(empty) => empty,
+                Err(_) => {
+                    cleanup_failed = true;
+                    false
+                }
+            };
         }
         #[cfg(unix)]
-        let group_cleanup_ok = if self.process_group {
-            crate::services::platform_service::terminate_owned_process_group(
+        let group_signal_ok = if self.process_group {
+            let remaining = group_cleanup_deadline.saturating_duration_since(now);
+            let term_grace = remaining / 3;
+            let result = crate::services::platform_service::terminate_owned_process_group(
                 self.child.id(),
-                deadline.saturating_duration_since(std::time::Instant::now()),
-            )
-            .is_ok()
+                term_grace,
+            );
+            if result.is_err() {
+                force_kill_unix_process_group(self.child.id());
+                false
+            } else {
+                true
+            }
         } else {
             true
         };
@@ -1160,17 +1326,25 @@ impl ProbeProcess {
         // The raw `Child` handle can lag that state on Windows, so do not
         // spend the absolute deadline waiting for a second observation of the
         // same process exit.
+        if !(self.managed_job.is_some() && job_empty) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+        }
+        #[cfg(unix)]
+        let group_exited = group_signal_ok
+            && wait_for_unix_process_group_exit(self.child.id(), group_cleanup_deadline);
+        #[cfg(not(unix))]
+        let group_exited = true;
         let child_exited = if self.managed_job.is_some() && job_empty {
+            // On Windows the Job's ACTIVE_PROCESS_ZERO notification is the
+            // authoritative reap boundary.  The raw Child handle can remain
+            // non-waitable after the Job has consumed the process.
             true
         } else {
             reap_child_until(&mut self.child, deadline)
         };
-        #[cfg(unix)]
-        let group_exited =
-            group_cleanup_ok && wait_for_unix_process_group_exit(self.child.id(), deadline);
-        #[cfg(not(unix))]
-        let group_exited = true;
-        if !job_empty || !child_exited || !group_exited {
+        if cleanup_failed || !job_empty || !child_exited || !group_exited {
             return Err(ProviderProbeError::Io(
                 ProviderProbeIoError::DescendantCleanupFailed,
             ));
@@ -1196,6 +1370,14 @@ fn reap_child_until(child: &mut Child, deadline: std::time::Instant) -> bool {
             Ok(None) | Err(_) => return false,
         }
     }
+}
+
+#[cfg(unix)]
+fn force_kill_unix_process_group(pid: u32) {
+    let group_target = format!("-{pid}");
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", group_target.as_str()])
+        .status();
 }
 
 #[cfg(unix)]
@@ -1466,7 +1648,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// executable. Authentication is a registry-owned receipt flow.
     async fn probe(
         &self,
-        executable: &ProviderExecutable,
+        executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError>;
 
     fn build_launch(
@@ -1480,7 +1662,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn observe_quota(
         &self,
-        executable: &ProviderExecutable,
+        executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError>;
 }
 
@@ -1488,8 +1670,8 @@ pub trait ProviderAdapter: Send + Sync {
 mod tests {
     use super::{
         classify_auth_output, ProviderAuthEvidenceError, ProviderAuthProbeResult,
-        ProviderExecutable, ProviderKind, ProviderProbeOutput, ProviderProbeRequest,
-        ProviderProbeResult,
+        ProviderExecutable, ProviderKind, ProviderProbeKind, ProviderProbeOutput,
+        ProviderProbeRequest, ProviderProbeResult,
     };
     use crate::providers::capabilities::ProviderAuthEvidenceRegistry;
     use std::time::Duration;
@@ -1576,7 +1758,7 @@ mod tests {
         let output =
             ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
                 .unwrap();
-        let result = ProviderProbeResult::with_output(&request, output).unwrap();
+        let result = ProviderProbeResult::with_trusted_output(&request, output).unwrap();
         let observation = result.into_auth_observation(&first, &request).unwrap();
         assert!(matches!(
             evidence.accept_observation(second, observation),
@@ -1588,9 +1770,83 @@ mod tests {
         let output =
             ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
                 .unwrap();
-        let result = ProviderProbeResult::with_output(&request, output).unwrap();
+        let result = ProviderProbeResult::with_trusted_output(&request, output).unwrap();
         let observation = result.into_auth_observation(&first, &request).unwrap();
         let accepted = evidence.accept_observation(first, observation);
         assert!(accepted.is_ok(), "{accepted:?}");
+    }
+
+    #[test]
+    fn auth_probe_result_without_runner_proof_is_rejected() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let mut evidence = ProviderAuthEvidenceRegistry::new();
+        let invocation = evidence
+            .begin(
+                ProviderKind::ClaudeCode,
+                executable.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let request = ProviderProbeRequest::auth_status(invocation.executable_handle().clone())
+            .unwrap()
+            .bind_to_auth_invocation(&invocation)
+            .unwrap();
+        let output =
+            ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
+                .unwrap();
+        let result = ProviderProbeResult::with_output(&request, output).unwrap();
+
+        assert!(matches!(
+            result.into_auth_observation(&invocation, &request),
+            Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence)
+        ));
+    }
+
+    #[test]
+    fn auth_probe_result_cannot_attach_to_a_different_request_same_invocation() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let mut evidence = ProviderAuthEvidenceRegistry::new();
+        let invocation = evidence
+            .begin(
+                ProviderKind::ClaudeCode,
+                executable,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let request = invocation
+            .bind_request(
+                ProviderProbeRequest::with_limits(
+                    invocation.executable_handle().clone(),
+                    ProviderProbeKind::AuthStatus,
+                    Duration::from_secs(1),
+                    1024,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let altered_request = invocation
+            .bind_request(
+                ProviderProbeRequest::with_limits(
+                    invocation.executable_handle().clone(),
+                    ProviderProbeKind::AuthStatus,
+                    Duration::from_secs(2),
+                    1024,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let output =
+            ProviderProbeOutput::new(b"logged in with claude.ai".to_vec(), Vec::new(), Some(0))
+                .unwrap();
+        let result = ProviderProbeResult::with_trusted_output(&request, output).unwrap();
+
+        let mismatch = result
+            .clone()
+            .into_auth_observation(&invocation, &altered_request);
+        assert!(matches!(
+            mismatch,
+            Err(ProviderAuthEvidenceError::RequestBindingMismatch)
+        ));
+        assert!(result.into_auth_observation(&invocation, &request).is_ok());
     }
 }

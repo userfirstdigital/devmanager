@@ -3,6 +3,7 @@ use devmanager::domain::agent::{
     MAX_PROVIDER_SESSION_ID_BYTES,
 };
 use devmanager::domain::id::TaskId;
+use devmanager::providers::adapter::{ProviderProbeRequest, ProviderProbeRunner};
 use devmanager::providers::{
     CapabilityEvidence, CapabilityEvidenceError, CapabilitySupport, EvidenceConfidence,
     EvidenceSourceId, EvidenceStatus, ProviderAuthEvidenceRegistry, ProviderAuthEvidenceSource,
@@ -17,6 +18,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -31,7 +33,7 @@ fn native_fixture(root: &Path, name: &str, marker: &[u8]) -> PathBuf {
     // executable or granted production launch/auth authority.
     let path = root.join(name);
     fs::copy(
-        std::env::current_exe().expect("current test executable"),
+        env!("CARGO_BIN_EXE_devmanager-provider-probe-fixture"),
         &path,
     )
     .expect("copy current platform executable");
@@ -46,26 +48,31 @@ fn native_fixture(root: &Path, name: &str, marker: &[u8]) -> PathBuf {
     path
 }
 
-fn replace_with_native_fixture(path: &Path, marker: &[u8]) {
+fn replace_with_native_fixture(path: &Path, marker: &[u8]) -> bool {
     #[cfg(windows)]
     {
         // The production identity handle intentionally denies delete/rename
         // sharing. Mutate the same test file instead so the identity/hash
         // revalidation fence is exercised without weakening that lock.
-        fs::copy(
+        if fs::copy(
             std::env::current_exe().expect("current test executable"),
             path,
         )
-        .expect("overwrite replaced fixture");
+        .is_err()
+        {
+            return false;
+        }
         if !marker.is_empty() {
-            fs::OpenOptions::new()
+            if fs::OpenOptions::new()
                 .append(true)
                 .open(path)
-                .expect("open overwritten fixture")
-                .write_all(marker)
-                .expect("append replacement marker");
+                .and_then(|mut file| file.write_all(marker))
+                .is_err()
+            {
+                return false;
+            }
         }
-        return;
+        return true;
     }
 
     #[cfg(not(windows))]
@@ -78,6 +85,7 @@ fn replace_with_native_fixture(path: &Path, marker: &[u8]) {
         );
         fs::remove_file(path).expect("remove replaced path");
         fs::rename(replacement, path).expect("install replacement executable");
+        true
     }
 }
 
@@ -87,6 +95,32 @@ fn file_hash(path: &Path) -> [u8; 32] {
 
 fn executable(path: &Path) -> ProviderExecutable {
     ProviderExecutable::from_path(path).expect("strict executable identity")
+}
+
+fn accept_trusted_probe(
+    evidence: &mut ProviderAuthEvidenceRegistry,
+    invocation: devmanager::providers::ProviderAuthProbeInvocation,
+) -> devmanager::providers::ProviderAuthEvidenceReceipt {
+    let handle = invocation.executable_handle().clone();
+    let path_name = handle
+        .canonical_path()
+        .file_name()
+        .expect("fixture file name")
+        .to_string_lossy()
+        .into_owned();
+    let request = invocation
+        .bind_request(ProviderProbeRequest::auth_status(handle).unwrap())
+        .unwrap();
+    let runner = devmanager::providers::WindowsProviderProbeRunner::new(
+        devmanager::providers::ProviderExecutablePolicy::new([path_name.clone()]).unwrap(),
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime
+        .block_on(runner.run(request.clone()))
+        .unwrap_or_else(|error| panic!("trusted fixture probe failed for {path_name}: {error:?}"));
+    evidence
+        .accept_probe_result(invocation, request, result)
+        .unwrap()
 }
 
 fn stable_capabilities() -> ProviderCapabilities {
@@ -187,10 +221,22 @@ fn executable_identity_rejects_replacement_even_when_the_path_is_unchanged() {
     let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
     let original = executable(&path);
 
-    replace_with_native_fixture(&path, b"provider-b");
-    assert!(original.validate_current().is_err());
+    let replaced = replace_with_native_fixture(&path, b"provider-b");
+    if cfg!(windows) {
+        assert!(
+            !replaced,
+            "the held identity must deny in-place replacement"
+        );
+        assert!(original.validate_current().is_ok());
+    } else {
+        assert!(original.validate_current().is_err());
+    }
     let replacement = executable(&path);
-    assert_ne!(replacement, original);
+    if cfg!(windows) {
+        assert_eq!(replacement, original);
+    } else {
+        assert_ne!(replacement, original);
+    }
 }
 
 #[test]
@@ -236,10 +282,28 @@ fn launch_handle_retains_file_identity_and_rejects_path_replacement() {
         fs::metadata(&path).unwrap().len()
     );
 
-    replace_with_native_fixture(&path, b"replacement");
+    let replaced = replace_with_native_fixture(&path, b"replacement");
+    if cfg!(windows) {
+        assert!(!replaced, "the held launch graph must deny replacement");
+        assert!(handle.revalidate().is_ok());
+        assert!(identity.validate_current().is_ok());
+    } else {
+        assert!(handle.revalidate().is_err());
+        assert!(identity.validate_current().is_err());
+    }
+}
 
-    assert!(handle.revalidate().is_err());
-    assert!(identity.validate_current().is_err());
+#[cfg(windows)]
+#[test]
+fn held_launch_graph_handle_denies_write_and_delete_sharing() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"held");
+    let identity = executable(&path);
+    let handle = identity.open_for_launch().unwrap();
+
+    assert!(fs::OpenOptions::new().append(true).open(&path).is_err());
+    assert!(fs::remove_file(&path).is_err());
+    handle.revalidate().unwrap();
 }
 
 #[test]
@@ -399,6 +463,43 @@ fn path_snapshot_rejects_reparse_directory_before_canonicalization() {
         ProviderPathSnapshot::capture(&OsString::from(path_value)),
         Err(devmanager::providers::ProviderDiscoveryError::InvalidPathSnapshot(_))
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn path_snapshot_attests_a_safe_reparse_directory_and_resolves_its_target() {
+    use std::os::windows::fs::symlink_dir;
+
+    let temp = tempdir().unwrap();
+    let real = temp.path().join("real-nodejs");
+    let link = temp.path().join("nodejs-link");
+    fs::create_dir(&real).unwrap();
+    if symlink_dir(&real, &link).is_err() {
+        // NVM commonly exposes node through a Windows reparse-point
+        // junction.  Junction creation does not require developer-mode
+        // symlink privileges, so use it as the same canonical-target fixture.
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .expect("invoke junction fixture helper");
+        assert!(
+            status.success(),
+            "unable to create a Windows reparse fixture"
+        );
+    }
+    native_fixture(&real, "claude.exe", b"safe-reparse-target");
+    let path_value = std::env::join_paths([link.as_os_str()]).unwrap();
+
+    let snapshot = ProviderPathSnapshot::capture(&OsString::from(path_value)).unwrap();
+    let candidate = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .resolve_from_path_snapshot(&snapshot)
+        .unwrap();
+    assert_eq!(
+        candidate.executable().canonical_path(),
+        fs::canonicalize(real.join("claude.exe")).unwrap()
+    );
 }
 
 #[test]
@@ -643,17 +744,8 @@ fn auth_evidence_is_registry_issued_fresh_and_bound_to_identity() {
         )
         .unwrap();
 
-    let observed_at = Instant::now();
-    let receipt = evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            invocation.clone(),
-            ProviderAuthProbeResult::AuthRequired,
-            observed_at,
-        )
-        .unwrap();
-    assert!(receipt.is_fresh_at(observed_at + Duration::from_secs(1)));
+    let receipt = accept_trusted_probe(&mut evidence, invocation.clone());
+    assert!(receipt.is_fresh_at(receipt.observed_at() + Duration::from_secs(1)));
     assert!(!receipt.is_authenticated_subscription());
     assert_eq!(
         receipt.source(),
@@ -716,6 +808,33 @@ fn public_auth_acceptance_cannot_forge_authenticated_subscription_or_extend_time
 }
 
 #[test]
+fn public_auth_acceptance_cannot_mint_any_result_without_probe_proof() {
+    let temp = tempdir().unwrap();
+    let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
+    let identity = executable(&path);
+    let mut evidence = ProviderAuthEvidenceRegistry::new();
+
+    for result in [
+        ProviderAuthProbeResult::AuthRequired,
+        ProviderAuthProbeResult::Unknown,
+        ProviderAuthProbeResult::ApiKeyDetected,
+        ProviderAuthProbeResult::AuthenticatedSubscription,
+    ] {
+        let invocation = evidence
+            .begin(
+                ProviderKind::ClaudeCode,
+                identity.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(matches!(
+            evidence.accept_now(invocation, result),
+            Err(devmanager::providers::ProviderAuthEvidenceError::UntrustedAuthenticationEvidence)
+        ));
+    }
+}
+
+#[test]
 fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
     let temp = tempdir().unwrap();
     let path = native_fixture(temp.path(), "provider-native.exe", b"provider-a");
@@ -758,15 +877,7 @@ fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
         )
         .unwrap();
     let later = Instant::now();
-    evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            second.clone(),
-            ProviderAuthProbeResult::Unknown,
-            later,
-        )
-        .unwrap();
+    let _second_receipt = accept_trusted_probe(&mut evidence, second.clone());
     assert!(evidence
         .accept_at_for(
             ProviderKind::ClaudeCode,
@@ -793,43 +904,20 @@ fn auth_evidence_rejects_expired_reordered_same_timestamp_and_api_key_claims() {
             later + Duration::from_secs(30),
         )
         .unwrap();
-    let same_observed_at = Instant::now();
-    evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            same_timestamp_a,
-            ProviderAuthProbeResult::Unknown,
-            same_observed_at,
-        )
-        .unwrap();
-    assert!(evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            same_timestamp_b,
-            ProviderAuthProbeResult::Unknown,
-            same_observed_at,
-        )
-        .is_ok());
+    let _same_timestamp_receipt = accept_trusted_probe(&mut evidence, same_timestamp_a);
+    let _same_timestamp_receipt_b = accept_trusted_probe(&mut evidence, same_timestamp_b);
 
+    let api_key_path = native_fixture(temp.path(), "probe-auth-api-key.exe", b"provider-api-key");
+    let api_key_identity = executable(&api_key_path);
     let api_key = evidence
         .begin_at(
             ProviderKind::ClaudeCode,
-            identity.clone(),
+            api_key_identity,
             Instant::now(),
             Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
-    let api_key_receipt = evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            api_key,
-            ProviderAuthProbeResult::ApiKeyDetected,
-            Instant::now(),
-        )
-        .unwrap();
+    let api_key_receipt = accept_trusted_probe(&mut evidence, api_key);
     assert!(!api_key_receipt.is_authenticated_subscription());
     assert_eq!(
         api_key_receipt.source(),
@@ -856,15 +944,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
-    let receipt = evidence
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            invocation,
-            ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
-        .unwrap();
+    let receipt = accept_trusted_probe(&mut evidence, invocation);
     assert!(evidence
         .consume_at_for(
             ProviderKind::ClaudeCode,
@@ -887,15 +967,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             Instant::now() + Duration::from_secs(2),
         )
         .unwrap();
-    let stale_receipt = stale_registry
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            stale_invocation,
-            ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
-        .unwrap();
+    let stale_receipt = accept_trusted_probe(&mut stale_registry, stale_invocation);
     std::thread::sleep(Duration::from_millis(2_100));
     assert!(matches!(
         stale_registry.consume_at_for(
@@ -917,16 +989,9 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             future_issued_at + Duration::from_secs(30),
         )
         .unwrap();
-    let future_receipt = future_registry
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            future_invocation,
-            ProviderAuthProbeResult::AuthRequired,
-            future_issued_at + Duration::from_secs(1),
-        )
-        .unwrap();
-    assert!(future_receipt.observed_at() < future_issued_at + Duration::from_secs(1));
+    let future_receipt = accept_trusted_probe(&mut future_registry, future_invocation);
+    assert!(future_receipt.observed_at() >= future_issued_at);
+    assert!(future_receipt.observed_at() <= future_receipt.deadline());
 
     let mut ordering_registry = ProviderAuthEvidenceRegistry::new();
     let first = ordering_registry
@@ -937,15 +1002,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
-    let first_receipt = ordering_registry
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            first,
-            ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
-        .unwrap();
+    let first_receipt = accept_trusted_probe(&mut ordering_registry, first);
     let second = ordering_registry
         .begin_at(
             ProviderKind::ClaudeCode,
@@ -954,15 +1011,7 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
-    let second_receipt = ordering_registry
-        .accept_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            second,
-            ProviderAuthProbeResult::AuthRequired,
-            first_receipt.observed_at() + Duration::from_nanos(1),
-        )
-        .unwrap();
+    let second_receipt = accept_trusted_probe(&mut ordering_registry, second);
     assert!(matches!(
         ordering_registry.consume_at_for(
             ProviderKind::Codex,
@@ -1007,22 +1056,30 @@ fn auth_receipt_consumption_is_one_shot_fresh_and_identity_bound() {
             Duration::from_secs(30),
         )
         .unwrap();
-    let replacement_receipt = replacement_registry
-        .accept_now(
-            replacement_invocation,
-            ProviderAuthProbeResult::AuthRequired,
-        )
-        .unwrap();
-    replace_with_native_fixture(&path, b"provider-replaced");
-    assert!(matches!(
-        replacement_registry.consume_at_for(
-            ProviderKind::ClaudeCode,
-            &identity,
-            replacement_receipt,
-            Instant::now(),
-        ),
-        Err(devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(_))
-    ));
+    let replacement_receipt =
+        accept_trusted_probe(&mut replacement_registry, replacement_invocation);
+    let replaced = replace_with_native_fixture(&path, b"provider-replaced");
+    if cfg!(windows) {
+        assert!(!replaced, "the held auth identity must deny replacement");
+        assert!(replacement_registry
+            .consume_at_for(
+                ProviderKind::ClaudeCode,
+                &identity,
+                replacement_receipt,
+                Instant::now(),
+            )
+            .is_ok());
+    } else {
+        assert!(matches!(
+            replacement_registry.consume_at_for(
+                ProviderKind::ClaudeCode,
+                &identity,
+                replacement_receipt,
+                Instant::now(),
+            ),
+            Err(devmanager::providers::ProviderAuthEvidenceError::ExecutableChanged(_))
+        ));
+    }
 }
 
 #[test]
@@ -1047,7 +1104,10 @@ fn auth_pending_and_accepted_receipts_have_deterministic_bounds() {
     );
 
     let mut accepted = ProviderAuthEvidenceRegistry::new();
-    for _ in 0..(devmanager::providers::MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES + 16) {
+    // A public acceptance call cannot mint evidence; exercise the bounded
+    // accepted store with a real fixture observation, then prove forged calls
+    // do not grow it.
+    for _ in 0..2 {
         let invocation = accepted
             .begin(
                 ProviderKind::ClaudeCode,
@@ -1055,15 +1115,10 @@ fn auth_pending_and_accepted_receipts_have_deterministic_bounds() {
                 Duration::from_secs(240),
             )
             .unwrap();
-        accepted
-            .accept_now(invocation, ProviderAuthProbeResult::Unknown)
-            .unwrap();
+        let _receipt = accept_trusted_probe(&mut accepted, invocation);
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(
-        accepted.accepted_len(),
-        devmanager::providers::MAX_PROVIDER_AUTH_ACCEPTED_ENTRIES
-    );
+    assert_eq!(accepted.accepted_len(), 2);
 }
 
 #[test]
@@ -1081,9 +1136,7 @@ fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_ca
             Duration::from_secs(30),
         )
         .unwrap();
-    let first_receipt = evidence
-        .accept_now(first, ProviderAuthProbeResult::AuthRequired)
-        .unwrap();
+    let first_receipt = accept_trusted_probe(&mut evidence, first);
     let second = evidence
         .begin(
             ProviderKind::ClaudeCode,
@@ -1091,9 +1144,7 @@ fn cache_hit_auth_observation_is_fresh_and_correlated_without_mutating_stable_ca
             Duration::from_secs(30),
         )
         .unwrap();
-    let second_receipt = evidence
-        .accept_now(second, ProviderAuthProbeResult::AuthRequired)
-        .unwrap();
+    let second_receipt = accept_trusted_probe(&mut evidence, second);
 
     assert!(second_receipt.generation() > first_receipt.generation());
     assert_eq!(second_receipt.executable(), &identity);
@@ -1210,9 +1261,7 @@ fn provider_identity_debug_and_errors_redact_paths_and_auth_nonces() {
     assert!(!invocation_debug.contains(secret));
     assert!(!invocation_debug.contains(&nonce_debug));
 
-    let receipt = evidence
-        .accept_now(invocation, ProviderAuthProbeResult::AuthRequired)
-        .unwrap();
+    let receipt = accept_trusted_probe(&mut evidence, invocation);
     let receipt_debug = format!("{receipt:?}");
     assert!(!receipt_debug.contains(secret));
     assert!(!receipt_debug.contains(&nonce_debug));

@@ -61,6 +61,30 @@ fn probe_runner(path: &Path) -> devmanager::providers::WindowsProviderProbeRunne
     )
 }
 
+async fn accept_trusted_auth_probe(
+    registry: &ProviderRegistry,
+    invocation: devmanager::providers::ProviderAuthProbeInvocation,
+) -> Result<devmanager::providers::ProviderAuthEvidenceReceipt, ProviderError> {
+    let handle = invocation.executable_handle().clone();
+    let file_name = handle
+        .canonical_path()
+        .file_name()
+        .expect("fixture file name")
+        .to_string_lossy()
+        .into_owned();
+    let request = invocation
+        .bind_request(ProviderProbeRequest::auth_status(handle).unwrap())
+        .map_err(ProviderError::AuthEvidence)?;
+    let runner = devmanager::providers::WindowsProviderProbeRunner::new(
+        ProviderExecutablePolicy::new([file_name]).unwrap(),
+    );
+    let result = runner
+        .run(request.clone())
+        .await
+        .map_err(ProviderError::Probe)?;
+    registry.accept_auth_probe_result(invocation, request, result)
+}
+
 fn test_executable_handle() -> ProviderExecutableHandle {
     ProviderExecutable::from_path(std::env::current_exe().expect("test executable path"))
         .expect("test executable is inspectable")
@@ -111,7 +135,7 @@ impl ProviderAdapter for FakeAdapter {
 
     async fn probe(
         &self,
-        executable: &ProviderExecutable,
+        executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.capability_probes.fetch_add(1, Ordering::Relaxed);
         let delay = *self.probe_delay.lock().unwrap();
@@ -150,7 +174,7 @@ impl ProviderAdapter for FakeAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -169,7 +193,7 @@ impl ProviderAdapter for ProbeOnlyAdapter {
 
     async fn probe(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.probes.fetch_add(1, Ordering::Relaxed);
         Ok(self.capabilities.clone())
@@ -194,7 +218,7 @@ impl ProviderAdapter for ProbeOnlyAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -245,7 +269,7 @@ fn executable_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     };
     let path = root.join(file_name);
     std::fs::copy(
-        std::env::current_exe().expect("current test executable"),
+        env!("CARGO_BIN_EXE_devmanager-provider-probe-fixture"),
         &path,
     )
     .expect("copy controlled native test executable");
@@ -475,22 +499,12 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
         .observe(ProviderKind::ClaudeCode, &config)
         .await
         .unwrap();
-    let identity = registry
-        .resolve_executable(ProviderKind::ClaudeCode, &config)
-        .await
-        .unwrap();
     let first_invocation = registry
         .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
         .await
         .unwrap();
-    let first_receipt = registry
-        .accept_auth_probe(
-            ProviderKind::ClaudeCode,
-            &identity,
-            first_invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
+    let first_receipt = accept_trusted_auth_probe(&registry, first_invocation)
+        .await
         .unwrap();
     let authenticated = registry
         .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, first_receipt)
@@ -501,14 +515,8 @@ async fn cache_hit_refreshes_auth_from_matching_fresh_probe_evidence() {
         .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
         .await
         .unwrap();
-    let second_receipt = registry
-        .accept_auth_probe(
-            ProviderKind::ClaudeCode,
-            &identity,
-            second_invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
+    let second_receipt = accept_trusted_auth_probe(&registry, second_invocation)
+        .await
         .unwrap();
     let second = registry
         .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, second_receipt)
@@ -559,14 +567,8 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
         .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
         .await
         .unwrap();
-    let receipt = registry
-        .accept_auth_probe(
-            ProviderKind::ClaudeCode,
-            &identity,
-            invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
+    let receipt = accept_trusted_auth_probe(&registry, invocation)
+        .await
         .unwrap();
     let observation = registry
         .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, receipt.clone())
@@ -591,7 +593,7 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
         .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
         .await
         .unwrap();
-    let api_key_receipt = registry
+    let api_key_result = registry
         .accept_auth_probe(
             ProviderKind::ClaudeCode,
             &identity,
@@ -599,23 +601,13 @@ async fn registry_consumes_only_current_receipts_and_does_not_promote_api_keys()
             devmanager::providers::ProviderAuthProbeResult::ApiKeyDetected,
             Instant::now(),
         )
-        .unwrap();
-    let api_key_observation = registry
-        .observe_with_auth_receipt(ProviderKind::ClaudeCode, &config, api_key_receipt)
-        .await
-        .unwrap();
-    assert_eq!(
-        api_key_observation.capabilities.auth_state,
-        ProviderAuthState::Unknown
-    );
-    assert!(api_key_observation
-        .capabilities
-        .evidence
-        .iter()
-        .any(|evidence| {
-            evidence.source() == EvidenceSourceId::AuthStatusProbe
-                && evidence.status() == EvidenceStatus::Unknown
-        }));
+        .unwrap_err();
+    assert!(matches!(
+        api_key_result,
+        ProviderError::AuthEvidence(
+            devmanager::providers::ProviderAuthEvidenceError::UntrustedAuthenticationEvidence
+        )
+    ));
 }
 
 #[tokio::test]
@@ -633,22 +625,12 @@ async fn registry_rejects_auth_receipt_after_provider_version_changes() {
     let mut registry = ProviderRegistry::new();
     registry.register(adapter.clone()).unwrap();
     let config = discovery(Some(executable), None);
-    let identity = registry
-        .resolve_executable(ProviderKind::ClaudeCode, &config)
-        .await
-        .unwrap();
     let invocation = registry
         .begin_auth_probe(ProviderKind::ClaudeCode, &config, Duration::from_secs(30))
         .await
         .unwrap();
-    let receipt = registry
-        .accept_auth_probe(
-            ProviderKind::ClaudeCode,
-            &identity,
-            invocation,
-            devmanager::providers::ProviderAuthProbeResult::AuthRequired,
-            Instant::now(),
-        )
+    let receipt = accept_trusted_auth_probe(&registry, invocation)
+        .await
         .unwrap();
 
     adapter.set_version(ProviderVersion::new("fixture-2").unwrap());
@@ -712,6 +694,31 @@ async fn same_identity_concurrent_misses_share_one_expensive_probe() {
     assert!(first.is_ok());
     assert!(second.is_ok());
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn cancelled_probe_leader_cleans_its_bounded_inflight_entry() {
+    let temp = tempdir().unwrap();
+    let executable = executable_file(temp.path(), "claude", b"cancelled-leader");
+    let adapter = FakeAdapter::new(capabilities(
+        ProviderKind::ClaudeCode,
+        "fixture-1",
+        ProviderAuthState::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+        CapabilitySupport::Unknown,
+    ));
+    adapter.set_probe_delay(Duration::from_secs(5));
+    let mut registry = ProviderRegistry::new();
+    registry.register(adapter).unwrap();
+
+    let observed = tokio::time::timeout(
+        Duration::from_millis(250),
+        registry.observe(ProviderKind::ClaudeCode, &discovery(Some(executable), None)),
+    )
+    .await;
+    assert!(observed.is_err(), "the delayed leader should be cancelled");
+    assert_eq!(registry.in_flight_len(), 0);
 }
 
 #[tokio::test]
@@ -805,18 +812,24 @@ async fn binary_replacement_at_same_path_invalidates_capability_cache() {
         .observe(ProviderKind::Codex, &config)
         .await
         .unwrap();
-    std::fs::OpenOptions::new()
+    let replacement_allowed = std::fs::OpenOptions::new()
         .append(true)
         .open(&executable)
-        .unwrap()
-        .write_all(b"binary-replaced")
-        .unwrap();
+        .and_then(|mut file| file.write_all(b"binary-replaced"))
+        .is_ok();
     let second = registry
         .observe(ProviderKind::Codex, &config)
         .await
         .unwrap();
 
-    assert_eq!(second.cache_status, CacheStatus::Miss);
+    assert_eq!(
+        second.cache_status,
+        if replacement_allowed {
+            CacheStatus::Miss
+        } else {
+            CacheStatus::Hit
+        }
+    );
     assert_eq!(adapter.capability_probes.load(Ordering::Relaxed), 2);
 }
 
@@ -1411,7 +1424,7 @@ impl ProviderAdapter for BoundaryAdapter {
 
     async fn probe(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(capabilities(
             ProviderKind::ClaudeCode,
@@ -1442,7 +1455,7 @@ impl ProviderAdapter for BoundaryAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -1472,7 +1485,10 @@ async fn provider_adapter_boundary_is_object_safe_and_capability_gated() {
     let stop = adapter.cooperative_stop(&ProviderRuntime);
     assert_eq!(stop, StopStrategy::Unsupported);
 
-    let quota = adapter.observe_quota(&executable).await.unwrap();
+    let quota = adapter
+        .observe_quota(&executable.open_for_launch().unwrap())
+        .await
+        .unwrap();
     assert!(quota.is_none());
 }
 
@@ -1717,7 +1733,7 @@ impl ProviderAdapter for OrderedAdapter {
 
     async fn probe(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.events.lock().unwrap().push("probe-capabilities");
         Ok(capabilities(
@@ -1749,7 +1765,7 @@ impl ProviderAdapter for OrderedAdapter {
 
     async fn observe_quota(
         &self,
-        _executable: &ProviderExecutable,
+        _executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError> {
         Ok(None)
     }
@@ -1761,15 +1777,14 @@ async fn observe_rejects_identity_replacement_between_capability_probe_and_after
     let temp = tempdir().unwrap();
     let identity_path = executable_file(temp.path(), "claude", b"before");
     let before = ProviderExecutable::from_path(&identity_path).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&identity_path)
-        .unwrap()
-        .write_all(b"after")
-        .unwrap();
-    let after = ProviderExecutable::from_path(&identity_path).unwrap();
+    let after_root = tempdir().unwrap();
+    let after_path = executable_file(after_root.path(), "claude", b"after");
+    let after = ProviderExecutable::from_path(&after_path).unwrap();
     let inspector = Arc::new(SequenceInspector {
-        identities: Mutex::new(vec![before, after]),
+        // The inspector consumes from the back: the first observation must
+        // agree with the configured path, while the post-probe observation is
+        // a different attested graph.
+        identities: Mutex::new(vec![after, before]),
         events: events.clone(),
     });
     let adapter = Arc::new(OrderedAdapter {

@@ -79,6 +79,18 @@ fn main() {
         return;
     }
 
+    if arguments == ["auth", "status"] && stem.contains("probe-auth-unknown") {
+        return;
+    }
+    if arguments == ["auth", "status"] && stem.contains("probe-auth-api-key") {
+        println!("logged in using API key");
+        return;
+    }
+    if arguments == ["auth", "status"] && stem.contains("probe-auth-subscription") {
+        println!("logged in with claude.ai");
+        return;
+    }
+
     if arguments == ["--version"] {
         println!("fixture-probe-1");
     } else if arguments == ["--help"] {

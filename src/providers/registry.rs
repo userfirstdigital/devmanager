@@ -15,6 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -268,6 +270,66 @@ struct ProbeFlight {
     >,
     completed: Notify,
     started_at: Instant,
+    deadline: Instant,
+    cancelled: AtomicBool,
+    cancellation: Notify,
+}
+
+impl ProbeFlight {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut result = self.result.lock().unwrap();
+        if result.is_none() {
+            *result = Some(Err(ProviderError::Probe(
+                crate::providers::adapter::ProviderProbeError::TimedOut,
+            )));
+        }
+        self.cancellation.notify_waiters();
+        self.completed.notify_waiters();
+    }
+}
+
+struct ProbeLeaderCleanup<'a> {
+    registry: &'a ProviderRegistry,
+    key: ProbeIdentityKey,
+    flight: Arc<ProbeFlight>,
+    armed: bool,
+}
+
+impl<'a> ProbeLeaderCleanup<'a> {
+    fn new(
+        registry: &'a ProviderRegistry,
+        key: ProbeIdentityKey,
+        flight: Arc<ProbeFlight>,
+    ) -> Self {
+        Self {
+            registry,
+            key,
+            flight,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeLeaderCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.flight.cancel();
+        if let Ok(mut in_flight) = self.registry.in_flight.lock() {
+            if in_flight
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+            {
+                in_flight.remove(&self.key);
+            }
+        }
+    }
 }
 
 struct ProbeRun {
@@ -401,6 +463,17 @@ pub struct ProviderRegistry {
     auth_evidence: Mutex<ProviderAuthEvidenceRegistry>,
 }
 
+impl Drop for ProviderRegistry {
+    fn drop(&mut self) {
+        if let Ok(in_flight) = self.in_flight.get_mut() {
+            for flight in in_flight.values() {
+                flight.cancel();
+            }
+            in_flight.clear();
+        }
+    }
+}
+
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self::with_executable_inspector(Arc::new(FileSystemExecutableInspector))
@@ -499,11 +572,37 @@ impl ProviderRegistry {
             .map_err(ProviderError::AuthEvidence)
     }
 
+    /// Accept only a result carrying the private proof emitted by the
+    /// crate-owned bounded probe runner.  Public callers may submit the
+    /// runner's opaque result, but cannot choose an auth state or timestamp.
+    pub fn accept_auth_probe_result(
+        &self,
+        invocation: ProviderAuthProbeInvocation,
+        request: ProviderProbeRequest,
+        result: ProviderProbeResult,
+    ) -> Result<ProviderAuthEvidenceReceipt, ProviderError> {
+        if request.executable() != invocation.executable_handle()
+            || !request.auth_binding_matches(&invocation)
+        {
+            return Err(ProviderError::AuthEvidence(
+                ProviderAuthEvidenceError::RequestBindingMismatch,
+            ));
+        }
+        let observation = result
+            .into_auth_observation(&invocation, &request)
+            .map_err(ProviderError::AuthEvidence)?;
+        self.auth_evidence
+            .lock()
+            .unwrap()
+            .accept_observation(invocation, observation)
+            .map_err(ProviderError::AuthEvidence)
+    }
+
     pub(crate) fn accept_auth_probe_observation(
         &self,
         invocation: ProviderAuthProbeInvocation,
         request: &ProviderProbeRequest,
-        result: &ProviderProbeResult,
+        result: ProviderProbeResult,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderError> {
         if request.executable() != invocation.executable_handle()
             || !request.auth_binding_matches(&invocation)
@@ -649,10 +748,7 @@ impl ProviderRegistry {
                 .map(|(key, flight)| (key.clone(), Arc::clone(flight)))
                 .collect();
             for (expired_key, expired_flight) in expired {
-                *expired_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
-                    crate::providers::adapter::ProviderProbeError::TimedOut,
-                )));
-                expired_flight.completed.notify_waiters();
+                expired_flight.cancel();
                 in_flight.remove(&expired_key);
             }
             let replaced: Vec<_> = in_flight
@@ -668,10 +764,7 @@ impl ProviderRegistry {
                 .map(|(existing_key, flight)| (existing_key.clone(), Arc::clone(flight)))
                 .collect();
             for (replaced_key, replaced_flight) in replaced {
-                *replaced_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
-                    crate::providers::adapter::ProviderProbeError::TimedOut,
-                )));
-                replaced_flight.completed.notify_waiters();
+                replaced_flight.cancel();
                 in_flight.remove(&replaced_key);
             }
             if let Some(flight) = in_flight.get(&key) {
@@ -685,16 +778,16 @@ impl ProviderRegistry {
                     else {
                         break;
                     };
-                    *oldest_flight.result.lock().unwrap() = Some(Err(ProviderError::Probe(
-                        crate::providers::adapter::ProviderProbeError::TimedOut,
-                    )));
-                    oldest_flight.completed.notify_waiters();
+                    oldest_flight.cancel();
                     in_flight.remove(&oldest_key);
                 }
                 let flight = Arc::new(ProbeFlight {
                     result: Mutex::new(None),
                     completed: Notify::new(),
                     started_at: now,
+                    deadline: now + PROVIDER_IN_FLIGHT_TTL,
+                    cancelled: AtomicBool::new(false),
+                    cancellation: Notify::new(),
                 });
                 in_flight.insert(key.clone(), Arc::clone(&flight));
                 (flight, true)
@@ -702,10 +795,33 @@ impl ProviderRegistry {
         };
 
         if leader {
-            let result = self
-                .perform_probe(&adapter, &requested_path, &before, &before_handle, &key)
-                .await;
-            *flight.result.lock().unwrap() = Some(result.clone());
+            let mut leader_cleanup =
+                ProbeLeaderCleanup::new(self, key.clone(), Arc::clone(&flight));
+            let remaining = flight.deadline.saturating_duration_since(Instant::now());
+            let mut cancellation = pin!(flight.cancellation.notified());
+            cancellation.as_mut().enable();
+            let result = if flight.cancelled.load(Ordering::Acquire) {
+                Err(ProviderError::Probe(
+                    crate::providers::adapter::ProviderProbeError::TimedOut,
+                ))
+            } else {
+                tokio::select! {
+                    result = self.perform_probe(&adapter, &requested_path, &before, &before_handle, &key) => result,
+                    _ = &mut cancellation => Err(ProviderError::Probe(
+                        crate::providers::adapter::ProviderProbeError::TimedOut,
+                    )),
+                    _ = tokio::time::sleep(remaining) => Err(ProviderError::Probe(
+                        crate::providers::adapter::ProviderProbeError::TimedOut,
+                    )),
+                }
+            };
+            let published = {
+                let mut slot = flight.result.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(result.clone());
+                }
+                slot.clone().unwrap_or(result)
+            };
             flight.completed.notify_waiters();
             let mut in_flight = self.in_flight.lock().unwrap();
             if in_flight
@@ -714,7 +830,8 @@ impl ProviderRegistry {
             {
                 in_flight.remove(&key);
             }
-            result.map(|(capabilities, executable, executable_handle)| ProbeRun {
+            leader_cleanup.disarm();
+            published.map(|(capabilities, executable, executable_handle)| ProbeRun {
                 capabilities,
                 executable,
                 executable_handle,
@@ -730,13 +847,37 @@ impl ProviderRegistry {
                         leader: false,
                     });
                 }
-                tokio::time::timeout(PROVIDER_IN_FLIGHT_TTL, flight.completed.notified())
-                    .await
-                    .map_err(|_| {
-                        ProviderError::Probe(
+                let remaining = flight.deadline.saturating_duration_since(Instant::now());
+                let mut completed = pin!(flight.completed.notified());
+                let mut cancellation = pin!(flight.cancellation.notified());
+                completed.as_mut().enable();
+                cancellation.as_mut().enable();
+                if let Some(result) = flight.result.lock().unwrap().clone() {
+                    return result.map(|(capabilities, executable, executable_handle)| ProbeRun {
+                        capabilities,
+                        executable,
+                        executable_handle,
+                        leader: false,
+                    });
+                }
+                if flight.cancelled.load(Ordering::Acquire) {
+                    return Err(ProviderError::Probe(
+                        crate::providers::adapter::ProviderProbeError::TimedOut,
+                    ));
+                }
+                tokio::select! {
+                    _ = &mut completed => {}
+                    _ = &mut cancellation => {
+                        return Err(ProviderError::Probe(
                             crate::providers::adapter::ProviderProbeError::TimedOut,
-                        )
-                    })?;
+                        ));
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        return Err(ProviderError::Probe(
+                            crate::providers::adapter::ProviderProbeError::TimedOut,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -756,7 +897,7 @@ impl ProviderRegistry {
         ),
         ProviderError,
     > {
-        let capabilities = adapter.probe(before).await?;
+        let capabilities = adapter.probe(before_handle).await?;
         if capabilities.kind != identity_key.kind {
             return Err(ProviderError::CapabilityKindMismatch {
                 expected: identity_key.kind,
@@ -898,6 +1039,10 @@ impl ProviderRegistry {
 
     pub fn cache_len(&self) -> usize {
         self.cache.lock().unwrap().len()
+    }
+
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.lock().unwrap().len()
     }
 
     pub fn clear_cache(&self) {

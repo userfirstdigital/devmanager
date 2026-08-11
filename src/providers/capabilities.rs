@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_PROVIDER_VERSION_BYTES: usize = 128;
 pub const MAX_CAPABILITY_EVIDENCE_ITEMS: usize = 16;
@@ -309,6 +309,56 @@ macro_rules! define_revision {
 define_revision!(AdapterRevision);
 define_revision!(SemanticSchemaVersion);
 
+/// The schema authority carried by every registry-issued authentication
+/// invocation.  Probe results are never accepted when this authority changes.
+pub const PROVIDER_AUTH_ADAPTER_REVISION: AdapterRevision = AdapterRevision::new(1);
+pub const PROVIDER_AUTH_SEMANTIC_SCHEMA_VERSION: SemanticSchemaVersion =
+    SemanticSchemaVersion::new(1);
+
+/// Clock authority for authentication evidence.  Freshness always uses the
+/// monotonic `Instant`; the serial timestamp is only for capability evidence
+/// projections and diagnostics.
+pub trait ProviderAuthClock: Send + Sync {
+    fn now(&self) -> Instant;
+
+    fn timestamp_ms(&self, instant: Instant) -> u64;
+}
+
+#[derive(Debug)]
+pub struct SystemProviderAuthClock {
+    origin: Instant,
+    origin_timestamp_ms: u64,
+}
+
+impl Default for SystemProviderAuthClock {
+    fn default() -> Self {
+        let origin = Instant::now();
+        let origin_timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(1);
+        Self {
+            origin,
+            origin_timestamp_ms: origin_timestamp_ms.max(1),
+        }
+    }
+}
+
+impl ProviderAuthClock for SystemProviderAuthClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn timestamp_ms(&self, instant: Instant) -> u64 {
+        self.origin_timestamp_ms.saturating_add(
+            instant
+                .saturating_duration_since(self.origin)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSourceId {
@@ -559,14 +609,14 @@ impl CapabilityEvidence {
                 EvidenceStatus::Unknown
             }
         };
-        let observed_at = receipt.generation;
+        let observed_at = receipt.observed_at_ms;
         Self {
             source: EvidenceSourceId::AuthStatusProbe,
             observed_at,
             status,
             diagnostic: None,
             auth_source: Some(receipt.source),
-            expires_at: Some(observed_at.saturating_add(1)),
+            expires_at: Some(receipt.deadline_ms),
             confidence: receipt.confidence,
             auth_authority: true,
         }
@@ -991,6 +1041,7 @@ struct ProviderAuthInvocationKey {
     executable: ProviderExecutableHandle,
     version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
+    generation: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1007,8 +1058,14 @@ struct ProviderAuthReceiptKey {
 /// prevents a wire/request caller from choosing a nonce or generation.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ProviderAuthProbeBinding {
+    kind: ProviderKind,
+    source: ProviderAuthEvidenceSource,
+    executable: ProviderExecutableHandle,
+    version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
+    adapter_revision: AdapterRevision,
+    semantic_schema_version: SemanticSchemaVersion,
 }
 
 #[derive(Clone)]
@@ -1019,8 +1076,11 @@ pub struct ProviderAuthProbeInvocation {
     version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
+    adapter_revision: AdapterRevision,
+    semantic_schema_version: SemanticSchemaVersion,
     issued_at: Instant,
     deadline: Instant,
+    clock: Arc<dyn ProviderAuthClock>,
 }
 
 impl fmt::Debug for ProviderAuthProbeInvocation {
@@ -1078,8 +1138,14 @@ impl ProviderAuthProbeInvocation {
 
     pub(crate) fn binding(&self) -> ProviderAuthProbeBinding {
         ProviderAuthProbeBinding {
+            kind: self.kind,
+            source: self.source,
+            executable: self.executable.clone(),
+            version: self.version.clone(),
             nonce: self.nonce,
             generation: self.generation,
+            adapter_revision: self.adapter_revision,
+            semantic_schema_version: self.semantic_schema_version,
         }
     }
 
@@ -1089,6 +1155,7 @@ impl ProviderAuthProbeInvocation {
             executable: self.executable.clone(),
             version: self.version.clone(),
             nonce: self.nonce,
+            generation: self.generation,
         }
     }
 }
@@ -1104,6 +1171,8 @@ pub struct ProviderAuthEvidenceReceipt {
     result: ProviderAuthProbeResult,
     observed_at: Instant,
     deadline: Instant,
+    observed_at_ms: u64,
+    deadline_ms: u64,
     confidence: EvidenceConfidence,
 }
 
@@ -1166,6 +1235,14 @@ impl ProviderAuthEvidenceReceipt {
         self.deadline
     }
 
+    pub const fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+
+    pub const fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+
     pub const fn expires_at(&self) -> Instant {
         self.deadline
     }
@@ -1203,6 +1280,7 @@ pub(crate) struct ProviderAuthProbeObservation {
     version: ProviderVersion,
     result: ProviderAuthProbeResult,
     observed_at: Instant,
+    observed_at_ms: u64,
     confidence: EvidenceConfidence,
     binding: ProviderAuthProbeBinding,
     permit: ProviderAuthObservationPermit,
@@ -1226,13 +1304,16 @@ impl ProviderAuthProbeObservation {
         if source.provider_kind() != kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
+        let observed_at = invocation.clock.now();
+        let observed_at_ms = invocation.clock.timestamp_ms(observed_at);
         Ok(Self {
             kind,
             source,
             executable,
             version,
             result,
-            observed_at: Instant::now(),
+            observed_at,
+            observed_at_ms,
             confidence,
             binding: binding.clone(),
             permit: ProviderAuthObservationPermit { binding },
@@ -1240,20 +1321,32 @@ impl ProviderAuthProbeObservation {
     }
 }
 
-#[derive(Default)]
 pub struct ProviderAuthEvidenceRegistry {
+    clock: Arc<dyn ProviderAuthClock>,
     next_generation: u64,
     pending: HashMap<ProviderAuthInvocationKey, ProviderAuthProbeInvocation>,
     pending_order: VecDeque<ProviderAuthInvocationKey>,
     accepted: HashMap<ProviderAuthReceiptKey, (ProviderAuthEvidenceReceipt, bool)>,
     accepted_order: VecDeque<ProviderAuthReceiptKey>,
     last_accepted:
-        HashMap<(ProviderKind, ProviderExecutableHandle, ProviderVersion), (u64, Instant)>,
+        HashMap<(ProviderKind, ProviderExecutableHandle, ProviderVersion), (u64, Instant, u64)>,
 }
 
 impl ProviderAuthEvidenceRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_clock(Arc::new(SystemProviderAuthClock::default()))
+    }
+
+    pub fn with_clock(clock: Arc<dyn ProviderAuthClock>) -> Self {
+        Self {
+            clock,
+            next_generation: 0,
+            pending: HashMap::new(),
+            pending_order: VecDeque::new(),
+            accepted: HashMap::new(),
+            accepted_order: VecDeque::new(),
+            last_accepted: HashMap::new(),
+        }
     }
 
     pub fn begin(
@@ -1335,7 +1428,7 @@ impl ProviderAuthEvidenceRegistry {
         version: ProviderVersion,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
-        let issued_at = Instant::now();
+        let issued_at = self.clock.now();
         let deadline = issued_at
             .checked_add(ttl.min(MAX_PROVIDER_AUTH_TTL))
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
@@ -1426,7 +1519,7 @@ impl ProviderAuthEvidenceRegistry {
         if source.provider_kind() != kind {
             return Err(ProviderAuthEvidenceError::WrongAuthSource);
         }
-        let now = Instant::now();
+        let now = self.clock.now();
         if deadline <= issued_at || deadline <= now {
             return Err(ProviderAuthEvidenceError::InvalidDeadline);
         }
@@ -1462,8 +1555,11 @@ impl ProviderAuthEvidenceRegistry {
             version,
             nonce,
             generation: self.next_generation,
+            adapter_revision: PROVIDER_AUTH_ADAPTER_REVISION,
+            semantic_schema_version: PROVIDER_AUTH_SEMANTIC_SCHEMA_VERSION,
             issued_at,
             deadline,
+            clock: Arc::clone(&self.clock),
         };
         let key = invocation.key();
         self.evict_oldest_pending();
@@ -1480,35 +1576,26 @@ impl ProviderAuthEvidenceRegistry {
         result: ProviderAuthProbeResult,
         _observed_at: Instant,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
-        if result.is_authenticated_subscription() {
-            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
-        }
-        self.accept_untrusted_at_for(
-            expected_kind,
-            expected_executable,
-            invocation,
-            result,
-            Instant::now(),
-        )
+        let _ = (expected_kind, expected_executable, invocation, result);
+        Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence)
     }
 
-    fn accept_untrusted_at_for(
+    /// Accepts only the opaque result emitted by the bounded provider probe
+    /// runner.  The result owns a private proof bound to this exact request
+    /// and invocation; callers cannot select an auth state or timestamp.
+    pub fn accept_probe_result(
         &mut self,
-        expected_kind: ProviderKind,
-        expected_executable: &ProviderExecutable,
         invocation: ProviderAuthProbeInvocation,
-        result: ProviderAuthProbeResult,
-        observed_at: Instant,
+        request: crate::providers::adapter::ProviderProbeRequest,
+        result: crate::providers::adapter::ProviderProbeResult,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
-        self.accept_at_for_internal(
-            expected_kind,
-            expected_executable,
-            invocation,
-            result,
-            observed_at,
-            result.default_confidence(),
-            false,
-        )
+        if request.executable() != invocation.executable_handle()
+            || !request.auth_binding_matches(&invocation)
+        {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        let observation = result.into_auth_observation(&invocation, &request)?;
+        self.accept_observation(invocation, observation)
     }
 
     pub(crate) fn accept_observation(
@@ -1523,6 +1610,7 @@ impl ProviderAuthEvidenceRegistry {
             version,
             result,
             observed_at,
+            observed_at_ms,
             confidence,
             binding,
             permit,
@@ -1552,8 +1640,8 @@ impl ProviderAuthEvidenceRegistry {
             invocation,
             result,
             observed_at,
+            observed_at_ms,
             confidence,
-            true,
         )
     }
 
@@ -1564,12 +1652,9 @@ impl ProviderAuthEvidenceRegistry {
         invocation: ProviderAuthProbeInvocation,
         result: ProviderAuthProbeResult,
         observed_at: Instant,
+        observed_at_ms: u64,
         confidence: EvidenceConfidence,
-        trusted_observation: bool,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
-        if result.is_authenticated_subscription() && !trusted_observation {
-            return Err(ProviderAuthEvidenceError::UntrustedAuthenticationEvidence);
-        }
         if invocation.kind != expected_kind {
             return Err(ProviderAuthEvidenceError::WrongProvider);
         }
@@ -1580,7 +1665,8 @@ impl ProviderAuthEvidenceRegistry {
             return Err(ProviderAuthEvidenceError::WrongExecutable);
         }
         let key = invocation.key();
-        self.evict_expired(Instant::now());
+        let now = self.clock.now();
+        self.evict_expired(now);
         if !self.pending.contains_key(&key) {
             return Err(ProviderAuthEvidenceError::UnknownInvocation);
         }
@@ -1588,11 +1674,22 @@ impl ProviderAuthEvidenceRegistry {
             self.remove_pending(&key);
             return Err(ProviderAuthEvidenceError::ExecutableChanged(error));
         }
-        let now = Instant::now();
         if observed_at > now {
             return Err(ProviderAuthEvidenceError::FutureTimestamp);
         }
         if observed_at < invocation.issued_at || observed_at > invocation.deadline {
+            self.remove_pending(&key);
+            return Err(ProviderAuthEvidenceError::Expired);
+        }
+        let issued_at_ms = self.clock.timestamp_ms(invocation.issued_at);
+        let deadline_ms = self.clock.timestamp_ms(invocation.deadline);
+        if observed_at_ms == 0
+            || observed_at_ms != self.clock.timestamp_ms(observed_at)
+            || observed_at_ms > self.clock.timestamp_ms(now)
+        {
+            return Err(ProviderAuthEvidenceError::FutureTimestamp);
+        }
+        if observed_at_ms < issued_at_ms || observed_at_ms > deadline_ms {
             self.remove_pending(&key);
             return Err(ProviderAuthEvidenceError::Expired);
         }
@@ -1603,11 +1700,16 @@ impl ProviderAuthEvidenceRegistry {
             invocation.executable.clone(),
             invocation.version.clone(),
         );
-        if let Some((last_generation, last_observed_at)) = self.last_accepted.get(&identity_key) {
+        if let Some((last_generation, last_observed_at, last_observed_at_ms)) =
+            self.last_accepted.get(&identity_key)
+        {
             if invocation.generation <= *last_generation {
                 return Err(ProviderAuthEvidenceError::Reordered);
             }
             if observed_at <= *last_observed_at {
+                return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
+            }
+            if observed_at_ms <= *last_observed_at_ms {
                 return Err(ProviderAuthEvidenceError::NonMonotonicTimestamp);
             }
         }
@@ -1621,10 +1723,14 @@ impl ProviderAuthEvidenceRegistry {
             result,
             observed_at,
             deadline: invocation.deadline,
+            observed_at_ms,
+            deadline_ms,
             confidence,
         };
-        self.last_accepted
-            .insert(identity_key, (invocation.generation, observed_at));
+        self.last_accepted.insert(
+            identity_key,
+            (invocation.generation, observed_at, observed_at_ms),
+        );
         self.evict_oldest_accepted();
         let receipt_key = receipt.key();
         self.accepted_order.push_back(receipt_key.clone());
@@ -1640,7 +1746,7 @@ impl ProviderAuthEvidenceRegistry {
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         let kind = invocation.kind;
         let executable = invocation.executable.executable().clone();
-        self.accept_at_for(kind, &executable, invocation, result, Instant::now())
+        self.accept_at_for(kind, &executable, invocation, result, self.clock.now())
     }
 
     pub fn accept_now(
@@ -1648,7 +1754,7 @@ impl ProviderAuthEvidenceRegistry {
         invocation: ProviderAuthProbeInvocation,
         result: ProviderAuthProbeResult,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
-        self.accept_at(invocation, result, Instant::now())
+        self.accept_at(invocation, result, self.clock.now())
     }
 
     pub fn consume_at_for(
@@ -1672,7 +1778,7 @@ impl ProviderAuthEvidenceRegistry {
             self.remove_accepted(&key);
             return Err(ProviderAuthEvidenceError::ExecutableChanged(error));
         }
-        let now = Instant::now();
+        let now = self.clock.now();
         if receipt.deadline < now {
             return Err(ProviderAuthEvidenceError::Expired);
         }
@@ -1687,7 +1793,7 @@ impl ProviderAuthEvidenceRegistry {
                 receipt.executable.clone(),
                 receipt.version.clone(),
             ))
-            .map_or(true, |(generation, _)| *generation != receipt.generation)
+            .map_or(true, |(generation, _, _)| *generation != receipt.generation)
         {
             return Err(ProviderAuthEvidenceError::Reordered);
         }
@@ -1721,17 +1827,17 @@ impl ProviderAuthEvidenceRegistry {
             expected_kind,
             expected_executable.executable(),
             receipt,
-            Instant::now(),
+            self.clock.now(),
         )
     }
 
     pub fn pending_len(&mut self) -> usize {
-        self.evict_expired(Instant::now());
+        self.evict_expired(self.clock.now());
         self.pending.len()
     }
 
     pub fn accepted_len(&mut self) -> usize {
-        self.evict_expired(Instant::now());
+        self.evict_expired(self.clock.now());
         self.accepted.len()
     }
 
@@ -1820,7 +1926,7 @@ impl ProviderAuthEvidenceRegistry {
                 if self
                     .last_accepted
                     .get(&identity_key)
-                    .is_some_and(|(generation, _)| *generation == receipt.generation)
+                    .is_some_and(|(generation, _, _)| *generation == receipt.generation)
                 {
                     self.last_accepted.remove(&identity_key);
                 }
@@ -1845,7 +1951,7 @@ impl ProviderAuthEvidenceRegistry {
             if self
                 .last_accepted
                 .get(&identity_key)
-                .is_some_and(|(generation, _)| *generation == receipt.generation)
+                .is_some_and(|(generation, _, _)| *generation == receipt.generation)
             {
                 self.last_accepted.remove(&identity_key);
             }
@@ -2462,17 +2568,14 @@ fn open_nofollow(path: &Path) -> Result<File, ProviderExecutableError> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-        // Keep the attested file open without delete sharing. Windows then
-        // cannot replace or rename the path between identity capture and
-        // CreateProcess. Write sharing is retained for existing fixture and
-        // updater behavior; the bound hash/identity check rejects in-place
-        // mutation before the launch is admitted.
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+        // Keep the attested file open with read-only sharing. Windows then
+        // cannot replace, rename, or mutate the path between identity capture
+        // and CreateProcess; the bound hash/identity check remains a postcheck
+        // for platforms whose filesystem permits an in-place write anyway.
         options
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
+            .share_mode(FILE_SHARE_READ.0);
     }
 
     #[cfg(unix)]
@@ -2689,6 +2792,10 @@ fn os_str_bytes(value: &OsStr) -> usize {
 }
 
 fn directory_identity(path: &Path) -> Result<u128, ProviderDiscoveryError> {
+    open_directory_handle(path).map(|(_, identity)| identity)
+}
+
+fn open_directory_handle(path: &Path) -> Result<(Arc<File>, u128), ProviderDiscoveryError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(path.to_path_buf()))?;
     if !metadata.is_dir() || metadata_is_reparse(&metadata) {
@@ -2705,9 +2812,11 @@ fn directory_identity(path: &Path) -> Result<u128, ProviderDiscoveryError> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
         };
-        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .share_mode(FILE_SHARE_READ.0);
     }
 
     #[cfg(unix)]
@@ -2735,7 +2844,7 @@ fn directory_identity(path: &Path) -> Result<u128, ProviderDiscoveryError> {
             path.to_path_buf(),
         ));
     }
-    Ok(stable_id)
+    Ok((Arc::new(file), stable_id))
 }
 
 fn reject_reparse_components(path: &Path) -> Result<(), ProviderExecutableError> {
@@ -2960,10 +3069,18 @@ impl ProviderExecutablePolicy {
 /// One immutable, canonicalized capture of PATH. Resolution uses these
 /// entries in their captured order and constructs candidate paths itself;
 /// callers cannot assert a `PathEntry` origin for an arbitrary path.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ProviderPathSnapshot {
     directories: Vec<ProviderPathSnapshotEntry>,
 }
+
+impl PartialEq for ProviderPathSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.directories == other.directories
+    }
+}
+
+impl Eq for ProviderPathSnapshot {}
 
 impl fmt::Debug for ProviderPathSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2974,12 +3091,25 @@ impl fmt::Debug for ProviderPathSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ProviderPathSnapshotEntry {
     index: usize,
+    requested_directory: PathBuf,
     directory: PathBuf,
     identity: u128,
+    directory_handle: Arc<File>,
 }
+
+impl PartialEq for ProviderPathSnapshotEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.requested_directory == other.requested_directory
+            && self.directory == other.directory
+            && self.identity == other.identity
+    }
+}
+
+impl Eq for ProviderPathSnapshotEntry {}
 
 impl ProviderPathSnapshot {
     pub fn capture(path: impl AsRef<OsStr>) -> Result<Self, ProviderDiscoveryError> {
@@ -3002,6 +3132,7 @@ impl ProviderPathSnapshot {
             if path_bytes(&directory) > MAX_PROVIDER_PATH_BYTES {
                 return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
             }
+            #[cfg(not(target_os = "windows"))]
             match reject_reparse_components(&directory) {
                 Ok(()) => {}
                 Err(ProviderExecutableError::Missing(_)) => continue,
@@ -3011,6 +3142,12 @@ impl ProviderPathSnapshot {
             }
             let canonical = match fs::canonicalize(&directory) {
                 Ok(canonical) => canonical,
+                // NVM for Windows commonly contributes a junction/reparse
+                // entry.  A missing target is just a stale PATH entry; do
+                // not abort discovery of later entries because the entry was
+                // a reparse point.  Valid entries retain this canonical
+                // target below, so resolution never follows the PATH string
+                // again after the snapshot is captured.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => {
                     return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
@@ -3021,11 +3158,13 @@ impl ProviderPathSnapshot {
             }
             reject_reparse_components(&canonical)
                 .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(canonical.clone()))?;
-            let identity = directory_identity(&canonical)?;
+            let (directory_handle, identity) = open_directory_handle(&canonical)?;
             directories.push(ProviderPathSnapshotEntry {
                 index,
+                requested_directory: directory,
                 directory: canonical,
                 identity,
+                directory_handle,
             });
         }
         Ok(Self { directories })
@@ -3050,7 +3189,7 @@ impl ProviderPathSnapshotEntry {
     fn validate_current(&self) -> Result<(), ProviderDiscoveryError> {
         reject_reparse_components(&self.directory)
             .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(self.directory.clone()))?;
-        let canonical = fs::canonicalize(&self.directory)
+        let canonical = fs::canonicalize(&self.requested_directory)
             .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(self.directory.clone()))?;
         if canonical != self.directory || !canonical.is_dir() {
             return Err(ProviderDiscoveryError::InvalidPathSnapshot(
@@ -3058,6 +3197,14 @@ impl ProviderPathSnapshotEntry {
             ));
         }
         if directory_identity(&canonical)? != self.identity {
+            return Err(ProviderDiscoveryError::InvalidPathSnapshot(
+                self.directory.clone(),
+            ));
+        }
+        let held_identity = file_identity(&self.directory_handle, &self.directory)
+            .map_err(|_| ProviderDiscoveryError::InvalidPathSnapshot(self.directory.clone()))?
+            .stable_id();
+        if held_identity != self.identity {
             return Err(ProviderDiscoveryError::InvalidPathSnapshot(
                 self.directory.clone(),
             ));
@@ -4042,6 +4189,88 @@ fn parse_cursor_version_key(name: &str) -> Option<(u32, u32, u32, u32, u32, u32)
         minute,
         second,
     ))
+}
+
+#[cfg(test)]
+mod auth_timestamp_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FixedClock {
+        now: Instant,
+        timestamp_ms: u64,
+    }
+
+    impl ProviderAuthClock for FixedClock {
+        fn now(&self) -> Instant {
+            self.now
+        }
+
+        fn timestamp_ms(&self, _instant: Instant) -> u64 {
+            self.timestamp_ms
+        }
+    }
+
+    #[test]
+    fn accepted_auth_evidence_uses_the_injected_clock_timestamp() {
+        let now = Instant::now();
+        let clock = Arc::new(FixedClock {
+            now,
+            timestamp_ms: 4_242,
+        });
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let mut registry = ProviderAuthEvidenceRegistry::with_clock(clock);
+        let invocation = registry
+            .begin(
+                ProviderKind::ClaudeCode,
+                executable,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let observation = ProviderAuthProbeObservation::from_bounded_probe(
+            &invocation,
+            ProviderAuthProbeResult::AuthRequired,
+            EvidenceConfidence::High,
+        )
+        .unwrap();
+        let receipt = registry
+            .accept_observation(invocation, observation)
+            .unwrap();
+
+        assert_eq!(receipt.observed_at(), now);
+        assert_eq!(receipt.observed_at_ms(), 4_242);
+        assert_ne!(receipt.observed_at_ms(), receipt.generation());
+    }
+
+    #[test]
+    fn auth_capability_evidence_uses_clock_timestamp_not_generation() {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap())
+            .unwrap()
+            .open_for_launch()
+            .unwrap();
+        let observed_at = Instant::now();
+        let receipt = ProviderAuthEvidenceReceipt {
+            kind: ProviderKind::ClaudeCode,
+            source: ProviderAuthEvidenceSource::ClaudeCodeSubscriptionLogin,
+            executable,
+            version: ProviderVersion::new("fixture-1").unwrap(),
+            nonce: [1; PROVIDER_AUTH_NONCE_BYTES],
+            generation: 99,
+            result: ProviderAuthProbeResult::AuthRequired,
+            observed_at,
+            deadline: observed_at + Duration::from_secs(30),
+            observed_at_ms: 1_000,
+            deadline_ms: 2_000,
+            confidence: EvidenceConfidence::High,
+        };
+
+        let evidence = CapabilityEvidence::from_auth_receipt(&receipt);
+        assert_ne!(evidence.observed_at(), receipt.generation);
+        assert!(evidence
+            .expires_at()
+            .is_some_and(|expires_at| expires_at > evidence.observed_at()));
+    }
 }
 
 fn same_entrypoint(left: &str, right: &str) -> bool {
