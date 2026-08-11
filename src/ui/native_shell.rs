@@ -64,6 +64,11 @@ const NATIVE_POINTER_ID: u64 = 1;
 const MAX_RENDERED_TASK_ROWS: usize = DEFAULT_VISIBLE_ROWS + FIXED_VIRTUAL_OVERSCAN * 2;
 const MAX_PENDING_HOST_ACTIONS: usize = 32;
 const MAX_HOST_PROJECTIONS: usize = 64;
+const MAX_ACTION_OUTCOME_PROJECTIONS: usize = MAX_PENDING_HOST_ACTIONS;
+const MAX_HOST_PROJECTION_MESSAGES: usize = MAX_HOST_PROJECTIONS + MAX_ACTION_OUTCOME_PROJECTIONS;
+// Keep shell-side retries aligned with the bounded transport/worker lane so
+// every admitted action has one finite retry slot without a second queue cap.
+const MAX_RETRY_HOST_ACTIONS: usize = MAX_PENDING_HOST_ACTIONS;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
 const MAX_PENDING_PREFERENCES: usize = 8;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
@@ -725,7 +730,7 @@ pub struct TerminalReleaseOutcome {
     pub release: TerminalRelease,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeActionRecord {
     pub id: &'static str,
     pub focus_epoch: FocusEpoch,
@@ -754,7 +759,15 @@ pub struct NativeActionRecord {
     pub command: NativeHostCommand,
 }
 
-#[derive(Clone, Debug)]
+impl NativeActionRecord {
+    fn rebind_transport_epochs(&mut self, epochs: NativeHostRuntimeEpochs) {
+        self.connection_epoch = epochs.connection_epoch;
+        self.resource_generation = epochs.resource_generation;
+        self.runtime_generation = epochs.runtime_generation;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostCommand {
     Envelope(crate::domain::command::CommandEnvelope),
     TaskCreate {
@@ -777,6 +790,29 @@ pub enum NativeHostCommand {
     },
 }
 
+fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
+    match command {
+        NativeHostCommand::Envelope(envelope) => Some(envelope.command_id),
+        NativeHostCommand::TaskCreate { command_id, .. }
+        | NativeHostCommand::TaskRename { command_id, .. } => Some(*command_id),
+        NativeHostCommand::Hold { .. } => None,
+    }
+}
+
+fn same_native_action_identity(left: &NativeActionRecord, right: &NativeActionRecord) -> bool {
+    match (
+        native_command_id(&left.command),
+        native_command_id(&right.command),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => {
+            left.id == right.id
+                && left.action_epoch == right.action_epoch
+                && left.request_generation == right.request_generation
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeKeyboardState {
     pub palette_open: bool,
@@ -792,6 +828,74 @@ pub enum NativeHostActionResult {
     Queued,
     Disconnected,
     QueueFull,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeHostActionFailure {
+    QueueFull {
+        action_id: &'static str,
+    },
+    Disconnected {
+        action_id: &'static str,
+    },
+    ExecutionFailed {
+        action_id: &'static str,
+        command_id: Option<CommandId>,
+        message: String,
+    },
+    ExecutionUncertain {
+        action_id: &'static str,
+        command_id: Option<CommandId>,
+        message: String,
+    },
+}
+
+impl NativeHostActionFailure {
+    fn action_id(&self) -> &'static str {
+        match self {
+            Self::QueueFull { action_id }
+            | Self::Disconnected { action_id }
+            | Self::ExecutionFailed { action_id, .. }
+            | Self::ExecutionUncertain { action_id, .. } => action_id,
+        }
+    }
+
+    fn command_id(&self) -> Option<CommandId> {
+        match self {
+            Self::ExecutionFailed { command_id, .. }
+            | Self::ExecutionUncertain { command_id, .. } => *command_id,
+            Self::QueueFull { .. } | Self::Disconnected { .. } => None,
+        }
+    }
+
+    fn retry_message(&self) -> String {
+        match self {
+            Self::QueueFull { .. } => "action retained; retry available".to_string(),
+            Self::Disconnected { .. } => "action retained until host reconnects".to_string(),
+            Self::ExecutionFailed { message, .. } => {
+                format!("action failed; retry available: {message}")
+            }
+            Self::ExecutionUncertain { message, .. } => {
+                format!("outcome uncertain; retry with same command: {message}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeHostActionOutcome {
+    Accepted {
+        action: NativeActionRecord,
+        receipt: crate::domain::command::CommandReceipt,
+    },
+    Failed {
+        action: NativeActionRecord,
+        error: String,
+    },
+    Uncertain {
+        action: NativeActionRecord,
+        error: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -851,6 +955,7 @@ pub struct NativeHostProjection {
     pub client_model: Option<Arc<ClientModel>>,
     pub error: Option<String>,
     pub epochs: Option<NativeHostRuntimeEpochs>,
+    pub action_outcome: Option<NativeHostActionOutcome>,
 }
 
 enum NativeHostWorkerCommand {
@@ -966,6 +1071,7 @@ impl NativeHostProjection {
             client_model: None,
             error: None,
             epochs: None,
+            action_outcome: None,
         }
     }
 
@@ -975,6 +1081,7 @@ impl NativeHostProjection {
             client_model: Some(model),
             error: None,
             epochs: None,
+            action_outcome: None,
         }
     }
 
@@ -1048,11 +1155,10 @@ pub(crate) trait NativeHostRuntimePort: native_host_runtime_sealed::Sealed + Sen
     fn host_state(&self) -> NativeHostState;
     fn epochs(&self) -> NativeHostRuntimeEpochs;
     fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
-    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
     fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection>;
     fn pending_front(&self) -> Option<&NativeActionRecord>;
-    fn drop_pending_front(&mut self) -> Option<NativeActionRecord>;
     fn dispatch_next_pending(&mut self) -> NativeHostActionResult;
+    fn rebind_pending(&mut self, epochs: NativeHostRuntimeEpochs);
 }
 
 impl std::fmt::Debug for NativeHostClientRuntime {
@@ -1370,35 +1476,14 @@ impl NativeHostClientRuntime {
         self.pending.front()
     }
 
-    fn drop_pending_front(&mut self) -> Option<NativeActionRecord> {
-        self.pending.pop_front()
-    }
-
     fn dispatch_next_pending(&mut self) -> NativeHostActionResult {
         dispatch_pending_action(&mut self.pending, &self.command_tx)
     }
 
-    /// Drain only already-buffered unsolicited host projections. This method
-    /// is intended for a controller/task lane; paint and input callbacks never
-    /// call it. The zero-duration timeout makes the live lane nonblocking.
-    pub async fn drain_bounded(
-        &mut self,
-        max: usize,
-    ) -> Result<Vec<NativeHostProjectionKind>, IpcError> {
-        Ok(self.take_ready_projections(max))
-    }
-
-    pub fn take_ready_projections(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
-        self.ready_projections
-            .lock()
-            .map(|mut projections| {
-                let count = max.min(MAX_PENDING_HOST_ACTIONS).min(projections.len());
-                projections
-                    .drain(..count)
-                    .map(|projection| projection.kind)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn rebind_pending(&mut self, epochs: NativeHostRuntimeEpochs) {
+        for action in &mut self.pending {
+            action.rebind_transport_epochs(epochs);
+        }
     }
 
     pub fn take_ready_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
@@ -1445,18 +1530,14 @@ impl NativeHostClientRuntime {
                 *current = Some(Arc::clone(&model));
             }
             let epochs = current_runtime_epochs(&self.epochs);
-            if let Ok(mut projections) = self.ready_projections.lock() {
-                if projections.len() < MAX_HOST_PROJECTIONS {
-                    projections.push_back(
-                        NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
-                    );
-                }
-                let remaining = MAX_HOST_PROJECTIONS.saturating_sub(projections.len());
-                projections.extend(
-                    std::iter::once(NativeHostProjectionKind::Replay)
-                        .take(remaining)
-                        .map(NativeHostProjection::kind)
-                        .map(|projection| projection.at_epochs(epochs)),
+            publish_projection(
+                &self.ready_projections,
+                NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
+            );
+            for _ in 0..MAX_HOST_PROJECTIONS.saturating_sub(1) {
+                publish_projection(
+                    &self.ready_projections,
+                    NativeHostProjection::kind(NativeHostProjectionKind::Replay).at_epochs(epochs),
                 );
             }
             self.bootstrapped.store(true, Ordering::Release);
@@ -1504,10 +1585,6 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         NativeHostClientRuntime::enqueue(self, action)
     }
 
-    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
-        self.take_ready_projections(max)
-    }
-
     fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
         self.take_ready_projection_messages(max)
     }
@@ -1516,12 +1593,12 @@ impl NativeHostRuntimePort for NativeHostClientRuntime {
         NativeHostClientRuntime::pending_front(self)
     }
 
-    fn drop_pending_front(&mut self) -> Option<NativeActionRecord> {
-        NativeHostClientRuntime::drop_pending_front(self)
-    }
-
     fn dispatch_next_pending(&mut self) -> NativeHostActionResult {
         NativeHostClientRuntime::dispatch_next_pending(self)
+    }
+
+    fn rebind_pending(&mut self, epochs: NativeHostRuntimeEpochs) {
+        NativeHostClientRuntime::rebind_pending(self, epochs)
     }
 }
 
@@ -1635,13 +1712,20 @@ fn native_host_worker_loop(
                 if cancellation.load(Ordering::Acquire) {
                     break;
                 }
-                let projection = match action.command {
-                    NativeHostCommand::Hold { action_id, reason } => NativeHostProjection {
-                        kind: NativeHostProjectionKind::Error,
-                        client_model: None,
-                        error: Some(bounded_host_error(format!("{action_id}: HOLD: {reason}"))),
-                        epochs: None,
-                    },
+                let projection = match action.command.clone() {
+                    NativeHostCommand::Hold { action_id, reason } => {
+                        let message = bounded_host_error(format!("{action_id}: HOLD: {reason}"));
+                        NativeHostProjection {
+                            kind: NativeHostProjectionKind::Error,
+                            client_model: None,
+                            error: Some(message.clone()),
+                            epochs: None,
+                            action_outcome: Some(NativeHostActionOutcome::Failed {
+                                action,
+                                error: message,
+                            }),
+                        }
+                    }
                     command => {
                         let result = client.lock().ok().map(|mut client| {
                             runtime.block_on(execute_native_command_cancellable(
@@ -1651,30 +1735,57 @@ fn native_host_worker_loop(
                             ))
                         });
                         match result {
-                            Some(Ok(())) => {
-                                NativeHostProjection::kind(NativeHostProjectionKind::Live)
+                            Some(Ok(receipt)) => {
+                                let kind = match &receipt {
+                                    crate::domain::command::CommandReceipt::Rejected { .. } => {
+                                        NativeHostProjectionKind::Error
+                                    }
+                                    crate::domain::command::CommandReceipt::Accepted { .. } => {
+                                        NativeHostProjectionKind::Live
+                                    }
+                                };
+                                NativeHostProjection {
+                                    kind,
+                                    client_model: None,
+                                    error: None,
+                                    epochs: None,
+                                    action_outcome: Some(NativeHostActionOutcome::Accepted {
+                                        action,
+                                        receipt,
+                                    }),
+                                }
                             }
-                            Some(Err(error)) => NativeHostProjection {
-                                kind: NativeHostProjectionKind::Error,
-                                client_model: None,
-                                error: Some(bounded_host_error(error.to_string())),
-                                epochs: None,
-                            },
-                            None => NativeHostProjection {
-                                kind: NativeHostProjectionKind::Error,
-                                client_model: None,
-                                error: Some("native host client lock poisoned".to_string()),
-                                epochs: None,
-                            },
+                            Some(Err(error)) => {
+                                let message = bounded_host_error(error.to_string());
+                                NativeHostProjection {
+                                    kind: NativeHostProjectionKind::Error,
+                                    client_model: None,
+                                    error: Some(message.clone()),
+                                    epochs: None,
+                                    action_outcome: Some(NativeHostActionOutcome::Uncertain {
+                                        action,
+                                        error: message,
+                                    }),
+                                }
+                            }
+                            None => {
+                                let message = "native host client lock poisoned".to_string();
+                                NativeHostProjection {
+                                    kind: NativeHostProjectionKind::Error,
+                                    client_model: None,
+                                    error: Some(message.clone()),
+                                    epochs: None,
+                                    action_outcome: Some(NativeHostActionOutcome::Uncertain {
+                                        action,
+                                        error: message,
+                                    }),
+                                }
+                            }
                         }
                     }
                 }
                 .at_epochs(current_runtime_epochs(&epochs));
-                if let Ok(mut queue) = projections.lock() {
-                    if queue.len() < MAX_HOST_PROJECTIONS {
-                        queue.push_back(projection);
-                    }
-                }
+                publish_projection(&projections, projection);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if cancellation.load(Ordering::Acquire) {
@@ -1719,6 +1830,7 @@ fn pump_subscription_once(
                     client_model: None,
                     error: Some("native host client lock poisoned".to_string()),
                     epochs: None,
+                    action_outcome: None,
                 }
                 .at_epochs(current_runtime_epochs(epochs)),
             );
@@ -1732,6 +1844,7 @@ fn pump_subscription_once(
                     client_model: None,
                     error: Some("native host subscription lock poisoned".to_string()),
                     epochs: None,
+                    action_outcome: None,
                 }
                 .at_epochs(current_runtime_epochs(epochs)),
             );
@@ -1796,6 +1909,7 @@ fn pump_subscription_once(
                                 client_model: None,
                                 error: Some(bounded_host_error(resync_error)),
                                 epochs: None,
+                                action_outcome: None,
                             }
                             .at_epochs(current_runtime_epochs(epochs)),
                         );
@@ -1863,6 +1977,7 @@ fn pump_subscription_once(
                         client_model: None,
                         error: Some(bounded_host_error(error)),
                         epochs: None,
+                        action_outcome: None,
                     }
                     .at_epochs(current_runtime_epochs(epochs)),
                 ),
@@ -1936,7 +2051,35 @@ fn publish_projection(
     projection: NativeHostProjection,
 ) {
     if let Ok(mut queue) = projections.lock() {
-        if queue.len() < MAX_HOST_PROJECTIONS {
+        let action_outcome_count = queue
+            .iter()
+            .filter(|queued| queued.action_outcome.is_some())
+            .count();
+        let is_action_outcome = projection.action_outcome.is_some();
+        if is_action_outcome {
+            if action_outcome_count >= MAX_ACTION_OUTCOME_PROJECTIONS {
+                // At most the bounded worker/action lane can be in flight.
+                // Never evict an earlier exact action outcome if that
+                // invariant is violated; the queue remains bounded and the
+                // controller's saturation state is the visible signal.
+                return;
+            }
+            if queue.len() >= MAX_HOST_PROJECTION_MESSAGES {
+                // Preserve action outcomes over stale subscription noise.
+                let Some(index) = queue
+                    .iter()
+                    .position(|queued| queued.action_outcome.is_none())
+                else {
+                    return;
+                };
+                let _ = queue.remove(index);
+            }
+            queue.push_back(projection);
+            return;
+        }
+
+        let normal_count = queue.len().saturating_sub(action_outcome_count);
+        if normal_count < MAX_HOST_PROJECTIONS && queue.len() < MAX_HOST_PROJECTION_MESSAGES {
             queue.push_back(projection);
         }
     }
@@ -1945,7 +2088,7 @@ fn publish_projection(
 async fn execute_native_command(
     client: &mut HostClient,
     command: NativeHostCommand,
-) -> Result<(), IpcError> {
+) -> Result<crate::domain::command::CommandReceipt, IpcError> {
     let envelope = match command {
         NativeHostCommand::Envelope(envelope) => envelope,
         NativeHostCommand::TaskCreate {
@@ -1974,14 +2117,14 @@ async fn execute_native_command(
         .map_err(|_| IpcError::Unavailable)?,
         NativeHostCommand::Hold { .. } => return Err(IpcError::Unavailable),
     };
-    client.execute_command(envelope).await.map(|_| ())
+    client.execute_command(envelope).await
 }
 
 async fn execute_native_command_cancellable(
     client: &mut HostClient,
     command: NativeHostCommand,
     cancellation: &Arc<AtomicBool>,
-) -> Result<(), IpcError> {
+) -> Result<crate::domain::command::CommandReceipt, IpcError> {
     tokio::select! {
         result = execute_native_command(client, command) => result,
         _ = wait_for_cancellation(Arc::clone(cancellation)) => Err(IpcError::Unavailable),
@@ -3011,6 +3154,9 @@ pub struct NativeShell {
     controller_task: Option<Task<()>>,
     controller_ticks: usize,
     last_projection_kinds: Vec<NativeHostProjectionKind>,
+    pending_host_actions: VecDeque<NativeActionRecord>,
+    last_action_failure: Option<NativeHostActionFailure>,
+    last_action_receipt: Option<crate::domain::command::CommandReceipt>,
     pending_preferences: VecDeque<RuntimePreferencesSnapshot>,
     appearance_subscription: Option<Subscription>,
     bounds_subscription: Option<Subscription>,
@@ -3149,6 +3295,9 @@ impl NativeShell {
             controller_task: None,
             controller_ticks: 0,
             last_projection_kinds: Vec::new(),
+            pending_host_actions: VecDeque::new(),
+            last_action_failure: None,
+            last_action_receipt: None,
             pending_preferences: VecDeque::new(),
             appearance_subscription: None,
             bounds_subscription: None,
@@ -3206,6 +3355,17 @@ impl NativeShell {
         self.last_keyboard_action
     }
 
+    pub fn last_action_failure(&self) -> Option<&NativeHostActionFailure> {
+        self.last_action_failure.as_ref()
+    }
+
+    /// The most recent command receipt remains attached to the shell so a
+    /// host response can be reconciled by its exact CommandId. UI status is
+    /// derived separately from this durable response identity.
+    pub fn last_action_receipt(&self) -> Option<&crate::domain::command::CommandReceipt> {
+        self.last_action_receipt.as_ref()
+    }
+
     fn start_controller(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(
             |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
@@ -3232,6 +3392,11 @@ impl NativeShell {
         self.controller_tick(max);
     }
 
+    #[cfg(test)]
+    fn pending_action_for_test(&self) -> Option<&NativeActionRecord> {
+        self.pending_host_actions.front()
+    }
+
     pub fn controller_tick_count(&self) -> usize {
         self.controller_ticks
     }
@@ -3246,6 +3411,185 @@ impl NativeShell {
 
     pub fn queue_preferences_for_test(&mut self, preferences: RuntimePreferencesSnapshot) {
         self.queue_preferences(preferences);
+    }
+
+    fn rebind_pending_host_actions(&mut self, epochs: NativeHostRuntimeEpochs) {
+        for action in &mut self.pending_host_actions {
+            action.rebind_transport_epochs(epochs);
+        }
+        if let Some(runtime) = self.host_runtime.as_mut() {
+            match runtime {
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.rebind_pending(epochs),
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.rebind_pending(epochs),
+            }
+        }
+    }
+
+    fn dispatch_pending_host_actions(&mut self, max: usize) {
+        for _ in 0..max.min(MAX_RETRY_HOST_ACTIONS) {
+            let Some(action) = self.pending_host_actions.front().cloned() else {
+                break;
+            };
+            match self.try_enqueue_host_action(action) {
+                NativeHostActionResult::Queued => {
+                    let _ = self.pending_host_actions.pop_front();
+                    self.clear_recovered_action_failure();
+                }
+                result @ (NativeHostActionResult::Disconnected
+                | NativeHostActionResult::QueueFull) => {
+                    if let Some(action) = self.pending_host_actions.front().cloned() {
+                        self.set_transport_failure(&action, result);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn retain_pending_host_action(&mut self, action: NativeActionRecord) -> bool {
+        if self
+            .pending_host_actions
+            .iter()
+            .any(|pending| same_native_action_identity(pending, &action))
+        {
+            return true;
+        }
+        if self.pending_host_actions.len() < MAX_RETRY_HOST_ACTIONS {
+            self.pending_host_actions.push_back(action);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.enqueue(record),
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.enqueue(record),
+            None => NativeHostActionResult::Disconnected,
+        }
+    }
+
+    fn set_transport_failure(
+        &mut self,
+        action: &NativeActionRecord,
+        result: NativeHostActionResult,
+    ) {
+        let failure = match result {
+            NativeHostActionResult::Disconnected => NativeHostActionFailure::Disconnected {
+                action_id: action.id,
+            },
+            NativeHostActionResult::QueueFull => NativeHostActionFailure::QueueFull {
+                action_id: action.id,
+            },
+            NativeHostActionResult::Queued => return,
+        };
+        self.host_state = match &failure {
+            NativeHostActionFailure::Disconnected { .. } => NativeHostState::Disconnected,
+            _ => NativeHostState::Error {
+                message: bounded_host_error(failure.retry_message()),
+            },
+        };
+        self.last_action_failure = Some(failure);
+    }
+
+    fn set_action_capacity_failure(&mut self, action_id: &'static str) {
+        let failure = NativeHostActionFailure::QueueFull { action_id };
+        self.host_state = NativeHostState::Error {
+            message: bounded_host_error(failure.retry_message()),
+        };
+        self.last_action_failure = Some(failure);
+    }
+
+    fn set_execution_failure(
+        &mut self,
+        action: &NativeActionRecord,
+        error: String,
+        uncertain: bool,
+    ) {
+        let command_id = native_command_id(&action.command);
+        let failure = if uncertain {
+            NativeHostActionFailure::ExecutionUncertain {
+                action_id: action.id,
+                command_id,
+                message: bounded_host_error(error),
+            }
+        } else {
+            NativeHostActionFailure::ExecutionFailed {
+                action_id: action.id,
+                command_id,
+                message: bounded_host_error(error),
+            }
+        };
+        self.host_state = NativeHostState::Error {
+            message: bounded_host_error(failure.retry_message()),
+        };
+        self.last_action_failure = Some(failure);
+    }
+
+    fn apply_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
+        match outcome {
+            NativeHostActionOutcome::Accepted { action, receipt } => {
+                let action_id = action.id;
+                let command_id = native_command_id(&action.command);
+                self.last_action_receipt = Some(receipt.clone());
+                if let crate::domain::command::CommandReceipt::Rejected { code, .. } = &receipt {
+                    let _ = self.retain_pending_host_action(action.clone());
+                    self.set_execution_failure(
+                        &action,
+                        format!("host rejected command: {code:?}"),
+                        false,
+                    );
+                    return;
+                }
+                if let Some(command_id) = command_id {
+                    self.pending_host_actions
+                        .retain(|action| native_command_id(&action.command) != Some(command_id));
+                }
+                if self.last_action_failure.as_ref().is_some_and(|failure| {
+                    failure.action_id() == action_id && failure.command_id() == command_id
+                }) {
+                    self.last_action_failure = None;
+                    self.restore_connected_host_state();
+                }
+            }
+            NativeHostActionOutcome::Failed { action, error } => {
+                let _ = self.retain_pending_host_action(action.clone());
+                self.set_execution_failure(&action, error, false);
+            }
+            NativeHostActionOutcome::Uncertain { action, error } => {
+                let _ = self.retain_pending_host_action(action.clone());
+                self.set_execution_failure(&action, error, true);
+            }
+        }
+    }
+
+    fn clear_recovered_action_failure(&mut self) {
+        if self.pending_host_actions.is_empty()
+            && self.last_action_failure.as_ref().is_some_and(|failure| {
+                matches!(
+                    failure,
+                    NativeHostActionFailure::QueueFull { .. }
+                        | NativeHostActionFailure::Disconnected { .. }
+                        | NativeHostActionFailure::ExecutionFailed { .. }
+                        | NativeHostActionFailure::ExecutionUncertain { .. }
+                )
+            })
+        {
+            self.last_action_failure = None;
+            self.restore_connected_host_state();
+        }
+    }
+
+    fn restore_connected_host_state(&mut self) {
+        let Some(runtime_state) = self.host_runtime.as_ref().map(|runtime| match runtime {
+            NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
+            NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
+        }) else {
+            self.host_state = NativeHostState::Disconnected;
+            return;
+        };
+        self.host_state = runtime_state;
     }
 
     fn controller_tick(&mut self, max: usize) {
@@ -3265,6 +3609,13 @@ impl NativeShell {
             })
             .unwrap_or_default();
         self.interaction.sync_host_epochs(runtime_epochs);
+        self.rebind_pending_host_actions(runtime_epochs);
+
+        // Retry actions rejected before transport admission before consuming
+        // new projections. A failure observed in this tick therefore remains
+        // visible until the next explicit retry boundary instead of being
+        // immediately hidden by a same-tick loopback.
+        self.dispatch_pending_host_actions(max);
 
         let projections = match self.host_runtime.as_mut() {
             Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
@@ -3278,19 +3629,23 @@ impl NativeShell {
         let had_projections = !projections.is_empty();
         let mut accepted_projection_kinds = Vec::with_capacity(projections.len());
         for projection in projections {
-            if projection
+            let stale_projection = projection
                 .epochs
-                .is_some_and(|epochs| epochs != runtime_epochs)
-            {
+                .is_some_and(|epochs| epochs != runtime_epochs);
+            if stale_projection && projection.action_outcome.is_none() {
                 continue;
             }
             accepted_projection_kinds.push(projection.kind);
-            if let Some(model) = projection.client_model {
-                if let Err(error) = self.apply_client_model(model) {
-                    self.host_state = NativeHostState::Error { message: error };
+            if !stale_projection {
+                if let Some(model) = projection.client_model {
+                    if let Err(error) = self.apply_client_model(model) {
+                        self.host_state = NativeHostState::Error { message: error };
+                    }
                 }
             }
-            if let Some(error) = projection.error {
+            if let Some(outcome) = projection.action_outcome {
+                self.apply_action_outcome(outcome);
+            } else if let Some(error) = projection.error {
                 self.host_state = NativeHostState::Error { message: error };
             }
         }
@@ -3309,28 +3664,15 @@ impl NativeShell {
                 break;
             }
 
-            let stale = match self.host_runtime.as_ref() {
-                Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime
-                    .pending_front()
-                    .is_some_and(|action| !self.interaction.accepts_action_record(action)),
-                Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime
-                    .pending_front()
-                    .is_some_and(|action| !self.interaction.accepts_action_record(action)),
-                None => false,
-            };
-            if stale {
-                match self.host_runtime.as_mut() {
-                    Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
-                        let _ = runtime.drop_pending_front();
-                    }
-                    Some(NativeHostRuntimeAttachment::Client(runtime)) => {
-                        let _ = runtime.drop_pending_front();
-                    }
-                    None => break,
+            let pending_action = match self.host_runtime.as_ref() {
+                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                    runtime.pending_front().cloned()
                 }
-                continue;
-            }
-
+                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                    runtime.pending_front().cloned()
+                }
+                None => None,
+            };
             let result = match self.host_runtime.as_mut() {
                 Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
                     runtime.dispatch_next_pending()
@@ -3341,17 +3683,28 @@ impl NativeShell {
                 None => break,
             };
             match result {
-                NativeHostActionResult::Queued => {}
+                NativeHostActionResult::Queued => {
+                    self.clear_recovered_action_failure();
+                }
                 NativeHostActionResult::Disconnected => {
-                    self.host_state = NativeHostState::Disconnected;
+                    if let Some(action) = pending_action.as_ref() {
+                        self.set_transport_failure(action, NativeHostActionResult::Disconnected);
+                    } else {
+                        self.host_state = NativeHostState::Disconnected;
+                    }
                     break;
                 }
                 NativeHostActionResult::QueueFull => {
-                    self.host_state = NativeHostState::Error {
-                        message: bounded_host_error(
-                            "native host worker queue is saturated; action retained".to_string(),
-                        ),
-                    };
+                    if let Some(action) = pending_action.as_ref() {
+                        self.set_transport_failure(action, NativeHostActionResult::QueueFull);
+                    } else {
+                        self.host_state = NativeHostState::Error {
+                            message: bounded_host_error(
+                                "native host worker queue is saturated; action retained"
+                                    .to_string(),
+                            ),
+                        };
+                    }
                     break;
                 }
             }
@@ -3442,18 +3795,58 @@ impl NativeShell {
             })
     }
 
+    fn apply_drained_projection_messages(
+        &mut self,
+        projections: Vec<NativeHostProjection>,
+    ) -> Vec<NativeHostProjectionKind> {
+        let runtime_epochs = self
+            .host_runtime
+            .as_ref()
+            .map(|runtime| match runtime {
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.epochs(),
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
+            })
+            .unwrap_or_default();
+        let mut kinds = Vec::with_capacity(projections.len());
+        for projection in projections {
+            let stale_projection = projection
+                .epochs
+                .is_some_and(|epochs| epochs != runtime_epochs);
+            if stale_projection && projection.action_outcome.is_none() {
+                continue;
+            }
+            kinds.push(projection.kind);
+            if !stale_projection {
+                if let Some(model) = projection.client_model {
+                    if let Err(error) = self.apply_client_model(model) {
+                        self.host_state = NativeHostState::Error { message: error };
+                    }
+                }
+            }
+            if let Some(outcome) = projection.action_outcome {
+                self.apply_action_outcome(outcome);
+            } else if let Some(error) = projection.error {
+                self.host_state = NativeHostState::Error { message: error };
+            }
+        }
+        kinds
+    }
+
     /// Drain only the injected/controller-owned projection queue. The method
     /// is deliberately explicit so GPUI paint/input callbacks cannot perform
-    /// transport work; a real [`NativeHostClientRuntime`] uses its async
-    /// `drain_bounded` method from the host controller lane.
+    /// transport work. Full projection messages are applied before returning
+    /// their kinds so action receipts/outcomes are never discarded.
     pub fn drain_host_projections(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
-        match self.host_runtime.as_mut() {
-            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.drain_ready(max),
+        let projections = match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                runtime.drain_projection_messages(max)
+            }
             Some(NativeHostRuntimeAttachment::Client(runtime)) => {
-                runtime.take_ready_projections(max)
+                runtime.take_ready_projection_messages(max)
             }
             None => Vec::new(),
-        }
+        };
+        self.apply_drained_projection_messages(projections)
     }
 
     /// Controller-lane async drain for the single real client. This is kept
@@ -3463,11 +3856,16 @@ impl NativeShell {
         &mut self,
         max: usize,
     ) -> Result<Vec<NativeHostProjectionKind>, IpcError> {
-        match self.host_runtime.as_mut() {
-            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.drain_bounded(max).await,
-            Some(NativeHostRuntimeAttachment::Injected(runtime)) => Ok(runtime.drain_ready(max)),
-            None => Ok(Vec::new()),
-        }
+        let projections = match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.take_ready_projection_messages(max)
+            }
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                runtime.drain_projection_messages(max)
+            }
+            None => Vec::new(),
+        };
+        Ok(self.apply_drained_projection_messages(projections))
     }
 
     /// Attach exactly one pre-connected host runtime. The shell never opens
@@ -3989,25 +4387,65 @@ impl NativeShell {
             )
     }
 
-    pub fn dispatch_action_for_test(&mut self, request: ActionRequest) {
-        self.dispatch_action(request);
+    pub fn dispatch_action_for_test(
+        &mut self,
+        request: ActionRequest,
+    ) -> Option<NativeActionRecord> {
+        self.dispatch_action(request)
     }
 
-    fn dispatch_action(&mut self, request: ActionRequest) {
+    fn dispatch_action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
+        if self.pending_host_actions.len() >= MAX_RETRY_HOST_ACTIONS {
+            // The shell-side retry queue is deliberately bounded. Refuse a
+            // new intent before constructing a record when that bound is
+            // reached, retaining every already-created record and surfacing
+            // typed pressure to the user instead of silently evicting one.
+            self.set_action_capacity_failure(request.id());
+            return None;
+        }
         let Some(record) = self.interaction.action(request) else {
-            return;
+            return None;
         };
-        let _ = self.enqueue_host_action(record);
+        let returned = record.clone();
+        match self.enqueue_host_action(record) {
+            NativeHostActionResult::Queued => None,
+            NativeHostActionResult::Disconnected | NativeHostActionResult::QueueFull => {
+                Some(returned)
+            }
+        }
     }
 
-    fn dispatch_pointer_action(&mut self, request: ActionRequest, pointer_id: u64) {
+    #[cfg(test)]
+    fn dispatch_pointer_action_for_test(
+        &mut self,
+        request: ActionRequest,
+        pointer_id: u64,
+    ) -> Option<NativeActionRecord> {
+        self.dispatch_pointer_action(request, pointer_id)
+    }
+
+    fn dispatch_pointer_action(
+        &mut self,
+        request: ActionRequest,
+        pointer_id: u64,
+    ) -> Option<NativeActionRecord> {
+        if self.pending_host_actions.len() >= MAX_RETRY_HOST_ACTIONS {
+            self.set_action_capacity_failure(request.id());
+            return None;
+        }
         let Some(record) = self
             .interaction
             .action_from_source(request, ActivationSource::Pointer { pointer_id })
         else {
-            return;
+            return None;
         };
-        let _ = self.enqueue_host_action(record);
+        let returned = record.clone();
+        match self.enqueue_host_action(record) {
+            NativeHostActionResult::Queued => None,
+            NativeHostActionResult::Disconnected | NativeHostActionResult::QueueFull => {
+                Some(returned)
+            }
+        }
     }
 
     fn dispatch_keyboard(&mut self, shortcut: KeyboardShortcut) {
@@ -4025,19 +4463,31 @@ impl NativeShell {
     }
 
     fn enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
-        match self.host_runtime.as_mut() {
-            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.enqueue(record),
-            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.enqueue(record),
-            None => NativeHostActionResult::Disconnected,
+        let result = self.try_enqueue_host_action(record.clone());
+        match result {
+            NativeHostActionResult::Queued => {}
+            NativeHostActionResult::Disconnected | NativeHostActionResult::QueueFull => {
+                if self.retain_pending_host_action(record.clone()) {
+                    self.set_transport_failure(&record, result);
+                } else {
+                    self.set_action_capacity_failure(record.id);
+                }
+            }
         }
+        result
     }
 
     fn host_status_text(&self) -> String {
-        match &self.host_state {
+        let base = match &self.host_state {
             NativeHostState::Connected { .. } => "Connected · host".to_string(),
             NativeHostState::Disconnected => "Disconnected · host".to_string(),
             NativeHostState::Error { .. } => "Error · host".to_string(),
-        }
+        };
+        self.last_action_failure
+            .as_ref()
+            .map_or(base.clone(), |failure| {
+                format!("{base} · {}", failure.retry_message())
+            })
     }
 }
 
@@ -4201,19 +4651,135 @@ fn enqueue_pending_preference(
 mod tests {
     use super::{
         acquire_reaper_permit, dispatch_pending_action, enqueue_pending_preference,
-        ensure_isolated_host_config_base, isolated_dev_profile, reap_retained_children,
-        reap_retained_workers, retain_child, retain_worker, retained_children,
-        wait_for_cancellation, AccessibilityTree, NativeHostActionResult, NativeHostRuntimeEpochs,
-        NativeHostWorkerCommand, NativeInteraction, NativePlatformAccessibilityBridge,
-        NativeShutdownDeadline, OwnedChild, OwnedWorker, ReaperKind, TaskId,
-        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
-        MAX_RETAINED_WORKERS,
+        ensure_isolated_host_config_base, isolated_dev_profile, publish_projection,
+        reap_retained_children, reap_retained_workers, retain_child, retain_worker,
+        retained_children, wait_for_cancellation, AccessibilityTree, NativeActionRecord,
+        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
+        NativeHostProjection, NativeHostProjectionKind, NativeHostRuntimeEpochs,
+        NativeHostRuntimePort, NativeHostWorkerCommand, NativeInteraction,
+        NativePlatformAccessibilityBridge, NativeShell, NativeShutdownDeadline, OwnedChild,
+        OwnedWorker, ReaperKind, TaskId, MAX_HOST_PROJECTIONS, MAX_PENDING_HOST_ACTIONS,
+        MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN, MAX_RETAINED_WORKERS,
     };
+    use gpui::AppContext;
     use std::collections::VecDeque;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    struct TestRuntime {
+        shared: Arc<Mutex<TestRuntimeState>>,
+    }
+
+    struct TestRuntimeState {
+        connected: bool,
+        epochs: NativeHostRuntimeEpochs,
+        admission: NativeHostActionResult,
+        accepted: Vec<NativeActionRecord>,
+        projections: VecDeque<NativeHostProjection>,
+    }
+
+    static HEADLESS_SHELL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    impl TestRuntime {
+        fn new(
+            connected: bool,
+            admission: NativeHostActionResult,
+        ) -> (Self, Arc<Mutex<TestRuntimeState>>) {
+            let shared = Arc::new(Mutex::new(TestRuntimeState {
+                connected,
+                epochs: NativeHostRuntimeEpochs {
+                    connection_epoch: 1,
+                    resource_generation: 1,
+                    runtime_generation: 1,
+                },
+                admission,
+                accepted: Vec::new(),
+                projections: VecDeque::new(),
+            }));
+            (
+                Self {
+                    shared: Arc::clone(&shared),
+                },
+                shared,
+            )
+        }
+    }
+
+    impl super::native_host_runtime_sealed::Sealed for TestRuntime {}
+
+    impl NativeHostRuntimePort for TestRuntime {
+        fn endpoint(&self) -> &str {
+            "test://native-shell"
+        }
+
+        fn host_state(&self) -> super::NativeHostState {
+            let state = self.shared.lock().expect("test runtime state");
+            if state.connected {
+                super::NativeHostState::Connected {
+                    endpoint: self.endpoint().to_string(),
+                }
+            } else {
+                super::NativeHostState::Disconnected
+            }
+        }
+
+        fn epochs(&self) -> NativeHostRuntimeEpochs {
+            self.shared.lock().expect("test runtime state").epochs
+        }
+
+        fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+            let mut state = self.shared.lock().expect("test runtime state");
+            if !state.connected {
+                return NativeHostActionResult::Disconnected;
+            }
+            match state.admission {
+                NativeHostActionResult::Queued => {
+                    state.accepted.push(action);
+                    NativeHostActionResult::Queued
+                }
+                result => result,
+            }
+        }
+
+        fn drain_projection_messages(&mut self, max: usize) -> Vec<NativeHostProjection> {
+            let mut state = self.shared.lock().expect("test runtime state");
+            let count = max.min(state.projections.len());
+            state.projections.drain(..count).collect()
+        }
+
+        fn pending_front(&self) -> Option<&NativeActionRecord> {
+            None
+        }
+
+        fn dispatch_next_pending(&mut self) -> NativeHostActionResult {
+            NativeHostActionResult::Queued
+        }
+
+        fn rebind_pending(&mut self, _epochs: NativeHostRuntimeEpochs) {}
+    }
+
+    fn with_test_shell_in_app<R>(
+        cx: &mut gpui::App,
+        runtime: TestRuntime,
+        action: impl FnOnce(&mut NativeShell) -> R,
+    ) -> R {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let entity = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(runtime),
+                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                cx,
+            )
+        });
+        let value = entity.update(cx, |shell, _cx| action(shell));
+        drop(entity);
+        value
+    }
 
     fn exited_child() -> std::process::Child {
         #[cfg(windows)]
@@ -4441,6 +5007,259 @@ mod tests {
             second.capture.is_ok(),
             "resync must release old shell capture"
         );
+    }
+
+    fn ui_queue_full_pointer_admission_returns_and_retains_exact_record(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
+        let (returned, retained, failure) = with_test_shell_in_app(cx, runtime, |shell| {
+            let returned = shell.dispatch_pointer_action_for_test(
+                crate::ui::components::ActionRequest::HostStatus,
+                17,
+            );
+            (
+                returned,
+                shell.pending_action_for_test().cloned(),
+                shell.last_action_failure().cloned(),
+            )
+        });
+        let returned = returned.expect("queue-full admission returns exact record");
+        assert_eq!(retained, Some(returned.clone()));
+        assert_eq!(
+            failure,
+            Some(NativeHostActionFailure::QueueFull {
+                action_id: returned.id,
+            })
+        );
+    }
+
+    fn disconnected_admission_rebinds_transport_epochs_and_retries_same_identity(
+        cx: &mut gpui::App,
+    ) {
+        let (runtime, shared) = TestRuntime::new(false, NativeHostActionResult::Queued);
+        let (original, accepted, failure) = with_test_shell_in_app(cx, runtime, |shell| {
+            let returned = shell
+                .dispatch_action_for_test(crate::ui::components::ActionRequest::TaskCreate(
+                    crate::client::action::TaskCreateArguments {
+                        task_id: TaskId::new(),
+                        environment_id: crate::domain::id::EnvironmentId::new(),
+                        title: "durable admission".to_string(),
+                        description: None,
+                        project_id: crate::domain::id::ProjectId::new(),
+                        workspace: crate::domain::task::WorkspaceRef::Main,
+                    },
+                ))
+                .expect("disconnected admission returns exact record");
+            let original = returned.clone();
+            {
+                let mut state = shared.lock().expect("test runtime state");
+                state.connected = true;
+                state.epochs = NativeHostRuntimeEpochs {
+                    connection_epoch: 2,
+                    resource_generation: 2,
+                    runtime_generation: 2,
+                };
+            }
+            shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+            let accepted = shared.lock().expect("test runtime state").accepted.clone();
+            (original, accepted, shell.last_action_failure().cloned())
+        });
+        assert_eq!(accepted.len(), 1);
+        let retried = &accepted[0];
+        assert_eq!(retried.id, original.id);
+        assert_eq!(retried.task_id, original.task_id);
+        assert_eq!(
+            retried.expected_task_revision,
+            original.expected_task_revision
+        );
+        assert_eq!(retried.command, original.command);
+        assert_eq!(retried.client_epoch, original.client_epoch);
+        assert_eq!(retried.connection_epoch, 2);
+        assert_eq!(retried.resource_generation, 2);
+        assert_eq!(retried.runtime_generation, 2);
+        assert_eq!(failure, None, "queue-pressure status clears after retry");
+    }
+
+    fn uncertain_execution_retains_and_retries_same_command_identity(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (original, retained, accepted, failure) =
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let _ = shell.dispatch_action_for_test(
+                    crate::ui::components::ActionRequest::TaskCreate(
+                        crate::client::action::TaskCreateArguments {
+                            task_id: TaskId::new(),
+                            environment_id: crate::domain::id::EnvironmentId::new(),
+                            title: "uncertain execution".to_string(),
+                            description: None,
+                            project_id: crate::domain::id::ProjectId::new(),
+                            workspace: crate::domain::task::WorkspaceRef::Main,
+                        },
+                    ),
+                );
+                let original = shared
+                    .lock()
+                    .expect("test runtime state")
+                    .accepted
+                    .first()
+                    .cloned()
+                    .expect("accepted action");
+                let epochs = shared.lock().expect("test runtime state").epochs;
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        error: Some("transport outcome uncertain".to_string()),
+                        epochs: Some(epochs),
+                        action_outcome: Some(NativeHostActionOutcome::Uncertain {
+                            action: original.clone(),
+                            error: "transport outcome uncertain".to_string(),
+                        }),
+                    });
+                shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                let retained = shell.pending_action_for_test().cloned();
+                shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                let accepted = shared.lock().expect("test runtime state").accepted.clone();
+                (
+                    original,
+                    retained,
+                    accepted,
+                    shell.last_action_failure().cloned(),
+                )
+            });
+        assert_eq!(retained, Some(original.clone()));
+        assert_eq!(accepted.len(), 2, "retry is dispatched once");
+        assert_eq!(accepted[1].command, original.command);
+        assert_eq!(accepted[1].id, original.id);
+        assert_eq!(
+            failure, None,
+            "successful same-command retry clears uncertain failure"
+        );
+    }
+
+    fn failed_execution_retains_and_retries_same_command_identity(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (original, retained, failure, recovered_failure, accepted) =
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let _ = shell.dispatch_action_for_test(
+                    crate::ui::components::ActionRequest::TaskCreate(
+                        crate::client::action::TaskCreateArguments {
+                            task_id: TaskId::new(),
+                            environment_id: crate::domain::id::EnvironmentId::new(),
+                            title: "failed execution".to_string(),
+                            description: None,
+                            project_id: crate::domain::id::ProjectId::new(),
+                            workspace: crate::domain::task::WorkspaceRef::Main,
+                        },
+                    ),
+                );
+                let original = shared
+                    .lock()
+                    .expect("test runtime state")
+                    .accepted
+                    .first()
+                    .cloned()
+                    .expect("accepted action");
+                let epochs = shared.lock().expect("test runtime state").epochs;
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        error: Some("host rejected command".to_string()),
+                        epochs: Some(epochs),
+                        action_outcome: Some(NativeHostActionOutcome::Failed {
+                            action: original.clone(),
+                            error: "host rejected command".to_string(),
+                        }),
+                    });
+                let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
+                let retained = shell.pending_action_for_test().cloned();
+                let failure = shell.last_action_failure().cloned();
+                shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                let recovered_failure = shell.last_action_failure().cloned();
+                let accepted = shared.lock().expect("test runtime state").accepted.clone();
+                (original, retained, failure, recovered_failure, accepted)
+            });
+        assert_eq!(retained, Some(original.clone()));
+        assert_eq!(accepted.len(), 2, "failed action is retried once");
+        assert_eq!(accepted[1].id, original.id);
+        assert_eq!(accepted[1].command, original.command);
+        assert!(matches!(
+            failure,
+            Some(NativeHostActionFailure::ExecutionFailed {
+                command_id: Some(command_id),
+                ..
+            }) if Some(command_id) == super::native_command_id(&original.command)
+        ));
+        assert_eq!(
+            recovered_failure, None,
+            "successful retry clears failed state"
+        );
+    }
+
+    #[test]
+    fn action_admission_and_outcome_durability() {
+        // GPUI's Windows headless message loop is process-global. Exercise
+        // every injected-runtime scenario in one app lifetime so teardown
+        // cannot race the next headless application instance.
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            ui_queue_full_pointer_admission_returns_and_retains_exact_record(cx);
+            disconnected_admission_rebinds_transport_epochs_and_retries_same_identity(cx);
+            uncertain_execution_retains_and_retries_same_command_identity(cx);
+            failed_execution_retains_and_retries_same_command_identity(cx);
+            *completed_for_app.borrow_mut() = true;
+            cx.quit();
+        });
+        assert!(*completed.borrow(), "action durability scenarios completed");
+    }
+
+    #[test]
+    fn action_outcome_projection_survives_a_full_normal_projection_lane() {
+        let projections = Arc::new(Mutex::new(VecDeque::new()));
+        for _ in 0..MAX_HOST_PROJECTIONS {
+            publish_projection(
+                &projections,
+                NativeHostProjection::kind(NativeHostProjectionKind::Replay),
+            );
+        }
+        let mut interaction = NativeInteraction::new(Some(TaskId::new()));
+        let action = interaction
+            .action(crate::ui::components::ActionRequest::HostStatus)
+            .expect("action outcome identity");
+        publish_projection(
+            &projections,
+            NativeHostProjection {
+                kind: NativeHostProjectionKind::Error,
+                client_model: None,
+                error: Some("outcome uncertain".to_string()),
+                epochs: None,
+                action_outcome: Some(NativeHostActionOutcome::Uncertain {
+                    action: action.clone(),
+                    error: "outcome uncertain".to_string(),
+                }),
+            },
+        );
+
+        let queue = projections.lock().expect("projection queue");
+        assert!(queue.iter().any(|projection| {
+            matches!(
+                projection.action_outcome.as_ref(),
+                Some(NativeHostActionOutcome::Uncertain { action: retained, .. })
+                    if retained.id == action.id
+            )
+        }));
+        assert_eq!(queue.len(), MAX_HOST_PROJECTIONS + 1);
     }
 
     #[test]
