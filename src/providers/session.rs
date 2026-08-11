@@ -3996,6 +3996,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state.lifecycle,
                 PersistedRuntimeLifecycle::Starting
                     | PersistedRuntimeLifecycle::Running
+                    | PersistedRuntimeLifecycle::Exited
                     | PersistedRuntimeLifecycle::Stopping
                     | PersistedRuntimeLifecycle::UnknownLeaked
             ) && self.current.get(&agent_id).is_none()
@@ -4190,6 +4191,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state.lifecycle,
                 PersistedRuntimeLifecycle::Starting
                     | PersistedRuntimeLifecycle::Running
+                    | PersistedRuntimeLifecycle::Exited
                     | PersistedRuntimeLifecycle::Stopping
                     | PersistedRuntimeLifecycle::UnknownLeaked
             ) {
@@ -4333,15 +4335,12 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                         state.lifecycle,
                         PersistedRuntimeLifecycle::Starting
                             | PersistedRuntimeLifecycle::Running
+                            | PersistedRuntimeLifecycle::Exited
                             | PersistedRuntimeLifecycle::Stopping
+                            | PersistedRuntimeLifecycle::UnknownLeaked
                     ) =>
                 {
-                    self.recover_persisted_state(&state)?;
-                    self.persist_state_with_lifecycle(&state, PersistedRuntimeLifecycle::Closed)
-                }
-                Some(state) if state.lifecycle == PersistedRuntimeLifecycle::UnknownLeaked => {
-                    self.recover_persisted_state(&state)?;
-                    self.persist_state_with_lifecycle(&state, PersistedRuntimeLifecycle::Closed)
+                    self.recover_persisted_state_to(&state, PersistedRuntimeLifecycle::Closed)
                 }
                 _ => Err(ProviderSessionError::AgentSessionNotFound(agent_session_id)),
             };
@@ -4665,6 +4664,14 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         state: &ProviderSessionState,
     ) -> Result<(), ProviderSessionError> {
+        self.recover_persisted_state_to(state, PersistedRuntimeLifecycle::Replaced)
+    }
+
+    fn recover_persisted_state_to(
+        &mut self,
+        state: &ProviderSessionState,
+        final_lifecycle: PersistedRuntimeLifecycle,
+    ) -> Result<(), ProviderSessionError> {
         let claim = self
             .state_store
             .claim_recovery(state, self.recovery_owner_id, recovery_now_ms())
@@ -4733,7 +4740,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(ProviderSessionError::SettlementFenceMismatch);
         }
-        let result = self.persist_state_with_lifecycle(state, PersistedRuntimeLifecycle::Replaced);
+        let result = self.persist_state_with_lifecycle(state, final_lifecycle);
         let _ = self.state_store.release_recovery(state, &claim);
         result
     }
@@ -4886,26 +4893,38 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state: slot_state,
             } = slot;
             let state = if let Some(runtime) = self.current.get(&agent_id) {
-                let lifecycle = if runtime.lifecycle() == RuntimeLifecycle::Closed {
-                    PersistedRuntimeLifecycle::Closed
-                } else {
-                    PersistedRuntimeLifecycle::UnknownLeaked
+                let lifecycle = match runtime.lifecycle() {
+                    RuntimeLifecycle::Closed => PersistedRuntimeLifecycle::Closed,
+                    RuntimeLifecycle::Exited => PersistedRuntimeLifecycle::Exited,
+                    _ => PersistedRuntimeLifecycle::UnknownLeaked,
                 };
                 self.state_for_runtime(runtime, lifecycle)
             } else {
                 let mut state = slot_state.clone();
-                state.lifecycle = PersistedRuntimeLifecycle::UnknownLeaked;
+                if !matches!(
+                    state.lifecycle,
+                    PersistedRuntimeLifecycle::Closed | PersistedRuntimeLifecycle::Exited
+                ) {
+                    state.lifecycle = PersistedRuntimeLifecycle::UnknownLeaked;
+                }
                 state.revision = 0;
                 state
             };
-            match self.launcher.retain_for_recovery(&state, lease) {
-                Ok(()) => {
-                    if let Err(error) = self.persist_state(state) {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
+            if let Err(error) = self.persist_state(state.clone()) {
+                self.leases.insert(
+                    agent_id,
+                    LeaseSlot {
+                        lease,
+                        state: slot_state,
+                    },
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
+                continue;
+            }
+            match self.launcher.retain_for_recovery(&state, lease) {
+                Ok(()) => {}
                 Err(failure) => {
                     let error = failure.error();
                     self.leases.insert(
@@ -5391,6 +5410,45 @@ mod tests {
         assert!(launcher.snapshot().stopped().is_empty());
     }
 
+    #[derive(Debug)]
+    struct FailingPersistProviderSessionStateStore {
+        inner: SqliteProviderSessionStateStore,
+        fail_next_persist: bool,
+    }
+
+    impl FailingPersistProviderSessionStateStore {
+        fn new(path: impl AsRef<Path>) -> Self {
+            Self {
+                inner: SqliteProviderSessionStateStore::open(path).unwrap(),
+                fail_next_persist: false,
+            }
+        }
+
+        fn fail_next_persist(&mut self) {
+            self.fail_next_persist = true;
+        }
+    }
+
+    impl sealed::ProviderSessionStateStore for FailingPersistProviderSessionStateStore {}
+
+    #[allow(private_interfaces)]
+    impl ProviderSessionStateStore for FailingPersistProviderSessionStateStore {
+        fn load(
+            &self,
+            agent_session_id: AgentSessionId,
+        ) -> Result<Option<ProviderSessionState>, String> {
+            self.inner.load(agent_session_id)
+        }
+
+        fn persist(&mut self, state: ProviderSessionState) -> Result<(), String> {
+            if self.fail_next_persist {
+                self.fail_next_persist = false;
+                return Err("injected provider session persist failure".to_string());
+            }
+            self.inner.persist(state)
+        }
+    }
+
     fn test_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,
@@ -5448,6 +5506,135 @@ mod tests {
         let reopened = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         let state = reopened.load(agent.id).unwrap().unwrap();
         assert_eq!(state.lifecycle(), PersistedRuntimeLifecycle::UnknownLeaked);
+    }
+
+    #[test]
+    fn crash_reopen_exited_state_closes_and_settles_the_old_generation() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.process_exited(runtime.correlation()).unwrap();
+        let state = manager.state_store.load(agent.id).unwrap().unwrap();
+        assert_eq!(state.lifecycle(), PersistedRuntimeLifecycle::Exited);
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        launcher
+            .clone()
+            .retain_for_recovery(&state, slot.lease)
+            .unwrap();
+        drop(runtime);
+        drop(manager);
+
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        reopened.close_agent_session(agent.id).unwrap();
+        assert_eq!(launcher.snapshot().stopped().len(), 1);
+        assert_eq!(
+            SqliteProviderSessionStateStore::open(path.path())
+                .unwrap()
+                .load(agent.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle(),
+            PersistedRuntimeLifecycle::Closed
+        );
+    }
+
+    #[test]
+    fn crash_reopen_exited_state_replaces_only_after_old_generation_settlement() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.process_exited(runtime.correlation()).unwrap();
+        let state = manager.state_store.load(agent.id).unwrap().unwrap();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        launcher
+            .clone()
+            .retain_for_recovery(&state, slot.lease)
+            .unwrap();
+        let old_generation = runtime.generation();
+        drop(runtime);
+        drop(manager);
+
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let mut replacement_agent = agent;
+        replacement_agent.runtime_generation = old_generation;
+        let replacement = reopened
+            .replace_generation(test_request(replacement_agent))
+            .unwrap();
+        assert!(replacement.generation() > old_generation);
+        reopened
+            .close_agent_session(replacement.agent_session_id())
+            .unwrap();
+        assert_eq!(launcher.snapshot().stopped().len(), 2);
+    }
+
+    #[test]
+    fn shutdown_persist_failure_keeps_the_exact_lease_for_retry() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.state_store.fail_next_persist();
+
+        assert!(matches!(
+            manager.prepare_for_shutdown(),
+            Err(ProviderSessionError::StateStore(error)) if error == "injected provider session persist failure"
+        ));
+        assert!(manager.leases.contains_key(&agent.id));
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        assert_eq!(
+            manager
+                .state_store
+                .inner
+                .load(agent.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle(),
+            PersistedRuntimeLifecycle::Running
+        );
+
+        manager.prepare_for_shutdown().unwrap();
+        assert!(!manager.leases.contains_key(&agent.id));
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        drop(runtime);
+        drop(manager);
     }
 
     #[test]
