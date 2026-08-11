@@ -11,23 +11,27 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     div, px, size, AnyElement, AppContext, Application, ClickEvent, Context, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions,
+    ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 
 use crate::assets::AppAssets;
 use crate::client::action;
+use crate::client::UnsolicitedServerMessage;
 use crate::client::{HostClient, HostClientConfig};
 use crate::domain::id::TaskId;
 use crate::domain::ClientId;
 use crate::host::IpcError;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::ui::actions::{
-    self, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
+    self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
     NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
     NativeDockFiles, NativeDockReview, NativeDockServices, NativeDockTerminal,
     NativeOpenCommandPalette, NativeOpenPalette, NativeOpenTaskSwitcher, NativeOpenTerminal,
@@ -43,7 +47,7 @@ use crate::ui::shell::{
 use crate::ui::task_cockpit::{TaskList, DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
-use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
+use crate::ui::tokens::{Density, RuntimePreferencesSnapshot};
 
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME: &str = "native-next-dev";
@@ -60,6 +64,30 @@ pub enum NativeShellError {
     WindowOpen { message: String },
     HostConnect { message: String },
     HeadlessRenderFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeHostState {
+    Connected { endpoint: String },
+    Disconnected,
+    Error { message: String },
+}
+
+impl NativeHostState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Connected { .. } => "Connected",
+            Self::Disconnected => "Disconnected",
+            Self::Error { .. } => "Error",
+        }
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::Connected { endpoint } => Some(endpoint),
+            Self::Disconnected | Self::Error { .. } => None,
+        }
+    }
 }
 
 impl Display for NativeShellError {
@@ -252,12 +280,29 @@ pub struct NativeActionRecord {
     pub event: ActionEvent,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeKeyboardState {
+    pub palette_open: bool,
+    pub task_switcher_open: bool,
+    pub command_palette_open: bool,
+    pub selected_dock: Option<DockTool>,
+    pub terminal_open: bool,
+}
+
 /// Result of handing one already-validated UI action to the host lane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeHostActionResult {
     Queued,
     Disconnected,
     QueueFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeHostProjectionKind {
+    Snapshot,
+    Replay,
+    Live,
+    Error,
 }
 
 /// The sole native-next transport/action owner.
@@ -270,6 +315,72 @@ pub enum NativeHostActionResult {
 pub struct NativeHostClientRuntime {
     client: HostClient,
     pending: std::collections::VecDeque<NativeActionRecord>,
+    ready_projections: std::collections::VecDeque<NativeHostProjectionKind>,
+    runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+/// Injectable runtime seam used by deterministic shell tests. Production uses
+/// [`NativeHostClientRuntime`] as the only concrete transport owner; tests can
+/// supply this port without opening a named pipe or starting another client.
+pub trait NativeHostRuntimePort: Send {
+    fn endpoint(&self) -> &str;
+    fn host_state(&self) -> NativeHostState;
+    fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult;
+    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind>;
+}
+
+#[derive(Debug)]
+pub struct NativeHostRuntimeStub {
+    endpoint: String,
+    state: NativeHostState,
+    pending: std::collections::VecDeque<NativeActionRecord>,
+    projections: std::collections::VecDeque<NativeHostProjectionKind>,
+}
+
+impl NativeHostRuntimeStub {
+    pub fn new(endpoint: impl Into<String>, state: NativeHostState) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            state,
+            pending: std::collections::VecDeque::new(),
+            projections: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn push_projection(&mut self, projection: NativeHostProjectionKind) {
+        self.projections.push_back(projection);
+    }
+}
+
+impl NativeHostRuntimePort for NativeHostRuntimeStub {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn host_state(&self) -> NativeHostState {
+        self.state.clone()
+    }
+
+    fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+        if !matches!(self.state, NativeHostState::Connected { .. }) {
+            return NativeHostActionResult::Disconnected;
+        }
+        if self.pending.len() >= MAX_PENDING_HOST_ACTIONS {
+            return NativeHostActionResult::QueueFull;
+        }
+        self.pending.push_back(action);
+        NativeHostActionResult::Queued
+    }
+
+    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
+        self.projections
+            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for NativeHostClientRuntime {
@@ -278,6 +389,8 @@ impl std::fmt::Debug for NativeHostClientRuntime {
             .debug_struct("NativeHostClientRuntime")
             .field("connected", &self.client.is_connected())
             .field("pending_count", &self.pending.len())
+            .field("ready_projection_count", &self.ready_projections.len())
+            .field("runtime_guard", &self.runtime_guard.is_some())
             .finish()
     }
 }
@@ -297,10 +410,50 @@ impl NativeHostClientRuntime {
             })
     }
 
+    /// Synchronous bootstrap for the default binary. The multi-thread Tokio
+    /// runtime remains owned by this one client owner so the connection's
+    /// reader/writer tasks continue draining while GPUI paints and handles
+    /// input. A failed attempt becomes a typed shell error at the call site.
+    pub fn connect_blocking(profile: &IsolatedDevProfile) -> Result<Self, NativeShellError> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|error| NativeShellError::HostConnect {
+                    message: format!("runtime bootstrap failed: {error}"),
+                })?,
+        );
+        let client = runtime.block_on(HostClient::connect(profile.host_client_config()));
+        let client = client.map_err(|error| NativeShellError::HostConnect {
+            message: error.to_string(),
+        })?;
+        let mut runtime_owner = Self::new_with_runtime(client, runtime.clone());
+        runtime
+            .block_on(runtime_owner.bootstrap_projection())
+            .map_err(|error| NativeShellError::HostConnect {
+                message: error.to_string(),
+            })?;
+        Ok(runtime_owner)
+    }
+
     pub fn new(client: HostClient) -> Self {
+        Self::new_with_runtime_guard(client, None)
+    }
+
+    fn new_with_runtime(client: HostClient, runtime: Arc<tokio::runtime::Runtime>) -> Self {
+        Self::new_with_runtime_guard(client, Some(runtime))
+    }
+
+    fn new_with_runtime_guard(
+        client: HostClient,
+        runtime_guard: Option<Arc<tokio::runtime::Runtime>>,
+    ) -> Self {
         Self {
             client,
             pending: std::collections::VecDeque::new(),
+            ready_projections: std::collections::VecDeque::new(),
+            runtime_guard,
         }
     }
 
@@ -338,7 +491,85 @@ impl NativeHostClientRuntime {
 
     /// Drain a bounded batch for the controller/task lane.
     pub fn take_pending(&mut self) -> Vec<NativeActionRecord> {
-        self.pending.drain(..).collect()
+        self.take_pending_bounded(MAX_PENDING_HOST_ACTIONS)
+    }
+
+    pub fn take_pending_bounded(&mut self, max: usize) -> Vec<NativeActionRecord> {
+        self.pending
+            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
+            .collect()
+    }
+
+    /// Drain only already-buffered unsolicited host projections. This method
+    /// is intended for a controller/task lane; paint and input callbacks never
+    /// call it. The zero-duration timeout makes the live lane nonblocking.
+    pub async fn drain_bounded(
+        &mut self,
+        max: usize,
+    ) -> Result<Vec<NativeHostProjectionKind>, IpcError> {
+        let mut drained = Vec::with_capacity(max.min(MAX_PENDING_HOST_ACTIONS));
+        for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
+            let message =
+                tokio::time::timeout(Duration::ZERO, self.client.recv_unsolicited()).await;
+            let Ok(message) = message else {
+                break;
+            };
+            let message = message?;
+            let kind = match message {
+                UnsolicitedServerMessage::DurableEvent { .. } => NativeHostProjectionKind::Live,
+                UnsolicitedServerMessage::ResyncRequired { .. } => NativeHostProjectionKind::Replay,
+                UnsolicitedServerMessage::Stream(_) => NativeHostProjectionKind::Live,
+            };
+            if self.ready_projections.len() < MAX_PENDING_HOST_ACTIONS {
+                self.ready_projections.push_back(kind);
+            }
+            drained.push(kind);
+        }
+        Ok(drained)
+    }
+
+    pub fn take_ready_projections(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
+        self.ready_projections
+            .drain(..max.min(MAX_PENDING_HOST_ACTIONS))
+            .collect()
+    }
+
+    /// Perform the initial paged snapshot and durable replay handoff on the
+    /// controller lane. The shell receives only the typed projection kinds;
+    /// decoding into the local TaskList remains an explicit projection seam.
+    pub async fn bootstrap_projection(
+        &mut self,
+    ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
+        let mut projection = Vec::with_capacity(2);
+        match self
+            .client
+            .snapshot_page(crate::domain::snapshot::SnapshotSection::Tasks, None, None)
+            .await
+            .map_err(|error| NativeShellError::HostConnect {
+                message: error.to_string(),
+            })? {
+            Ok(_) => projection.push(NativeHostProjectionKind::Snapshot),
+            Err(error) => {
+                return Err(NativeShellError::HostConnect {
+                    message: format!("{error:?}"),
+                })
+            }
+        }
+        match self.client.open_event_replay(0).await.map_err(|error| {
+            NativeShellError::HostConnect {
+                message: error.to_string(),
+            }
+        })? {
+            Ok(_) => projection.push(NativeHostProjectionKind::Replay),
+            Err(error) => {
+                return Err(NativeShellError::HostConnect {
+                    message: format!("{error:?}"),
+                })
+            }
+        }
+        self.ready_projections
+            .extend(projection.iter().copied().take(MAX_PENDING_HOST_ACTIONS));
+        Ok(projection)
     }
 
     /// Execute a caller-created, revision-fenced command on this same client.
@@ -353,6 +584,50 @@ impl NativeHostClientRuntime {
     }
 }
 
+impl NativeHostRuntimePort for NativeHostClientRuntime {
+    fn endpoint(&self) -> &str {
+        self.endpoint()
+    }
+
+    fn host_state(&self) -> NativeHostState {
+        if self.client.is_connected() {
+            NativeHostState::Connected {
+                endpoint: self.endpoint().to_string(),
+            }
+        } else {
+            NativeHostState::Disconnected
+        }
+    }
+
+    fn enqueue(&mut self, action: NativeActionRecord) -> NativeHostActionResult {
+        NativeHostClientRuntime::enqueue(self, action)
+    }
+
+    fn drain_ready(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
+        self.take_ready_projections(max)
+    }
+}
+
+pub enum NativeHostRuntimeAttachment {
+    Client(NativeHostClientRuntime),
+    Injected(Box<dyn NativeHostRuntimePort>),
+}
+
+impl std::fmt::Debug for NativeHostRuntimeAttachment {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeHostRuntimeAttachment")
+            .field(
+                "kind",
+                &match self {
+                    Self::Client(_) => "client",
+                    Self::Injected(_) => "injected",
+                },
+            )
+            .finish()
+    }
+}
+
 /// Pure handler state shared by the native GPUI callbacks and focused tests.
 /// Every event captures focus epoch, task identity, and a monotonic request
 /// generation before it can reach a host-facing action.
@@ -364,6 +639,8 @@ pub struct NativeInteraction {
     request_generation: u64,
     pointer_owner: Option<PointerOwner>,
     last_handler: Option<HandlerTrace>,
+    keyboard_state: NativeKeyboardState,
+    pending_keyboard: Option<(FocusEpoch, u64, KeyboardAction)>,
 }
 
 impl NativeInteraction {
@@ -375,6 +652,8 @@ impl NativeInteraction {
             request_generation: 0,
             pointer_owner: None,
             last_handler: None,
+            keyboard_state: NativeKeyboardState::default(),
+            pending_keyboard: None,
         }
     }
 
@@ -407,6 +686,10 @@ impl NativeInteraction {
 
     pub fn sync_selected_task(&mut self, selected_task: Option<TaskId>) -> bool {
         self.shell.sync_selected_task(selected_task)
+    }
+
+    pub fn keyboard_state(&self) -> NativeKeyboardState {
+        self.keyboard_state
     }
 
     fn begin_handler(&mut self, task_id: Option<TaskId>) -> (FocusEpoch, u64) {
@@ -499,9 +782,51 @@ impl NativeInteraction {
         shortcut: KeyboardShortcut,
     ) -> Option<(FocusEpoch, u64, KeyboardAction)> {
         let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
-        keyboard
+        let result = keyboard
             .activate(shortcut, &self.interaction, focus_epoch)
-            .map(|action| (focus_epoch, request_generation, action))
+            .map(|action| (focus_epoch, request_generation, action));
+        self.pending_keyboard = result;
+        result
+    }
+
+    /// Commit one resolved keyboard intent only if it is still the current
+    /// focus/request capture. A later event invalidates the old tuple, which
+    /// prevents stale key callbacks from mutating shell state.
+    pub fn commit_keyboard_action(
+        &mut self,
+        focus_epoch: FocusEpoch,
+        request_generation: u64,
+        action: KeyboardAction,
+    ) -> bool {
+        if self.pending_keyboard != Some((focus_epoch, request_generation, action))
+            || !self.interaction.state().can_activate()
+        {
+            return false;
+        }
+        match action {
+            KeyboardAction::OpenPalette => {
+                self.keyboard_state.palette_open = true;
+                self.keyboard_state.task_switcher_open = false;
+                self.keyboard_state.command_palette_open = false;
+            }
+            KeyboardAction::OpenTaskSwitcher => {
+                self.keyboard_state.task_switcher_open = true;
+                self.keyboard_state.palette_open = false;
+                self.keyboard_state.command_palette_open = false;
+            }
+            KeyboardAction::OpenCommandPalette => {
+                self.keyboard_state.command_palette_open = true;
+                self.keyboard_state.palette_open = false;
+                self.keyboard_state.task_switcher_open = false;
+            }
+            KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
+            KeyboardAction::OpenTerminal => self.keyboard_state.terminal_open = true,
+            KeyboardAction::DismissTransient => {
+                self.keyboard_state = NativeKeyboardState::default();
+            }
+        }
+        self.pending_keyboard = None;
+        true
     }
 
     pub fn action(&mut self, request: ActionRequest) -> Option<NativeActionRecord> {
@@ -547,6 +872,9 @@ impl NativeInteraction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessibilityNode {
     metadata: AccessibilityMetadata,
+    element_id: String,
+    focusable: bool,
+    tab_stop: bool,
     children: Vec<AccessibilityNode>,
 }
 
@@ -559,8 +887,18 @@ impl AccessibilityNode {
             .expect("native shell semantic descriptions are bounded literals");
         Self {
             metadata,
+            element_id: String::new(),
+            focusable: false,
+            tab_stop: false,
             children: Vec::new(),
         }
+    }
+
+    fn gpui(mut self, element_id: impl Into<String>, focusable: bool, tab_stop: bool) -> Self {
+        self.element_id = element_id.into();
+        self.focusable = focusable;
+        self.tab_stop = tab_stop;
+        self
     }
 
     fn with_children(mut self, children: Vec<AccessibilityNode>) -> Self {
@@ -587,6 +925,28 @@ impl AccessibilityNode {
     pub fn children(&self) -> &[AccessibilityNode] {
         &self.children
     }
+
+    pub fn element_id(&self) -> &str {
+        &self.element_id
+    }
+
+    pub fn focusable(&self) -> bool {
+        self.focusable
+    }
+
+    pub fn tab_stop(&self) -> bool {
+        self.tab_stop
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeAccessibilityNode {
+    pub element_id: String,
+    pub role: AccessibleRole,
+    pub label: String,
+    pub description: String,
+    pub focusable: bool,
+    pub tab_stop: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -600,12 +960,14 @@ impl AccessibilityTree {
         let rows = task_list
             .rendered_task_ids()
             .iter()
-            .map(|task_id| {
+            .enumerate()
+            .map(|(row_index, task_id)| {
                 let mut row = AccessibilityNode::new(
                     AccessibleRole::Button,
                     format!("Task {task_id}"),
                     "Select this task and open its native task cockpit.",
-                );
+                )
+                .gpui(format!("native-task-row-{row_index}"), true, true);
                 row.metadata.focused = selected_task == Some(*task_id);
                 row
             })
@@ -616,18 +978,21 @@ impl AccessibilityTree {
                 "No tasks in isolated inbox",
                 "The dev/test host has not supplied a task snapshot.",
             )
+            .gpui("native-task-inbox-status", false, false)
         } else {
             AccessibilityNode::new(
                 AccessibleRole::Status,
                 "Task inbox ready",
                 "Only the bounded visible task window is rendered.",
             )
+            .gpui("native-task-inbox-status", false, false)
         };
         let inbox = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task inbox",
             "Bounded virtualized task list; keyboard and pointer navigation share one focus epoch.",
         )
+        .gpui("native-task-inbox", false, false)
         .with_children(
             std::iter::once(inbox_status)
                 .chain(rows)
@@ -637,17 +1002,20 @@ impl AccessibilityTree {
             AccessibleRole::Region,
             "Task cockpit actions",
             "Actions are dispatched through the shared client action catalog.",
-        );
+        )
+        .gpui("native-shell-toolbar", false, false);
         let terminal = AccessibilityNode::new(
             AccessibleRole::Status,
             "Terminal dock",
             TerminalDockState::unavailable().message(),
-        );
+        )
+        .gpui("native-shell-terminal-dock", false, false);
         let root = AccessibilityNode::new(
             AccessibleRole::Region,
             "Task Cockpit",
             "Native GPUI shell using an isolated dev/test host profile.",
         )
+        .gpui("native-shell-root", true, true)
         .with_children(vec![toolbar, inbox, terminal]);
         Self {
             root,
@@ -674,6 +1042,24 @@ impl AccessibilityTree {
         visit(&self.root, &mut nodes);
         nodes
     }
+
+    /// The GPUI 0.2.2 element API exposes stable IDs, labels, and focus/tab
+    /// hooks rather than a platform accessibility namespace. This projection
+    /// is built from those exact IDs and hooks and is used by headless tests to
+    /// inspect the rendered control/tree semantics.
+    pub fn gpui_nodes(&self) -> Vec<NativeAccessibilityNode> {
+        self.nodes()
+            .into_iter()
+            .map(|node| NativeAccessibilityNode {
+                element_id: node.element_id.clone(),
+                role: node.role(),
+                label: node.name().to_string(),
+                description: node.description().to_string(),
+                focusable: node.focusable,
+                tab_stop: node.tab_stop,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -683,6 +1069,8 @@ pub struct NativeRenderSmokeReport {
     pub rendered_task_rows: usize,
     pub host_profile: PathBuf,
     pub profile_root: PathBuf,
+    pub host_state: NativeHostState,
+    pub gpui_accessibility_nodes: Vec<NativeAccessibilityNode>,
 }
 
 /// Build a real GPUI element tree without opening a window or touching a host.
@@ -708,6 +1096,8 @@ pub fn headless_render_smoke(
                     rendered_task_rows: shell.rendered_task_count(),
                     host_profile: shell.host_connection.profile_root().to_path_buf(),
                     profile_root: shell.profile.root().to_path_buf(),
+                    host_state: shell.host_state.clone(),
+                    gpui_accessibility_nodes: shell.accessibility_tree.gpui_nodes(),
                 }
             });
             *report_slot_for_app.borrow_mut() = Some(report);
@@ -726,7 +1116,9 @@ pub fn headless_render_smoke(
 pub struct NativeShell {
     profile: IsolatedDevProfile,
     host_connection: DevTestHostConnection,
-    host_runtime: Option<NativeHostClientRuntime>,
+    host_runtime: Option<NativeHostRuntimeAttachment>,
+    host_state: NativeHostState,
+    preferences: RuntimePreferencesSnapshot,
     task_list: TaskList,
     interaction: NativeInteraction,
     keyboard: KeyboardModel,
@@ -737,12 +1129,92 @@ pub struct NativeShell {
 
 impl NativeShell {
     pub fn new(profile: IsolatedDevProfile, cx: &mut Context<Self>) -> Self {
-        Self::new_with_host_runtime(profile, None, cx)
+        Self::new_with_host_runtime_and_preferences(
+            profile,
+            None,
+            RuntimePreferencesSnapshot::default(),
+            cx,
+        )
     }
 
     pub fn new_with_host_runtime(
         profile: IsolatedDevProfile,
         host_runtime: Option<NativeHostClientRuntime>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let host_state = host_runtime
+            .as_ref()
+            .map(|runtime| NativeHostState::Connected {
+                endpoint: runtime.endpoint().to_string(),
+            })
+            .unwrap_or(NativeHostState::Disconnected);
+        Self::new_with_host_runtime_and_state_and_preferences(
+            profile,
+            host_runtime,
+            host_state,
+            RuntimePreferencesSnapshot::default(),
+            cx,
+        )
+    }
+
+    pub fn new_with_host_runtime_and_preferences(
+        profile: IsolatedDevProfile,
+        host_runtime: Option<NativeHostClientRuntime>,
+        preferences: RuntimePreferencesSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let host_state = host_runtime
+            .as_ref()
+            .map(|runtime| NativeHostState::Connected {
+                endpoint: runtime.endpoint().to_string(),
+            })
+            .unwrap_or(NativeHostState::Disconnected);
+        Self::new_with_host_runtime_and_state_and_preferences(
+            profile,
+            host_runtime,
+            host_state,
+            preferences,
+            cx,
+        )
+    }
+
+    fn new_with_host_runtime_and_state_and_preferences(
+        profile: IsolatedDevProfile,
+        host_runtime: Option<NativeHostClientRuntime>,
+        host_state: NativeHostState,
+        preferences: RuntimePreferencesSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_attachment_and_state_and_preferences(
+            profile,
+            host_runtime.map(NativeHostRuntimeAttachment::Client),
+            host_state,
+            preferences,
+            cx,
+        )
+    }
+
+    pub fn new_with_host_runtime_port(
+        profile: IsolatedDevProfile,
+        host_runtime: Box<dyn NativeHostRuntimePort>,
+        preferences: RuntimePreferencesSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let host_state = host_runtime.host_state();
+        Self::new_with_attachment_and_state_and_preferences(
+            profile,
+            Some(NativeHostRuntimeAttachment::Injected(host_runtime)),
+            host_state,
+            preferences,
+            cx,
+        )
+    }
+
+    fn new_with_attachment_and_state_and_preferences(
+        profile: IsolatedDevProfile,
+        host_runtime: Option<NativeHostRuntimeAttachment>,
+        host_state: NativeHostState,
+        preferences: RuntimePreferencesSnapshot,
         cx: &mut Context<Self>,
     ) -> Self {
         let task_list = TaskList::empty();
@@ -751,6 +1223,8 @@ impl NativeShell {
             host_connection: profile.host_connection(),
             profile,
             host_runtime,
+            host_state,
+            preferences,
             task_list,
             interaction: NativeInteraction::new(None),
             keyboard: KeyboardModel::default(),
@@ -771,16 +1245,65 @@ impl NativeShell {
     pub fn host_endpoint(&self) -> &str {
         self.host_runtime
             .as_ref()
-            .map(NativeHostClientRuntime::endpoint)
+            .map(|attachment| match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => runtime.endpoint(),
+                NativeHostRuntimeAttachment::Injected(runtime) => runtime.endpoint(),
+            })
             .unwrap_or_else(|| self.host_connection.endpoint())
     }
 
+    pub fn host_state(&self) -> &NativeHostState {
+        &self.host_state
+    }
+
+    pub fn preferences(&self) -> RuntimePreferencesSnapshot {
+        self.preferences
+    }
+
     pub fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
-        self.host_runtime.as_ref()
+        self.host_runtime
+            .as_ref()
+            .and_then(|attachment| match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => Some(runtime),
+                NativeHostRuntimeAttachment::Injected(_) => None,
+            })
     }
 
     pub fn host_runtime_mut(&mut self) -> Option<&mut NativeHostClientRuntime> {
-        self.host_runtime.as_mut()
+        self.host_runtime
+            .as_mut()
+            .and_then(|attachment| match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => Some(runtime),
+                NativeHostRuntimeAttachment::Injected(_) => None,
+            })
+    }
+
+    /// Drain only the injected/controller-owned projection queue. The method
+    /// is deliberately explicit so GPUI paint/input callbacks cannot perform
+    /// transport work; a real [`NativeHostClientRuntime`] uses its async
+    /// `drain_bounded` method from the host controller lane.
+    pub fn drain_host_projections(&mut self, max: usize) -> Vec<NativeHostProjectionKind> {
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.drain_ready(max),
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.take_ready_projections(max)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Controller-lane async drain for the single real client. This is kept
+    /// separate from synchronous paint/input APIs so a GPUI callback cannot
+    /// accidentally await transport work.
+    pub async fn drain_host_projections_async(
+        &mut self,
+        max: usize,
+    ) -> Result<Vec<NativeHostProjectionKind>, IpcError> {
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.drain_bounded(max).await,
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => Ok(runtime.drain_ready(max)),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Attach exactly one pre-connected host runtime. The shell never opens
@@ -792,7 +1315,30 @@ impl NativeShell {
         if self.host_runtime.is_some() {
             return Err(host_runtime);
         }
-        self.host_runtime = Some(host_runtime);
+        self.host_runtime = Some(NativeHostRuntimeAttachment::Client(host_runtime));
+        self.host_state = NativeHostState::Connected {
+            endpoint: self
+                .host_runtime
+                .as_ref()
+                .and_then(|attachment| match attachment {
+                    NativeHostRuntimeAttachment::Client(runtime) => Some(runtime.endpoint()),
+                    NativeHostRuntimeAttachment::Injected(_) => None,
+                })
+                .expect("runtime attached")
+                .to_string(),
+        };
+        Ok(())
+    }
+
+    pub fn attach_host_runtime_port(
+        &mut self,
+        host_runtime: Box<dyn NativeHostRuntimePort>,
+    ) -> Result<(), Box<dyn NativeHostRuntimePort>> {
+        if self.host_runtime.is_some() {
+            return Err(host_runtime);
+        }
+        self.host_state = host_runtime.host_state();
+        self.host_runtime = Some(NativeHostRuntimeAttachment::Injected(host_runtime));
         Ok(())
     }
 
@@ -830,7 +1376,7 @@ impl NativeShell {
     }
 
     fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
-        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+        let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
         let toolbar = div()
             .id("native-shell-toolbar")
@@ -849,7 +1395,7 @@ impl NativeShell {
                 div()
                     .text_color(tokens.text.secondary.to_gpui())
                     .whitespace_normal()
-                    .child(format!("isolated dev/test host: {}", self.host_endpoint())),
+                    .child(self.host_status_text()),
             );
         let inbox = div()
             .id("native-shell-task-inbox")
@@ -877,7 +1423,7 @@ impl NativeShell {
     }
 
     fn element_with_handlers(&mut self, cx: &Context<Self>) -> impl IntoElement {
-        let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+        let tokens = self.preferences.tokens();
         let metrics = tokens.density.physical();
         let task_rows = self
             .task_list
@@ -912,7 +1458,7 @@ impl NativeShell {
                     }
                 });
                 div()
-                    .id(("native-task-row", row_index))
+                    .id(("native-task-row", row_index as u64))
                     .tab_stop(true)
                     .w_full()
                     .h(px(metrics.row_height as f32))
@@ -944,6 +1490,19 @@ impl NativeShell {
         let terminal_up = cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
             cx.stop_propagation();
             shell.interaction.terminal_mouse_up();
+        });
+        let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
+            cx.stop_propagation();
+            let delta = -(event.delta.pixel_delta(px(metrics.row_height as f32)).y / px(1.0));
+            let _ = shell.task_list.apply_scroll_delta(
+                delta,
+                metrics.row_height as f32 * DEFAULT_VISIBLE_ROWS as f32,
+                metrics.row_height as f32,
+            );
+            shell.accessibility_tree = AccessibilityTree::for_task_list(
+                &shell.task_list,
+                shell.interaction.selected_task(),
+            );
         });
 
         let host_actions = cx.listener(|shell, _action: &HostActions, _window, cx| {
@@ -1107,7 +1666,7 @@ impl NativeShell {
                                 );
                             })),
                     )
-                    .child(format!("isolated dev/test host: {}", self.host_endpoint())),
+                    .child(self.host_status_text()),
             )
             .child(
                 div()
@@ -1116,6 +1675,7 @@ impl NativeShell {
                     .flex_col()
                     .gap(px(tokens.density.spacing.xs))
                     .overflow_y_scroll()
+                    .on_scroll_wheel(inbox_scroll)
                     .children(task_rows),
             )
             .child(
@@ -1134,9 +1694,7 @@ impl NativeShell {
         let Some(record) = self.interaction.action(request) else {
             return;
         };
-        if let Some(runtime) = self.host_runtime.as_mut() {
-            let _ = runtime.enqueue(record);
-        }
+        let _ = self.enqueue_host_action(record);
     }
 
     fn dispatch_pointer_action(&mut self, request: ActionRequest, pointer_id: u64) {
@@ -1146,13 +1704,43 @@ impl NativeShell {
         else {
             return;
         };
-        if let Some(runtime) = self.host_runtime.as_mut() {
-            let _ = runtime.enqueue(record);
-        }
+        let _ = self.enqueue_host_action(record);
     }
 
     fn dispatch_keyboard(&mut self, shortcut: KeyboardShortcut) {
-        let _ = self.interaction.keyboard(&self.keyboard, shortcut);
+        let Some((focus_epoch, request_generation, action)) =
+            self.interaction.keyboard(&self.keyboard, shortcut)
+        else {
+            return;
+        };
+        let _ = self
+            .interaction
+            .commit_keyboard_action(focus_epoch, request_generation, action);
+    }
+
+    fn enqueue_host_action(&mut self, record: NativeActionRecord) -> NativeHostActionResult {
+        match self.host_runtime.as_mut() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.enqueue(record),
+            Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.enqueue(record),
+            None => NativeHostActionResult::Disconnected,
+        }
+    }
+
+    fn host_status_text(&self) -> String {
+        match &self.host_state {
+            NativeHostState::Connected { endpoint } => {
+                format!(
+                    "{} · isolated endpoint: {endpoint}",
+                    self.host_state.label()
+                )
+            }
+            NativeHostState::Disconnected => {
+                "Disconnected · isolated Phase 2 host unavailable".to_string()
+            }
+            NativeHostState::Error { message } => {
+                format!("Error · isolated Phase 2 host: {message}")
+            }
+        }
     }
 }
 
@@ -1165,7 +1753,26 @@ impl Render for NativeShell {
 /// Launch the actual native GPUI shell with only the generated isolated
 /// dev/test profile. The preview CLI remains a separate host-free path.
 pub fn run_native_shell(workspace_root: impl AsRef<Path>) -> Result<(), NativeShellError> {
-    run_native_shell_with_runtime(workspace_root, None)
+    let profile = isolated_dev_profile(workspace_root)?;
+    let (host_runtime, host_state) = match NativeHostClientRuntime::connect_blocking(&profile) {
+        Ok(runtime) => {
+            let endpoint = runtime.endpoint().to_string();
+            (Some(runtime), NativeHostState::Connected { endpoint })
+        }
+        Err(NativeShellError::HostConnect { message }) => (
+            None,
+            NativeHostState::Error {
+                message: bounded_host_error(message),
+            },
+        ),
+        Err(error) => (
+            None,
+            NativeHostState::Error {
+                message: bounded_host_error(error.to_string()),
+            },
+        ),
+    };
+    launch_native_shell(profile, host_runtime, host_state)
 }
 
 /// Launch the native shell with one caller-owned host runtime attachment.
@@ -1178,6 +1785,20 @@ pub fn run_native_shell_with_runtime(
     host_runtime: Option<NativeHostClientRuntime>,
 ) -> Result<(), NativeShellError> {
     let profile = isolated_dev_profile(workspace_root)?;
+    let host_state = host_runtime
+        .as_ref()
+        .map(|runtime| NativeHostState::Connected {
+            endpoint: runtime.endpoint().to_string(),
+        })
+        .unwrap_or(NativeHostState::Disconnected);
+    launch_native_shell(profile, host_runtime, host_state)
+}
+
+fn launch_native_shell(
+    profile: IsolatedDevProfile,
+    host_runtime: Option<NativeHostClientRuntime>,
+    host_state: NativeHostState,
+) -> Result<(), NativeShellError> {
     eprintln!(
         "devmanager-next native shell profile: {}",
         profile.root().display()
@@ -1191,16 +1812,24 @@ pub fn run_native_shell_with_runtime(
             actions::register_native_keyboard_bindings(cx);
             let profile_for_window = profile.clone();
             let host_runtime_for_window = host_runtime;
+            let host_state_for_window = host_state;
             let result = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(1_280.0), px(800.0)), cx)),
                     ..WindowOptions::default()
                 },
-                move |_window, cx| {
+                move |window, cx| {
+                    let preferences = RuntimePreferencesSnapshot::from_system(
+                        window.appearance(),
+                        window.scale_factor(),
+                        Density::Comfortable,
+                    );
                     cx.new(|cx| {
-                        NativeShell::new_with_host_runtime(
+                        NativeShell::new_with_host_runtime_and_state_and_preferences(
                             profile_for_window,
                             host_runtime_for_window,
+                            host_state_for_window,
+                            preferences,
                             cx,
                         )
                     })
@@ -1217,6 +1846,11 @@ pub fn run_native_shell_with_runtime(
         });
     let error = error_slot.borrow_mut().take().map_or(Ok(()), Err);
     error
+}
+
+fn bounded_host_error(message: String) -> String {
+    const MAX_HOST_ERROR_CHARS: usize = 256;
+    message.chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
 #[allow(dead_code)]

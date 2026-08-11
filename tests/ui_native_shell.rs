@@ -1,11 +1,14 @@
 use devmanager::domain::id::TaskId;
+use devmanager::ui::actions::{KeyboardShortcut, ShortcutKey};
 use devmanager::ui::components::{ActionRequest, ActivationSource};
 use devmanager::ui::native_shell::{
-    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeInteraction,
-    NativeShellError, TerminalDockState,
+    headless_render_smoke, isolated_dev_profile, AccessibilityTree, NativeHostRuntimeStub,
+    NativeHostState, NativeInteraction, NativeShell, NativeShellError, TerminalDockState,
 };
 use devmanager::ui::shell::{NavigationResult, PointerButton, TerminalPressRejection};
 use devmanager::ui::task_cockpit::TaskList;
+use devmanager::ui::tokens::{Density, RuntimePreferencesSnapshot, Scale, ThemeMode};
+use gpui::AppContext;
 use tempfile::tempdir;
 
 fn task_id(tail: u8) -> TaskId {
@@ -95,6 +98,112 @@ fn native_headless_render_smoke_constructs_the_real_gpui_shell() {
     assert!(report.semantic_nodes > 0);
     assert!(report.rendered_task_rows <= 104);
     assert_eq!(report.host_profile, report.profile_root);
+    assert_eq!(report.host_state, NativeHostState::Disconnected);
+    assert!(report
+        .gpui_accessibility_nodes
+        .iter()
+        .any(|node| node.element_id == "native-shell-root" && node.focusable));
+    assert!(report
+        .gpui_accessibility_nodes
+        .iter()
+        .any(|node| node.element_id == "native-task-inbox" && node.label == "Task inbox"));
+}
+
+#[test]
+fn native_shell_accepts_one_injected_runtime_seam_without_opening_a_second_client() {
+    let workspace = tempdir().expect("workspace tempdir");
+    let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+    let fake = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    let report_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let report_slot_for_app = std::rc::Rc::clone(&report_slot);
+    gpui::Application::headless().run(move |cx| {
+        devmanager::ui::init(cx);
+        let entity = cx.new(|cx| {
+            NativeShell::new_with_host_runtime_port(
+                profile,
+                Box::new(fake),
+                RuntimePreferencesSnapshot::new(
+                    ThemeMode::Dark,
+                    Density::Comfortable,
+                    Scale::Scale100,
+                ),
+                cx,
+            )
+        });
+        let result = entity.update(cx, |shell, _cx| {
+            (
+                shell.host_endpoint().to_string(),
+                shell.host_state().clone(),
+                shell.host_runtime().is_none(),
+            )
+        });
+        *report_slot_for_app.borrow_mut() = Some(result);
+        cx.quit();
+    });
+    let (endpoint, state, concrete_runtime_absent) = report_slot
+        .borrow_mut()
+        .take()
+        .expect("injected shell report");
+    assert_eq!(endpoint, "phase2-test://isolated");
+    assert!(matches!(state, NativeHostState::Connected { .. }));
+    assert!(concrete_runtime_absent);
+}
+
+#[test]
+fn injected_host_projection_drain_is_bounded_and_keeps_live_kinds_typed() {
+    use devmanager::ui::native_shell::{NativeHostProjectionKind, NativeHostRuntimePort};
+    let mut stub = NativeHostRuntimeStub::new(
+        "phase2-test://isolated",
+        NativeHostState::Connected {
+            endpoint: "phase2-test://isolated".to_string(),
+        },
+    );
+    for kind in [
+        NativeHostProjectionKind::Snapshot,
+        NativeHostProjectionKind::Replay,
+        NativeHostProjectionKind::Live,
+    ] {
+        for _ in 0..40 {
+            stub.push_projection(kind);
+        }
+    }
+    let first = stub.drain_ready(32);
+    let second = stub.drain_ready(32);
+    assert_eq!(first.len(), 32);
+    assert_eq!(second.len(), 32);
+    assert!(first.iter().chain(second.iter()).all(|kind| matches!(
+        kind,
+        NativeHostProjectionKind::Snapshot
+            | NativeHostProjectionKind::Replay
+            | NativeHostProjectionKind::Live
+    )));
+}
+
+#[test]
+fn keyboard_dispatch_commits_only_the_captured_action_and_epoch() {
+    let mut interaction = NativeInteraction::new(None);
+    let model = devmanager::ui::actions::KeyboardModel::default();
+    let (focus_epoch, request_generation, action) = interaction
+        .keyboard(&model, KeyboardShortcut::ctrl(ShortcutKey::Character('k')))
+        .expect("ctrl-k should resolve to the palette action");
+
+    assert!(interaction.commit_keyboard_action(focus_epoch, request_generation, action));
+    assert!(interaction.keyboard_state().palette_open);
+    assert!(!interaction.commit_keyboard_action(focus_epoch, request_generation, action));
+    let (new_focus_epoch, new_request_generation, new_action) = interaction
+        .keyboard(&model, KeyboardShortcut::escape())
+        .expect("escape should resolve to dismiss");
+    assert!(!interaction.commit_keyboard_action(focus_epoch, request_generation, action));
+    assert!(interaction.commit_keyboard_action(
+        new_focus_epoch,
+        new_request_generation,
+        new_action
+    ));
 }
 
 #[test]

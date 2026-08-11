@@ -1,0 +1,13 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit",
+  "title": "Task Cockpit",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit"
+  }
+}

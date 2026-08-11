@@ -36,8 +36,93 @@ impl Scale {
         }
     }
 
-    const fn factor(self) -> f32 {
+    pub const fn factor(self) -> f32 {
         self.percent() as f32 / 100.0
+    }
+
+    /// Resolve the nearest supported Windows display scale once, before a
+    /// render pass starts. Native layout consumes the resulting immutable
+    /// snapshot rather than querying the window while painting.
+    pub fn from_factor(factor: f32) -> Self {
+        let percent = (factor.max(1.0) * 100.0).round() as u16;
+        match percent {
+            0..=112 => Self::Scale100,
+            113..=137 => Self::Scale125,
+            138..=174 => Self::Scale150,
+            _ => Self::Scale200,
+        }
+    }
+}
+
+/// The only runtime preference input consumed by the native shell. It is a
+/// copyable snapshot so appearance and display scale are resolved at window
+/// creation (or by a future preferences event), never during GPUI render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimePreferencesSnapshot {
+    mode: ThemeMode,
+    density: Density,
+    scale: Scale,
+}
+
+impl Default for RuntimePreferencesSnapshot {
+    fn default() -> Self {
+        Self::new(ThemeMode::Dark, Density::Comfortable, Scale::Scale100)
+    }
+}
+
+impl RuntimePreferencesSnapshot {
+    pub const fn new(mode: ThemeMode, density: Density, scale: Scale) -> Self {
+        Self {
+            mode,
+            density,
+            scale,
+        }
+    }
+
+    pub fn from_system(
+        appearance: gpui::WindowAppearance,
+        scale_factor: f32,
+        density: Density,
+    ) -> Self {
+        let mode = match appearance {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                ThemeMode::Light
+            }
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => ThemeMode::Dark,
+        };
+        Self::new(mode, density, Scale::from_factor(scale_factor))
+    }
+
+    pub const fn mode(self) -> ThemeMode {
+        self.mode
+    }
+
+    pub const fn density(self) -> Density {
+        self.density
+    }
+
+    pub const fn scale(self) -> Scale {
+        self.scale
+    }
+
+    pub fn tokens(self) -> ThemeTokens {
+        theme(self.mode, self.density, self.scale)
+    }
+
+    pub fn metrics(self) -> PhysicalDensityMetrics {
+        self.tokens().density.physical()
+    }
+
+    /// Conservative minimum window check used by acceptance tests and by the
+    /// shell's initial bounds. It catches scale regressions before a window
+    /// is painted, without requiring a platform capture in unit tests.
+    pub fn layout_fits(self, width: u32, height: u32) -> bool {
+        let metrics = self.metrics();
+        width
+            >= metrics
+                .label_min_width
+                .saturating_add(metrics.control_padding * 8)
+            && height >= metrics.control_height.saturating_mul(4)
     }
 }
 

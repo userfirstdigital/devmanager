@@ -8,7 +8,9 @@ use devmanager::domain::task::{
 use devmanager::ui::shell::{
     NavigationRejection, NavigationResult, PointerButton, ReleaseRejection, Shell, TerminalRelease,
 };
-use devmanager::ui::task_cockpit::{TaskList, VirtualWindow, MAX_TASK_LIST_ITEMS};
+use devmanager::ui::task_cockpit::{
+    TaskList, VirtualListViewport, VirtualWindow, MAX_TASK_LIST_ITEMS,
+};
 use serde::Deserialize;
 use std::fs;
 
@@ -328,4 +330,20 @@ fn virtual_window_keeps_visible_rows_and_fixed_bounded_overscan_local() {
         before,
         "invalid viewport has zero effects"
     );
+}
+
+#[test]
+fn virtual_viewport_scrolls_100k_rows_without_materializing_the_source() {
+    let mut viewport = VirtualListViewport::new(100_000, 40).expect("valid viewport");
+    assert_eq!(viewport.total_rows(), 100_000);
+    assert_eq!(viewport.materialized_rows(), 0);
+
+    viewport
+        .apply_scroll_delta(2_500.0, 800.0, 20.0)
+        .expect("real scroll delta should update the viewport");
+
+    assert_eq!(viewport.visible_range(), 125..165);
+    assert!(viewport.render_range().len() <= 104);
+    assert_eq!(viewport.stable_key(125), "task-row-00000125");
+    assert_eq!(viewport.materialized_rows(), 0);
 }

@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use devmanager::theme;
 use devmanager::ui::tokens::{
-    contrast_ratio, srgb_luminance, theme as build_theme, Color, ContrastPair, Density, Scale,
-    TerminalSlotRole, ThemeMode, ThemeTokens,
+    contrast_ratio, srgb_luminance, theme as build_theme, Color, ContrastPair, Density,
+    RuntimePreferencesSnapshot, Scale, TerminalSlotRole, ThemeMode, ThemeTokens,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -82,6 +82,32 @@ const EXPECTED_COLOR_KEYS: &[&str] = &[
     "terminal_bright_cyan",
     "terminal_bright_white",
 ];
+
+#[test]
+fn runtime_preferences_resolve_scale_and_theme_once_without_clipping() {
+    for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        for scale in [
+            Scale::Scale100,
+            Scale::Scale125,
+            Scale::Scale150,
+            Scale::Scale200,
+        ] {
+            let preferences = RuntimePreferencesSnapshot::new(mode, Density::Comfortable, scale);
+            assert_eq!(preferences.tokens().mode, mode);
+            assert_eq!(preferences.scale(), scale);
+            assert!(preferences.layout_fits(1_280, 800));
+            assert!(preferences.metrics().row_height > 0);
+        }
+    }
+
+    let system = RuntimePreferencesSnapshot::from_system(
+        gpui::WindowAppearance::Light,
+        1.5,
+        Density::Compact,
+    );
+    assert_eq!(system.tokens().mode, ThemeMode::Light);
+    assert_eq!(system.scale(), Scale::Scale150);
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

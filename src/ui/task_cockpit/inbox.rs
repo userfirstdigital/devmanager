@@ -9,6 +9,7 @@ use crate::domain::task::TaskLifecycle;
 pub const MAX_TASK_LIST_ITEMS: usize = 5_000;
 pub const FIXED_VIRTUAL_OVERSCAN: usize = 32;
 pub const DEFAULT_VISIBLE_ROWS: usize = 40;
+pub const MAX_VIRTUAL_SOURCE_ROWS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskListOverflow {
@@ -54,6 +55,80 @@ impl VirtualWindow {
         let visible_end = visible.end.min(item_count).max(visible_start);
         visible_start.saturating_sub(self.overscan)
             ..visible_end.saturating_add(self.overscan).min(item_count)
+    }
+}
+
+/// A uniform-row viewport over a potentially much larger source than the
+/// bounded host projection. It stores only counts and offsets; row identities
+/// are stable keys generated on demand by the GPUI list closure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualListViewport {
+    total_rows: usize,
+    visible_rows: usize,
+    scroll_offset: f32,
+    window: VirtualWindow,
+}
+
+impl VirtualListViewport {
+    pub fn new(total_rows: usize, visible_rows: usize) -> Result<Self, ViewportError> {
+        if visible_rows == 0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        let total_rows = total_rows.min(MAX_VIRTUAL_SOURCE_ROWS);
+        Ok(Self {
+            total_rows,
+            visible_rows,
+            scroll_offset: 0.0,
+            window: VirtualWindow::for_item_count(0, visible_rows, total_rows),
+        })
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    pub fn materialized_rows(&self) -> usize {
+        0
+    }
+
+    pub fn visible_range(&self) -> Range<usize> {
+        self.window.visible_range()
+    }
+
+    pub fn render_range(&self) -> Range<usize> {
+        self.window.render_range(self.total_rows)
+    }
+
+    pub fn stable_key(&self, index: usize) -> String {
+        format!("task-row-{index:08}")
+    }
+
+    pub fn scroll_offset(&self) -> f32 {
+        self.scroll_offset
+    }
+
+    /// Apply a GPUI scroll-wheel pixel delta to the uniform viewport. The
+    /// caller supplies the measured viewport and row dimensions, so this
+    /// method is deterministic in headless tests as well as in a real window.
+    pub fn apply_scroll_delta(
+        &mut self,
+        delta_pixels: f32,
+        viewport_height: f32,
+        row_height: f32,
+    ) -> Result<(), ViewportError> {
+        if viewport_height <= 0.0 || row_height <= 0.0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        let visible_rows = (viewport_height / row_height).ceil().max(1.0) as usize;
+        self.visible_rows = visible_rows;
+        let max_offset = self
+            .total_rows
+            .saturating_sub(visible_rows)
+            .saturating_mul(row_height as usize) as f32;
+        self.scroll_offset = (self.scroll_offset + delta_pixels).clamp(0.0, max_offset);
+        let first_visible = (self.scroll_offset / row_height).floor() as usize;
+        self.window = VirtualWindow::for_item_count(first_visible, visible_rows, self.total_rows);
+        Ok(())
     }
 }
 
@@ -133,6 +208,28 @@ impl TaskList {
         }
         self.viewport = VirtualWindow::for_item_count(first_visible, visible_rows, self.len());
         Ok(())
+    }
+
+    /// Apply a pixel scroll delta to the bounded task projection. GPUI's
+    /// scroll callback calls this without constructing a second list model.
+    pub fn apply_scroll_delta(
+        &mut self,
+        delta_pixels: f32,
+        viewport_height: f32,
+        row_height: f32,
+    ) -> Result<(), ViewportError> {
+        if viewport_height <= 0.0 || row_height <= 0.0 {
+            return Err(ViewportError::ZeroVisibleRows);
+        }
+        let visible_rows = (viewport_height / row_height).ceil().max(1.0) as usize;
+        let current_start = self.viewport.visible_range().start;
+        let current_offset = current_start as f32 * row_height;
+        let max_offset = self
+            .len()
+            .saturating_sub(visible_rows)
+            .saturating_mul(row_height as usize) as f32;
+        let offset = (current_offset + delta_pixels).clamp(0.0, max_offset);
+        self.set_viewport((offset / row_height).floor() as usize, visible_rows)
     }
 
     pub fn visible_task_ids(&self) -> &[TaskId] {

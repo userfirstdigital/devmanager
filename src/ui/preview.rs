@@ -280,6 +280,7 @@ impl PreviewResources {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewRootSnapshot {
     pub fixture_id: String,
+    pub root_kind: String,
     pub title: String,
     pub body: String,
 }
@@ -348,7 +349,7 @@ impl PreviewApplication {
             || fixture.title.chars().count() > 256
             || fixture.capture.cursor != PreviewCaptureSetting::Excluded
             || fixture.capture.border != PreviewCaptureSetting::Excluded
-            || fixture.root.kind != "minimal"
+            || !matches!(fixture.root.kind.as_str(), "minimal" | "task-cockpit")
             || fixture.root.label.trim().is_empty()
             || fixture.root.label.chars().count() > 256
         {
@@ -358,9 +359,19 @@ impl PreviewApplication {
             });
         }
 
+        let is_task_cockpit = fixture.root.kind == "task-cockpit";
+        let body = if is_task_cockpit {
+            format!(
+                "Task Cockpit\nHeader\nTask Inbox\nContext Dock\nDisconnected\n{}",
+                fixture.title
+            )
+        } else {
+            format!("{}: {}", fixture.root.label, fixture.title)
+        };
         let root_snapshot = PreviewRootSnapshot {
             fixture_id: fixture.id,
-            body: format!("{}: {}", fixture.root.label, fixture.title),
+            root_kind: fixture.root.kind,
+            body,
             title: fixture.title,
         };
         Ok(Self {
@@ -486,6 +497,20 @@ impl PreviewRoot {
 
     pub fn element(&self) -> impl IntoElement {
         let tokens = theme(ThemeMode::Dark, Density::Comfortable, Scale::Scale100);
+        let shell = if self.snapshot.root_kind == "task-cockpit" {
+            div()
+                .id("preview-task-cockpit")
+                .flex_col()
+                .gap(px(12.0))
+                .child(div().id("preview-shell-title").child("Task Cockpit"))
+                .child(div().id("preview-header").child("Header"))
+                .child(div().id("preview-inbox").child("Task Inbox"))
+                .child(div().id("preview-dock").child("Context Dock"))
+                .child(div().id("preview-host-state").child("Disconnected"))
+                .into_any_element()
+        } else {
+            div().child(self.snapshot.body.clone()).into_any_element()
+        };
         div()
             .size_full()
             .p(px(16.0))
@@ -498,7 +523,7 @@ impl PreviewRoot {
                     .size(px(PREVIEW_SENTINEL_SIZE))
                     .bg(PREVIEW_SENTINEL.to_gpui()),
             )
-            .child(self.snapshot.body.clone())
+            .child(shell)
     }
 }
 
