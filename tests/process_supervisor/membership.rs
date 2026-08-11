@@ -904,7 +904,8 @@ fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
     assert!(saw_active_zero, "real Job did not emit ACTIVE_PROCESS_ZERO");
     assert_eq!(
         registry.current(resource).expect("current Job").state(),
-        ManagedProcessState::Stopped
+        ManagedProcessState::Running,
+        "a completion hint must not publish stopped while the Job is retained"
     );
 
     assert!(
@@ -925,6 +926,11 @@ fn membership_windows_job_emits_fenced_new_process_and_active_zero() {
     let authority = registry
         .mint_teardown_release_authority_exact(&ticket, proof)
         .expect("authoritative empty membership settlement");
+    assert_eq!(
+        registry.current(resource).expect("retained Job").state(),
+        ManagedProcessState::ZeroSettled,
+        "authoritative zero still retains exact Job release authority"
+    );
 
     let removed = registry
         .release_stopped_with_authority(&ticket, &authority)

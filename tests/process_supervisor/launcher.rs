@@ -2,8 +2,8 @@
 
 #[cfg(windows)]
 mod windows {
-    use std::collections::BTreeMap;
-    use std::ffi::OsString;
+    use std::collections::{BTreeMap, HashMap};
+    use std::ffi::{OsStr, OsString};
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -12,7 +12,10 @@ mod windows {
     use devmanager::domain::resource::ResourceKind;
     use devmanager::process::identity::ProcessOwner;
     use devmanager::process::job::ManagedProcessJob;
-    use devmanager::process::launcher::{prepare_suspended_pty, LaunchIntent, ManagedPtyChild};
+    use devmanager::process::launcher::{
+        prepare_suspended_pty, validate_process_image_length,
+        validate_terminal_launch_source_bounds, LaunchIntent, ManagedPtyChild,
+    };
     use devmanager::process::registry::{
         ManagedProcessState, ProcessRegistry, ProcessRegistryError,
     };
@@ -25,6 +28,14 @@ mod windows {
 
     const MARKER_BOUND: Duration = Duration::from_secs(5);
     const EXIT_BOUND: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn process_image_length_must_fit_the_supplied_buffer() {
+        assert_eq!(validate_process_image_length(4, 4), Ok(4));
+        assert!(validate_process_image_length(5, 4)
+            .expect_err("OS-reported path length outside the allocation must fail closed")
+            .contains("buffer"));
+    }
 
     fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
         [
@@ -218,6 +229,16 @@ mod windows {
         )
         .expect("prepare suspended managed launch");
 
+        assert!(pending
+            .internal_job_name()
+            .starts_with("Local\\DevManager-Task-"));
+        assert!(pending
+            .internal_job_name()
+            .ends_with(&format!("-{}-1", resource_id(1))));
+        assert!(!pending
+            .internal_job_name()
+            .contains("Phase 3 process helper"));
+
         assert!(
             pending
                 .active_process_ids()
@@ -385,6 +406,103 @@ mod windows {
 
         close_registered(registry, &mut root);
         child_wait.assert_signaled();
+    }
+
+    #[test]
+    fn launch_intent_rejects_unbounded_argument_and_environment_collections() {
+        let pty = TestPty::open();
+        let too_many_args = vec![OsString::from("x"); 257];
+        let error = prepare_suspended_pty(pty.slave(), intent(resource_id(6), 1, too_many_args))
+            .expect_err("argument count must be bounded before process creation");
+        assert!(error.to_string().contains("argument count"));
+
+        let mut too_many_environment_entries = BTreeMap::new();
+        for index in 0..257 {
+            too_many_environment_entries.insert(
+                OsString::from(format!("DEVMANAGER_BOUND_{index}")),
+                OsString::from("x"),
+            );
+        }
+        let mut environment_intent = intent(resource_id(7), 1, Vec::new());
+        environment_intent.environment = too_many_environment_entries;
+        let error = prepare_suspended_pty(pty.slave(), environment_intent)
+            .expect_err("environment count must be bounded before process creation");
+        assert!(error.to_string().contains("environment entry count"));
+    }
+
+    #[test]
+    fn terminal_launch_sources_are_bounded_before_native_collection_allocation() {
+        let error = validate_terminal_launch_source_bounds(
+            OsStr::new("powershell.exe"),
+            OsStr::new("."),
+            "powershell.exe",
+            &vec!["x".to_string(); 257],
+            &HashMap::new(),
+            8,
+        )
+        .expect_err("borrowed argument count must fail before OsString allocation");
+        assert!(error.to_string().contains("argument count"));
+
+        let mut environment = HashMap::new();
+        for index in 0..249 {
+            environment.insert(format!("BOUND_{index}"), "x".to_string());
+        }
+        let error = validate_terminal_launch_source_bounds(
+            OsStr::new("powershell.exe"),
+            OsStr::new("."),
+            "powershell.exe",
+            &[],
+            &environment,
+            8,
+        )
+        .expect_err("reserved defaults must be included before environment allocation");
+        assert!(error.to_string().contains("environment entry count"));
+    }
+
+    #[test]
+    fn launch_intent_rejects_unbounded_host_strings_and_total_bytes() {
+        let pty = TestPty::open();
+
+        let mut oversized_label = intent(resource_id(12), 1, Vec::new());
+        oversized_label.display_label = "l".repeat(257);
+        let error = prepare_suspended_pty(pty.slave(), oversized_label)
+            .expect_err("display labels must be bounded before filesystem or process effects");
+        assert!(error.to_string().contains("display label"));
+
+        let error = prepare_suspended_pty(
+            pty.slave(),
+            intent(
+                resource_id(8),
+                1,
+                vec![OsString::from("x".repeat(32 * 1024 + 1))],
+            ),
+        )
+        .expect_err("individual argument bytes must be bounded");
+        assert!(error.to_string().contains("argument 0"));
+
+        let mut oversized_key = intent(resource_id(9), 1, Vec::new());
+        oversized_key
+            .environment
+            .insert(OsString::from("K".repeat(257)), OsString::from("value"));
+        let error = prepare_suspended_pty(pty.slave(), oversized_key)
+            .expect_err("environment key bytes must be bounded");
+        assert!(error.to_string().contains("environment key"));
+
+        let mut oversized_value = intent(resource_id(10), 1, Vec::new());
+        oversized_value.environment.insert(
+            OsString::from("DEVMANAGER_BOUND_VALUE"),
+            OsString::from("v".repeat(32 * 1024 + 1)),
+        );
+        let error = prepare_suspended_pty(pty.slave(), oversized_value)
+            .expect_err("environment value bytes must be bounded");
+        assert!(error.to_string().contains("environment value"));
+
+        let total_args = (0..9)
+            .map(|_| OsString::from("a".repeat(16 * 1024)))
+            .collect();
+        let error = prepare_suspended_pty(pty.slave(), intent(resource_id(11), 1, total_args))
+            .expect_err("aggregate launch bytes must be bounded");
+        assert!(error.to_string().contains("total byte"));
     }
 }
 

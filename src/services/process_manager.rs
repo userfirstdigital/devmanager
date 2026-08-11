@@ -48,6 +48,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const AI_SESSION_ATTACH_GRACE_WINDOW: Duration = Duration::from_secs(30);
+const MAX_RESTART_HISTORY_BYTES: usize = 256 * 1024;
+const MAX_PROCESS_OP_HOST_STRING_BYTES: usize = 32 * 1024;
 
 pub(crate) fn ai_session_needs_restore(
     session: Option<&SessionRuntimeState>,
@@ -494,7 +496,7 @@ const DEFAULT_CLAUDE_COMMAND: &str =
 const DEFAULT_CODEX_COMMAND: &str =
     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
 const AI_COMMAND_INJECTION_DELAY_MS: u64 = 500;
-const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(2);
+const PROCESS_MANAGER_HELPER_JOIN_BUDGET: Duration = Duration::from_secs(5);
 const MAX_AUTO_RESTART_WORKERS: usize = 256;
 const MAX_TERMINAL_AUTHORITY_RESOURCES: usize = 1_024;
 
@@ -743,6 +745,7 @@ impl ProcessManager {
         activate_tab: bool,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        validate_process_op_host_string(command_id, "server command identity")?;
         self.validate_server_launch(app_state, command_id)?;
         let Some(launch) =
             self.prepare_start_server(app_state, command_id, dimensions, activate_tab)?
@@ -768,6 +771,8 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        validate_process_op_host_string(command_id, "server command identity")?;
+        validate_process_op_host_string(banner, "restart banner")?;
         self.validate_server_launch(app_state, command_id)?;
         let (launch, clear_logs) =
             self.prepare_restart_server(app_state, command_id, dimensions, banner)?;
@@ -790,6 +795,7 @@ impl ProcessManager {
         wait: Duration,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        validate_process_op_host_string(command_id, "server command identity")?;
         let op_id = next_op_id();
         self.op_queue
             .submit(ProcessOp::StopServer {
@@ -810,6 +816,8 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        validate_process_op_host_string(command_id, "server command identity")?;
+        validate_process_op_host_string(banner, "restart banner")?;
         let op_id = next_op_id();
         self.op_queue
             .submit(ProcessOp::KillPortAndRestart {
@@ -829,14 +837,18 @@ impl ProcessManager {
         wait: Duration,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
-        let command_ids: Vec<String> = self
-            .runtime_state()
+        let runtime = self.runtime_state();
+        let mut command_ids = Vec::with_capacity(MAX_PROCESS_OP_BATCH_ITEMS);
+        for command_id in runtime
             .sessions
             .values()
-            .filter(|session| session.command_id.is_some() && session.status.is_live())
-            .filter_map(|session| session.command_id.clone())
+            .filter(|session| session.status.is_live())
+            .filter_map(|session| session.command_id.as_deref())
             .take(MAX_PROCESS_OP_BATCH_ITEMS + 1)
-            .collect();
+        {
+            validate_process_op_host_string(command_id, "server command identity")?;
+            command_ids.push(command_id.to_string());
+        }
         if command_ids.len() > MAX_PROCESS_OP_BATCH_ITEMS {
             return Err(format!(
                 "Stop-all server batch exceeds {MAX_PROCESS_OP_BATCH_ITEMS} managed sessions."
@@ -880,34 +892,18 @@ impl ProcessManager {
         &self,
         session_id: &str,
         pid: u32,
-        response: Option<Sender<RemoteActionResult>>,
+        _response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
-        let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::KillProcess {
-                op_id,
-                session_id: session_id.to_string(),
-                pid,
-                response,
-            })
-            .map(|_| ())
+        Err(pid_only_teardown_unavailable(session_id, pid))
     }
 
     pub fn enqueue_kill_process_tree(
         &self,
         session_id: &str,
         pid: u32,
-        response: Option<Sender<RemoteActionResult>>,
+        _response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
-        let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::KillProcessTree {
-                op_id,
-                session_id: session_id.to_string(),
-                pid,
-                response,
-            })
-            .map(|_| ())
+        Err(pid_only_teardown_unavailable(session_id, pid))
     }
 
     pub fn schedule_kill_port_and_restart(
@@ -919,6 +915,8 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        validate_process_op_host_string(command_id, "server command identity")?;
+        validate_process_op_host_string(banner, "restart banner")?;
         self.validate_server_launch(app_state, command_id)?;
         let lookup = app_state
             .find_command(command_id)
@@ -2110,10 +2108,19 @@ impl ProcessManager {
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
+        self.close_session_with_reason(session_id, true)
+    }
+
+    fn close_session_with_reason(
+        &self,
+        session_id: &str,
+        closed_by_user: bool,
+    ) -> Result<(), String> {
         let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
-        let result = self.request_session_close(session_id, true);
+        self.request_session_close(session_id, closed_by_user)?;
+        self.finalize_settled_session(session_id)?;
         unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
-        result
+        Ok(())
     }
 
     pub fn close_tab(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
@@ -2303,7 +2310,7 @@ impl ProcessManager {
             .cloned()
             .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
 
-        let mut existing_session_to_forget = None;
+        let mut existing_session_to_close = None;
         if let Some(existing_session_id) = tab.pty_session_id.as_deref() {
             let existing_runtime = self
                 .runtime_state()
@@ -2326,7 +2333,7 @@ impl ProcessManager {
                 }
                 return Ok(existing_session_id.to_string());
             }
-            existing_session_to_forget = Some(existing_session_id.to_string());
+            existing_session_to_close = Some(existing_session_id.to_string());
         }
 
         let session_id = next_ai_session_id(&tab.tab_type);
@@ -2337,9 +2344,6 @@ impl ProcessManager {
             &session_id,
             tab.browser_workspace.clone().unwrap_or_default(),
         );
-        if let Some(existing_session_id) = existing_session_to_forget.as_deref() {
-            self.forget_session(existing_session_id);
-        }
         self.prepare_claude_launch_for_session(
             &mut launch,
             &session_id,
@@ -2361,14 +2365,26 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        if let Err(error) = self.schedule_spawn_ai(
-            &launch,
-            &session_id,
-            dimensions,
-            activate_tab,
-            response,
-            attachment_binding,
-        ) {
+        let schedule_result = if existing_session_to_close.is_some() {
+            self.schedule_restart_ai(
+                existing_session_to_close,
+                launch.clone(),
+                session_id.clone(),
+                dimensions,
+                response,
+                attachment_binding,
+            )
+        } else {
+            self.schedule_spawn_ai(
+                &launch,
+                &session_id,
+                dimensions,
+                activate_tab,
+                response,
+                attachment_binding,
+            )
+        };
+        if let Err(error) = schedule_result {
             self.cleanup_ai_adapters_for_session(&session_id);
             return Err(error);
         }
@@ -2707,7 +2723,9 @@ impl ProcessManager {
                 }
                 return Ok(existing_session_id.to_string());
             }
-            self.forget_session(existing_session_id);
+            // The operation worker closes this exact prior owner before it
+            // admits the replacement. It must never be forgotten here while
+            // exact teardown is still pending or retryable.
         }
 
         let session_id = next_ssh_session_id(&connection_id);
@@ -2732,14 +2750,27 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        self.schedule_start_ssh(
-            launch,
-            session_id.clone(),
-            dimensions,
-            key_error,
-            activate_tab,
-            response,
-        )?;
+        let existing_session_id = tab.pty_session_id.clone();
+        if existing_session_id.is_some() {
+            self.schedule_restart_ssh(
+                existing_session_id,
+                launch,
+                session_id.clone(),
+                dimensions,
+                key_error,
+                activate_tab,
+                response,
+            )?;
+        } else {
+            self.schedule_start_ssh(
+                launch,
+                session_id.clone(),
+                dimensions,
+                key_error,
+                activate_tab,
+                response,
+            )?;
+        }
         Ok(session_id)
     }
 
@@ -2972,32 +3003,23 @@ impl ProcessManager {
             return true;
         }
 
-        let _ = self.retry_exact_session_teardown(command_id);
+        let retry_result = self.retry_exact_session_teardown(command_id);
         if self.wait_for_session_shutdown(command_id, Duration::from_secs(2)) {
-            self.update_session_state(command_id, |state| {
-                state.status = SessionStatus::Stopped;
-                state.pid = None;
-                state.resources = ResourceSnapshot::default();
-                state.mark_dirty();
-            });
             return true;
         }
 
         let remaining_tracked_pids = pid_file::active_tracked_pids_for_session(command_id);
-        if remaining_tracked_pids.is_empty() {
-            self.update_session_state(command_id, |state| {
-                state.status = SessionStatus::Stopped;
-                state.pid = None;
-                state.resources = ResourceSnapshot::default();
-                state.exit = Some(SessionExitState {
-                    code: None,
-                    signal: None,
-                    closed_by_user: true,
-                    summary: "Managed process did not stop cleanly.".to_string(),
-                });
-                state.mark_dirty();
-            });
+        if retry_result.is_ok()
+            && remaining_tracked_pids.is_empty()
+            && !self.session_attached(command_id)
+        {
+            mark_session_reaped(&self.inner, command_id);
+            return true;
         } else {
+            let retry_detail = retry_result
+                .err()
+                .map(|error| format!(" Exact teardown remains retryable: {error}"))
+                .unwrap_or_default();
             self.update_session_state(command_id, |state| {
                 state.status = SessionStatus::Failed;
                 state.pid = None;
@@ -3013,8 +3035,8 @@ impl ProcessManager {
                     signal: None,
                     closed_by_user: true,
                     summary: format!(
-                        "Managed process left {} tracked child process(es) running.",
-                        remaining_tracked_pids.len()
+                        "Managed process left {} tracked child process(es) running.{retry_detail}",
+                        remaining_tracked_pids.len(),
                     ),
                 });
                 state.mark_dirty();
@@ -3281,35 +3303,56 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
-        let result = match self.get_session(session_id) {
-            Ok(session) => session.close(closed_by_user),
-            Err(error) => {
-                self.cleanup_ai_adapters_for_session(session_id);
+        match close_exact_session_owner(&self.inner, session_id, closed_by_user) {
+            Ok(true) => {
+                // The exact Job/registry release and actor joins completed,
+                // and the manager-owned TerminalSession was removed and
+                // dropped before runtime/remote reconciliation.
+                self.reconcile_closed_session(session_id);
+                Ok(())
+            }
+            Ok(false) if session_projection_is_already_settled(&self.inner, session_id) => Ok(()),
+            Ok(false) => {
                 self.note_missing_session_close_request(session_id, closed_by_user);
+                Err(format!("Unknown session `{session_id}`"))
+            }
+            Err(error) => {
+                self.note_exact_teardown_failure(session_id, &error, closed_by_user);
                 Err(error)
             }
-        };
-        // `TerminalSession::close` owns and joins the exact Job/coordinator
-        // teardown.  Reconciliation stays on this caller; there is no
-        // detached PID-selected reaper that can mutate runtime or persistence
-        // after this operation returns.
-        self.reconcile_closed_session(session_id);
-        result
+        }
+    }
+
+    fn note_exact_teardown_failure(&self, session_id: &str, error: &str, closed_by_user: bool) {
+        self.update_session_state(session_id, |session| {
+            session.status = SessionStatus::Failed;
+            session.reap_incomplete = true;
+            session.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user,
+                summary: format!("Exact managed teardown remains retryable: {error}"),
+            });
+            session.mark_dirty();
+        });
     }
 
     fn note_missing_session_close_request(&self, session_id: &str, closed_by_user: bool) {
         self.update_session_state(session_id, |session| {
             if session.status.is_live() {
-                session.status = SessionStatus::Stopping;
+                // A runtime row without its exact TerminalSession/Job owner
+                // cannot be declared stopped: there is no authority left to
+                // prove ACTIVE_PROCESS_ZERO or release the exact fence. Make
+                // the unavailable authority visible instead of leaving the
+                // row in an indefinitely optimistic Stopping state.
+                session.status = SessionStatus::Failed;
+                session.reap_incomplete = true;
                 session.exit = Some(SessionExitState {
                     code: None,
                     signal: None,
                     closed_by_user,
-                    summary: if closed_by_user {
-                        "Session close requested by user".to_string()
-                    } else {
-                        "Session close requested".to_string()
-                    },
+                    summary: "Exact managed teardown unavailable: terminal owner is missing"
+                        .to_string(),
                 });
                 session.mark_dirty();
             }
@@ -3329,14 +3372,14 @@ impl ProcessManager {
     fn wait_for_session_shutdown(&self, session_id: &str, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
-            let session_live = self
+            let session_settled = self
                 .runtime_state()
                 .sessions
                 .get(session_id)
-                .map(|session| session.status.is_live())
-                .unwrap_or(false);
+                .map(|session| session.status == SessionStatus::Stopped && !session.reap_incomplete)
+                .unwrap_or(true);
             let tracked_pids = pid_file::active_tracked_pids_for_session(session_id);
-            if !session_live && tracked_pids.is_empty() {
+            if session_settled && tracked_pids.is_empty() && !self.session_attached(session_id) {
                 return true;
             }
             if started.elapsed() >= timeout {
@@ -3351,14 +3394,15 @@ impl ProcessManager {
     }
 
     fn reconcile_closed_session(&self, session_id: &str) {
-        let _ = pid_file::prune_inactive_entries();
-        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
-            && !live_runtime_root_running(&self.inner, session_id)
-        {
-            mark_session_reaped(&self.inner, session_id);
-        } else {
-            self.note_reap_incomplete(session_id);
+        if self.session_attached(session_id) {
+            return;
         }
+        // Exact close has already proved receiver-owned ACTIVE_PROCESS_ZERO,
+        // joined the PTY actors, released the exact registry/Job entry, and
+        // durably removed the matching ledger observation. PID scans are not
+        // authority and must not delay or redirect this publication.
+        let _ = pid_file::prune_inactive_entries();
+        mark_session_reaped(&self.inner, session_id);
     }
 
     fn note_reap_incomplete(&self, session_id: &str) {
@@ -3489,15 +3533,12 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    fn settle_session_teardown_for_test(&self, session_id: &str, timeout: Duration) -> bool {
-        let settled =
-            ensure_prior_session_teardown_settled(&self.inner, session_id, timeout).is_ok();
-        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
-            && !live_runtime_root_running(&self.inner, session_id)
-        {
-            mark_session_reaped(&self.inner, session_id);
-        }
-        settled
+    fn ensure_session_replacement_safe_for_test(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> bool {
+        ensure_prior_session_teardown_settled(&self.inner, session_id, timeout).is_ok()
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -3516,15 +3557,18 @@ impl ProcessManager {
         }
     }
 
-    fn forget_session(&self, session_id: &str) {
-        let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
-        self.cleanup_ai_adapters_for_session(session_id);
-        if let Ok(mut sessions) = self.inner.sessions.lock() {
-            sessions.remove(session_id);
+    fn finalize_settled_session(&self, session_id: &str) -> Result<(), String> {
+        if self.session_attached(session_id)
+            || !session_projection_is_already_settled(&self.inner, session_id)
+        {
+            return Err(format!(
+                "Session `{session_id}` cannot be forgotten before exact teardown settlement"
+            ));
         }
+        self.cleanup_ai_adapters_for_session(session_id);
         mark_remote_session_dirty(&self.inner, session_id);
         emit_remote_session_removed(&self.inner, session_id);
-        unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
+        Ok(())
     }
 
     fn ensure_runtime_entry(&self, session_id: &str, cwd: PathBuf, dimensions: SessionDimensions) {
@@ -3680,21 +3724,35 @@ fn shutdown_process_manager_workers(inner: &ProcessManagerInner) {
     // the one real terminal objects without holding the store lock, then route
     // every remaining process tree through its exact coordinator authority.
     loop {
-        let session = {
-            let mut sessions = inner
+        let entry = {
+            let sessions = inner
                 .sessions
                 .lock()
                 .unwrap_or_else(|_| std::process::abort());
             let Some(session_id) = sessions.keys().next().cloned() else {
                 break;
             };
-            sessions.remove(&session_id)
+            sessions
+                .get(&session_id)
+                .cloned()
+                .map(|session| (session_id, session))
         };
-        if let Some(session) = session {
+        if let Some((session_id, session)) = entry {
             if let Err(error) = session.close(false) {
                 eprintln!("process-manager shutdown failed exact terminal close: {error}");
                 std::process::abort();
             }
+            let mut sessions = inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|_| std::process::abort());
+            if !sessions
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                std::process::abort();
+            }
+            sessions.remove(&session_id);
         }
     }
 }
@@ -3899,11 +3957,6 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                 session.note_resource_sample(snapshot);
                 session.note_external_editor_wait(awaiting_external_editor);
                 if cleared_unreaped {
-                    session.reap_incomplete = false;
-                    session.status = SessionStatus::Stopped;
-                    session.pid = None;
-                    session.resources = ResourceSnapshot::default();
-                    session.mark_dirty();
                     cleared_reap_sessions.push(session_id.clone());
                 }
                 if session.dirty_generation != dirty_before {
@@ -3920,7 +3973,7 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     }
     for session_id in cleared_reap_sessions {
         let _ = pid_file::prune_inactive_entries();
-        emit_tracked_remote_runtime_snapshot(inner, &session_id);
+        mark_session_reaped(inner, &session_id);
     }
 }
 
@@ -4277,9 +4330,12 @@ fn ensure_prior_session_teardown_settled(
         if let Err(error) = retry_exact_session_teardown(inner, session_id) {
             last_close_error = Some(error);
         }
-        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
-            && !live_runtime_root_running(inner, session_id)
-        {
+        // Launch preparation creates or updates the runtime projection before
+        // the process operation executes.  A Starting row is therefore not
+        // evidence of an old process owner.  Admission is safe once both
+        // authoritative sources of process ownership are absent: no retained
+        // TerminalSession/Job and no live ledger identity.
+        if session_has_no_process_authority_or_evidence(inner, session_id) {
             return Ok(());
         }
         if started_at.elapsed() >= timeout {
@@ -4298,17 +4354,108 @@ fn retry_exact_session_teardown(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
 ) -> Result<(), String> {
+    let closed = close_exact_session_owner(inner, session_id, false)?;
+    let _ = pid_file::prune_inactive_entries();
+    if closed {
+        mark_session_reaped(inner, session_id);
+        return Ok(());
+    }
+    if session_projection_is_already_settled(inner, session_id) {
+        return Ok(());
+    }
+    // Crash-recovery reconciliation may encounter ledger evidence for a
+    // session that has no runtime projection and no exact Job capability.
+    // There is nothing authoritative to terminate or publish in that case;
+    // retain the ledger evidence for recovery and report the reconciliation
+    // pass itself as complete.  A retained Failed/reap-incomplete runtime row
+    // still fails closed through the branch below.
+    if session_runtime_projection_is_absent(inner, session_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "Exact managed teardown authority for session `{session_id}` is unavailable"
+    ))
+}
+
+fn session_runtime_projection_is_absent(inner: &ProcessManagerInner, session_id: &str) -> bool {
+    inner
+        .runtime_state
+        .read()
+        .map(|runtime| !runtime.sessions.contains_key(session_id))
+        .unwrap_or(false)
+}
+
+fn session_has_no_process_authority_or_evidence(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+) -> bool {
+    inner
+        .sessions
+        .lock()
+        .map(|sessions| !sessions.contains_key(session_id))
+        .unwrap_or(false)
+        && pid_file::active_tracked_pids_for_session(session_id).is_empty()
+}
+
+fn session_projection_is_already_settled(inner: &ProcessManagerInner, session_id: &str) -> bool {
+    let owner_absent = inner
+        .sessions
+        .lock()
+        .map(|sessions| !sessions.contains_key(session_id))
+        .unwrap_or(false);
+    let runtime_settled = inner
+        .runtime_state
+        .read()
+        .map(|runtime| {
+            runtime
+                .sessions
+                .get(session_id)
+                .map(|session| session.status == SessionStatus::Stopped && !session.reap_incomplete)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    owner_absent
+        && runtime_settled
+        && pid_file::active_tracked_pids_for_session(session_id).is_empty()
+}
+
+/// Close and remove only the exact TerminalSession observed before teardown.
+/// Failed release or persistence leaves it retained for the same operation
+/// and fence to retry; a concurrent replacement is never removed.
+fn close_exact_session_owner(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    closed_by_user: bool,
+) -> Result<bool, String> {
     let session = inner
         .sessions
         .lock()
         .map_err(|_| "Session store poisoned".to_string())?
         .get(session_id)
         .cloned();
-    if let Some(session) = session {
-        session.close(false)?;
-    }
-    let _ = pid_file::prune_inactive_entries();
-    Ok(())
+    let Some(session) = session else {
+        return Ok(false);
+    };
+    session.close(closed_by_user)?;
+
+    let removed = {
+        let mut sessions = inner
+            .sessions
+            .lock()
+            .map_err(|_| "Session store poisoned".to_string())?;
+        match sessions.get(session_id) {
+            Some(current) if Arc::ptr_eq(current, &session) => sessions.remove(session_id),
+            Some(_) => {
+                return Err(format!(
+                    "Session `{session_id}` changed generations before exact owner release"
+                ))
+            }
+            None => None,
+        }
+    };
+    drop(removed);
+    drop(session);
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4421,18 +4568,6 @@ impl TerminalAuthorityIssuer {
     }
 }
 
-#[cfg(not(windows))]
-fn session_managed_process_ids(inner: &ProcessManagerInner, session_id: &str) -> Vec<u32> {
-    let session = inner
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|guard| guard.get(session_id).cloned());
-    session
-        .and_then(|session| session.managed_process_ids())
-        .unwrap_or_default()
-}
-
 fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
     inner.runtime_state.read().ok().and_then(|runtime| {
         runtime
@@ -4442,20 +4577,68 @@ fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> 
     })
 }
 
+fn restart_history_text(snapshot: &TerminalScreenSnapshot) -> String {
+    let estimated = snapshot
+        .lines
+        .len()
+        .saturating_mul(snapshot.cols.saturating_add(2))
+        .min(MAX_RESTART_HISTORY_BYTES);
+    let mut text = String::with_capacity(estimated);
+
+    'lines: for line in &snapshot.lines {
+        let line_start = text.len();
+        for cell in line {
+            let character = if cell.character == '\u{00a0}' {
+                ' '
+            } else {
+                cell.character
+            };
+            if text.len().saturating_add(character.len_utf8()) > MAX_RESTART_HISTORY_BYTES {
+                break 'lines;
+            }
+            text.push(character);
+        }
+        while text.len() > line_start && text.ends_with(' ') {
+            text.pop();
+        }
+        if text.len().saturating_add(2) > MAX_RESTART_HISTORY_BYTES {
+            break;
+        }
+        text.push_str("\r\n");
+    }
+
+    while text.ends_with("\r\n") {
+        text.truncate(text.len().saturating_sub(2));
+    }
+    text
+}
+
 fn live_runtime_root_running(inner: &Arc<ProcessManagerInner>, session_id: &str) -> bool {
     live_runtime_root_pid(inner, session_id).is_some_and(platform_service::is_pid_running)
 }
 
-fn mark_session_reaped(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+fn mark_session_reaped(inner: &ProcessManagerInner, session_id: &str) {
+    if inner
+        .sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(session_id))
+        .unwrap_or(true)
+    {
+        // A retained session owns a retryable exact teardown. PID absence is
+        // not enough to publish Stopped before registry release and durable
+        // settlement have succeeded.
+        return;
+    }
     let mut changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if let Some(session) = runtime.sessions.get_mut(session_id) {
-            if session.status.is_live() || session.reap_incomplete {
+            if session.status != SessionStatus::Stopped || session.reap_incomplete {
                 let dirty_before = session.dirty_generation;
                 session.status = SessionStatus::Stopped;
                 session.pid = None;
                 session.resources = ResourceSnapshot::default();
                 session.reap_incomplete = false;
+                session.clear_user_exit_requests();
                 if session.exit.is_none() {
                     session.exit = Some(SessionExitState {
                         code: None,
@@ -4540,39 +4723,16 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 cwd,
                 dimensions,
             } => {
-                let _ = retry_exact_session_teardown(inner, &session_id);
-                if restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions).is_err() {
-                    let mut changed = false;
-                    if let Ok(mut runtime) = inner.runtime_state.write() {
-                        if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                            let dirty_before = session.dirty_generation;
-                            session.status = SessionStatus::Stopped;
-                            session.clear_user_exit_requests();
-                            session.mark_dirty();
-                            changed = session.dirty_generation != dirty_before;
-                        }
-                    }
-                    if changed {
-                        bump_runtime_revision(inner);
-                        emit_tracked_remote_runtime_snapshot(inner, &session_id);
-                    }
+                if retry_exact_session_teardown(inner, &session_id).is_ok()
+                    && restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions)
+                        .is_err()
+                {
+                    mark_session_reaped(inner, &session_id);
                 }
             }
             ExitReconciliation::MarkStopped { session_id } => {
-                let _ = retry_exact_session_teardown(inner, &session_id);
-                let mut changed = false;
-                if let Ok(mut runtime) = inner.runtime_state.write() {
-                    if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                        let dirty_before = session.dirty_generation;
-                        session.status = SessionStatus::Stopped;
-                        session.clear_user_exit_requests();
-                        session.mark_dirty();
-                        changed = session.dirty_generation != dirty_before;
-                    }
-                }
-                if changed {
-                    bump_runtime_revision(inner);
-                    emit_tracked_remote_runtime_snapshot(inner, &session_id);
+                if retry_exact_session_teardown(inner, &session_id).is_ok() {
+                    mark_session_reaped(inner, &session_id);
                 }
             }
             ExitReconciliation::MarkCrashed { session_id } => {
@@ -6190,45 +6350,31 @@ pub(crate) fn execute_process_op_inner(
         } => {
             let command_id = launch.command_id.clone();
             let result = (|| {
+                let retained_output = if clear_logs {
+                    None
+                } else {
+                    manager
+                        .get_session(&command_id)
+                        .ok()
+                        .map(|session| restart_history_text(&session.snapshot()))
+                };
                 if !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
                     return Err(format!(
                         "Managed process `{command_id}` did not stop cleanly."
                     ));
                 }
                 manager.set_active_session(command_id.clone());
-                if let Ok(session) = manager.get_session(&command_id) {
-                    if clear_logs {
-                        session.clear_virtual_output();
-                    }
-                    session.write_virtual_text(&format!(
-                        "{}\x1b[33m{banner}\x1b[0m\r\n",
-                        if clear_logs { "" } else { "\r\n" }
-                    ));
-                    let authority =
-                        issue_host_terminal_authority(inner, &command_id, launch.port.into_iter())?;
-                    session.restart_command(
-                        launch.cwd.clone(),
-                        dimensions,
-                        launch.program.clone(),
-                        launch.args.clone(),
-                        launch.env.clone(),
-                        launch.log_file_path.clone(),
-                        true,
-                        authority,
-                    )?;
-                    manager.update_session_state(&command_id, |state| {
-                        state.configure_server(launch.clone());
-                    });
-                    return Ok(());
-                }
+                // A restart always creates a fresh terminal process owner.
+                // The old session has already reached ACTIVE_PROCESS_ZERO,
+                // joined its actors, released its exact registry fence, and
+                // dropped before this new authority is minted.
                 spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                let _ = manager.write_virtual_text(
-                    &command_id,
-                    &format!(
-                        "{}\x1b[33m{banner}\x1b[0m\r\n",
-                        if clear_logs { "" } else { "\r\n" }
-                    ),
-                );
+                if let Some(retained_output) = retained_output.filter(|text| !text.is_empty()) {
+                    manager.write_virtual_text(&command_id, &retained_output)?;
+                    manager.write_virtual_text(&command_id, "\r\n")?;
+                }
+                let _ = manager
+                    .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
                 manager.update_session_state(&command_id, |state| {
                     state.configure_server(launch.clone());
                 });
@@ -6270,12 +6416,10 @@ pub(crate) fn execute_process_op_inner(
                         "Managed process `{command_id}` did not stop cleanly."
                     ));
                 }
-                let listener = crate::services::ports_service::check_port_in_use(port)?;
-                if listener.in_use {
-                    return Err(format!(
-                        "Port {port} is still owned by an external or unreconciled listener; DevManager will not terminate it by PID."
-                    ));
-                }
+                let reconciliation_deadline = Instant::now()
+                    .checked_add(Duration::from_secs(1))
+                    .ok_or_else(|| "port reconciliation deadline overflow".to_string())?;
+                reconcile_port_listener_until(port, reconciliation_deadline)?;
                 spawn_server_session_with_inner(inner, &launch, dimensions)?;
                 let _ = manager
                     .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
@@ -6331,11 +6475,12 @@ pub(crate) fn execute_process_op_inner(
             response,
             ..
         } => {
-            if let Some(close_id) = close_session_id {
-                let _ = manager.close_session(&close_id);
-                manager.forget_session(&close_id);
-            }
-            let result = spawn_ssh_session_with_inner(inner, &launch, &session_id, dimensions);
+            let result = (|| {
+                if let Some(close_id) = close_session_id {
+                    manager.close_session(&close_id)?;
+                }
+                spawn_ssh_session_with_inner(inner, &launch, &session_id, dimensions)
+            })();
             if let Some(error) = key_warning {
                 let _ = manager.write_virtual_text(
                     &session_id,
@@ -6360,9 +6505,7 @@ pub(crate) fn execute_process_op_inner(
             ..
         } => {
             let result = if let Some(session_id) = session_id {
-                let _ = manager.close_session(&session_id);
-                manager.forget_session(&session_id);
-                Ok(())
+                manager.close_session(&session_id)
             } else {
                 Ok(())
             };
@@ -6407,17 +6550,18 @@ pub(crate) fn execute_process_op_inner(
             response,
             ..
         } => {
-            if let Some(close_id) = close_session_id {
-                let _ = manager.close_session(&close_id);
-                manager.forget_session(&close_id);
-            }
-            let result = spawn_ai_session_with_attachment_binding(
-                inner,
-                &launch,
-                &session_id,
-                dimensions,
-                attachment_binding,
-            );
+            let result = (|| {
+                if let Some(close_id) = close_session_id {
+                    manager.close_session(&close_id)?;
+                }
+                spawn_ai_session_with_attachment_binding(
+                    inner,
+                    &launch,
+                    &session_id,
+                    dimensions,
+                    attachment_binding,
+                )
+            })();
             (
                 ProcessOpKind::RestartAi,
                 result,
@@ -6433,11 +6577,10 @@ pub(crate) fn execute_process_op_inner(
             response,
             ..
         } => {
-            let _ = manager.close_session(&session_id);
-            manager.forget_session(&session_id);
+            let result = manager.close_session(&session_id);
             (
                 ProcessOpKind::CloseAi,
-                Ok(()),
+                result,
                 ProcessOpContext {
                     session_id: Some(session_id),
                     ..Default::default()
@@ -6497,57 +6640,29 @@ pub(crate) fn execute_process_op_inner(
             pid,
             response,
             ..
-        } => {
-            let outcome = kill_session_process_inner(inner, &session_id, pid, false);
-            let (result, message) = match outcome {
-                Ok(KillProcessOutcome::Killed) => (Ok(()), Some(format!("Killed process {pid}."))),
-                #[cfg(not(windows))]
-                Ok(KillProcessOutcome::AlreadyGone) => {
-                    (Ok(()), Some(format!("Process {pid} was already gone.")))
-                }
-                Err(error) => (Err(error), None),
-            };
-            (
-                ProcessOpKind::KillProcess,
-                result,
-                ProcessOpContext {
-                    session_id: Some(session_id),
-                    message,
-                    ..Default::default()
-                },
-                response,
-            )
-        }
+        } => (
+            ProcessOpKind::KillProcess,
+            Err(pid_only_teardown_unavailable(&session_id, pid)),
+            ProcessOpContext {
+                session_id: Some(session_id),
+                ..Default::default()
+            },
+            response,
+        ),
         ProcessOp::KillProcessTree {
             session_id,
             pid,
             response,
             ..
-        } => {
-            let outcome = kill_session_process_inner(inner, &session_id, pid, true);
-            let (result, message) = match outcome {
-                Ok(KillProcessOutcome::Killed) => (
-                    Ok(()),
-                    Some(format!("Killed process tree rooted at {pid}.")),
-                ),
-                #[cfg(not(windows))]
-                Ok(KillProcessOutcome::AlreadyGone) => (
-                    Ok(()),
-                    Some(format!("Process tree rooted at {pid} was already gone.")),
-                ),
-                Err(error) => (Err(error), None),
-            };
-            (
-                ProcessOpKind::KillProcessTree,
-                result,
-                ProcessOpContext {
-                    session_id: Some(session_id),
-                    message,
-                    ..Default::default()
-                },
-                response,
-            )
-        }
+        } => (
+            ProcessOpKind::KillProcessTree,
+            Err(pid_only_teardown_unavailable(&session_id, pid)),
+            ProcessOpContext {
+                session_id: Some(session_id),
+                ..Default::default()
+            },
+            response,
+        ),
     };
 
     ProcessOpCompletion {
@@ -6560,176 +6675,47 @@ pub(crate) fn execute_process_op_inner(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KillProcessOutcome {
-    Killed,
-    #[cfg(not(windows))]
-    AlreadyGone,
-}
-
-#[cfg(not(windows))]
-fn verified_session_process_identity(
-    inner: &Arc<ProcessManagerInner>,
-    session_id: &str,
-    pid: u32,
-) -> Option<platform_service::ProcessIdentity> {
-    for entry in pid_file::active_tracked_processes_for_session(session_id) {
-        if entry.pid == pid
-            && platform_service::process_matches_identity(
-                entry.pid,
-                entry.started_at_unix_secs,
-                entry.process_name.as_deref(),
-            )
-        {
-            return Some(platform_service::ProcessIdentity {
-                pid: entry.pid,
-                started_at_unix_secs: entry.started_at_unix_secs,
-                process_name: entry.process_name.clone(),
-            });
-        }
-        for descendant in &entry.descendant_processes {
-            if descendant.pid == pid
-                && platform_service::process_matches_identity(
-                    descendant.pid,
-                    descendant.started_at_unix_secs,
-                    descendant.process_name.as_deref(),
-                )
-            {
-                return Some(platform_service::ProcessIdentity {
-                    pid: descendant.pid,
-                    started_at_unix_secs: descendant.started_at_unix_secs,
-                    process_name: descendant.process_name.clone(),
-                });
-            }
-        }
-        if platform_service::process_matches_identity(
-            entry.pid,
-            entry.started_at_unix_secs,
-            entry.process_name.as_deref(),
-        ) {
-            for descendant in platform_service::collect_descendant_process_identities(entry.pid) {
-                if descendant.pid == pid {
-                    return Some(descendant);
-                }
-            }
-        }
-    }
-
-    if live_runtime_root_pid(inner, session_id) == Some(pid) {
-        return platform_service::capture_process_identity(pid);
-    }
-    if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
-        for descendant in platform_service::collect_descendant_process_identities(root_pid) {
-            if descendant.pid == pid {
-                return Some(descendant);
-            }
-        }
-    }
-
-    // Job membership survives broken parent links. Capture identity, then re-check
-    // membership so a PID that left the job between the two OS queries is rejected.
-    if session_managed_process_ids(inner, session_id).contains(&pid) {
-        let identity = platform_service::capture_process_identity(pid)?;
-        if session_managed_process_ids(inner, session_id).contains(&pid) {
-            return Some(identity);
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn kill_session_process_inner(
-    inner: &Arc<ProcessManagerInner>,
-    session_id: &str,
-    pid: u32,
-    _kill_tree: bool,
-) -> Result<KillProcessOutcome, String> {
-    let session = inner
-        .sessions
-        .lock()
-        .map_err(|_| "Session store poisoned".to_string())?
-        .get(session_id)
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "Process {pid} is not part of session `{session_id}`; exact managed authority is unavailable."
-            )
-        })?;
-    let (fence, active_process_ids) = session
-        .managed_process_snapshot()
-        .ok_or_else(|| {
-            format!(
-                "Process {pid} is not part of session `{session_id}`; exact managed authority is unavailable."
-            )
-        })?;
-    if !active_process_ids.contains(&pid) {
-        return Err(format!(
-            "Process {pid} is not part of session `{session_id}`'s exact managed Job membership."
-        ));
-    }
-
-    // A PID row is diagnostic selection, never termination authority. Close
-    // only the generation fence observed with that same authoritative Job
-    // membership snapshot; a concurrent restart cannot redirect this action
-    // to its replacement.
-    session.close_managed_process_exact(&fence, false)?;
-    let _ = pid_file::prune_inactive_entries();
-    let remaining = pid_file::active_tracked_pids_for_session(session_id);
-    if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
-        mark_session_reaped(inner, session_id);
+fn pid_only_teardown_unavailable(session_id: &str, pid: u32) -> String {
+    let session_id = if session_id.len() <= MAX_PROCESS_OP_HOST_STRING_BYTES {
+        session_id
     } else {
-        bump_runtime_revision(inner);
-        emit_tracked_remote_runtime_snapshot(inner, session_id);
-    }
-    Ok(KillProcessOutcome::Killed)
-}
-
-#[cfg(not(windows))]
-fn kill_session_process_inner(
-    inner: &Arc<ProcessManagerInner>,
-    session_id: &str,
-    pid: u32,
-    _kill_tree: bool,
-) -> Result<KillProcessOutcome, String> {
-    let Some(expected) = verified_session_process_identity(inner, session_id, pid) else {
-        return Err(format!(
-            "Process {pid} is not part of session `{session_id}`."
-        ));
+        "<oversized-session-identity>"
     };
-    if !platform_service::process_matches_identity(
-        pid,
-        expected.started_at_unix_secs,
-        expected.process_name.as_deref(),
-    ) {
+    format!(
+        "Process {pid} in session `{session_id}` cannot be closed from a PID-only selection; an exact managed-process fence is required."
+    )
+}
+
+fn validate_process_op_host_string(value: &str, field: &str) -> Result<(), String> {
+    if value.len() > MAX_PROCESS_OP_HOST_STRING_BYTES {
         return Err(format!(
-            "Process {pid} no longer matches the tracked identity for session `{session_id}`."
+            "{field} exceeds {MAX_PROCESS_OP_HOST_STRING_BYTES} bytes"
         ));
     }
-    if !platform_service::is_pid_running(pid) {
-        let _ = pid_file::prune_inactive_entries();
-        bump_runtime_revision(inner);
-        return Ok(KillProcessOutcome::AlreadyGone);
+    Ok(())
+}
+
+fn reconcile_port_listener_until(port: u16, absolute_deadline: Instant) -> Result<(), String> {
+    check_process_operation_deadline(absolute_deadline, "port listener reconciliation")?;
+    let listeners = platform_service::snapshot_listener_pids_until(&[port], absolute_deadline)?;
+    check_process_operation_deadline(absolute_deadline, "port listener reconciliation")?;
+    if let Some(pid) = listeners.get(&port) {
+        return Err(format!(
+            "Port {port} is still owned by external or unreconciled process {pid}; DevManager will not terminate it by PID."
+        ));
     }
-    let session = inner
-        .sessions
-        .lock()
-        .map_err(|_| "Session store poisoned".to_string())?
-        .get(session_id)
-        .cloned()
-        .ok_or_else(|| format!("Unknown session `{session_id}`"))?;
-    // A managed terminal is one Job-owned resource.  A PID row is diagnostic
-    // selection, never termination authority; both UI actions therefore
-    // close the exact session tree through its coordinator.
-    session.close(false)?;
-    let _ = pid_file::prune_inactive_entries();
-    let remaining = pid_file::active_tracked_pids_for_session(session_id);
-    if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
-        mark_session_reaped(inner, session_id);
+    Ok(())
+}
+
+fn check_process_operation_deadline(
+    absolute_deadline: Instant,
+    context: &str,
+) -> Result<(), String> {
+    if Instant::now() >= absolute_deadline {
+        Err(format!("{context} exceeded its absolute deadline"))
     } else {
-        bump_runtime_revision(inner);
-        emit_tracked_remote_runtime_snapshot(inner, session_id);
+        Ok(())
     }
-    Ok(KillProcessOutcome::Killed)
 }
 
 fn spawn_ssh_session_with_inner(
@@ -6917,17 +6903,13 @@ where
     if let Err(write_error) = write_startup_command(&session, &startup_command) {
         let error = format!("inject AI startup command: {write_error}");
         manager.cleanup_ai_adapters_for_session(session_id);
-        if let Ok(mut sessions) = inner.sessions.lock() {
-            let is_failed_session = sessions
-                .get(session_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &session));
-            if is_failed_session {
-                sessions.remove(session_id);
-            }
-        }
-        let _ = session.close(false);
         drop(session);
-        let _ = ensure_prior_session_teardown_settled(inner, session_id, Duration::from_secs(2));
+        if let Err(close_error) = manager.request_session_close(session_id, false) {
+            return Err(format!(
+                "{error}; exact managed teardown remains retryable: {close_error}"
+            ));
+        }
+        unbind_attachment_if_matches(inner, attachment_binding.as_ref());
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Failed;
             state.exit = Some(SessionExitState {
@@ -6968,17 +6950,27 @@ fn shutdown_managed_processes_inner(
             continue;
         };
         requested_sessions = requested_sessions.saturating_add(1);
-        if session.close(false).is_err() {
-            // Keep the exact owner alive through this error observation. Its
-            // Drop guard below still fails closed rather than detaching Job
-            // authority.
+        if let Err(error) = session.close(false) {
+            // Retain the exact owner for a later retry. Publishing Stopped or
+            // dropping this owner after a failed release would either lie
+            // about settlement or trip the fail-closed Drop invariant.
+            match inner.sessions.lock() {
+                Ok(mut sessions) => match sessions.entry(session_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(session);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => std::process::abort(),
+                },
+                Err(_) => std::process::abort(),
+            }
+            manager.note_exact_teardown_failure(&session_id, &error, false);
             manager.note_reap_incomplete(&session_id);
+            break;
         }
-        manager.reconcile_closed_session(&session_id);
         drop(session);
-        // TerminalSession::Drop performs the same idempotent close guard. It
-        // may update runtime state to Stopping while its last owner leaves;
-        // reconcile that exact identity after the owner is gone.
+        // Reconcile only after the manager's final owner has dropped. The
+        // close itself already proved zero, joined actors, released the exact
+        // registry entry, and durably settled.
         manager.reconcile_closed_session(&session_id);
     }
 
@@ -7660,6 +7652,36 @@ mod tests {
             );
             stop_background_tasks_for_test(&manager);
         }
+    }
+
+    #[test]
+    fn oversized_restart_banner_is_rejected_before_state_or_queue_mutation() {
+        let cwd = temp_test_dir("oversized-restart-banner");
+        let manager = ProcessManager::new();
+        let mut state = app_state_with_server(&cwd, true);
+        let tabs_before = state.open_tabs.clone();
+        let runtime_before = manager.runtime_state();
+        let revision_before = manager.runtime_revision();
+        let banner = "x".repeat(MAX_PROCESS_OP_HOST_STRING_BYTES + 1);
+
+        let error = manager
+            .restart_server_with_banner(
+                &mut state,
+                "server-cmd",
+                SessionDimensions::default(),
+                &banner,
+            )
+            .expect_err("oversized host strings must fail before operation admission");
+        assert!(error.contains("restart banner"), "{error}");
+        assert_eq!(state.open_tabs, tabs_before);
+        let runtime_after = manager.runtime_state();
+        assert_eq!(runtime_after.sessions.len(), runtime_before.sessions.len());
+        assert_eq!(
+            runtime_after.active_session_id,
+            runtime_before.active_session_id
+        );
+        assert_eq!(manager.runtime_revision(), revision_before);
+        assert!(manager.drain_process_op_completions().is_empty());
     }
 
     #[test]
@@ -10190,7 +10212,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_server_can_start_again_on_same_terminal_session() {
+    fn stopped_server_can_start_again_with_fresh_terminal_authority() {
         let cwd = temp_test_dir("restart-after-stop");
         let pid_file_path = cwd.join("running-pids.json");
         let _pid_file_guard = pid_file::use_test_pid_file(pid_file_path);
@@ -10203,6 +10225,15 @@ mod tests {
             .start_server(&mut app_state, command_id, dimensions)
             .unwrap();
         wait_for_running_session(&manager, command_id);
+        #[cfg(windows)]
+        let first_generation = manager
+            .get_session(command_id)
+            .expect("first terminal owner")
+            .managed_process_snapshot()
+            .expect("first exact managed snapshot")
+            .0
+            .resource()
+            .runtime_generation;
 
         assert!(manager.stop_server_and_wait(command_id, Duration::from_secs(5)));
         wait_for_stopped_session(&manager, command_id);
@@ -10211,6 +10242,19 @@ mod tests {
             .start_server(&mut app_state, command_id, dimensions)
             .unwrap();
         wait_for_running_session(&manager, command_id);
+        #[cfg(windows)]
+        assert!(
+            manager
+                .get_session(command_id)
+                .expect("replacement terminal owner")
+                .managed_process_snapshot()
+                .expect("replacement exact managed snapshot")
+                .0
+                .resource()
+                .runtime_generation
+                > first_generation,
+            "a stopped terminal must never reuse its released process authority"
+        );
     }
 
     #[test]
@@ -10342,7 +10386,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_marks_stopping_session_stopped_after_processes_clear() {
+    fn replacement_safety_does_not_publish_stopped_without_exact_release() {
         let cwd = temp_test_dir("settled-stopped-session");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -10358,12 +10402,13 @@ mod tests {
             session.mark_dirty();
         });
 
-        manager.settle_session_teardown_for_test("alpha", Duration::from_millis(1));
+        assert!(manager.ensure_session_replacement_safe_for_test("alpha", Duration::from_millis(1)));
 
         let runtime = manager.runtime_state();
         assert_eq!(
             runtime.sessions.get("alpha").map(|session| session.status),
-            Some(SessionStatus::Stopped)
+            Some(SessionStatus::Stopping),
+            "replacement safety is not proof of exact Job release and must not publish Stopped"
         );
     }
 
@@ -10772,7 +10817,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_process_rejects_pid_outside_session_tree() {
+    fn pid_only_process_action_rejects_foreign_pid_without_submission() {
         let cwd = temp_test_dir("kill-reject-foreign");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -10797,13 +10842,25 @@ mod tests {
         assert!(completion
             .result
             .unwrap_err()
-            .contains("not part of session"));
+            .contains("exact managed-process fence"));
+
+        let queued = manager.enqueue_kill_process(session_id, foreign_pid, None);
+        assert!(queued
+            .expect_err("PID-only public action must be unavailable")
+            .contains("exact managed-process fence"));
 
         let _ = manager.close_session(session_id);
     }
 
     #[test]
-    fn kill_process_rejects_stale_resource_pid_without_verified_identity() {
+    fn kill_port_reconciliation_rejects_expired_deadline_before_platform_lookup() {
+        let error = reconcile_port_listener_until(43123, Instant::now())
+            .expect_err("an expired operation must not launch a listener helper");
+        assert!(error.contains("absolute deadline"), "{error}");
+    }
+
+    #[test]
+    fn pid_only_process_action_rejects_stale_resource_row() {
         let cwd = temp_test_dir("kill-reject-stale");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -10849,11 +10906,89 @@ mod tests {
         assert!(completion
             .result
             .unwrap_err()
-            .contains("not part of session"));
+            .contains("exact managed-process fence"));
     }
 
     #[test]
-    fn kill_process_accepts_verified_live_session_root() {
+    fn missing_exact_owner_is_not_reported_as_a_successful_retry() {
+        let manager = ProcessManager::new();
+        let session_id = "missing-exact-owner";
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        runtime.status = SessionStatus::Failed;
+        runtime.reap_incomplete = true;
+        runtime.pid = Some(std::process::id());
+        manager.register_runtime_session(runtime);
+
+        let error = retry_exact_session_teardown(&manager.inner, session_id)
+            .expect_err("PID absence or a missing session owner cannot forge exact settlement");
+
+        assert!(error.contains("authority"), "{error}");
+        let runtime = manager.runtime_state();
+        let retained = runtime
+            .sessions
+            .get(session_id)
+            .expect("runtime row retained");
+        assert_eq!(retained.status, SessionStatus::Failed);
+        assert!(retained.reap_incomplete);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_op_close_retains_exact_owner_when_teardown_persistence_fails() {
+        let cwd = temp_test_dir("close-retains-exact-owner");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "close-retains-exact-owner";
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
+            .expect("spawn exact managed terminal");
+        wait_for_live_session(&manager, session_id);
+
+        let completion_store = manager
+            .inner
+            .terminal_authority_issuer
+            .state
+            .lock()
+            .expect("terminal authority state")
+            .completion_store
+            .clone()
+            .expect("terminal completion store");
+        completion_store.fail_persist_for_test("injected transient persistence failure");
+
+        let failed = execute_process_op_inner(
+            &manager.inner,
+            ProcessOp::CloseAi {
+                op_id: next_op_id(),
+                session_id: session_id.to_string(),
+                response: None,
+            },
+        );
+        assert!(failed.result.is_err());
+        assert!(
+            manager.session_attached(session_id),
+            "a failed exact close must retain the sole TerminalSession/Job owner"
+        );
+
+        completion_store.clear_persist_failure_for_test();
+        let retry = execute_process_op_inner(
+            &manager.inner,
+            ProcessOp::CloseAi {
+                op_id: next_op_id(),
+                session_id: session_id.to_string(),
+                response: None,
+            },
+        );
+        retry.result.expect("exact close retry must settle");
+        assert!(!manager.session_attached(session_id));
+    }
+
+    #[test]
+    fn pid_only_process_action_is_unavailable_even_for_a_live_managed_root() {
         let cwd = temp_test_dir("kill-accept-root");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -10879,15 +11014,20 @@ mod tests {
                 response: None,
             },
         );
-        assert!(completion.result.is_ok(), "{:?}", completion.result);
+        let error = completion
+            .result
+            .expect_err("a PID-only action must not reconstruct teardown authority");
+        assert!(error.contains("exact managed-process fence"), "{error}");
         assert!(
-            completion
-                .context
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains(&format!("Killed process {pid}"))),
-            "unexpected message: {:?}",
-            completion.context.message
+            manager.session_attached(session_id),
+            "rejecting a raw PID action must leave the managed session untouched"
+        );
+        manager
+            .close_session(session_id)
+            .expect("close exact session");
+        assert!(
+            !manager.session_attached(session_id),
+            "reconciliation must run only after the final manager-owned session authority is removed"
         );
     }
 
@@ -11157,7 +11297,18 @@ mod tests {
     }
 
     fn wait_for_running_session(manager: &ProcessManager, session_id: &str) {
+        let mut operation_completed = false;
         for _ in 0..30 {
+            for completion in manager.drain_process_op_completions() {
+                if completion.target_id == session_id
+                    && completion.kind == ProcessOpKind::StartServer
+                {
+                    completion
+                        .result
+                        .unwrap_or_else(|error| panic!("session operation failed: {error}"));
+                    operation_completed = true;
+                }
+            }
             if manager
                 .runtime_state()
                 .sessions
@@ -11165,6 +11316,7 @@ mod tests {
                 .is_some_and(|session| {
                     session.status == SessionStatus::Running && session.pid.is_some()
                 })
+                && operation_completed
             {
                 return;
             }

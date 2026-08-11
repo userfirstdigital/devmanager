@@ -1,10 +1,12 @@
 //! Fail-closed managed PTY process creation.
 
-use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 #[cfg(test)]
 use std::io;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,11 +22,19 @@ use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, Process
 use crate::process::job::ManagedProcessJob;
 use crate::process::registry::{
     ProcessDisplayLabel, ProcessRegistry, ProcessRegistryError, RegisteredProcess,
-    UnregisterOutcome,
+    UnregisterOutcome, MAX_PROCESS_DISPLAY_LABEL_BYTES,
 };
 
 #[cfg(test)]
 static MANAGED_LAUNCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+const MAX_LAUNCH_ARGUMENTS: usize = 256;
+const MAX_LAUNCH_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_LAUNCH_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_ENVIRONMENT_KEY_BYTES: usize = 256;
+const MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_PATH_BYTES: usize = 32 * 1024;
+const MAX_LAUNCH_TOTAL_BYTES: usize = 256 * 1024;
 
 #[cfg(test)]
 pub(crate) fn managed_launch_count_for_test() -> usize {
@@ -124,6 +134,7 @@ impl LaunchIntent {
                 "runtime generation must be greater than zero",
             ));
         }
+        validate_launch_input_bounds(&self)?;
         let executable = std::fs::canonicalize(&self.executable).map_err(|error| {
             ManagedLaunchError::new(
                 ManagedLaunchStage::Validation,
@@ -139,6 +150,11 @@ impl LaunchIntent {
                 format!("executable `{}` is not a file", executable.display()),
             ));
         }
+        validate_host_os_bound(
+            executable.as_os_str(),
+            MAX_LAUNCH_PATH_BYTES,
+            "canonical executable path",
+        )?;
         let cwd = std::fs::canonicalize(&self.cwd).map_err(|error| {
             ManagedLaunchError::new(
                 ManagedLaunchStage::Validation,
@@ -154,6 +170,11 @@ impl LaunchIntent {
                 format!("working directory `{}` is not a directory", cwd.display()),
             ));
         }
+        validate_host_os_bound(
+            cwd.as_os_str(),
+            MAX_LAUNCH_PATH_BYTES,
+            "canonical working directory path",
+        )?;
         let display_label = ProcessDisplayLabel::new(self.display_label).map_err(|error| {
             ManagedLaunchError::new(ManagedLaunchStage::Validation, error.to_string())
         })?;
@@ -169,6 +190,203 @@ impl LaunchIntent {
             display_label,
         })
     }
+}
+
+fn validate_launch_input_bounds(intent: &LaunchIntent) -> Result<(), ManagedLaunchError> {
+    if intent.display_label.trim().is_empty() {
+        return Err(validation_error("display label must be non-empty"));
+    }
+    if intent.display_label.len() > MAX_PROCESS_DISPLAY_LABEL_BYTES {
+        return Err(validation_error(format!(
+            "display label exceeds {MAX_PROCESS_DISPLAY_LABEL_BYTES} bytes"
+        )));
+    }
+    if intent.args.len() > MAX_LAUNCH_ARGUMENTS {
+        return Err(validation_error(format!(
+            "argument count exceeds {MAX_LAUNCH_ARGUMENTS}"
+        )));
+    }
+    if intent.environment.len() > MAX_LAUNCH_ENVIRONMENT_ENTRIES {
+        return Err(validation_error(format!(
+            "environment entry count exceeds {MAX_LAUNCH_ENVIRONMENT_ENTRIES}"
+        )));
+    }
+
+    let mut total = 0usize;
+    accumulate_host_os_bound(
+        &mut total,
+        intent.executable.as_os_str(),
+        MAX_LAUNCH_PATH_BYTES,
+        "executable path",
+    )?;
+    accumulate_host_os_bound(
+        &mut total,
+        intent.cwd.as_os_str(),
+        MAX_LAUNCH_PATH_BYTES,
+        "working directory path",
+    )?;
+    accumulate_bytes(&mut total, intent.display_label.len(), "display label")?;
+    for (index, argument) in intent.args.iter().enumerate() {
+        let bytes = host_os_bytes(argument)?;
+        if bytes > MAX_LAUNCH_ARGUMENT_BYTES {
+            return Err(validation_error(format!(
+                "argument {index} exceeds {MAX_LAUNCH_ARGUMENT_BYTES} host bytes"
+            )));
+        }
+        accumulate_bytes(&mut total, bytes, "argument")?;
+    }
+    for (key, value) in &intent.environment {
+        accumulate_host_os_bound(
+            &mut total,
+            key,
+            MAX_LAUNCH_ENVIRONMENT_KEY_BYTES,
+            "environment key",
+        )?;
+        accumulate_host_os_bound(
+            &mut total,
+            value,
+            MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate borrowed terminal inputs before duplicating them into native
+/// launch collections or resolving caller-controlled paths. The reserved
+/// environment count covers the fixed defaults added by the terminal bridge.
+pub(crate) fn validate_terminal_launch_source_bounds(
+    executable: &OsStr,
+    cwd: &OsStr,
+    display_label: &str,
+    args: &[String],
+    environment: &HashMap<String, String>,
+    reserved_environment_entries: usize,
+) -> Result<(), ManagedLaunchError> {
+    if display_label.trim().is_empty() {
+        return Err(validation_error("display label must be non-empty"));
+    }
+    if display_label.len() > MAX_PROCESS_DISPLAY_LABEL_BYTES {
+        return Err(validation_error(format!(
+            "display label exceeds {MAX_PROCESS_DISPLAY_LABEL_BYTES} bytes"
+        )));
+    }
+    if args.len() > MAX_LAUNCH_ARGUMENTS {
+        return Err(validation_error(format!(
+            "argument count exceeds {MAX_LAUNCH_ARGUMENTS}"
+        )));
+    }
+    let environment_count = environment
+        .len()
+        .checked_add(reserved_environment_entries)
+        .ok_or_else(|| validation_error("environment entry count overflow"))?;
+    if environment_count > MAX_LAUNCH_ENVIRONMENT_ENTRIES {
+        return Err(validation_error(format!(
+            "environment entry count exceeds {MAX_LAUNCH_ENVIRONMENT_ENTRIES}"
+        )));
+    }
+
+    let mut total = 0usize;
+    accumulate_host_os_bound(
+        &mut total,
+        executable,
+        MAX_LAUNCH_PATH_BYTES,
+        "executable path",
+    )?;
+    accumulate_host_os_bound(
+        &mut total,
+        cwd,
+        MAX_LAUNCH_PATH_BYTES,
+        "working directory path",
+    )?;
+    accumulate_bytes(&mut total, display_label.len(), "display label")?;
+    for (index, argument) in args.iter().enumerate() {
+        let bytes = host_os_bytes(OsStr::new(argument))?;
+        if bytes > MAX_LAUNCH_ARGUMENT_BYTES {
+            return Err(validation_error(format!(
+                "argument {index} exceeds {MAX_LAUNCH_ARGUMENT_BYTES} host bytes"
+            )));
+        }
+        accumulate_bytes(&mut total, bytes, "argument")?;
+    }
+    for (key, value) in environment {
+        accumulate_host_os_bound(
+            &mut total,
+            OsStr::new(key),
+            MAX_LAUNCH_ENVIRONMENT_KEY_BYTES,
+            "environment key",
+        )?;
+        accumulate_host_os_bound(
+            &mut total,
+            OsStr::new(value),
+            MAX_LAUNCH_ENVIRONMENT_VALUE_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_host_os_bound(
+    value: &OsStr,
+    maximum: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    let bytes = host_os_bytes(value)?;
+    if bytes > maximum {
+        return Err(validation_error(format!(
+            "{field} exceeds {maximum} host bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn accumulate_host_os_bound(
+    total: &mut usize,
+    value: &OsStr,
+    maximum: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    let bytes = host_os_bytes(value)?;
+    if bytes > maximum {
+        return Err(validation_error(format!(
+            "{field} exceeds {maximum} host bytes"
+        )));
+    }
+    accumulate_bytes(total, bytes, field)
+}
+
+fn accumulate_bytes(
+    total: &mut usize,
+    bytes: usize,
+    field: &str,
+) -> Result<(), ManagedLaunchError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| validation_error(format!("{field} overflows the launch byte budget")))?;
+    if *total > MAX_LAUNCH_TOTAL_BYTES {
+        return Err(validation_error(format!(
+            "launch total byte count exceeds {MAX_LAUNCH_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn host_os_bytes(value: &OsStr) -> Result<usize, ManagedLaunchError> {
+    value
+        .encode_wide()
+        .count()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| validation_error("host string byte count overflow"))
+}
+
+#[cfg(not(windows))]
+fn host_os_bytes(value: &OsStr) -> Result<usize, ManagedLaunchError> {
+    Ok(value.as_encoded_bytes().len())
+}
+
+fn validation_error(detail: impl Into<String>) -> ManagedLaunchError {
+    ManagedLaunchError::new(ManagedLaunchStage::Validation, detail)
 }
 
 #[cfg(all(test, not(windows)))]
@@ -207,6 +425,11 @@ impl PendingManagedLaunch {
     #[cfg(test)]
     pub(crate) fn active_process_ids(&self) -> Result<Vec<u32>, String> {
         self.job.active_process_ids()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn internal_job_name(&self) -> &str {
+        self.job.internal_name()
     }
 
     pub(crate) fn register_suspended(
@@ -339,6 +562,21 @@ impl ManagedPtyChild {
 }
 
 #[cfg(windows)]
+pub(crate) fn validate_process_image_length(
+    reported_length: u32,
+    buffer_capacity: usize,
+) -> Result<usize, String> {
+    let reported_length = usize::try_from(reported_length)
+        .map_err(|_| "process image length does not fit usize".to_string())?;
+    if reported_length > buffer_capacity {
+        return Err(format!(
+            "process image length {reported_length} exceeds buffer capacity {buffer_capacity}"
+        ));
+    }
+    Ok(reported_length)
+}
+
+#[cfg(windows)]
 pub(crate) fn prepare_suspended_pty(
     slave: &dyn SlavePty,
     intent: LaunchIntent,
@@ -353,14 +591,8 @@ pub(crate) fn prepare_suspended_pty(
     };
 
     let intent = intent.validate()?;
-    let job = ManagedProcessJob::create()
-        .map_err(|error| ManagedLaunchError::new(ManagedLaunchStage::JobCreation, error))?
-        .ok_or_else(|| {
-            ManagedLaunchError::new(
-                ManagedLaunchStage::Unsupported,
-                "Windows Job Objects are unavailable",
-            )
-        })?;
+    let job = ManagedProcessJob::create_for_resource(intent.owner, intent.fence)
+        .map_err(|error| ManagedLaunchError::new(ManagedLaunchStage::JobCreation, error))?;
 
     let mut command = CommandBuilder::new(&intent.executable);
     command.args(&intent.args);
@@ -449,7 +681,17 @@ pub(crate) fn prepare_suspended_pty(
             pending,
         ));
     }
-    let observed_executable = PathBuf::from(OsString::from_wide(&path_buffer[..path_len as usize]));
+    let path_len = match validate_process_image_length(path_len, path_buffer.len()) {
+        Ok(path_len) => path_len,
+        Err(error) => {
+            return Err(abort_pending(
+                ManagedLaunchStage::IdentityCapture,
+                error,
+                pending,
+            ));
+        }
+    };
+    let observed_executable = PathBuf::from(OsString::from_wide(&path_buffer[..path_len]));
     let process_id = match ManagedProcessId::new(pid, creation_time_100ns) {
         Ok(process_id) => process_id,
         Err(error) => {

@@ -186,10 +186,11 @@ pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, St
         )
     })?;
     let pid = child.id();
-    // On Windows, kill-on-close job ownership is the reliable backstop for a
-    // wrapper that exits before its descendants. Unix probes are placed in a
-    // dedicated process group above. Tree termination remains the portable
-    // first attempt on every completion path.
+    // On Windows, kill-on-close job ownership is the authoritative backstop
+    // for a wrapper that exits before its descendants. Unix probes are placed
+    // in a dedicated process group above. A failed Windows claim leaves the
+    // root suspended, so only its retained Child handle may be used to roll it
+    // back; a raw PID/tree fallback would recreate authority we do not own.
     let managed_job = match crate::services::platform_service::claim_suspended_process(pid) {
         Ok(managed_job) => managed_job,
         Err(error) => {
@@ -221,9 +222,11 @@ pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, St
     };
 
     terminate_probe_tree(&mut child, pid, managed_job);
-    let pipe_deadline = std::time::Instant::now() + CODEX_PROBE_PIPE_DRAIN_TIMEOUT;
-    let stdout = receive_probe_pipe(&mut stdout_reader, pipe_deadline);
-    let stderr = receive_probe_pipe(&mut stderr_reader, pipe_deadline);
+    let pipe_deadline = std::time::Instant::now()
+        .checked_add(CODEX_PROBE_PIPE_DRAIN_TIMEOUT)
+        .ok_or_else(|| "Codex capability probe pipe deadline overflow".to_string())?;
+    let stdout = receive_probe_pipe(&mut stdout_reader, pipe_deadline)?;
+    let stderr = receive_probe_pipe(&mut stderr_reader, pipe_deadline)?;
     let status = status?;
     let output = format!(
         "{}{}",
@@ -255,24 +258,97 @@ struct ProbePipeReader {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-fn receive_probe_pipe(reader: &mut ProbePipeReader, deadline: std::time::Instant) -> Vec<u8> {
-    match reader
+fn receive_probe_pipe(
+    reader: &mut ProbePipeReader,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    let received = reader
         .receiver
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-    {
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    match received {
         Ok(bytes) => {
-            if let Some(thread) = reader.thread.take() {
-                let _ = thread.join();
-            }
-            bytes
+            join_probe_pipe_thread(reader, deadline, "Codex probe pipe reader")?;
+            Ok(bytes)
         }
-        Err(_) => Vec::new(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            cancel_probe_pipe_read(reader);
+            // Cancellation is an ownership-settlement operation. Give the
+            // exact retained thread a small, bounded acknowledgement window;
+            // returning while it still owns the pipe would detach an actor.
+            let cancellation_deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(250))
+                .unwrap_or_else(|| std::process::abort());
+            join_probe_pipe_thread(
+                reader,
+                cancellation_deadline,
+                "timed-out Codex probe pipe reader",
+            )?;
+            Err("Codex capability probe pipe drain exceeded its deadline".to_string())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            join_probe_pipe_thread(reader, deadline, "failed Codex probe pipe reader")?;
+            Err("Codex capability probe pipe reader disconnected".to_string())
+        }
+    }
+}
+
+fn cancel_probe_pipe_read(reader: &ProbePipeReader) {
+    #[cfg(windows)]
+    if let Some(thread) = reader.thread.as_ref() {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CancelSynchronousIo(thread: *mut c_void) -> i32;
+        }
+
+        // SAFETY: the JoinHandle retains the exact reader-thread handle until
+        // `join_probe_pipe_thread` consumes it below.
+        unsafe {
+            let _ = CancelSynchronousIo(thread.as_raw_handle());
+        }
+    }
+}
+
+fn join_probe_pipe_thread(
+    reader: &mut ProbePipeReader,
+    deadline: std::time::Instant,
+    context: &str,
+) -> Result<(), String> {
+    let Some(thread) = reader.thread.take() else {
+        return Ok(());
+    };
+    while !thread.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    if !thread.is_finished() {
+        // There is no safe way to drop a JoinHandle without detaching its
+        // thread. A probe reader that ignores both tree closure and explicit
+        // cancellation violates the no-orphan host invariant, so fail closed.
+        std::process::abort();
+    }
+    thread.join().map_err(|_| format!("{context} panicked"))
+}
+
+impl Drop for ProbePipeReader {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        cancel_probe_pipe_read(self);
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(250))
+            .unwrap_or_else(|| std::process::abort());
+        if join_probe_pipe_thread(self, deadline, "Codex probe pipe reader drop").is_err() {
+            std::process::abort();
+        }
     }
 }
 
 fn terminate_probe_tree(
     child: &mut std::process::Child,
-    pid: u32,
+    _pid: u32,
     managed_job: Option<crate::services::platform_service::ManagedProcessJob>,
 ) {
     if let Some(managed_job) = managed_job {
@@ -280,24 +356,24 @@ fn terminate_probe_tree(
         // identity-bound job is safer than snapshotting and killing raw PIDs.
         drop(managed_job);
     } else {
-        // Unix process groups and the Windows pre-claim failure path do not
-        // have a retained job, so retain the bounded portable cleanup.
-        let (tree_kill_tx, tree_kill_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            #[cfg(windows)]
-            let result = crate::services::platform_service::kill_process_tree(pid);
-            #[cfg(not(windows))]
-            let result = crate::services::platform_service::terminate_owned_process_group(
-                pid,
+        // Unix probes explicitly created their own process group before any
+        // code ran, so that group is a sealed pre-authority rollback
+        // capability. On Windows this branch is reachable only when the
+        // suspended root could not be enrolled; the Child handle below is the
+        // sole rollback authority and no descendant could have run.
+        #[cfg(not(windows))]
+        {
+            let _ = crate::services::platform_service::terminate_owned_process_group(
+                _pid,
                 CODEX_PROCESS_GROUP_TERM_GRACE,
             );
-            let _ = tree_kill_tx.send(result);
-        });
-        let _ = tree_kill_rx.recv_timeout(CODEX_PROBE_TREE_KILL_TIMEOUT);
+        }
     }
 
     let _ = child.kill();
-    let reap_deadline = std::time::Instant::now() + CODEX_PROBE_TREE_KILL_TIMEOUT;
+    let reap_deadline = std::time::Instant::now()
+        .checked_add(CODEX_PROBE_TREE_KILL_TIMEOUT)
+        .unwrap_or_else(|| std::process::abort());
     while std::time::Instant::now() < reap_deadline {
         match child.try_wait() {
             Ok(Some(_)) | Err(_) => break,
@@ -394,6 +470,19 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
 mod tests {
     use super::*;
 
+    struct DelayedProbePipe {
+        completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Read for DelayedProbePipe {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            self.completed
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(0)
+        }
+    }
+
     fn read_probe_child_pid(path: &Path, timeout: std::time::Duration) -> Option<u32> {
         let started = std::time::Instant::now();
         while started.elapsed() < timeout {
@@ -405,6 +494,30 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         None
+    }
+
+    #[test]
+    fn timed_out_probe_pipe_reader_is_cancelled_and_joined_before_return() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reader = spawn_probe_pipe_reader(Some(DelayedProbePipe {
+            completed: std::sync::Arc::clone(&completed),
+        }));
+
+        let error = receive_probe_pipe(
+            &mut reader,
+            std::time::Instant::now() + std::time::Duration::from_millis(1),
+        )
+        .expect_err("a pipe that misses its drain deadline must fail closed");
+
+        assert!(error.contains("exceeded its deadline"));
+        assert!(
+            completed.load(std::sync::atomic::Ordering::Acquire),
+            "the blocking reader actor must finish before the timeout returns"
+        );
+        assert!(
+            reader.thread.is_none(),
+            "the reader JoinHandle must be consumed"
+        );
     }
 
     #[test]

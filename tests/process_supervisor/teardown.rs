@@ -397,6 +397,10 @@ impl FakeCompletionStore {
         self.inner.fail_persist_for_test(detail);
     }
 
+    fn clear_persist_failure(&self) {
+        self.inner.clear_persist_failure_for_test();
+    }
+
     fn store(&self) -> TeardownCompletionStore {
         self.inner.clone()
     }
@@ -458,14 +462,12 @@ impl BlockingPersistStore {
 
 #[derive(Debug, Clone)]
 struct FakeClock {
-    next: Arc<AtomicUsize>,
     deadlines: Arc<Mutex<Vec<TeardownDeadline>>>,
 }
 
 impl Default for FakeClock {
     fn default() -> Self {
         Self {
-            next: Arc::new(AtomicUsize::new(100)),
             deadlines: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -479,11 +481,9 @@ impl FakeClock {
 
 impl TeardownClock for FakeClock {
     fn deadline(&self, timeout: Duration) -> TeardownDeadline {
-        let deadline = self
-            .next
-            .fetch_add(timeout.as_millis() as usize, Ordering::SeqCst)
-            + timeout.as_millis() as usize;
-        let deadline = TeardownDeadline::new(deadline as u64);
+        let deadline = TeardownDeadline::new(
+            u64::try_from(timeout.as_nanos()).expect("test teardown duration fits nanoseconds"),
+        );
         self.deadlines
             .lock()
             .expect("clock deadlines")
@@ -509,6 +509,7 @@ enum WaitPlan {
 
 #[derive(Debug, Clone)]
 struct BranchScript {
+    cooperative_close: StageResult,
     cooperative: WaitPlan,
     interrupt: WaitPlan,
     termination: WaitPlan,
@@ -522,6 +523,7 @@ struct BranchScript {
 impl BranchScript {
     fn cooperative_zero(_ticket: &TeardownTicket) -> Self {
         Self {
+            cooperative_close: StageResult::Completed,
             cooperative: WaitPlan::Zero,
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::TimedOut,
@@ -535,6 +537,7 @@ impl BranchScript {
 
     fn escalation_to_zero(_ticket: &TeardownTicket) -> Self {
         Self {
+            cooperative_close: StageResult::Completed,
             cooperative: WaitPlan::TimedOut,
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::Zero,
@@ -548,6 +551,7 @@ impl BranchScript {
 
     fn timeout_with_residue() -> Self {
         Self {
+            cooperative_close: StageResult::Completed,
             cooperative: WaitPlan::TimedOut,
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::TimedOut,
@@ -569,6 +573,7 @@ impl BranchScript {
 
     fn timeout_without_residue() -> Self {
         Self {
+            cooperative_close: StageResult::Completed,
             cooperative: WaitPlan::TimedOut,
             interrupt: WaitPlan::TimedOut,
             termination: WaitPlan::TimedOut,
@@ -671,7 +676,11 @@ impl FakeEffects {
 }
 
 impl TeardownEffects for FakeEffects {
-    fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn drain<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
@@ -705,18 +714,23 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn cooperative_close<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn cooperative_close<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
             effects.record(&ticket, "cooperative_close");
-            StageResult::Completed
+            effects.script(ticket.resource_id()).cooperative_close
         })
     }
 
     fn interrupt_or_safe_close<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
@@ -726,7 +740,11 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn terminate_tree<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn terminate_tree<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
@@ -744,7 +762,7 @@ impl TeardownEffects for FakeEffects {
         &'a self,
         ticket: &'a TeardownTicket,
         stage: WaitStage,
-        _deadline: TeardownDeadline,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, WaitResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
@@ -766,6 +784,7 @@ impl TeardownEffects for FakeEffects {
     fn settle_active_process_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
@@ -775,7 +794,11 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn detach_after_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
@@ -784,7 +807,11 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn reconcile_ports<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
@@ -793,7 +820,11 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn persist_settlement<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move {
@@ -802,7 +833,11 @@ impl TeardownEffects for FakeEffects {
         })
     }
 
-    fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
+    fn residue<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, Option<ResidueEvidence>> {
         let effects = self.clone();
         let ticket = ticket.clone();
         Box::pin(async move { effects.script(ticket.resource_id()).residue })
@@ -811,6 +846,7 @@ impl TeardownEffects for FakeEffects {
     fn release_stopped_exact<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let effects = self.clone();
         let ticket = ticket.clone();
@@ -855,36 +891,49 @@ impl FaultyEffects {
 }
 
 impl TeardownEffects for FaultyEffects {
-    fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn drain<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         if self.stage == FaultStage::PanicDrain {
             return Box::pin(async { panic!("test completion waiter failure") });
         }
         if self.stage == FaultStage::Drain {
             return Box::pin(std::future::pending());
         }
-        self.inner.drain(ticket)
+        self.inner.drain(ticket, deadline)
     }
 
-    fn cooperative_close<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.cooperative_close(ticket)
+    fn cooperative_close<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.cooperative_close(ticket, deadline)
     }
 
     fn interrupt_or_safe_close<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.interrupt_or_safe_close(ticket)
+        self.inner.interrupt_or_safe_close(ticket, deadline)
     }
 
-    fn terminate_tree<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.terminate_tree(ticket)
+    fn terminate_tree<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.terminate_tree(ticket, deadline)
     }
 
     fn wait_for_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
         stage: WaitStage,
-        deadline: TeardownDeadline,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, WaitResult> {
         if self.stage == FaultStage::Wait(stage) {
             return Box::pin(std::future::pending());
@@ -895,34 +944,52 @@ impl TeardownEffects for FaultyEffects {
     fn settle_active_process_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.settle_active_process_zero(ticket)
+        self.inner.settle_active_process_zero(ticket, deadline)
     }
 
-    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.detach_after_zero(ticket)
+    fn detach_after_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.detach_after_zero(ticket, deadline)
     }
 
-    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.reconcile_ports(ticket)
+    fn reconcile_ports<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.reconcile_ports(ticket, deadline)
     }
 
-    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn persist_settlement<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         if self.stage == FaultStage::PersistSettlement {
             return Box::pin(std::future::pending());
         }
-        self.inner.persist_settlement(ticket)
+        self.inner.persist_settlement(ticket, deadline)
     }
 
-    fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
-        self.inner.residue(ticket)
+    fn residue<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, Option<ResidueEvidence>> {
+        self.inner.residue(ticket, deadline)
     }
 
     fn release_stopped_exact<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.release_stopped_exact(ticket)
+        self.inner.release_stopped_exact(ticket, deadline)
     }
 }
 
@@ -967,7 +1034,11 @@ impl BlockingConstructionEffects {
 }
 
 impl TeardownEffects for BlockingConstructionEffects {
-    fn drain<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn drain<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let inner = self.inner.clone();
         let ticket = ticket.clone();
         let release = Arc::clone(&self.release);
@@ -980,30 +1051,39 @@ impl TeardownEffects for BlockingConstructionEffects {
                 }
                 inner.record(&ticket, "drain_future_constructed");
             }
-            inner.drain(&ticket).await
+            inner.drain(&ticket, deadline).await
         })
     }
 
-    fn cooperative_close<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.cooperative_close(ticket)
+    fn cooperative_close<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.cooperative_close(ticket, deadline)
     }
 
     fn interrupt_or_safe_close<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.interrupt_or_safe_close(ticket)
+        self.inner.interrupt_or_safe_close(ticket, deadline)
     }
 
-    fn terminate_tree<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.terminate_tree(ticket)
+    fn terminate_tree<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.terminate_tree(ticket, deadline)
     }
 
     fn wait_for_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
         stage: WaitStage,
-        deadline: TeardownDeadline,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, WaitResult> {
         self.inner.wait_for_zero(ticket, stage, deadline)
     }
@@ -1011,23 +1091,40 @@ impl TeardownEffects for BlockingConstructionEffects {
     fn settle_active_process_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.settle_active_process_zero(ticket)
+        self.inner.settle_active_process_zero(ticket, deadline)
     }
 
-    fn detach_after_zero<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.detach_after_zero(ticket)
+    fn detach_after_zero<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.detach_after_zero(ticket, deadline)
     }
 
-    fn reconcile_ports<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.reconcile_ports(ticket)
+    fn reconcile_ports<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.reconcile_ports(ticket, deadline)
     }
 
-    fn persist_settlement<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
-        self.inner.persist_settlement(ticket)
+    fn persist_settlement<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
+        self.inner.persist_settlement(ticket, deadline)
     }
 
-    fn residue<'a>(&'a self, ticket: &'a TeardownTicket) -> BoxFuture<'a, Option<ResidueEvidence>> {
+    fn residue<'a>(
+        &'a self,
+        ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, Option<ResidueEvidence>> {
         let inner = self.inner.clone();
         let ticket = ticket.clone();
         let release = Arc::clone(&self.release);
@@ -1038,15 +1135,16 @@ impl TeardownEffects for BlockingConstructionEffects {
                     tokio::task::yield_now().await;
                 }
             }
-            inner.residue(&ticket).await
+            inner.residue(&ticket, deadline).await
         })
     }
 
     fn release_stopped_exact<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
-        self.inner.release_stopped_exact(ticket)
+        self.inner.release_stopped_exact(ticket, deadline)
     }
 }
 
@@ -1372,16 +1470,42 @@ fn teardown_escalation_order_is_fixed() {
             "wait:Termination",
             "settle_active_process_zero",
             "detach_after_zero",
+            "release_stopped_exact",
             "reconcile_ports",
             "persist_settlement",
-            "release_stopped_exact",
         ]
     );
-    assert_eq!(clock.deadlines().len(), 1);
-    assert!(clock
-        .deadlines()
-        .windows(2)
-        .all(|deadlines| deadlines[0] == deadlines[1]));
+    assert_eq!(
+        clock.deadlines().len(),
+        1,
+        "all staged waits must derive from the coordinator's one absolute deadline"
+    );
+}
+
+#[test]
+fn teardown_reports_unsupported_cooperative_capability_without_faking_completion() {
+    let ticket = ticket(77, 78, TeardownScope::Host, 79, 177, 1_077);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    let mut script = BranchScript::cooperative_zero(&ticket);
+    script.cooperative_close = StageResult::Unsupported {
+        detail: "provider has no graceful close protocol".to_string(),
+    };
+    effects.install(&ticket, script);
+    let coordinator = coordinator(&admission, &effects, &FakeClock::default());
+
+    let report = runtime().block_on(
+        coordinator
+            .request(ticket)
+            .expect("unsupported capability still admits exact teardown")
+            .wait(),
+    );
+
+    assert_eq!(report.outcome(), TeardownOutcome::Closed);
+    assert!(report.errors().is_empty());
+    assert_eq!(report.stage_notes().len(), 1);
+    assert!(report.stage_notes()[0].contains("unsupported"));
 }
 
 #[test]
@@ -1454,6 +1578,40 @@ fn teardown_post_zero_failure_retains_authority_and_never_releases() {
 }
 
 #[test]
+fn teardown_release_failure_is_not_cached_and_exact_retry_can_close() {
+    let ticket = ticket(71, 72, TeardownScope::Host, 73, 171, 1_071);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    let mut fail_once = BranchScript::cooperative_zero(&ticket);
+    fail_once.release_stopped_exact = StageResult::Failed {
+        detail: "transient Job receiver join failure".to_string(),
+    };
+    effects.install(&ticket, fail_once);
+    let coordinator = coordinator(&admission, &effects, &FakeClock::default());
+
+    let first = runtime().block_on(
+        coordinator
+            .request(ticket.clone())
+            .expect("first exact release admission")
+            .wait(),
+    );
+    assert_eq!(first.outcome(), TeardownOutcome::CleanupFailed);
+    assert_eq!(coordinator.completed_operation_count(), 0);
+
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let retry = runtime().block_on(
+        coordinator
+            .request(ticket.clone())
+            .expect("failed release must remain retryable")
+            .wait(),
+    );
+
+    assert_eq!(retry.outcome(), TeardownOutcome::Closed);
+    assert_eq!(effects.release_count(ticket.resource_id()), 2);
+}
+
+#[test]
 fn teardown_handoff_failure_keeps_idempotent_residue_without_poisoning_other_work() {
     let first = ticket(25, 45, TeardownScope::Host, 27, 125, 1_025);
     let unrelated = ticket(26, 46, TeardownScope::Host, 27, 126, 1_026);
@@ -1479,13 +1637,14 @@ fn teardown_handoff_failure_keeps_idempotent_residue_without_poisoning_other_wor
     assert!(first_report.residue().is_some());
     assert_eq!(coordinator.active_operation_count(), 0);
 
-    let retry = runtime().block_on(
+    let retry = runtime().block_on({
+        store.clear_persist_failure();
         coordinator
             .request(first.clone())
-            .expect("exact retry uses bounded in-memory settlement")
-            .wait(),
-    );
-    assert_eq!(retry, first_report);
+            .expect("exact retry completes the durable handoff")
+            .wait()
+    });
+    assert_eq!(retry.outcome(), TeardownOutcome::Closed);
     assert_eq!(effects.release_count(first.resource_id()), 1);
 
     let unrelated_report = runtime().block_on(
@@ -1494,7 +1653,7 @@ fn teardown_handoff_failure_keeps_idempotent_residue_without_poisoning_other_wor
             .expect("handoff failure must not poison unrelated operations")
             .wait(),
     );
-    assert_eq!(unrelated_report.outcome(), TeardownOutcome::CleanupFailed);
+    assert_eq!(unrelated_report.outcome(), TeardownOutcome::Closed);
     assert_eq!(effects.release_count(unrelated.resource_id()), 1);
 }
 
@@ -2257,6 +2416,96 @@ fn teardown_completion_journal_replays_exact_report_after_store_reopen() {
         effects.release_count(ticket.resource_id()),
         1,
         "reopening the journal must not execute teardown effects again"
+    );
+}
+
+#[test]
+fn teardown_effects_closed_handoff_is_durable_and_replayed_without_releasing_twice() {
+    let temp = tempfile::tempdir().expect("durable teardown retry journal directory");
+    let path = temp.path().join("teardown-retry.sqlite3");
+    let ticket = ticket(74, 75, TeardownScope::Host, 76, 174, 1_074);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let first_store = TeardownCompletionStore::durable(&path).expect("open retry journal");
+    first_store.fail_persist_for_test("crash after exact release");
+    let first = TeardownCoordinator::with_configuration_and_completion_store(
+        Arc::new(admission),
+        Arc::new(effects.clone()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::default(),
+        8,
+        first_store,
+    );
+
+    let failed_handoff = runtime().block_on(
+        first
+            .request(ticket.clone())
+            .expect("first exact admission")
+            .wait(),
+    );
+    assert_eq!(failed_handoff.outcome(), TeardownOutcome::CleanupFailed);
+    assert_eq!(effects.release_count(ticket.resource_id()), 1);
+    drop(first);
+
+    let reopened_store = TeardownCompletionStore::durable(&path).expect("reopen retry journal");
+    let reopened = TeardownCoordinator::with_configuration_and_completion_store(
+        Arc::new(FakeAdmission::default()),
+        Arc::new(effects.clone()),
+        Arc::new(FakeClock::default()),
+        1,
+        TeardownBudgets::default(),
+        8,
+        reopened_store,
+    );
+    let replay = runtime().block_on(
+        reopened
+            .request(ticket.clone())
+            .expect("effects-closed handoff must replay without new admission")
+            .wait(),
+    );
+
+    assert_eq!(replay.outcome(), TeardownOutcome::Closed);
+    assert_eq!(effects.release_count(ticket.resource_id()), 1);
+}
+
+#[test]
+fn teardown_shutdown_rejects_late_join_before_effects_closed_persistence() {
+    let ticket = ticket(80, 81, TeardownScope::Host, 82, 180, 1_080);
+    let admission = FakeAdmission::default();
+    admission.allow(&ticket);
+    let effects = FakeEffects::default();
+    effects.install(&ticket, BranchScript::cooperative_zero(&ticket));
+    let store = FakeCompletionStore::default();
+    store.fail_persist("retain effects-closed attempt");
+    let coordinator = coordinator_with_store(
+        &admission,
+        Arc::new(effects.clone()),
+        &FakeClock::default(),
+        store.store(),
+    );
+
+    let first = runtime().block_on(
+        coordinator
+            .request(ticket.clone())
+            .expect("initial exact admission")
+            .wait(),
+    );
+    assert_eq!(first.outcome(), TeardownOutcome::CleanupFailed);
+    assert_eq!(effects.release_count(ticket.resource_id()), 1);
+
+    store.clear_persist_failure();
+    coordinator.shutdown();
+    assert!(matches!(
+        coordinator.join(ticket.action_epoch(), ticket.fence()),
+        Err(devmanager::process::teardown::TeardownReject::ExecutorClosed)
+    ));
+    assert_eq!(
+        effects.release_count(ticket.resource_id()),
+        1,
+        "shutdown must not permit a late join to cross any persistence/effect boundary"
     );
 }
 

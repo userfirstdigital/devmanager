@@ -1109,7 +1109,28 @@ impl NativeShell {
                 None => diagnostic,
             });
         }
-        pid_file::cleanup_orphaned_processes();
+        match pid_file::reconcile_orphaned_process_ledger() {
+            Ok(pid_file::OrphanedProcessReconciliation::Clear) => {}
+            Ok(pid_file::OrphanedProcessReconciliation::ExactAuthorityUnavailable {
+                retained_sessions,
+                retained_processes,
+            }) => {
+                let diagnostic = format!(
+                    "Found {retained_processes} verified process(es) from {retained_sessions} prior session(s). They remain observable, but were not terminated because the prior instance's exact managed-process authority is unavailable."
+                );
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+            Err(error) => {
+                let diagnostic = format!("Could not reconcile the prior process ledger: {error}");
+                startup_notice = Some(match startup_notice {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic,
+                });
+            }
+        }
 
         let process_manager = ProcessManager::new();
         process_manager.set_settings(state.config.settings.clone());

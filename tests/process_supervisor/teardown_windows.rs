@@ -170,8 +170,10 @@ impl TeardownAdmission for WindowsAdmission {
 struct WindowsClock;
 
 impl TeardownClock for WindowsClock {
-    fn deadline(&self, _timeout: Duration) -> TeardownDeadline {
-        TeardownDeadline::new(1)
+    fn deadline(&self, timeout: Duration) -> TeardownDeadline {
+        TeardownDeadline::new(
+            u64::try_from(timeout.as_nanos()).expect("test teardown duration fits nanoseconds"),
+        )
     }
 }
 
@@ -183,22 +185,35 @@ struct WindowsEffects {
 }
 
 impl TeardownEffects for WindowsEffects {
-    fn drain<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn drain<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
-    fn cooperative_close<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn cooperative_close<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
     fn interrupt_or_safe_close<'a>(
         &'a self,
         _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
-    fn terminate_tree<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn terminate_tree<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         let shared_job = Arc::clone(&self.shared_job);
         Box::pin(async move {
             match shared_job
@@ -218,7 +233,7 @@ impl TeardownEffects for WindowsEffects {
         &'a self,
         ticket: &'a TeardownTicket,
         stage: WaitStage,
-        _deadline: TeardownDeadline,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, WaitResult> {
         if stage != WaitStage::Termination {
             return Box::pin(async { WaitResult::TimedOut });
@@ -260,6 +275,7 @@ impl TeardownEffects for WindowsEffects {
     fn settle_active_process_zero<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let registry = Arc::clone(&self.registry);
         let release_authority = Arc::clone(&self.release_authority);
@@ -286,21 +302,34 @@ impl TeardownEffects for WindowsEffects {
         })
     }
 
-    fn detach_after_zero<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn detach_after_zero<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
-    fn reconcile_ports<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn reconcile_ports<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
-    fn persist_settlement<'a>(&'a self, _ticket: &'a TeardownTicket) -> BoxFuture<'a, StageResult> {
+    fn persist_settlement<'a>(
+        &'a self,
+        _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
+    ) -> BoxFuture<'a, StageResult> {
         Box::pin(async { StageResult::Completed })
     }
 
     fn residue<'a>(
         &'a self,
         _ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, Option<ResidueEvidence>> {
         Box::pin(async { None })
     }
@@ -308,6 +337,7 @@ impl TeardownEffects for WindowsEffects {
     fn release_stopped_exact<'a>(
         &'a self,
         ticket: &'a TeardownTicket,
+        _deadline: CleanupDeadline,
     ) -> BoxFuture<'a, StageResult> {
         let registry = Arc::clone(&self.registry);
         let shared_job = Arc::clone(&self.shared_job);
