@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::fmt;
 
+use serde::ser::{Error as SerdeError, Serializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,14 +16,23 @@ pub const MAX_PROMPT_VARIABLES: usize = 32;
 pub const MAX_PROMPT_VARIABLE_NAME_SCALARS: usize = 64;
 pub const MAX_PROMPT_CHAIN_TITLE_SCALARS: usize = MAX_PROMPT_TITLE_SCALARS;
 pub const MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS: usize = MAX_PROMPT_DESCRIPTION_SCALARS;
-pub const MAX_PROMPT_CHAIN_LINKS: usize = 2_000;
-/// Public codec budget. The durable SQLite journal intentionally uses the
-/// smaller 512 KiB bound; the codec/privacy union will enforce this contract
-/// when its separate branch is merged.
-pub const MAX_PROMPT_PUBLIC_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PROMPT_PAGE_SIZE: usize = 100;
 pub const MAX_PROMPT_PAGE_SIZE: usize = 1_000;
 pub const PROMPT_WIRE_SCHEMA_VERSION: u32 = 1;
+/// Hard ceiling for any one prompt/chain MessagePack frame before decoding.
+pub const MAX_PROMPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Compatibility name for the public codec budget. Durable SQLite rows use
+/// the smaller 512 KiB bound in `PromptStore`.
+pub const MAX_PROMPT_PUBLIC_WIRE_BYTES: usize = MAX_PROMPT_WIRE_BYTES;
+/// Maximum number of links a durable prompt chain may contain.
+pub const MAX_PROMPT_CHAIN_LINKS: usize = 2_000;
+const MAX_PROMPT_WIRE_DEPTH: usize = 64;
+const MAX_PROMPT_WIRE_MAP_ENTRIES: usize = 64;
+const MAX_PROMPT_WIRE_COLLECTION_ITEMS: usize = MAX_PROMPT_CHAIN_LINKS;
+const MAX_PROMPT_WIRE_NODES: usize = 32_768;
+const MAX_PROMPT_WIRE_STRING_BYTES: usize = MAX_PROMPT_BODY_BYTES;
+const MAX_PROMPT_WIRE_BIN_BYTES: usize = MAX_PROMPT_BODY_BYTES;
+const MAX_PROMPT_WIRE_EXT_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCodecError(String);
@@ -62,6 +73,19 @@ struct PromptChainCommandWire<T> {
     command: T,
 }
 
+/// Durable chain-command envelope. Its schema is intentionally distinct from
+/// the public codec envelope because it records the exact version resolution
+/// used by the store when a link command was applied.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromptChainCommandDurableWire<T> {
+    pub(crate) schema_version: u32,
+    pub(crate) command: T,
+    pub(crate) resolved_prompt_version_id: Option<PromptVersionId>,
+}
+
+pub(crate) const PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptChainEventWire<T> {
@@ -69,7 +93,21 @@ struct PromptChainEventWire<T> {
     event: T,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptMutationReceiptEnvelope {
+    schema_version: u32,
+    receipt: PromptMutationReceiptWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptChainMutationReceiptEnvelope {
+    schema_version: u32,
+    receipt: PromptChainMutationReceiptWire,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedPromptWire {
     id: PromptId,
@@ -81,7 +119,7 @@ struct SavedPromptWire {
     archived_at_ms: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptVersionWire {
     id: PromptVersionId,
@@ -93,7 +131,7 @@ struct PromptVersionWire {
     created_at_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePromptWire {
     prompt_id: PromptId,
@@ -106,7 +144,7 @@ struct CreatePromptWire {
     created_at_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePromptVersionWire {
     prompt_id: PromptId,
@@ -117,7 +155,7 @@ struct CreatePromptVersionWire {
     expected_revision: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenamePromptWire {
     prompt_id: PromptId,
@@ -125,7 +163,7 @@ struct RenamePromptWire {
     expected_revision: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetPromptTagsWire {
     prompt_id: PromptId,
@@ -133,7 +171,7 @@ struct SetPromptTagsWire {
     expected_revision: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptChainWire {
     id: PromptChainId,
@@ -143,7 +181,7 @@ struct PromptChainWire {
     archived_at_ms: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePromptChainWire {
     chain_id: PromptChainId,
@@ -152,7 +190,7 @@ struct CreatePromptChainWire {
     created_at_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenamePromptChainWire {
     chain_id: PromptChainId,
@@ -206,7 +244,7 @@ enum PromptChainEventSerde {
     },
     PromptChainLinksReplaced {
         chain_id: PromptChainId,
-        links: Vec<PromptChainLink>,
+        links: Vec<PromptChainLinkWire>,
         revision: u64,
     },
     PromptChainArchived {
@@ -220,7 +258,7 @@ enum PromptChainEventSerde {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptMutationReceiptWire {
     command_id: CommandId,
@@ -229,7 +267,7 @@ struct PromptMutationReceiptWire {
     revision: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptChainMutationReceiptWire {
     command_id: CommandId,
@@ -238,10 +276,171 @@ struct PromptChainMutationReceiptWire {
     revision: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptChainLinkWire {
+    id: PromptChainLinkId,
+    chain_id: PromptChainId,
+    position: u32,
+    prompt_id: PromptId,
+    prompt_version_id: PromptVersionId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchivePromptSerializeWire {
+    prompt_id: PromptId,
+    archived_at_ms: i64,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestorePromptSerializeWire {
+    prompt_id: PromptId,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsertPromptChainLinkSerializeWire {
+    chain_id: PromptChainId,
+    link_id: PromptChainLinkId,
+    prompt_id: PromptId,
+    prompt_version_id: Option<PromptVersionId>,
+    before_link_id: Option<PromptChainLinkId>,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MovePromptChainLinkSerializeWire {
+    chain_id: PromptChainId,
+    link_id: PromptChainLinkId,
+    before_link_id: Option<PromptChainLinkId>,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovePromptChainLinkSerializeWire {
+    chain_id: PromptChainId,
+    link_id: PromptChainLinkId,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdatePromptChainLinkVersionSerializeWire {
+    chain_id: PromptChainId,
+    link_id: PromptChainLinkId,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchivePromptChainSerializeWire {
+    chain_id: PromptChainId,
+    archived_at_ms: i64,
+    expected_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestorePromptChainSerializeWire {
+    chain_id: PromptChainId,
+    expected_revision: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptCommandSerializeWire<'a> {
+    CreatePrompt(&'a CreatePrompt),
+    CreatePromptVersion(&'a CreatePromptVersion),
+    RenamePrompt(&'a RenamePrompt),
+    SetPromptTags(&'a SetPromptTags),
+    ArchivePrompt(&'a ArchivePrompt),
+    RestorePrompt(&'a RestorePrompt),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptEventSerializeWire<'a> {
+    PromptCreated {
+        prompt: &'a SavedPrompt,
+        version: &'a PromptVersion,
+    },
+    PromptVersionCreated {
+        prompt_id: PromptId,
+        version: &'a PromptVersion,
+        revision: u64,
+    },
+    PromptRenamed {
+        prompt_id: PromptId,
+        title: &'a str,
+        revision: u64,
+    },
+    PromptTagsSet {
+        prompt_id: PromptId,
+        tags: &'a [String],
+        revision: u64,
+    },
+    PromptArchived {
+        prompt_id: PromptId,
+        archived_at_ms: i64,
+        revision: u64,
+    },
+    PromptRestored {
+        prompt_id: PromptId,
+        revision: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptChainCommandSerializeWire<'a> {
+    CreatePromptChain(&'a CreatePromptChain),
+    RenamePromptChain(&'a RenamePromptChain),
+    InsertPromptChainLink(&'a InsertPromptChainLink),
+    MovePromptChainLink(&'a MovePromptChainLink),
+    RemovePromptChainLink(&'a RemovePromptChainLink),
+    UpdatePromptChainLinkVersion(&'a UpdatePromptChainLinkVersion),
+    ArchivePromptChain(&'a ArchivePromptChain),
+    RestorePromptChain(&'a RestorePromptChain),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptChainEventSerializeWire<'a> {
+    PromptChainCreated {
+        chain: &'a PromptChain,
+    },
+    PromptChainRenamed {
+        chain_id: PromptChainId,
+        title: &'a str,
+        revision: u64,
+    },
+    PromptChainLinksReplaced {
+        chain_id: PromptChainId,
+        links: &'a [PromptChainLink],
+        revision: u64,
+    },
+    PromptChainArchived {
+        chain_id: PromptChainId,
+        archived_at_ms: i64,
+        revision: u64,
+    },
+    PromptChainRestored {
+        chain_id: PromptChainId,
+        revision: u64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptValidationError {
     ExpectedRevisionZero,
+    VersionZero,
     EmptyTitle,
     TitleTooLong {
         actual: usize,
@@ -288,6 +487,7 @@ impl fmt::Display for PromptValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ExpectedRevisionZero => f.write_str("expected prompt revision must be positive"),
+            Self::VersionZero => f.write_str("prompt version number must be positive"),
             Self::EmptyTitle => f.write_str("prompt title must not be empty"),
             Self::TitleTooLong { actual, max } => {
                 write!(
@@ -337,19 +537,6 @@ impl fmt::Display for PromptValidationError {
 }
 
 impl std::error::Error for PromptValidationError {}
-
-fn deserialize_positive_revision<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let revision = u64::deserialize(deserializer)?;
-    if revision == 0 {
-        return Err(serde::de::Error::custom(
-            PromptValidationError::ExpectedRevisionZero,
-        ));
-    }
-    Ok(revision)
-}
 
 pub fn normalized_tags(tags: &[String]) -> Result<Vec<String>, PromptValidationError> {
     let mut normalized = Vec::with_capacity(tags.len());
@@ -448,6 +635,12 @@ pub fn validate_body(body: &str) -> Result<(), PromptValidationError> {
     Ok(())
 }
 
+/// Keep prompt metadata whitespace identical across Rust model, codec, store,
+/// and the SQLite migration's explicit Unicode codepoint set.
+pub fn trim_prompt_whitespace(value: &str) -> &str {
+    value.trim_matches(char::is_whitespace)
+}
+
 fn validate_common(
     title: &str,
     description: Option<&str>,
@@ -461,7 +654,7 @@ fn validate_common(
     Ok(tags)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "SavedPromptWire")]
 pub struct SavedPrompt {
     pub id: PromptId,
@@ -490,7 +683,49 @@ impl TryFrom<SavedPromptWire> for SavedPrompt {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for SavedPrompt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_saved_prompt_values(
+            self.revision,
+            &self.title,
+            self.description.as_deref(),
+            &self.tags,
+        )
+        .map_err(S::Error::custom)?;
+        SavedPromptWire {
+            id: self.id,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            tags: self.tags.clone(),
+            current_version_id: self.current_version_id,
+            revision: self.revision,
+            archived_at_ms: self.archived_at_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl fmt::Debug for SavedPrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SavedPrompt")
+            .field("id", &self.id)
+            .field("title_bytes", &self.title.len())
+            .field(
+                "description_bytes",
+                &self.description.as_deref().map(str::len),
+            )
+            .field("tag_count", &self.tags.len())
+            .field("current_version_id", &self.current_version_id)
+            .field("revision", &self.revision)
+            .field("archived_at_ms", &self.archived_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "PromptVersionWire")]
 pub struct PromptVersion {
     pub id: PromptVersionId,
@@ -520,6 +755,25 @@ impl TryFrom<PromptVersionWire> for PromptVersion {
     }
 }
 
+impl Serialize for PromptVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_prompt_version_wire(self).map_err(S::Error::custom)?;
+        PromptVersionWire {
+            id: self.id,
+            prompt_id: self.prompt_id,
+            version: self.version,
+            body: self.body.clone(),
+            variables: self.variables.clone(),
+            body_sha256: self.body_sha256,
+            created_at_ms: self.created_at_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl PromptVersion {
     pub fn new(
         id: PromptVersionId,
@@ -539,6 +793,9 @@ impl PromptVersion {
         variables: Vec<String>,
         created_at_ms: i64,
     ) -> Result<Self, PromptValidationError> {
+        if version == 0 {
+            return Err(PromptValidationError::VersionZero);
+        }
         validate_body(&body)?;
         let variables = normalized_variables(&variables)?;
         let body_sha256: [u8; 32] = Sha256::digest(body.as_bytes()).into();
@@ -569,14 +826,14 @@ impl fmt::Debug for PromptVersion {
             .field("prompt_id", &self.prompt_id)
             .field("version", &self.version)
             .field("body", &RedactedBody(self.body.len()))
-            .field("variables", &self.variables)
-            .field("body_sha256", &self.body_sha256)
+            .field("variable_count", &self.variables.len())
+            .field("body_sha256_bytes", &self.body_sha256.len())
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "CreatePromptWire")]
 pub struct CreatePrompt {
     pub prompt_id: PromptId,
@@ -635,17 +892,40 @@ impl fmt::Debug for CreatePrompt {
         f.debug_struct("CreatePrompt")
             .field("prompt_id", &self.prompt_id)
             .field("prompt_version_id", &self.prompt_version_id)
-            .field("title", &self.title)
-            .field("description", &self.description)
-            .field("tags", &self.tags)
-            .field("variables", &self.variables)
+            .field("title_bytes", &self.title.len())
+            .field(
+                "description_bytes",
+                &self.description.as_deref().map(str::len),
+            )
+            .field("tag_count", &self.tags.len())
+            .field("variable_count", &self.variables.len())
             .field("body", &RedactedBody(self.body.len()))
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for CreatePrompt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_prompt_command_wire(self).map_err(S::Error::custom)?;
+        CreatePromptWire {
+            prompt_id: self.prompt_id,
+            prompt_version_id: self.prompt_version_id,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            tags: self.tags.clone(),
+            variables: self.variables.clone(),
+            body: self.body.clone(),
+            created_at_ms: self.created_at_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "CreatePromptVersionWire")]
 pub struct CreatePromptVersion {
     pub prompt_id: PromptId,
@@ -653,7 +933,6 @@ pub struct CreatePromptVersion {
     pub variables: Vec<String>,
     pub body: String,
     pub created_at_ms: i64,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
@@ -693,7 +972,7 @@ impl fmt::Debug for CreatePromptVersion {
         f.debug_struct("CreatePromptVersion")
             .field("prompt_id", &self.prompt_id)
             .field("prompt_version_id", &self.prompt_version_id)
-            .field("variables", &self.variables)
+            .field("variable_count", &self.variables.len())
             .field("body", &RedactedBody(self.body.len()))
             .field("created_at_ms", &self.created_at_ms)
             .field("expected_revision", &self.expected_revision)
@@ -701,12 +980,30 @@ impl fmt::Debug for CreatePromptVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for CreatePromptVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        validate_canonical_variables(&self.variables).map_err(S::Error::custom)?;
+        CreatePromptVersionWire {
+            prompt_id: self.prompt_id,
+            prompt_version_id: self.prompt_version_id,
+            variables: self.variables.clone(),
+            body: self.body.clone(),
+            created_at_ms: self.created_at_ms,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "RenamePromptWire")]
 pub struct RenamePrompt {
     pub prompt_id: PromptId,
     pub title: String,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
@@ -732,12 +1029,38 @@ impl RenamePrompt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for RenamePrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenamePrompt")
+            .field("prompt_id", &self.prompt_id)
+            .field("title_bytes", &self.title.len())
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+impl Serialize for RenamePrompt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        validate_canonical_title(&self.title, MAX_PROMPT_TITLE_SCALARS)
+            .map_err(S::Error::custom)?;
+        RenamePromptWire {
+            prompt_id: self.prompt_id,
+            title: self.title.clone(),
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "SetPromptTagsWire")]
 pub struct SetPromptTags {
     pub prompt_id: PromptId,
     pub tags: Vec<String>,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
@@ -763,24 +1086,102 @@ impl SetPromptTags {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl fmt::Debug for SetPromptTags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SetPromptTags")
+            .field("prompt_id", &self.prompt_id)
+            .field("tag_count", &self.tags.len())
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+impl Serialize for SetPromptTags {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        validate_canonical_tags(&self.tags).map_err(S::Error::custom)?;
+        SetPromptTagsWire {
+            prompt_id: self.prompt_id,
+            tags: self.tags.clone(),
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "ArchivePromptSerializeWire")]
 pub struct ArchivePrompt {
     pub prompt_id: PromptId,
     pub archived_at_ms: i64,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RestorePromptSerializeWire")]
 pub struct RestorePrompt {
     pub prompt_id: PromptId,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl TryFrom<ArchivePromptSerializeWire> for ArchivePrompt {
+    type Error = String;
+
+    fn try_from(wire: ArchivePromptSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            prompt_id: wire.prompt_id,
+            archived_at_ms: wire.archived_at_ms,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<RestorePromptSerializeWire> for RestorePrompt {
+    type Error = String;
+
+    fn try_from(wire: RestorePromptSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            prompt_id: wire.prompt_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl Serialize for ArchivePrompt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        ArchivePromptSerializeWire {
+            prompt_id: self.prompt_id,
+            archived_at_ms: self.archived_at_ms,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for RestorePrompt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        RestorePromptSerializeWire {
+            prompt_id: self.prompt_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PromptCommand {
     CreatePrompt(CreatePrompt),
@@ -792,6 +1193,50 @@ pub enum PromptCommand {
 }
 
 impl PromptCommand {
+    pub fn canonicalize(&self) -> Result<Self, PromptValidationError> {
+        match self {
+            Self::CreatePrompt(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.title = trim_prompt_whitespace(&command.title).to_string();
+                canonical.description = command
+                    .description
+                    .as_deref()
+                    .map(trim_prompt_whitespace)
+                    .map(str::to_string);
+                canonical.tags = normalized_tags(&command.tags)?;
+                canonical.variables = normalized_variables(&command.variables)?;
+                Ok(Self::CreatePrompt(canonical))
+            }
+            Self::CreatePromptVersion(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.variables = normalized_variables(&command.variables)?;
+                Ok(Self::CreatePromptVersion(canonical))
+            }
+            Self::RenamePrompt(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.title = trim_prompt_whitespace(&command.title).to_string();
+                Ok(Self::RenamePrompt(canonical))
+            }
+            Self::SetPromptTags(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.tags = normalized_tags(&command.tags)?;
+                Ok(Self::SetPromptTags(canonical))
+            }
+            Self::ArchivePrompt(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::ArchivePrompt(command.clone()))
+            }
+            Self::RestorePrompt(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::RestorePrompt(command.clone()))
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PromptValidationError> {
         match self {
             Self::CreatePrompt(command) => command.validate(),
@@ -803,20 +1248,40 @@ impl PromptCommand {
         }
     }
 
-    pub fn fingerprint(&self) -> [u8; 32] {
-        let encoded = self.encode().expect("prompt commands are serializable");
-        Sha256::digest(encoded).into()
+    pub fn fingerprint(&self) -> Result<[u8; 32], PromptCodecError> {
+        let canonical = self
+            .canonicalize()
+            .map_err(|_| PromptCodecError("prompt command validation failed".into()))?;
+        canonical.fingerprint_canonical()
+    }
+
+    /// Hash the exact canonical wire bytes used for persistence and execution.
+    pub(crate) fn fingerprint_canonical(&self) -> Result<[u8; 32], PromptCodecError> {
+        let encoded = self.encode_canonical()?;
+        let fingerprint = Sha256::digest(encoded).into();
+        Ok(fingerprint)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
-        rmp_serde::to_vec_named(&PromptCommandWire {
-            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
-            command: self,
-        })
-        .map_err(|_| PromptCodecError("prompt command encoding failed".into()))
+        self.validate()
+            .map_err(|_| PromptCodecError("prompt command validation failed".into()))?;
+        validate_prompt_command_canonical(self)
+            .map_err(|_| PromptCodecError("prompt command validation failed".into()))?;
+        self.encode_canonical()
+    }
+
+    fn encode_canonical(&self) -> Result<Vec<u8>, PromptCodecError> {
+        bounded_wire_encode(
+            &PromptCommandWire {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                command: self,
+            },
+            "prompt command encoding failed",
+        )
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
+        validate_wire_payload_size(payload)?;
         let wire: PromptCommandWireOwned = rmp_serde::from_slice(payload)
             .map_err(|_| PromptCodecError("prompt command decoding failed".into()))?;
         if wire.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
@@ -835,8 +1300,28 @@ impl PromptCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, try_from = "PromptMutationReceiptWire")]
+impl Serialize for PromptCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_prompt_command_canonical(self).map_err(S::Error::custom)?;
+        let wire = match self {
+            Self::CreatePrompt(command) => PromptCommandSerializeWire::CreatePrompt(command),
+            Self::CreatePromptVersion(command) => {
+                PromptCommandSerializeWire::CreatePromptVersion(command)
+            }
+            Self::RenamePrompt(command) => PromptCommandSerializeWire::RenamePrompt(command),
+            Self::SetPromptTags(command) => PromptCommandSerializeWire::SetPromptTags(command),
+            Self::ArchivePrompt(command) => PromptCommandSerializeWire::ArchivePrompt(command),
+            Self::RestorePrompt(command) => PromptCommandSerializeWire::RestorePrompt(command),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "PromptMutationReceiptEnvelope")]
 pub struct PromptMutationReceipt {
     pub command_id: CommandId,
     pub prompt_id: PromptId,
@@ -844,10 +1329,14 @@ pub struct PromptMutationReceipt {
     pub revision: u64,
 }
 
-impl TryFrom<PromptMutationReceiptWire> for PromptMutationReceipt {
+impl TryFrom<PromptMutationReceiptEnvelope> for PromptMutationReceipt {
     type Error = String;
 
-    fn try_from(wire: PromptMutationReceiptWire) -> Result<Self, Self::Error> {
+    fn try_from(envelope: PromptMutationReceiptEnvelope) -> Result<Self, Self::Error> {
+        if envelope.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
+            return Err("unsupported prompt receipt schema".into());
+        }
+        let wire = envelope.receipt;
         if wire.revision == 0 {
             return Err("prompt receipt revision must be positive".into());
         }
@@ -862,17 +1351,60 @@ impl TryFrom<PromptMutationReceiptWire> for PromptMutationReceipt {
 
 impl PromptMutationReceipt {
     pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
-        rmp_serde::to_vec_named(self)
-            .map_err(|_| PromptCodecError("prompt receipt encoding failed".into()))
+        if self.revision == 0 {
+            return Err(PromptCodecError("prompt receipt validation failed".into()));
+        }
+        bounded_wire_encode(
+            &PromptMutationReceiptEnvelope {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                receipt: PromptMutationReceiptWire {
+                    command_id: self.command_id,
+                    prompt_id: self.prompt_id,
+                    prompt_version_id: self.prompt_version_id,
+                    revision: self.revision,
+                },
+            },
+            "prompt receipt encoding failed",
+        )
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
-        rmp_serde::from_slice(payload)
-            .map_err(|_| PromptCodecError("prompt receipt decoding failed".into()))
+        validate_wire_payload_size(payload)?;
+        let envelope: PromptMutationReceiptEnvelope = rmp_serde::from_slice(payload)
+            .map_err(|_| PromptCodecError("prompt receipt decoding failed".into()))?;
+        let receipt = Self::try_from(envelope)
+            .map_err(|_| PromptCodecError("prompt receipt validation failed".into()))?;
+        if receipt.encode()? != payload {
+            return Err(PromptCodecError(
+                "prompt receipt payload is not canonical".into(),
+            ));
+        }
+        Ok(receipt)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for PromptMutationReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.revision == 0 {
+            return Err(S::Error::custom("prompt receipt revision must be positive"));
+        }
+        PromptMutationReceiptEnvelope {
+            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+            receipt: PromptMutationReceiptWire {
+                command_id: self.command_id,
+                prompt_id: self.prompt_id,
+                prompt_version_id: self.prompt_version_id,
+                revision: self.revision,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(
     rename_all = "snake_case",
     deny_unknown_fields,
@@ -979,20 +1511,151 @@ impl PromptEvent {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
-        rmp_serde::to_vec_named(&PromptEventWire {
-            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
-            event: self,
-        })
-        .map_err(|_| PromptCodecError("prompt event encoding failed".into()))
+        validate_prompt_event_wire(self)
+            .map_err(|_| PromptCodecError("prompt event validation failed".into()))?;
+        bounded_wire_encode(
+            &PromptEventWire {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                event: self,
+            },
+            "prompt event encoding failed",
+        )
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
-        let wire: PromptEventWire<PromptEvent> = rmp_serde::from_slice(payload)
+        validate_wire_payload_size(payload)?;
+        let wire: PromptEventWire<PromptEventSerde> = rmp_serde::from_slice(payload)
             .map_err(|_| PromptCodecError("prompt event decoding failed".into()))?;
         if wire.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
             return Err(PromptCodecError("unsupported prompt event schema".into()));
         }
-        Ok(wire.event)
+        let event = PromptEvent::try_from(wire.event)
+            .map_err(|_| PromptCodecError("prompt event validation failed".into()))?;
+        let canonical = event.encode()?;
+        if canonical != payload {
+            return Err(PromptCodecError(
+                "prompt event payload is not canonical".into(),
+            ));
+        }
+        Ok(event)
+    }
+}
+
+impl Serialize for PromptEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_prompt_event_wire(self).map_err(S::Error::custom)?;
+        let wire = match self {
+            Self::PromptCreated { prompt, version } => {
+                PromptEventSerializeWire::PromptCreated { prompt, version }
+            }
+            Self::PromptVersionCreated {
+                prompt_id,
+                version,
+                revision,
+            } => PromptEventSerializeWire::PromptVersionCreated {
+                prompt_id: *prompt_id,
+                version,
+                revision: *revision,
+            },
+            Self::PromptRenamed {
+                prompt_id,
+                title,
+                revision,
+            } => PromptEventSerializeWire::PromptRenamed {
+                prompt_id: *prompt_id,
+                title,
+                revision: *revision,
+            },
+            Self::PromptTagsSet {
+                prompt_id,
+                tags,
+                revision,
+            } => PromptEventSerializeWire::PromptTagsSet {
+                prompt_id: *prompt_id,
+                tags,
+                revision: *revision,
+            },
+            Self::PromptArchived {
+                prompt_id,
+                archived_at_ms,
+                revision,
+            } => PromptEventSerializeWire::PromptArchived {
+                prompt_id: *prompt_id,
+                archived_at_ms: *archived_at_ms,
+                revision: *revision,
+            },
+            Self::PromptRestored {
+                prompt_id,
+                revision,
+            } => PromptEventSerializeWire::PromptRestored {
+                prompt_id: *prompt_id,
+                revision: *revision,
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl fmt::Debug for PromptEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PromptCreated { prompt, version } => f
+                .debug_struct("PromptEvent::PromptCreated")
+                .field("prompt", prompt)
+                .field("version", version)
+                .finish(),
+            Self::PromptVersionCreated {
+                prompt_id,
+                version,
+                revision,
+            } => f
+                .debug_struct("PromptEvent::PromptVersionCreated")
+                .field("prompt_id", prompt_id)
+                .field("version", version)
+                .field("revision", revision)
+                .finish(),
+            Self::PromptRenamed {
+                prompt_id,
+                title,
+                revision,
+            } => f
+                .debug_struct("PromptEvent::PromptRenamed")
+                .field("prompt_id", prompt_id)
+                .field("title_bytes", &title.len())
+                .field("revision", revision)
+                .finish(),
+            Self::PromptTagsSet {
+                prompt_id,
+                tags,
+                revision,
+            } => f
+                .debug_struct("PromptEvent::PromptTagsSet")
+                .field("prompt_id", prompt_id)
+                .field("tag_count", &tags.len())
+                .field("revision", revision)
+                .finish(),
+            Self::PromptArchived {
+                prompt_id,
+                archived_at_ms,
+                revision,
+            } => f
+                .debug_struct("PromptEvent::PromptArchived")
+                .field("prompt_id", prompt_id)
+                .field("archived_at_ms", archived_at_ms)
+                .field("revision", revision)
+                .finish(),
+            Self::PromptRestored {
+                prompt_id,
+                revision,
+            } => f
+                .debug_struct("PromptEvent::PromptRestored")
+                .field("prompt_id", prompt_id)
+                .field("revision", revision)
+                .finish(),
+        }
     }
 }
 
@@ -1008,7 +1671,7 @@ pub struct PromptProjectionRebuild {
     pub events_replayed: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "PromptChainWire")]
 pub struct PromptChain {
     pub id: PromptChainId,
@@ -1036,17 +1699,124 @@ impl TryFrom<PromptChainWire> for PromptChain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PromptChainLink {
-    pub id: PromptChainLinkId,
-    pub chain_id: PromptChainId,
-    pub position: u32,
-    pub prompt_id: PromptId,
-    pub prompt_version_id: PromptVersionId,
+impl Serialize for PromptChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.revision == 0 {
+            return Err(S::Error::custom("prompt chain revision must be positive"));
+        }
+        validate_canonical_chain_metadata(&self.title, self.description.as_deref())
+            .map_err(S::Error::custom)?;
+        PromptChainWire {
+            id: self.id,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            revision: self.revision,
+            archived_at_ms: self.archived_at_ms,
+        }
+        .serialize(serializer)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for PromptChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptChain")
+            .field("id", &self.id)
+            .field("title_bytes", &self.title.len())
+            .field(
+                "description_bytes",
+                &self.description.as_deref().map(str::len),
+            )
+            .field("revision", &self.revision)
+            .field("archived_at_ms", &self.archived_at_ms)
+            .finish()
+    }
+}
+
+/// A read-only link snapshot issued by the prompt store.
+///
+/// Wire decoding can construct only a structurally checked event containing
+/// these private-field values; it does not establish prompt/version lineage.
+/// Replay must still pass the link through `PromptStore` before treating it as
+/// authoritative state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PromptChainLink {
+    id: PromptChainLinkId,
+    chain_id: PromptChainId,
+    position: u32,
+    prompt_id: PromptId,
+    prompt_version_id: PromptVersionId,
+}
+
+impl PromptChainLink {
+    pub fn id(&self) -> PromptChainLinkId {
+        self.id
+    }
+
+    pub fn chain_id(&self) -> PromptChainId {
+        self.chain_id
+    }
+
+    pub fn position(&self) -> u32 {
+        self.position
+    }
+
+    pub fn prompt_id(&self) -> PromptId {
+        self.prompt_id
+    }
+
+    pub fn prompt_version_id(&self) -> PromptVersionId {
+        self.prompt_version_id
+    }
+
+    pub(crate) fn store_issued(
+        id: PromptChainLinkId,
+        chain_id: PromptChainId,
+        position: u32,
+        prompt_id: PromptId,
+        prompt_version_id: PromptVersionId,
+    ) -> Self {
+        Self {
+            id,
+            chain_id,
+            position,
+            prompt_id,
+            prompt_version_id,
+        }
+    }
+}
+
+impl fmt::Debug for PromptChainLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptChainLink")
+            .field("id", &self.id)
+            .field("chain_id", &self.chain_id)
+            .field("position", &self.position)
+            .field("prompt_id", &self.prompt_id)
+            .field("prompt_version_id", &self.prompt_version_id)
+            .finish()
+    }
+}
+
+impl Serialize for PromptChainLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PromptChainLinkWire {
+            id: self.id,
+            chain_id: self.chain_id,
+            position: self.position,
+            prompt_id: self.prompt_id,
+            prompt_version_id: self.prompt_version_id,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptChainLinkContext {
     pub link: PromptChainLink,
@@ -1055,7 +1825,7 @@ pub struct PromptChainLinkContext {
     pub update_available: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "CreatePromptChainWire")]
 pub struct CreatePromptChain {
     pub chain_id: PromptChainId,
@@ -1080,6 +1850,24 @@ impl TryFrom<CreatePromptChainWire> for CreatePromptChain {
     }
 }
 
+impl Serialize for CreatePromptChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        validate_canonical_chain_metadata(&self.title, self.description.as_deref())
+            .map_err(S::Error::custom)?;
+        CreatePromptChainWire {
+            chain_id: self.chain_id,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            created_at_ms: self.created_at_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl CreatePromptChain {
     pub fn validate(&self) -> Result<(), PromptValidationError> {
         validate_title_with_limit(
@@ -1094,12 +1882,25 @@ impl CreatePromptChain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for CreatePromptChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreatePromptChain")
+            .field("chain_id", &self.chain_id)
+            .field("title_bytes", &self.title.len())
+            .field(
+                "description_bytes",
+                &self.description.as_deref().map(str::len),
+            )
+            .field("created_at_ms", &self.created_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "RenamePromptChainWire")]
 pub struct RenamePromptChain {
     pub chain_id: PromptChainId,
     pub title: String,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
@@ -1129,8 +1930,35 @@ impl RenamePromptChain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl fmt::Debug for RenamePromptChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenamePromptChain")
+            .field("chain_id", &self.chain_id)
+            .field("title_bytes", &self.title.len())
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+impl Serialize for RenamePromptChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        validate_canonical_title(&self.title, MAX_PROMPT_CHAIN_TITLE_SCALARS)
+            .map_err(S::Error::custom)?;
+        RenamePromptChainWire {
+            chain_id: self.chain_id,
+            title: self.title.clone(),
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "InsertPromptChainLinkSerializeWire")]
 pub struct InsertPromptChainLink {
     pub chain_id: PromptChainId,
     pub link_id: PromptChainLinkId,
@@ -1139,56 +1967,227 @@ pub struct InsertPromptChainLink {
     /// stored link always contains the resolved immutable version ID.
     pub prompt_version_id: Option<PromptVersionId>,
     pub before_link_id: Option<PromptChainLinkId>,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "MovePromptChainLinkSerializeWire")]
 pub struct MovePromptChainLink {
     pub chain_id: PromptChainId,
     pub link_id: PromptChainLinkId,
     pub before_link_id: Option<PromptChainLinkId>,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RemovePromptChainLinkSerializeWire")]
 pub struct RemovePromptChainLink {
     pub chain_id: PromptChainId,
     pub link_id: PromptChainLinkId,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    try_from = "UpdatePromptChainLinkVersionSerializeWire"
+)]
 pub struct UpdatePromptChainLinkVersion {
     pub chain_id: PromptChainId,
     pub link_id: PromptChainLinkId,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "ArchivePromptChainSerializeWire")]
 pub struct ArchivePromptChain {
     pub chain_id: PromptChainId,
     pub archived_at_ms: i64,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RestorePromptChainSerializeWire")]
 pub struct RestorePromptChain {
     pub chain_id: PromptChainId,
-    #[serde(deserialize_with = "deserialize_positive_revision")]
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl TryFrom<InsertPromptChainLinkSerializeWire> for InsertPromptChainLink {
+    type Error = String;
+
+    fn try_from(wire: InsertPromptChainLinkSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            link_id: wire.link_id,
+            prompt_id: wire.prompt_id,
+            prompt_version_id: wire.prompt_version_id,
+            before_link_id: wire.before_link_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<MovePromptChainLinkSerializeWire> for MovePromptChainLink {
+    type Error = String;
+
+    fn try_from(wire: MovePromptChainLinkSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            link_id: wire.link_id,
+            before_link_id: wire.before_link_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<RemovePromptChainLinkSerializeWire> for RemovePromptChainLink {
+    type Error = String;
+
+    fn try_from(wire: RemovePromptChainLinkSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            link_id: wire.link_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<UpdatePromptChainLinkVersionSerializeWire> for UpdatePromptChainLinkVersion {
+    type Error = String;
+
+    fn try_from(wire: UpdatePromptChainLinkVersionSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            link_id: wire.link_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<ArchivePromptChainSerializeWire> for ArchivePromptChain {
+    type Error = String;
+
+    fn try_from(wire: ArchivePromptChainSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            archived_at_ms: wire.archived_at_ms,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl TryFrom<RestorePromptChainSerializeWire> for RestorePromptChain {
+    type Error = String;
+
+    fn try_from(wire: RestorePromptChainSerializeWire) -> Result<Self, Self::Error> {
+        validate_expected_revision(wire.expected_revision).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chain_id: wire.chain_id,
+            expected_revision: wire.expected_revision,
+        })
+    }
+}
+
+impl Serialize for InsertPromptChainLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        InsertPromptChainLinkSerializeWire {
+            chain_id: self.chain_id,
+            link_id: self.link_id,
+            prompt_id: self.prompt_id,
+            prompt_version_id: self.prompt_version_id,
+            before_link_id: self.before_link_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for MovePromptChainLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        MovePromptChainLinkSerializeWire {
+            chain_id: self.chain_id,
+            link_id: self.link_id,
+            before_link_id: self.before_link_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for RemovePromptChainLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        RemovePromptChainLinkSerializeWire {
+            chain_id: self.chain_id,
+            link_id: self.link_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for UpdatePromptChainLinkVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        UpdatePromptChainLinkVersionSerializeWire {
+            chain_id: self.chain_id,
+            link_id: self.link_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for ArchivePromptChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        ArchivePromptChainSerializeWire {
+            chain_id: self.chain_id,
+            archived_at_ms: self.archived_at_ms,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for RestorePromptChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_expected_revision(self.expected_revision).map_err(S::Error::custom)?;
+        RestorePromptChainSerializeWire {
+            chain_id: self.chain_id,
+            expected_revision: self.expected_revision,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PromptChainCommand {
     CreatePromptChain(CreatePromptChain),
@@ -1202,6 +2201,52 @@ pub enum PromptChainCommand {
 }
 
 impl PromptChainCommand {
+    pub fn canonicalize(&self) -> Result<Self, PromptValidationError> {
+        match self {
+            Self::CreatePromptChain(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.title = trim_prompt_whitespace(&command.title).to_string();
+                canonical.description = command
+                    .description
+                    .as_deref()
+                    .map(trim_prompt_whitespace)
+                    .map(str::to_string);
+                Ok(Self::CreatePromptChain(canonical))
+            }
+            Self::RenamePromptChain(command) => {
+                command.validate()?;
+                let mut canonical = command.clone();
+                canonical.title = trim_prompt_whitespace(&command.title).to_string();
+                Ok(Self::RenamePromptChain(canonical))
+            }
+            Self::InsertPromptChainLink(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::InsertPromptChainLink(command.clone()))
+            }
+            Self::MovePromptChainLink(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::MovePromptChainLink(command.clone()))
+            }
+            Self::RemovePromptChainLink(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::RemovePromptChainLink(command.clone()))
+            }
+            Self::UpdatePromptChainLinkVersion(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::UpdatePromptChainLinkVersion(command.clone()))
+            }
+            Self::ArchivePromptChain(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::ArchivePromptChain(command.clone()))
+            }
+            Self::RestorePromptChain(command) => {
+                validate_expected_revision(command.expected_revision)?;
+                Ok(Self::RestorePromptChain(command.clone()))
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PromptValidationError> {
         match self {
             Self::CreatePromptChain(command) => command.validate(),
@@ -1227,18 +2272,151 @@ impl PromptChainCommand {
         }
     }
 
-    pub fn fingerprint(&self) -> [u8; 32] {
-        let encoded = rmp_serde::to_vec_named(&PromptChainCommandWire {
-            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
-            command: self,
-        })
-        .expect("prompt chain commands are serializable");
-        Sha256::digest(encoded).into()
+    pub fn fingerprint(&self) -> Result<[u8; 32], PromptCodecError> {
+        let canonical = self
+            .canonicalize()
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        canonical.fingerprint_canonical()
+    }
+
+    /// Hash the exact canonical wire bytes used for persistence and execution.
+    pub(crate) fn fingerprint_canonical(&self) -> Result<[u8; 32], PromptCodecError> {
+        let encoded = self.encode_canonical()?;
+        let fingerprint = Sha256::digest(encoded).into();
+        Ok(fingerprint)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
+        self.validate()
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_canonical(self)
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        self.encode_canonical()
+    }
+
+    fn encode_canonical(&self) -> Result<Vec<u8>, PromptCodecError> {
+        bounded_wire_encode(
+            &PromptChainCommandWire {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                command: self,
+            },
+            "prompt chain command encoding failed",
+        )
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
+        validate_wire_payload_size(payload)?;
+        let wire: PromptChainCommandWire<PromptChainCommand> = rmp_serde::from_slice(payload)
+            .map_err(|_| PromptCodecError("prompt chain command decoding failed".into()))?;
+        if wire.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
+            return Err(PromptCodecError(
+                "unsupported prompt chain command schema".into(),
+            ));
+        }
+        wire.command
+            .validate()
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        let canonical = wire.command.encode()?;
+        if canonical != payload {
+            return Err(PromptCodecError(
+                "prompt chain command payload is not canonical".into(),
+            ));
+        }
+        Ok(wire.command)
+    }
+
+    /// Encode the durable schema-v2 envelope while reusing this checked model
+    /// codec for the command itself. The store adds its stricter 512 KiB
+    /// preflight before writing the returned bytes to SQLite.
+    pub(crate) fn encode_durable(
+        &self,
+        resolved_prompt_version_id: Option<PromptVersionId>,
+    ) -> Result<Vec<u8>, PromptCodecError> {
+        self.validate()
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_canonical(self)
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_resolution_model(self, resolved_prompt_version_id)
+            .map_err(|_| PromptCodecError("prompt chain command resolution failed".into()))?;
+        bounded_wire_encode(
+            &PromptChainCommandDurableWire {
+                schema_version: PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION,
+                command: self,
+                resolved_prompt_version_id,
+            },
+            "prompt chain command encoding failed",
+        )
+    }
+
+    pub(crate) fn decode_durable(
+        payload: &[u8],
+    ) -> Result<(Self, Option<PromptVersionId>), PromptCodecError> {
+        validate_wire_payload_size(payload)?;
+        let wire: PromptChainCommandDurableWire<PromptChainCommand> =
+            rmp_serde::from_slice(payload)
+                .map_err(|_| PromptCodecError("prompt chain command decoding failed".into()))?;
+        if wire.schema_version != PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION {
+            return Err(PromptCodecError(
+                "unsupported prompt chain command schema".into(),
+            ));
+        }
+        wire.command
+            .validate()
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_canonical(&wire.command)
+            .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_resolution_model(&wire.command, wire.resolved_prompt_version_id)
+            .map_err(|_| PromptCodecError("prompt chain command resolution failed".into()))?;
+        let canonical = wire
+            .command
+            .encode_durable(wire.resolved_prompt_version_id)?;
+        if canonical != payload {
+            return Err(PromptCodecError(
+                "prompt chain command payload is not canonical".into(),
+            ));
+        }
+        Ok((wire.command, wire.resolved_prompt_version_id))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, try_from = "PromptChainMutationReceiptWire")]
+impl Serialize for PromptChainCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_chain_command_canonical(self).map_err(S::Error::custom)?;
+        let wire = match self {
+            Self::CreatePromptChain(command) => {
+                PromptChainCommandSerializeWire::CreatePromptChain(command)
+            }
+            Self::RenamePromptChain(command) => {
+                PromptChainCommandSerializeWire::RenamePromptChain(command)
+            }
+            Self::InsertPromptChainLink(command) => {
+                PromptChainCommandSerializeWire::InsertPromptChainLink(command)
+            }
+            Self::MovePromptChainLink(command) => {
+                PromptChainCommandSerializeWire::MovePromptChainLink(command)
+            }
+            Self::RemovePromptChainLink(command) => {
+                PromptChainCommandSerializeWire::RemovePromptChainLink(command)
+            }
+            Self::UpdatePromptChainLinkVersion(command) => {
+                PromptChainCommandSerializeWire::UpdatePromptChainLinkVersion(command)
+            }
+            Self::ArchivePromptChain(command) => {
+                PromptChainCommandSerializeWire::ArchivePromptChain(command)
+            }
+            Self::RestorePromptChain(command) => {
+                PromptChainCommandSerializeWire::RestorePromptChain(command)
+            }
+        };
+        wire.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "PromptChainMutationReceiptEnvelope")]
 pub struct PromptChainMutationReceipt {
     pub command_id: CommandId,
     pub chain_id: PromptChainId,
@@ -1246,10 +2424,14 @@ pub struct PromptChainMutationReceipt {
     pub revision: u64,
 }
 
-impl TryFrom<PromptChainMutationReceiptWire> for PromptChainMutationReceipt {
+impl TryFrom<PromptChainMutationReceiptEnvelope> for PromptChainMutationReceipt {
     type Error = String;
 
-    fn try_from(wire: PromptChainMutationReceiptWire) -> Result<Self, Self::Error> {
+    fn try_from(envelope: PromptChainMutationReceiptEnvelope) -> Result<Self, Self::Error> {
+        if envelope.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
+            return Err("unsupported prompt chain receipt schema".into());
+        }
+        let wire = envelope.receipt;
         if wire.revision == 0 {
             return Err("prompt chain receipt revision must be positive".into());
         }
@@ -1264,17 +2446,64 @@ impl TryFrom<PromptChainMutationReceiptWire> for PromptChainMutationReceipt {
 
 impl PromptChainMutationReceipt {
     pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
-        rmp_serde::to_vec_named(self)
-            .map_err(|_| PromptCodecError("prompt chain receipt encoding failed".into()))
+        if self.revision == 0 {
+            return Err(PromptCodecError(
+                "prompt chain receipt validation failed".into(),
+            ));
+        }
+        bounded_wire_encode(
+            &PromptChainMutationReceiptEnvelope {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                receipt: PromptChainMutationReceiptWire {
+                    command_id: self.command_id,
+                    chain_id: self.chain_id,
+                    link_id: self.link_id,
+                    revision: self.revision,
+                },
+            },
+            "prompt chain receipt encoding failed",
+        )
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
-        rmp_serde::from_slice(payload)
-            .map_err(|_| PromptCodecError("prompt chain receipt decoding failed".into()))
+        validate_wire_payload_size(payload)?;
+        let envelope: PromptChainMutationReceiptEnvelope = rmp_serde::from_slice(payload)
+            .map_err(|_| PromptCodecError("prompt chain receipt decoding failed".into()))?;
+        let receipt = Self::try_from(envelope)
+            .map_err(|_| PromptCodecError("prompt chain receipt validation failed".into()))?;
+        if receipt.encode()? != payload {
+            return Err(PromptCodecError(
+                "prompt chain receipt payload is not canonical".into(),
+            ));
+        }
+        Ok(receipt)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for PromptChainMutationReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.revision == 0 {
+            return Err(S::Error::custom(
+                "prompt chain receipt revision must be positive",
+            ));
+        }
+        PromptChainMutationReceiptEnvelope {
+            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+            receipt: PromptChainMutationReceiptWire {
+                command_id: self.command_id,
+                chain_id: self.chain_id,
+                link_id: self.link_id,
+                revision: self.revision,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(
     rename_all = "snake_case",
     deny_unknown_fields,
@@ -1326,11 +2555,26 @@ impl TryFrom<PromptChainEventSerde> for PromptChainEvent {
                 chain_id,
                 links,
                 revision,
-            } => Self::PromptChainLinksReplaced {
-                chain_id,
-                links,
-                revision,
-            },
+            } => {
+                if links.len() > MAX_PROMPT_CHAIN_LINKS {
+                    return Err("prompt chain contains too many links".into());
+                }
+                let mut checked_links = Vec::with_capacity(links.len());
+                for link in links {
+                    checked_links.push(PromptChainLink::store_issued(
+                        link.id,
+                        link.chain_id,
+                        link.position,
+                        link.prompt_id,
+                        link.prompt_version_id,
+                    ));
+                }
+                Self::PromptChainLinksReplaced {
+                    chain_id,
+                    links: checked_links,
+                    revision,
+                }
+            }
             PromptChainEventSerde::PromptChainArchived {
                 chain_id,
                 archived_at_ms,
@@ -1361,28 +2605,131 @@ impl PromptChainEvent {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PromptCodecError> {
-        rmp_serde::to_vec_named(&PromptChainEventWire {
-            schema_version: PROMPT_WIRE_SCHEMA_VERSION,
-            event: self,
-        })
-        .map_err(|_| PromptCodecError("prompt chain event encoding failed".into()))
+        validate_chain_event_wire(self)
+            .map_err(|_| PromptCodecError("prompt chain event validation failed".into()))?;
+        bounded_wire_encode(
+            &PromptChainEventWire {
+                schema_version: PROMPT_WIRE_SCHEMA_VERSION,
+                event: self,
+            },
+            "prompt chain event encoding failed",
+        )
     }
 
+    /// Decode a structurally checked event. Link ownership and prompt/version
+    /// lineage remain a store concern and are not settled by this codec.
     pub fn decode(payload: &[u8]) -> Result<Self, PromptCodecError> {
-        let wire: PromptChainEventWire<PromptChainEvent> = rmp_serde::from_slice(payload)
+        validate_wire_payload_size(payload)?;
+        let wire: PromptChainEventWire<PromptChainEventSerde> = rmp_serde::from_slice(payload)
             .map_err(|_| PromptCodecError("prompt chain event decoding failed".into()))?;
         if wire.schema_version != PROMPT_WIRE_SCHEMA_VERSION {
             return Err(PromptCodecError(
                 "unsupported prompt chain event schema".into(),
             ));
         }
-        let canonical = wire.event.encode()?;
+        let event = PromptChainEvent::try_from(wire.event)
+            .map_err(|_| PromptCodecError("prompt chain event validation failed".into()))?;
+        let canonical = event.encode()?;
         if canonical != payload {
             return Err(PromptCodecError(
                 "prompt chain event payload is not canonical".into(),
             ));
         }
-        Ok(wire.event)
+        Ok(event)
+    }
+}
+
+impl Serialize for PromptChainEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_chain_event_wire(self).map_err(S::Error::custom)?;
+        let wire = match self {
+            Self::PromptChainCreated { chain } => {
+                PromptChainEventSerializeWire::PromptChainCreated { chain }
+            }
+            Self::PromptChainRenamed {
+                chain_id,
+                title,
+                revision,
+            } => PromptChainEventSerializeWire::PromptChainRenamed {
+                chain_id: *chain_id,
+                title,
+                revision: *revision,
+            },
+            Self::PromptChainLinksReplaced {
+                chain_id,
+                links,
+                revision,
+            } => PromptChainEventSerializeWire::PromptChainLinksReplaced {
+                chain_id: *chain_id,
+                links,
+                revision: *revision,
+            },
+            Self::PromptChainArchived {
+                chain_id,
+                archived_at_ms,
+                revision,
+            } => PromptChainEventSerializeWire::PromptChainArchived {
+                chain_id: *chain_id,
+                archived_at_ms: *archived_at_ms,
+                revision: *revision,
+            },
+            Self::PromptChainRestored { chain_id, revision } => {
+                PromptChainEventSerializeWire::PromptChainRestored {
+                    chain_id: *chain_id,
+                    revision: *revision,
+                }
+            }
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl fmt::Debug for PromptChainEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PromptChainCreated { chain } => f
+                .debug_struct("PromptChainEvent::PromptChainCreated")
+                .field("chain", chain)
+                .finish(),
+            Self::PromptChainRenamed {
+                chain_id,
+                title,
+                revision,
+            } => f
+                .debug_struct("PromptChainEvent::PromptChainRenamed")
+                .field("chain_id", chain_id)
+                .field("title_bytes", &title.len())
+                .field("revision", revision)
+                .finish(),
+            Self::PromptChainLinksReplaced {
+                chain_id,
+                links,
+                revision,
+            } => f
+                .debug_struct("PromptChainEvent::PromptChainLinksReplaced")
+                .field("chain_id", chain_id)
+                .field("link_count", &links.len())
+                .field("revision", revision)
+                .finish(),
+            Self::PromptChainArchived {
+                chain_id,
+                archived_at_ms,
+                revision,
+            } => f
+                .debug_struct("PromptChainEvent::PromptChainArchived")
+                .field("chain_id", chain_id)
+                .field("archived_at_ms", archived_at_ms)
+                .field("revision", revision)
+                .finish(),
+            Self::PromptChainRestored { chain_id, revision } => f
+                .debug_struct("PromptChainEvent::PromptChainRestored")
+                .field("chain_id", chain_id)
+                .field("revision", revision)
+                .finish(),
+        }
     }
 }
 
@@ -1391,6 +2738,238 @@ fn validate_expected_revision(revision: u64) -> Result<(), PromptValidationError
         Err(PromptValidationError::ExpectedRevisionZero)
     } else {
         Ok(())
+    }
+}
+
+fn validate_wire_payload_size(payload: &[u8]) -> Result<(), PromptCodecError> {
+    if payload.len() > MAX_PROMPT_WIRE_BYTES {
+        return Err(PromptCodecError(
+            "prompt wire payload exceeds configured limit".into(),
+        ));
+    }
+    MessagePackPreflight::new(payload).run()
+}
+
+fn bounded_wire_encode<T: Serialize>(
+    value: &T,
+    error_message: &'static str,
+) -> Result<Vec<u8>, PromptCodecError> {
+    let payload =
+        rmp_serde::to_vec_named(value).map_err(|_| PromptCodecError(error_message.into()))?;
+    if payload.len() > MAX_PROMPT_WIRE_BYTES {
+        return Err(PromptCodecError(
+            "prompt wire payload exceeds configured limit".into(),
+        ));
+    }
+    Ok(payload)
+}
+
+struct MessagePackPreflight<'a> {
+    payload: &'a [u8],
+    offset: usize,
+    depth: usize,
+    nodes: usize,
+}
+
+impl<'a> MessagePackPreflight<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            depth: 0,
+            nodes: 0,
+        }
+    }
+
+    fn run(mut self) -> Result<(), PromptCodecError> {
+        self.visit_value(0)?;
+        if self.offset != self.payload.len() {
+            return Err(Self::error());
+        }
+        Ok(())
+    }
+
+    fn visit_value(&mut self, depth: usize) -> Result<(), PromptCodecError> {
+        if depth > MAX_PROMPT_WIRE_DEPTH {
+            return Err(Self::error());
+        }
+        self.depth = self.depth.max(depth);
+        self.nodes = self.nodes.checked_add(1).ok_or_else(Self::error)?;
+        if self.nodes > MAX_PROMPT_WIRE_NODES {
+            return Err(Self::error());
+        }
+        let marker = self.read_u8()?;
+        match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => Ok(()),
+            0xc1 => Err(Self::error()),
+            0xcc | 0xd0 => self.skip(1),
+            0xcd | 0xd1 => self.skip(2),
+            0xce | 0xd2 => self.skip(4),
+            0xcf | 0xd3 => self.skip(8),
+            0xca => self.skip(4),
+            0xcb => self.skip(8),
+            0xd4 => self.skip_ext(1),
+            0xd5 => self.skip_ext(2),
+            0xd6 => self.skip_ext(4),
+            0xd7 => self.skip_ext(8),
+            0xd8 => self.skip_ext(16),
+            0xc7 => {
+                let length = self.read_u8()? as usize;
+                self.visit_ext(length)
+            }
+            0xc8 => {
+                let length = self.read_u16()? as usize;
+                self.visit_ext(length)
+            }
+            0xc9 => {
+                let length = self.read_u32()? as usize;
+                self.visit_ext(length)
+            }
+            0xa0..=0xbf => self.visit_string((marker & 0x1f) as usize),
+            0xd9 => {
+                let length = self.read_u8()? as usize;
+                self.visit_string(length)
+            }
+            0xda => {
+                let length = self.read_u16()? as usize;
+                self.visit_string(length)
+            }
+            0xdb => {
+                let length = self.read_u32()? as usize;
+                self.visit_string(length)
+            }
+            0xc4 => {
+                let length = self.read_u8()? as usize;
+                self.visit_bin(length)
+            }
+            0xc5 => {
+                let length = self.read_u16()? as usize;
+                self.visit_bin(length)
+            }
+            0xc6 => {
+                let length = self.read_u32()? as usize;
+                self.visit_bin(length)
+            }
+            0x90..=0x9f => self.visit_array((marker & 0x0f) as usize, depth + 1),
+            0xdc => {
+                let count = self.read_u16()? as usize;
+                self.visit_array(count, depth + 1)
+            }
+            0xdd => {
+                let count = self.read_u32()? as usize;
+                self.visit_array(count, depth + 1)
+            }
+            0x80..=0x8f => self.visit_map((marker & 0x0f) as usize, depth + 1),
+            0xde => {
+                let count = self.read_u16()? as usize;
+                self.visit_map(count, depth + 1)
+            }
+            0xdf => {
+                let count = self.read_u32()? as usize;
+                self.visit_map(count, depth + 1)
+            }
+        }
+    }
+
+    fn visit_array(&mut self, count: usize, depth: usize) -> Result<(), PromptCodecError> {
+        if count > MAX_PROMPT_WIRE_COLLECTION_ITEMS {
+            return Err(Self::error());
+        }
+        for _ in 0..count {
+            self.visit_value(depth)?;
+        }
+        Ok(())
+    }
+
+    fn visit_map(&mut self, count: usize, depth: usize) -> Result<(), PromptCodecError> {
+        if count > MAX_PROMPT_WIRE_MAP_ENTRIES {
+            return Err(Self::error());
+        }
+        let mut keys = HashSet::with_capacity(count);
+        for _ in 0..count {
+            let key = self.read_string()?.to_vec();
+            if !keys.insert(key) {
+                return Err(Self::error());
+            }
+            self.visit_value(depth)?;
+        }
+        Ok(())
+    }
+
+    fn visit_string(&mut self, length: usize) -> Result<(), PromptCodecError> {
+        if length > MAX_PROMPT_WIRE_STRING_BYTES {
+            return Err(Self::error());
+        }
+        let bytes = self.take(length)?;
+        std::str::from_utf8(bytes).map_err(|_| Self::error())?;
+        Ok(())
+    }
+
+    fn read_string(&mut self) -> Result<&'a [u8], PromptCodecError> {
+        let marker = self.read_u8()?;
+        let length = match marker {
+            0xa0..=0xbf => (marker & 0x1f) as usize,
+            0xd9 => self.read_u8()? as usize,
+            0xda => self.read_u16()? as usize,
+            0xdb => self.read_u32()? as usize,
+            _ => return Err(Self::error()),
+        };
+        if length > MAX_PROMPT_WIRE_STRING_BYTES {
+            return Err(Self::error());
+        }
+        let bytes = self.take(length)?;
+        std::str::from_utf8(bytes).map_err(|_| Self::error())?;
+        Ok(bytes)
+    }
+
+    fn visit_bin(&mut self, length: usize) -> Result<(), PromptCodecError> {
+        if length > MAX_PROMPT_WIRE_BIN_BYTES {
+            return Err(Self::error());
+        }
+        self.skip(length)
+    }
+
+    fn visit_ext(&mut self, length: usize) -> Result<(), PromptCodecError> {
+        if length > MAX_PROMPT_WIRE_EXT_BYTES {
+            return Err(Self::error());
+        }
+        self.skip_ext(length)
+    }
+
+    fn skip_ext(&mut self, length: usize) -> Result<(), PromptCodecError> {
+        self.skip(length.checked_add(1).ok_or_else(Self::error)?)
+    }
+
+    fn skip(&mut self, length: usize) -> Result<(), PromptCodecError> {
+        self.take(length).map(|_| ())
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PromptCodecError> {
+        let end = self.offset.checked_add(length).ok_or_else(Self::error)?;
+        if end > self.payload.len() {
+            return Err(Self::error());
+        }
+        let bytes = &self.payload[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, PromptCodecError> {
+        Ok(*self.take(1)?.first().ok_or_else(Self::error)?)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, PromptCodecError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, PromptCodecError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn error() -> PromptCodecError {
+        PromptCodecError("prompt wire payload is malformed or exceeds bounds".into())
     }
 }
 
@@ -1444,12 +3023,6 @@ fn validate_canonical_description(description: Option<&str>, max: usize) -> Resu
     Ok(())
 }
 
-/// Prompt metadata uses Rust's Unicode whitespace definition at every boundary.
-/// The SQLite migration mirrors this exact codepoint set with `char(...)`.
-pub fn trim_prompt_whitespace(value: &str) -> &str {
-    value.trim_matches(char::is_whitespace)
-}
-
 fn validate_canonical_tags(tags: &[String]) -> Result<(), String> {
     let normalized = normalized_tags(tags).map_err(|error| error.to_string())?;
     if normalized != tags {
@@ -1486,10 +3059,24 @@ fn validate_canonical_chain_metadata(title: &str, description: Option<&str>) -> 
 }
 
 fn validate_saved_prompt_wire(wire: &SavedPromptWire) -> Result<(), String> {
-    if wire.revision == 0 {
+    validate_saved_prompt_values(
+        wire.revision,
+        &wire.title,
+        wire.description.as_deref(),
+        &wire.tags,
+    )
+}
+
+fn validate_saved_prompt_values(
+    revision: u64,
+    title: &str,
+    description: Option<&str>,
+    tags: &[String],
+) -> Result<(), String> {
+    if revision == 0 {
         return Err("saved prompt revision must be positive".into());
     }
-    validate_canonical_prompt_metadata(&wire.title, wire.description.as_deref(), &wire.tags, &[])
+    validate_canonical_prompt_metadata(title, description, tags, &[])
 }
 
 fn validate_prompt_version_wire(version: &PromptVersion) -> Result<(), String> {
@@ -1515,9 +3102,98 @@ fn validate_prompt_command_wire(command: &CreatePrompt) -> Result<(), String> {
     )
 }
 
+fn validate_prompt_command_canonical(command: &PromptCommand) -> Result<(), String> {
+    match command {
+        PromptCommand::CreatePrompt(command) => validate_prompt_command_wire(command),
+        PromptCommand::CreatePromptVersion(command) => {
+            validate_canonical_variables(&command.variables)
+        }
+        PromptCommand::RenamePrompt(command) => {
+            validate_canonical_title(&command.title, MAX_PROMPT_TITLE_SCALARS)
+        }
+        PromptCommand::SetPromptTags(command) => validate_canonical_tags(&command.tags),
+        PromptCommand::ArchivePrompt(_) | PromptCommand::RestorePrompt(_) => Ok(()),
+    }
+}
+
+fn validate_chain_command_canonical(command: &PromptChainCommand) -> Result<(), String> {
+    match command {
+        PromptChainCommand::CreatePromptChain(command) => {
+            command.validate().map_err(|error| error.to_string())?;
+            validate_canonical_chain_metadata(&command.title, command.description.as_deref())
+        }
+        PromptChainCommand::RenamePromptChain(command) => {
+            command.validate().map_err(|error| error.to_string())?;
+            validate_canonical_title(&command.title, MAX_PROMPT_CHAIN_TITLE_SCALARS)
+        }
+        PromptChainCommand::InsertPromptChainLink(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+        PromptChainCommand::MovePromptChainLink(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+        PromptChainCommand::RemovePromptChainLink(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+        PromptChainCommand::UpdatePromptChainLinkVersion(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+        PromptChainCommand::ArchivePromptChain(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+        PromptChainCommand::RestorePromptChain(command) => {
+            validate_expected_revision(command.expected_revision).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn validate_chain_command_resolution_model(
+    command: &PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+) -> Result<(), String> {
+    match command {
+        PromptChainCommand::InsertPromptChainLink(command) => {
+            if command.prompt_version_id.is_none()
+                || command.prompt_version_id != resolved_prompt_version_id
+            {
+                return Err(
+                    "prompt chain insert command has no exact resolved prompt version".into(),
+                );
+            }
+        }
+        PromptChainCommand::UpdatePromptChainLinkVersion(_) => {
+            if resolved_prompt_version_id.is_none() {
+                return Err(
+                    "prompt chain update command has no exact resolved prompt version".into(),
+                );
+            }
+        }
+        PromptChainCommand::CreatePromptChain(_)
+        | PromptChainCommand::RenamePromptChain(_)
+        | PromptChainCommand::MovePromptChainLink(_)
+        | PromptChainCommand::RemovePromptChainLink(_)
+        | PromptChainCommand::ArchivePromptChain(_)
+        | PromptChainCommand::RestorePromptChain(_) => {
+            if resolved_prompt_version_id.is_some() {
+                return Err(
+                    "prompt chain command has an unexpected resolved prompt version".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_prompt_event_wire(event: &PromptEvent) -> Result<(), String> {
     match event {
         PromptEvent::PromptCreated { prompt, version } => {
+            validate_saved_prompt_values(
+                prompt.revision,
+                &prompt.title,
+                prompt.description.as_deref(),
+                &prompt.tags,
+            )?;
+            validate_prompt_version_wire(version)?;
             if prompt.revision != 1
                 || prompt.archived_at_ms.is_some()
                 || prompt.current_version_id != version.id
@@ -1528,10 +3204,11 @@ fn validate_prompt_event_wire(event: &PromptEvent) -> Result<(), String> {
             }
         }
         PromptEvent::PromptVersionCreated {
-            prompt_id,
             version,
+            prompt_id,
             revision,
         } => {
+            validate_prompt_version_wire(version)?;
             if *revision == 0 || version.prompt_id != *prompt_id {
                 return Err("prompt version event lineage is invalid".into());
             }
@@ -1585,18 +3262,15 @@ fn validate_chain_event_wire(event: &PromptChainEvent) -> Result<(), String> {
                 return Err("prompt chain links event revision is invalid".into());
             }
             if links.len() > MAX_PROMPT_CHAIN_LINKS {
-                return Err(format!(
-                    "prompt chain exceeds maximum of {MAX_PROMPT_CHAIN_LINKS} links"
-                ));
+                return Err("prompt chain contains too many links".into());
             }
+            let mut seen = HashSet::with_capacity(links.len());
             for (position, link) in links.iter().enumerate() {
                 let expected_position =
                     u32::try_from(position).map_err(|_| "prompt chain is too long".to_string())?;
-                if link.chain_id != *chain_id
-                    || link.position != expected_position
-                    || links[..position]
-                        .iter()
-                        .any(|previous| previous.id == link.id)
+                if link.chain_id() != *chain_id
+                    || link.position() != expected_position
+                    || !seen.insert(link.id())
                 {
                     return Err("prompt chain links must be a dense ordered prefix".into());
                 }

@@ -727,7 +727,9 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair
   WHEN NEW.blocked = 0 AND EXISTS (
     SELECT 1
     FROM prompt_lineage_quarantine_ledger AS ledger
-    WHERE NOT EXISTS (
+    WHERE ledger.command_sha256 = zeroblob(32)
+      OR (
+      NOT EXISTS (
       SELECT 1
       FROM prompt_lineage_quarantine AS quarantine
       WHERE quarantine.quarantine_id = ledger.quarantine_id
@@ -792,6 +794,7 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair
         )
       )
     )
+      )
   )\n\
 BEGIN
   SELECT RAISE(ABORT, 'prompt lineage requires ledger-backed exact repair before unblock');
@@ -821,7 +824,8 @@ CREATE TRIGGER prompt_lineage_migration_state_unblock_requires_ledger_repair_ins
   BEFORE INSERT ON prompt_lineage_migration_state
   WHEN NEW.blocked = 0 AND EXISTS (
     SELECT 1 FROM prompt_lineage_quarantine_ledger AS ledger
-    WHERE NOT EXISTS (
+    WHERE ledger.command_sha256 = zeroblob(32)
+      OR NOT EXISTS (
       SELECT 1 FROM prompt_lineage_quarantine AS quarantine
       WHERE quarantine.quarantine_id = ledger.quarantine_id
         AND quarantine.source_kind = ledger.source_kind
@@ -1707,7 +1711,10 @@ mod tests {
                          ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 1)",
                         rusqlite::params![
                             prompt_command_id.as_bytes().as_slice(),
-                            prompt_command.fingerprint().as_slice(),
+                            prompt_command
+                                .fingerprint()
+                                .expect("legacy prompt command fingerprint")
+                                .as_slice(),
                             prompt_id.as_bytes().as_slice(),
                             prompt_version_id.as_bytes().as_slice(),
                             prompt_receipt.encode().expect("legacy prompt receipt"),
@@ -1735,7 +1742,10 @@ mod tests {
                          ) VALUES (?1, ?2, ?3, NULL, 1, ?4, 1)",
                         rusqlite::params![
                             chain_command_id.as_bytes().as_slice(),
-                            chain_command.fingerprint().as_slice(),
+                            chain_command
+                                .fingerprint()
+                                .expect("legacy chain command fingerprint")
+                                .as_slice(),
                             chain_id.as_bytes().as_slice(),
                             chain_receipt.encode().expect("legacy chain receipt"),
                         ],

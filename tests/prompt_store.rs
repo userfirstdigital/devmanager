@@ -5,7 +5,7 @@ use devmanager::domain::{
 };
 use devmanager::prompts::{
     ArchivePrompt, CreatePrompt, CreatePromptChain, CreatePromptVersion, InsertPromptChainLink,
-    MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent, PromptChainLink,
+    MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent,
     PromptChainMutationReceipt, PromptCommand, PromptEvent, PromptMutationReceipt, PromptStore,
     PromptStoreError, PromptValidationError, PromptVersion, RemovePromptChainLink, RenamePrompt,
     RestorePrompt, SavedPrompt, SetPromptTags, UpdatePromptChainLinkVersion,
@@ -27,6 +27,96 @@ struct PromptChainCommandWireOwned {
     schema_version: u32,
     command: PromptChainCommand,
     resolved_prompt_version_id: Option<PromptVersionId>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptChainEventWire {
+    schema_version: u32,
+    event: RawPromptChainEvent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RawPromptChainEvent {
+    PromptChainCreated {
+        chain: RawPromptChain,
+    },
+    PromptChainLinksReplaced {
+        chain_id: PromptChainId,
+        links: Vec<RawPromptChainLink>,
+        revision: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptChainLink {
+    id: PromptChainLinkId,
+    chain_id: PromptChainId,
+    position: u32,
+    prompt_id: PromptId,
+    prompt_version_id: PromptVersionId,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptEventWire {
+    schema_version: u32,
+    event: RawPromptEvent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RawPromptEvent {
+    PromptCreated {
+        prompt: RawSavedPrompt,
+        version: PromptVersion,
+    },
+    PromptRenamed {
+        prompt_id: PromptId,
+        title: String,
+        revision: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawSavedPrompt {
+    id: PromptId,
+    title: String,
+    description: Option<String>,
+    tags: Vec<String>,
+    current_version_id: PromptVersionId,
+    revision: u64,
+    archived_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptChain {
+    id: PromptChainId,
+    title: String,
+    description: Option<String>,
+    revision: u64,
+    archived_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptCommandWire {
+    schema_version: u32,
+    command: RawPromptCommand,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RawPromptCommand {
+    SetPromptTags {
+        prompt_id: PromptId,
+        tags: Vec<String>,
+        expected_revision: u64,
+    },
 }
 
 fn db_path(dir: &TempDir) -> PathBuf {
@@ -101,6 +191,45 @@ fn canonical_create_prompt(prompt_id: PromptId, version_id: PromptVersionId) -> 
 
 fn open_store(path: &Path) -> PromptStore {
     PromptStore::open(path).expect("open isolated prompt store")
+}
+
+#[test]
+fn prompt_store_debug_is_opaque_and_does_not_leak_database_metadata() {
+    let temp_dir = TempDir::new().expect("create isolated prompt store directory");
+    let database_path = temp_dir
+        .path()
+        .join("PROMPT_STORE_DEBUG_ATTACKER_SENTINEL.sqlite3");
+    let store = open_store(&database_path);
+
+    let rendered = format!("{store:?}");
+    let database_path_text = database_path.to_string_lossy().into_owned();
+    let database_name = database_path
+        .file_name()
+        .expect("database filename")
+        .to_string_lossy()
+        .into_owned();
+    let parent_path = database_path
+        .parent()
+        .expect("database parent")
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(rendered, "PromptStore");
+    for (label, forbidden) in [
+        ("database path", database_path_text),
+        ("database basename", database_name),
+        ("database parent", parent_path),
+        (
+            "attacker sentinel",
+            "PROMPT_STORE_DEBUG_ATTACKER_SENTINEL".into(),
+        ),
+        ("connection details", "Connection".into()),
+    ] {
+        assert!(
+            !rendered.contains(&forbidden),
+            "PromptStore Debug leaked {label}: {rendered}"
+        );
+    }
 }
 
 fn write_id_bytes(buffer: &mut Vec<u8>, id: &[u8; 16]) {
@@ -1009,18 +1138,23 @@ fn projection_rejects_noncanonical_prompt_created_event() {
     let command = command_id(103);
     let version =
         PromptVersion::new(version_id, prompt, 1, "body".into(), 1).expect("valid version");
-    let event = PromptEvent::PromptCreated {
-        prompt: SavedPrompt {
-            id: prompt,
-            title: "  noncanonical title  ".into(),
-            description: None,
-            tags: Vec::new(),
-            current_version_id: version_id,
-            revision: 1,
-            archived_at_ms: None,
+    let event_type = "prompt.created";
+    let event_payload = rmp_serde::to_vec_named(&RawPromptEventWire {
+        schema_version: 1,
+        event: RawPromptEvent::PromptCreated {
+            prompt: RawSavedPrompt {
+                id: prompt,
+                title: "  noncanonical title  ".into(),
+                description: None,
+                tags: Vec::new(),
+                current_version_id: version_id,
+                revision: 1,
+                archived_at_ms: None,
+            },
+            version,
         },
-        version,
-    };
+    })
+    .expect("noncanonical event payload");
 
     drop(open_store(&path));
     let conn = Connection::open(&path).expect("open isolated raw connection");
@@ -1063,9 +1197,9 @@ fn projection_rejects_noncanonical_prompt_created_event() {
             EventId::new().as_bytes().as_slice(),
             command.as_bytes().as_slice(),
             prompt.as_bytes().as_slice(),
-            event.event_type(),
+            event_type,
             1_i64,
-            event.encode().expect("event payload"),
+            event_payload,
         ],
     )
     .expect("insert event");
@@ -1088,11 +1222,16 @@ fn projection_rejects_noncanonical_prompt_mutation_event() {
     drop(store);
 
     let command = command_id(110);
-    let event = PromptEvent::PromptRenamed {
-        prompt_id: prompt,
-        title: "  noncanonical title  ".into(),
-        revision: 2,
-    };
+    let event_type = "prompt.renamed";
+    let event_payload = rmp_serde::to_vec_named(&RawPromptEventWire {
+        schema_version: 1,
+        event: RawPromptEvent::PromptRenamed {
+            prompt_id: prompt,
+            title: "  noncanonical title  ".into(),
+            revision: 2,
+        },
+    })
+    .expect("noncanonical mutation event payload");
     let conn = Connection::open(&path).expect("open isolated raw connection");
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("foreign keys");
@@ -1131,9 +1270,9 @@ fn projection_rejects_noncanonical_prompt_mutation_event() {
             EventId::new().as_bytes().as_slice(),
             command.as_bytes().as_slice(),
             prompt.as_bytes().as_slice(),
-            event.event_type(),
+            event_type,
             2_i64,
-            event.encode().expect("event payload"),
+            event_payload,
         ],
     )
     .expect("insert event");
@@ -1523,24 +1662,24 @@ fn chain_pins_current_versions_and_exposes_previous_next_context() {
 
     let links = store.list_chain_links(chain).expect("list chain links");
     assert_eq!(
-        links.iter().map(|link| link.position).collect::<Vec<_>>(),
+        links.iter().map(|link| link.position()).collect::<Vec<_>>(),
         vec![0, 1]
     );
-    assert_eq!(links[0].prompt_version_id, first_version);
-    assert_eq!(links[1].prompt_version_id, version_id(148));
+    assert_eq!(links[0].prompt_version_id(), first_version);
+    assert_eq!(links[1].prompt_version_id(), version_id(148));
 
     let first_context = store
-        .get_chain_link_context(chain, links[0].id)
+        .get_chain_link_context(chain, links[0].id())
         .expect("first context")
         .expect("first link");
     assert_eq!(first_context.previous_link_id, None);
-    assert_eq!(first_context.next_link_id, Some(links[1].id));
+    assert_eq!(first_context.next_link_id, Some(links[1].id()));
     assert!(first_context.update_available);
     let last_context = store
-        .get_chain_link_context(chain, links[1].id)
+        .get_chain_link_context(chain, links[1].id())
         .expect("last context")
         .expect("last link");
-    assert_eq!(last_context.previous_link_id, Some(links[0].id));
+    assert_eq!(last_context.previous_link_id, Some(links[0].id()));
     assert_eq!(last_context.next_link_id, None);
     assert!(!last_context.update_available);
 }
@@ -1581,7 +1720,7 @@ fn chain_insert_move_remove_keeps_dense_order() {
             .list_chain_links(chain)
             .unwrap()
             .iter()
-            .map(|link| link.id)
+            .map(|link| link.id())
             .collect::<Vec<_>>(),
         vec![link_id(157), link_id(161), link_id(159)]
     );
@@ -1602,7 +1741,7 @@ fn chain_insert_move_remove_keeps_dense_order() {
             .list_chain_links(chain)
             .unwrap()
             .iter()
-            .map(|link| link.id)
+            .map(|link| link.id())
             .collect::<Vec<_>>(),
         vec![link_id(159), link_id(157), link_id(161)]
     );
@@ -1619,11 +1758,11 @@ fn chain_insert_move_remove_keeps_dense_order() {
         .expect("remove link");
     let links = store.list_chain_links(chain).unwrap();
     assert_eq!(
-        links.iter().map(|link| link.position).collect::<Vec<_>>(),
+        links.iter().map(|link| link.position()).collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(
-        links.iter().map(|link| link.id).collect::<Vec<_>>(),
+        links.iter().map(|link| link.id()).collect::<Vec<_>>(),
         vec![link_id(159), link_id(161)]
     );
 }
@@ -1730,7 +1869,7 @@ fn chain_update_to_current_is_explicit_and_replayable() {
         )
         .expect("new prompt version");
     assert_eq!(
-        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id(),
         first
     );
 
@@ -1745,14 +1884,14 @@ fn chain_update_to_current_is_explicit_and_replayable() {
         )
         .expect("explicit update");
     assert_eq!(
-        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id(),
         second
     );
     store
         .rebuild_projection()
         .expect("rebuild all prompt projections");
     assert_eq!(
-        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id(),
         second
     );
 }
@@ -1814,7 +1953,7 @@ fn rebuild_chain_insert_uses_the_pinned_version_after_a_later_version() {
         .rebuild_projection()
         .expect("rebuild must use the durable link effect");
     assert_eq!(
-        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id(),
         first
     );
 }
@@ -1897,7 +2036,7 @@ fn rebuild_chain_update_uses_the_version_pinned_by_the_effect() {
         .rebuild_projection()
         .expect("rebuild must use the durable update effect");
     assert_eq!(
-        store.list_chain_links(chain).unwrap()[0].prompt_version_id,
+        store.list_chain_links(chain).unwrap()[0].prompt_version_id(),
         second
     );
 }
@@ -2135,15 +2274,20 @@ fn replay_rejects_untrimmed_chain_title_and_description() {
     let path = db_path(&dir);
     let chain = chain_id(221);
     let command = command_id(222);
-    let event = PromptChainEvent::PromptChainCreated {
-        chain: PromptChain {
-            id: chain,
-            title: " Chain ".into(),
-            description: Some(" description ".into()),
-            revision: 1,
-            archived_at_ms: None,
+    let event_type = "prompt_chain.created";
+    let event_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainCreated {
+            chain: RawPromptChain {
+                id: chain,
+                title: " Chain ".into(),
+                description: Some(" description ".into()),
+                revision: 1,
+                archived_at_ms: None,
+            },
         },
-    };
+    })
+    .expect("untrimmed chain event payload");
     let receipt = PromptChainMutationReceipt {
         command_id: command,
         chain_id: chain,
@@ -2194,9 +2338,9 @@ fn replay_rejects_untrimmed_chain_title_and_description() {
             EventId::new().as_bytes().as_slice(),
             command.as_bytes().as_slice(),
             chain.as_bytes().as_slice(),
-            event.event_type(),
+            event_type,
             1_i64,
-            event.encode().expect("chain event payload"),
+            event_payload,
         ],
     )
     .expect("seed chain event");
@@ -2391,17 +2535,21 @@ fn replay_rejects_chain_links_not_derived_from_exact_command() {
         .expect("insert chain link pinned to first version");
     drop(store);
 
-    let forged_event = PromptChainEvent::PromptChainLinksReplaced {
-        chain_id: chain,
-        links: vec![PromptChainLink {
-            id: link,
+    let forged_event_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainLinksReplaced {
             chain_id: chain,
-            position: 0,
-            prompt_id: prompt,
-            prompt_version_id: second_version,
-        }],
-        revision: 2,
-    };
+            links: vec![RawPromptChainLink {
+                id: link,
+                chain_id: chain,
+                position: 0,
+                prompt_id: prompt,
+                prompt_version_id: second_version,
+            }],
+            revision: 2,
+        },
+    })
+    .expect("forge event payload");
     let conn = Connection::open(&path).expect("open isolated raw connection");
     conn.execute_batch("DROP TRIGGER prompt_chain_events_immutable_update")
         .expect("disable append-only trigger for corruption fixture");
@@ -2409,7 +2557,7 @@ fn replay_rejects_chain_links_not_derived_from_exact_command() {
         "UPDATE prompt_chain_events SET payload = ?1
          WHERE command_id = ?2 AND event_type = 'prompt_chain.links_replaced'",
         rusqlite::params![
-            forged_event.encode().expect("forged event payload"),
+            forged_event_payload,
             insert_command_id.as_bytes().as_slice(),
         ],
     )
@@ -3270,15 +3418,20 @@ fn replay_rejects_archived_chain_create_event() {
     let path = db_path(&dir);
     let chain = chain_id(244);
     let command = command_id(245);
-    let event = PromptChainEvent::PromptChainCreated {
-        chain: PromptChain {
-            id: chain,
-            title: "Archived chain".into(),
-            description: None,
-            revision: 1,
-            archived_at_ms: Some(9),
+    let event_type = "prompt_chain.created";
+    let event_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainCreated {
+            chain: RawPromptChain {
+                id: chain,
+                title: "Archived chain".into(),
+                description: None,
+                revision: 1,
+                archived_at_ms: Some(9),
+            },
         },
-    };
+    })
+    .expect("archived chain event payload");
     let receipt = PromptChainMutationReceipt {
         command_id: command,
         chain_id: chain,
@@ -3324,9 +3477,9 @@ fn replay_rejects_archived_chain_create_event() {
             EventId::new().as_bytes().as_slice(),
             command.as_bytes().as_slice(),
             chain.as_bytes().as_slice(),
-            event.event_type(),
+            event_type,
             1_i64,
-            event.encode().expect("archived chain event payload"),
+            event_payload,
         ],
     )
     .expect("seed archived chain event");
@@ -3576,6 +3729,69 @@ fn sqlite_rejects_unblocking_unrepaired_lineage_quarantine() {
     let error = PromptStore::open(&path)
         .expect_err("unrepaired lineage quarantine must keep the prompt store blocked");
     assert!(matches!(error, PromptStoreError::Corruption(_)));
+}
+
+#[test]
+fn sqlite_rejects_zero_hash_legacy_repair_without_external_authority() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let prompt = prompt_id(245);
+    let version = version_id(246);
+    let receipt_command = command_id(247);
+    let mut store = open_store(&path);
+    store
+        .execute(receipt_command, create_prompt(prompt, version))
+        .expect("create canonical receipt");
+    drop(store);
+
+    let conn = Connection::open(&path).expect("open isolated schema");
+    conn.execute_batch(
+        "DROP TRIGGER prompt_command_receipts_immutable_update;
+         DROP TRIGGER prompt_lineage_quarantine_append_only_insert;
+         DROP TRIGGER prompt_lineage_quarantine_ledger_immutable_insert;",
+    )
+    .expect("disable immutable guards for zero-hash legacy fixture");
+    conn.execute(
+        "UPDATE prompt_command_receipts
+         SET command_sha256 = zeroblob(32)
+         WHERE command_id = ?1",
+        [receipt_command.as_bytes().as_slice()],
+    )
+    .expect("seed unknown legacy digest");
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine(
+            source_kind, command_id, event_id, reason, command_sha256, quarantined_at_ms
+         ) VALUES ('prompt_receipt', ?1, NULL, 'unknown legacy bytes', zeroblob(32), 1)",
+        [receipt_command.as_bytes().as_slice()],
+    )
+    .expect("seed zero-hash quarantine");
+    let quarantine_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO prompt_lineage_quarantine_ledger(
+            quarantine_id, source_kind, command_id, event_id, reason,
+            command_sha256, quarantined_at_ms
+         ) VALUES (?1, 'prompt_receipt', ?2, NULL, 'unknown legacy bytes', zeroblob(32), 1)",
+        rusqlite::params![quarantine_id, receipt_command.as_bytes().as_slice()],
+    )
+    .expect("seed zero-hash immutable ledger");
+    conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 1 WHERE singleton_key = 1",
+        [],
+    )
+    .expect("enter derived blocked state");
+    conn.execute(
+        "DELETE FROM prompt_lineage_quarantine WHERE quarantine_id = ?1",
+        [quarantine_id],
+    )
+    .expect("delete only through the audited repair transition");
+    let unblock = conn.execute(
+        "UPDATE prompt_lineage_migration_state SET blocked = 0 WHERE singleton_key = 1",
+        [],
+    );
+    assert!(
+        unblock.is_err(),
+        "zero-hash supplied bytes require explicit external/manual authority"
+    );
 }
 
 #[test]
@@ -3969,26 +4185,30 @@ fn replay_rejects_duplicate_chain_link_ids() {
             archived_at_ms: None,
         },
     };
-    let link_event = PromptChainEvent::PromptChainLinksReplaced {
-        chain_id: chain,
-        links: vec![
-            devmanager::prompts::PromptChainLink {
-                id: link,
-                chain_id: chain,
-                position: 0,
-                prompt_id: prompt_id(250),
-                prompt_version_id: version_id(251),
-            },
-            devmanager::prompts::PromptChainLink {
-                id: link,
-                chain_id: chain,
-                position: 1,
-                prompt_id: prompt_id(252),
-                prompt_version_id: version_id(253),
-            },
-        ],
-        revision: 2,
-    };
+    let link_event_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainLinksReplaced {
+            chain_id: chain,
+            links: vec![
+                RawPromptChainLink {
+                    id: link,
+                    chain_id: chain,
+                    position: 0,
+                    prompt_id: prompt_id(250),
+                    prompt_version_id: version_id(251),
+                },
+                RawPromptChainLink {
+                    id: link,
+                    chain_id: chain,
+                    position: 1,
+                    prompt_id: prompt_id(252),
+                    prompt_version_id: version_id(253),
+                },
+            ],
+            revision: 2,
+        },
+    })
+    .expect("duplicate-link event payload");
     let create_receipt = PromptChainMutationReceipt {
         command_id: create_command,
         chain_id: chain,
@@ -4036,7 +4256,18 @@ fn replay_rejects_duplicate_chain_link_ids() {
         )
         .expect("seed chain receipt");
     }
-    for (command, event) in [(create_command, create_event), (link_command, link_event)] {
+    for (command, event_type, event_payload) in [
+        (
+            create_command,
+            "prompt_chain.created",
+            create_event.encode().expect("chain-created event payload"),
+        ),
+        (
+            link_command,
+            "prompt_chain.links_replaced",
+            link_event_payload,
+        ),
+    ] {
         conn.execute(
             "INSERT INTO prompt_chain_events(
                 prompt_chain_event_id, command_id, chain_id, event_type,
@@ -4046,9 +4277,9 @@ fn replay_rejects_duplicate_chain_link_ids() {
                 EventId::new().as_bytes().as_slice(),
                 command.as_bytes().as_slice(),
                 chain.as_bytes().as_slice(),
-                event.event_type(),
+                event_type,
                 1_i64,
-                event.encode().expect("chain event payload"),
+                event_payload,
             ],
         )
         .expect("seed chain event");
@@ -4077,18 +4308,23 @@ fn replay_rejects_prompt_created_with_stale_current_pointer() {
     drop(store);
 
     let command = command_id(2);
-    let event = PromptEvent::PromptCreated {
-        prompt: SavedPrompt {
-            id: prompt,
-            title: "Review code".into(),
-            description: Some("A bounded local prompt".into()),
-            tags: vec!["rust".into(), "review".into()],
-            current_version_id: version_id(3),
-            revision: 1,
-            archived_at_ms: None,
+    let event_type = "prompt.created";
+    let event_payload = rmp_serde::to_vec_named(&RawPromptEventWire {
+        schema_version: 1,
+        event: RawPromptEvent::PromptCreated {
+            prompt: RawSavedPrompt {
+                id: prompt,
+                title: "Review code".into(),
+                description: Some("A bounded local prompt".into()),
+                tags: vec!["rust".into(), "review".into()],
+                current_version_id: version_id(3),
+                revision: 1,
+                archived_at_ms: None,
+            },
+            version: saved_version,
         },
-        version: saved_version,
-    };
+    })
+    .expect("stale prompt event payload");
     let receipt = PromptMutationReceipt {
         command_id: command,
         prompt_id: prompt,
@@ -4126,9 +4362,9 @@ fn replay_rejects_prompt_created_with_stale_current_pointer() {
             EventId::new().as_bytes().as_slice(),
             command.as_bytes().as_slice(),
             prompt.as_bytes().as_slice(),
-            event.event_type(),
+            event_type,
             1_i64,
-            event.encode().expect("stale prompt event payload"),
+            event_payload,
         ],
     )
     .expect("seed stale prompt event");
@@ -4387,14 +4623,15 @@ fn open_rejects_non_ascii_tag_in_durable_receipt_and_sql_projection() {
     assert!(sql_error.to_string().to_lowercase().contains("tag"));
 
     let command_id = command_id(13);
-    let command = PromptCommand::SetPromptTags(SetPromptTags {
-        prompt_id: prompt,
-        tags: vec!["café".into()],
-        expected_revision: 1,
-    });
-    let command_payload = command
-        .encode()
-        .expect("encode invalid durable command fixture");
+    let command_payload = rmp_serde::to_vec_named(&RawPromptCommandWire {
+        schema_version: 1,
+        command: RawPromptCommand::SetPromptTags {
+            prompt_id: prompt,
+            tags: vec!["café".into()],
+            expected_revision: 1,
+        },
+    })
+    .expect("encode invalid durable command fixture");
     let command_sha256: [u8; 32] = Sha256::digest(&command_payload).into();
     let receipt = PromptMutationReceipt {
         command_id,

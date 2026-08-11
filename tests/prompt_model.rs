@@ -1,16 +1,53 @@
 use devmanager::domain::{
-    PromptChainId, PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId,
+    CommandId, PromptChainId, PromptChainLinkId, PromptHistoryId, PromptId, PromptVersionId,
 };
 use devmanager::prompts::{
     ArchivePrompt, ArchivePromptChain, CreatePrompt, CreatePromptChain, CreatePromptVersion,
     InsertPromptChainLink, MovePromptChainLink, PromptChain, PromptChainCommand, PromptChainEvent,
-    PromptChainLink, PromptCommand, PromptValidationError, PromptVersion, RemovePromptChainLink,
-    RenamePrompt, RenamePromptChain, RestorePrompt, RestorePromptChain, SetPromptTags,
-    UpdatePromptChainLinkVersion, MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS,
-    MAX_PROMPT_CHAIN_LINKS, MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS,
-    MAX_PROMPT_PUBLIC_WIRE_BYTES, MAX_PROMPT_TAGS, MAX_PROMPT_TAG_SCALARS,
-    MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES, MAX_PROMPT_VARIABLE_NAME_SCALARS,
+    PromptChainMutationReceipt, PromptCommand, PromptEvent, PromptMutationReceipt,
+    PromptValidationError, PromptVersion, RemovePromptChainLink, RenamePrompt, RenamePromptChain,
+    RestorePrompt, RestorePromptChain, SetPromptTags, UpdatePromptChainLinkVersion,
+    MAX_PROMPT_BODY_BYTES, MAX_PROMPT_CHAIN_DESCRIPTION_SCALARS, MAX_PROMPT_CHAIN_LINKS,
+    MAX_PROMPT_CHAIN_TITLE_SCALARS, MAX_PROMPT_DESCRIPTION_SCALARS, MAX_PROMPT_PUBLIC_WIRE_BYTES,
+    MAX_PROMPT_TAGS, MAX_PROMPT_TAG_SCALARS, MAX_PROMPT_TITLE_SCALARS, MAX_PROMPT_VARIABLES,
+    MAX_PROMPT_VARIABLE_NAME_SCALARS,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptChainEventWire {
+    schema_version: u32,
+    event: RawPromptChainEvent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawPromptChainEvent {
+    PromptChainLinksReplaced {
+        chain_id: PromptChainId,
+        links: Vec<RawPromptChainLink>,
+        revision: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptChainLink {
+    id: PromptChainLinkId,
+    chain_id: PromptChainId,
+    position: u32,
+    prompt_id: PromptId,
+    prompt_version_id: PromptVersionId,
+}
+
+#[derive(Serialize)]
+struct RawPromptMutationReceipt {
+    command_id: CommandId,
+    prompt_id: PromptId,
+    prompt_version_id: PromptVersionId,
+    revision: u64,
+}
 
 #[test]
 fn public_and_durable_wire_contracts_are_named_separately() {
@@ -226,6 +263,96 @@ fn prompt_command_wire_encoding_is_deterministic_and_framed() {
 }
 
 #[test]
+fn checked_codecs_preflight_public_budget_for_every_frame() {
+    let oversized = vec![0_u8; MAX_PROMPT_PUBLIC_WIRE_BYTES + 1];
+    let errors = [
+        PromptCommand::decode(&oversized).expect_err("command must preflight its input"),
+        PromptMutationReceipt::decode(&oversized).expect_err("receipt must preflight its input"),
+        PromptEvent::decode(&oversized).expect_err("event must preflight its input"),
+        PromptChainCommand::decode(&oversized).expect_err("chain command must preflight its input"),
+        PromptChainMutationReceipt::decode(&oversized)
+            .expect_err("chain receipt must preflight its input"),
+        PromptChainEvent::decode(&oversized).expect_err("chain event must preflight its input"),
+    ];
+    assert!(errors
+        .iter()
+        .all(|error| error.to_string().contains("configured limit")));
+}
+
+#[test]
+fn chain_command_codec_owns_canonicalization_and_fingerprint() {
+    let command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+        chain_id: PromptChainId::new(),
+        title: "  Review workflow  ".into(),
+        description: Some("  Ordered steps  ".into()),
+        created_at_ms: 1,
+    });
+    let canonical = command
+        .canonicalize()
+        .expect("semantically valid chain command canonicalizes");
+    let canonical_payload = canonical.encode().expect("canonical chain command");
+    assert_eq!(
+        command.fingerprint().expect("chain fingerprint"),
+        canonical.fingerprint().expect("canonical fingerprint")
+    );
+    assert_eq!(
+        PromptChainCommand::decode(&canonical_payload).expect("decode canonical command"),
+        canonical
+    );
+    assert!(
+        command.encode().is_err(),
+        "noncanonical command must not persist"
+    );
+}
+
+#[test]
+fn receipt_and_event_codecs_use_checked_canonical_envelopes() {
+    let receipt = PromptMutationReceipt {
+        command_id: CommandId::new(),
+        prompt_id: PromptId::new(),
+        prompt_version_id: PromptVersionId::new(),
+        revision: 1,
+    };
+    let receipt_payload = receipt.encode().expect("encode prompt receipt");
+    assert_eq!(
+        PromptMutationReceipt::decode(&receipt_payload).expect("decode prompt receipt"),
+        receipt
+    );
+    let raw_receipt = rmp_serde::to_vec_named(&RawPromptMutationReceipt {
+        command_id: receipt.command_id,
+        prompt_id: receipt.prompt_id,
+        prompt_version_id: receipt.prompt_version_id,
+        revision: receipt.revision,
+    })
+    .expect("encode raw receipt");
+    assert!(PromptMutationReceipt::decode(&raw_receipt).is_err());
+
+    let event = PromptEvent::PromptRenamed {
+        prompt_id: receipt.prompt_id,
+        title: "Prompt".into(),
+        revision: 2,
+    };
+    let event_payload = event.encode().expect("encode prompt event");
+    assert_eq!(
+        PromptEvent::decode(&event_payload).expect("decode prompt event"),
+        event
+    );
+
+    let chain_receipt = PromptChainMutationReceipt {
+        command_id: receipt.command_id,
+        chain_id: PromptChainId::new(),
+        link_id: None,
+        revision: 1,
+    };
+    let chain_receipt_payload = chain_receipt.encode().expect("encode prompt chain receipt");
+    assert_eq!(
+        PromptChainMutationReceipt::decode(&chain_receipt_payload)
+            .expect("decode prompt chain receipt"),
+        chain_receipt
+    );
+}
+
+#[test]
 fn chain_metadata_uses_the_same_unicode_scalar_bounds() {
     let command = CreatePromptChain {
         chain_id: PromptChainId::new(),
@@ -254,8 +381,8 @@ fn chain_metadata_uses_the_same_unicode_scalar_bounds() {
 #[test]
 fn prompt_chain_event_codec_enforces_the_two_thousand_link_cap() {
     let chain_id = PromptChainId::new();
-    let links = (0..=MAX_PROMPT_CHAIN_LINKS)
-        .map(|position| PromptChainLink {
+    let links = (0..MAX_PROMPT_CHAIN_LINKS)
+        .map(|position| RawPromptChainLink {
             id: PromptChainLinkId::new(),
             chain_id,
             position: u32::try_from(position).expect("test position fits u32"),
@@ -263,14 +390,37 @@ fn prompt_chain_event_codec_enforces_the_two_thousand_link_cap() {
             prompt_version_id: PromptVersionId::new(),
         })
         .collect();
-    let event = PromptChainEvent::PromptChainLinksReplaced {
-        chain_id,
-        links,
-        revision: 1,
-    };
-    let payload = event.encode().expect("encode bounded chain event fixture");
+    let payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainLinksReplaced {
+            chain_id,
+            links,
+            revision: 1,
+        },
+    })
+    .expect("encode bounded chain event fixture");
+    PromptChainEvent::decode(&payload).expect("exactly 2,000 links are valid");
+
+    let overflow_links = (0..=MAX_PROMPT_CHAIN_LINKS)
+        .map(|position| RawPromptChainLink {
+            id: PromptChainLinkId::new(),
+            chain_id,
+            position: u32::try_from(position).expect("test position fits u32"),
+            prompt_id: PromptId::new(),
+            prompt_version_id: PromptVersionId::new(),
+        })
+        .collect();
+    let overflow_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainLinksReplaced {
+            chain_id,
+            links: overflow_links,
+            revision: 1,
+        },
+    })
+    .expect("encode overflow chain event fixture");
     assert!(
-        PromptChainEvent::decode(&payload).is_err(),
+        PromptChainEvent::decode(&overflow_payload).is_err(),
         "public codec must enforce the SQLite/store 2,000-link cap"
     );
 }
@@ -289,17 +439,6 @@ fn prompt_models_reject_unknown_future_fields() {
         "future_field": "must not be ignored"
     }))
     .expect_err("unknown prompt fields must fail closed");
-    assert!(error.to_string().contains("unknown field"));
-
-    let error = serde_json::from_value::<PromptChainLink>(serde_json::json!({
-        "id": PromptChainLinkId::new().to_string(),
-        "chain_id": PromptChainId::new().to_string(),
-        "position": 0,
-        "prompt_id": PromptId::new().to_string(),
-        "prompt_version_id": PromptVersionId::new().to_string(),
-        "future_selection": "execute"
-    }))
-    .expect_err("unknown chain fields must fail closed");
     assert!(error.to_string().contains("unknown field"));
 }
 
@@ -361,8 +500,7 @@ fn prompt_command_decode_rejects_invalid_bounds_and_canonicality() {
         body: "body".into(),
         created_at_ms: 1,
     });
-    let payload = oversized.encode().expect("encode oversized command");
-    assert!(PromptCommand::decode(&payload).is_err());
+    assert!(oversized.encode().is_err());
 
     let uncanonical = PromptCommand::CreatePrompt(CreatePrompt {
         prompt_id: PromptId::new(),
@@ -374,8 +512,7 @@ fn prompt_command_decode_rejects_invalid_bounds_and_canonicality() {
         body: "body".into(),
         created_at_ms: 1,
     });
-    let payload = uncanonical.encode().expect("encode uncanonical command");
-    assert!(PromptCommand::decode(&payload).is_err());
+    assert!(uncanonical.encode().is_err());
 }
 
 #[test]
@@ -490,27 +627,30 @@ fn public_prompt_and_chain_mutations_reject_zero_expected_revision() {
 fn prompt_chain_event_decode_rejects_duplicate_links_and_noncanonical_bytes() {
     let chain_id = PromptChainId::new();
     let duplicate_link_id = PromptChainLinkId::new();
-    let duplicate = PromptChainEvent::PromptChainLinksReplaced {
-        chain_id,
-        links: vec![
-            PromptChainLink {
-                id: duplicate_link_id,
-                chain_id,
-                position: 0,
-                prompt_id: devmanager::domain::PromptId::new(),
-                prompt_version_id: PromptVersionId::new(),
-            },
-            PromptChainLink {
-                id: duplicate_link_id,
-                chain_id,
-                position: 1,
-                prompt_id: devmanager::domain::PromptId::new(),
-                prompt_version_id: PromptVersionId::new(),
-            },
-        ],
-        revision: 2,
-    };
-    let duplicate_payload = duplicate.encode().expect("encode duplicate links");
+    let duplicate_payload = rmp_serde::to_vec_named(&RawPromptChainEventWire {
+        schema_version: 1,
+        event: RawPromptChainEvent::PromptChainLinksReplaced {
+            chain_id,
+            links: vec![
+                RawPromptChainLink {
+                    id: duplicate_link_id,
+                    chain_id,
+                    position: 0,
+                    prompt_id: devmanager::domain::PromptId::new(),
+                    prompt_version_id: PromptVersionId::new(),
+                },
+                RawPromptChainLink {
+                    id: duplicate_link_id,
+                    chain_id,
+                    position: 1,
+                    prompt_id: devmanager::domain::PromptId::new(),
+                    prompt_version_id: PromptVersionId::new(),
+                },
+            ],
+            revision: 2,
+        },
+    })
+    .expect("encode duplicate links");
     assert!(PromptChainEvent::decode(&duplicate_payload).is_err());
 
     let event = PromptChainEvent::PromptChainCreated {
