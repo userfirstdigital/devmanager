@@ -1,3 +1,4 @@
+use crate::process::registry::ManagedProcessFence;
 use crate::state::{
     aggregate_memory_snapshots, AppState, ProcessResourceNode, ResourceMemoryMetric,
     ResourceMemoryTotal, ResourceMetricValueState, RuntimeState, SessionKind, SessionRuntimeState,
@@ -21,14 +22,26 @@ pub struct ProcessMonitorState {
 pub enum ProcessMonitorAction {
     Close,
     ToggleSession(String),
-    KillProcess { session_id: String, pid: u32 },
-    KillProcessTree { session_id: String, pid: u32 },
+    KillProcess {
+        session_id: String,
+        pid: u32,
+        fence: ManagedProcessFence,
+    },
+    KillProcessTree {
+        session_id: String,
+        pid: u32,
+        fence: ManagedProcessFence,
+    },
     StopSession(String),
 }
 
 pub struct ProcessMonitorActions<'a> {
     pub on_action:
         &'a dyn Fn(ProcessMonitorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    /// Resolves the fence published with the current exact Job-member
+    /// snapshot. No fence means the row is diagnostic-only and cannot expose
+    /// a close action.
+    pub fence_for_session: &'a dyn Fn(&str) -> Option<ManagedProcessFence>,
 }
 
 pub fn render_process_monitor(
@@ -200,6 +213,7 @@ fn render_session_card(
     let unreaped = entry.unreaped;
     let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
+    let process_fence = (actions.fence_for_session)(&session_id);
 
     div()
         .rounded_sm()
@@ -374,6 +388,7 @@ fn render_session_card(
                                 node,
                                 root_pid,
                                 logical_cpu_count,
+                                process_fence.as_ref(),
                                 actions,
                             )
                             .into_any_element()
@@ -388,6 +403,7 @@ fn render_process_row(
     node: ProcessResourceNode,
     root_pid: Option<u32>,
     logical_cpu_count: u32,
+    process_fence: Option<&ManagedProcessFence>,
     actions: &ProcessMonitorActions<'_>,
 ) -> impl IntoElement {
     let is_root = root_pid == Some(node.pid);
@@ -467,7 +483,13 @@ fn render_process_row(
                     )),
                 )),
         )
-        .child(
+        .child(if let Some(process_fence) = process_fence {
+            let kill_action =
+                build_process_monitor_kill_action(&session_id, pid, Some(process_fence), false)
+                    .expect("a fence is required for a process close action");
+            let kill_tree_action =
+                build_process_monitor_kill_action(&session_id, pid, Some(process_fence), true)
+                    .expect("a fence is required for a process close action");
             div()
                 .flex()
                 .items_center()
@@ -475,17 +497,43 @@ fn render_process_row(
                 .child(render_text_button(
                     "Kill",
                     theme::WARNING_TEXT,
-                    (actions.on_action)(ProcessMonitorAction::KillProcess {
-                        session_id: session_id.clone(),
-                        pid,
-                    }),
+                    (actions.on_action)(kill_action),
                 ))
                 .child(render_text_button(
                     "Kill tree",
                     theme::DANGER_TEXT,
-                    (actions.on_action)(ProcessMonitorAction::KillProcessTree { session_id, pid }),
-                )),
-        )
+                    (actions.on_action)(kill_tree_action),
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("Exact close unavailable")
+                .into_any_element()
+        })
+}
+
+fn build_process_monitor_kill_action(
+    session_id: &str,
+    pid: u32,
+    process_fence: Option<&ManagedProcessFence>,
+    kill_tree: bool,
+) -> Option<ProcessMonitorAction> {
+    let fence = process_fence?.clone();
+    Some(if kill_tree {
+        ProcessMonitorAction::KillProcessTree {
+            session_id: session_id.to_string(),
+            pid,
+            fence,
+        }
+    } else {
+        ProcessMonitorAction::KillProcess {
+            session_id: session_id.to_string(),
+            pid,
+            fence,
+        }
+    })
 }
 
 fn process_metrics_label(status: crate::domain::snapshot::ProcessMetricStatus) -> &'static str {
@@ -807,17 +855,75 @@ fn format_metric_memory(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_cpu_detail_with_core, format_metric_cpu_detail, format_metric_memory,
-        monitor_sessions, monitor_totals, ordered_process_nodes, pointer_disposition,
-        process_monitor_entries, session_label, PointerDisposition, PointerTarget,
+        build_process_monitor_kill_action, format_cpu_detail_with_core, format_metric_cpu_detail,
+        format_metric_memory, monitor_sessions, monitor_totals, ordered_process_nodes,
+        pointer_disposition, process_monitor_entries, session_label, PointerDisposition,
+        PointerTarget,
     };
+    use crate::domain::id::ResourceId;
+    use crate::domain::operation::ResourceFence;
     use crate::models::Project;
+    use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
+    use crate::process::registry::ManagedProcessFence;
     use crate::state::{
         AppState, ProcessResourceNode, ResourceSnapshot, RuntimeState, SessionDimensions,
         SessionKind, SessionRuntimeState, SessionStatus,
     };
     use crate::terminal::session::TerminalBackend;
     use std::path::PathBuf;
+
+    fn test_process_fence() -> ManagedProcessFence {
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42, 7).expect("test process identity"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("canonical test executable");
+        ManagedProcessFence::new(
+            ResourceFence::new(ResourceId::new(), 3),
+            ProcessOwner::Host,
+            identity,
+        )
+    }
+
+    #[test]
+    fn process_monitor_kill_actions_fail_closed_without_fence() {
+        assert!(build_process_monitor_kill_action("session", 42, None, false).is_none());
+        assert!(build_process_monitor_kill_action("session", 42, None, true).is_none());
+    }
+
+    #[test]
+    fn process_monitor_kill_actions_carry_exact_fence_and_diagnostic_pid() {
+        let fence = test_process_fence();
+        let action = build_process_monitor_kill_action("session", 9_999, Some(&fence), false)
+            .expect("fenced process action");
+        match action {
+            super::ProcessMonitorAction::KillProcess {
+                session_id,
+                pid,
+                fence: action_fence,
+            } => {
+                assert_eq!(session_id, "session");
+                assert_eq!(pid, 9_999);
+                assert_eq!(action_fence, fence);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let tree_action = build_process_monitor_kill_action("session", 10_000, Some(&fence), true)
+            .expect("fenced tree action");
+        match tree_action {
+            super::ProcessMonitorAction::KillProcessTree {
+                session_id,
+                pid,
+                fence: action_fence,
+            } => {
+                assert_eq!(session_id, "session");
+                assert_eq!(pid, 10_000);
+                assert_eq!(action_fence, fence);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
 
     #[test]
     fn monitor_sessions_includes_live_and_unreaped() {

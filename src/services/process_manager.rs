@@ -13,13 +13,20 @@ use crate::browser::{
     BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
+use crate::domain::id::ResourceId;
+use crate::domain::operation::ResourceFence;
 use crate::domain::snapshot::{ProcessAccountingMemberSnapshot, ProcessMetricStatus};
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
+#[cfg(test)]
 use crate::process::identity::ManagedProcessIdentity;
+use crate::process::identity::ProcessOwner;
 use crate::process::job::JobMemberObservation;
+use crate::process::registry::ManagedProcessFence;
+#[cfg(test)]
+use crate::process::sampler::AccessibleProcess;
 use crate::process::sampler::{
     InaccessibleProcess, ProcessMemberObservation, ProcessSampler, SamplerError, SamplingBudget,
 };
@@ -60,6 +67,57 @@ const RESOURCE_SAMPLE_TICK_BUDGET: Duration = Duration::from_millis(40);
 struct ManagedJobObservationSnapshot {
     members: Option<Vec<JobMemberObservation>>,
     error: Option<String>,
+}
+
+/// A bounded, in-memory source snapshot used by deterministic process-accounting
+/// tests. The Job members are captured through the real Job API before the
+/// 40 ms projection tick; metric observations and labels are then supplied as
+/// immutable input so a slow Windows identity query cannot make the test race.
+#[derive(Debug, Default)]
+struct ResourceSamplingSource {
+    sessions: HashMap<String, ResourceSamplingSession>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceSamplingSession {
+    job_members: Vec<JobMemberObservation>,
+    member_observations: Vec<ProcessMemberObservation>,
+    metadata: HashMap<u32, ProcessProjectionMetadata>,
+}
+
+fn capture_process_monitor_fence(
+    previous: Option<&ManagedProcessFence>,
+    _session_id: &str,
+    runtime_pid: u32,
+    members: &[JobMemberObservation],
+) -> Option<ManagedProcessFence> {
+    let root = members.iter().find_map(|member| match member {
+        JobMemberObservation::Accessible { identity } if identity.id().pid() == runtime_pid => {
+            Some(identity.clone())
+        }
+        _ => None,
+    })?;
+
+    if let Some(previous) = previous {
+        if previous.root().matches_root(&root) {
+            return Some(previous.clone());
+        }
+    }
+
+    let generation = previous
+        .map(|previous| previous.resource().runtime_generation.saturating_add(1))
+        .unwrap_or(1);
+    Some(ManagedProcessFence::new(
+        ResourceFence::new(ResourceId::new(), generation),
+        ProcessOwner::Host,
+        root,
+    ))
+}
+
+fn clear_process_monitor_fence(inner: &ProcessManagerInner, session_id: &str) {
+    if let Ok(mut authorities) = inner.process_authorities.lock() {
+        authorities.remove(session_id);
+    }
 }
 
 pub(crate) fn ai_session_needs_restore(
@@ -261,6 +319,10 @@ pub(crate) struct ProcessManagerInner {
     codex_adapter_generation: AtomicU64,
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     resource_samplers: Mutex<HashMap<String, ProcessSampler>>,
+    /// Exact monitor action authorities published only after the same Job
+    /// query that supplied the current accounting members. A stale/failed
+    /// query removes the entry so UI selectors can never become ownership.
+    process_authorities: Mutex<HashMap<String, ManagedProcessFence>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
     op_queue: Mutex<Weak<ProcessOpQueue>>,
@@ -550,6 +612,7 @@ impl ProcessManager {
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             resource_samplers: Mutex::new(HashMap::new()),
+            process_authorities: Mutex::new(HashMap::new()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
             op_queue: Mutex::new(Weak::new()),
@@ -862,6 +925,7 @@ impl ProcessManager {
         &self,
         session_id: &str,
         pid: u32,
+        fence: ManagedProcessFence,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
         let op_id = next_op_id();
@@ -870,6 +934,7 @@ impl ProcessManager {
                 op_id,
                 session_id: session_id.to_string(),
                 pid,
+                fence,
                 response,
             })
             .map(|_| ())
@@ -879,6 +944,7 @@ impl ProcessManager {
         &self,
         session_id: &str,
         pid: u32,
+        fence: ManagedProcessFence,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
         let op_id = next_op_id();
@@ -887,6 +953,7 @@ impl ProcessManager {
                 op_id,
                 session_id: session_id.to_string(),
                 pid,
+                fence,
                 response,
             })
             .map(|_| ())
@@ -1255,6 +1322,17 @@ impl ProcessManager {
             .read()
             .map(|runtime| runtime.clone())
             .unwrap_or_default()
+    }
+
+    /// Return the exact action fence published with the current Job-member
+    /// accounting projection. A missing value is fail-closed: the latest Job
+    /// query was unavailable, stale, or did not expose an accessible root.
+    pub fn process_monitor_fence(&self, session_id: &str) -> Option<ManagedProcessFence> {
+        self.inner
+            .process_authorities
+            .lock()
+            .ok()
+            .and_then(|authorities| authorities.get(session_id).cloned())
     }
 
     pub fn runtime_revision(&self) -> u64 {
@@ -3266,6 +3344,7 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
+        clear_process_monitor_fence(&self.inner, session_id);
         let result = match self.get_session(session_id) {
             Ok(session) => session.close(closed_by_user),
             Err(error) => {
@@ -3648,6 +3727,7 @@ impl ProcessManager {
     }
 
     fn forget_session(&self, session_id: &str) {
+        clear_process_monitor_fence(&self.inner, session_id);
         let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
         self.cleanup_ai_adapters_for_session(session_id);
         if let Ok(mut sessions) = self.inner.sessions.lock() {
@@ -3851,6 +3931,14 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
 }
 
 fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo::System) {
+    refresh_resource_snapshots_with_source(inner, system, None);
+}
+
+fn refresh_resource_snapshots_with_source(
+    inner: &ProcessManagerInner,
+    system: &mut sysinfo::System,
+    source: Option<&ResourceSamplingSource>,
+) {
     // The production deadline starts before any runtime/session enumeration.
     // Accounting never reads the legacy PID ledger: only the current
     // teardown-owned Job can grant membership.
@@ -3908,6 +3996,9 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         if let Ok(mut samplers) = inner.resource_samplers.lock() {
             samplers.clear();
         }
+        if let Ok(mut authorities) = inner.process_authorities.lock() {
+            authorities.clear();
+        }
         return;
     }
 
@@ -3931,31 +4022,71 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
             break;
         }
         tick_budget.note_session_authority_read();
-        let observation = match terminal_sessions.get(session_id) {
-            Some(session) => {
-                match session.managed_process_observations_with_budget(&mut tick_budget) {
-                    Ok(Some(members)) => ManagedJobObservationSnapshot {
-                        members: Some(members),
-                        error: None,
-                    },
-                    Ok(None) => ManagedJobObservationSnapshot {
-                        members: None,
-                        error: Some("job_authority_unavailable".to_string()),
-                    },
-                    Err(error) => ManagedJobObservationSnapshot {
-                        members: None,
-                        error: Some(job_query_diagnostic_code(&error).to_string()),
-                    },
+        let observation = match source.and_then(|source| source.sessions.get(session_id)) {
+            Some(source_session) => ManagedJobObservationSnapshot {
+                members: Some(
+                    source_session
+                        .job_members
+                        .iter()
+                        .take(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK)
+                        .cloned()
+                        .collect(),
+                ),
+                error: None,
+            },
+            None => match terminal_sessions.get(session_id) {
+                Some(session) => {
+                    match session.managed_process_observations_with_budget(&mut tick_budget) {
+                        Ok(Some(members)) => ManagedJobObservationSnapshot {
+                            members: Some(members),
+                            error: None,
+                        },
+                        Ok(None) => ManagedJobObservationSnapshot {
+                            members: None,
+                            error: Some("job_authority_unavailable".to_string()),
+                        },
+                        Err(error) => ManagedJobObservationSnapshot {
+                            members: None,
+                            error: Some(job_query_diagnostic_code(&error).to_string()),
+                        },
+                    }
                 }
-            }
-            None => ManagedJobObservationSnapshot {
-                members: None,
-                error: Some("job_authority_unavailable".to_string()),
+                None => ManagedJobObservationSnapshot {
+                    members: None,
+                    error: Some("job_authority_unavailable".to_string()),
+                },
             },
         };
         job_member_observations.insert(session_id.clone(), observation);
     }
     drop(terminal_sessions);
+
+    let active_authority_ids: BTreeSet<String> = sessions
+        .iter()
+        .map(|(session_id, _, _, _, _, _)| session_id.clone())
+        .collect();
+    if let Ok(mut authorities) = inner.process_authorities.lock() {
+        authorities.retain(|session_id, _| active_authority_ids.contains(session_id));
+        for (session_id, runtime_pid, _, _, _, _) in &sessions {
+            let Some(members) = job_member_observations
+                .get(session_id)
+                .and_then(|observation| observation.members.as_deref())
+            else {
+                authorities.remove(session_id);
+                continue;
+            };
+            let Some(fence) = capture_process_monitor_fence(
+                authorities.get(session_id),
+                session_id,
+                *runtime_pid,
+                members,
+            ) else {
+                authorities.remove(session_id);
+                continue;
+            };
+            authorities.insert(session_id.clone(), fence);
+        }
+    }
 
     // Deduplicate all authoritative PIDs before building the one selected OS
     // metadata snapshot. Runtime roots never consume a slot unless the Job
@@ -3978,7 +4109,17 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
             process_ids.insert(pid);
         }
     }
-    let process_metadata = capture_process_metadata(system, &process_ids, &mut tick_budget);
+    let process_metadata = if let Some(source) = source {
+        source
+            .sessions
+            .values()
+            .flat_map(|session| session.metadata.iter())
+            .take(RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK)
+            .map(|(pid, metadata)| (*pid, metadata.clone()))
+            .collect()
+    } else {
+        capture_process_metadata(system, &process_ids, &mut tick_budget)
+    };
     let logical_cpu_count = resolve_logical_cpu_count();
     let mut snapshots = Vec::with_capacity(sessions.len());
     let active_sampler_ids: BTreeSet<String> = sessions
@@ -4036,6 +4177,9 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
             Some(sample_job_resources(
                 &session_id,
                 job_members,
+                source
+                    .and_then(|source| source.sessions.get(&session_id))
+                    .map(|session| session.member_observations.as_slice()),
                 &process_metadata,
                 sample_ctx,
                 sampler,
@@ -4123,19 +4267,23 @@ struct ProcessProjectionMetadata {
 fn sample_job_resources(
     session_id: &str,
     job_members: &[JobMemberObservation],
+    injected_member_observations: Option<&[ProcessMemberObservation]>,
     metadata: &HashMap<u32, ProcessProjectionMetadata>,
     ctx: ResourceSampleContext,
     sampler: &mut ProcessSampler,
     budget: &mut SamplingBudget,
 ) -> (ResourceSnapshot, bool) {
-    let current_members = match observe_job_members_with_budget(job_members, budget) {
-        Ok(members) => members,
-        Err(error) => {
-            return (
-                budget_failed_resource_snapshot(session_id, job_members, ctx, error),
-                false,
-            );
-        }
+    let current_members = match injected_member_observations {
+        Some(members) => members.iter().take(budget.max_members()).cloned().collect(),
+        None => match observe_job_members_with_budget(job_members, budget) {
+            Ok(members) => members,
+            Err(error) => {
+                return (
+                    budget_failed_resource_snapshot(session_id, job_members, ctx, error),
+                    false,
+                );
+            }
+        },
     };
     let owned_pids = unique_job_member_pids(job_members);
     let awaiting_external_editor = ctx.is_ai_session
@@ -5115,19 +5263,6 @@ fn session_managed_process_observations(
         .unwrap_or_default()
 }
 
-fn session_managed_process_identity(
-    inner: &ProcessManagerInner,
-    session_id: &str,
-    pid: u32,
-) -> Option<ManagedProcessIdentity> {
-    let session = inner
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|guard| guard.get(session_id).cloned());
-    session.and_then(|session| session.managed_process_identity(pid))
-}
-
 fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
     inner.runtime_state.read().ok().and_then(|runtime| {
         runtime
@@ -5142,6 +5277,7 @@ fn live_runtime_root_running(inner: &Arc<ProcessManagerInner>, session_id: &str)
 }
 
 fn mark_session_reaped(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+    clear_process_monitor_fence(inner, session_id);
     let mut changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if let Some(session) = runtime.sessions.get_mut(session_id) {
@@ -7132,23 +7268,16 @@ pub(crate) fn execute_process_op_inner(
         ProcessOp::KillProcess {
             session_id,
             pid,
+            fence,
             response,
             ..
         } => {
-            let outcome = kill_session_process_inner(inner, &session_id, pid, false);
-            let (result, message) = match outcome {
-                Ok(KillProcessOutcome::Killed) => (Ok(()), Some(format!("Killed process {pid}."))),
-                Ok(KillProcessOutcome::AlreadyGone) => {
-                    (Ok(()), Some(format!("Process {pid} was already gone.")))
-                }
-                Err(error) => (Err(error), None),
-            };
+            let result = close_managed_process_exact(inner, &session_id, &fence, pid, false);
             (
                 ProcessOpKind::KillProcess,
                 result,
                 ProcessOpContext {
                     session_id: Some(session_id),
-                    message,
                     ..Default::default()
                 },
                 response,
@@ -7157,27 +7286,16 @@ pub(crate) fn execute_process_op_inner(
         ProcessOp::KillProcessTree {
             session_id,
             pid,
+            fence,
             response,
             ..
         } => {
-            let outcome = kill_session_process_inner(inner, &session_id, pid, true);
-            let (result, message) = match outcome {
-                Ok(KillProcessOutcome::Killed) => (
-                    Ok(()),
-                    Some(format!("Killed process tree rooted at {pid}.")),
-                ),
-                Ok(KillProcessOutcome::AlreadyGone) => (
-                    Ok(()),
-                    Some(format!("Process tree rooted at {pid} was already gone.")),
-                ),
-                Err(error) => (Err(error), None),
-            };
+            let result = close_managed_process_exact(inner, &session_id, &fence, pid, true);
             (
                 ProcessOpKind::KillProcessTree,
                 result,
                 ProcessOpContext {
                     session_id: Some(session_id),
-                    message,
                     ..Default::default()
                 },
                 response,
@@ -7196,118 +7314,80 @@ pub(crate) fn execute_process_op_inner(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KillProcessOutcome {
-    Killed,
-    AlreadyGone,
+enum ExactProcessCloseError {
+    StaleFence,
+    Task37Unavailable,
 }
 
-fn verified_session_process_identity(
-    inner: &Arc<ProcessManagerInner>,
-    session_id: &str,
-    pid: u32,
-) -> Option<platform_service::ProcessIdentity> {
-    for entry in pid_file::active_tracked_processes_for_session(session_id) {
-        if entry.pid == pid
-            && platform_service::process_matches_identity(
-                entry.pid,
-                entry.started_at_unix_secs,
-                entry.process_name.as_deref(),
-            )
-        {
-            return Some(platform_service::ProcessIdentity {
-                pid: entry.pid,
-                started_at_unix_secs: entry.started_at_unix_secs,
-                process_name: entry.process_name.clone(),
-            });
-        }
-        for descendant in &entry.descendant_processes {
-            if descendant.pid == pid
-                && platform_service::process_matches_identity(
-                    descendant.pid,
-                    descendant.started_at_unix_secs,
-                    descendant.process_name.as_deref(),
-                )
-            {
-                return Some(platform_service::ProcessIdentity {
-                    pid: descendant.pid,
-                    started_at_unix_secs: descendant.started_at_unix_secs,
-                    process_name: descendant.process_name.clone(),
-                });
-            }
-        }
-        if platform_service::process_matches_identity(
-            entry.pid,
-            entry.started_at_unix_secs,
-            entry.process_name.as_deref(),
-        ) {
-            for descendant in platform_service::collect_descendant_process_identities(entry.pid) {
-                if descendant.pid == pid {
-                    return Some(descendant);
-                }
-            }
+impl std::fmt::Display for ExactProcessCloseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleFence => formatter.write_str("managed process action fence is stale"),
+            Self::Task37Unavailable => formatter.write_str(
+                "exact managed-process close is unavailable until Task 3.7 provides close_managed_process_exact",
+            ),
         }
     }
-
-    if live_runtime_root_pid(inner, session_id) == Some(pid) {
-        return platform_service::capture_process_identity(pid);
-    }
-    if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
-        for descendant in platform_service::collect_descendant_process_identities(root_pid) {
-            if descendant.pid == pid {
-                return Some(descendant);
-            }
-        }
-    }
-
-    // Job membership survives broken parent links, but the PID list is never
-    // control authority. Require the Job's exact IsProcessInJob plus creation
-    // identity observation before capturing the kill-time identity.
-    if session_managed_process_identity(inner, session_id, pid).is_some() {
-        return platform_service::capture_process_identity(pid);
-    }
-    None
 }
 
-fn kill_session_process_inner(
+/// Sealed fail-closed adapter for the Task 3.7 exact Job closer. The
+/// accounting branch carries the registry fence and diagnostic PID selector,
+/// but it must not reinterpret the selector as kill authority. The later
+/// teardown union will replace this adapter with `close_managed_process_exact`.
+mod exact_process_closer {
+    use super::{ExactProcessCloseError, ManagedProcessFence};
+
+    pub(super) trait Sealed {}
+
+    pub(super) trait ExactCloser: Sealed {
+        fn close_managed_process_exact(
+            &self,
+            fence: &ManagedProcessFence,
+            diagnostic_pid: u32,
+            kill_tree: bool,
+        ) -> Result<(), ExactProcessCloseError>;
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub(super) struct Task37Unavailable;
+
+    impl Sealed for Task37Unavailable {}
+
+    impl ExactCloser for Task37Unavailable {
+        fn close_managed_process_exact(
+            &self,
+            _fence: &ManagedProcessFence,
+            _diagnostic_pid: u32,
+            _kill_tree: bool,
+        ) -> Result<(), ExactProcessCloseError> {
+            Err(ExactProcessCloseError::Task37Unavailable)
+        }
+    }
+}
+
+fn close_managed_process_exact(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
-    pid: u32,
+    fence: &ManagedProcessFence,
+    diagnostic_pid: u32,
     kill_tree: bool,
-) -> Result<KillProcessOutcome, String> {
-    let Some(expected) = verified_session_process_identity(inner, session_id, pid) else {
-        return Err(format!(
-            "Process {pid} is not part of session `{session_id}`."
-        ));
-    };
-    if !platform_service::process_matches_identity(
-        pid,
-        expected.started_at_unix_secs,
-        expected.process_name.as_deref(),
-    ) {
-        return Err(format!(
-            "Process {pid} no longer matches the tracked identity for session `{session_id}`."
-        ));
+) -> Result<(), String> {
+    let current = inner
+        .process_authorities
+        .lock()
+        .ok()
+        .and_then(|authorities| authorities.get(session_id).cloned());
+    if current.as_ref() != Some(fence) {
+        return Err(ExactProcessCloseError::StaleFence.to_string());
     }
-    if !platform_service::is_pid_running(pid) {
-        let _ = pid_file::prune_inactive_entries();
-        bump_runtime_revision(inner);
-        return Ok(KillProcessOutcome::AlreadyGone);
-    }
-    let result = if kill_tree {
-        platform_service::kill_process_tree(pid)
-    } else {
-        platform_service::kill_process(pid)
-    };
-    let _ = pid_file::prune_inactive_entries();
-    result?;
-    let remaining = pid_file::active_tracked_pids_for_session(session_id);
-    if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
-        mark_session_reaped(inner, session_id);
-    } else {
-        bump_runtime_revision(inner);
-        emit_tracked_remote_runtime_snapshot(inner, session_id);
-    }
-    Ok(KillProcessOutcome::Killed)
+
+    exact_process_closer::ExactCloser::close_managed_process_exact(
+        &exact_process_closer::Task37Unavailable,
+        fence,
+        diagnostic_pid,
+        kill_tree,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn spawn_ssh_session_with_inner(
@@ -11023,6 +11103,20 @@ mod tests {
         path
     }
 
+    fn synthetic_process_fence(pid: u32) -> ManagedProcessFence {
+        let identity = ManagedProcessIdentity::new(
+            crate::process::identity::ManagedProcessId::new(pid, 1)
+                .expect("non-zero synthetic process id"),
+            std::env::current_exe().expect("test executable"),
+        )
+        .expect("canonical test executable");
+        ManagedProcessFence::new(
+            ResourceFence::new(ResourceId::new(), 1),
+            ProcessOwner::Host,
+            identity,
+        )
+    }
+
     fn app_state_with_server(cwd: &Path, clear_logs_on_restart: bool) -> AppState {
         let (command_text, args) = server_test_command();
         let command = RunCommand {
@@ -11175,7 +11269,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_process_rejects_pid_outside_session_tree() {
+    fn kill_process_does_not_authorize_from_pid_selector() {
         let cwd = temp_test_dir("kill-reject-foreign");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -11186,6 +11280,20 @@ mod tests {
             .unwrap();
         wait_for_live_session(&manager, session_id);
 
+        let fence = synthetic_process_fence(
+            manager
+                .runtime_state()
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.pid)
+                .expect("live pid"),
+        );
+        manager
+            .inner
+            .process_authorities
+            .lock()
+            .expect("process authorities")
+            .insert(session_id.to_string(), fence.clone());
         let foreign_pid = 4_294_967_294;
         let completion = execute_process_op_inner(
             &manager.inner,
@@ -11193,6 +11301,7 @@ mod tests {
                 op_id: next_op_id(),
                 session_id: session_id.to_string(),
                 pid: foreign_pid,
+                fence,
                 response: None,
             },
         );
@@ -11200,13 +11309,13 @@ mod tests {
         assert!(completion
             .result
             .unwrap_err()
-            .contains("not part of session"));
+            .contains("exact managed-process close is unavailable"));
 
         let _ = manager.close_session(session_id);
     }
 
     #[test]
-    fn kill_process_rejects_stale_resource_pid_without_verified_identity() {
+    fn kill_process_rejects_stale_fence_without_pid_authority() {
         let cwd = temp_test_dir("kill-reject-stale");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -11261,6 +11370,7 @@ mod tests {
                 op_id: next_op_id(),
                 session_id: session_id.to_string(),
                 pid: running_pid,
+                fence: synthetic_process_fence(running_pid),
                 response: None,
             },
         );
@@ -11268,11 +11378,11 @@ mod tests {
         assert!(completion
             .result
             .unwrap_err()
-            .contains("not part of session"));
+            .contains("managed process action fence is stale"));
     }
 
     #[test]
-    fn kill_process_accepts_verified_live_session_root() {
+    fn kill_process_requires_task37_exact_closer() {
         let cwd = temp_test_dir("kill-accept-root");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
@@ -11288,6 +11398,13 @@ mod tests {
             .get(session_id)
             .and_then(|session| session.pid)
             .expect("live pid");
+        let fence = synthetic_process_fence(pid);
+        manager
+            .inner
+            .process_authorities
+            .lock()
+            .expect("process authorities")
+            .insert(session_id.to_string(), fence.clone());
 
         let completion = execute_process_op_inner(
             &manager.inner,
@@ -11295,19 +11412,16 @@ mod tests {
                 op_id: next_op_id(),
                 session_id: session_id.to_string(),
                 pid,
+                fence,
                 response: None,
             },
         );
-        assert!(completion.result.is_ok(), "{:?}", completion.result);
-        assert!(
-            completion
-                .context
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains(&format!("Killed process {pid}"))),
-            "unexpected message: {:?}",
-            completion.context.message
-        );
+        assert!(completion.result.is_err());
+        assert!(completion
+            .result
+            .unwrap_err()
+            .contains("exact managed-process close is unavailable"));
+        let _ = manager.close_session(session_id);
     }
 
     #[test]
@@ -11372,8 +11486,69 @@ mod tests {
         wait_for_live_session(&manager, session_id);
         wait_for_tracked_process(session_id);
 
+        // Capture the exact current Job members once, outside the production
+        // tick. Windows identity/command queries can exceed 40 ms even for a
+        // one-process Job; the projection contract itself is deterministic
+        // when fed this bounded immutable source snapshot.
+        let job_members = manager
+            .inner
+            .sessions
+            .lock()
+            .expect("session store")
+            .get(session_id)
+            .and_then(|session| session.managed_process_observations())
+            .expect("live managed Job members");
+        assert!(!job_members.is_empty(), "expected a live Job member");
+        let member_observations = job_members
+            .iter()
+            .map(|member| match member {
+                JobMemberObservation::Accessible { identity } => {
+                    ProcessMemberObservation::Accessible(AccessibleProcess::new(
+                        identity.clone(),
+                        0,
+                        4_096,
+                    ))
+                }
+                JobMemberObservation::Inaccessible {
+                    pid,
+                    creation_time_100ns,
+                    reason,
+                } => ProcessMemberObservation::Inaccessible(
+                    InaccessibleProcess::new(*pid, *creation_time_100ns)
+                        .with_reason(reason.clone()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let metadata = job_members
+            .iter()
+            .filter_map(|member| match member {
+                JobMemberObservation::Accessible { identity } => Some((
+                    identity.id().pid(),
+                    ProcessProjectionMetadata {
+                        parent_pid: None,
+                        display_name: "Shell".to_string(),
+                        command_label: "Shell".to_string(),
+                        command_arg_count: 0,
+                        command_arg_bytes: 0,
+                        blocking_external_editor: false,
+                    },
+                )),
+                JobMemberObservation::Inaccessible { .. } => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let source = ResourceSamplingSource {
+            sessions: HashMap::from([(
+                session_id.to_string(),
+                ResourceSamplingSession {
+                    job_members,
+                    member_observations,
+                    metadata,
+                },
+            )]),
+        };
+
         let mut system = sysinfo::System::new();
-        refresh_resource_snapshots(&manager.inner, &mut system);
+        refresh_resource_snapshots_with_source(&manager.inner, &mut system, Some(&source));
 
         let session = manager
             .runtime_state()

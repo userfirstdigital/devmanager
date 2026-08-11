@@ -567,6 +567,11 @@ fn query_job_active_process_ids(job: *mut c_void, max_members: usize) -> Result<
     if max_members == 0 {
         return Err("managed Job process list budget is zero".to_string());
     }
+    if max_members > MAX_JOB_PROCESS_ID_CAPACITY {
+        return Err(format!(
+            "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+        ));
+    }
 
     // JOBOBJECT_BASIC_PROCESS_ID_LIST:
     //   DWORD NumberOfAssignedProcesses;
@@ -962,7 +967,10 @@ fn current_creation_time_100ns(job: *mut c_void, pid: u32) -> Result<u64, String
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{CompletionMailbox, MAX_COMPLETION_MESSAGES};
+    use super::{
+        query_job_active_process_ids, CompletionMailbox, ManagedProcessJob,
+        MAX_COMPLETION_MESSAGES, MAX_JOB_PROCESS_ID_CAPACITY,
+    };
     use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
@@ -988,6 +996,22 @@ mod tests {
 
     fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
         JobCompletionMessage::new(authority.clone(), event)
+    }
+
+    #[test]
+    fn query_information_job_object_enforces_the_16384_member_cap() {
+        let Some(job) = ManagedProcessJob::create().expect("create test Job") else {
+            return;
+        };
+        let members =
+            query_job_active_process_ids(job.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY)
+                .expect("empty test Job query at the maximum capacity");
+        assert!(members.len() <= MAX_JOB_PROCESS_ID_CAPACITY);
+
+        let overflow =
+            query_job_active_process_ids(job.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY + 1)
+                .expect_err("capacity above the QueryInformationJobObject cap must fail closed");
+        assert!(overflow.contains("16384"));
     }
 
     #[test]

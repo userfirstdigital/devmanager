@@ -1,4 +1,5 @@
 use crate::browser::BrowserAttachmentSessionBinding;
+use crate::process::registry::ManagedProcessFence;
 use crate::remote::RemoteActionResult;
 use crate::services::process_manager::{ManagedShutdownReport, ProcessManagerInner};
 use crate::state::{AiLaunchSpec, ServerLaunchSpec, SessionDimensions, SshLaunchSpec};
@@ -152,12 +153,18 @@ pub enum ProcessOp {
         op_id: u64,
         session_id: String,
         pid: u32,
+        /// PID is a diagnostic row selector only; ownership is the exact
+        /// Job/registry fence captured with the monitor snapshot.
+        fence: ManagedProcessFence,
         response: Option<Sender<RemoteActionResult>>,
     },
     KillProcessTree {
         op_id: u64,
         session_id: String,
         pid: u32,
+        /// PID is a diagnostic row selector only; ownership is the exact
+        /// Job/registry fence captured with the monitor snapshot.
+        fence: ManagedProcessFence,
         response: Option<Sender<RemoteActionResult>>,
     },
 }

@@ -8650,10 +8650,14 @@ impl NativeShell {
                     cx.notify();
                 }
             }
-            process_monitor::ProcessMonitorAction::KillProcess { session_id, pid } => {
+            process_monitor::ProcessMonitorAction::KillProcess {
+                session_id,
+                pid,
+                fence,
+            } => {
                 match self
                     .process_manager
-                    .enqueue_kill_process(&session_id, pid, None)
+                    .enqueue_kill_process(&session_id, pid, fence, None)
                 {
                     Ok(()) => {
                         self.terminal_notice =
@@ -8665,10 +8669,14 @@ impl NativeShell {
                 }
                 cx.notify();
             }
-            process_monitor::ProcessMonitorAction::KillProcessTree { session_id, pid } => {
+            process_monitor::ProcessMonitorAction::KillProcessTree {
+                session_id,
+                pid,
+                fence,
+            } => {
                 match self
                     .process_manager
-                    .enqueue_kill_process_tree(&session_id, pid, None)
+                    .enqueue_kill_process_tree(&session_id, pid, fence, None)
                 {
                     Ok(()) => {
                         self.terminal_notice =
@@ -15353,6 +15361,9 @@ impl Render for NativeShell {
                     this.handle_process_monitor_action(action.clone(), cx);
                 }))
             };
+        let process_monitor_fence_manager = self.process_manager.clone();
+        let process_monitor_fence_for_session =
+            move |session_id: &str| process_monitor_fence_manager.process_monitor_fence(session_id);
         let editor_entity = cx.weak_entity();
         let make_editor_action_handler = {
             let editor_entity = editor_entity.clone();
@@ -15884,6 +15895,7 @@ impl Render for NativeShell {
                     &runtime_snapshot,
                     process_monitor::ProcessMonitorActions {
                         on_action: &make_process_monitor_action_handler,
+                        fence_for_session: &process_monitor_fence_for_session,
                     },
                 )
             }))
