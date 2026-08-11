@@ -74,17 +74,20 @@ struct PromptChainCommandWire<T> {
 }
 
 /// Durable chain-command envelope. Its schema is intentionally distinct from
-/// the public codec envelope because it records the exact version resolution
-/// used by the store when a link command was applied.
+/// the public codec envelope because it records the exact original caller
+/// payload alongside the normalized command and version resolution used by
+/// the store when a link command was applied.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromptChainCommandDurableWire<T> {
     pub(crate) schema_version: u32,
+    pub(crate) original_command_sha256: [u8; 32],
+    pub(crate) original_command_payload: Vec<u8>,
     pub(crate) command: T,
     pub(crate) resolved_prompt_version_id: Option<PromptVersionId>,
 }
 
-pub(crate) const PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2325,22 +2328,46 @@ impl PromptChainCommand {
         Ok(wire.command)
     }
 
-    /// Encode the durable schema-v2 envelope while reusing this checked model
-    /// codec for the command itself. The store adds its stricter 512 KiB
-    /// preflight before writing the returned bytes to SQLite.
+    /// Encode the durable envelope using this command as both the original and
+    /// normalized command. Store callers use the companion method when
+    /// resolution changes the command before it is persisted.
     pub(crate) fn encode_durable(
         &self,
         resolved_prompt_version_id: Option<PromptVersionId>,
     ) -> Result<Vec<u8>, PromptCodecError> {
+        self.encode_durable_with_original(self, resolved_prompt_version_id)
+    }
+
+    pub(crate) fn encode_durable_with_original(
+        &self,
+        original_command: &Self,
+        resolved_prompt_version_id: Option<PromptVersionId>,
+    ) -> Result<Vec<u8>, PromptCodecError> {
         self.validate()
             .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        original_command.validate().map_err(|_| {
+            PromptCodecError("original prompt chain command validation failed".into())
+        })?;
         validate_chain_command_canonical(self)
             .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
+        validate_chain_command_canonical(original_command).map_err(|_| {
+            PromptCodecError("original prompt chain command validation failed".into())
+        })?;
         validate_chain_command_resolution_model(self, resolved_prompt_version_id)
             .map_err(|_| PromptCodecError("prompt chain command resolution failed".into()))?;
+        validate_chain_command_original_resolution_model(
+            original_command,
+            self,
+            resolved_prompt_version_id,
+        )
+        .map_err(|_| PromptCodecError("original prompt chain command resolution failed".into()))?;
+        let original_command_payload = original_command.encode()?;
+        let original_command_sha256 = Sha256::digest(&original_command_payload).into();
         bounded_wire_encode(
             &PromptChainCommandDurableWire {
                 schema_version: PROMPT_DURABLE_CHAIN_WIRE_SCHEMA_VERSION,
+                original_command_sha256,
+                original_command_payload,
                 command: self,
                 resolved_prompt_version_id,
             },
@@ -2350,7 +2377,7 @@ impl PromptChainCommand {
 
     pub(crate) fn decode_durable(
         payload: &[u8],
-    ) -> Result<(Self, Option<PromptVersionId>), PromptCodecError> {
+    ) -> Result<(Self, [u8; 32], Self, Option<PromptVersionId>), PromptCodecError> {
         validate_wire_payload_size(payload)?;
         let wire: PromptChainCommandDurableWire<PromptChainCommand> =
             rmp_serde::from_slice(payload)
@@ -2360,6 +2387,30 @@ impl PromptChainCommand {
                 "unsupported prompt chain command schema".into(),
             ));
         }
+        validate_wire_payload_size(&wire.original_command_payload).map_err(|_| {
+            PromptCodecError("original prompt chain command payload is invalid".into())
+        })?;
+        if wire.original_command_payload.is_empty() {
+            return Err(PromptCodecError(
+                "original prompt chain command payload is empty".into(),
+            ));
+        }
+        let original_command = Self::decode(&wire.original_command_payload).map_err(|_| {
+            PromptCodecError("original prompt chain command payload is invalid".into())
+        })?;
+        let canonical_original_payload = original_command.encode()?;
+        if canonical_original_payload != wire.original_command_payload {
+            return Err(PromptCodecError(
+                "original prompt chain command payload is not canonical".into(),
+            ));
+        }
+        let original_command_sha256: [u8; 32] =
+            Sha256::digest(&wire.original_command_payload).into();
+        if original_command_sha256 != wire.original_command_sha256 {
+            return Err(PromptCodecError(
+                "original prompt chain command hash does not match payload".into(),
+            ));
+        }
         wire.command
             .validate()
             .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
@@ -2367,15 +2418,26 @@ impl PromptChainCommand {
             .map_err(|_| PromptCodecError("prompt chain command validation failed".into()))?;
         validate_chain_command_resolution_model(&wire.command, wire.resolved_prompt_version_id)
             .map_err(|_| PromptCodecError("prompt chain command resolution failed".into()))?;
+        validate_chain_command_original_resolution_model(
+            &original_command,
+            &wire.command,
+            wire.resolved_prompt_version_id,
+        )
+        .map_err(|_| PromptCodecError("original prompt chain command resolution failed".into()))?;
         let canonical = wire
             .command
-            .encode_durable(wire.resolved_prompt_version_id)?;
+            .encode_durable_with_original(&original_command, wire.resolved_prompt_version_id)?;
         if canonical != payload {
             return Err(PromptCodecError(
                 "prompt chain command payload is not canonical".into(),
             ));
         }
-        Ok((wire.command, wire.resolved_prompt_version_id))
+        Ok((
+            original_command,
+            original_command_sha256,
+            wire.command,
+            wire.resolved_prompt_version_id,
+        ))
     }
 }
 
@@ -3180,6 +3242,37 @@ fn validate_chain_command_resolution_model(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_chain_command_original_resolution_model(
+    original_command: &PromptChainCommand,
+    command: &PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+) -> Result<(), String> {
+    match (original_command, command) {
+        (
+            PromptChainCommand::InsertPromptChainLink(original),
+            PromptChainCommand::InsertPromptChainLink(command),
+        ) => {
+            if original.chain_id != command.chain_id
+                || original.link_id != command.link_id
+                || original.prompt_id != command.prompt_id
+                || original.before_link_id != command.before_link_id
+                || original.expected_revision != command.expected_revision
+                || original
+                    .prompt_version_id
+                    .is_some_and(|version_id| Some(version_id) != command.prompt_version_id)
+                || command.prompt_version_id != resolved_prompt_version_id
+            {
+                return Err("prompt chain insert command resolution changed its payload".into());
+            }
+        }
+        _ if original_command != command => {
+            return Err("prompt chain command resolution changed its payload".into());
+        }
+        _ => {}
     }
     Ok(())
 }

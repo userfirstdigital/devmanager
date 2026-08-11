@@ -18,6 +18,8 @@ use tempfile::TempDir;
 #[derive(Serialize)]
 struct PromptChainCommandWire<'a> {
     schema_version: u32,
+    original_command_sha256: [u8; 32],
+    original_command_payload: Vec<u8>,
     command: &'a PromptChainCommand,
     resolved_prompt_version_id: Option<PromptVersionId>,
 }
@@ -25,6 +27,8 @@ struct PromptChainCommandWire<'a> {
 #[derive(Deserialize)]
 struct PromptChainCommandWireOwned {
     schema_version: u32,
+    original_command_sha256: [u8; 32],
+    original_command_payload: Vec<u8>,
     command: PromptChainCommand,
     resolved_prompt_version_id: Option<PromptVersionId>,
 }
@@ -270,8 +274,12 @@ fn noncanonical_prompt_renamed_payload(prompt_id: PromptId, title: &str, revisio
 }
 
 fn chain_command_payload(command: &PromptChainCommand) -> Vec<u8> {
+    let original_command_payload = command.encode().expect("original command payload");
+    let original_command_sha256: [u8; 32] = Sha256::digest(&original_command_payload).into();
     rmp_serde::to_vec_named(&PromptChainCommandWire {
-        schema_version: 2,
+        schema_version: 3,
+        original_command_sha256,
+        original_command_payload,
         command,
         resolved_prompt_version_id: None,
     })
@@ -1982,7 +1990,16 @@ fn rebuild_chain_insert_uses_the_pinned_version_after_a_later_version() {
         )
         .expect("insert link at the current version");
     let stored_insert = stored_chain_command(&path, command_id(198));
-    assert_eq!(stored_insert.schema_version, 2);
+    assert_eq!(stored_insert.schema_version, 3);
+    let original_insert_payload = insert_link(chain, link, prompt, None, None, 1)
+        .encode()
+        .expect("canonical original insert payload");
+    let original_insert_hash: [u8; 32] = Sha256::digest(&original_insert_payload).into();
+    assert_eq!(
+        stored_insert.original_command_payload,
+        original_insert_payload
+    );
+    assert_eq!(stored_insert.original_command_sha256, original_insert_hash);
     assert_eq!(stored_insert.resolved_prompt_version_id, Some(first));
     match stored_insert.command {
         PromptChainCommand::InsertPromptChainLink(command) => {
@@ -2068,7 +2085,7 @@ fn rebuild_chain_update_uses_the_version_pinned_by_the_effect() {
         )
         .expect("pin second version");
     let stored_update = stored_chain_command(&path, command_id(206));
-    assert_eq!(stored_update.schema_version, 2);
+    assert_eq!(stored_update.schema_version, 3);
     assert_eq!(stored_update.resolved_prompt_version_id, Some(second));
     store
         .execute(

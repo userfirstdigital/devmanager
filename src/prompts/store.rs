@@ -69,6 +69,8 @@ END;";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodedPromptChainCommand {
+    original_command: PromptChainCommand,
+    original_command_sha256: [u8; 32],
     command: PromptChainCommand,
     resolved_prompt_version_id: Option<PromptVersionId>,
 }
@@ -320,13 +322,20 @@ impl PromptStore {
 
         if let Some((stored_hash, stored_payload)) = load_chain_command_payload(&tx, command_id)? {
             let stored_command = decode_chain_command(&stored_payload)?;
-            if !chain_commands_match_retry(&requested_command, &stored_command.command) {
+            let requested_original_hash = requested_command
+                .fingerprint()
+                .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+            let stored_original_hash = stored_command.original_command_sha256;
+            if requested_original_hash != stored_original_hash
+                || requested_command != stored_command.original_command
+            {
                 return Err(PromptStoreError::IdempotencyConflict);
             }
             let stored_sha256 = digest_from_bytes(&stored_hash)?;
             let receipt = load_chain_receipt(
                 &tx,
                 command_id,
+                &stored_command.original_command,
                 &stored_command.command,
                 &stored_sha256,
                 stored_command.resolved_prompt_version_id,
@@ -340,8 +349,10 @@ impl PromptStore {
             return Ok(receipt);
         }
 
-        let (command, resolved_prompt_version_id) = resolve_chain_command(requested_command, &tx)?;
-        let command_payload = encode_chain_command(&command, resolved_prompt_version_id)?;
+        let (command, resolved_prompt_version_id) =
+            resolve_chain_command(requested_command.clone(), &tx)?;
+        let command_payload =
+            encode_chain_command(&requested_command, &command, resolved_prompt_version_id)?;
         let command_sha256 = sha256_bytes(&command_payload);
         let (receipt, event, chain_id, occurred_at_ms) =
             apply_chain_command(&tx, command_id, &command)?;
@@ -910,7 +921,12 @@ fn validate_prompt_command_payloads(tx: &Transaction<'_>) -> Result<(), PromptSt
             ));
         }
         let decoded = decode_chain_command(&payload)?;
-        if encode_chain_command(&decoded.command, decoded.resolved_prompt_version_id)? != payload {
+        if encode_chain_command(
+            &decoded.original_command,
+            &decoded.command,
+            decoded.resolved_prompt_version_id,
+        )? != payload
+        {
             return Err(PromptStoreError::Corruption(
                 "prompt chain receipt command payload is not canonical".into(),
             ));
@@ -2068,25 +2084,6 @@ fn load_chain_command_payload(
         ));
     };
     Ok(Some((command_sha256, command_payload)))
-}
-
-fn chain_commands_match_retry(requested: &PromptChainCommand, stored: &PromptChainCommand) -> bool {
-    match (requested, stored) {
-        (
-            PromptChainCommand::InsertPromptChainLink(requested),
-            PromptChainCommand::InsertPromptChainLink(stored),
-        ) => {
-            requested.chain_id == stored.chain_id
-                && requested.link_id == stored.link_id
-                && requested.prompt_id == stored.prompt_id
-                && requested.before_link_id == stored.before_link_id
-                && requested.expected_revision == stored.expected_revision
-                && requested.prompt_version_id.map_or(true, |version_id| {
-                    Some(version_id) == stored.prompt_version_id
-                })
-        }
-        _ => requested == stored,
-    }
 }
 
 fn apply_command(
@@ -3956,6 +3953,7 @@ fn load_receipt(
 fn load_chain_receipt(
     tx: &Transaction<'_>,
     command_id: CommandId,
+    original_command: &PromptChainCommand,
     command: &PromptChainCommand,
     command_sha256: &[u8; 32],
     resolved_prompt_version_id: Option<PromptVersionId>,
@@ -4018,6 +4016,7 @@ fn load_chain_receipt(
     let stored_command = decode_chain_command(&stored_command_payload)?;
     if sha256_bytes(&stored_command_payload).as_slice() != stored_hash.as_slice()
         || encode_chain_command(
+            &stored_command.original_command,
             &stored_command.command,
             stored_command.resolved_prompt_version_id,
         )? != stored_command_payload
@@ -4026,12 +4025,18 @@ fn load_chain_receipt(
             "prompt chain receipt command payload digest or encoding is invalid".into(),
         ));
     }
-    if stored_command.resolved_prompt_version_id != resolved_prompt_version_id
+    let original_command_hash = original_command
+        .fingerprint()
+        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    if original_command_hash != stored_command.original_command_sha256
+        || stored_command.original_command != *original_command
+        || stored_command.resolved_prompt_version_id != resolved_prompt_version_id
         || stored_command.command != *command
     {
         return Err(PromptStoreError::IdempotencyConflict);
     }
-    let command_payload = encode_chain_command(command, resolved_prompt_version_id)?;
+    let command_payload =
+        encode_chain_command(original_command, command, resolved_prompt_version_id)?;
     if stored_command_payload != command_payload {
         return Err(PromptStoreError::IdempotencyConflict);
     }
@@ -4590,8 +4595,11 @@ fn validate_chain_event_row(
     }
     let command = decode_chain_command(&command_payload)?;
     if sha256_bytes(&command_payload).as_slice() != command_sha256.as_slice()
-        || encode_chain_command(&command.command, command.resolved_prompt_version_id)?
-            != command_payload
+        || encode_chain_command(
+            &command.original_command,
+            &command.command,
+            command.resolved_prompt_version_id,
+        )? != command_payload
     {
         return Err(PromptStoreError::Corruption(
             "prompt chain event command payload digest or encoding is invalid".into(),
@@ -5651,6 +5659,7 @@ fn validate_all_chain_receipts(tx: &Transaction<'_>) -> Result<(), PromptStoreEr
         load_chain_receipt(
             tx,
             command_id,
+            &command.original_command,
             &command.command,
             &command_hash,
             command.resolved_prompt_version_id,
@@ -6306,11 +6315,12 @@ fn validate_prompt_chain_event_structure(event: &PromptChainEvent) -> Result<(),
 }
 
 fn encode_chain_command(
+    original_command: &PromptChainCommand,
     command: &PromptChainCommand,
     resolved_prompt_version_id: Option<PromptVersionId>,
 ) -> Result<Vec<u8>, PromptStoreError> {
     let payload = command
-        .encode_durable(resolved_prompt_version_id)
+        .encode_durable_with_original(original_command, resolved_prompt_version_id)
         .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
     validate_wire_size("prompt chain command", &payload)?;
     Ok(payload)
@@ -6318,9 +6328,12 @@ fn encode_chain_command(
 
 fn decode_chain_command(payload: &[u8]) -> Result<DecodedPromptChainCommand, PromptStoreError> {
     validate_wire_size("prompt chain command", payload)?;
-    let (command, resolved_prompt_version_id) = PromptChainCommand::decode_durable(payload)
-        .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
+    let (original_command, original_command_sha256, command, resolved_prompt_version_id) =
+        PromptChainCommand::decode_durable(payload)
+            .map_err(|error| PromptStoreError::Corruption(error.to_string()))?;
     Ok(DecodedPromptChainCommand {
+        original_command,
+        original_command_sha256,
         command,
         resolved_prompt_version_id,
     })

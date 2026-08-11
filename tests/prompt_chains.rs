@@ -9,7 +9,36 @@ use devmanager::prompts::{
     PromptStoreError, RemovePromptChainLink, UpdatePromptChainLinkVersion,
 };
 use rusqlite::Connection;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct StrictDurableChainCommandWire<'a> {
+    schema_version: u32,
+    original_command_sha256: [u8; 32],
+    original_command_payload: Vec<u8>,
+    command: &'a PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+}
+
+#[derive(Serialize)]
+struct UnknownStrictDurableChainCommandWire<'a> {
+    schema_version: u32,
+    original_command_sha256: [u8; 32],
+    original_command_payload: Vec<u8>,
+    command: &'a PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+    unexpected: u8,
+}
+
+#[derive(Serialize)]
+struct MissingOriginalStrictDurableChainCommandWire<'a> {
+    schema_version: u32,
+    command: &'a PromptChainCommand,
+    resolved_prompt_version_id: Option<PromptVersionId>,
+}
 
 fn db_path(dir: &TempDir) -> PathBuf {
     dir.path().join("prompts.sqlite3")
@@ -96,6 +125,395 @@ fn prompt_version(
             }),
         )
         .expect("create prompt version");
+}
+
+fn chain_retry_fixture() -> (
+    TempDir,
+    PromptStore,
+    PromptId,
+    PromptVersionId,
+    PromptVersionId,
+    PromptChainId,
+    PromptChainLinkId,
+) {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let prompt_id = PromptId::new();
+    let first_version = PromptVersionId::new();
+    let second_version = PromptVersionId::new();
+    let chain_id = PromptChainId::new();
+    let link_id = PromptChainLinkId::new();
+    create_prompt(&mut store, prompt_id, first_version);
+    create_chain(&mut store, chain_id);
+    (
+        dir,
+        store,
+        prompt_id,
+        first_version,
+        second_version,
+        chain_id,
+        link_id,
+    )
+}
+
+fn retry_insert_command(
+    chain_id: PromptChainId,
+    link_id: PromptChainLinkId,
+    prompt_id: PromptId,
+    prompt_version_id: Option<PromptVersionId>,
+) -> PromptChainCommand {
+    PromptChainCommand::InsertPromptChainLink(InsertPromptChainLink {
+        chain_id,
+        link_id,
+        prompt_id,
+        prompt_version_id,
+        before_link_id: None,
+        expected_revision: 1,
+    })
+}
+
+fn replace_chain_command_payload(path: &Path, command_id: CommandId, payload: Vec<u8>) {
+    let command_sha256: [u8; 32] = Sha256::digest(&payload).into();
+    let connection = Connection::open(path).expect("open command payload fixture database");
+    connection
+        .execute_batch("DROP TRIGGER prompt_chain_command_receipts_immutable_update")
+        .expect("disable immutable trigger for command payload fixture");
+    connection
+        .execute(
+            "UPDATE prompt_chain_command_receipts
+             SET command_sha256 = ?1, command_payload = ?2
+             WHERE command_id = ?3",
+            rusqlite::params![
+                command_sha256.as_slice(),
+                payload,
+                command_id.as_bytes().as_slice(),
+            ],
+        )
+        .expect("write command payload fixture");
+}
+
+#[test]
+fn chain_command_id_rejects_explicit_version_then_omitted_retry() {
+    let (_dir, mut store, prompt_id, first_version, _second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let command_id = CommandId::new();
+
+    store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, Some(first_version)),
+        )
+        .expect("insert explicit pinned version");
+
+    let error = store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, None),
+        )
+        .expect_err("omitted version is a different original command payload");
+    assert!(matches!(error, PromptStoreError::IdempotencyConflict));
+}
+
+#[test]
+fn chain_command_id_rejects_omitted_version_then_explicit_retry() {
+    let (_dir, mut store, prompt_id, first_version, _second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let command_id = CommandId::new();
+
+    store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, None),
+        )
+        .expect("insert current version through omitted payload");
+
+    let error = store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, Some(first_version)),
+        )
+        .expect_err("explicit version is a different original command payload");
+    assert!(matches!(error, PromptStoreError::IdempotencyConflict));
+}
+
+#[test]
+fn chain_command_id_rejects_different_explicit_version_retry() {
+    let (_dir, mut store, prompt_id, first_version, second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let command_id = CommandId::new();
+
+    store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, Some(first_version)),
+        )
+        .expect("insert first pinned version");
+    prompt_version(
+        &mut store,
+        prompt_id,
+        second_version,
+        "A later immutable body.",
+        1,
+    );
+
+    let error = store
+        .execute_chain(
+            command_id,
+            retry_insert_command(chain_id, link_id, prompt_id, Some(second_version)),
+        )
+        .expect_err("a different explicit version is a different payload");
+    assert!(matches!(error, PromptStoreError::IdempotencyConflict));
+}
+
+#[test]
+fn exact_omitted_version_retry_returns_original_pinned_outcome_after_revision() {
+    let (_dir, mut store, prompt_id, first_version, second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let command_id = CommandId::new();
+    let command = retry_insert_command(chain_id, link_id, prompt_id, None);
+
+    let original = store
+        .execute_chain(command_id, command.clone())
+        .expect("insert current version through omitted payload");
+    prompt_version(
+        &mut store,
+        prompt_id,
+        second_version,
+        "A later immutable body.",
+        1,
+    );
+
+    let retry = store
+        .execute_chain(command_id, command)
+        .expect("exact omitted payload remains idempotent after version advance");
+    assert_eq!(retry, original);
+    assert_eq!(
+        PromptChainService::new(&mut store)
+            .links(chain_id)
+            .expect("read pinned link after retry")[0]
+            .prompt_version_id(),
+        first_version
+    );
+}
+
+#[test]
+fn exact_explicit_version_retry_returns_original_pinned_outcome_after_revision() {
+    let (_dir, mut store, prompt_id, first_version, second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let command_id = CommandId::new();
+    let command = retry_insert_command(chain_id, link_id, prompt_id, Some(first_version));
+
+    let original = store
+        .execute_chain(command_id, command.clone())
+        .expect("insert explicit pinned version");
+    prompt_version(
+        &mut store,
+        prompt_id,
+        second_version,
+        "A later immutable body.",
+        1,
+    );
+
+    let retry = store
+        .execute_chain(command_id, command)
+        .expect("exact explicit payload remains idempotent after version advance");
+    assert_eq!(retry, original);
+    assert_eq!(
+        PromptChainService::new(&mut store)
+            .links(chain_id)
+            .expect("read pinned link after retry")[0]
+            .prompt_version_id(),
+        first_version
+    );
+}
+
+#[test]
+fn exact_omitted_version_retry_survives_independent_reopen() {
+    let (dir, mut store, prompt_id, first_version, second_version, chain_id, link_id) =
+        chain_retry_fixture();
+    let path = db_path(&dir);
+    let command_id = CommandId::new();
+    let command = retry_insert_command(chain_id, link_id, prompt_id, None);
+
+    let original = store
+        .execute_chain(command_id, command.clone())
+        .expect("insert current version through omitted payload");
+    prompt_version(
+        &mut store,
+        prompt_id,
+        second_version,
+        "A later immutable body.",
+        1,
+    );
+    drop(store);
+
+    let mut reopened = open_store(&path);
+    let retry = reopened
+        .execute_chain(command_id, command)
+        .expect("exact omitted payload remains idempotent after reopen");
+    assert_eq!(retry, original);
+    assert_eq!(
+        PromptChainService::new(&mut reopened)
+            .links(chain_id)
+            .expect("read pinned link after reopen retry")[0]
+            .prompt_version_id(),
+        first_version
+    );
+}
+
+#[test]
+fn chain_receipt_rejects_damaged_original_command_hash_on_reopen() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let chain_id = PromptChainId::new();
+    let command_id = CommandId::new();
+    let command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+        chain_id,
+        title: "Durable corruption chain".into(),
+        description: None,
+        created_at_ms: 1,
+    });
+    store
+        .execute_chain(command_id, command.clone())
+        .expect("create chain before corruption fixture");
+    drop(store);
+
+    let original_command_payload = command.encode().expect("canonical original payload");
+    let corrupt_payload = rmp_serde::to_vec_named(&StrictDurableChainCommandWire {
+        schema_version: 3,
+        original_command_sha256: [0_u8; 32],
+        original_command_payload,
+        command: &command,
+        resolved_prompt_version_id: None,
+    })
+    .expect("encode corrupt durable command");
+    replace_chain_command_payload(&path, command_id, corrupt_payload);
+
+    let error = PromptStore::open(&path).expect_err("damaged original hash must fail visibly");
+    assert!(
+        error
+            .to_string()
+            .contains("original prompt chain command hash"),
+        "unexpected corruption error: {error}"
+    );
+}
+
+#[test]
+fn chain_receipt_rejects_unknown_durable_command_fields_on_reopen() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let chain_id = PromptChainId::new();
+    let command_id = CommandId::new();
+    let command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+        chain_id,
+        title: "Durable unknown-field chain".into(),
+        description: None,
+        created_at_ms: 1,
+    });
+    store
+        .execute_chain(command_id, command.clone())
+        .expect("create chain before unknown-field fixture");
+    drop(store);
+
+    let original_command_payload = command.encode().expect("canonical original payload");
+    let original_command_sha256: [u8; 32] = Sha256::digest(&original_command_payload).into();
+    let corrupt_payload = rmp_serde::to_vec_named(&UnknownStrictDurableChainCommandWire {
+        schema_version: 3,
+        original_command_sha256,
+        original_command_payload,
+        command: &command,
+        resolved_prompt_version_id: None,
+        unexpected: 7,
+    })
+    .expect("encode unknown-field durable command");
+    replace_chain_command_payload(&path, command_id, corrupt_payload);
+
+    let error = PromptStore::open(&path).expect_err("unknown durable field must fail visibly");
+    assert!(
+        error
+            .to_string()
+            .contains("prompt chain command decoding failed"),
+        "unexpected corruption error: {error}"
+    );
+}
+
+#[test]
+fn chain_receipt_rejects_missing_original_command_fields_on_reopen() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let chain_id = PromptChainId::new();
+    let command_id = CommandId::new();
+    let command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+        chain_id,
+        title: "Durable missing-original chain".into(),
+        description: None,
+        created_at_ms: 1,
+    });
+    store
+        .execute_chain(command_id, command.clone())
+        .expect("create chain before missing-field fixture");
+    drop(store);
+
+    let corrupt_payload = rmp_serde::to_vec_named(&MissingOriginalStrictDurableChainCommandWire {
+        schema_version: 3,
+        command: &command,
+        resolved_prompt_version_id: None,
+    })
+    .expect("encode missing-field durable command");
+    replace_chain_command_payload(&path, command_id, corrupt_payload);
+
+    let error = PromptStore::open(&path).expect_err("missing original fields must fail visibly");
+    assert!(
+        error
+            .to_string()
+            .contains("prompt chain command decoding failed"),
+        "unexpected corruption error: {error}"
+    );
+}
+
+#[test]
+fn chain_receipt_rejects_trailing_original_command_bytes_on_reopen() {
+    let dir = TempDir::new().expect("unique temp dir");
+    let path = db_path(&dir);
+    let mut store = open_store(&path);
+    let chain_id = PromptChainId::new();
+    let command_id = CommandId::new();
+    let command = PromptChainCommand::CreatePromptChain(CreatePromptChain {
+        chain_id,
+        title: "Durable trailing-byte chain".into(),
+        description: None,
+        created_at_ms: 1,
+    });
+    store
+        .execute_chain(command_id, command.clone())
+        .expect("create chain before trailing-byte fixture");
+    drop(store);
+
+    let canonical_original_payload = command.encode().expect("canonical original payload");
+    let original_command_sha256: [u8; 32] = Sha256::digest(&canonical_original_payload).into();
+    let mut trailing_original_payload = canonical_original_payload;
+    trailing_original_payload.push(0);
+    let corrupt_payload = rmp_serde::to_vec_named(&StrictDurableChainCommandWire {
+        schema_version: 3,
+        original_command_sha256,
+        original_command_payload: trailing_original_payload,
+        command: &command,
+        resolved_prompt_version_id: None,
+    })
+    .expect("encode trailing-byte durable command");
+    replace_chain_command_payload(&path, command_id, corrupt_payload);
+
+    let error = PromptStore::open(&path).expect_err("trailing original bytes must fail visibly");
+    assert!(
+        error
+            .to_string()
+            .contains("original prompt chain command payload is invalid"),
+        "unexpected corruption error: {error}"
+    );
 }
 
 #[test]
