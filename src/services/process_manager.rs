@@ -143,6 +143,9 @@ impl Clone for ProcessManager {
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         if self.handle_lifecycle.release() {
+            // Fence queued and in-flight port refresh callbacks before
+            // shutting down workers and closing managed server sessions.
+            bump_server_lifecycle_generation(&self.inner);
             shutdown_process_manager_workers(&self.inner);
         }
     }
@@ -10549,6 +10552,36 @@ mod tests {
 
         assert!(manager.server_lifecycle_generation() > before);
         stop_background_tasks_for_test(&manager);
+    }
+
+    #[test]
+    fn shutdown_queue_admission_invalidates_server_lifecycle_before_worker_runs() {
+        let manager = ProcessManager::new();
+        let before = manager.server_lifecycle_generation();
+
+        manager
+            .submit_process_op(ProcessOp::Shutdown {
+                op_id: next_op_id(),
+                timeout: Duration::ZERO,
+            })
+            .expect("queue Shutdown");
+
+        assert!(manager.server_lifecycle_generation() > before);
+        stop_background_tasks_for_test(&manager);
+    }
+
+    #[test]
+    fn direct_process_manager_drop_bumps_server_lifecycle_before_close() {
+        let manager = ProcessManager::new();
+        let inner = manager.inner.clone();
+        let before = manager.server_lifecycle_generation();
+
+        drop(manager);
+
+        assert!(
+            inner.server_lifecycle_generation.load(Ordering::Acquire) > before,
+            "direct ProcessManager drop must fence late lifecycle callbacks before close"
+        );
     }
 
     #[test]

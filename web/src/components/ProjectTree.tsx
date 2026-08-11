@@ -55,6 +55,7 @@ function authorityDotState(
     authority.fresh !== true ||
     authority.reapIncomplete !== false ||
     authority.error !== null ||
+    authority.diagnostic != null ||
     authority.listeners.length === 0 ||
     !authority.listeners.every(
       (listener) =>

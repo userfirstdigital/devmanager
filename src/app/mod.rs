@@ -300,6 +300,7 @@ struct NativeShell {
     last_remote_runtime_revision: u64,
     last_remote_port_hash: u64,
     last_remote_authority_hash: u64,
+    last_remote_port_snapshot_sequence: u64,
     remote_live_session_generations: HashMap<String, u64>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
@@ -548,6 +549,9 @@ struct ServerPortSnapshotState {
     statuses: HashMap<u16, PortStatus>,
     authorities: HashMap<u16, crate::process::ports::PortStatus>,
     probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
     refresh_generation: u64,
@@ -565,6 +569,9 @@ struct PortRefreshProjection {
     statuses: HashMap<u16, PortStatus>,
     authorities: HashMap<u16, crate::process::ports::PortStatus>,
     probe_failures: HashMap<u16, String>,
+    source_observed_at: Option<Instant>,
+    source_freshness_deadline: Option<Instant>,
+    source_publication_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1375,6 +1382,7 @@ impl NativeShell {
             last_remote_runtime_revision: 0,
             last_remote_port_hash: 0,
             last_remote_authority_hash: 0,
+            last_remote_port_snapshot_sequence: 0,
             remote_live_session_generations: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
@@ -5584,41 +5592,59 @@ impl NativeShell {
         let runtime_revision = self.process_manager.runtime_revision();
         let port_hash = local_stable_hash(&self.server_port_snapshot.statuses);
         let authority_hash = local_port_authority_hash(&self.server_port_snapshot.authorities);
+        let port_snapshot_sequence = self.server_port_snapshot.source_publication_sequence;
         let forced_sync = self.last_remote_snapshot_sync_at.is_none();
         let app_changed = forced_sync || app_revision != self.last_remote_app_revision;
         let runtime_changed = forced_sync || runtime_revision != self.last_remote_runtime_revision;
         let port_changed = forced_sync || port_hash != self.last_remote_port_hash;
         let authority_changed = forced_sync || authority_hash != self.last_remote_authority_hash;
+        let source_changed =
+            forced_sync || port_snapshot_sequence != self.last_remote_port_snapshot_sequence;
+        let port_authority_changed = port_changed || authority_changed || source_changed;
         if !forced_sync
             && !app_changed
             && !runtime_changed
             && !port_changed
             && !authority_changed
+            && !source_changed
             && !has_pending_requests
         {
             self.last_remote_snapshot_sync_at = Some(now);
             return;
         }
 
+        let reference_epoch_ms = now_epoch_ms();
+        let source_observed_at_epoch_ms = self
+            .server_port_snapshot
+            .source_observed_at
+            .map(|observed_at| instant_to_epoch_ms(observed_at, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_freshness_deadline_epoch_ms = self
+            .server_port_snapshot
+            .source_freshness_deadline
+            .map(|deadline| instant_to_epoch_ms(deadline, now, reference_epoch_ms))
+            .unwrap_or(reference_epoch_ms);
+        let source_publication_sequence = self.server_port_snapshot.source_publication_sequence;
         self.remote_host_service.update_snapshot_parts(
             app_changed.then(|| remote_shared_app_state(&self.state)),
             runtime_changed.then(|| runtime_state.clone()),
-            (port_changed || authority_changed).then(|| self.server_port_snapshot.statuses.clone()),
-            (port_changed || authority_changed).then(|| {
+            port_authority_changed.then(|| self.server_port_snapshot.statuses.clone()),
+            port_authority_changed.then(|| {
                 self.server_port_snapshot
                     .authorities
                     .iter()
                     .map(|(port, authority)| {
                         let remote_authority =
-                            remote::RemotePortAuthority::from_rich(authority, now_epoch_ms())
-                                .with_snapshot_metadata(
-                                    self.server_port_snapshot
-                                        .inventory
-                                        .cached_snapshot()
-                                        .publication_sequence(),
-                                    0,
-                                    0,
-                                );
+                            remote::RemotePortAuthority::from_rich_with_source_metadata(
+                                authority,
+                                source_observed_at_epoch_ms,
+                                source_freshness_deadline_epoch_ms,
+                            )
+                            .with_snapshot_metadata(
+                                source_publication_sequence,
+                                0,
+                                0,
+                            );
                         let remote_authority = if matches!(
                             remote_authority.kind(),
                             remote::RemotePortAuthorityKind::Managed
@@ -5641,6 +5667,7 @@ impl NativeShell {
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
         self.last_remote_authority_hash = authority_hash;
+        self.last_remote_port_snapshot_sequence = port_snapshot_sequence;
         self.last_remote_snapshot_sync_at = Some(now);
     }
 
@@ -12041,6 +12068,7 @@ impl NativeShell {
             self.server_port_snapshot.statuses.clear();
             self.server_port_snapshot.authorities.clear();
             self.server_port_snapshot.probe_failures.clear();
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
             self.server_port_snapshot.last_checked_at = None;
             self.server_port_snapshot.refresh_in_flight = false;
             self.server_port_snapshot.refresh_generation = self
@@ -12066,6 +12094,7 @@ impl NativeShell {
             self.server_port_snapshot
                 .probe_failures
                 .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            clear_server_port_source_metadata(&mut self.server_port_snapshot);
             self.server_port_snapshot.last_checked_at = None;
             self.server_port_snapshot.refresh_generation = self
                 .server_port_snapshot
@@ -12094,6 +12123,7 @@ impl NativeShell {
             &mut self.server_port_snapshot.probe_failures,
             &tracked_ports,
         );
+        clear_server_port_source_metadata(&mut self.server_port_snapshot);
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
         let runtime_generation = self.process_manager.runtime_revision();
@@ -12144,23 +12174,16 @@ impl NativeShell {
                 async move {
                     let projection = background_executor
                         .spawn(async move {
-                            match inventory.refresh(&ports) {
-                                Ok(snapshot) => project_typed_port_snapshot(
-                                    &snapshot,
-                                    &ports,
-                                    no_managed_resource,
-                                    &HashMap::new(),
-                                    &managed_candidate_ports,
-                                ),
-                                Err(error) => {
-                                    let mut projection = PortRefreshProjection::default();
-                                    let detail = bounded_port_probe_detail(&error);
-                                    for &port in &ports {
-                                        projection.probe_failures.insert(port, detail.clone());
-                                    }
-                                    projection
-                                }
-                            }
+                            let result = inventory.refresh(&ports);
+                            let cached_snapshot = inventory.cached_snapshot();
+                            project_port_refresh_result(
+                                result,
+                                cached_snapshot,
+                                &ports,
+                                no_managed_resource,
+                                &HashMap::new(),
+                                &managed_candidate_ports,
+                            )
                         })
                         .await;
                     while native_dialog_blockers.load(Ordering::Acquire) > 0 {
@@ -12172,6 +12195,14 @@ impl NativeShell {
                             this.server_port_snapshot.active_refresh.as_ref(),
                             &expected_fence,
                         ) {
+                            return;
+                        }
+                        if !port_refresh_projection_is_fresh_at(&projection, Instant::now()) {
+                            this.server_port_snapshot.refresh_in_flight = false;
+                            this.server_port_snapshot.active_refresh = None;
+                            this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
+                            cx.notify();
                             return;
                         }
                         let current_runtime = this.process_manager.runtime_state();
@@ -12199,17 +12230,22 @@ impl NativeShell {
                             this.server_port_snapshot.refresh_in_flight = false;
                             this.server_port_snapshot.active_refresh = None;
                             this.server_port_snapshot.last_checked_at = None;
+                            clear_server_port_source_metadata(&mut this.server_port_snapshot);
                             cx.notify();
                             return;
                         }
+                        let source_observed_at = projection.source_observed_at;
                         this.server_port_snapshot.refresh_in_flight = false;
                         this.server_port_snapshot.active_refresh = None;
-                        this.server_port_snapshot.last_checked_at = Some(Instant::now());
+                        this.server_port_snapshot.last_checked_at = source_observed_at;
                         let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
-                        if let Some(notice) = apply_server_port_refresh(
+                        if let Some(notice) = apply_server_port_refresh_with_metadata(
                             &mut this.server_port_snapshot.statuses,
                             &mut this.server_port_snapshot.authorities,
                             &mut this.server_port_snapshot.probe_failures,
+                            &mut this.server_port_snapshot.source_observed_at,
+                            &mut this.server_port_snapshot.source_freshness_deadline,
+                            &mut this.server_port_snapshot.source_publication_sequence,
                             &tracked_ports,
                             Ok(projection),
                         ) {
@@ -12270,6 +12306,7 @@ impl NativeShell {
             }
         }
         self.server_port_snapshot.last_checked_at = None;
+        clear_server_port_source_metadata(&mut self.server_port_snapshot);
         self.server_port_snapshot.refresh_generation = self
             .server_port_snapshot
             .refresh_generation
@@ -16751,6 +16788,12 @@ fn stage_server_port_refresh(
     }
 }
 
+fn clear_server_port_source_metadata(snapshot: &mut ServerPortSnapshotState) {
+    snapshot.source_observed_at = None;
+    snapshot.source_freshness_deadline = None;
+    snapshot.source_publication_sequence = 0;
+}
+
 fn port_refresh_is_current(active: Option<&PortRefreshFence>, expected: &PortRefreshFence) -> bool {
     active == Some(expected)
 }
@@ -16774,8 +16817,33 @@ fn port_refresh_is_current_for_state(
         && expected.server_lifecycle_generation == server_lifecycle_generation
 }
 
+fn port_refresh_projection_is_fresh_at(projection: &PortRefreshProjection, now: Instant) -> bool {
+    let (Some(observed_at), Some(deadline)) = (
+        projection.source_observed_at,
+        projection.source_freshness_deadline,
+    ) else {
+        return false;
+    };
+    now <= deadline
+        && now
+            .checked_duration_since(observed_at)
+            .is_some_and(|age| age <= crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
+}
+
 const MAX_PORT_PROBE_DETAIL_CHARS: usize = 256;
 const MAX_PORT_PROBE_NOTICE_CHARS: usize = 1024;
+
+fn instant_to_epoch_ms(source: Instant, reference: Instant, reference_epoch_ms: u64) -> u64 {
+    if source <= reference {
+        reference_epoch_ms.saturating_sub(
+            u64::try_from(reference.duration_since(source).as_millis()).unwrap_or(u64::MAX),
+        )
+    } else {
+        reference_epoch_ms.saturating_add(
+            u64::try_from(source.duration_since(reference).as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+}
 
 fn bounded_port_text(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
@@ -16894,9 +16962,10 @@ fn project_typed_port_snapshot(
 ) -> PortRefreshProjection {
     let mut projection = project_legacy_port_snapshot(snapshot, ports);
     let observed_at = snapshot.observed_at();
-    let deadline = observed_at
-        .checked_add(crate::process::ports::DEFAULT_FREE_PROOF_MAX_AGE)
-        .unwrap_or(observed_at);
+    let deadline = snapshot.freshness_deadline();
+    projection.source_observed_at = Some(observed_at);
+    projection.source_freshness_deadline = Some(deadline);
+    projection.source_publication_sequence = snapshot.publication_sequence();
 
     for &port in ports {
         let resource = managed
@@ -16908,7 +16977,27 @@ fn project_typed_port_snapshot(
             resource,
             crate::process::ports::ManagedPortHealth::Ready,
         );
-        let authority = if managed_candidate_ports.contains(&port) && !managed.contains_key(&port) {
+        let probe_error = matches!(
+            snapshot.observation(port),
+            Some(crate::process::ports::PortObservation::ProbeError(_))
+        ) || matches!(
+            snapshot.issue(port),
+            Some(crate::process::ports::PortObservationIssue::ProbeError(_))
+        );
+        let authority = if probe_error {
+            // A scan fault is authoritative for the affected port even when
+            // a live session is waiting for a managed fence. Do not let the
+            // candidate fallback turn typed ProbeError evidence into an
+            // apparently healthy/merely-unknown authority.
+            crate::process::ports::project_port_status_from_snapshot_with_membership_reconciliation_at(
+                &target,
+                snapshot,
+                None,
+                None,
+                observed_at,
+                deadline,
+            )
+        } else if managed_candidate_ports.contains(&port) && !managed.contains_key(&port) {
             crate::process::ports::PortStatus {
                 port,
                 resource,
@@ -16934,13 +17023,48 @@ fn project_typed_port_snapshot(
                 snapshot,
                 managed.get(&port),
                 None,
-                Instant::now(),
+                observed_at,
                 deadline,
             )
         };
         projection.authorities.insert(port, authority);
     }
     projection
+}
+
+fn project_port_refresh_result(
+    result: Result<Arc<crate::process::ports::PortInventorySnapshot>, String>,
+    cached_snapshot: Arc<crate::process::ports::PortInventorySnapshot>,
+    ports: &[u16],
+    no_managed_resource: crate::domain::operation::ResourceFence,
+    managed: &HashMap<u16, crate::process::ports::ManagedResourceSnapshot>,
+    managed_candidate_ports: &std::collections::HashSet<u16>,
+) -> PortRefreshProjection {
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(_)
+            if cached_snapshot.is_exactly_for(ports)
+                && ports.iter().all(|port| {
+                    matches!(
+                        cached_snapshot.observation(*port),
+                        Some(crate::process::ports::PortObservation::ProbeError(_))
+                    )
+                }) =>
+        {
+            cached_snapshot
+        }
+        Err(error) => Arc::new(crate::process::ports::PortInventorySnapshot::probe_failure(
+            ports.iter().copied(),
+            error,
+        )),
+    };
+    project_typed_port_snapshot(
+        &snapshot,
+        ports,
+        no_managed_resource,
+        managed,
+        managed_candidate_ports,
+    )
 }
 
 fn port_probe_failure_notice(probe_failures: &HashMap<u16, String>) -> Option<String> {
@@ -16975,6 +17099,31 @@ fn apply_server_port_refresh(
     tracked_ports: &[u16],
     result: Result<PortRefreshProjection, String>,
 ) -> Option<String> {
+    let mut source_observed_at = None;
+    let mut source_freshness_deadline = None;
+    let mut source_publication_sequence = 0;
+    apply_server_port_refresh_with_metadata(
+        current,
+        authorities,
+        probe_failures,
+        &mut source_observed_at,
+        &mut source_freshness_deadline,
+        &mut source_publication_sequence,
+        tracked_ports,
+        result,
+    )
+}
+
+fn apply_server_port_refresh_with_metadata(
+    current: &mut HashMap<u16, PortStatus>,
+    authorities: &mut HashMap<u16, crate::process::ports::PortStatus>,
+    probe_failures: &mut HashMap<u16, String>,
+    source_observed_at: &mut Option<Instant>,
+    source_freshness_deadline: &mut Option<Instant>,
+    source_publication_sequence: &mut u64,
+    tracked_ports: &[u16],
+    result: Result<PortRefreshProjection, String>,
+) -> Option<String> {
     match result {
         Ok(mut next) => {
             next.statuses
@@ -16986,12 +17135,18 @@ fn apply_server_port_refresh(
             *current = next.statuses;
             *authorities = next.authorities;
             *probe_failures = next.probe_failures;
+            *source_observed_at = next.source_observed_at;
+            *source_freshness_deadline = next.source_freshness_deadline;
+            *source_publication_sequence = next.source_publication_sequence;
             port_probe_failure_notice(probe_failures)
         }
         Err(error) => {
             current.clear();
             authorities.clear();
             probe_failures.clear();
+            *source_observed_at = None;
+            *source_freshness_deadline = None;
+            *source_publication_sequence = 0;
             let detail = bounded_port_probe_detail(&error);
             for &port in tracked_ports {
                 probe_failures.insert(port, detail.clone());
@@ -21321,6 +21476,38 @@ mod tests {
     }
 
     #[test]
+    fn applying_port_projection_preserves_source_metadata_without_restamping() {
+        let observed_at = Instant::now() - Duration::from_millis(25);
+        let deadline = observed_at + Duration::from_secs(5);
+        let mut statuses = HashMap::new();
+        let mut authorities = HashMap::new();
+        let mut probe_failures = HashMap::new();
+        let mut applied_observed_at = None;
+        let mut applied_deadline = None;
+        let mut applied_sequence = 0;
+
+        apply_server_port_refresh_with_metadata(
+            &mut statuses,
+            &mut authorities,
+            &mut probe_failures,
+            &mut applied_observed_at,
+            &mut applied_deadline,
+            &mut applied_sequence,
+            &[5174],
+            Ok(PortRefreshProjection {
+                source_observed_at: Some(observed_at),
+                source_freshness_deadline: Some(deadline),
+                source_publication_sequence: 9,
+                ..PortRefreshProjection::default()
+            }),
+        );
+
+        assert_eq!(applied_observed_at, Some(observed_at));
+        assert_eq!(applied_deadline, Some(deadline));
+        assert_eq!(applied_sequence, 9);
+    }
+
+    #[test]
     fn failed_port_refresh_does_not_override_starting_indicator() {
         let mut session = SessionRuntimeState::new(
             "server-cmd",
@@ -21584,6 +21771,58 @@ mod tests {
             ),
             sidebar::ServerIndicatorState::Unknown
         );
+    }
+
+    #[test]
+    fn failed_refresh_uses_cached_typed_probe_snapshot_for_every_port() {
+        let ports = [43_201, 43_202];
+        let observed_at = Instant::now();
+        let deadline = observed_at + Duration::from_secs(5);
+        let snapshot = Arc::new(
+            crate::process::ports::PortInventorySnapshot::probe_failure_at(
+                ports,
+                "listener probe failed: [redacted path]",
+                observed_at,
+                deadline,
+            )
+            .with_publication_sequence(7),
+        );
+        let projection = project_port_refresh_result(
+            Err("listener inventory scan failed".to_string()),
+            snapshot.clone(),
+            &ports,
+            crate::domain::operation::ResourceFence::new(crate::domain::id::ResourceId::new(), 0),
+            &HashMap::new(),
+            &std::collections::HashSet::from(ports),
+        );
+
+        for port in ports {
+            assert_eq!(
+                projection
+                    .authorities
+                    .get(&port)
+                    .map(crate::process::ports::PortStatus::kind),
+                Some(crate::process::ports::PortStatusKind::ProbeError)
+            );
+        }
+        assert_eq!(projection.source_observed_at, Some(observed_at));
+        assert_eq!(projection.source_freshness_deadline, Some(deadline));
+        assert_eq!(projection.source_publication_sequence, 7);
+    }
+
+    #[test]
+    fn dialog_delayed_expired_port_projection_is_rejected_and_rescans() {
+        let observed_at = Instant::now() - Duration::from_secs(2);
+        let projection = PortRefreshProjection {
+            source_observed_at: Some(observed_at),
+            source_freshness_deadline: Some(Instant::now() - Duration::from_millis(1)),
+            ..PortRefreshProjection::default()
+        };
+
+        assert!(!port_refresh_projection_is_fresh_at(
+            &projection,
+            Instant::now()
+        ));
     }
 
     #[test]

@@ -296,7 +296,20 @@ impl WebPortAuthority {
         runtime: &RuntimeState,
         now_epoch_ms: u64,
     ) -> Self {
-        let kind = WebPortAuthorityKind::from(authority.kind);
+        let inconsistent_probe = matches!(
+            authority.kind,
+            RemotePortAuthorityKind::Managed
+                | RemotePortAuthorityKind::ManagedUnready
+                | RemotePortAuthorityKind::ProvenExternal
+        ) && (authority.diagnostic
+            == Some(RemotePortDiagnostic::ProbeError)
+            || authority.error.is_some());
+        let effective_kind = if inconsistent_probe {
+            RemotePortAuthorityKind::Unknown
+        } else {
+            authority.kind
+        };
+        let kind = WebPortAuthorityKind::from(effective_kind);
         let fresh = authority.is_fresh_at(now_epoch_ms);
         let matching_session = authority
             .session_id
@@ -330,7 +343,7 @@ impl WebPortAuthority {
         let control_reason = if !fresh {
             WebPortControlReason::Stale
         } else {
-            match authority.kind {
+            match effective_kind {
                 RemotePortAuthorityKind::Managed if host_verified_for_current_session => {
                     WebPortControlReason::ExactManagedFence
                 }
@@ -349,7 +362,7 @@ impl WebPortAuthority {
                 }
             }
         };
-        let probe_error = authority.kind == RemotePortAuthorityKind::ProbeError;
+        let probe_error = effective_kind == RemotePortAuthorityKind::ProbeError;
         let has_probe_diagnostic = probe_error || authority.error.is_some();
         Self {
             port: authority.port,
@@ -812,6 +825,36 @@ mod tests {
         let wire = serde_json::to_string(projected).expect("serialize web authority");
         assert!(wire.contains("probeError"));
         assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn browser_rejects_proven_external_probe_diagnostic_as_unknown() {
+        let fixture = host_fixture_with_sentinels();
+        let status = crate::process::ports::PortStatus {
+            port: 43872,
+            resource: crate::domain::operation::ResourceFence::new(
+                crate::domain::id::ResourceId::new(),
+                7,
+            ),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: std::sync::Arc::from([]),
+            error: None,
+        };
+        let mut authority = RemotePortAuthority::from_rich(&status, crate::remote::now_epoch_ms());
+        authority.diagnostic = Some(crate::remote::RemotePortDiagnostic::ProbeError);
+        authority.publication_sequence = 1;
+
+        let projected = WebPortAuthority::from_remote(
+            &authority,
+            &fixture.runtime,
+            crate::remote::now_epoch_ms(),
+        );
+
+        assert!(matches!(projected.kind, WebPortAuthorityKind::Unknown));
+        assert!(matches!(
+            projected.control_reason,
+            WebPortControlReason::MixedOrUnverified
+        ));
     }
 
     #[test]

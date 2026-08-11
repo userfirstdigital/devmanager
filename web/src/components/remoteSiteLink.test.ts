@@ -12,12 +12,26 @@ describe("remoteSiteLink", () => {
     overrides: Partial<
       Pick<
         WebPortAuthority,
-        "kind" | "controlReason" | "fresh" | "listeners" | "reapIncomplete" | "error" | "sessionId"
+        | "kind"
+        | "controlReason"
+        | "fresh"
+        | "listeners"
+        | "reapIncomplete"
+        | "error"
+        | "diagnostic"
+        | "sessionId"
       >
     > = {},
   ): Pick<
     WebPortAuthority,
-    "kind" | "controlReason" | "fresh" | "listeners" | "reapIncomplete" | "error" | "sessionId"
+    | "kind"
+    | "controlReason"
+    | "fresh"
+    | "listeners"
+    | "reapIncomplete"
+    | "error"
+    | "diagnostic"
+    | "sessionId"
   > => ({
     kind: "managed",
     controlReason: "exactManagedFence",
@@ -25,6 +39,7 @@ describe("remoteSiteLink", () => {
     sessionId: "session-1",
     reapIncomplete: false,
     error: null,
+    diagnostic: null,
     listeners: [
       { pid: 42, creationTime100ns: 123, executableProven: true },
     ],
@@ -57,6 +72,13 @@ describe("remoteSiteLink", () => {
         { port: 3000 },
         { status: "Running", session_id: "session-1" },
         authority({ error: "listener probe failed" }),
+      ),
+    ).toBe(false);
+    expect(
+      canOpenRemoteSite(
+        { port: 3000 },
+        { status: "Running", session_id: "session-1" },
+        authority({ kind: "provenExternal", diagnostic: "probeError" }),
       ),
     ).toBe(false);
     expect(

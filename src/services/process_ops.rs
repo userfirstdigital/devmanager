@@ -173,6 +173,7 @@ impl ProcessOp {
                 | ProcessOp::StopServer { .. }
                 | ProcessOp::RestartServer { .. }
                 | ProcessOp::StopAll { .. }
+                | ProcessOp::Shutdown { .. }
         )
     }
 
@@ -312,6 +313,8 @@ impl ProcessOpQueue {
         let op_id = op.op_id();
         let target_id = op.target_id();
         let invalidates_server_lifecycle = op.invalidates_server_lifecycle();
+        let tracks_in_flight =
+            !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. });
         if !matches!(op, ProcessOp::Shutdown { .. } | ProcessOp::StopAll { .. }) {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 if op_preempts_in_flight(&op) {
@@ -319,18 +322,25 @@ impl ProcessOpQueue {
                 } else if in_flight.contains_key(&target_id) {
                     return Err(format!("Operation already in progress for `{target_id}`."));
                 }
-                in_flight.insert(target_id, op_id);
+                in_flight.insert(target_id.clone(), op_id);
             }
         }
-        self.submit_tx
-            .send(op)
-            .map_err(|_| "Process operation queue is unavailable.".to_string())?;
         if invalidates_server_lifecycle {
             // Queue admission is the single lifecycle hook shared by UI,
             // remote, monitor, restore, and auto-restart server paths.
+            // Fence before handing the operation to the worker so an
+            // already-running refresh cannot publish between send and bump.
             if let Some(inner) = self.lifecycle_inner.upgrade() {
                 bump_server_lifecycle_generation(&inner);
             }
+        }
+        if let Err(_) = self.submit_tx.send(op) {
+            if tracks_in_flight {
+                if let Ok(mut in_flight) = self.in_flight.lock() {
+                    in_flight.remove(&target_id);
+                }
+            }
+            return Err("Process operation queue is unavailable.".to_string());
         }
         #[cfg(test)]
         self.successful_submissions.fetch_add(1, Ordering::SeqCst);

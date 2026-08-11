@@ -303,7 +303,19 @@ impl RemotePortAuthority {
     }
 
     pub fn from_rich(status: &RichPortStatus, now_epoch_ms: u64) -> Self {
-        let kind = match status.kind() {
+        Self::from_rich_with_source_metadata(
+            status,
+            now_epoch_ms,
+            now_epoch_ms.saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+        )
+    }
+
+    pub fn from_rich_with_source_metadata(
+        status: &RichPortStatus,
+        observed_at_epoch_ms: u64,
+        freshness_deadline_epoch_ms: u64,
+    ) -> Self {
+        let projected_kind = match status.kind() {
             RichPortStatusKind::ManagedHealthy => RemotePortAuthorityKind::Managed,
             RichPortStatusKind::ManagedUnready => RemotePortAuthorityKind::ManagedUnready,
             RichPortStatusKind::ProvenExternal => RemotePortAuthorityKind::ProvenExternal,
@@ -312,6 +324,20 @@ impl RemotePortAuthority {
             RichPortStatusKind::Stopped => RemotePortAuthorityKind::Free,
             RichPortStatusKind::Starting => RemotePortAuthorityKind::Unknown,
             RichPortStatusKind::Unknown => RemotePortAuthorityKind::Unknown,
+        };
+        // A positive authority carrying probe detail is internally
+        // inconsistent. Fail closed before it reaches a renderer or control
+        // predicate rather than allowing a blue/green claim with a fault.
+        let kind = if status.error().is_some()
+            && matches!(
+                projected_kind,
+                RemotePortAuthorityKind::Managed
+                    | RemotePortAuthorityKind::ManagedUnready
+                    | RemotePortAuthorityKind::ProvenExternal
+            ) {
+            RemotePortAuthorityKind::Unknown
+        } else {
+            projected_kind
         };
         let resource = matches!(
             kind,
@@ -345,9 +371,8 @@ impl RemotePortAuthority {
             membership_revision: 0,
             observation_sequence: 0,
             publication_sequence: 0,
-            observed_at_epoch_ms: now_epoch_ms,
-            freshness_deadline_epoch_ms: now_epoch_ms
-                .saturating_add(REMOTE_PORT_AUTHORITY_MAX_AGE_MS),
+            observed_at_epoch_ms,
+            freshness_deadline_epoch_ms,
             managed_fence_fingerprint: None,
             verified: None,
             error: None,
@@ -9444,6 +9469,41 @@ mod tests {
         let wire = serde_json::to_string(&authority).expect("serialize remote authority");
         assert!(wire.contains("probeError"));
         assert!(!wire.contains("listener-table.txt"));
+    }
+
+    #[test]
+    fn remote_probe_error_preserves_source_observation_window() {
+        let status = crate::process::ports::PortStatus {
+            port: 43126,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProbeError,
+            listeners: Arc::from([]),
+            error: Some("listener probe failed".to_string()),
+        };
+        let authority =
+            RemotePortAuthority::from_rich_with_source_metadata(&status, 20_000, 21_000);
+
+        assert_eq!(authority.observed_at_epoch_ms, 20_000);
+        assert_eq!(authority.freshness_deadline_epoch_ms, 21_000);
+        assert!(!authority.is_fresh_at(21_001));
+    }
+
+    #[test]
+    fn remote_rejects_proven_external_probe_diagnostic() {
+        let status = crate::process::ports::PortStatus {
+            port: 43127,
+            resource: ResourceFence::new(crate::domain::id::ResourceId::new(), 7),
+            kind: crate::process::ports::PortStatusKind::ProvenExternal,
+            listeners: Arc::from([]),
+            error: Some("listener probe failed".to_string()),
+        };
+        let authority = RemotePortAuthority::from_rich(&status, now_epoch_ms());
+
+        assert_eq!(authority.kind(), RemotePortAuthorityKind::Unknown);
+        assert_eq!(
+            authority.diagnostic,
+            Some(super::RemotePortDiagnostic::ProbeError)
+        );
     }
 
     #[test]
