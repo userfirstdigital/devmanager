@@ -3966,6 +3966,7 @@ where
     state_store: S,
     current: HashMap<AgentSessionId, ProviderRuntime>,
     leases: HashMap<AgentSessionId, LeaseSlot>,
+    settled_claims: HashMap<AgentSessionId, RecoveryClaim>,
     pending_launches: HashMap<AgentSessionId, ProviderSessionState>,
     next_generation: HashMap<AgentSessionId, u64>,
     next_action_epoch: HashMap<AgentSessionId, u64>,
@@ -3994,6 +3995,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             state_store,
             current: HashMap::new(),
             leases: HashMap::new(),
+            settled_claims: HashMap::new(),
             pending_launches: HashMap::new(),
             next_generation: HashMap::new(),
             next_action_epoch: HashMap::new(),
@@ -4453,6 +4455,15 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         agent_session_id: AgentSessionId,
         runtime: &ProviderRuntime,
     ) -> Result<(), ProviderSessionError> {
+        if self
+            .leases
+            .get(&agent_session_id)
+            .is_some_and(|slot| slot.settled)
+        {
+            self.ensure_durable_settlement(agent_session_id)?;
+            self.leases.remove(&agent_session_id);
+            return Ok(());
+        }
         let slot = self.leases.get_mut(&agent_session_id).ok_or(
             ProviderSessionError::SettlementRequired {
                 agent_session_id,
@@ -4466,7 +4477,11 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         if !settlement.matches_fence(&runtime.fence()) {
             return Err(ProviderSessionError::SettlementFenceMismatch);
         }
-        self.persist_state_for_runtime(runtime, PersistedRuntimeLifecycle::Closed)?;
+        self.leases
+            .get_mut(&agent_session_id)
+            .expect("lease remains present after settlement")
+            .settled = true;
+        self.ensure_durable_settlement(agent_session_id)?;
         self.leases.remove(&agent_session_id);
         Ok(())
     }
@@ -4478,6 +4493,15 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         &mut self,
         state: &ProviderSessionState,
     ) -> Result<(), ProviderSessionError> {
+        if self
+            .leases
+            .get(&state.agent_session_id)
+            .is_some_and(|slot| slot.settled)
+        {
+            self.ensure_durable_settlement(state.agent_session_id)?;
+            self.leases.remove(&state.agent_session_id);
+            return Ok(());
+        }
         let claim = self
             .state_store
             .claim_recovery(state, self.recovery_owner_id, recovery_now_ms())
@@ -4516,6 +4540,10 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(ProviderSessionError::SettlementFenceMismatch);
         }
+        if claim.settled {
+            let _ = self.state_store.release_recovery(state, &claim);
+            return Ok(());
+        }
         let settlement = match self.launcher.stop_and_join(&mut lease) {
             Ok(settlement) => settlement,
             Err(error) => {
@@ -4535,9 +4563,21 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(ProviderSessionError::SettlementFenceMismatch);
         }
-        let result = self.persist_state_with_lifecycle(state, PersistedRuntimeLifecycle::Closed);
+        self.leases.insert(
+            state.agent_session_id,
+            LeaseSlot {
+                lease,
+                state: state.clone(),
+                settled: true,
+            },
+        );
+        if let Err(error) = self.state_store.mark_recovery_settled(state, &claim) {
+            self.settled_claims.insert(state.agent_session_id, claim);
+            return Err(ProviderSessionError::StateStore(error));
+        }
+        self.leases.remove(&state.agent_session_id);
         let _ = self.state_store.release_recovery(state, &claim);
-        result
+        Ok(())
     }
 
     pub fn close_task(&mut self, task_id: TaskId) -> Result<(), ProviderSessionError> {
@@ -4656,6 +4696,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             lifecycle => return Err(ProviderSessionError::RuntimeNotLive { lifecycle }),
         }
         if self.leases.get(&agent_id).is_some_and(|slot| slot.settled) {
+            self.ensure_durable_settlement(agent_id)?;
             self.persist_state_for_runtime(runtime, final_state)?;
             match final_state {
                 PersistedRuntimeLifecycle::Replaced => runtime.mark_replaced(),
@@ -4685,6 +4726,11 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         if !settlement.matches_fence(&runtime.fence()) {
             return Err(ProviderSessionError::SettlementFenceMismatch);
         }
+        self.leases
+            .get_mut(&agent_id)
+            .expect("lease remains present after settlement")
+            .settled = true;
+        self.ensure_durable_settlement(agent_id)?;
         self.persist_state_for_runtime(runtime, final_state)?;
         match final_state {
             PersistedRuntimeLifecycle::Replaced => runtime.mark_replaced(),
@@ -4760,6 +4806,53 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         self.persist_state(self.state_for_runtime(runtime, lifecycle))
     }
 
+    /// Make joined-zero settlement durable before any later lifecycle write or
+    /// recovery handoff. If the marker write fails, retain the exact claim so
+    /// the local settled permit remains the only retry authority.
+    fn ensure_durable_settlement(
+        &mut self,
+        agent_session_id: AgentSessionId,
+    ) -> Result<(), ProviderSessionError> {
+        let state = self
+            .state_store
+            .load(agent_session_id)
+            .map_err(ProviderSessionError::StateStore)?
+            .ok_or(ProviderSessionError::AgentSessionNotFound(agent_session_id))?;
+        if let Some(slot) = self.leases.get_mut(&agent_session_id) {
+            slot.state = state.clone();
+        }
+        let claim = self
+            .state_store
+            .claim_recovery(&state, self.recovery_owner_id, recovery_now_ms())
+            .map_err(ProviderSessionError::StateStore)?
+            .ok_or(ProviderSessionError::RecoveryClaimed {
+                agent_session_id,
+                generation: state.generation,
+            })?;
+        if claim.settled {
+            self.settled_claims.remove(&agent_session_id);
+            let _ = self.state_store.release_recovery(&state, &claim);
+            return Ok(());
+        }
+        if let Err(error) = self.state_store.mark_recovery_settled(&state, &claim) {
+            self.settled_claims.insert(agent_session_id, claim);
+            return Err(ProviderSessionError::StateStore(error));
+        }
+        self.settled_claims.remove(&agent_session_id);
+        let _ = self.state_store.release_recovery(&state, &claim);
+        Ok(())
+    }
+
+    fn release_settled_claim(
+        &mut self,
+        agent_session_id: AgentSessionId,
+        state: &ProviderSessionState,
+    ) {
+        if let Some(claim) = self.settled_claims.remove(&agent_session_id) {
+            let _ = self.state_store.release_recovery(state, &claim);
+        }
+    }
+
     fn recover_persisted_state(
         &mut self,
         state: &ProviderSessionState,
@@ -4772,6 +4865,28 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         state: &ProviderSessionState,
         final_lifecycle: PersistedRuntimeLifecycle,
     ) -> Result<(), ProviderSessionError> {
+        if self
+            .leases
+            .get(&state.agent_session_id)
+            .is_some_and(|slot| slot.settled)
+        {
+            let local_state = self
+                .leases
+                .get(&state.agent_session_id)
+                .expect("settled lease remains present")
+                .state
+                .clone();
+            if local_state != *state {
+                return Err(ProviderSessionError::StateStore(
+                    "local settled provider recovery state is stale".to_string(),
+                ));
+            }
+            self.ensure_durable_settlement(state.agent_session_id)?;
+            self.persist_state_with_lifecycle(state, final_lifecycle)?;
+            self.leases.remove(&state.agent_session_id);
+            self.release_settled_claim(state.agent_session_id, state);
+            return Ok(());
+        }
         let claim = self
             .state_store
             .claim_recovery(state, self.recovery_owner_id, recovery_now_ms())
@@ -4788,6 +4903,11 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             }
         };
         let Some(mut lease) = recovered else {
+            if claim.settled {
+                let result = self.persist_state_with_lifecycle(state, final_lifecycle);
+                let _ = self.state_store.release_recovery(state, &claim);
+                return result;
+            }
             if state.lifecycle != PersistedRuntimeLifecycle::UnknownLeaked {
                 if let Err(error) = self
                     .persist_state_with_lifecycle(state, PersistedRuntimeLifecycle::UnknownLeaked)
@@ -4841,38 +4961,26 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 let _ = self.state_store.release_recovery(state, &claim);
                 return Err(ProviderSessionError::SettlementFenceMismatch);
             }
+        }
+        self.leases.insert(
+            state.agent_session_id,
+            LeaseSlot {
+                lease,
+                state: state.clone(),
+                settled: true,
+            },
+        );
+        if !claim.settled {
             if let Err(error) = self.state_store.mark_recovery_settled(state, &claim) {
-                let retained = self.launcher.retain_for_recovery(state, lease);
-                if let Err(failure) = retained {
-                    self.leases.insert(
-                        state.agent_session_id,
-                        LeaseSlot {
-                            lease: failure.into_lease(),
-                            state: state.clone(),
-                            settled: true,
-                        },
-                    );
-                }
-                let _ = self.state_store.release_recovery(state, &claim);
+                self.settled_claims.insert(state.agent_session_id, claim);
                 return Err(ProviderSessionError::StateStore(error));
             }
         }
-        let result = self.persist_state_with_lifecycle(state, final_lifecycle);
-        if let Err(error) = result {
-            let retained = self.launcher.retain_for_recovery(state, lease);
-            if let Err(failure) = retained {
-                self.leases.insert(
-                    state.agent_session_id,
-                    LeaseSlot {
-                        lease: failure.into_lease(),
-                        state: state.clone(),
-                        settled: true,
-                    },
-                );
-            }
+        if let Err(error) = self.persist_state_with_lifecycle(state, final_lifecycle) {
             let _ = self.state_store.release_recovery(state, &claim);
             return Err(error);
         }
+        self.leases.remove(&state.agent_session_id);
         let _ = self.state_store.release_recovery(state, &claim);
         Ok(())
     }
@@ -5025,7 +5133,40 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state: slot_state,
                 settled,
             } = slot;
-            let state = if let Some(runtime) = self.current.get(&agent_id) {
+            let state = if settled {
+                match self.state_store.load(agent_id) {
+                    Ok(Some(state)) => state,
+                    Ok(None) => {
+                        self.leases.insert(
+                            agent_id,
+                            LeaseSlot {
+                                lease,
+                                state: slot_state,
+                                settled,
+                            },
+                        );
+                        if first_error.is_none() {
+                            first_error =
+                                Some(ProviderSessionError::AgentSessionNotFound(agent_id));
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        self.leases.insert(
+                            agent_id,
+                            LeaseSlot {
+                                lease,
+                                state: slot_state,
+                                settled,
+                            },
+                        );
+                        if first_error.is_none() {
+                            first_error = Some(ProviderSessionError::StateStore(error));
+                        }
+                        continue;
+                    }
+                }
+            } else if let Some(runtime) = self.current.get(&agent_id) {
                 let lifecycle = match runtime.lifecycle() {
                     RuntimeLifecycle::Closed => PersistedRuntimeLifecycle::Closed,
                     RuntimeLifecycle::Exited => PersistedRuntimeLifecycle::Exited,
@@ -5043,7 +5184,22 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 state.revision = 0;
                 state
             };
-            if !settled {
+            if settled {
+                if let Err(error) = self.ensure_durable_settlement(agent_id) {
+                    self.leases.insert(
+                        agent_id,
+                        LeaseSlot {
+                            lease,
+                            state: slot_state,
+                            settled,
+                        },
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            } else {
                 if let Err(error) = self.persist_state(state.clone()) {
                     self.leases.insert(
                         agent_id,
@@ -5551,6 +5707,8 @@ mod tests {
     struct FailingPersistProviderSessionStateStore {
         inner: SqliteProviderSessionStateStore,
         fail_next_persist: bool,
+        fail_after_successful_persists: Option<usize>,
+        fail_next_mark_recovery_settled: bool,
     }
 
     impl FailingPersistProviderSessionStateStore {
@@ -5558,11 +5716,21 @@ mod tests {
             Self {
                 inner: SqliteProviderSessionStateStore::open(path).unwrap(),
                 fail_next_persist: false,
+                fail_after_successful_persists: None,
+                fail_next_mark_recovery_settled: false,
             }
         }
 
         fn fail_next_persist(&mut self) {
             self.fail_next_persist = true;
+        }
+
+        fn fail_persist_after_successes(&mut self, successes: usize) {
+            self.fail_after_successful_persists = Some(successes);
+        }
+
+        fn fail_next_mark_recovery_settled(&mut self) {
+            self.fail_next_mark_recovery_settled = true;
         }
     }
 
@@ -5582,6 +5750,13 @@ mod tests {
                 self.fail_next_persist = false;
                 return Err("injected provider session persist failure".to_string());
             }
+            if let Some(remaining) = self.fail_after_successful_persists.as_mut() {
+                if *remaining == 0 {
+                    self.fail_after_successful_persists = None;
+                    return Err("injected provider session persist failure".to_string());
+                }
+                *remaining -= 1;
+            }
             self.inner.persist(state)
         }
 
@@ -5599,6 +5774,10 @@ mod tests {
             state: &ProviderSessionState,
             claim: &RecoveryClaim,
         ) -> Result<(), String> {
+            if self.fail_next_mark_recovery_settled {
+                self.fail_next_mark_recovery_settled = false;
+                return Err("injected provider recovery settlement failure".to_string());
+            }
             self.inner.mark_recovery_settled(state, claim)
         }
 
@@ -5702,7 +5881,7 @@ mod tests {
             SqliteProviderSessionStateStore::open(path.path()).unwrap(),
         );
         reopened.close_agent_session(agent.id).unwrap();
-        assert_eq!(launcher.snapshot().stopped().len(), 1);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
         assert_eq!(
             SqliteProviderSessionStateStore::open(path.path())
                 .unwrap()
@@ -5796,6 +5975,88 @@ mod tests {
         assert!(!manager.leases.contains_key(&agent.id));
         assert_eq!(launcher.snapshot().lease_drops(), 0);
         drop(runtime);
+        drop(manager);
+    }
+
+    #[test]
+    fn current_manager_close_post_stop_persist_failure_does_not_stop_twice() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.state_store.fail_persist_after_successes(1);
+
+        assert!(matches!(
+            manager.close_agent_session(agent.id),
+            Err(ProviderSessionError::StateStore(error))
+                if error == "injected provider session persist failure"
+        ));
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+
+        manager.close_agent_session(agent.id).unwrap();
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(
+            manager
+                .state_store
+                .inner
+                .load(agent.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle(),
+            PersistedRuntimeLifecycle::Closed
+        );
+        drop(runtime);
+        drop(manager);
+    }
+
+    #[test]
+    fn current_manager_replacement_post_stop_persist_failure_does_not_stop_twice() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        let old_generation = runtime.generation();
+        manager.state_store.fail_persist_after_successes(1);
+
+        let mut replacement_agent = agent.clone();
+        replacement_agent.runtime_generation = old_generation;
+        assert!(matches!(
+            manager.replace_generation(test_request(replacement_agent.clone())),
+            Err(ProviderSessionError::StateStore(error))
+                if error == "injected provider session persist failure"
+        ));
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+
+        let replacement = manager
+            .replace_generation(test_request(replacement_agent))
+            .unwrap();
+        assert!(replacement.generation() > old_generation);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        manager
+            .close_agent_session(replacement.agent_session_id())
+            .unwrap();
+        drop(runtime);
+        drop(replacement);
         drop(manager);
     }
 
@@ -5949,6 +6210,57 @@ mod tests {
     }
 
     #[test]
+    fn recovery_marker_write_failure_does_not_stop_twice_on_retry() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+        manager.process_exited(runtime.correlation()).unwrap();
+        let state = manager.state_store.inner.load(agent.id).unwrap().unwrap();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        launcher
+            .clone()
+            .retain_for_recovery(&state, slot.lease)
+            .unwrap();
+        drop(runtime);
+        drop(manager);
+
+        let mut failed = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        failed.state_store.fail_next_mark_recovery_settled();
+        assert!(matches!(
+            failed.close_agent_session(agent.id),
+            Err(ProviderSessionError::StateStore(error))
+                if error == "injected provider recovery settlement failure"
+        ));
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 0);
+        assert!(failed.leases.contains_key(&agent.id));
+        drop(failed);
+
+        let mut retrying = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            FailingPersistProviderSessionStateStore::new(path.path()),
+        );
+        retrying.close_agent_session(agent.id).unwrap();
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 1);
+        drop(retrying);
+    }
+
+    #[test]
     fn crash_after_permit_acquisition_reopens_as_unknown_leaked() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -6063,7 +6375,7 @@ mod tests {
         reopened.close_task(agent.task_id).unwrap();
         drop(reopened);
 
-        assert_eq!(launcher.snapshot().stopped().len(), 1);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
         let final_store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         assert_eq!(
             final_store.load(agent.id).unwrap().unwrap().lifecycle(),
@@ -6095,7 +6407,7 @@ mod tests {
         drop(manager);
         // The first stop/join completed before the crash; the retry is
         // idempotent and does not issue a second stop for the same process.
-        assert_eq!(launcher.snapshot().stopped().len(), 1);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
     }
 
     #[test]
@@ -6137,7 +6449,7 @@ mod tests {
             PersistedRuntimeLifecycle::Closed
         );
         reopened.close_task(agent.task_id).unwrap();
-        assert_eq!(launcher.snapshot().stopped().len(), 1);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
         assert_eq!(
             SqliteProviderSessionStateStore::open(path.path())
                 .unwrap()
