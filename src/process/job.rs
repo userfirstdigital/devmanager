@@ -207,6 +207,55 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 #[cfg(windows)]
 const ERROR_MORE_DATA: i32 = 234;
 const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JobProcessQueryError {
+    InvalidHandle,
+    ZeroBudget,
+    BoundedOverflow {
+        max_members: usize,
+        reported_members: Option<usize>,
+    },
+    BufferSizeOverflow,
+    BufferTooLarge,
+    MisalignedBuffer,
+    NativeFailure(String),
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for JobProcessQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidHandle => formatter.write_str("managed job handle is null"),
+            Self::ZeroBudget => formatter.write_str("managed Job process list budget is zero"),
+            Self::BoundedOverflow {
+                max_members,
+                reported_members,
+            } => match reported_members {
+                Some(reported_members) => write!(
+                    formatter,
+                    "QueryInformationJobObject bounded Job overflow: process list exceeds {max_members} members ({reported_members} reported)"
+                ),
+                None => write!(
+                    formatter,
+                    "QueryInformationJobObject bounded Job overflow: process list exceeds {max_members} members"
+                ),
+            },
+            Self::BufferSizeOverflow => formatter.write_str("job process list size overflow"),
+            Self::BufferTooLarge => formatter.write_str(
+                "job process list buffer exceeds QueryInformationJobObject limit",
+            ),
+            Self::MisalignedBuffer => {
+                formatter.write_str("job process list aligned buffer out of range")
+            }
+            Self::NativeFailure(detail) => {
+                write!(formatter, "QueryInformationJobObject failed: {detail}")
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 const MAX_COMPLETION_MESSAGES: usize = 4_096;
 #[cfg(windows)]
@@ -382,6 +431,7 @@ impl ManagedProcessJob {
         #[cfg(windows)]
         {
             query_job_active_process_ids(self.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY)
+                .map_err(|error| error.to_string())
         }
 
         #[cfg(not(windows))]
@@ -413,6 +463,7 @@ impl ManagedProcessJob {
                 // capacity, so a repeated authoritative query can still be
                 // recognized when the tick is otherwise full.
                 query_job_active_process_ids(self.raw_job_handle(), budget.max_members())
+                    .map_err(|error| error.to_string())
             }
 
             #[cfg(not(windows))]
@@ -560,17 +611,21 @@ pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJo
 }
 
 #[cfg(windows)]
-fn query_job_active_process_ids(job: *mut c_void, max_members: usize) -> Result<Vec<u32>, String> {
+fn query_job_active_process_ids(
+    job: *mut c_void,
+    max_members: usize,
+) -> Result<Vec<u32>, JobProcessQueryError> {
     if job.is_null() {
-        return Err("managed job handle is null".to_string());
+        return Err(JobProcessQueryError::InvalidHandle);
     }
     if max_members == 0 {
-        return Err("managed Job process list budget is zero".to_string());
+        return Err(JobProcessQueryError::ZeroBudget);
     }
     if max_members > MAX_JOB_PROCESS_ID_CAPACITY {
-        return Err(format!(
-            "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
-        ));
+        return Err(JobProcessQueryError::BoundedOverflow {
+            max_members: MAX_JOB_PROCESS_ID_CAPACITY,
+            reported_members: Some(max_members),
+        });
     }
 
     // JOBOBJECT_BASIC_PROCESS_ID_LIST:
@@ -579,38 +634,37 @@ fn query_job_active_process_ids(job: *mut c_void, max_members: usize) -> Result<
     //   ULONG_PTR ProcessIdList[ANYSIZE_ARRAY];
     let header_bytes = std::mem::size_of::<u32>()
         .checked_mul(2)
-        .ok_or_else(|| "job process list header size overflow".to_string())?;
+        .ok_or(JobProcessQueryError::BufferSizeOverflow)?;
     let mut capacity = 16usize.min(max_members);
 
     loop {
         if capacity > max_members {
-            return Err(format!(
-                "QueryInformationJobObject process list exceeds {max_members} members"
-            ));
+            return Err(JobProcessQueryError::BoundedOverflow {
+                max_members,
+                reported_members: Some(capacity),
+            });
         }
         let list_bytes = capacity
             .checked_mul(std::mem::size_of::<usize>())
-            .ok_or_else(|| "job process list size overflow".to_string())?;
+            .ok_or(JobProcessQueryError::BufferSizeOverflow)?;
         let total_bytes = header_bytes
             .checked_add(list_bytes)
-            .ok_or_else(|| "job process list buffer size overflow".to_string())?;
+            .ok_or(JobProcessQueryError::BufferSizeOverflow)?;
         if total_bytes > u32::MAX as usize {
-            return Err(
-                "job process list buffer exceeds QueryInformationJobObject limit".to_string(),
-            );
+            return Err(JobProcessQueryError::BufferTooLarge);
         }
         let align = std::mem::align_of::<usize>().max(std::mem::align_of::<u32>());
         let storage_len = total_bytes
             .checked_add(align)
-            .ok_or_else(|| "job process list storage size overflow".to_string())?;
+            .ok_or(JobProcessQueryError::BufferSizeOverflow)?;
         let mut storage = vec![0u8; storage_len];
         let offset = storage.as_ptr().align_offset(align);
         let end = offset
             .checked_add(total_bytes)
-            .ok_or_else(|| "job process list aligned range overflow".to_string())?;
+            .ok_or(JobProcessQueryError::BufferSizeOverflow)?;
         let buffer = storage
             .get_mut(offset..end)
-            .ok_or_else(|| "job process list aligned buffer out of range".to_string())?;
+            .ok_or(JobProcessQueryError::MisalignedBuffer)?;
 
         let mut return_length = 0u32;
         let ok = unsafe {
@@ -628,28 +682,31 @@ fn query_job_active_process_ids(job: *mut c_void, max_members: usize) -> Result<
                 let assigned = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
                 let needed = (assigned as usize).max(1);
                 if needed > max_members || capacity >= max_members {
-                    return Err(format!(
-                        "QueryInformationJobObject process list exceeds {max_members} members"
-                    ));
+                    return Err(JobProcessQueryError::BoundedOverflow {
+                        max_members,
+                        reported_members: Some(assigned as usize),
+                    });
                 }
                 let next_capacity = needed.max(capacity.saturating_mul(2)).min(max_members);
                 if next_capacity <= capacity {
-                    return Err(format!(
-                        "QueryInformationJobObject returned ERROR_MORE_DATA but capacity {capacity} cannot grow"
-                    ));
+                    return Err(JobProcessQueryError::BoundedOverflow {
+                        max_members,
+                        reported_members: Some(assigned as usize),
+                    });
                 }
                 capacity = next_capacity;
                 continue;
             }
-            return Err(format!("QueryInformationJobObject failed: {error}"));
+            return Err(JobProcessQueryError::NativeFailure(error.to_string()));
         }
 
         let count = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
         if count > capacity {
             if count > max_members {
-                return Err(format!(
-                    "QueryInformationJobObject returned {count} members (max {max_members})"
-                ));
+                return Err(JobProcessQueryError::BoundedOverflow {
+                    max_members,
+                    reported_members: Some(count),
+                });
             }
             capacity = count;
             continue;
@@ -968,30 +1025,56 @@ fn current_creation_time_100ns(job: *mut c_void, pid: u32) -> Result<u64, String
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        query_job_active_process_ids, CompletionMailbox, ManagedProcessJob,
+        query_job_active_process_ids, CompletionMailbox, JobProcessQueryError, ManagedProcessJob,
         MAX_COMPLETION_MESSAGES, MAX_JOB_PROCESS_ID_CAPACITY,
     };
     use crate::domain::id::ResourceId;
     use crate::domain::operation::ResourceFence;
     use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
     use crate::process::registry::{JobCompletionEvent, JobCompletionMessage, ManagedProcessFence};
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    mod sealed_fence_issuer {
+        use super::*;
+
+        trait Sealed {}
+
+        struct Issuer;
+
+        impl Sealed for Issuer {}
+
+        trait IssueExactFence: Sealed {
+            fn issue(&self) -> ManagedProcessFence;
+        }
+
+        impl IssueExactFence for Issuer {
+            fn issue(&self) -> ManagedProcessFence {
+                let resource_id = ResourceId::from_bytes([
+                    0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x71,
+                ])
+                .expect("resource id");
+                let identity = ManagedProcessIdentity::new(
+                    ManagedProcessId::new(71, 7_100).expect("process id"),
+                    std::env::current_exe().expect("test executable"),
+                )
+                .expect("process identity");
+                ManagedProcessFence::new(
+                    ResourceFence::new(resource_id, 1),
+                    ProcessOwner::Host,
+                    identity,
+                )
+            }
+        }
+
+        pub(super) fn issue() -> ManagedProcessFence {
+            Issuer.issue()
+        }
+    }
 
     fn authority() -> ManagedProcessFence {
-        let resource_id = ResourceId::from_bytes([
-            0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x71,
-        ])
-        .expect("resource id");
-        let identity = ManagedProcessIdentity::new(
-            ManagedProcessId::new(71, 7_100).expect("process id"),
-            std::env::current_exe().expect("test executable"),
-        )
-        .expect("process identity");
-        ManagedProcessFence::new(
-            ResourceFence::new(resource_id, 1),
-            ProcessOwner::Host,
-            identity,
-        )
+        sealed_fence_issuer::issue()
     }
 
     fn message(authority: &ManagedProcessFence, event: JobCompletionEvent) -> JobCompletionMessage {
@@ -1011,7 +1094,199 @@ mod tests {
         let overflow =
             query_job_active_process_ids(job.raw_job_handle(), MAX_JOB_PROCESS_ID_CAPACITY + 1)
                 .expect_err("capacity above the QueryInformationJobObject cap must fail closed");
-        assert!(overflow.contains("16384"));
+        match overflow {
+            JobProcessQueryError::BoundedOverflow {
+                max_members,
+                reported_members: Some(reported_members),
+            } => {
+                assert_eq!(max_members, MAX_JOB_PROCESS_ID_CAPACITY);
+                assert_eq!(reported_members, MAX_JOB_PROCESS_ID_CAPACITY + 1);
+            }
+            other => panic!("expected hard-cap overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_information_job_object_reports_native_bounded_overflow_without_growing() {
+        let Some(job) = ManagedProcessJob::create().expect("create test Job") else {
+            return;
+        };
+        let helpers = SuspendedJobMembers::spawn_two(&job).expect("spawn suspended Job helpers");
+        assert_eq!(helpers.members.len(), 2);
+
+        let overflow = query_job_active_process_ids(job.raw_job_handle(), 1)
+            .expect_err("a one-member buffer must reject the two-member Job");
+        assert!(matches!(
+            overflow,
+            JobProcessQueryError::BoundedOverflow {
+                max_members: 1,
+                reported_members: Some(reported_members),
+            } if reported_members >= 2
+        ));
+        drop(helpers);
+        assert!(
+            job.active_process_ids()
+                .expect("authoritative zero-members query")
+                .is_empty(),
+            "test helpers must be cleaned from the Job before teardown"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SuspendedJobMembers {
+        members: Vec<SuspendedJobMember>,
+    }
+
+    impl SuspendedJobMembers {
+        fn spawn_two(job: &ManagedProcessJob) -> Result<Self, String> {
+            let first = SuspendedJobMember::spawn(job)?;
+            let second = match SuspendedJobMember::spawn(job) {
+                Ok(member) => member,
+                Err(error) => {
+                    drop(first);
+                    return Err(error);
+                }
+            };
+            Ok(Self {
+                members: vec![first, second],
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SuspendedJobMember {
+        process: *mut c_void,
+        thread: *mut c_void,
+    }
+
+    impl SuspendedJobMember {
+        fn spawn(job: &ManagedProcessJob) -> Result<Self, String> {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            let mut executable = executable
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut startup = StartupInfoW::default();
+            startup.cb = std::mem::size_of::<StartupInfoW>() as u32;
+            let mut information = ProcessInformation::default();
+            let created = unsafe {
+                CreateProcessW(
+                    executable.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut startup,
+                    &mut information,
+                )
+            };
+            if created == 0 {
+                return Err(format!(
+                    "CreateProcessW suspended Job helper failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let assigned =
+                unsafe { AssignProcessToJobObject(job.raw_job_handle(), information.process) };
+            if assigned == 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    TerminateProcess(information.process, 1);
+                    WaitForSingleObject(information.process, 5_000);
+                    CloseHandle(information.thread);
+                    CloseHandle(information.process);
+                }
+                return Err(format!(
+                    "AssignProcessToJobObject suspended Job helper failed: {error}"
+                ));
+            }
+            unsafe {
+                CloseHandle(information.thread);
+            }
+            Ok(Self {
+                process: information.process,
+                thread: std::ptr::null_mut(),
+            })
+        }
+    }
+
+    impl Drop for SuspendedJobMember {
+        fn drop(&mut self) {
+            if self.process.is_null() {
+                return;
+            }
+            unsafe {
+                TerminateProcess(self.process, 0);
+                WaitForSingleObject(self.process, 5_000);
+                CloseHandle(self.process);
+                if !self.thread.is_null() {
+                    CloseHandle(self.thread);
+                }
+            }
+            self.process = std::ptr::null_mut();
+            self.thread = std::ptr::null_mut();
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        reserved2: u16,
+        reserved2_ptr: *mut u8,
+        stdin: *mut c_void,
+        stdout: *mut c_void,
+        stderr: *mut c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessInformation {
+        process: *mut c_void,
+        thread: *mut c_void,
+        process_id: u32,
+        thread_id: u32,
+    }
+
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    #[cfg(windows)]
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn CreateProcessW(
+            application_name: *mut u16,
+            command_line: *mut u16,
+            process_attributes: *mut c_void,
+            thread_attributes: *mut c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *mut c_void,
+            current_directory: *mut u16,
+            startup_info: *mut StartupInfoW,
+            process_information: *mut ProcessInformation,
+        ) -> i32;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
     #[test]

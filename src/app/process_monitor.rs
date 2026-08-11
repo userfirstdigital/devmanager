@@ -872,17 +872,46 @@ mod tests {
     use crate::terminal::session::TerminalBackend;
     use std::path::PathBuf;
 
+    mod sealed_fence_issuer {
+        use super::*;
+
+        trait Sealed {}
+
+        struct Issuer;
+
+        impl Sealed for Issuer {}
+
+        trait IssueExactFence: Sealed {
+            fn issue(&self) -> ManagedProcessFence;
+        }
+
+        impl IssueExactFence for Issuer {
+            fn issue(&self) -> ManagedProcessFence {
+                let resource_id = ResourceId::from_bytes([
+                    0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x42,
+                ])
+                .expect("resource id");
+                let identity = ManagedProcessIdentity::new(
+                    ManagedProcessId::new(42, 7).expect("test process identity"),
+                    std::env::current_exe().expect("test executable"),
+                )
+                .expect("canonical test executable");
+                ManagedProcessFence::new(
+                    ResourceFence::new(resource_id, 3),
+                    ProcessOwner::Host,
+                    identity,
+                )
+            }
+        }
+
+        pub(super) fn issue() -> ManagedProcessFence {
+            Issuer.issue()
+        }
+    }
+
     fn test_process_fence() -> ManagedProcessFence {
-        let identity = ManagedProcessIdentity::new(
-            ManagedProcessId::new(42, 7).expect("test process identity"),
-            std::env::current_exe().expect("test executable"),
-        )
-        .expect("canonical test executable");
-        ManagedProcessFence::new(
-            ResourceFence::new(ResourceId::new(), 3),
-            ProcessOwner::Host,
-            identity,
-        )
+        sealed_fence_issuer::issue()
     }
 
     #[test]

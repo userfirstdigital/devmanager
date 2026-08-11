@@ -13,7 +13,9 @@ use crate::browser::{
     BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
+#[cfg(test)]
 use crate::domain::id::ResourceId;
+#[cfg(test)]
 use crate::domain::operation::ResourceFence;
 use crate::domain::snapshot::{ProcessAccountingMemberSnapshot, ProcessMetricStatus};
 use crate::models::{
@@ -22,6 +24,7 @@ use crate::models::{
 use crate::notifications;
 #[cfg(test)]
 use crate::process::identity::ManagedProcessIdentity;
+#[cfg(test)]
 use crate::process::identity::ProcessOwner;
 use crate::process::job::JobMemberObservation;
 use crate::process::registry::ManagedProcessFence;
@@ -85,35 +88,7 @@ struct ResourceSamplingSession {
     metadata: HashMap<u32, ProcessProjectionMetadata>,
 }
 
-fn capture_process_monitor_fence(
-    previous: Option<&ManagedProcessFence>,
-    _session_id: &str,
-    runtime_pid: u32,
-    members: &[JobMemberObservation],
-) -> Option<ManagedProcessFence> {
-    let root = members.iter().find_map(|member| match member {
-        JobMemberObservation::Accessible { identity } if identity.id().pid() == runtime_pid => {
-            Some(identity.clone())
-        }
-        _ => None,
-    })?;
-
-    if let Some(previous) = previous {
-        if previous.root().matches_root(&root) {
-            return Some(previous.clone());
-        }
-    }
-
-    let generation = previous
-        .map(|previous| previous.resource().runtime_generation.saturating_add(1))
-        .unwrap_or(1);
-    Some(ManagedProcessFence::new(
-        ResourceFence::new(ResourceId::new(), generation),
-        ProcessOwner::Host,
-        root,
-    ))
-}
-
+#[cfg(test)]
 fn clear_process_monitor_fence(inner: &ProcessManagerInner, session_id: &str) {
     if let Ok(mut authorities) = inner.process_authorities.lock() {
         authorities.remove(session_id);
@@ -319,9 +294,10 @@ pub(crate) struct ProcessManagerInner {
     codex_adapter_generation: AtomicU64,
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     resource_samplers: Mutex<HashMap<String, ProcessSampler>>,
-    /// Exact monitor action authorities published only after the same Job
-    /// query that supplied the current accounting members. A stale/failed
-    /// query removes the entry so UI selectors can never become ownership.
+    /// Test-only capability storage used to exercise exact action rejection
+    /// until the Task 3.7 registry snapshot is present. Production accounting
+    /// never mints or stores a ManagedProcessFence locally.
+    #[cfg(test)]
     process_authorities: Mutex<HashMap<String, ManagedProcessFence>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -612,6 +588,7 @@ impl ProcessManager {
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             resource_samplers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             process_authorities: Mutex::new(HashMap::new()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
@@ -1325,14 +1302,37 @@ impl ProcessManager {
     }
 
     /// Return the exact action fence published with the current Job-member
-    /// accounting projection. A missing value is fail-closed: the latest Job
-    /// query was unavailable, stale, or did not expose an accessible root.
+    /// accounting projection. This branch has no Task 3.7 registry snapshot,
+    /// so production always returns `None` and the UI must fail closed. The
+    /// test-only map exists solely to exercise exact-fence rejection behavior.
     pub fn process_monitor_fence(&self, session_id: &str) -> Option<ManagedProcessFence> {
-        self.inner
-            .process_authorities
-            .lock()
-            .ok()
-            .and_then(|authorities| authorities.get(session_id).cloned())
+        self.process_monitor_fence_capability(session_id).ok()
+    }
+
+    /// Typed capability boundary for monitor actions. Until the Task 3.7
+    /// registry snapshot is available, this branch exposes no production
+    /// fence and callers must surface `Task37Unavailable` rather than minting
+    /// one from runtime PID/Job observations.
+    pub(crate) fn process_monitor_fence_capability(
+        &self,
+        session_id: &str,
+    ) -> Result<ManagedProcessFence, ExactProcessCloseError> {
+        #[cfg(test)]
+        {
+            return self
+                .inner
+                .process_authorities
+                .lock()
+                .ok()
+                .and_then(|authorities| authorities.get(session_id).cloned())
+                .ok_or(ExactProcessCloseError::Task37Unavailable);
+        }
+
+        #[cfg(not(test))]
+        {
+            let _ = session_id;
+            Err(ExactProcessCloseError::Task37Unavailable)
+        }
     }
 
     pub fn runtime_revision(&self) -> u64 {
@@ -3344,6 +3344,7 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
+        #[cfg(test)]
         clear_process_monitor_fence(&self.inner, session_id);
         let result = match self.get_session(session_id) {
             Ok(session) => session.close(closed_by_user),
@@ -3727,6 +3728,7 @@ impl ProcessManager {
     }
 
     fn forget_session(&self, session_id: &str) {
+        #[cfg(test)]
         clear_process_monitor_fence(&self.inner, session_id);
         let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
         self.cleanup_ai_adapters_for_session(session_id);
@@ -3996,6 +3998,7 @@ fn refresh_resource_snapshots_with_source(
         if let Ok(mut samplers) = inner.resource_samplers.lock() {
             samplers.clear();
         }
+        #[cfg(test)]
         if let Ok(mut authorities) = inner.process_authorities.lock() {
             authorities.clear();
         }
@@ -4060,33 +4063,6 @@ fn refresh_resource_snapshots_with_source(
         job_member_observations.insert(session_id.clone(), observation);
     }
     drop(terminal_sessions);
-
-    let active_authority_ids: BTreeSet<String> = sessions
-        .iter()
-        .map(|(session_id, _, _, _, _, _)| session_id.clone())
-        .collect();
-    if let Ok(mut authorities) = inner.process_authorities.lock() {
-        authorities.retain(|session_id, _| active_authority_ids.contains(session_id));
-        for (session_id, runtime_pid, _, _, _, _) in &sessions {
-            let Some(members) = job_member_observations
-                .get(session_id)
-                .and_then(|observation| observation.members.as_deref())
-            else {
-                authorities.remove(session_id);
-                continue;
-            };
-            let Some(fence) = capture_process_monitor_fence(
-                authorities.get(session_id),
-                session_id,
-                *runtime_pid,
-                members,
-            ) else {
-                authorities.remove(session_id);
-                continue;
-            };
-            authorities.insert(session_id.clone(), fence);
-        }
-    }
 
     // Deduplicate all authoritative PIDs before building the one selected OS
     // metadata snapshot. Runtime roots never consume a slot unless the Job
@@ -5277,6 +5253,7 @@ fn live_runtime_root_running(inner: &Arc<ProcessManagerInner>, session_id: &str)
 }
 
 fn mark_session_reaped(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+    #[cfg(test)]
     clear_process_monitor_fence(inner, session_id);
     let mut changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
@@ -7314,7 +7291,8 @@ pub(crate) fn execute_process_op_inner(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExactProcessCloseError {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum ExactProcessCloseError {
     StaleFence,
     Task37Unavailable,
 }
@@ -7372,13 +7350,20 @@ fn close_managed_process_exact(
     diagnostic_pid: u32,
     kill_tree: bool,
 ) -> Result<(), String> {
-    let current = inner
-        .process_authorities
-        .lock()
-        .ok()
-        .and_then(|authorities| authorities.get(session_id).cloned());
-    if current.as_ref() != Some(fence) {
-        return Err(ExactProcessCloseError::StaleFence.to_string());
+    #[cfg(test)]
+    {
+        let current = inner
+            .process_authorities
+            .lock()
+            .ok()
+            .and_then(|authorities| authorities.get(session_id).cloned());
+        if current.as_ref() != Some(fence) {
+            return Err(ExactProcessCloseError::StaleFence.to_string());
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (inner, session_id);
     }
 
     exact_process_closer::ExactCloser::close_managed_process_exact(
@@ -11103,18 +11088,68 @@ mod tests {
         path
     }
 
+    mod sealed_fence_issuer {
+        use super::*;
+
+        trait Sealed {}
+
+        struct Issuer;
+
+        impl Sealed for Issuer {}
+
+        trait IssueExactFence: Sealed {
+            fn issue(
+                &self,
+                seed: u8,
+                generation: u64,
+                owner: ProcessOwner,
+                pid: u32,
+                creation_time_100ns: u64,
+            ) -> ManagedProcessFence;
+        }
+
+        impl IssueExactFence for Issuer {
+            fn issue(
+                &self,
+                seed: u8,
+                generation: u64,
+                owner: ProcessOwner,
+                pid: u32,
+                creation_time_100ns: u64,
+            ) -> ManagedProcessFence {
+                let mut resource_bytes = [
+                    0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ];
+                resource_bytes[15] = seed;
+                let resource_id = ResourceId::from_bytes(resource_bytes).expect("resource id");
+                let identity = ManagedProcessIdentity::new(
+                    crate::process::identity::ManagedProcessId::new(pid, creation_time_100ns)
+                        .expect("non-zero test process identity"),
+                    std::env::current_exe().expect("test executable"),
+                )
+                .expect("canonical test executable");
+                ManagedProcessFence::new(
+                    ResourceFence::new(resource_id, generation),
+                    owner,
+                    identity,
+                )
+            }
+        }
+
+        pub(super) fn issue(
+            seed: u8,
+            generation: u64,
+            owner: ProcessOwner,
+            pid: u32,
+            creation_time_100ns: u64,
+        ) -> ManagedProcessFence {
+            Issuer.issue(seed, generation, owner, pid, creation_time_100ns)
+        }
+    }
+
     fn synthetic_process_fence(pid: u32) -> ManagedProcessFence {
-        let identity = ManagedProcessIdentity::new(
-            crate::process::identity::ManagedProcessId::new(pid, 1)
-                .expect("non-zero synthetic process id"),
-            std::env::current_exe().expect("test executable"),
-        )
-        .expect("canonical test executable");
-        ManagedProcessFence::new(
-            ResourceFence::new(ResourceId::new(), 1),
-            ProcessOwner::Host,
-            identity,
-        )
+        sealed_fence_issuer::issue(1, 1, ProcessOwner::Host, pid, 1)
     }
 
     fn app_state_with_server(cwd: &Path, clear_logs_on_restart: bool) -> AppState {
@@ -11382,6 +11417,68 @@ mod tests {
     }
 
     #[test]
+    fn kill_process_rejects_wrong_task_resource_generation_owner_and_root() {
+        let manager = ProcessManager::new();
+        let session_id = "wrong-fence-fields";
+        let expected_owner = ProcessOwner::Task(
+            crate::domain::id::TaskId::from_bytes([
+                0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01,
+            ])
+            .expect("task id"),
+        );
+        let expected = sealed_fence_issuer::issue(1, 3, expected_owner, 71, 7_100);
+        manager
+            .inner
+            .process_authorities
+            .lock()
+            .expect("process authorities")
+            .insert(session_id.to_string(), expected.clone());
+
+        let wrong_resource = sealed_fence_issuer::issue(2, 3, expected_owner, 71, 7_100);
+        let wrong_generation = sealed_fence_issuer::issue(1, 4, expected_owner, 71, 7_100);
+        let wrong_task = sealed_fence_issuer::issue(
+            1,
+            3,
+            ProcessOwner::Task(
+                crate::domain::id::TaskId::from_bytes([
+                    0x01, 0x9a, 0x11, 0x22, 0x33, 0x44, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x02,
+                ])
+                .expect("task id"),
+            ),
+            71,
+            7_100,
+        );
+        let wrong_owner = sealed_fence_issuer::issue(1, 3, ProcessOwner::Host, 71, 7_100);
+        let wrong_root = sealed_fence_issuer::issue(1, 3, expected_owner, 72, 7_200);
+
+        for (label, fence) in [
+            ("resource", wrong_resource),
+            ("generation", wrong_generation),
+            ("task", wrong_task),
+            ("owner", wrong_owner),
+            ("root", wrong_root),
+        ] {
+            let completion = execute_process_op_inner(
+                &manager.inner,
+                ProcessOp::KillProcess {
+                    op_id: next_op_id(),
+                    session_id: session_id.to_string(),
+                    pid: expected.root().id().pid(),
+                    fence,
+                    response: None,
+                },
+            );
+            assert_eq!(
+                completion.result.unwrap_err(),
+                "managed process action fence is stale",
+                "wrong {label} field must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn kill_process_requires_task37_exact_closer() {
         let cwd = temp_test_dir("kill-accept-root");
         let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
@@ -11565,6 +11662,14 @@ mod tests {
             session.resources.processes.len()
         );
         assert!(!session.resources.processes[0].name.is_empty());
+        assert!(
+            manager.process_monitor_fence(session_id).is_none(),
+            "accounting cannot mint an action fence without the Task 3.7 registry snapshot"
+        );
+        assert_eq!(
+            manager.process_monitor_fence_capability(session_id),
+            Err(ExactProcessCloseError::Task37Unavailable)
+        );
 
         let _ = manager.close_session(session_id);
     }
