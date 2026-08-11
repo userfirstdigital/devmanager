@@ -3,7 +3,8 @@ use super::{
     CodexResumeObservation, CodexSemanticLaunchState,
 };
 use crate::ai::codex_hooks::{
-    CodexHookRegistry, CodexLaunchPermit, CodexRelayIngestStatus, MAX_CODEX_HOOK_BODY_BYTES,
+    CodexHookRegistry, CodexLaunchPermit, CodexRegistryEvent, CodexRelayIngestStatus,
+    MAX_CODEX_HOOK_BODY_BYTES,
 };
 use crate::domain::{AgentSessionId, ProviderSessionId, TaskId, MAX_PROVIDER_SESSION_ID_BYTES};
 use crate::process::identity::ManagedProcessId;
@@ -18,7 +19,7 @@ use crate::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const FIXTURE_SESSION_ID: &str = "019f-fixture-codex-session";
 const VERSION: &str = include_str!("../../tests/fixtures/providers/codex/version.txt");
@@ -759,6 +760,126 @@ async fn codex_same_identity_reprobe_failure_quarantines_previous_capabilities()
             capability: ProviderCapability::BuildLaunch
         })
     ));
+}
+
+#[tokio::test]
+async fn codex_public_probe_inspection_failure_quarantines_previous_capabilities() {
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let identity = fixture_executable();
+    assert!(adapter.last_capabilities(&identity).is_some());
+
+    let missing = Path::new("C:/devmanager-missing-codex-public-probe");
+    assert!(ProviderAdapter::probe(&adapter, missing).await.is_err());
+    assert!(adapter.last_capabilities(&identity).is_none());
+    assert_eq!(
+        adapter.semantic_launch_state(&identity),
+        CodexSemanticLaunchState::TerminalOnly
+    );
+    assert!(matches!(
+        adapter.build_launch(LaunchProviderRequest::new(identity, None, None)),
+        Err(ProviderError::DependencyUnavailable {
+            capability: ProviderCapability::BuildLaunch
+        })
+    ));
+}
+
+#[tokio::test]
+async fn codex_bind_first_rechecks_current_generation_atomically() {
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let registry = Arc::new(CodexHookRegistry::default());
+    let task = TaskId::new();
+    let agent = AgentSessionId::new();
+    let mut launch = launch_with(
+        &adapter,
+        fixture_executable(),
+        None,
+        &registry,
+        task,
+        agent,
+        process_root(26),
+    )
+    .unwrap();
+    let replacement = issue_permit(&registry, task, agent, process_root(27));
+
+    assert_eq!(
+        launch.authority.bind_first(session_id()),
+        Err(CodexIdentityError::Rejected)
+    );
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn codex_replaced_same_identity_cannot_keep_stale_registered_state() {
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let registry = Arc::new(CodexHookRegistry::default());
+    let task = TaskId::new();
+    let agent = AgentSessionId::new();
+    let first = launch_with(
+        &adapter,
+        fixture_executable(),
+        None,
+        &registry,
+        task,
+        agent,
+        process_root(28),
+    )
+    .unwrap();
+    let second = launch_with(
+        &adapter,
+        fixture_executable(),
+        None,
+        &registry,
+        task,
+        agent,
+        process_root(29),
+    )
+    .unwrap();
+    assert_eq!(
+        adapter.semantic_launch_state(&fixture_executable()),
+        CodexSemanticLaunchState::Registered
+    );
+
+    drop(second);
+    assert_eq!(
+        adapter.semantic_launch_state(&fixture_executable()),
+        CodexSemanticLaunchState::DependencyUnavailable
+    );
+    drop(first);
+}
+
+#[tokio::test]
+async fn codex_relay_observation_does_not_publish_before_adapter_admission() {
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let registry = Arc::new(CodexHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
+        sink.lock().expect("event sink").push(event);
+    })));
+    let mut launch = launch_with(
+        &adapter,
+        fixture_executable(),
+        None,
+        &registry,
+        TaskId::new(),
+        AgentSessionId::new(),
+        process_root(30),
+    )
+    .unwrap();
+
+    let observation = launch.relay_ingest(loopback(), SESSION_START.as_bytes(), 1);
+    assert_eq!(observation.status(), CodexRelayIngestStatus::Accepted);
+    assert!(events.lock().expect("event sink").is_empty());
+
+    assert!(matches!(
+        launch.admit_ingest(observation, SESSION_START.as_bytes()),
+        Ok(CodexAdmission::Bound(_))
+    ));
+    assert!(events
+        .lock()
+        .expect("event sink")
+        .iter()
+        .any(|event| matches!(event, CodexRegistryEvent::SessionStarted(_))));
 }
 
 #[tokio::test]

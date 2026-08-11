@@ -27,7 +27,6 @@ use crate::providers::capabilities::{
 };
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -67,7 +66,6 @@ struct ProbedCodexSurface {
     capabilities: ProviderCapabilities,
     hooks_advertised: bool,
     semantic_state: CodexSemanticLaunchState,
-    live_hook_generations: BTreeSet<u64>,
 }
 
 pub struct CodexAdapter {
@@ -106,6 +104,20 @@ impl CodexAdapter {
             .filter(|surface| surface.identity == *identity)
             .map(|surface| surface.semantic_state)
             .unwrap_or(CodexSemanticLaunchState::TerminalOnly)
+    }
+
+    fn quarantine_attestation(&self) -> Result<(), ProviderError> {
+        let mut pinned = self
+            .pinned
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        let mut probed = self
+            .probed
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        *probed = None;
+        *pinned = None;
+        Ok(())
     }
 
     async fn probe_attested(
@@ -243,7 +255,6 @@ impl CodexAdapter {
             capabilities: capabilities.clone(),
             hooks_advertised,
             semantic_state,
-            live_hook_generations: BTreeSet::new(),
         });
         Ok(capabilities)
     }
@@ -308,7 +319,6 @@ impl CodexAdapter {
         let spec = ProviderLaunchSpec::new(request.executable().clone(), arguments)
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))?;
         reject_forbidden_launch(&spec)?;
-        surface.live_hook_generations.insert(issued.generation);
         surface.semantic_state = CodexSemanticLaunchState::Registered;
         surface.capabilities.semantic_events = CapabilitySupport::Supported;
         surface.capabilities.provider_session_id = CapabilitySupport::Supported;
@@ -347,6 +357,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn probe(&self, executable: &Path) -> Result<ProviderCapabilities, ProviderError> {
+        self.quarantine_attestation()?;
         let identity =
             ProviderExecutable::inspect_blocking(executable).map_err(ProviderError::Executable)?;
         self.probe_attested(&identity).await
@@ -505,12 +516,7 @@ impl CodexCorrelatedLaunch {
         let surface = lock_surface(&self.authority.surface)
             .ok()
             .flatten()
-            .filter(|surface| {
-                surface.identity == *identity
-                    && surface
-                        .live_hook_generations
-                        .contains(&self.authority.registration.generation)
-            })
+            .filter(|surface| surface.identity == *identity)
             .ok_or(CodexResumeFailure::Incompatible)?;
         match observed {
             CodexResumeObservation::Failed(failure) => Err(failure),
@@ -532,7 +538,7 @@ impl CodexCorrelatedLaunch {
         body: &[u8],
         occurred_at_epoch_ms: u64,
     ) -> CodexRelayIngestObservation {
-        self.authority.registry.ingest(
+        self.authority.registry.observe_ingest(
             peer,
             &self.authority.registration.nonce,
             body,
@@ -608,18 +614,23 @@ impl CodexIdentityAuthority {
             return Err(CodexIdentityError::Rejected);
         }
         let outcome = preflight_hook_json(body)?;
-        self.verify_live()?;
-        match outcome.hook {
-            PreflightHook::SessionStart => {
-                let session_id = outcome
+        let session_id = match outcome.hook {
+            PreflightHook::SessionStart => Some(
+                outcome
                     .session_id
                     .ok_or(CodexIdentityError::MissingSessionId)?
-                    .into_provider_session_id()?;
-                self.verify_live()?;
-                self.bind_first(session_id)
-            }
-            PreflightHook::Other => Ok(redacted_partial(body)),
-        }
+                    .into_provider_session_id()?,
+            ),
+            PreflightHook::Other => None,
+        };
+        let registry = Arc::clone(&self.registry);
+        let registration = self.registration.clone();
+        let admitted =
+            registry.admit_and_publish(&registration, &observation, body, || match session_id {
+                Some(session_id) => self.bind_first_unchecked(session_id),
+                None => Ok(redacted_partial(body)),
+            })?;
+        admitted.ok_or(CodexIdentityError::Rejected)
     }
 
     fn verify_live(&self) -> Result<(), CodexIdentityError> {
@@ -635,7 +646,19 @@ impl CodexIdentityAuthority {
         Ok(())
     }
 
+    #[cfg(test)]
     fn bind_first(
+        &mut self,
+        session_id: ProviderSessionId,
+    ) -> Result<CodexAdmission, CodexIdentityError> {
+        let registry = Arc::clone(&self.registry);
+        let registration = self.registration.clone();
+        registry
+            .with_live_registration(&registration, || self.bind_first_unchecked(session_id))
+            .ok_or(CodexIdentityError::Rejected)?
+    }
+
+    fn bind_first_unchecked(
         &mut self,
         session_id: ProviderSessionId,
     ) -> Result<CodexAdmission, CodexIdentityError> {
@@ -655,10 +678,7 @@ impl Drop for CodexIdentityAuthority {
         self.registry.unregister(&self.registration.nonce);
         if let Ok(mut probed) = self.surface.lock() {
             if let Some(surface) = probed.as_mut() {
-                surface
-                    .live_hook_generations
-                    .remove(&self.registration.generation);
-                if surface.live_hook_generations.is_empty() {
+                if !self.registry.has_live_registrations() {
                     surface.semantic_state = if surface.hooks_advertised {
                         CodexSemanticLaunchState::DependencyUnavailable
                     } else {

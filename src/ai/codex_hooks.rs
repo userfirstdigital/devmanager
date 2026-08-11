@@ -399,6 +399,7 @@ pub struct CodexRelayIngestObservation {
     status: CodexRelayIngestStatus,
     body_digest: Option<[u8; 32]>,
     registration: Option<CodexHookRegistration>,
+    occurred_at_epoch_ms: u64,
 }
 
 impl fmt::Debug for CodexRelayIngestObservation {
@@ -421,12 +422,14 @@ impl CodexRelayIngestObservation {
         status: CodexRelayIngestStatus,
         body: &[u8],
         registration: Option<CodexHookRegistration>,
+        occurred_at_epoch_ms: u64,
     ) -> Self {
         Self {
             status,
             body_digest: (body.len() <= MAX_CODEX_HOOK_BODY_BYTES)
                 .then(|| Sha256::digest(body).into()),
             registration,
+            occurred_at_epoch_ms,
         }
     }
 
@@ -459,6 +462,25 @@ struct CodexRegistryState {
     order: std::collections::VecDeque<String>,
     next_generation: u64,
     latest_generation_by_key: HashMap<StableSessionKey, u64>,
+}
+
+fn registration_is_current(state: &CodexRegistryState, expected: &CodexHookRegistration) -> bool {
+    let Some(session) = state.registrations.get(&expected.nonce) else {
+        return false;
+    };
+    session.generation == expected.generation
+        && session.stable_session_key == expected.stable_session_key
+        && state
+            .latest_generation_by_key
+            .get(&session.stable_session_key)
+            == Some(&session.generation)
+}
+
+fn session_is_current(state: &CodexRegistryState, session: &RegisteredCodexSession) -> bool {
+    state
+        .latest_generation_by_key
+        .get(&session.stable_session_key)
+        == Some(&session.generation)
 }
 
 /// Nonce- and generation-fenced ingest for Codex hook relay payloads.
@@ -576,13 +598,10 @@ impl CodexHookRegistry {
     }
 
     pub(crate) fn current_registration(&self, nonce: &str) -> Option<CodexHookRegistration> {
+        let _publication = self.publication_gate.read().ok()?;
         let state = self.state.lock().ok()?;
         let session = state.registrations.get(nonce)?;
-        if state
-            .latest_generation_by_key
-            .get(&session.stable_session_key)
-            != Some(&session.generation)
-        {
+        if !session_is_current(&state, session) {
             return None;
         }
         Some(CodexHookRegistration {
@@ -590,6 +609,30 @@ impl CodexHookRegistry {
             stable_session_key: session.stable_session_key.clone(),
             generation: session.generation,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_live_registration<T>(
+        &self,
+        expected: &CodexHookRegistration,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _publication = self.publication_gate.read().ok()?;
+        let state = self.state.lock().ok()?;
+        if !registration_is_current(&state, expected) {
+            return None;
+        }
+        Some(operation())
+    }
+
+    pub(crate) fn has_live_registrations(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state
+            .registrations
+            .values()
+            .any(|session| session_is_current(&state, session))
     }
 
     pub(crate) fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
@@ -609,7 +652,7 @@ impl CodexHookRegistry {
         Some(removed.stable_session_key)
     }
 
-    pub(crate) fn ingest(
+    pub(crate) fn observe_ingest(
         &self,
         peer: std::net::SocketAddr,
         nonce: &str,
@@ -617,81 +660,146 @@ impl CodexHookRegistry {
         occurred_at_epoch_ms: u64,
     ) -> CodexRelayIngestObservation {
         if !peer.ip().is_loopback() {
-            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Rejected, body, None);
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         }
         if body.len() > MAX_CODEX_HOOK_BODY_BYTES {
             return CodexRelayIngestObservation::new(
                 CodexRelayIngestStatus::BodyTooLarge,
                 body,
                 None,
+                occurred_at_epoch_ms,
             );
         }
-        let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Malformed, body, None);
+        if serde_json::from_slice::<Value>(body).is_err() {
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Malformed,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         };
         let Ok(_publication) = self.publication_gate.read() else {
-            return CodexRelayIngestObservation::new(CodexRelayIngestStatus::Rejected, body, None);
+            return CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            );
         };
-        let (registration, reduction) = {
-            let Ok(mut state) = self.state.lock() else {
+        let registration = {
+            let Ok(state) = self.state.lock() else {
                 return CodexRelayIngestObservation::new(
                     CodexRelayIngestStatus::Rejected,
                     body,
                     None,
+                    occurred_at_epoch_ms,
                 );
             };
-            let latest = {
-                let Some(session) = state.registrations.get(nonce) else {
-                    return CodexRelayIngestObservation::new(
-                        CodexRelayIngestStatus::Rejected,
-                        body,
-                        None,
-                    );
-                };
-                state
-                    .latest_generation_by_key
-                    .get(&session.stable_session_key)
-                    == Some(&session.generation)
-            };
-            if !latest {
-                state.registrations.remove(nonce);
-                state.order.retain(|candidate| candidate != nonce);
+            let Some(session) = state.registrations.get(nonce) else {
                 return CodexRelayIngestObservation::new(
                     CodexRelayIngestStatus::Rejected,
                     body,
                     None,
+                    occurred_at_epoch_ms,
+                );
+            };
+            if !session_is_current(&state, session) {
+                return CodexRelayIngestObservation::new(
+                    CodexRelayIngestStatus::Rejected,
+                    body,
+                    None,
+                    occurred_at_epoch_ms,
                 );
             }
-            let Some(session) = state.registrations.get_mut(nonce) else {
-                return CodexRelayIngestObservation::new(
-                    CodexRelayIngestStatus::Rejected,
-                    body,
-                    None,
-                );
-            };
-            let registration = CodexHookRegistration {
+            CodexHookRegistration {
                 nonce: nonce.to_string(),
                 stable_session_key: session.stable_session_key.clone(),
                 generation: session.generation,
-            };
-            (
-                registration,
-                session.reducer.apply_json(&payload, occurred_at_epoch_ms),
-            )
+            }
         };
+        CodexRelayIngestObservation::new(
+            CodexRelayIngestStatus::Accepted,
+            body,
+            Some(registration),
+            occurred_at_epoch_ms,
+        )
+    }
+
+    pub(crate) fn admit_and_publish<T, E>(
+        &self,
+        expected: &CodexHookRegistration,
+        observation: &CodexRelayIngestObservation,
+        body: &[u8],
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        if !observation.authenticates(expected, body) {
+            return Ok(None);
+        }
+        let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+            return Ok(None);
+        };
+        let Ok(_publication) = self.publication_gate.read() else {
+            return Ok(None);
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return Ok(None);
+        };
+        if !registration_is_current(&state, expected) {
+            return Ok(None);
+        }
+        let Some(session) = state.registrations.get_mut(&expected.nonce) else {
+            return Ok(None);
+        };
+        // The publication read-lock and registry state lock remain held while
+        // the adapter commits its identity decision. The operation must only
+        // mutate adapter-local state; registry callbacks would deadlock.
+        let admitted = operation()?;
+        let reduction = session
+            .reducer
+            .apply_json(&payload, observation.occurred_at_epoch_ms);
+        drop(state);
         let handler = self.event_handler.read().ok().and_then(|slot| slot.clone());
         if let Some(handler) = handler {
             if let Some(binding) = reduction.session_binding {
                 handler(
-                    registration.clone(),
+                    expected.clone(),
                     CodexRegistryEvent::SessionStarted(binding),
                 );
             }
             for draft in reduction.drafts {
-                handler(registration.clone(), CodexRegistryEvent::Semantic(draft));
+                handler(expected.clone(), CodexRegistryEvent::Semantic(draft));
             }
         }
-        CodexRelayIngestObservation::new(CodexRelayIngestStatus::Accepted, body, Some(registration))
+        Ok(Some(admitted))
+    }
+
+    pub(crate) fn ingest(
+        &self,
+        peer: std::net::SocketAddr,
+        nonce: &str,
+        body: &[u8],
+        occurred_at_epoch_ms: u64,
+    ) -> CodexRelayIngestObservation {
+        let observation = self.observe_ingest(peer, nonce, body, occurred_at_epoch_ms);
+        let Some(registration) = observation.registration.clone() else {
+            return observation;
+        };
+        match self.admit_and_publish(&registration, &observation, body, || {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(Some(())) => observation,
+            _ => CodexRelayIngestObservation::new(
+                CodexRelayIngestStatus::Rejected,
+                body,
+                None,
+                occurred_at_epoch_ms,
+            ),
+        }
     }
 }
 
