@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::domain::id::ResourceId;
 use crate::domain::operation::ResourceFence;
 use crate::kernel::{RuntimeRegistry, RuntimeRegistryError};
-use crate::process::identity::{ManagedProcessIdentity, ProcessOwner};
+use crate::process::identity::{ManagedProcessId, ManagedProcessIdentity, ProcessOwner};
 use crate::process::teardown::{TeardownReleaseAuthority, TeardownTicket};
 
 pub const MAX_PROCESS_DISPLAY_LABEL_BYTES: usize = 256;
@@ -416,6 +416,9 @@ pub struct ManagedProcessFence {
 }
 
 impl ManagedProcessFence {
+    /// Internal construction is reserved for the process registry and the
+    /// future Task 3 managed-launch bridge. Provider callers receive an
+    /// opaque permit instead of a caller-forged fence.
     pub(crate) fn new(
         resource: ResourceFence,
         owner: ProcessOwner,
@@ -442,6 +445,102 @@ impl ManagedProcessFence {
 
     pub fn root(&self) -> &ManagedProcessIdentity {
         &self.root
+    }
+}
+
+/// Private ownership receipt embedded in a provider permit. The trait is
+/// deliberately crate-private: an external caller can hold a permit returned
+/// by the registry, but cannot implement or construct the authority seam.
+/// There is intentionally no production implementation on this branch; the
+/// Task 3 union must supply the real suspended Job-root/PTY receipt. Fixtures
+/// implement it only under `cfg(test)`.
+pub(crate) trait ProviderPermitOwnership: fmt::Debug + Send {}
+
+/// Opaque, non-Clone authority for one exact process/PTY Job registration.
+///
+/// The value owns an authority receipt in addition to the generation fence.
+/// Dropping or transferring the permit therefore remains visible to the
+/// process-registry/Task 3 bridge rather than reducing ownership to an
+/// inspectable PID or fence copy.
+pub struct ProviderManagedProcessPermit {
+    fence: ManagedProcessFence,
+    #[allow(dead_code)]
+    ownership: Box<dyn ProviderPermitOwnership>,
+}
+
+impl fmt::Debug for ProviderManagedProcessPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderManagedProcessPermit")
+            .field("resource", &self.fence.resource())
+            .field("owner", &self.fence.owner())
+            .field("pid", &self.fence.root().id().pid())
+            .finish()
+    }
+}
+
+impl ProviderManagedProcessPermit {
+    pub fn process_id(&self) -> ManagedProcessId {
+        self.fence.root().id()
+    }
+
+    /// Registry/Task 3-only issuer. The private ownership trait makes this
+    /// impossible to call from an external crate, even though the permit is
+    /// part of the public launcher contract.
+    #[allow(dead_code)]
+    pub(crate) fn from_registry<T>(fence: ManagedProcessFence, ownership: T) -> Self
+    where
+        T: ProviderPermitOwnership + 'static,
+    {
+        Self {
+            fence,
+            ownership: Box::new(ownership),
+        }
+    }
+
+    pub(crate) fn fence(&self) -> &ManagedProcessFence {
+        &self.fence
+    }
+}
+
+/// Opaque, non-Clone proof that the exact managed Job/PTY authority joined
+/// ACTIVE_PROCESS_ZERO. There is intentionally no public status boolean or
+/// fence constructor; failure to establish this value is represented by the
+/// launcher error path.
+pub struct JoinedActiveProcessZeroProof {
+    fence: ManagedProcessFence,
+    #[allow(dead_code)]
+    receipt: Box<dyn ProviderPermitOwnership>,
+}
+
+impl fmt::Debug for JoinedActiveProcessZeroProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JoinedActiveProcessZeroProof")
+            .field("resource", &self.fence.resource())
+            .field("owner", &self.fence.owner())
+            .finish()
+    }
+}
+
+impl JoinedActiveProcessZeroProof {
+    #[allow(dead_code)]
+    pub(crate) fn from_registry<T>(fence: ManagedProcessFence, receipt: T) -> Self
+    where
+        T: ProviderPermitOwnership + 'static,
+    {
+        Self {
+            fence,
+            receipt: Box::new(receipt),
+        }
+    }
+
+    pub(crate) fn matches_permit(&self, permit: &ProviderManagedProcessPermit) -> bool {
+        self.fence == permit.fence
+    }
+
+    pub(crate) fn matches_fence(&self, fence: &ManagedProcessFence) -> bool {
+        &self.fence == fence
     }
 }
 
