@@ -412,6 +412,66 @@ fn preview_script_rejects_a_renamed_unrelated_exe_before_launch() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn preview_script_rejects_cross_invocation_receipt_even_when_path_matches() {
+    let receipt_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".devmanager-next/preview-artifact.json");
+    let receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(receipt_path).expect("existing preview receipt"))
+            .expect("preview receipt JSON");
+    let binary = PathBuf::from(receipt["binaryPath"].as_str().expect("receipt binary path"));
+    let result = run_preview_artifact_validation(&binary);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.status.success(),
+        "cross-invocation receipt was accepted"
+    );
+    assert!(
+        combined.contains("caller-supplied warm binary paths are disabled"),
+        "warm receipt trust must be disabled even for a matching path: {combined}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preview_script_rejects_a_wrong_cwd_before_any_build_or_launch() {
+    let root = tempdir().expect("wrong cwd root");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/native-next/Capture-UiPreviews.ps1");
+    let result = Command::new("pwsh")
+        .current_dir(root.path())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .args(["-ValidateOnly"])
+        .output()
+        .expect("PowerShell must run the preview validator");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.status.success(),
+        "wrong cwd was accepted: {combined}"
+    );
+    assert!(
+        combined.contains("canonical worktree"),
+        "wrong cwd must fail closed before Cargo: {combined}"
+    );
+}
+
 #[test]
 fn preview_script_binds_every_warm_launch_to_the_fixed_artifact_receipt() {
     let script = fs::read_to_string(
@@ -441,6 +501,168 @@ fn preview_script_binds_every_warm_launch_to_the_fixed_artifact_receipt() {
     assert!(
         !script.contains("StartsWith($repoPrefix"),
         "a lexical worktree prefix must not be the warm-binary authority"
+    );
+}
+
+#[test]
+fn preview_script_disables_cross_invocation_warm_receipt_trust() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    assert!(
+        script.contains("caller-supplied warm binary paths are disabled"),
+        "warm mode must build and retain one trusted artifact per invocation"
+    );
+    assert!(
+        script.contains("InMemoryArtifactReceipt") || script.contains("artifactReceipt ="),
+        "matrix launches must use the receipt minted by the current invocation"
+    );
+}
+
+#[test]
+fn preview_script_derives_and_rechecks_a_clean_source_build_digest() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "git status --porcelain",
+        "HEAD^{tree}",
+        "Get-PreviewSourceContentDigest",
+        "sourceContentDigest",
+        "MAX_SOURCE_DIGEST_FILES",
+        "MAX_SOURCE_DIGEST_DIRECTORIES",
+        "MAX_SOURCE_DIGEST_BYTES",
+        "BuildIdentityDigest",
+        "source tree changed during the isolated build",
+    ] {
+        assert!(
+            script.contains(marker),
+            "source/build identity must derive and recheck {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_pins_cargo_manifest_target_profile_and_features() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "--manifest-path",
+        "--target",
+        "--profile",
+        "--no-default-features",
+        "--message-format=json-render-diagnostics",
+        "features = @()",
+    ] {
+        assert!(
+            script.contains(marker),
+            "isolated cargo build must pin {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_script_retains_no_follow_directory_authority_through_launch() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "OpenDirectoryNoFollow",
+        "FILE_SHARE_NONE",
+        "Open-PreviewLaunchAuthority",
+        "Assert-PreviewLaunchAuthorityStable",
+        "Authority = $authority",
+    ] {
+        assert!(
+            script.contains(marker),
+            "every launch must retain and recheck {marker}"
+        );
+    }
+    assert!(
+        !script.contains("& $opened.Path")
+            && !script.contains("Start-Process -FilePath $opened.Path"),
+        "launch must not rely on an unprotected path after validation"
+    );
+}
+
+#[test]
+fn preview_receipt_publication_is_atomic_and_handle_verified() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "WriteAtomicPreviewReceipt",
+        "MoveFileExW",
+        "FlushFileBuffers",
+        "receipt handle remains held",
+        "Assert-PreviewReceiptSchema",
+        "embeddedBuildIdentity",
+        "BuildIdentityDigest",
+    ] {
+        assert!(
+            script.contains(marker),
+            "receipt publication must provide {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_forged_receipts_and_caller_build_overrides_cannot_authorize_warm_launch() {
+    let script = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/native-next/Capture-UiPreviews.ps1"),
+    )
+    .expect("preview capture script");
+    for marker in [
+        "caller-supplied warm binary paths are disabled",
+        "caller build override",
+        "Assert-PreviewReceiptSchema",
+        "binaryFileIdentity",
+        "binarySha256",
+        "Read-PreviewArtifactReceipt",
+        "Open-PreviewDirectoryNoFollow",
+        "Get-PreviewDirectoryChain",
+        "Get-PreviewToolPath",
+        "cargoSha256",
+        "rustcSha256",
+        "CargoPath",
+        "rustup which",
+        "canonicalRustupPath",
+        "globalCargoConfigSha256",
+    ] {
+        assert!(
+            script.contains(marker),
+            "untrusted receipt/build metadata must fail closed at {marker}"
+        );
+    }
+}
+
+#[test]
+fn preview_binary_exposes_a_build_identity_marker_without_runtime_execution() {
+    let build_script =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+            .expect("build script");
+    let preview_source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ui/preview.rs"))
+            .expect("preview source");
+    assert!(
+        build_script.contains("DEV_MANAGER_PREVIEW_BUILD_IDENTITY"),
+        "build identity must be injected by the trusted build"
+    );
+    assert!(
+        preview_source.contains("DEV_MANAGER_PREVIEW_BUILD_IDENTITY_MARKER"),
+        "the executable must expose the build identity as readable bytes"
     );
 }
 

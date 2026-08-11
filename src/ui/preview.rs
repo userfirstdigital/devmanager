@@ -30,6 +30,19 @@ use crate::ui::tokens::{theme, Density, Scale, StatusMeaning, ThemeMode};
 pub const PREVIEW_SCHEMA: &str = "devmanager.ui.preview/v1";
 pub const MAX_FIXTURE_BYTES: u64 = 256 * 1024;
 pub const PREVIEW_SENTINEL_RGBA: [u8; 4] = [0x91, 0x2b, 0xd4, 0xff];
+#[used]
+#[no_mangle]
+pub static DEV_MANAGER_PREVIEW_BUILD_IDENTITY_MARKER: &[u8] = concat!(
+    "DEV_MANAGER_PREVIEW_BUILD_IDENTITY=",
+    env!("DEV_MANAGER_PREVIEW_BUILD_IDENTITY"),
+    "\0"
+)
+.as_bytes();
+
+#[inline(never)]
+fn retain_preview_build_identity_marker() {
+    std::hint::black_box(DEV_MANAGER_PREVIEW_BUILD_IDENTITY_MARKER);
+}
 const PREVIEW_SENTINEL_RGB: u32 = ((PREVIEW_SENTINEL_RGBA[0] as u32) << 16)
     | ((PREVIEW_SENTINEL_RGBA[1] as u32) << 8)
     | PREVIEW_SENTINEL_RGBA[2] as u32;
@@ -792,6 +805,7 @@ pub struct PreviewApplication {
 
 impl PreviewApplication {
     pub fn load(request: PreviewRequest, policy: &PreviewPathPolicy) -> Result<Self, PreviewError> {
+        retain_preview_build_identity_marker();
         let gallery_page = request.gallery_page;
         let window_hold_ms = request.window_hold_ms;
         let fixture_authority = Arc::clone(&request.fixture_authority);
